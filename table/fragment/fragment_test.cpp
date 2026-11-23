@@ -198,7 +198,8 @@ TEST_F(FragmentAuditTest, NullKeyNeverSatisfiesKeyRange) {
   // MemTable::Put rejects NULL keys, so the snapshot pairs are built by
   // hand: the key blob is the bare kNull tag and the entry holds the row.
   std::vector<std::pair<std::string, RowEntry>> mem;
-  for (const Row& row : rows) {
+  mem.reserve(rows.size());
+for (const Row& row : rows) {
     mem.emplace_back(row.EncodeKeyMemcomparableFormat(schema), RowEntry(row));
   }
   const std::vector<ArtifactRef> artifacts{

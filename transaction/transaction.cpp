@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -27,8 +26,10 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -155,8 +156,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
     // forever. Use a temporary charge so a failed TryAdd cannot disturb the
     // entry charges held by mem_charge_.
     ProcessMemoryCharge spill_charge(MemoryPoolKind::kTx, 0);
-    if (!spill_charge.TryAdd(kSpillBufferBytes,
-                             /*respect_soft_limit=*/false)) {
+    if (!spill_charge.TryAdd(
+            kSpillBufferBytes + (kSpillTailCapacity * sizeof(RowPosition)),
+            /*respect_soft_limit=*/false)) {
       if (error_out != nullptr) {
         *error_out = StatusError(
             StatusCode::kMemoryLimitExceeded,
@@ -164,8 +166,24 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
       }
       return false;
     }
-    segment_writer_ =
-        std::make_unique<SpillSegmentWriter>(store.get(), kSpillBufferBytes);
+    std::vector<RowPosition> chunk;
+    try {
+      chunk.reserve(kSpillTailCapacity);
+    } catch (const std::bad_alloc&) {
+      if (error_out != nullptr) {
+        *error_out = Status::kMemoryLimitExceeded;
+      }
+      return false;
+    }
+    try {
+      segment_writer_ =
+          std::make_unique<SpillSegmentWriter>(store.get(), kSpillBufferBytes);
+    } catch (const std::bad_alloc&) {
+      if (error_out != nullptr) {
+        *error_out = Status::kMemoryLimitExceeded;
+      }
+      return false;
+    }
     const Status open_st = segment_writer_->EnsureOpen();
     if (open_st != Status::kSuccess) {
       if (error_out != nullptr) {
@@ -176,8 +194,6 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
     }
     spill_store_ = store;
     spill_segment_id_ = segment_writer_->SegmentId();
-    std::vector<RowPosition> chunk;
-    chunk.reserve(std::min<size_t>(entries.size(), kSpillTailCapacity));
     uint64_t written = 0;
     for (const RowPosition& rp : entries) {
       chunk.push_back(rp);
@@ -226,7 +242,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
     if (spilled_bytes_out != nullptr) {
       *spilled_bytes_out += written;
     }
-    spill_tail_.push_back(value);
+    chunk.clear();
+    chunk.push_back(value);
+    spill_tail_.swap(chunk);
     ++total_count_;
     return true;
   };
@@ -354,13 +372,23 @@ Status TransactionWriteSet::ForEach(
                      segment_writer_->Finish(/*keep_empty=*/false));
     seg_id = finished_seg;
     segment_writer_.reset();
-    spill_segment_id_ = kInvalidSpillSegmentId;
-    std::vector<RowPosition>().swap(spill_tail_);
+    spill_segment_id_ = seg_id;
   }
+  // The tail rows were all delivered by the loop above; clearing them here
+  // (rather than inside the writer block) keeps a retry from re-delivering
+  // them while the segment read below stays retryable through
+  // spill_segment_id_.
+  std::vector<RowPosition>().swap(spill_tail_);
   if (seg_id != kInvalidSpillSegmentId && spill_store_ != nullptr) {
     const auto store = spill_store_;
-    UnwindGuard drop_guard([&store, seg_id] { store->DropSegment(seg_id); });
     SpillSegmentReader reader(store.get(), seg_id, kSpillBufferBytes);
+    // The segment is dropped only after every row was delivered.  An early
+    // return (Open failure, fn failure, read error) used to drop it through
+    // the unwind guard AND clear spill_segment_id_/spill_tail_, so a retrying
+    // ForEach silently succeeded with an empty write set and scattered
+    // entries were lost.  Keeping both lets the retry re-read the segment;
+    // re-delivering already-seen segment rows matches the in-memory path's
+    // retry semantics.
     RETURN_IF_FAIL(reader.Open());
     std::array<RowPosition, 512> batch{};
     while (!reader.Eof()) {
@@ -374,6 +402,8 @@ Status TransactionWriteSet::ForEach(
         RETURN_IF_FAIL(fn(batch[i]));
       }
     }
+    store->DropSegment(seg_id);
+    spill_segment_id_ = kInvalidSpillSegmentId;
   }
   clear();
   return Status::kSuccess;
@@ -474,7 +504,10 @@ void Transaction::FinishRunningNoexcept() noexcept {
     if (manager != nullptr) {
       if (manager->recovery_ != nullptr) {
         try {
-          (void)manager->Abort(*this);
+          const Status aborted = manager->Abort(*this);
+          if (!aborted.ok()) {
+            LOG(ERROR) << "automatic transaction abort failed: " << aborted;
+          }
         } catch (...) {
           failed_.store(true, std::memory_order_release);
         }
@@ -515,13 +548,36 @@ void Transaction::FinishRunningNoexcept() noexcept {
   FinalizeFinishHooks();
 }
 
+void Transaction::AddFinishHook(std::shared_ptr<TransactionFinishHook> hook) {
+  if (hook == nullptr) {
+    return;
+  }
+  {
+    std::scoped_lock lock(finish_hooks_mu_);
+    if (!finish_hooks_finalized_.load(std::memory_order_relaxed)) {
+      finish_hooks_.push_back(std::move(hook));
+      return;
+    }
+  }
+  const TransactionStatus status = status_.load(std::memory_order_acquire);
+  if (status == TransactionStatus::kCommitted ||
+      status == TransactionStatus::kAborted) {
+    hook->OnTransactionFinished(status);
+  }
+}
+
 void Transaction::FinalizeFinishHooks() noexcept {
-  if (!IsFinished() ||
-      finish_hooks_finalized_.exchange(true, std::memory_order_acq_rel)) {
+  if (!IsFinished()) {
     return;
   }
   std::vector<std::shared_ptr<TransactionFinishHook>> hooks;
-  hooks.swap(finish_hooks_);
+  {
+    std::scoped_lock lock(finish_hooks_mu_);
+    if (finish_hooks_finalized_.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
+    hooks.swap(finish_hooks_);
+  }
   const TransactionStatus status = status_.load(std::memory_order_acquire);
   for (const auto& hook : hooks) {
     if (hook == nullptr) {
@@ -540,10 +596,7 @@ void Transaction::FinalizeFinishHooks() noexcept {
 Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
                          bool read_only)
     : txn_id_(txn_id),
-      // Begin() immediately overwrites this with StableTimestamp() under the
-      // registry lock; the value here is a placeholder only (the stable
-      // timestamp cannot be read safely before registration).
-      snapshot_ts_(0),
+      
       shard_epoch_(NextShardEpoch()),
       transaction_manager_(tm),
       status_(TransactionStatus::kRunning),
@@ -691,7 +744,9 @@ Status Transaction::Abort() {
 }
 
 bool Transaction::AddReadSet(const RowPosition& rp) {
-  assert(!IsFinished());
+  if (IsFinished()) {
+    return false;
+  }
   // MV2PL readers use snapshot-visible row versions and therefore never take
   // a lock that conflicts with a writer's exclusive lock.
   // Keep a bounded diagnostic sample in RAM so large scans never blow kTx.
@@ -707,7 +762,7 @@ bool Transaction::TryInsertWriteSet(const RowPosition& rp, Status* error_out) {
   std::shared_ptr<SpillStore> store;
   // Mirrors TransactionManager::kDefaultWriteSetSpillEntries (4096) when no
   // manager is attached.
-  size_t threshold = 4096;
+  size_t threshold = TransactionManager::kDefaultWriteSetSpillEntries;
   if (transaction_manager_ != nullptr) {
     threshold = transaction_manager_->EffectiveWriteSetSpillThresholdEntries();
     if (!write_set_.IsDiskSpilled()) {
@@ -745,7 +800,6 @@ bool Transaction::TryInsertWriteSet(const RowPosition& rp, Status* error_out) {
 }
 
 bool Transaction::AddWriteSet(const RowPosition& rp) {
-  assert(!IsFinished());
   write_set_failure_status_ = Status::kSuccess;
   // IsFinished() must be enforced, not just asserted: a stale caller that
   // keeps writing through a committed transaction would install a permanent
@@ -791,7 +845,6 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
 }
 
 bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
-  assert(!IsFinished());
   write_set_failure_status_ = Status::kSuccess;
   if (IsFailed()) {
     RecordWriteSetFailure(Status::kRuntimeError);
@@ -841,7 +894,6 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
 }
 
 bool Transaction::TryAddWriteSet(const RowPosition& rp) {
-  assert(!IsFinished());
   write_set_failure_status_ = Status::kSuccess;
   if (IsFailed()) {
     RecordWriteSetFailure(Status::kRuntimeError);
@@ -943,18 +995,20 @@ uint64_t Transaction::NextShardEpoch() {
 StatusOr<std::string_view> Transaction::ReadVersion(
     const RowPosition& rp, std::optional<std::string_view> physical,
     bool resolve_head) {
-  assert(!IsFinished());
+  if (IsFinished()) {
+    return StatusError(StatusCode::kRuntimeError,
+                       "cannot read through a finished transaction");
+  }
   if (transaction_manager_ != nullptr && transaction_manager_->FailStopped()) {
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
-  // Fast path: a row whose version shard carries no chain has exactly one
-  // version -- the physical image inside the caller's pinned page -- which
-  // every snapshot sees as-is.  Return it directly: no copy, no cache entry,
-  // and no locks.  One acquire load instead of a shard-mutex probe; rows on
-  // chain-bearing pages take the fused path below (TransactionManager::
-  // ReadVersion resolves them under a single shard lock).
-  if (transaction_manager_ != nullptr && physical &&
+  // Read-only scans can use the chain-free physical-image fast path. A
+  // read-write transaction must consult the version shard even when the
+  // page counter is zero: another worker using this transaction may have
+  // published a chain entry just before incrementing that counter, and its
+  // own staged value must remain visible across workers.
+  if (transaction_manager_ != nullptr && physical && read_only_ &&
       transaction_manager_->VersionShardIdle(rp)) {
     return *physical;
   }
@@ -1187,10 +1241,50 @@ StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
     return Status::kConflicts;
   }
   DebugSetPhase("wal-append");
+  const UnwindGuard clear_phase([&] { DebugSetPhase(nullptr); });
   LogRecord record = lr;
   record.prev_lsn = prev_lsn_.load(std::memory_order_relaxed);
   serialization_scratch_.clear();
   record.SerializeTo(serialization_scratch_);
+  const size_t rec_bytes = serialization_scratch_.size();
+  RETURN_IF_FAIL(transaction_manager_->logger_->CheckAppendSize(rec_bytes));
+  // Reserve the serialized record before advancing the WAL. A transaction
+  // without a recovery reader must keep every appended change for replay.
+  const bool needs_staging =
+      record.type != LogType::kBegin && record.type != LogType::kCommit &&
+      record.type != LogType::kAbort &&
+      record.type != LogType::kBeginCheckpoint &&
+      record.type != LogType::kEndCheckpoint && !wal_reread_mode_;
+  bool staged = false;
+  if (needs_staging) {
+    const bool can_reread = transaction_manager_->CanWalReread();
+    const size_t limit =
+        can_reread ? transaction_manager_->EffectiveWalRereadThresholdBytes()
+                   : std::numeric_limits<size_t>::max();
+    const bool within_limit =
+        rec_bytes <= limit - std::min(staged_bytes_, limit);
+    if (within_limit &&
+        staged_charge_.TryAdd(rec_bytes, /*respect_soft_limit=*/false)) {
+      try {
+        staged_records_.push_back(std::move(record));
+        staged = true;
+      } catch (const std::bad_alloc&) {
+        staged_charge_.Release(rec_bytes);
+      } catch (const std::length_error&) {
+        staged_charge_.Release(rec_bytes);
+      }
+    }
+    if (!staged && !can_reread) {
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "cannot stage transaction WAL record");
+    }
+  }
+  UnwindGuard undo_staging([&] {
+    if (staged) {
+      staged_records_.pop_back();
+      staged_charge_.Release(rec_bytes);
+    }
+  });
   ASSIGN_OR_RETURN(
       lsn_t, start,
       transaction_manager_->logger_->AddLog(serialization_scratch_));
@@ -1199,39 +1293,18 @@ StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
     first_lsn_.store(start, std::memory_order_relaxed);
   }
   has_log_.store(true, std::memory_order_release);
-  const std::string& data = serialization_scratch_;
-  prev_end_lsn_ = start + static_cast<lsn_t>(data.size());
-  record.record_lsn = start;
-  if (record.type != LogType::kBegin && record.type != LogType::kCommit &&
-      record.type != LogType::kAbort &&
-      record.type != LogType::kBeginCheckpoint &&
-      record.type != LogType::kEndCheckpoint && !wal_reread_mode_) {
-    // Account for the serialized record (header + payload + CRC), not the
-    // in-memory LogRecord struct; the latter overcounts small records by ~100x.
-    const size_t rec_bytes = record.Size();
-    const bool can_reread =
-        transaction_manager_ != nullptr && transaction_manager_->CanWalReread();
-    const size_t limit =
-        transaction_manager_ != nullptr
-            ? transaction_manager_->EffectiveWalRereadThresholdBytes()
-            : TransactionManager::kDefaultWalRereadThresholdBytes;
-    if (can_reread &&
-        (staged_bytes_ + rec_bytes > limit ||
-         !staged_charge_.TryAdd(rec_bytes, /*respect_soft_limit=*/false))) {
-      wal_reread_mode_ = true;
-      std::vector<LogRecord>().swap(staged_records_);
-      staged_charge_.ReleaseAll();
-      staged_bytes_ = 0;
-      transaction_manager_->RecordWalRereadActivation();
-    } else {
-      if (!can_reread) {
-        (void)staged_charge_.TryAdd(rec_bytes, /*respect_soft_limit=*/false);
-      }
-      staged_bytes_ += rec_bytes;
-      staged_records_.push_back(std::move(record));
-    }
+  prev_end_lsn_ = start + static_cast<lsn_t>(rec_bytes);
+  if (staged) {
+    staged_records_.back().record_lsn = start;
+    staged_bytes_ += rec_bytes;
+  } else if (needs_staging) {
+    wal_reread_mode_ = true;
+    std::vector<LogRecord>().swap(staged_records_);
+    staged_charge_.ReleaseAll();
+    staged_bytes_ = 0;
+    transaction_manager_->RecordWalRereadActivation();
   }
-  DebugSetPhase(nullptr);
+  undo_staging.Disarm();
   return start;
 }
 
@@ -1290,11 +1363,11 @@ StatusOr<lsn_t> Transaction::LsmDestroyLog(page_id_t root) {
   return AppendLog(LogRecord::LsmDestroyLogRecord(prev_lsn_, txn_id_, root));
 }
 
-void Transaction::ReserveIndexUndoBytes(page_id_t pid, size_t bytes) {
+Status Transaction::ReserveIndexUndoBytes(page_id_t pid, size_t bytes) {
   if (bytes == 0 || transaction_manager_ == nullptr) {
-    return;
+    return Status::kSuccess;
   }
-  transaction_manager_->ReserveIndexUndoBytes(*this, pid, bytes);
+  return transaction_manager_->ReserveIndexUndoBytes(*this, pid, bytes);
 }
 
 StatusOr<lsn_t> Transaction::AllocatePageLog(page_id_t allocated_page_id,
@@ -1308,6 +1381,11 @@ StatusOr<lsn_t> Transaction::DestroyPageLog(
     std::string_view /*old_page_body*/) {
   return AppendLog(
       LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
+}
+
+bool Transaction::NoWaitForConflicts() const {
+  return transaction_manager_ != nullptr &&
+         transaction_manager_->GetDeadlockPolicy() == TransactionManager::DeadlockPolicy::kNoWait;
 }
 
 void Transaction::NoteWaitForHolder(txn_id_t holder, RowPosition row) const {
@@ -1345,7 +1423,7 @@ std::atomic<int64_t>& StatementTimeoutOverrideMs() noexcept {
 }
 thread_local int64_t tl_statement_deadline_ns = 0;
 
-Status CheckDeadlineNs(int64_t deadline) noexcept {
+Status CheckDeadlineNs(int64_t deadline) {
   if (deadline == 0) {
     return Status::kSuccess;
   }

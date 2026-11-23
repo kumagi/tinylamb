@@ -47,6 +47,7 @@ std::pair<Schema, Schema> BuildUnnestSchema(const Plan& child,
     return {schema, schema};
   }
   std::vector<Column> cols;
+  cols.reserve(offset_alias.empty() ? 1U : 2U);
   const std::string rel_name = alias.empty() ? "unnest" : alias;
   cols.emplace_back(ColumnName(rel_name, rel_name), ValueType::kNull);
   if (!offset_alias.empty()) {

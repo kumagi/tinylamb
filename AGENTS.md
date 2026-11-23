@@ -108,9 +108,7 @@ python3 scripts/check_ooc_invariants.py # must exit 0
   iteration — the disk-quota guard that keeps long sweeps from turning
   `Database::Create` failures into bogus crashes.
 
-- Filtered test run: `ctest --test-dir build --output-on-failure -j$(nproc) -R 'Suite\.Case'` (always keep `-j`; avoid running full unsharded binaries serially). Most tests link `tinylamb::sql` + `tinylamb::test_util`; the fuzz replay
-tests (added via `add_replay_test`) instead link `tinylamb::sql` /
-`tinylamb::postgres_server` directly and do not use `tinylamb::test_util`.
+- Filtered test run: `ctest --test-dir build --output-on-failure -j$(nproc) -R 'Suite\.Case'` (always keep `-j`; avoid running full unsharded binaries serially). Most tests link `tinylamb::sql` + `tinylamb::test_util`; fuzz replay tests added via `add_replay_test` link `tinylamb::core` plus any explicit per-target libraries and do not use `tinylamb::test_util`.
 - Format: `clang-format -i` on touched `*.hpp`/`*.cpp`.
 - Unit test per bugfix/feature in the same layer dir (`*_test.cpp`).
 - Benchmarks: TPC-H (`tinylamb_tpch_benchmark`) and
@@ -137,10 +135,13 @@ tests (added via `add_replay_test`) instead link `tinylamb::sql` /
   `SqlOracleFuzzer.ReplayCommittedRegressionFiles` replays every `.test` in
   `TINYLAMB_ORACLE_REGRESSION_DIR` (expr/griffin traces replay through
   `ReplayExprOracleTrace` / `ReplayGriffinTrace` in their `*_fuzzer_test`;
-  session traces through `SqlSessionFuzzer.ReplayCommittedRegressionFilesShard0..3`
-  over `TINYLAMB_SESSION_REGRESSION_DIR`, wired in CMake to
-  `query/testdata/session_regressions/`; OOC traces through
-  `SqlOocFuzzer.ReplayCommittedRegressionFilesShard0..3` over
+  session traces through the parameterized
+  `RegressionShards/SqlSessionRegressionTest.ReplayCommittedRegressionFiles/ReplayCommittedRegressionFilesShard0..15`
+  (grep for `ReplayCommittedRegressionFilesShard`) over
+  `TINYLAMB_SESSION_REGRESSION_DIR`, wired in CMake to
+  `query/testdata/session_regressions/`; OOC traces through the parameterized
+  `RegressionShards/OocCommittedRegressionTest.ReplayCommittedRegressionFiles/0..15`
+  (grep for `ReplayCommittedRegressionFiles`) over
   `TINYLAMB_OOC_REGRESSION_DIR`, wired in CMake to
   `query/testdata/ooc_regressions/`).
   Logic bugs (wrong results), not just crashes, fail the run; run them long

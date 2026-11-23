@@ -1240,8 +1240,9 @@ class PaxChunk final {
     // produce equal code sequences and the memcmp is exact), then each row
     // costs one u8 load and a first-byte-rejected compare. The needle never
     // materializes a conforming string byte; only exception rows are compared
-    // as strings. Ordered comparisons (LT/LE/GT/GE, the range form) and any
-    // future prefix op decline to the generic decode path: codes are not
+    // as strings. Prefix counts use a separate bytewise fold; ordered
+    // comparisons (LT/LE/GT/GE, the range form) decline to the generic decode
+    // path because codes are not
     // order-preserving, and a byte-prefix of a string may encode differently
     // than the prefix encoded standalone (a symbol may cross the boundary),
     // so a sound prefix fold needs its own op first. Wire (nexc echoed in
@@ -2000,7 +2001,7 @@ class PaxChunk final {
   // hand-built footer) fall back to the stateless SelectBit.
   void BuildEfSelectDirs();
   void BuildFsstDirs();
-  std::span<const int64_t> DecodedIntCell(slot_t col, uint32_t group) const;
+  [[nodiscard]] std::span<const int64_t> DecodedIntCell(slot_t col, uint32_t group) const;
   // Resolves a global row index to (row group, local index).
   // Returns 0 on success, 1 when the prefix is unavailable (hostile footer),
   // 2 when the row index is past the end of the chunk.

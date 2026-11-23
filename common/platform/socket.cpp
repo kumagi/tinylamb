@@ -23,6 +23,8 @@
 #include <climits>
 #include <mutex>
 #include <unordered_map>
+
+#include "common/log_message.hpp"
 #else
 #include <fcntl.h>
 #include <sys/time.h>
@@ -36,11 +38,17 @@ namespace tinylamb::platform {
 namespace {
 
 void EnsureWinsockInitialized() {
-  static const bool initialized = []() {
+  // WSAStartup returns 0 on success and a Winsock error code on failure. Do
+  // not discard that code: without it every later Winsock call just fails
+  // with WSANOTINITIALISED, which TranslateWsaError flattens into a generic
+  // EIO with no hint about the real startup failure.
+  static const int wsa_error = []() {
     WSADATA wsa_data{};
-    return ::WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0;
+    return ::WSAStartup(MAKEWORD(2, 2), &wsa_data);
   }();
-  (void)initialized;
+  if (wsa_error != 0) {
+    LOG(WARN) << "WSAStartup failed with Winsock error " << wsa_error;
+  }
 }
 
 int TranslateWsaError(int wsa_err) {
@@ -105,8 +113,10 @@ SocketFd ApplyWinSocketFlags(SOCKET s, FdFlags flags) {
   const HANDLE handle = reinterpret_cast<HANDLE>(s);
   if (!::SetHandleInformation(handle, HANDLE_FLAG_INHERIT,
                               flags.close_on_exec ? 0 : HANDLE_FLAG_INHERIT)) {
+    SetErrnoFromWsa();
+    const int saved = errno;
     ::closesocket(s);
-    errno = EIO;
+    errno = saved;
     return -1;
   }
   u_long nonbio = flags.nonblocking ? 1UL : 0UL;
@@ -154,7 +164,7 @@ int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
   EnsureWinsockInitialized();
   const SocketFd listener = OpenSocket(
       AF_INET, SOCK_STREAM, 0, {.nonblocking = false, .close_on_exec = true});
-  if (listener < 0) return -1;
+  if (!IsValidSocketFd(listener)) return -1;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -174,8 +184,18 @@ int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
   const SocketFd write_end =
       OpenSocket(AF_INET, SOCK_STREAM, 0,
                  {.nonblocking = false, .close_on_exec = flags.close_on_exec});
-  if (write_end < 0) {
+  if (!IsValidSocketFd(write_end)) {
     const int saved = errno;
+    CloseSocket(listener);
+    errno = saved;
+    return -1;
+  }
+  // A blocking Winsock connect() has no guaranteed bound. If loopback is down
+  // or firewalled, Waker::Open() would hang forever, so give it a deadline.
+  constexpr int kConnectTimeoutMs = 5000;
+  if (SetSocketTimeout(write_end, SO_SNDTIMEO, kConnectTimeoutMs) < 0) {
+    const int saved = errno;
+    CloseSocket(write_end);
     CloseSocket(listener);
     errno = saved;
     return -1;
@@ -189,9 +209,11 @@ int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
     errno = saved;
     return -1;
   }
+  // Waker traffic is tiny; it must not inherit the connect deadline.
+  (void)SetSocketTimeout(write_end, SO_SNDTIMEO, 0);
   const SocketFd read_end = AcceptSocket(listener, flags);
   CloseSocket(listener);
-  if (read_end < 0) {
+  if (!IsValidSocketFd(read_end)) {
     const int saved = errno;
     CloseSocket(write_end);
     errno = saved;
@@ -204,25 +226,33 @@ int OpenPipe(std::array<SocketFd, 2>& fds, FdFlags flags) {
     return -1;
   }
   const int nodelay = 1;
-  (void)SetSocketOptInt(read_end, IPPROTO_TCP, TCP_NODELAY, nodelay);
-  (void)SetSocketOptInt(write_end, IPPROTO_TCP, TCP_NODELAY, nodelay);
+  if (SetSocketOptInt(read_end, IPPROTO_TCP, TCP_NODELAY, nodelay) < 0 ||
+      SetSocketOptInt(write_end, IPPROTO_TCP, TCP_NODELAY, nodelay) < 0) {
+    const int saved = errno;
+    CloseSocket(read_end);
+    CloseSocket(write_end);
+    errno = saved;
+    return -1;
+  }
   fds[0] = read_end;
   fds[1] = write_end;
   return 0;
 }
 
 int CloseSocket(SocketFd fd) {
-  if (fd < 0) {
+  if (!IsValidSocketFd(fd)) {
     errno = EBADF;
     return -1;
-  }
-  {
-    std::scoped_lock lock(SocketFlagsMutex());
-    SocketFlagsMap().erase(fd);
   }
   if (::closesocket(static_cast<SOCKET>(fd)) != 0) {
     SetErrnoFromWsa();
     return -1;
+  }
+  // Only drop the cached flags once the handle is really gone; otherwise a
+  // failed close leaves a live fd whose queries report the default flags.
+  {
+    std::scoped_lock lock(SocketFlagsMutex());
+    SocketFlagsMap().erase(fd);
   }
   return 0;
 }
@@ -242,10 +272,15 @@ ssize_t RecvSocket(SocketFd fd, void* data, size_t size, int flags) {
 
 ssize_t SendNoSignal(SocketFd fd, const void* data, size_t size,
                      int extra_flags) {
-  const int flags = extra_flags & ~MSG_DONTWAIT;
+  // Winsock's length parameter is an int; cap instead of narrowing so a
+  // >INT_MAX buffer cannot wrap into a negative / short send (the POSIX
+  // branch passes size_t through unchanged). Pass extra_flags through as-is:
+  // MSG_DONTWAIT is 0 on Windows, so there is nothing to strip, and keeping
+  // it preserves the same contract on both platforms.
+  const int capped = static_cast<int>(std::min<size_t>(size, INT_MAX));
   const int sent =
-      ::send(static_cast<SOCKET>(fd), static_cast<const char*>(data),
-             static_cast<int>(size), flags);
+      ::send(static_cast<SOCKET>(fd), static_cast<const char*>(data), capped,
+             kSendNoSignal | extra_flags);
   if (sent == SOCKET_ERROR) {
     SetErrnoFromWsa();
     return -1;
@@ -281,7 +316,12 @@ int SetSocketOptInt(SocketFd fd, int level, int optname, int value) {
 }
 
 int SetSocketTimeout(SocketFd fd, int optname, int timeout_ms) {
-  const DWORD val = timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : DWORD{0};
+  if (timeout_ms < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  // Winsock treats DWORD 0 as "no timeout" (infinite wait), not "no wait".
+  const DWORD val = static_cast<DWORD>(timeout_ms);
   if (::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, optname,
                    reinterpret_cast<const char*>(&val), sizeof(val)) != 0) {
     SetErrnoFromWsa();
@@ -440,12 +480,16 @@ int SetSocketOptInt(SocketFd fd, int level, int optname, int value) {
 }
 
 int SetSocketTimeout(SocketFd fd, int optname, int timeout_ms) {
-  // Match the Windows branch: a non-positive timeout means no wait, so clamp
-  // it to 0 instead of handing a negative timeval to setsockopt (EINVAL).
-  const int clamped = timeout_ms > 0 ? timeout_ms : 0;
+  if (timeout_ms < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  // timeval{0, 0} means "no timeout" (infinite wait), matching Winsock's
+  // DWORD 0. Reject negative values above instead of clamping them into an
+  // accidental infinite wait.
   timeval tv{};
-  tv.tv_sec = clamped / 1000;
-  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(clamped % 1000) * 1000;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(timeout_ms % 1000) * 1000;
   return ::setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
 }
 

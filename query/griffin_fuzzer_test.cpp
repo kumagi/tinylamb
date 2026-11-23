@@ -68,12 +68,16 @@ TEST(GriffinFuzzer, TestFileRoundTripAndReplay) {
   GriffinTrace parsed;
   ASSERT_TRUE(ParseGriffinTest(text, &parsed));
   EXPECT_EQ(parsed, trace);
-  EXPECT_EQ(ReplayGriffinTrace(parsed, false), "");
+  bool skipped = false;
+  EXPECT_EQ(ReplayGriffinTrace(parsed, false, &skipped), "");
+  EXPECT_FALSE(skipped) << "replay skipped (DB could not open): false green";
 
   // Tampered statements must not replay clean.
   GriffinTrace tampered = parsed;
   tampered.statements[0] = "CREATE TABLE tampered (x INT64);";
-  EXPECT_NE(ReplayGriffinTrace(tampered, false), "");
+  skipped = false;
+  EXPECT_NE(ReplayGriffinTrace(tampered, false, &skipped), "");
+  EXPECT_FALSE(skipped) << "tampered replay skipped: no check actually ran";
 
   // Malformed input is refused, never half-replayed.
   GriffinTrace junk;
@@ -95,6 +99,9 @@ TEST(GriffinFuzzer, BytecodeDisabledPathStillExecutes) {
   // relies on is live. With TINYLAMB_DISABLE_BYTECODE set the engine must
   // actually leave the bytecode fast path; otherwise oracle (2) compares
   // bytecode against bytecode and every seeded sweep passes vacuously.
+  // Snapshot both *presence* and value: an inherited `=0` must be restored as
+  // `0`, not unset. Copy the value before SetEnv may invalidate getenv's
+  // pointer.
   const char* prior_disable = std::getenv("TINYLAMB_DISABLE_BYTECODE");
   const std::string prior_value =
       prior_disable == nullptr ? std::string() : std::string(prior_disable);
@@ -155,8 +162,11 @@ TEST(GriffinFuzzer, ReplayCommittedRegressionFiles) {
     GriffinTrace trace;
     ASSERT_TRUE(ParseGriffinTest(text, &trace))
         << "malformed regression file: " << path;
-    EXPECT_EQ(ReplayGriffinTrace(trace, false), "")
+    bool skipped = false;
+    EXPECT_EQ(ReplayGriffinTrace(trace, false, &skipped), "")
         << "regression " << path << " still reproduces";
+    EXPECT_FALSE(skipped)
+        << "regression " << path << " replay skipped (DB could not open)";
   }
 }
 
@@ -182,7 +192,11 @@ TEST(GriffinFuzzer,
     GriffinTrace trace;
     trace.seed = seed;
     EXPECT_EQ(RunGriffinIteration(rng, false, &trace), "") << "seed=" << seed;
-    EXPECT_EQ(ReplayGriffinTrace(trace, false), "") << "seed=" << seed;
+    bool skipped = false;
+    EXPECT_EQ(ReplayGriffinTrace(trace, false, &skipped), "")
+        << "seed=" << seed;
+    EXPECT_FALSE(skipped) << "seed=" << seed
+                          << ": replay skipped (DB could not open)";
   }
 }
 

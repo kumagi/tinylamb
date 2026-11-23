@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -99,20 +100,33 @@ std::optional<std::vector<EngineRow>> RunQuery(Database& db,
   }
   std::vector<EngineRow> rows;
   Row row;
-  while (result.Value().Next(&row)) {
-    EngineRow er;
-    for (size_t i = 0; i < row.values_.size(); ++i) {
-      er.cells.push_back(row[i]);
+  // Next()/Drain() can still escape an exception through the transitional
+  // EXC-SHIM boundary. These queries are always valid, so an exception is a
+  // finding: record it as an error for the caller instead of letting the
+  // libFuzzer process terminate before the mismatch is reported (cf. the
+  // equivalent guard in griffin_fuzzer.cpp).
+  try {
+    while (result.Value().Next(&row)) {
+      EngineRow er;
+      for (size_t i = 0; i < row.values_.size(); ++i) {
+        er.cells.push_back(row[i]);
+      }
+      rows.push_back(std::move(er));
     }
-    rows.push_back(std::move(er));
-  }
-  // QueryResult is lazy: a mid-stream error truncates the result, which is
-  // an engine bug for these always-valid generated queries — mark it so the
-  // caller reports rather than skipping.
-  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
-    *error = "stream-error: " + (st.GetMessage().empty()
-                                     ? std::string(ToString(st.GetCode()))
-                                     : std::string(st.GetMessage()));
+    // QueryResult is lazy: a mid-stream error truncates the result, which is
+    // an engine bug for these always-valid generated queries — mark it so
+    // the caller reports rather than skipping.
+    if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+      *error = "stream-error: " + (st.GetMessage().empty()
+                                       ? std::string(ToString(st.GetCode()))
+                                       : std::string(st.GetMessage()));
+      return std::nullopt;
+    }
+  } catch (const std::exception& e) {
+    *error = "stream exception: " + std::string(e.what());
+    return std::nullopt;
+  } catch (...) {
+    *error = "stream exception: unknown";
     return std::nullopt;
   }
   return rows;
@@ -190,7 +204,15 @@ static std::string RunJoinSetup(SqlEngine& engine, TransactionContext& ctx,
       return "[JOIN FUZZ SETUP ERROR] " + sql + ": " +
              result.GetStatus().GetMessage();
     }
-    result.Value().Drain();
+    try {
+      result.Value().Drain();
+    } catch (const std::exception& e) {
+      return "[JOIN FUZZ SETUP ERROR] " + sql +
+             ": stream exception: " + std::string(e.what());
+    } catch (...) {
+      return "[JOIN FUZZ SETUP ERROR] " + sql +
+             ": stream exception: unknown";
+    }
     if (result.Value().GetStatus() != Status::kSuccess) {
       return "[JOIN FUZZ SETUP ERROR] " + sql + ": " +
              result.Value().GetStatus().GetMessage();
@@ -275,7 +297,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
   const std::string setup_error = RunJoinSetup(engine, ctx, t.setup);
-  if (!setup_error.empty()) return setup_error;
+  if (!setup_error.empty()) { return setup_error;
+}
   ctx = db.BeginContext();
 
   const int query_count = large ? g.Pick(1, 2) : g.Pick(2, 5);
@@ -942,7 +965,10 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         break;
       }
     }
-    std::sort(expected.begin(), expected.end());
+    const bool ordered = sql.find(" ORDER BY ") != std::string::npos;
+    if (!ordered) {
+      std::sort(expected.begin(), expected.end());
+    }
 
     std::string error;
     auto got = RunQuery(db, ctx, sql, &error);
@@ -978,7 +1004,9 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
       actual.push_back(row);
     }
-    std::sort(actual.begin(), actual.end());
+    if (!ordered) {
+      std::sort(actual.begin(), actual.end());
+    }
     t.queries.push_back({sql, expected});
     if (actual == expected) {
       continue;
@@ -1385,7 +1413,14 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       return "[JOIN-INDEXED SETUP FAILED] ANALYZE failed: " +
              std::string(analyze.GetStatus().GetMessage()) + "\n";
     }
-    analyze.Value().Drain();
+    try {
+      analyze.Value().Drain();
+    } catch (const std::exception& e) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream exception: " +
+             std::string(e.what()) + "\n";
+    } catch (...) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream exception\n";
+    }
     if (analyze.Value().GetStatus() != Status::kSuccess) {
       return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream failed: " +
              std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
@@ -1432,9 +1467,12 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         }
         actual.push_back(row);
       }
-      std::sort(actual.begin(), actual.end());
+      const bool ordered = qe.sql.find(" ORDER BY ") != std::string::npos;
       std::vector<std::string> expected = qe.expected;
-      std::sort(expected.begin(), expected.end());
+      if (!ordered) {
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+      }
       if (actual != expected) {
         if (prev_route != nullptr) {
           platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
@@ -1472,13 +1510,18 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
   }
   ScopedDb db_owner("sql_join_replay");
   if (!db_owner) {
-    return "";  // resource pressure: replay skipped, not a mismatch
+    // No query ran. Regression replay treats "" as "bug fixed", so returning
+    // an empty report here made a quota-pressure skip a false green; surface
+    // the skip as a diagnostic instead (generation uses its own ScopedDb and
+    // is unaffected).
+    return "replay skipped: could not create database (resource pressure)";
   }
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
   const std::string setup_error = RunJoinSetup(engine, ctx, trace.setup);
-  if (!setup_error.empty()) return setup_error;
+  if (!setup_error.empty()) { return setup_error;
+}
   ctx = db.BeginContext();
   auto check_queries = [&](bool force_relational,
                            const char* tag) -> std::string {
@@ -1497,9 +1540,14 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
         }
         actual.push_back(row);
       }
-      std::sort(actual.begin(), actual.end());
+      const bool ordered = q.sql.find(" ORDER BY ") != std::string::npos;
+      if (!ordered) {
+        std::sort(actual.begin(), actual.end());
+      }
       std::vector<std::string> expected = q.expected;
-      std::sort(expected.begin(), expected.end());
+      if (!ordered) {
+        std::sort(expected.begin(), expected.end());
+      }
       if (actual != expected) {
         std::string report = std::string(tag) + " " + q.sql + "\n";
         report.reserve(report.size() + expected.size() + actual.size());
@@ -1523,11 +1571,16 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
       !rep.empty()) {
     return rep;
   }
-  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
-  if (trace.setup.size() > 4) {
-    ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  if (!ApplyIndexSpec(db, ctx,
+                      "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);") ||
+      (trace.setup.size() > 4 &&
+       !ApplyIndexSpec(db, ctx,
+                       "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
+      !ApplyIndexSpec(db, ctx,
+                      "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);")) {
+    return std::string(
+        "[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");
   }
-  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     // Statistics collection is part of the indexed-mode setup: a silent
     // failure would run the "indexed" verification with no statistics and
@@ -1537,7 +1590,14 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
       return "[JOIN-INDEXED SETUP FAILED] ANALYZE failed: " +
              std::string(analyze.GetStatus().GetMessage()) + "\n";
     }
-    analyze.Value().Drain();
+    try {
+      analyze.Value().Drain();
+    } catch (const std::exception& e) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream exception: " +
+             std::string(e.what()) + "\n";
+    } catch (...) {
+      return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream exception\n";
+    }
     if (analyze.Value().GetStatus() != Status::kSuccess) {
       return "[JOIN-INDEXED SETUP FAILED] ANALYZE stream failed: " +
              std::string(analyze.Value().GetStatus().GetMessage()) + "\n";
@@ -1649,7 +1709,7 @@ bool ParseJoinTest(std::string_view text, uint64_t* seed, JoinTrace* trace,
       return false;
     }
   }
-  return saw_header && !trace->setup.empty();
+  return saw_header && !trace->setup.empty() && !trace->queries.empty();
 }
 
 void JoinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
@@ -1676,7 +1736,8 @@ void JoinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   } else {
     verify = ReplayJoinTrace(parsed, false);
     if (verify.empty()) {
-      verify = "internal error: serialized join replay holds (flaky)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized join replay holds (flaky)");
     }
   }
   const std::string path =

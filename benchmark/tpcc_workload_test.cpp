@@ -174,8 +174,8 @@ TEST(TpccScaleTest, NurandCLastDelta) {
     const TpccNurand nurand = TpccNurand::FromSeed(seed);
     ASSERT_TRUE(nurand.valid);
     const int delta = std::abs(nurand.c_last_load - nurand.c_last_run);
-    EXPECT_GE(delta, 65) << (seed != 0U);
-    EXPECT_LE(delta, 119) << (seed != 0U);
+    EXPECT_GE(delta, 65) << "seed=" << seed;
+    EXPECT_LE(delta, 119) << "seed=" << seed;
     EXPECT_NE(delta, 96) << (seed != 0U);
     EXPECT_NE(delta, 112) << (seed != 0U);
     EXPECT_GE(nurand.c_last_load, 0);

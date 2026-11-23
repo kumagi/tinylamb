@@ -82,11 +82,17 @@ size_t DistinctRowHash::operator()(const Row& row) const {
 
 size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
+  if (!ok()) {
+    return 0;
+  }
   while (destination->Size() < max_rows) {
     if (input_offset_ >= input_batch_.Size()) {
       input_offset_ = 0;
       if (source_->NextBatch(&input_batch_) == 0) {
-        FailWithChildOf(*source_);
+        if (FailWithChildOf(*source_)) {
+          destination->Reset();
+          return 0;
+        }
         break;
       }
     }
@@ -107,7 +113,8 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
           StatusOr<Value> key = expr->TryEvaluate(row, schema_);
           if (!key.HasValue()) {
             FailWith(key.GetStatus());
-            return 0;  // do not emit a partial DISTINCT ON batch on error
+            destination->Reset();
+            return 0;
           }
           current_keys.values_.push_back(key.MoveValue());
         }
@@ -120,7 +127,8 @@ size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
           if (static_cast<size_t>(c) >= row.Count()) {
             FailWith(StatusError(StatusCode::kInvalidArgument,
                                  "DISTINCT key column out of range"));
-            return 0;  // do not emit a partial DISTINCT batch on error
+            destination->Reset();
+            return 0;
           }
           current_keys.values_.push_back(row[static_cast<size_t>(c)]);
         }
@@ -149,6 +157,9 @@ void DistinctExecutor::Dump(std::ostream& output, int indent) const {
 
 size_t SortDistinctExecutor::NextBatch(DataChunk* destination,
                                        size_t max_rows) {
+  if (!ok()) {
+    return 0;
+  }
   destination->Reset();
   while (destination->Size() < max_rows) {
     if (input_offset_ >= input_batch_.Size()) {

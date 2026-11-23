@@ -55,9 +55,15 @@ TEST(ExpressionFuzzerReplayTest, OutOfBandInputsAreSkipped) {
   // Same contract as the libFuzzer entry: too-small / too-large inputs are
   // ignored, they never count as violations.
   const std::vector<uint8_t> tiny = {1, 2, 3};
-  EXPECT_TRUE(ExpressionFuzzRun(tiny.data(), tiny.size()).ok);
+  const ExpressionFuzzResult tiny_result =
+      ExpressionFuzzRun(tiny.data(), tiny.size());
+  EXPECT_TRUE(tiny_result.ok);
+  EXPECT_TRUE(tiny_result.ignored);
   const std::vector<uint8_t> huge(5000, 0);
-  EXPECT_TRUE(ExpressionFuzzRun(huge.data(), huge.size()).ok);
+  const ExpressionFuzzResult huge_result =
+      ExpressionFuzzRun(huge.data(), huge.size());
+  EXPECT_TRUE(huge_result.ok);
+  EXPECT_TRUE(huge_result.ignored);
 }
 
 TEST(ExpressionFuzzerReplayTest, ReplayCommittedRegressionFiles) {

@@ -216,7 +216,7 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
   std::vector<BytecodeColumnView> views;
   std::vector<relational_detail::ColumnarColumn> view_scratches;
   std::vector<Value> cand_keys(n_keys);
-  Value cand0;
+  std::vector<SortKeyOrder> observed(order_specs.begin(), order_specs.end());
   size_t seq = 0;
 
   for (size_t ci = 0; ci < src_table.chunks.size(); ++ci) {
@@ -279,12 +279,11 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
     };
 
     for (size_t r = 0; r < ch.rows; ++r, ++seq) {
-      read_key_val(0, r, &cand0);
+      for (size_t k = 0; k < n_keys; ++k) {
+        read_key_val(k, r, &cand_keys[k]);
+      }
+      RETURN_IF_FAIL(ObserveSortKeys(observed, cand_keys));
       if (heap.size() < capacity) {
-        cand_keys[0] = cand0;
-        for (size_t k = 1; k < n_keys; ++k) {
-          read_key_val(k, r, &cand_keys[k]);
-        }
         heap.push_back(ColTopNEntry{.chunk_idx = static_cast<uint32_t>(ci),
                                     .row_idx = static_cast<uint32_t>(r),
                                     .seq = seq,
@@ -292,16 +291,12 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
         intern_entry_strings(&heap.back());
         std::push_heap(heap.begin(), heap.end(), heap_before);
       } else {
-        const int cmp0 = order_specs[0].Compare(cand0, heap.front().keys[0]);
+        const int cmp0 = order_specs[0].Compare(cand_keys[0], heap.front().keys[0]);
         if (cmp0 > 0) {
           continue;
         }
-        cand_keys[0] = cand0;
         bool enter = cmp0 < 0;
         if (cmp0 == 0) {
-          for (size_t k = 1; k < n_keys; ++k) {
-            read_key_val(k, r, &cand_keys[k]);
-          }
           for (size_t k = 1; k < n_keys; ++k) {
             const int cmp =
                 order_specs[k].Compare(cand_keys[k], heap.front().keys[k]);
@@ -312,10 +307,6 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
           }
           if (!enter) {
             continue;
-          }
-        } else {
-          for (size_t k = 1; k < n_keys; ++k) {
-            read_key_val(k, r, &cand_keys[k]);
           }
         }
         std::pop_heap(heap.begin(), heap.end(), heap_before);
@@ -433,14 +424,21 @@ Row EncodeKeyedRunRow(KeyedRow&& keyed) {
   return Row(std::move(combined));
 }
 
-KeyedRow DecodeKeyedRunRow(Row&& encoded, size_t key_count) {
+StatusOr<KeyedRow> DecodeKeyedRunRow(Row&& encoded, size_t key_count) {
+  if (key_count >= encoded.values_.size()) {
+    return StatusError(StatusCode::kCorrupt, "missing spilled sort sequence");
+  }
+  const Value& sequence = encoded.values_[key_count];
+  if (sequence.type != ValueType::kInt64 || sequence.IsUnsigned() ||
+      sequence.value.int_value < 0) {
+    return StatusError(StatusCode::kCorrupt, "invalid spilled sort sequence");
+  }
   KeyedRow keyed;
   keyed.keys.reserve(key_count);
   for (size_t i = 0; i < key_count; ++i) {
     keyed.keys.push_back(std::move(encoded.values_[i]));
   }
-  keyed.sequence =
-      static_cast<size_t>(encoded.values_[key_count].value.int_value);
+  keyed.sequence = static_cast<size_t>(sequence.value.int_value);
   std::vector<Value> payload;
   payload.reserve(encoded.values_.size() - key_count - 1);
   for (size_t i = key_count + 1; i < encoded.values_.size(); ++i) {
@@ -509,25 +507,21 @@ StatusOr<Relation> DistinctOf(Relation input,
   return distinct;
 }
 
-// Sorts `output` in place by the statement's ORDER BY terms. Key values are
-// evaluated once per row (not per comparison). All rows are copied out before
-// refilling so a previously spilled output is never appended to after its
-// spill files were finished.
-Status ApplyOrderBy(TransactionContext& context,
-                    const SelectStatement& statement, Relation* output,
-                    const Scope* outer, const CteMap& ctes,
-                    bool allow_bounded) {
-  const auto sort_begin = std::chrono::steady_clock::now();
+struct ResolvedOrderByKeys {
+  std::vector<Expression> key_expressions;
+  std::vector<std::optional<slot_t>> ordinal_columns;
+  std::vector<SortKeyOrder> order_specs;
+  std::vector<std::optional<slot_t>> direct_key_cols;
+  bool all_direct_keys{false};
+};
+
+static StatusOr<ResolvedOrderByKeys> ResolveOrderByKeys(
+    const SelectStatement& statement, const Schema& schema) {
   const std::vector<SelectStatement::OrderByTerm>& order_by =
       statement.OrderBy();
-  // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.  The
-  // AST visitor defers it when the select list still contained an unexpanded
-  // star; the output schema here already carries the expanded columns, so
-  // the ordinal binds to that output column.
-  std::vector<Expression> key_expressions;
-  key_expressions.reserve(order_by.size());
-  std::vector<std::optional<slot_t>> ordinal_columns;
-  ordinal_columns.reserve(order_by.size());
+  ResolvedOrderByKeys resolved;
+  resolved.key_expressions.reserve(order_by.size());
+  resolved.ordinal_columns.reserve(order_by.size());
   for (const auto& key : order_by) {
     Expression expression = key.expression;
     std::optional<slot_t> ordinal_column;
@@ -538,7 +532,7 @@ Status ApplyOrderBy(TransactionContext& context,
       // values here instead of falling through to the constant-key path,
       // which would silently sort by a constant instead of erroring.
       if (collated->ordinal < 1 ||
-          std::cmp_greater(collated->ordinal, output->schema.ColumnCount())) {
+          std::cmp_greater(collated->ordinal, schema.ColumnCount())) {
         return StatusError(StatusCode::kInvalidArgument,
                            "ORDER BY ordinal out of range");
       }
@@ -553,43 +547,197 @@ Status ApplyOrderBy(TransactionContext& context,
         // path rejects both with the same error).
         if (ordinal_value.value.int_value < 1 ||
             std::cmp_greater(ordinal_value.value.int_value,
-                             output->schema.ColumnCount())) {
+                             schema.ColumnCount())) {
           return StatusError(StatusCode::kInvalidArgument,
                              "ORDER BY ordinal out of range");
         }
         ordinal_column = static_cast<slot_t>(ordinal_value.value.int_value - 1);
       }
     }
-    ordinal_columns.push_back(ordinal_column);
-    key_expressions.push_back(std::move(expression));
+    resolved.ordinal_columns.push_back(ordinal_column);
+    resolved.key_expressions.push_back(std::move(expression));
   }
-  RETURN_IF_FAIL(output->FinishSpill());
-  std::vector<SortKeyOrder> order_specs;
-  order_specs.reserve(order_by.size());
+  resolved.order_specs.reserve(order_by.size());
   for (const SelectStatement::OrderByTerm& term : order_by) {
-    order_specs.emplace_back(term.ascending, term.nulls_first,
-                             CollationOfExpression(term.expression));
+    resolved.order_specs.emplace_back(term.ascending, term.nulls_first,
+                                      CollationOfExpression(term.expression));
   }
-  std::vector<std::optional<slot_t>> direct_key_cols;
-  direct_key_cols.reserve(key_expressions.size());
-  bool all_direct_keys = !key_expressions.empty();
-  for (size_t i = 0; i < key_expressions.size(); ++i) {
-    const Expression& key = key_expressions[i];
-    if (ordinal_columns[i]) {
-      direct_key_cols.push_back(ordinal_columns[i]);
+  resolved.direct_key_cols.reserve(resolved.key_expressions.size());
+  resolved.all_direct_keys = !resolved.key_expressions.empty();
+  for (size_t i = 0; i < resolved.key_expressions.size(); ++i) {
+    const Expression& key = resolved.key_expressions[i];
+    if (resolved.ordinal_columns[i]) {
+      resolved.direct_key_cols.push_back(resolved.ordinal_columns[i]);
     } else if (key && key->Type() == TypeTag::kColumnValue) {
-      const auto col_off = LocalColumnOffset(
-          output->schema, key->AsColumnValue().GetColumnName());
-      direct_key_cols.push_back(
+      const auto col_off =
+          LocalColumnOffset(schema, key->AsColumnValue().GetColumnName());
+      resolved.direct_key_cols.push_back(
           col_off.has_value() ? std::optional<slot_t>(*col_off) : std::nullopt);
       if (!col_off.has_value()) {
-        all_direct_keys = false;
+        resolved.all_direct_keys = false;
       }
     } else {
-      direct_key_cols.emplace_back(std::nullopt);
-      all_direct_keys = false;
+      resolved.direct_key_cols.emplace_back(std::nullopt);
+      resolved.all_direct_keys = false;
     }
   }
+  return resolved;
+}
+
+StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
+                                 const SelectStatement& statement,
+                                 Relation* output, const Scope* outer,
+                                 const CteMap& ctes) {
+  const char* disable_env = std::getenv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
+  if (disable_env != nullptr && disable_env[0] == '1') {
+    return false;
+  }
+  if (output == nullptr || statement.OrderBy().empty() ||
+      statement.DistinctOn().empty()) {
+    return false;
+  }
+  RETURN_IF_FAIL(output->FinishSpill());
+  if (output->HasSpill()) {
+    return false;
+  }
+  if (output->HasColumnarOnly()) {
+    if (!QueryMemoryBudget::Global().CanReserve(output->TotalRows() * 160)) {
+      return false;
+    }
+    RETURN_IF_FAIL(output->EnsureRowsMaterializedChecked());
+  }
+  if (output->HasSpill() || output->HasColumnarOnly()) {
+    return false;
+  }
+
+  // Lean proof: lean/TinylambOpt/ProposedProofs/DistinctOnTop1.lean (sound)
+  const auto sort_begin = std::chrono::steady_clock::now();
+  ASSIGN_OR_RETURN(ResolvedOrderByKeys, resolved,
+                   (ResolveOrderByKeys(statement, output->schema)));
+  const size_t n = output->rows.size();
+  if (n == 0) {
+    return true;
+  }
+
+  const std::vector<Expression>& distinct_on = statement.DistinctOn();
+  std::vector<std::optional<slot_t>> distinct_direct_cols;
+  distinct_direct_cols.reserve(distinct_on.size());
+  for (const Expression& expr : distinct_on) {
+    if (expr && expr->Type() == TypeTag::kColumnValue) {
+      distinct_direct_cols.emplace_back(LocalColumnOffset(
+          output->schema, expr->AsColumnValue().GetColumnName()));
+    } else {
+      distinct_direct_cols.emplace_back(std::nullopt);
+    }
+  }
+
+  struct Winner {
+    std::vector<Value> order_keys;
+    size_t row_idx{0};
+  };
+  std::unordered_map<Row, Winner, WorkTableRowHash, WorkTableRowEqual> winners;
+  winners.reserve(std::min<size_t>(n, 4096));
+
+  std::vector<Value> cur_order_keys(resolved.key_expressions.size());
+  std::vector<Value> cur_distinct_keys;
+  for (size_t ri = 0; ri < n; ++ri) {
+    const Row& row = output->rows[ri];
+    Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
+    for (size_t k = 0; k < resolved.key_expressions.size(); ++k) {
+      if (resolved.direct_key_cols[k].has_value()) {
+        cur_order_keys[k] = row[*resolved.direct_key_cols[k]];
+      } else {
+        ASSIGN_OR_RETURN(Value, kv,
+                         (TryEvaluate(resolved.key_expressions[k], scope,
+                                      nullptr, context, ctes)));
+        cur_order_keys[k] = std::move(kv);
+      }
+    }
+    RETURN_IF_FAIL(ObserveSortKeys(resolved.order_specs, cur_order_keys));
+    cur_distinct_keys.clear();
+    cur_distinct_keys.reserve(distinct_on.size());
+    for (size_t k = 0; k < distinct_on.size(); ++k) {
+      if (distinct_direct_cols[k].has_value()) {
+        cur_distinct_keys.push_back(
+            CanonicalDistinctValue(row[*distinct_direct_cols[k]]));
+      } else {
+        ASSIGN_OR_RETURN(
+            Value, dv,
+            (TryEvaluate(distinct_on[k], scope, nullptr, context, ctes)));
+        cur_distinct_keys.push_back(CanonicalDistinctValue(dv));
+      }
+    }
+    Row dkey(std::move(cur_distinct_keys));
+    auto it = winners.find(dkey);
+    if (it == winners.end()) {
+      winners.emplace(std::move(dkey),
+                      Winner{.order_keys = cur_order_keys, .row_idx = ri});
+    } else {
+      int cmp = 0;
+      for (size_t k = 0; k < resolved.order_specs.size(); ++k) {
+        cmp = resolved.order_specs[k].Compare(cur_order_keys[k],
+                                              it->second.order_keys[k]);
+        if (cmp != 0) {
+          break;
+        }
+      }
+      if (cmp < 0) {
+        it->second.order_keys = cur_order_keys;
+        it->second.row_idx = ri;
+      }
+    }
+  }
+
+  std::vector<Winner> ordered_winners;
+  ordered_winners.reserve(winners.size());
+  for (auto& [k, w] : winners) {
+    (void)k;
+    ordered_winners.push_back(std::move(w));
+  }
+  winners.clear();
+  std::ranges::sort(ordered_winners, [&](const Winner& a, const Winner& b) {
+    for (size_t k = 0; k < resolved.order_specs.size(); ++k) {
+      const int cmp =
+          resolved.order_specs[k].Compare(a.order_keys[k], b.order_keys[k]);
+      if (cmp != 0) {
+        return cmp < 0;
+      }
+    }
+    return a.row_idx < b.row_idx;
+  });
+
+  std::vector<Row> old_rows = std::move(output->rows);
+  output->ResetContents();
+  output->rows.reserve(ordered_winners.size());
+  for (const Winner& w : ordered_winners) {
+    output->AddRow(std::move(old_rows[w.row_idx]));
+  }
+  RETURN_IF_FAIL(output->FinishSpill());
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->sort_ms += ElapsedMs(sort_begin);
+  }
+  return true;
+}
+
+// Sorts `output` in place by the statement's ORDER BY terms. Key values are
+// evaluated once per row (not per comparison). All rows are copied out before
+// refilling so a previously spilled output is never appended to after its
+// spill files were finished.
+Status ApplyOrderBy(TransactionContext& context,
+                    const SelectStatement& statement, Relation* output,
+                    const Scope* outer, const CteMap& ctes,
+                    bool allow_bounded) {
+  const auto sort_begin = std::chrono::steady_clock::now();
+  const std::vector<SelectStatement::OrderByTerm>& order_by =
+      statement.OrderBy();
+  ASSIGN_OR_RETURN(ResolvedOrderByKeys, resolved,
+                   (ResolveOrderByKeys(statement, output->schema)));
+  std::vector<Expression>& key_expressions = resolved.key_expressions;
+  std::vector<SortKeyOrder>& order_specs = resolved.order_specs;
+  std::vector<std::optional<slot_t>>& direct_key_cols =
+      resolved.direct_key_cols;
+  const bool all_direct_keys = resolved.all_direct_keys;
+  RETURN_IF_FAIL(output->FinishSpill());
   bool col_bounded = false;
   size_t raw_keep = 0;
   if (allow_bounded && statement.HasLimit() && !statement.WithTies() &&
@@ -695,6 +843,7 @@ Status ApplyOrderBy(TransactionContext& context,
             (TryEvaluate(key_expressions[k], scope, nullptr, context, ctes)));
         cur_keys[k] = std::move(kv);
       }
+      RETURN_IF_FAIL(ObserveSortKeys(order_specs, cur_keys));
       if (winner_indices.empty()) {
         best_keys = cur_keys;
         winner_indices.push_back(ri);
@@ -742,6 +891,12 @@ Status ApplyOrderBy(TransactionContext& context,
       context.execution_runtime()->topn_finish_input_rows = n;
     }
     const std::vector<Row>& rows_ref = output->rows;
+    for (size_t k = 0; k < order_specs.size(); ++k) {
+      const size_t col = *direct_key_cols[k];
+      for (const Row& row : rows_ref) {
+        RETURN_IF_FAIL(order_specs[k].Observe(row[col]));
+      }
+    }
     if (n >= 256 && !order_specs.empty()) {
       struct SortEntry {
         uint64_t k0;
@@ -1051,13 +1206,13 @@ Status ApplyOrderBy(TransactionContext& context,
         keys.push_back(row[*direct_key_cols[k]]);
         continue;
       }
-      StatusOr<Value> hv33968_0 =
+      StatusOr<Value> key_value =
           TryEvaluate(key_expressions[k], scope, nullptr, context, ctes);
-      if (!hv33968_0.HasValue()) {
-        sort_error = hv33968_0.GetStatus();
+      if (!key_value.HasValue()) {
+        sort_error = key_value.GetStatus();
         return;
       }
-      keys.push_back(hv33968_0.MoveValue());
+      keys.push_back(key_value.MoveValue());
     }
     Status st_add = sorter.Add(KeyedRow{.keys = std::move(keys), .row = row});
     if (st_add != Status::kSuccess) {

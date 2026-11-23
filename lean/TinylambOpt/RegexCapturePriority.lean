@@ -247,4 +247,33 @@ theorem greedy_backtracks_before_final_literal :
     ((compiledSearch (.seq .greedyAny (.byte 98)) [97, 98]).map Outcome.pos) = some 2 := by
   decide
 
+/-- Return the starting offset as well as the end and capture. Only the
+    first successful starting position is selected. -/
+def searchSpan (r : Re) (s : List UInt8) : Option (Nat × Outcome) :=
+  let run := fun p => execK (compile r) some s p
+  ((List.range (s.length+1)).find? fun i => (run i).isSome).bind
+    fun p => (run p).map (fun out => (p,out))
+
+theorem searchSpan_iff (r : Re) (s : List UInt8) (p : Nat) (o : Outcome) :
+    searchSpan r s = some (p,o) ↔ p ≤ s.length ∧ searchK r some s p = some o ∧
+      ∀ i < p, searchK r some s i = none := by
+  unfold searchSpan
+  simp only [← compiled_matches_reference]
+  change ((List.range (s.length+1)).find? (fun i => (searchK r some s i).isSome)).bind
+    (fun q => (searchK r some s q).map (fun out => (q,out))) = some (p,o) ↔ _
+  constructor
+  · intro h
+    cases he : (List.range (s.length+1)).find? (fun i => (searchK r some s i).isSome) with
+    | none => simp [he] at h
+    | some q =>
+      obtain ⟨hq,hbound,hmin⟩ := List.find?_range_eq_some.mp he
+      obtain ⟨out,hrun⟩ := Option.isSome_iff_exists.mp hq
+      simp [he,hrun] at h
+      obtain ⟨rfl,rfl⟩ := h
+      exact ⟨by have := List.mem_range.mp hbound; omega, hrun, fun i hi => by simpa using hmin i hi⟩
+  · rintro ⟨hp,ho,hm⟩
+    have he : (List.range (s.length+1)).find? (fun i => (searchK r some s i).isSome) = some p :=
+      List.find?_range_eq_some.mpr ⟨by simp [ho],List.mem_range.mpr (by omega),fun i hi => by simp [hm i hi]⟩
+    simp [he,ho]
+
 end TinylambOpt.RegexCapturePriority

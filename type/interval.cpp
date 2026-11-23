@@ -388,6 +388,11 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
     }
     while (pos < s.size()) {
       if (s[pos] == 'T' || s[pos] == 't') {
+        // ISO 8601 has a single date/time separator.  A second 'T' (e.g.
+        // "P1T2T3H") used to silently switch back into the time section.
+        if (in_time) {
+          return fail("'" + s + "': duplicate 'T' in ISO 8601 interval");
+        }
         in_time = true;
         ++pos;
         continue;
@@ -658,7 +663,11 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           // The nanoseconds product must stay representable: "nan"/"inf"
           // spellings and huge magnitudes would turn the cast below into
           // undefined behavior (UBSan-found via INTERVAL fuzzing).
-          if (!std::isfinite(ts) || ts > 9.2e9 || ts < -9.2e9) {
+          // 9.2e9 seconds is stricter than int64 nanoseconds allow
+          // (2^63 / 1e9 = 9223372036.85s); use the same int64-bound constants
+          // as the other time paths and let checked_mul reject real overflow.
+          if (!std::isfinite(ts) || ts < kInt64MinAsDouble ||
+              ts >= kInt64MaxExclusive) {
             ok = false;
             break;
           }
@@ -746,12 +755,17 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
   // or MINUTE TO SECOND (4->5).  A bare composite literal also permits it.
   // "HOUR TO SECOND" still owes its seconds field.
   bool allow_two_field_time = u.empty();
-  const bool minute_to_second = u == "minute to second";
+  // Derive the M:S spelling from the resolved range indices, not from an
+  // exact string match: RangeUnitIndex accepts plural unit names ("MINUTES
+  // TO SECONDS"), and a string compare here made those parse as H:M
+  // (1:2 -> 3720s) instead of 1m2s (62s).
+  bool minute_to_second = false;
   if (!allow_two_field_time) {
     if (const size_t sp = u.find(" to "); sp != std::string::npos) {
       const int lo = RangeUnitIndex(u.substr(0, sp));
       const int hi = RangeUnitIndex(u.substr(sp + 4));
       allow_two_field_time = (hi - lo == 1) && (lo >= 3) && (hi <= 5);
+      minute_to_second = (lo == 4 && hi == 5);
     }
   }
   for (size_t idx = 0; idx < parts.size(); ++idx) {

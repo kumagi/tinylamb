@@ -54,9 +54,12 @@ class UpdatePreimageCache {
   UpdatePreimageCache& operator=(UpdatePreimageCache&&) = delete;
   ~UpdatePreimageCache() = default;
 
-  // Returns a pointer to the before-image at `pos`.  The pointee lives in
-  // the cache (or in `scratch` for an over-budget miss) and stays valid for
-  // the rest of the statement.
+  // Returns a pointer to the before-image at `pos`.  A cache hit points into
+  // entries_ and stays valid until Take() erases it.  On an over-budget miss
+  // the pointee is the caller-owned `scratch`, so its lifetime is the caller's
+  // scope (a callback-local Row must not be passed here); the apply loop never
+  // relies on that case because Take() misses make Table::Update re-read the
+  // before-image itself.
   StatusOr<const Row*> Get(const Table& target, Transaction& txn,
                            const RowPosition& pos, Row* scratch) {
     const auto found = entries_.find(pos);
@@ -113,7 +116,14 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
         }
       }
       const RowPosition position = batch.PositionAt(i);
-      assert(position.IsValid());
+      // assert() disappears under NDEBUG; report an invalid source position
+      // through Status so a malformed batch cannot feed a bogus row id into
+      // the pending update list.
+      if (!position.IsValid()) {
+        return FailWith(StatusError(
+            StatusCode::kInvalidArgument,
+            "UPDATE source produced an invalid row position"));
+      }
       const Status push_st = pending.PushBack(batch.RowAt(i), position);
       if (push_st != Status::kSuccess) {
         return FailWith(push_st);
@@ -334,6 +344,12 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
         // A non-unique referenced column can have untouched rows for the
         // same key. A snapshot occurrence beyond the number being changed
         // proves the key still exists after the update.
+        if (!vacated_keys.empty() &&
+            check.parent_offset >= target_->GetSchema().ColumnCount()) {
+          return FailWith(StatusError(
+              StatusCode::kCorrupt,
+              "referenced key offset exceeds target schema width"));
+        }
         if (!vacated_keys.empty() && !target_->GetSchema()
                                           .GetColumn(check.parent_offset)
                                           .GetConstraint()
@@ -503,7 +519,6 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
   if (assert_rows_modified_ >= 0 && update_count != assert_rows_modified_) {
     return FailWith(
         StatusError(StatusCode::kInvalidArgument,
-
                     "ASSERT_ROWS_MODIFIED was specified with " +
                         std::to_string(assert_rows_modified_) + " rows, but " +
                         std::to_string(update_count) + " rows were modified"));

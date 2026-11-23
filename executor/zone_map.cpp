@@ -3,11 +3,20 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <string>
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/in_expression.hpp"
+#include "expression/unary_expression.hpp"
+#include "table/lstable_bridge.hpp"
 #include "type/collation.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -345,6 +354,411 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
     default:
       return true;
   }
+}
+
+namespace {
+
+enum class Val4 : uint8_t { kT = 0, kF = 1, kU = 2, kE = 3 };
+
+KleeneMask BitFor(Val4 v) noexcept {
+  return static_cast<KleeneMask>(uint8_t{1} << static_cast<uint8_t>(v));
+}
+
+KleeneMask KleeneNot(KleeneMask m) noexcept {
+  KleeneMask out = kKleeneNone;
+  if ((m & kKleeneT) != 0) { out |= kKleeneF;
+}
+  if ((m & kKleeneF) != 0) { out |= kKleeneT;
+}
+  if ((m & kKleeneU) != 0) { out |= kKleeneU;
+}
+  if ((m & kKleeneE) != 0) { out |= kKleeneE;
+}
+  return out;
+}
+
+KleeneMask KleeneAnd(KleeneMask a, KleeneMask b) noexcept {
+  // Exact 4-valued lift from `lean/TinylambOpt/BlockKleene.lean` (`val4_and`,
+  // strict error propagation).
+  if ((a & kKleeneE) != 0 || (b & kKleeneE) != 0) {
+    // If one side is definitely empty (0), result is 0; if any pair can hit E,
+    // propagate E cleanly alongside other reachable non-error values.
+    if (a == 0 || b == 0) {
+      return 0;
+    }
+  }
+  KleeneMask out = kKleeneNone;
+  const Val4 vals[4] = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
+  for (Val4 va : vals) {
+    if ((a & BitFor(va)) == 0) { continue;
+}
+    for (Val4 vb : vals) {
+      if ((b & BitFor(vb)) == 0) { continue;
+}
+      if (va == Val4::kE || vb == Val4::kE) {
+        out |= kKleeneE;
+      } else if (va == Val4::kF || vb == Val4::kF) {
+        out |= kKleeneF;
+      } else if (va == Val4::kU || vb == Val4::kU) {
+        out |= kKleeneU;
+      } else {
+        out |= kKleeneT;
+      }
+    }
+  }
+  return out;
+}
+
+KleeneMask KleeneOr(KleeneMask a, KleeneMask b) noexcept {
+  KleeneMask out = kKleeneNone;
+  const Val4 vals[4] = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
+  for (Val4 va : vals) {
+    if ((a & BitFor(va)) == 0) { continue;
+}
+    for (Val4 vb : vals) {
+      if ((b & BitFor(vb)) == 0) { continue;
+}
+      if (va == Val4::kE || vb == Val4::kE) {
+        out |= kKleeneE;
+      } else if (va == Val4::kT || vb == Val4::kT) {
+        out |= kKleeneT;
+      } else if (va == Val4::kU || vb == Val4::kU) {
+        out |= kKleeneU;
+      } else {
+        out |= kKleeneF;
+      }
+    }
+  }
+  return out;
+}
+
+bool ExprGuaranteedBooleanOrNull(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->Type() == TypeTag::kConstantValue) {
+    const Value& v = expr->AsConstantValue().GetValue();
+    return v.IsNull() || (v.type == ValueType::kInt64 && !v.IsUnsigned() &&
+                          (v.value.int_value == 0 || v.value.int_value == 1));
+  }
+  if (expr->Type() == TypeTag::kUnaryExp) {
+    const auto op = expr->AsUnaryExpression().Op();
+    return op == UnaryOperation::kNot || op == UnaryOperation::kIsNull ||
+           op == UnaryOperation::kIsNotNull || op == UnaryOperation::kIsTrue ||
+           op == UnaryOperation::kIsNotTrue || op == UnaryOperation::kIsFalse ||
+           op == UnaryOperation::kIsNotFalse;
+  }
+  if (expr->Type() == TypeTag::kInExp) {
+    return true;
+  }
+  if (expr->Type() == TypeTag::kBinaryExp) {
+    const auto op = expr->AsBinaryExpression().Op();
+    return op == BinaryOperation::kEquals ||
+           op == BinaryOperation::kNotEquals ||
+           op == BinaryOperation::kLessThan ||
+           op == BinaryOperation::kLessThanEquals ||
+           op == BinaryOperation::kGreaterThan ||
+           op == BinaryOperation::kGreaterThanEquals ||
+           op == BinaryOperation::kIsDistinctFrom ||
+           op == BinaryOperation::kIsNotDistinctFrom ||
+           op == BinaryOperation::kLike || op == BinaryOperation::kNotLike ||
+           op == BinaryOperation::kAnd || op == BinaryOperation::kOr ||
+           op == BinaryOperation::kXor;
+  }
+  (void)schema;
+  return false;
+}
+
+BinaryOperation FlipOp(BinaryOperation op) noexcept {
+  switch (op) {
+    case BinaryOperation::kLessThan:
+      return BinaryOperation::kGreaterThan;
+    case BinaryOperation::kLessThanEquals:
+      return BinaryOperation::kGreaterThanEquals;
+    case BinaryOperation::kGreaterThan:
+      return BinaryOperation::kLessThan;
+    case BinaryOperation::kGreaterThanEquals:
+      return BinaryOperation::kLessThanEquals;
+    default:
+      return op;
+  }
+}
+
+KleeneMask EvalColConstCompare(const LSTableColumnBlock& col,
+                               BinaryOperation op, const Value& cval) noexcept {
+  if (cval.IsNull()) {
+    return kKleeneU;
+  }
+  if (col.type == ValueType::kInt64 || col.type == ValueType::kDate) {
+    if (col.is_unsigned || cval.IsUnsigned() || cval.type != col.type) {
+      return kKleeneAll;
+    }
+    KleeneMask out = col.has_null ? kKleeneU : kKleeneNone;
+    if (!col.has_min_max) {
+      // No non-NULL values contributed bounds. Preserve whether NULL rows
+      // exist; an empty block can have neither bounds nor NULLs.
+      return out;
+    }
+    const int64_t mn = col.min_int;
+    const int64_t mx = col.max_int;
+    const int64_t c = cval.value.int_value;
+    bool may_t = false;
+    bool may_f = false;
+    switch (op) {
+      case BinaryOperation::kEquals:
+        may_t = (mn <= c && c <= mx);
+        may_f = mn != c || mx != c;
+        break;
+      case BinaryOperation::kNotEquals:
+        may_t = mn != c || mx != c;
+        may_f = (mn <= c && c <= mx);
+        break;
+      case BinaryOperation::kLessThan:
+        may_t = (mn < c);
+        may_f = (mx >= c);
+        break;
+      case BinaryOperation::kLessThanEquals:
+        may_t = (mn <= c);
+        may_f = (mx > c);
+        break;
+      case BinaryOperation::kGreaterThan:
+        may_t = (mx > c);
+        may_f = (mn <= c);
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        may_t = (mx >= c);
+        may_f = (mn < c);
+        break;
+      default:
+        return kKleeneAll;
+    }
+    if (may_t) { out |= kKleeneT;
+}
+    if (may_f) { out |= kKleeneF;
+}
+    return out;
+  }
+  if (col.type == ValueType::kDouble) {
+    if (col.has_nan) {
+      return kKleeneAll;
+    }
+    double c = 0.0;
+    if (cval.type == ValueType::kDouble) {
+      c = cval.value.double_value;
+    } else if (cval.type == ValueType::kInt64 && !cval.IsUnsigned() &&
+               cval.value.int_value >= -(int64_t{1} << 53) &&
+               cval.value.int_value <= (int64_t{1} << 53)) {
+      c = static_cast<double>(cval.value.int_value);
+    } else {
+      return kKleeneAll;
+    }
+    if (std::isnan(c)) {
+      // Comparison with NaN is FALSE (or TRUE for !=) on non-NULL doubles, and
+      // NULL on NULLs.
+      KleeneMask out = col.has_null ? kKleeneU : kKleeneNone;
+      if (col.has_double_min_max) {
+        out |= (op == BinaryOperation::kNotEquals) ? kKleeneT : kKleeneF;
+      }
+      return out;
+    }
+    KleeneMask out = col.has_null ? kKleeneU : kKleeneNone;
+    if (!col.has_double_min_max) {
+      return out;
+    }
+    const double mn = col.min_double;
+    const double mx = col.max_double;
+    bool may_t = false;
+    bool may_f = false;
+    switch (op) {
+      case BinaryOperation::kEquals:
+        may_t = (mn <= c && c <= mx);
+        may_f = mn != c || mx != c;
+        break;
+      case BinaryOperation::kNotEquals:
+        may_t = mn != c || mx != c;
+        may_f = (mn <= c && c <= mx);
+        break;
+      case BinaryOperation::kLessThan:
+        may_t = (mn < c);
+        may_f = (mx >= c);
+        break;
+      case BinaryOperation::kLessThanEquals:
+        may_t = (mn <= c);
+        may_f = (mx > c);
+        break;
+      case BinaryOperation::kGreaterThan:
+        may_t = (mx > c);
+        may_f = (mn <= c);
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        may_t = (mx >= c);
+        may_f = (mn < c);
+        break;
+      default:
+        return kKleeneAll;
+    }
+    if (may_t) { out |= kKleeneT;
+}
+    if (may_f) { out |= kKleeneF;
+}
+    return out;
+  }
+  return kKleeneAll;
+}
+
+KleeneMask EvalKleeneImpl(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema, const LSTablePageBlock& blk) {
+  if (!expr || blk.row_count == 0) {
+    return blk.row_count == 0 ? kKleeneNone : kKleeneAll;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kConstantValue: {
+      const Value& v = expr->AsConstantValue().GetValue();
+      if (v.IsNull()) {
+        return kKleeneU;
+      }
+      return v.Truthy() ? kKleeneT : kKleeneF;
+    }
+    case TypeTag::kUnaryExp: {
+      const UnaryExpression& u = expr->AsUnaryExpression();
+      if (u.Op() == UnaryOperation::kIsNull ||
+          u.Op() == UnaryOperation::kIsNotNull) {
+        if (!u.Child() || u.Child()->Type() != TypeTag::kColumnValue) {
+          return kKleeneAll;
+        }
+        const int off =
+            schema.Offset(u.Child()->AsColumnValue().GetColumnName());
+        if (off < 0 || !blk.columns.Contains(static_cast<size_t>(off))) {
+          return kKleeneAll;
+        }
+        const LSTableColumnBlock& col = blk.columns[static_cast<size_t>(off)];
+        KleeneMask is_null_mask = kKleeneNone;
+        if (!col.has_null) {
+          is_null_mask = kKleeneF;
+        } else if (((col.type == ValueType::kInt64 ||
+                     col.type == ValueType::kDate) &&
+                    !col.has_min_max) ||
+                   (col.type == ValueType::kDouble && !col.has_double_min_max &&
+                    !col.has_nan)) {
+          is_null_mask = kKleeneT;
+        } else {
+          is_null_mask = kKleeneTF;
+        }
+        return u.Op() == UnaryOperation::kIsNull ? is_null_mask
+                                                 : KleeneNot(is_null_mask);
+      }
+      const KleeneMask inner = EvalKleeneImpl(u.Child(), schema, blk);
+      if (u.Op() == UnaryOperation::kNot) {
+        return KleeneNot(inner);
+      }
+      if (!ExprGuaranteedBooleanOrNull(u.Child(), schema)) {
+        return kKleeneAll;
+      }
+      KleeneMask out = (inner & kKleeneE);
+      switch (u.Op()) {
+        case UnaryOperation::kIsTrue:
+          if ((inner & kKleeneT) != 0) { out |= kKleeneT;
+}
+          if ((inner & (kKleeneF | kKleeneU)) != 0) { out |= kKleeneF;
+}
+          return out;
+        case UnaryOperation::kIsNotTrue:
+          if ((inner & (kKleeneF | kKleeneU)) != 0) { out |= kKleeneT;
+}
+          if ((inner & kKleeneT) != 0) { out |= kKleeneF;
+}
+          return out;
+        case UnaryOperation::kIsFalse:
+          if ((inner & kKleeneF) != 0) { out |= kKleeneT;
+}
+          if ((inner & (kKleeneT | kKleeneU)) != 0) { out |= kKleeneF;
+}
+          return out;
+        case UnaryOperation::kIsNotFalse:
+          if ((inner & (kKleeneT | kKleeneU)) != 0) { out |= kKleeneT;
+}
+          if ((inner & kKleeneF) != 0) { out |= kKleeneF;
+}
+          return out;
+        default:
+          return kKleeneAll;
+      }
+    }
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& bin = expr->AsBinaryExpression();
+      if (bin.Op() == BinaryOperation::kAnd) {
+        return KleeneAnd(EvalKleeneImpl(bin.Left(), schema, blk),
+                         EvalKleeneImpl(bin.Right(), schema, blk));
+      }
+      if (bin.Op() == BinaryOperation::kOr) {
+        return KleeneOr(EvalKleeneImpl(bin.Left(), schema, blk),
+                        EvalKleeneImpl(bin.Right(), schema, blk));
+      }
+      Expression col_expr;
+      Expression const_expr;
+      BinaryOperation op = bin.Op();
+      if (bin.Left() && bin.Left()->Type() == TypeTag::kColumnValue &&
+          bin.Right() && bin.Right()->Type() == TypeTag::kConstantValue) {
+        col_expr = bin.Left();
+        const_expr = bin.Right();
+      } else if (bin.Left() && bin.Left()->Type() == TypeTag::kConstantValue &&
+                 bin.Right() && bin.Right()->Type() == TypeTag::kColumnValue) {
+        col_expr = bin.Right();
+        const_expr = bin.Left();
+        op = FlipOp(op);
+      } else {
+        return kKleeneAll;
+      }
+      if (op != BinaryOperation::kEquals && op != BinaryOperation::kNotEquals &&
+          op != BinaryOperation::kLessThan &&
+          op != BinaryOperation::kLessThanEquals &&
+          op != BinaryOperation::kGreaterThan &&
+          op != BinaryOperation::kGreaterThanEquals) {
+        return kKleeneAll;
+      }
+      const int off = schema.Offset(col_expr->AsColumnValue().GetColumnName());
+      if (off < 0 || !blk.columns.Contains(static_cast<size_t>(off))) {
+        return kKleeneAll;
+      }
+      return EvalColConstCompare(blk.columns[static_cast<size_t>(off)], op,
+                                 const_expr->AsConstantValue().GetValue());
+    }
+    case TypeTag::kInExp: {
+      const InExpression& in = expr->AsInExpression();
+      if (!in.child_ || in.child_->Type() != TypeTag::kColumnValue ||
+          in.list_.size() > 64) {
+        return kKleeneAll;
+      }
+      const int off = schema.Offset(in.child_->AsColumnValue().GetColumnName());
+      if (off < 0 || !blk.columns.Contains(static_cast<size_t>(off))) {
+        return kKleeneAll;
+      }
+      if (in.list_.empty()) {
+        return kKleeneF;
+      }
+      const LSTableColumnBlock& col = blk.columns[static_cast<size_t>(off)];
+      KleeneMask acc = kKleeneF;
+      for (const Expression& item : in.list_) {
+        if (!item || item->Type() != TypeTag::kConstantValue) {
+          return kKleeneAll;
+        }
+        acc = KleeneOr(acc,
+                       EvalColConstCompare(col, BinaryOperation::kEquals,
+                                           item->AsConstantValue().GetValue()));
+      }
+      return acc;
+    }
+    default:
+      return kKleeneAll;
+  }
+}
+
+}  // namespace
+
+KleeneMask EvaluateBlockKleene(const Expression& expr, const Schema& schema,
+                               const LSTablePageBlock& blk) {
+  return EvalKleeneImpl(expr, schema, blk);
 }
 
 }  // namespace tinylamb

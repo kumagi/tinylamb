@@ -29,6 +29,14 @@ class CatalogReader {
   // readers that own a schema epoch implement this; the default is a no-op.
   virtual void BumpCatalogEpoch() noexcept {}
 
+  virtual StatusOr<bool> TableExists(TransactionContext& context, std::string_view name) {
+    const auto table = GetTable(context, name);
+    if (table.HasValue()) { return true;
+}
+    if (table.GetStatus() == Status::kNotExists) { return false;
+}
+    return table.GetStatus();
+  }
   virtual StatusOr<Table> GetTable(TransactionContext& context,
                                    std::string_view name) = 0;
   virtual StatusOr<TableStatistics> GetStatistics(TransactionContext& context,

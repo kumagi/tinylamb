@@ -13,6 +13,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -47,7 +48,7 @@ namespace {
 
 std::vector<std::string> SplitTokens(std::string_view line) {
   std::vector<std::string> out;
-  out.reserve(line.size() / 2 + 1);
+  out.reserve((line.size() / 2) + 1);
   size_t p = 0;
   while (p < line.size()) {
     while (p < line.size() && line[p] == ' ') {
@@ -159,7 +160,13 @@ struct MTable {
       pad_bytes += r.pad.size();
       rows.emplace(k, std::move(r));
     }
-    next_k = std::max(next_k, k + 1);
+    // Saturate at INT64_MAX: computing k + 1 there is signed overflow (UB).
+    // No larger key can exist, so keeping next_k at k is the correct bound.
+    if (k < std::numeric_limits<int64_t>::max()) {
+      next_k = std::max(next_k, k + 1);
+    } else {
+      next_k = std::max(next_k, k);
+    }
   }
   void Erase(int64_t k) {
     auto it = rows.find(k);
@@ -932,13 +939,29 @@ class OocSession {
     }
     QueryResult qr = result.MoveValue();
     Row row;
-    while ((take < 0 || std::cmp_less(out.rows.size(), take)) &&
-           qr.Next(&row)) {
-      out.rows.push_back(RenderRow(row));
+    try {
+      while ((take < 0 || std::cmp_less(out.rows.size(), take)) &&
+             qr.Next(&row)) {
+        out.rows.push_back(RenderRow(row));
+      }
+      out.status = qr.GetStatus();
+    } catch (const std::exception& e) {
+      out.status = Status(StatusCode::kRuntimeError, e.what());
+      out.why = "stream exception: " + std::string(e.what());
+      out.rows.clear();
+      return out;
+    } catch (...) {
+      out.status =
+          Status(StatusCode::kRuntimeError, "unknown stream exception");
+      out.why = "stream exception: unknown";
+      out.rows.clear();
+      return out;
     }
-    out.status = qr.GetStatus();
     if (out.status != Status::kSuccess) {
-      out.why = "stream: " + ToString(out.status);
+      out.why = "stream: " + ToString(out.status) +
+                (out.status.GetMessage().empty()
+                     ? std::string()
+                     : " " + std::string(out.status.GetMessage()));
       out.rows.clear();
       return out;
     }
@@ -963,6 +986,14 @@ class OocSession {
       tolerated = true;
     } else if (big_rows && (code == StatusCode::kNoSpace ||
                             code == StatusCode::kTooBigData)) {
+      tolerated = true;
+    }
+    // A non-invertible streaming window aggregate is a deterministic
+    // capability gap (kNotImplemented), not memory pressure; tolerate it by
+    // message so it does not masquerade as a finding on every skew run.
+    if (code == StatusCode::kNotImplemented &&
+        o.why.find("Unsupported streaming window aggregate") !=
+            std::string::npos) {
       tolerated = true;
     }
     if (tolerated) {
@@ -1645,7 +1676,10 @@ class OocSession {
       const StatusCode code = o.status.GetCode();
       if (((injecting_ || TempCapped()) && TolerableUnderInjection(code)) ||
           (injecting_ && o.why.find("injected") != std::string::npos) ||
-          code == StatusCode::kMemoryLimitExceeded) {
+          code == StatusCode::kMemoryLimitExceeded ||
+          (code == StatusCode::kNotImplemented &&
+           o.why.find("Unsupported streaming window aggregate") !=
+               std::string::npos)) {
         Bump(&OocStats::tolerated_failures);
         NoteFailedRead(ctx);
         return "";
@@ -3509,10 +3543,21 @@ bool SkippedByEnv(std::string_view op) {
     }
   }
   const std::string_view kind = op.substr(0, op.find(' '));
+  const auto trim = [](std::string_view item) {
+    while (!item.empty() &&
+           std::isspace(static_cast<unsigned char>(item.front())) != 0) {
+      item.remove_prefix(1);
+    }
+    while (!item.empty() &&
+           std::isspace(static_cast<unsigned char>(item.back())) != 0) {
+      item.remove_suffix(1);
+    }
+    return item;
+  };
   std::string_view list(env);
   while (!list.empty()) {
     const size_t comma = list.find(',');
-    if (list.substr(0, comma) == kind) {
+    if (trim(list.substr(0, comma)) == kind) {
       return true;
     }
     if (comma == std::string_view::npos) {
@@ -4115,9 +4160,11 @@ constexpr const char* kOocReplaySkipped =
 std::string ReplayOocTrace(const OocTrace& trace, const OocRunOptions& options,
                            OocStats* stats) {
   KnobGuard guard;
-  if (const std::string bad = ValidateReplayTraceConsistency(trace);
-      !bad.empty()) {
-    return bad;
+  if (!options.skip_consistency_check) {
+    if (const std::string bad = ValidateReplayTraceConsistency(trace);
+        !bad.empty()) {
+      return bad;
+    }
   }
   if (options.on_profile) {
     options.on_profile(trace.profile);
@@ -4195,7 +4242,15 @@ std::string OocFailureSignature(std::string_view report) {
     // Without a second ": " there is no fixed boundary before the variable
     // SQL/error body. Fall back to the known prefix so two seeds of the same
     // bug still land in one bucket (and stay matchable by the ignore list).
-    const size_t line_cut = second == std::string_view::npos ? first : second;
+    // Guard first==npos too: otherwise line_cut would be npos and the whole
+    // (variable) line would leak into the signature.
+    const std::string_view known_prefix = rest.starts_with("prepare: ")
+                                              ? std::string_view("prepare: ")
+                                              : std::string_view("stream: ");
+    const size_t line_cut =
+        second != std::string_view::npos
+            ? second
+            : (first != std::string_view::npos ? first : known_prefix.size());
     out += " | " + Digitless(line.substr(0, line_cut));
   } else if (rest.starts_with("status: ")) {
     out += " | " +
@@ -4205,7 +4260,8 @@ std::string OocFailureSignature(std::string_view report) {
 }
 
 OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
-                          double budget_seconds, std::string* final_report) {
+                          double budget_seconds, std::string* final_report,
+                          std::function<void(const std::string&)> on_op) {
   const std::string want = OocFailureSignature(report);
   const auto deadline =
       std::chrono::steady_clock::now() +
@@ -4214,9 +4270,13 @@ OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
   auto in_time = [&]() { return std::chrono::steady_clock::now() < deadline; };
   OocRunOptions lenient;
   lenient.lenient = true;
+  lenient.skip_consistency_check = true;
+  lenient.on_op = std::move(on_op);
   auto fails = [&](const OocTrace& candidate, std::string* why) {
     const std::string r = ReplayOocTrace(candidate, lenient, nullptr);
-    if (r.empty() || OocFailureSignature(r) != want) {
+    // A quota skip is "not run", never a reproduced failure, even though its
+    // failure signature collapses to the same "skip" prefix as the generator's.
+    if (r.empty() || r == kOocReplaySkipped || OocFailureSignature(r) != want) {
       return false;
     }
     *why = r;
@@ -4291,6 +4351,34 @@ OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
       best_report = std::move(why);
     }
   }
+  // The lenient pass above skips the serialize/digest/parse consistency check,
+  // but committed regressions replay with default options where it is
+  // enabled — a trace that only fails leniently would be rejected the moment
+  // it is registered.  Re-verify the survivor under the strict options and
+  // fall back to the original trace when nothing strictly reproduces.
+  OocRunOptions verify;
+  const auto strict_fails = [&](const OocTrace& candidate, std::string* why) {
+    const std::string r = ReplayOocTrace(candidate, verify, nullptr);
+    if (r.empty() || r == kOocReplaySkipped || OocFailureSignature(r) != want) {
+      return false;
+    }
+    *why = r;
+    return true;
+  };
+  std::string verify_why;
+  if (!strict_fails(best, &verify_why)) {
+    if (strict_fails(trace, &verify_why)) {
+      best = trace;
+      best_report = std::move(verify_why);
+    } else {
+      if (final_report != nullptr) {
+        final_report->clear();
+      }
+      return trace;
+    }
+  } else {
+    best_report = std::move(verify_why);
+  }
   if (final_report != nullptr) {
     *final_report = best_report;
   }
@@ -4300,7 +4388,7 @@ OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
 // Digest over the seed, profile and op lines. The seed alone cannot regenerate
 // the original libFuzzer `data` bytes, so an integrity digest is what actually
 // lets replay/minimize detect a hand-edited or merge-corrupted trace.
-std::string OocTraceDigest(
+static std::string OocTraceDigest(
     uint64_t seed,
     std::string_view profile_text,  // NOLINT(misc-use-internal-linkage)
     const std::vector<std::string>& ops) {
@@ -4357,14 +4445,20 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
     }
     const std::string_view raw_line = text.substr(p, nl - p);
     p = nl + 1;
-    // Header values use the trimmed line so an editor-added trailing space
-    // does not break strict numeric parsing. Op lines must be kept
-    // byte-for-byte: OocTraceDigest hashes exactly the bytes SerializeOocTest
-    // wrote, so stripping trailing whitespace here would make a legitimate
-    // regression (an op with a trailing space) fail its digest check.
+    // Header values use the trimmed line so an editor-added trailing space or
+    // tab does not break strict numeric parsing. Op lines are kept byte-for-
+    // byte except for a trailing CR: OocTraceDigest hashes exactly the bytes
+    // SerializeOocTest wrote, so stripping trailing spaces here would make a
+    // legitimate regression (an op with a trailing space) fail its digest,
+    // but a CRLF checkout would leave a CR on every op and fail it too.
     std::string_view line = raw_line;
-    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+    while (!line.empty() &&
+           (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
       line.remove_suffix(1);
+    }
+    std::string_view op_line = raw_line;
+    while (!op_line.empty() && op_line.back() == '\r') {
+      op_line.remove_suffix(1);
     }
     if (line.empty()) {
       continue;
@@ -4395,7 +4489,7 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
     } else if (line.starts_with("--")) {
       continue;
     } else {
-      trace->ops.emplace_back(raw_line);
+      trace->ops.emplace_back(op_line);
     }
   }
   if (!saw_profile || trace->ops.empty()) {
@@ -4418,7 +4512,11 @@ void OocFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   OocTrace trace;
   std::string report =
       RunOocIteration(data, size, seed, verbose, nullptr, &trace);
-  if (report.empty()) {
+  // "skip" means the generation DB could not be opened (disk quota guard):
+  // no checks ran, so there is nothing to shrink or persist. Replay turns the
+  // same condition into kOocReplaySkipped, which has the same failure
+  // signature and could otherwise be mistaken for a reproduced finding.
+  if (report.empty() || report == "skip") {
     return;
   }
   // Shrink before persisting: a 100-op session is rarely the story.

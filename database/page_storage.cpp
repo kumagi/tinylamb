@@ -21,6 +21,8 @@
 #include "page_storage.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -56,7 +58,9 @@ size_t LogSegmentSizeFromEnv() {
   errno = 0;
   const unsigned long long bytes = std::strtoull(env, &end, 10);
   if (end == env || *end != '\0' || errno == ERANGE ||
-      bytes > std::numeric_limits<size_t>::max()) {
+      (sizeof(size_t) < sizeof(bytes) &&
+       bytes > static_cast<unsigned long long>(
+                   std::numeric_limits<size_t>::max()))) {
     return Logger::kDefaultLogSegmentSize;
   }
   if (bytes < kPageSize) {
@@ -70,8 +74,9 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     std::string_view dbname, size_t wal_sync_ms, bool preallocate_new_wal) {
   const std::string dbname_str(dbname);
   const size_t requested_segment_size = LogSegmentSizeFromEnv();
-  // PageManager::Create discards its capacity argument (pages live in RAM
-  // under PageManager), so no pool-size env override exists.
+  // Pages live in RAM under PageManager; a non-zero capacity only installs a
+  // test buffer-pool byte limit (SetBufferPoolLimitBytesForTest). This path
+  // passes 0, so no test override is applied.
   ASSIGN_OR_RETURN(std::unique_ptr<PageManager>, pm,
                    PageManager::Create(dbname_str + ".db",
                                        /*capacity=*/0, false));
@@ -88,18 +93,35 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
   size_t checkpoint_interval = 10;
   const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
   if (ckpt_env != nullptr && ckpt_env[0] != '\0') {
+    // strtoull wraps a leading '-' to ULLONG_MAX and accepts '+' and
+    // leading whitespace; reject signs/space explicitly like
+    // LogSegmentSizeFromEnv does.
+    const bool bad_sign =
+        ckpt_env[0] == '-' || ckpt_env[0] == '+' ||
+        std::isspace(static_cast<unsigned char>(ckpt_env[0])) != 0;
     char* end = nullptr;
     errno = 0;
-    const unsigned long long seconds = std::strtoull(ckpt_env, &end, 10);
-    if (errno != 0 || end == ckpt_env || *end != '\0' || seconds == 0) {
+    const unsigned long long seconds =
+        bad_sign ? 0 : std::strtoull(ckpt_env, &end, 10);
+    // 0 is a valid value: CheckpointManager treats interval_seconds_ == 0 as
+    // "periodic checkpointing disabled", so let it through unchanged.
+    if (bad_sign || errno != 0 || end == ckpt_env || *end != '\0') {
       LOG(WARN) << "invalid TINYLAMB_CHECKPOINT_SECONDS='" << ckpt_env
-                   << "'; using default 10s";
+                << "'; using default 10s";
     } else {
+      // CheckpointManager waits with std::chrono::seconds; durations are
+      // nanoseconds internally, so cap at a value whose *1e9 stays inside
+      // int64 (~9.2e9 s). The size_t-width clamp still applies on 32-bit.
+      constexpr unsigned long long kMaxCheckpointSeconds =
+          9'000'000'000ULL;
       checkpoint_interval = static_cast<size_t>(std::min<unsigned long long>(
-          seconds, 1ULL << (sizeof(size_t) * 8 - 5)));
+          {seconds,
+          
+              kMaxCheckpointSeconds,
+              1ULL << (sizeof(size_t) * 8 - 5)}));
     }
   }
-  auto cm = std::make_unique<CheckpointManager>(dbname_str + ".last_checkpoint",
+  auto cm = std::make_unique<CheckpointManager>(dbname_str,
                                                 tm.get(), pm->GetPool(),
                                                 checkpoint_interval);
   auto storage = std::unique_ptr<PageStorage>(
@@ -177,6 +199,10 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
                   .file = opened.MoveValue(),
                   .schema = std::move(file_schema),
               });
+            } else {
+              LOG(LogLevel::kWarn)
+                  << "recovery: cannot open TLCS file "
+                  << entry.path().string() << ": " << opened.GetStatus();
             }
           }
         }

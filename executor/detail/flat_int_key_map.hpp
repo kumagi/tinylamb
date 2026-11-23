@@ -308,7 +308,7 @@ class FlatIntSet {
     if (span > kMaxDenseSpan) {
       return false;
     }
-    const size_t words = static_cast<size_t>((span >> 6) + 1);
+    const auto words = static_cast<size_t>((span >> 6) + 1);
     const size_t dense_bytes = words * sizeof(uint64_t);
     const size_t hash_bytes = slots_.size() * sizeof(Slot);
     if (dense_bytes > std::max<size_t>(hash_bytes, size_t{2} << 20)) {
@@ -565,7 +565,7 @@ class FlatIntSet {
         static_cast<uint64_t>(clamped_hi) - static_cast<uint64_t>(clamped_lo);
     if (width <= 64ULL) {
       for (uint64_t off = 0; off <= width; ++off) {
-        const int64_t k =
+        const auto k =
             static_cast<int64_t>(static_cast<uint64_t>(clamped_lo) + off);
         if (Contains(k)) {
           return true;

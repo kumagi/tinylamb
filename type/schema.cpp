@@ -227,7 +227,13 @@ Decoder& operator>>(Decoder& e, Schema& sc) {
   // Decoding changes column offsets just like assignment; cached lookups
   // keyed by the old identity must not survive even a partial decode.
   sc.identity_ = Schema::NextLookupIdentity();
-  e >> sc.name_ >> sc.columns_;
+  // The wire format carries neither key_column_index_ nor schema_version_;
+  // reset them so a reused Schema does not keep stale values that may now be
+  // out of range for the decoded columns.
+  sc.key_column_index_ = 0;
+  sc.schema_version_ = 0;
+  e >> sc.name_;
+  e.ReadVector(sc.columns_, Schema::kMaxColumns);
   sc.RefreshDerived();
   return e;
 }

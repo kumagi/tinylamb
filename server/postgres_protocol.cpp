@@ -3,8 +3,10 @@
 #include "server/postgres_protocol.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,8 +15,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
+#include "common/string_util.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -99,13 +104,19 @@ PgType ToPgType(ValueType type) {
   return {.oid = 25, .length = -1};
 }
 
-std::string Trim(std::string_view value) {
+std::string_view Trim(std::string_view value) {
   const size_t begin = value.find_first_not_of(" \t\r\n");
   if (begin == std::string_view::npos) {
     return {};
   }
   const size_t end = value.find_last_not_of(" \t\r\n");
-  return std::string(value.substr(begin, end - begin + 1));
+  return value.substr(begin, end - begin + 1);
+}
+
+size_t Utf8CharacterCount(std::string_view text) {
+  return static_cast<size_t>(std::ranges::count_if(text, [](unsigned char c) {
+    return (c & 0xC0) != 0x80;
+  }));
 }
 
 }  // namespace
@@ -241,7 +252,8 @@ std::string ReadyForQuery(char transaction_status) {
 }
 
 std::string ErrorResponse(std::string_view message, std::string_view sqlstate,
-                          std::string_view severity) {
+                          std::string_view severity,
+                          std::optional<size_t> position) {
   std::string payload;
   payload.push_back('S');
   AppendCString(&payload, severity);
@@ -251,50 +263,83 @@ std::string ErrorResponse(std::string_view message, std::string_view sqlstate,
   AppendCString(&payload, SanitizeField(sqlstate));
   payload.push_back('M');
   AppendCString(&payload, SanitizeField(message));
-  // GoogleSQL frontend diagnostics end with "[at line:column]". L is a genuine
-  // line number, but P is NOT a character index: PostgreSQL defines P as a
-  // 0-based offset into the query text, which ErrorResponse never receives and
-  // which cannot be derived from a line:column pair. The column is still sent
-  // as a best-effort hint for existing clients, but callers must not rely on P
-  // for caret placement -- the authoritative "[at L:C]" location is carried
-  // verbatim in the M field above.
-  if (const size_t at = message.find("[at "); at != std::string_view::npos) {
-    const size_t colon = message.find(':', at + 4);
-    const size_t close =
-        message.find(']', colon == std::string_view::npos ? at + 4 : colon + 1);
-    if (colon != std::string_view::npos && close != std::string_view::npos &&
-        close > colon + 1) {
-      std::string_view pos = message.substr(colon + 1, close - colon - 1);
-      bool digits = !pos.empty();
-      for (char c : pos) {
-        digits = digits && c >= '0' && c <= '9';
-      }
-      std::string_view line = message.substr(at + 4, colon - at - 4);
-      bool line_digits = !line.empty();
-      for (char c : line) {
-        line_digits = line_digits && c >= '0' && c <= '9';
-      }
-      if (line_digits) {
-        payload.push_back('L');
-        AppendCString(&payload, line);
-      }
-      if (digits) {
-        payload.push_back('P');
-        AppendCString(&payload, pos);
-      }
-    }
+  if (position.has_value()) {
+    payload.push_back('P');
+    AppendCString(&payload, std::to_string(*position));
   }
   payload.push_back('\0');
   return Message('E', payload);
 }
 
+std::optional<size_t> SqlErrorPosition(std::string_view message,
+                                       const SqlStatement& statement,
+                                       size_t parsed_byte_offset) {
+  const std::string_view diagnostic = message.substr(0, message.find('\n'));
+  const size_t at = diagnostic.rfind("[at ");
+  // The "[at L:C]" tag is matched by content, not by an "ERROR:" prefix or a
+  // terminal ']' — diagnostics from non-parse sources and future formats
+  // with trailing hint text must keep their position.
+  if (at == std::string_view::npos || parsed_byte_offset > statement.text.size()) {
+    return std::nullopt;
+  }
+  const size_t close = diagnostic.find(']', at + 4);
+  if (close == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto location = diagnostic.substr(at + 4, close - at - 4);
+  const size_t colon = location.find(':');
+  if (colon == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const char* const split = location.data() + colon;
+  const char* const end = location.data() + location.size();
+  size_t line = 0;
+  size_t column = 0;
+  const auto parsed_line = std::from_chars(location.data(), split, line);
+  const auto parsed_col = std::from_chars(split + 1, end, column);
+  if (parsed_line.ptr != split || parsed_line.ec != std::errc{} || line == 0 ||
+      parsed_col.ptr != end || parsed_col.ec != std::errc{} || column == 0) {
+    return std::nullopt;
+  }
+
+  const std::string_view sql = statement.text;
+  if (!IsValidUtf8Text(sql)) {
+    return std::nullopt;
+  }
+  size_t offset = parsed_byte_offset;
+  for (size_t row = 1; row < line; ++row) {
+    offset = sql.find_first_of("\r\n", offset);
+    if (offset == std::string_view::npos) {
+      return std::nullopt;
+    }
+    offset += sql.substr(offset, 2) == "\r\n" ? 2 : 1;
+  }
+  size_t display_column = 1;
+  while (display_column < column && offset < sql.size() &&
+         sql[offset] != '\n' && sql[offset] != '\r') {
+    if (sql[offset] == '\t') {
+      // GoogleSQL reports columns after expansion to eight-column tab stops.
+      displ(ay_column += 8 - (displa)y_column - 1) % 8;
+      ++offset;
+    } else {
+      offset += Utf8SequenceLength(static_cast<unsigned char>(sql[offset]));
+      ++display_column;
+    }
+  }
+  if (display_column != column) {
+    return std::nullopt;
+  }
+  return statement.position + Utf8CharacterCount(sql.substr(0, offset));
+}
+
 std::string NoticeResponse(std::string_view message,
-                           std::string_view sqlstate) {
+                           std::string_view sqlstate,
+                           std::string_view severity) {
   std::string payload;
   payload.push_back('S');
-  AppendCString(&payload, "NOTICE");
+  AppendCString(&payload, severity);
   payload.push_back('V');
-  AppendCString(&payload, "NOTICE");
+  AppendCString(&payload, severity);
   payload.push_back('C');
   AppendCString(&payload, SanitizeField(sqlstate));
   payload.push_back('M');
@@ -352,6 +397,98 @@ std::string DataRow(const Row& row) {
   return Message('D', payload);
 }
 
+// Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
+                              size_t row_idx) {
+  if (wire_out == nullptr || row_idx >= chunk.Size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid DataChunk row index for PostgreSQL DataRow");
+  }
+  const size_t col_count = chunk.ColumnCount();
+  if (col_count > std::numeric_limits<uint16_t>::max()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "too many values for PostgreSQL protocol");
+  }
+  for (size_t c = 0; c < col_count; ++c) {
+    const ColumnVector& col = chunk.ColumnAt(c);
+    if (!col.IsNull(row_idx) && !col.IsHeterogeneous() &&
+        col.Type() == ValueType::kVarChar) {
+      if (col.StringData()[row_idx].size() >
+          static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return StatusError(StatusCode::kTooBigData,
+                           "PostgreSQL DataRow cell exceeds uint32 length");
+      }
+    }
+  }
+  const size_t frame_start = wire_out->size();
+  wire_out->push_back('D');
+  AppendUint32(wire_out, 0);  // Patched below with final frame length.
+  AppendUint16(wire_out, static_cast<uint16_t>(col_count));
+  std::array<char, 32> int_buf{};
+  for (size_t c = 0; c < col_count; ++c) {
+    const ColumnVector& col = chunk.ColumnAt(c);
+    if (col.IsNull(row_idx)) {
+      AppendUint32(wire_out, std::numeric_limits<uint32_t>::max());
+      continue;
+    }
+    if (!col.IsHeterogeneous()) {
+      switch (col.Type()) {
+        case ValueType::kInt64: {
+          std::to_chars_result res{};
+          if (col.IsUnsigned()) {
+            res = std::to_chars(
+                int_buf.data(), int_buf.data() + int_buf.size(),
+                static_cast<uint64_t>(col.IntegerData()[row_idx]));
+          } else {
+            res = std::to_chars(int_buf.data(), int_buf.data() + int_buf.size(),
+                                col.IntegerData()[row_idx]);
+          }
+          const auto len = static_cast<uint32_t>(res.ptr - int_buf.data());
+          AppendUint32(wire_out, len);
+          wire_out->append(int_buf.data(), len);
+          continue;
+        }
+        case ValueType::kVarChar: {
+          const std::string& s = col.StringData()[row_idx];
+          AppendUint32(wire_out, static_cast<uint32_t>(s.size()));
+          if (s.find('\0') == std::string::npos) {
+            wire_out->append(s);
+          } else {
+            const size_t pos = wire_out->size();
+            wire_out->append(s);
+            std::replace(wire_out->begin() + static_cast<std::ptrdiff_t>(pos),
+                         wire_out->end(), '\0', ' ');
+          }
+          continue;
+        }
+        default:
+          break;
+      }
+    }
+    const std::string text = SanitizeField(ValueText(col.ValueAt(row_idx)));
+    if (text.size() >
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      wire_out->resize(frame_start);
+      return StatusError(StatusCode::kTooBigData,
+                         "PostgreSQL DataRow cell exceeds uint32 length");
+    }
+    AppendUint32(wire_out, static_cast<uint32_t>(text.size()));
+    wire_out->append(text);
+  }
+  const size_t msg_len = wire_out->size() - (frame_start + 1);
+  if (msg_len > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    wire_out->resize(frame_start);
+    return StatusError(StatusCode::kTooBigData,
+                       "PostgreSQL DataRow frame exceeds uint32 length");
+  }
+  const auto len32 = static_cast<uint32_t>(msg_len);
+  (*wire_out)[frame_start + 1] = static_cast<char>((len32 >> 24U) & 0xffU);
+  (*wire_out)[frame_start + 2] = static_cast<char>((len32 >> 16U) & 0xffU);
+  (*wire_out)[frame_start + 3] = static_cast<char>((len32 >> 8U) & 0xffU);
+  (*wire_out)[frame_start + 4] = static_cast<char>(len32 & 0xffU);
+  return Status::kSuccess;
+}
+
 std::string CommandComplete(std::string_view tag) {
   std::string payload;
   AppendCString(&payload, tag);
@@ -370,10 +507,14 @@ std::string NegotiateProtocolVersion(
   return Message('v', payload);
 }
 
-StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
-  std::vector<std::string> statements;
+StatusOr<std::vector<SqlStatement>> SplitSqlStatementsWithPositions(
+    std::string_view sql) {
+  std::vector<SqlStatement> statements;
   bool overflowed = false;
   std::string current;
+  size_t segment_start = 0;
+  size_t counted_bytes = 0;
+  size_t characters = 0;
   // Length of `current` up to the last character that is neither whitespace
   // nor comment bytes. A trailing comment (or trailing whitespace/comment
   // run) after the final real token of a statement is dropped, so a client
@@ -393,18 +534,24 @@ StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
       meaningful = current.size();
     }
   };
-  const auto FlushCurrent = [&]() {
+  const auto FlushCurrent = [&](size_t segment_end) {
     current.resize(meaningful);
-    current = Trim(current);
-    if (!current.empty()) {
+    const std::string_view text = Trim(current);
+    if (!text.empty()) {
       if (statements.size() >= kMaxSqlStatements) {
         overflowed = true;
       } else {
-        statements.push_back(current);
+        const size_t start = segment_start +
+                             static_cast<size_t>(text.data() - current.data());
+        characters += Utf8CharacterCount(sql.substr(counted_bytes,
+                                                      start - counted_bytes));
+        counted_bytes = start;
+        statements.push_back({std::string(text), characters + 1});
       }
     }
     current.clear();
     meaningful = 0;
+    segment_start = segment_end + 1;
   };
   for (size_t i = 0; i < sql.size(); ++i) {
     const char current_char = sql[i];
@@ -547,16 +694,27 @@ StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
     }
     if (current_char == ';' && !single_quote && !double_quote &&
         !backtick_quote) {
-      FlushCurrent();
+      FlushCurrent(i);
       continue;
     }
     Append(current_char);
   }
-  FlushCurrent();
+  FlushCurrent(sql.size());
   if (overflowed) {
     return StatusError(StatusCode::kInvalidArgument,
                        "too many SQL statements in one message (limit " +
                            std::to_string(kMaxSqlStatements) + ")");
+  }
+  return statements;
+}
+
+StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql) {
+  ASSIGN_OR_RETURN(std::vector<SqlStatement>, with_positions,
+                   SplitSqlStatementsWithPositions(sql));
+  std::vector<std::string> statements;
+  statements.reserve(with_positions.size());
+  for (SqlStatement& statement : with_positions) {
+    statements.push_back(std::move(statement.text));
   }
   return statements;
 }

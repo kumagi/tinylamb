@@ -19,20 +19,55 @@
 
 namespace tinylamb {
 
-TEST(MemoryBudgetTest, ServerBufferFloorSaturatesInsteadOfWrapping) {
+namespace {
+
+// A release-listener callback captures local counters by reference. If an
+// ASSERT/exception/GTEST_SKIP ends the test early, an explicit unregister at
+// the bottom is skipped and the global budget keeps a dangling reference.
+class ScopedReleaseListener {
+ public:
+  ScopedReleaseListener(ProcessMemoryBudget& budget, uint64_t id)
+      : budget_(budget), id_(id) {}
+  ~ScopedReleaseListener() { budget_.UnregisterReleaseListener(id_); }
+  ScopedReleaseListener(const ScopedReleaseListener&) = delete;
+  ScopedReleaseListener& operator=(const ScopedReleaseListener&) = delete;
+
+ private:
+  ProcessMemoryBudget& budget_;
+  uint64_t id_;
+};
+
+}  // namespace
+
+TEST(MemoryBudgetTest, ServerBufferFloorRejectsOverflowAndCanBeReleased) {
   auto& budget = ProcessMemoryBudget::Global();
+  struct ResetBudgetOnExit {
+    ProcessMemoryBudget& budget;
+    ~ResetBudgetOnExit() { budget.ResetForTest(0); }
+  } reset{budget};
   budget.ResetForTest(0);
-  budget.AddServerBufferFloorBytes(std::numeric_limits<size_t>::max() - 4);
-  budget.AddServerBufferFloorBytes(10);
-  EXPECT_EQ(budget.ServerBufferFloorBytes(),
-            std::numeric_limits<size_t>::max());
-  EXPECT_EQ(budget.PoolFloorBytes(MemoryPoolKind::kTx),
-            std::numeric_limits<size_t>::max());
-  budget.ResetForTest(0);
+  constexpr size_t kLarge = std::numeric_limits<size_t>::max() - 4;
+  ASSERT_TRUE(budget.TryAddServerBufferFloorBytes(kLarge));
+  EXPECT_FALSE(budget.TryAddServerBufferFloorBytes(10));
+  EXPECT_EQ(budget.ServerBufferFloorBytes(), kLarge);
+  budget.SubServerBufferFloorBytes(kLarge);
+  ASSERT_TRUE(budget.TryAddServerBufferFloorBytes(10));
+  EXPECT_EQ(budget.PoolFloorBytes(MemoryPoolKind::kTx), 10U);
+  budget.SubServerBufferFloorBytes(10);
+  EXPECT_EQ(budget.ServerBufferFloorBytes(), 0U);
 }
+
+// A failing ASSERT inside a budget test must not leave the process-global
+// soft limit pinned to a test value; restore the uncapped default on scope
+// exit (same contract as the explicit ResetForTest(0) at each test's end).
+class ScopedBudgetUncapped {
+ public:
+  ~ScopedBudgetUncapped() { ProcessMemoryBudget::Global().ResetForTest(0); }
+};
 
 TEST(MemoryBudgetTest,
      UncappedColumnarBudgetRetainsLargeProjectionAndOtherFloors) {
+  ScopedBudgetUncapped budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
   for (const size_t limit : {size_t{1} << 30, size_t{16} << 30}) {
     budget.ResetForTest(limit, limit / 4, 0, false);
@@ -68,6 +103,7 @@ TEST(MemoryBudgetTest,
 }
 
 TEST(MemoryBudgetTest, ColumnarReclaimEvictsLeastRecentlyUsedUnpinnedStore) {
+  ScopedBudgetUncapped budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
   budget.ResetForTest(0, 0, 300, false);
   {
@@ -174,9 +210,8 @@ TEST(MemoryBudgetTest, TempDirectoryRespectsRegisteredDefaultWhenEnvUnset) {
        std::to_string(unique_counter.fetch_add(1, std::memory_order_relaxed)));
   // The default temp directory is process-global: restore it (and clean up
   // the path) on every exit path so a fatal assertion or exception cannot
-  // leak the override into later tests.
-  // guard type is
-  // non-copyable by design
+  // leak the override into later tests. The guard type is non-copyable by
+  // design.
   struct
       DefaultTempDirReset {  // NOLINT(cppcoreguidelines-special-member-functions)
     ~DefaultTempDirReset() {
@@ -339,6 +374,10 @@ TEST(MemoryBudgetTest, RssGatedReclaimPurgesRetainedHeapBeforeRefusing) {
   // Place the RSS cap strictly between the retained-heap reading and the
   // (approximately base) reading a successful purge produces.
   const uint64_t gate = (rss_retained + base) / 2;
+  if (gate > (static_cast<uint64_t>(std::numeric_limits<size_t>::max()) - 8) *
+                 7 / 8) {
+    GTEST_SKIP() << "RSS gate cannot be represented by size_t";
+  }
   b.ResetForTest(static_cast<size_t>((gate * 8 / 7) + 8), 0, 0,
                  /*check_rss_pressure=*/true);
   const bool refused_before =
@@ -397,8 +436,10 @@ TEST(MemoryBudgetTest, ReleaseNotifiesEveryListenerWithoutDrops) {
   std::atomic<uint64_t> hits3{0};
   const uint64_t id1 = b.RegisterReleaseListener(
       [&] { hits1.fetch_add(1, std::memory_order_relaxed); });
+  const ScopedReleaseListener guard1(b, id1);
   const uint64_t id2 = b.RegisterReleaseListener(
       [&] { hits2.fetch_add(1, std::memory_order_relaxed); });
+  const ScopedReleaseListener guard2(b, id2);
   constexpr int kThreads = 8;
   constexpr int kReleases = 500;
   std::vector<std::thread> workers;
@@ -423,8 +464,10 @@ TEST(MemoryBudgetTest, ReleaseNotifiesEveryListenerWithoutDrops) {
 
   // A throwing listener must not suppress the listeners registered after it.
   const uint64_t id_throw = b.RegisterReleaseListener([] { throw 1; });
+  const ScopedReleaseListener guard_throw(b, id_throw);
   const uint64_t id3 = b.RegisterReleaseListener(
       [&] { hits3.fetch_add(1, std::memory_order_relaxed); });
+  const ScopedReleaseListener guard3(b, id3);
   b.Release(MemoryPoolKind::kQuery, 1);
   EXPECT_EQ(hits3.load(), 1U);
 
@@ -519,7 +562,7 @@ TEST(MemoryBudgetTest, UnderMemoryPressureUsesRssWarnLine) {
     GTEST_SKIP() << "RSS reporting unavailable: " << rss0;
   }
   // soft = 0.8 * (rss/0.8375) = 0.955*rss < rss < 1.045*rss = warn.
-  const size_t limit = static_cast<size_t>(
+  const auto limit = static_cast<size_t>(
       rss0 * 10000ULL / 8375ULL);  // NOLINT(modernize-use-auto)
   b.ResetForTest(/*limit_bytes=*/limit, 0, 0,
                  /*check_rss_pressure=*/true);
@@ -556,6 +599,36 @@ TEST(MemoryBudgetTest, EmergencyReserveHonorsAggregateLimit) {
             0u);  // NOLINT(readability-uppercase-literal-suffix)
   EXPECT_TRUE(b.ReserveEmergency(MemoryPoolKind::kTx, 1));  // room again
   b.ReleaseEmergency(MemoryPoolKind::kTx, 1);
+  b.ResetForTest(0);
+}
+
+// A failed CAS in ReleaseEmergency used to leave `released` at the failed
+// iteration's value.  When another thread drained the ledger to zero first,
+// the loop exited and handed back bytes this thread never removed, silently
+// eating an unrelated pool reservation.  Racing several releasers against a
+// small emergency charge makes the stale-credit path fire reliably.
+TEST(MemoryBudgetTest, ReleaseEmergencyDoesNotOverCreditOnCasFailure) {
+  auto& b = ProcessMemoryBudget::Global();
+  b.ResetForTest(/*limit_bytes=*/size_t{256} << 20, 0, 0,
+                 /*check_rss_pressure=*/false);
+  constexpr size_t kBase = size_t{1} << 20;
+  ASSERT_TRUE(b.TryReserveNoFault(MemoryPoolKind::kQuery, kBase));
+  constexpr int kThreads = 8;
+  for (int round = 0; round < 40; ++round) {
+    ASSERT_TRUE(b.ReserveEmergency(MemoryPoolKind::kQuery, kThreads));
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+      workers.emplace_back(
+          [&b] { b.ReleaseEmergency(MemoryPoolKind::kQuery, 1); });
+    }
+    for (auto& worker : workers) {
+      worker.join();
+    }
+    ASSERT_EQ(b.EmergencyUsed(), 0U);
+    ASSERT_EQ(b.QueryUsed(), kBase)
+        << "round " << round << ": unrelated pool charge was consumed";
+  }
   b.ResetForTest(0);
 }
 

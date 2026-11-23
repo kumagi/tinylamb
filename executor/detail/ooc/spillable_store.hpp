@@ -80,6 +80,8 @@ class SpillableStore {
  private:
   template <typename ChunkRef>
   [[nodiscard]] Status AppendChunkImpl(ChunkRef&& chunk);
+  template <typename ChunkRef>
+  [[nodiscard]] Status AppendReadyChunk(ChunkRef&& chunk, size_t reserved);
   [[nodiscard]] size_t EffectiveBudgetBytes() const noexcept;
   [[nodiscard]] size_t EffectiveIoBufferBytes() const noexcept;
   // Row-batch flush cap: staging flushes and spill frames stay below this
@@ -109,6 +111,9 @@ class SpillableStore {
 
   bool spilled_{false};
   bool sealed_{false};
+  // Append allocation failures can leave a partially modified staging chunk;
+  // latch the failure so no partial store can later be sealed or read.
+  Status failure_status_{Status::kSuccess};
   std::unique_ptr<SpillSegmentWriter> writer_;
   SpillSegmentId segment_id_{kInvalidSpillSegmentId};
   std::string scratch_codec_;

@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_TABLE_HPP
 #define TINYLAMB_TABLE_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -209,7 +210,7 @@ class Table {
   // `const Table&`) use the `Refill*`/`Note*` variants, which name the
   // shared-state write instead of hiding it behind `const`.
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetLSTableStore() const;
-  void SetLSTableStore(std::shared_ptr<const LSTableStore> store);
+  void SetLSTableStore(std::shared_ptr<const LSTableStore> store) const;
   void RefillLSTableStore(std::shared_ptr<const LSTableStore> store) const;
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetProjectedLSTableStore()
       const;
@@ -220,7 +221,8 @@ class Table {
   GetCachedLSTableColumn(slot_t col, uint64_t generation) const;
   void RefillCachedLSTableColumn(
       slot_t col, uint64_t generation, size_t bytes,
-      std::shared_ptr<const LSTableColumnCacheEntry> entry) const;
+      std::shared_ptr<const LSTableColumnCacheEntry> entry,
+      std::shared_ptr<const std::atomic<size_t>> dynamic_bytes = nullptr) const;
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetCachedLSTableView(
       uint64_t generation, const std::vector<uint32_t>& projection) const;
   void RefillCachedLSTableView(uint64_t generation,
@@ -234,10 +236,10 @@ class Table {
   [[nodiscard]] bool LSTableColumnRejected(slot_t col,
                                            uint64_t generation) const;
   void NoteLSTableColumnRejected(slot_t col, uint64_t generation) const;
-  size_t EvictIdleColumnarHeadroom(size_t target_bytes) const;
+  [[nodiscard]] size_t EvictIdleColumnarHeadroom(size_t target_bytes) const;
   [[nodiscard]] size_t CachedColumnCountForTest() const;
   [[nodiscard]] std::shared_ptr<const TlcsFile> GetBackingTlcsStore() const;
-  void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store);
+  void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
   void RefillBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
   [[nodiscard]] std::shared_ptr<const TablePageDirectory>
   GetCleanPageDirectory() const;
@@ -246,7 +248,7 @@ class Table {
   [[nodiscard]] uint64_t BackingColumnarRowCount() const;
   Status EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const;
   [[nodiscard]] bool LSTableCapacityRejected(uint64_t generation) const {
-    return incarnation_state_ != nullptr &&
+    return generation != 0 && incarnation_state_ != nullptr &&
            incarnation_state_->LSTableCapacityRejectedGeneration() ==
                generation;
   }
@@ -291,7 +293,7 @@ class Table {
   friend std::ostream& operator<<(std::ostream& o, const Table& t);
   bool operator==(const Table& rhs) const;
   [[nodiscard]] const Index& GetIndex(size_t offset) const {
-    return indexes_[offset];
+    return indexes_.at(offset);
   }
   [[nodiscard]] Status ReadEncodedFromStub(RowPosition pos,
                                            std::string* out) const;

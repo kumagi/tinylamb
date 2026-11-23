@@ -481,6 +481,8 @@ void ParallelMergeJoin::EnsureMaterialized() {
       FailWith(st);
       return;
     }
+    // No reserve: reserve(size()+batch) exhausts capacity every batch and
+    // copies all materialized rows; push_back growth is already amortized.
     for (size_t i = 0; i < batch.Size(); ++i) {
       left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
@@ -491,6 +493,7 @@ void ParallelMergeJoin::EnsureMaterialized() {
       FailWith(st);
       return;
     }
+    // No reserve: same anti-pattern as the left side above.
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
@@ -520,7 +523,11 @@ void ParallelMergeJoin::EnsureMaterialized() {
   // A failed child must stop materialization here: continuing would run the
   // merge over truncated input and serve the partial join as success
   // (mirrors SharedBuildParallelHashJoin).
-  if (FailWithChildOf(*left_) || FailWithChildOf(*right_)) {
+  // Evaluate both children: short-circuiting on a failed left child would
+  // skip latching the right child's distinct failure.
+  const bool left_failed = FailWithChildOf(*left_);
+  const bool right_failed = FailWithChildOf(*right_);
+  if (left_failed || right_failed) {
     return;
   }
 

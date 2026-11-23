@@ -108,8 +108,11 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
   物理変更なしで成功とし、再適用によるエラーを発生させない。
 - 理由: リカバリは同じログを複数回適用し得るため、物理バイトの変化ではなく
   論理ページ状態を成功条件にする。
-- 実装範囲: `recovery/recovery_manager.cpp`、`page/row_page.cpp`、
-  `page/leaf_page.cpp`、`page/branch_page.cpp` の redo/undo操作と回帰テスト。
+- 当時の実装範囲: `recovery/recovery_manager.cpp`、`page/row_page.cpp`、
+  旧 B+Tree の `page/leaf_page.cpp` / `page/branch_page.cpp` の redo/undo 操作と
+  回帰テスト。後者の2ファイルは B+Tree 廃止に伴い削除済み。現行の復旧契約と
+  検証入口は `recovery/recovery_manager.cpp`、`recovery/recovery_manager_test.cpp`、
+  `docs/recovery_invariants.md` を参照。
 
 ### 守る不変条件
 
@@ -125,7 +128,7 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 ### 受け入れ条件
 
 1. loser INSERT/DELETEを含むDBをクラッシュさせ、`RecoverFrom`、flush、再起動、
-   `RecoverFrom`を2〜3回実行して、RowCount、行内容、`SanityCheckForTest` が毎回
+   `RecoverFrom`を2〜3回実行して、RowCount、行内容、索引の構造整合性が毎回
    一致する。
 2. leaf と branch の削除・挿入CLRを同じログへ再適用しても、構造検査が成功する。
 3. 再適用で物理変更が発生しないケースを成功として検証する。
@@ -423,7 +426,7 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 - 理由: foster chainを壊してsubtreeを孤児化する誤ったliftを防ぎ、既存の削除・挿入・
   前後走査の構造を維持する。
 - 実装範囲: LSM 索引 (`index/lsm_index.*`) のルート縮退・ページ回収、
-  `SanityCheckForTest`を用いた回帰・fuzzテスト。
+  索引の構造検査を用いた回帰・fuzzテスト。
 
 ### 守る不変条件
 

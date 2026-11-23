@@ -32,8 +32,8 @@ TEST(RangeSelectionTest, SignedBoundsTailsAndUnalignedBuffers) {
       for (uint32_t row = 0; row < count; ++row) {
         if (input[row + 1] >= lower && input[row + 1] <= upper) {
           expected.push_back(row);
-}
-}
+        }
+      }
       std::vector<uint32_t> output(count + 2, UINT32_MAX);
       const uint32_t size = SelectInt64ClosedRange(
           input.data() + 1, count, lower, upper, output.data() + 1);
@@ -53,8 +53,9 @@ TEST(RangeSelectionTest, DoubleCompactionKeepsOrderNanInfinityAndTails) {
   const std::vector<double> values{nan, -inf, inf, -0.0, 0.0, -1, 1, 2, 0.5};
   std::vector<int64_t> cells;
   cells.reserve(values.size());
-for (const double v : values) { cells.push_back(std::bit_cast<int64_t>(v));
-}
+  for (const double v : values) {
+    cells.push_back(std::bit_cast<int64_t>(v));
+  }
   for (uint32_t count = 0; count < 128; ++count) {
     for (const double lo : values) {
       for (const double hi : values) {
@@ -68,7 +69,7 @@ for (const double v : values) { cells.push_back(std::bit_cast<int64_t>(v));
               if ((lower_inclusive ? v >= lo : v > lo) &&
                   (upper_inclusive ? v <= hi : v < hi)) {
                 expected.push_back(row);
-}
+              }
             }
             const uint32_t size =
                 CompactDoubleRange(cells.data(), positions.data() + 1, count,

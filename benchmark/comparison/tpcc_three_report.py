@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 
@@ -167,7 +168,8 @@ def generate(directory, output):
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(.5,.93), ncol=3)
     fig.suptitle('Median of per-trial successful transaction percentiles; aborts reported separately')
     fig.tight_layout(rect=(0,0,1,.85));fig.savefig(analysis/'latency.png',dpi=160);fig.savefig(analysis/'latency.svg');plt.close(fig)
-    args=env['tpcc_args'];rel='../benchmark/comparison/results/'+directory.name
+    args=env['tpcc_args']
+    rel=os.path.relpath(directory.resolve(), start=output.parent.resolve())
     pg=dict(env['settings']['postgresql']);mysql=dict(env['settings']['mysql'])
     mysql_tiny = median('mysql','tps')/median('tinylamb','tps')
     mysql_pg = median('mysql','tps')/median('postgresql','tps')

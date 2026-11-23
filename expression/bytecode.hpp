@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXPRESSION_BYTECODE_HPP
 #define TINYLAMB_EXPRESSION_BYTECODE_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -76,6 +77,98 @@ enum class BytecodeOp : uint8_t {
   //   (ascii_substr_1based_slice_sound)
   // Pops `operand` (2 or 3) slots (str, start [, length]) and pushes SUBSTR.
   kSubstr,
+  // Lean proof: lean/TinylambOpt/SimdInRange.lean
+  //   (simd_in_range_sound, int64_range_lowering)
+  // Pops one signed INT64/DATE value and checks wrapping range [lo, hi].
+  kInt64InRange,
+  // Lean proof: lean/TinylambOpt/ResearchProofs/ReciprocalDivMod.lean
+  //   (est_bounds, divModConst_sound)
+  // Pops one signed INT64 value and divides/modulos by non-trivial constant
+  // (|d| >= 2) using ceil(2^64 / |d|) 128-bit multiply-high + 1-step fixup.
+  kDivInt64Const,
+  kModInt64Const,
+  // Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
+  // Pops `row_in_masks_[operand].num_fields` values and pushes 3VL composite
+  // tuple membership evaluated via two 64-bit masks per chunk of candidates.
+  kRowInMask,
+};
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
+struct RowInMaskSpec {
+  struct Column {
+    uint64_t null_mask{0};
+    uint64_t non_null_mask{0};
+    std::array<int64_t, 64> values{};
+  };
+  struct Chunk {
+    uint64_t enabled{0};
+    uint32_t count{0};
+    std::vector<Column> columns;
+  };
+  uint32_t num_fields{0};
+  std::vector<Chunk> chunks;
+};
+
+struct Int64RangeSpec {
+  int64_t lo{0};
+  int64_t hi{0};
+  ValueType expected_type{ValueType::kInt64};
+
+  // Callers must validate lo <= hi before using this range. Converting the
+  // signed endpoints to uint64_t and subtracting modulo 2^64 maps the whole
+  // signed interval (including INT64_MIN..INT64_MAX) to a contiguous unsigned
+  // width; the same wrapping subtraction tests x's distance from lo without
+  // signed overflow. With lo > hi the width would wrap to a misleading range.
+  [[nodiscard]] bool Contains(int64_t x) const noexcept {
+    const auto ux = static_cast<uint64_t>(x);
+    const auto ulo = static_cast<uint64_t>(lo);
+    const uint64_t uwidth = static_cast<uint64_t>(hi) - ulo;
+    return (ux - ulo) <= uwidth;
+  }
+};
+
+struct ReciprocalDivModSpec {
+  int64_t divisor{1};
+  uint64_t abs_d{1};
+  uint64_t recip{0};
+
+  static ReciprocalDivModSpec FromDivisor(int64_t d) noexcept {
+    const uint64_t ad = (d < 0) ? (uint64_t{0} - static_cast<uint64_t>(d))
+                                : static_cast<uint64_t>(d);
+    const uint64_t r =
+        (ad >= 2)
+            ? static_cast<uint64_t>(((__uint128_t{1} << 64) + ad - 1) / ad)
+            : 0;
+    return {.divisor = d, .abs_d = ad, .recip = r};
+  }
+
+  [[nodiscard]] int64_t Div(int64_t x) const noexcept {
+    const bool x_neg = x < 0;
+    const uint64_t ax = x_neg ? (uint64_t{0} - static_cast<uint64_t>(x))
+                              : static_cast<uint64_t>(x);
+    auto q =
+        static_cast<uint64_t>((static_cast<__uint128_t>(ax) * recip) >> 64);
+    if (static_cast<__uint128_t>(q) * abs_d > ax) {
+      --q;
+    }
+    const bool q_neg = x_neg != (divisor < 0);
+    return q_neg ? static_cast<int64_t>(uint64_t{0} - q)
+                 : static_cast<int64_t>(q);
+  }
+
+  [[nodiscard]] int64_t Mod(int64_t x) const noexcept {
+    const bool x_neg = x < 0;
+    const uint64_t ax = x_neg ? (uint64_t{0} - static_cast<uint64_t>(x))
+                              : static_cast<uint64_t>(x);
+    auto q =
+        static_cast<uint64_t>((static_cast<__uint128_t>(ax) * recip) >> 64);
+    if (static_cast<__uint128_t>(q) * abs_d > ax) {
+      --q;
+    }
+    const uint64_t r = ax - (q * abs_d);
+    return x_neg ? static_cast<int64_t>(uint64_t{0} - r)
+                 : static_cast<int64_t>(r);
+  }
 };
 
 struct StringSetSpec {
@@ -204,8 +297,14 @@ class BytecodeProgram {
   // D7: the compiler emits a conditional jump before knowing the target,
   // then patches it once the short-circuit label is reached.
   [[nodiscard]] size_t Size() const { return instructions_.size(); }
-  void SetJumpTarget(size_t index, int32_t relative_offset) {
+  // Returns false (leaving the program unchanged) for an out-of-range index,
+  // e.g. when a compiler bug patches a label before emitting its instruction.
+  bool SetJumpTarget(size_t index, int32_t relative_offset) {
+    if (index >= instructions_.size()) {
+      return false;
+    }
     instructions_[index].jump_target = relative_offset;
+    return true;
   }
   bool AddConstant(Value value, uint16_t* offset) {
     if (constants_.size() >= std::numeric_limits<uint16_t>::max()) {
@@ -243,6 +342,39 @@ class BytecodeProgram {
   }
   void MarkHasSubstr() { has_substr_ = true; }
   [[nodiscard]] bool HasSubstr() const { return has_substr_; }
+  bool AddInt64Range(Int64RangeSpec spec, uint16_t* offset) {
+    if (int64_ranges_.size() >= std::numeric_limits<uint16_t>::max()) {
+      return false;
+    }
+    int64_ranges_.push_back(spec);
+    *offset = static_cast<uint16_t>(int64_ranges_.size() - 1);
+    return true;
+  }
+  [[nodiscard]] const std::vector<Int64RangeSpec>& Int64Ranges() const {
+    return int64_ranges_;
+  }
+  bool AddReciprocal(ReciprocalDivModSpec spec, uint16_t* offset) {
+    if (reciprocals_.size() >= std::numeric_limits<uint16_t>::max()) {
+      return false;
+    }
+    reciprocals_.push_back(spec);
+    *offset = static_cast<uint16_t>(reciprocals_.size() - 1);
+    return true;
+  }
+  [[nodiscard]] const std::vector<ReciprocalDivModSpec>& Reciprocals() const {
+    return reciprocals_;
+  }
+  bool AddRowInMask(RowInMaskSpec spec, uint16_t* offset) {
+    if (row_in_masks_.size() >= std::numeric_limits<uint16_t>::max()) {
+      return false;
+    }
+    row_in_masks_.push_back(std::move(spec));
+    *offset = static_cast<uint16_t>(row_in_masks_.size() - 1);
+    return true;
+  }
+  [[nodiscard]] const std::vector<RowInMaskSpec>& RowInMasks() const {
+    return row_in_masks_;
+  }
   void SetResultType(ValueType type) { result_type_ = type; }
   // Compile-time shape scan: marks whether TryEvaluateRowFast can take this
   // program.  Only the compiler may call it (hand-built programs stay
@@ -256,6 +388,9 @@ class BytecodeProgram {
   bool has_varchar_constant_{false};
   std::vector<CastSpec> casts_;
   std::vector<StringSetSpec> string_sets_;
+  std::vector<Int64RangeSpec> int64_ranges_;
+  std::vector<ReciprocalDivModSpec> reciprocals_;
+  std::vector<RowInMaskSpec> row_in_masks_;
   ValueType result_type_{ValueType::kNull};
   bool fast_interpretable_{false};
   bool has_substr_{false};
@@ -289,11 +424,19 @@ class BytecodeCompiler {
       Context context = Context::kValue);
 };
 
+// Bitmask of bytecode optimization disable toggles for cache invalidation.
+[[nodiscard]] uint8_t BytecodeOptToggleBits() noexcept;
+
 // Differential-testing hook: false when TINYLAMB_DISABLE_BYTECODE is set in
 // the environment. Compile call sites gate on this so the same query can be
 // executed through the AST evaluation path (the semantic reference) and
 // compared against the bytecode/JIT fast path.
 [[nodiscard]] bool BytecodeEnabled();
+// Thread-safe in-process override for differential harnesses. Prefer this
+// over mutating TINYLAMB_DISABLE_BYTECODE with setenv/unsetenv, which races
+// getenv in parallel executor workers. The environment variable still wins
+// when it is set externally and this override is false.
+void SetBytecodeDisabledForProcess(bool disabled);
 
 // Row evaluation through the boxing-free interpreter with a canonical
 // fallback: fast-shaped programs (columns/constants/int64+double arithmetic)
@@ -302,6 +445,11 @@ class BytecodeCompiler {
 // (differential_test pins this).
 [[nodiscard]] StatusOr<Value> TryEvaluateRowAuto(const BytecodeProgram& program,
                                                  const Row& row);
+
+// Conservative "cannot raise an error on any row" analysis used by the
+// filter-order pass. Exposed for audits/tests of the error-free contract.
+[[nodiscard]] bool AuditIsErrorFreePredicateForOrdering(const Expression& expr,
+                                                        const Schema& schema);
 
 }  // namespace tinylamb
 #endif

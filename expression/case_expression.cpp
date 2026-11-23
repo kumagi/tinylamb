@@ -16,6 +16,7 @@
 
 #include "expression/case_expression.hpp"
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 #include <unordered_set>
@@ -36,8 +37,13 @@ namespace tinylamb {
 std::unordered_set<ColumnName> CaseExpression::TouchedColumns() const {
   std::unordered_set<ColumnName> result;
   for (const auto& when : when_clauses_) {
-    result.merge(when.first->TouchedColumns());
-    result.merge(when.second->TouchedColumns());
+    // Hand-built or rewrite-damaged trees can contain null WHEN/THEN nodes.
+    if (when.first) {
+      result.merge(when.first->TouchedColumns());
+    }
+    if (when.second) {
+      result.merge(when.second->TouchedColumns());
+    }
   }
   if (else_clause_) {
     result.merge(else_clause_->TouchedColumns());
@@ -51,8 +57,16 @@ StatusOr<Value> TryPickBranch(
     const std::vector<std::pair<Expression, Expression>>& when_clauses,
     ExpressionBase* else_clause, Args&&... args) {
   for (const auto& when : when_clauses) {
+    // Hand-built or rewrite-damaged trees can contain null WHEN/THEN nodes;
+    // a missing condition can never be true and a missing THEN yields NULL.
+    if (when.first == nullptr) {
+      continue;
+    }
     ASSIGN_OR_RETURN(Value, condition, when.first->TryEvaluate(args...));
     if (!condition.IsNull() && condition.Truthy()) {
+      if (when.second == nullptr) {
+        return Value();
+      }
       return when.second->TryEvaluate(args...);
     }
   }
@@ -63,10 +77,6 @@ StatusOr<Value> TryPickBranch(
 }
 }  // namespace
 
-StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
-                                            const Schema& schema) const {
-  return TryPickBranch(when_clauses_, else_clause_.get(), row, schema);
-}
 
 namespace {
 
@@ -81,24 +91,75 @@ Type UnifiedBranchType(std::vector<Type> branch_types) {
     return {TypeTag::kInvalid};
   }
   const Type first = branch_types.front();
+  bool all_same = true;
+  bool has_bigint = false;
+  bool has_double = false;
   for (const Type& type : branch_types) {
-    if (type.GetType() != first.GetType()) {
-      // Branches disagree on the result type; the declared type would not
-      // match the actually returned values.
-      return {TypeTag::kInvalid};
+    const TypeTag tag = type.GetType();
+    if (tag != first.GetType()) {
+      all_same = false;
+    }
+    if (tag == TypeTag::kInteger || tag == TypeTag::kBigInt) {
+      has_bigint = has_bigint || tag == TypeTag::kBigInt;
+    } else if (tag == TypeTag::kDouble) {
+      has_double = true;
+    } else {
+      // Non-numeric branches must still agree exactly.
+      if (tag != first.GetType()) {
+        return {TypeTag::kInvalid};
+      }
     }
   }
-  return first;
+  if (all_same) {
+    return first;
+  }
+  const bool all_numeric = std::ranges::all_of(
+      branch_types, [](const Type& type) {
+        return type.GetType() == TypeTag::kInteger ||
+               type.GetType() == TypeTag::kBigInt ||
+               type.GetType() == TypeTag::kDouble;
+      });
+  if (all_numeric) {
+    return has_double ? Type(TypeTag::kDouble)
+                      : (has_bigint ? Type(TypeTag::kBigInt)
+                                    : Type(TypeTag::kInteger));
+  }
+  return {TypeTag::kInvalid};
+}
+
+StatusOr<Value> CoerceCaseBranch(StatusOr<Value> result, Type result_type) {
+  if (!result.HasValue()) {
+    return result.GetStatus();
+  }
+  Value value = result.MoveValue();
+  if (value.IsNull() || result_type.GetType() != TypeTag::kDouble ||
+      value.type != ValueType::kInt64) {
+    return value;
+  }
+  const double converted =
+      value.IsUnsigned()
+          ? static_cast<double>(static_cast<uint64_t>(value.value.int_value))
+          : static_cast<double>(value.value.int_value);
+  return Value(converted);
 }
 
 }  // namespace
+
+StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
+                                            const Schema& schema) const {
+  return CoerceCaseBranch(
+      TryPickBranch(when_clauses_, else_clause_.get(), row, schema),
+      ResultType(schema));
+}
 
 StatusOr<Value> CaseExpression::TryEvaluate(const Row* left,
                                             const Schema& left_schema,
                                             const Row* right,
                                             const Schema& right_schema) const {
-  return TryPickBranch(when_clauses_, else_clause_.get(), left, left_schema,
-                       right, right_schema);
+  return CoerceCaseBranch(
+      TryPickBranch(when_clauses_, else_clause_.get(), left, left_schema,
+                    right, right_schema),
+      ResultType(left_schema, right_schema));
 }
 
 // Context-aware form: same dispatch as the plain evaluator with the context
@@ -106,7 +167,9 @@ StatusOr<Value> CaseExpression::TryEvaluate(const Row* left,
 StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
                                             const Schema& schema,
                                             EvaluationContext& context) const {
-  return TryPickBranch(when_clauses_, else_clause_.get(), row, schema, context);
+  return CoerceCaseBranch(
+      TryPickBranch(when_clauses_, else_clause_.get(), row, schema, context),
+      ResultType(schema));
 }
 
 // EXC-SHIM: deprecated throwing wrappers (common/exc_shim.hpp).
@@ -131,7 +194,7 @@ Type CaseExpression::ResultType(const Schema& schema) const {
   std::vector<tinylamb::Type> branch_types;
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
-    if (!IsNullLiteral(when.second)) {
+    if (when.second != nullptr && !IsNullLiteral(when.second)) {
       branch_types.push_back(when.second->ResultType(schema));
     }
   }
@@ -145,7 +208,7 @@ Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
   std::vector<tinylamb::Type> branch_types;
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
-    if (!IsNullLiteral(when.second)) {
+    if (when.second != nullptr && !IsNullLiteral(when.second)) {
       branch_types.push_back(when.second->ResultType(left, right));
     }
   }
@@ -158,8 +221,10 @@ Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
 std::string CaseExpression::ToString() const {
   std::string result = "CASE";
   for (const auto& when : when_clauses_) {
-    result +=
-        " WHEN " + when.first->ToString() + " THEN " + when.second->ToString();
+    result += " WHEN " +
+              (when.first ? when.first->ToString() : std::string("<null>")) +
+              " THEN " +
+              (when.second ? when.second->ToString() : std::string("<null>"));
   }
   if (else_clause_) {
     result += " ELSE " + else_clause_->ToString();

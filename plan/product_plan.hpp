@@ -287,8 +287,8 @@ class ProductPlan final : public PlanBase {
 // no statistics for it. 0 is a legal (coarser) answer, never an unsafe one.
 [[nodiscard]] double JoinKeyDomainEstimate(const Plan& plan,
                                            const ColumnName& column);
-// Widest single-key estimate over `columns` (a composite key cannot have more
-// distinct values than its widest component).
+// Composite-key NDV estimate from the product of component NDVs, capped at
+// the plan row count. Returns 0 when any component has no usable statistics.
 [[nodiscard]] double JoinKeyDomainEstimate(
     const Plan& plan, const std::vector<ColumnName>& columns);
 // Build rows the probe key domain can still admit.

@@ -5,17 +5,20 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <optional>
 #include <ostream>
 #include <ranges>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/join_kind.hpp"
 #include "common/memory_budget.hpp"
 #include "common/set_operation.hpp"
@@ -23,6 +26,7 @@
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/disjunctive_join_branches.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/ooc/chunk_codec.hpp"
 #include "executor/detail/ooc/external_sorter.hpp"
@@ -669,56 +673,68 @@ Status OocBandJoinSource::Open(PipelineContext* ctx) {
 }
 
 Status OocBandJoinSource::PullNextLeftBlock(PipelineContext* ctx) {
-  left_block_.clear();
-  cur_left_idx_ = 0;
-  left_key_index_.clear();
-  cand_lo_ = cand_hi_ = cur_cand_idx_ = 0;
-  right_row_current_ = false;
-  size_t block_bytes = 0;
-  const size_t max_block_bytes = std::max<size_t>(16384, budget_bytes_ / 2);
+  try {
+    left_block_.clear();
+    cur_left_idx_ = 0;
+    left_key_index_.clear();
+    cand_lo_ = cand_hi_ = cur_cand_idx_ = 0;
+    right_row_current_ = false;
+    size_t block_bytes = 0;
+    const size_t max_block_bytes = std::max<size_t>(16384, budget_bytes_ / 2);
 
-  while (block_bytes < max_block_bytes) {
-    if (in_left_idx_ >= in_left_chunk_.Size()) {
-      in_left_chunk_.Reset();
-      in_left_idx_ = 0;
-      if (left_eof_) {
-        break;
+    while (block_bytes < max_block_bytes) {
+      if (in_left_idx_ >= in_left_chunk_.Size()) {
+        in_left_chunk_.Reset();
+        in_left_idx_ = 0;
+        if (left_eof_) {
+          break;
+        }
+        ASSIGN_OR_RETURN(
+            bool, got,
+            PullStreamChunk(ctx, left_.source.get(), left_.operators,
+                            &in_left_chunk_, kDefaultVectorSize, &left_eof_));
+        if (!got || in_left_chunk_.Empty()) {
+          left_eof_ = true;
+          break;
+        }
       }
-      ASSIGN_OR_RETURN(
-          bool, got,
-          PullStreamChunk(ctx, left_.source.get(), left_.operators,
-                          &in_left_chunk_, kDefaultVectorSize, &left_eof_));
-      if (!got || in_left_chunk_.Empty()) {
-        left_eof_ = true;
-        break;
+      if (left_block_.capacity() == 0) {
+        left_block_.reserve(std::min(in_left_chunk_.Size() - in_left_idx_,
+                                     max_block_bytes / sizeof(LeftEntry)));
       }
+      Row r = in_left_chunk_.RowAt(in_left_idx_);
+      const RowPosition pos = in_left_chunk_.PositionAt(in_left_idx_);
+      ++in_left_idx_;
+      ASSIGN_OR_RETURN(std::optional<int64_t>, k, ReadKey(r, left_col_));
+      if (k.has_value()) {
+        if (!key_type_.has_value()) {
+          key_type_ = r[left_col_].type;
+        }
+        if (have_prev_left_key_ && *k < prev_left_key_) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "BandJoin left input is not ordered");
+        }
+        prev_left_key_ = *k;
+        have_prev_left_key_ = true;
+      }
+      block_bytes += EstimateRowMemoryBytes(r) + sizeof(LeftEntry);
+      if (k.has_value()) {
+        left_key_index_.emplace_back(*k, left_block_.size());
+      }
+      left_block_.push_back(LeftEntry{.row = std::move(r), .pos = pos, .key = k});
     }
-    Row r = in_left_chunk_.RowAt(in_left_idx_);
-    const RowPosition pos = in_left_chunk_.PositionAt(in_left_idx_);
-    ++in_left_idx_;
-    ASSIGN_OR_RETURN(std::optional<int64_t>, k, ReadKey(r, left_col_));
-    if (k.has_value()) {
-      if (!key_type_.has_value()) {
-        key_type_ = r[left_col_].type;
-      }
-      if (have_prev_left_key_ && *k < prev_left_key_) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "BandJoin left input is not ordered");
-      }
-      prev_left_key_ = *k;
-      have_prev_left_key_ = true;
-    }
-    block_bytes += EstimateRowMemoryBytes(r) + sizeof(LeftEntry);
-    if (k.has_value()) {
-      left_key_index_.emplace_back(*k, left_block_.size());
-    }
-    left_block_.push_back(LeftEntry{.row = std::move(r), .pos = pos, .key = k});
+    // The input is verified ordered (see above), but sort defensively so the
+    // binary searches below are valid even if a NULL key split the run.
+    std::sort(left_key_index_.begin(), left_key_index_.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return Status::kSuccess;
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "band join left block allocation failed");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "band join left block is too large");
   }
-  // The input is verified ordered (see above), but sort defensively so the
-  // binary searches below are valid even if a NULL key split the run.
-  std::sort(left_key_index_.begin(), left_key_index_.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-  return Status::kSuccess;
 }
 
 StatusOr<bool> OocBandJoinSource::NextBatch(PipelineContext* ctx,
@@ -1016,17 +1032,100 @@ void OocCrossJoinBuildSink::DumpExplain(std::ostream& out, int indent) const {
                   cross_ctx_->right_ops_explain);
 }
 
+struct OocCrossJoinProbeSource::DisjunctiveJoinIndex {
+  std::vector<Row> right_rows;
+  std::vector<relational_detail::DisjunctiveBranchBuckets> buckets;
+  QueryMemoryGrant::LocalBatchCache mem_guard;
+  Row combined_scratch;
+  Row null_right;
+
+  bool has_cur_left{false};
+  Row cur_left_row;
+  RowPosition cur_left_pos;
+  bool cur_left_matched{false};
+  size_t branch_idx{0};
+  bool probe_initialized{false};
+  bool linear_fallback{false};
+  std::span<const uint32_t> candidates;
+  size_t cand_idx{0};
+};
+
 OocCrossJoinProbeSource::OocCrossJoinProbeSource(
     std::shared_ptr<OocCrossJoinContext> cross_ctx,
     OocSetOpInputStream left_stream)
     : cross_ctx_(std::move(cross_ctx)), left_(std::move(left_stream)) {}
 
-Status OocCrossJoinProbeSource::Open(PipelineContext* ctx) {
+OocCrossJoinProbeSource::~OocCrossJoinProbeSource() = default;
+
+Status OocCrossJoinProbeSource::Open(PipelineContext* ctx) try {
   if (left_.source != nullptr) {
     RETURN_IF_FAIL(left_.source->Open(ctx));
   }
   for (const auto& op : left_.operators) {
     RETURN_IF_FAIL(op->Open(ctx));
+  }
+  if ((cross_ctx_->kind == JoinKind::kInner ||
+       cross_ctx_->kind == JoinKind::kLeftOuter) &&
+      !cross_ctx_->right_store->Spilled() &&
+      !cross_ctx_->right_store->Empty() &&
+      cross_ctx_->right_store->RowCount() <=
+          std::numeric_limits<uint32_t>::max() &&
+      !ProcessMemoryBudget::Global().AlwaysSpillEnabled()) {
+    auto specs = relational_detail::ExtractDisjunctiveJoinBranches(
+        cross_ctx_->residual, cross_ctx_->left_schema, cross_ctx_->right_schema,
+        cross_ctx_->combined_schema);
+    if (specs.has_value()) {
+      const size_t rcount = cross_ctx_->right_store->RowCount();
+      const size_t est_bytes =
+          cross_ctx_->right_store->InMemoryBytes() +
+          (rcount * (sizeof(Row) + specs->size() * size_t{48}));
+      QueryMemoryGrant::LocalBatchCache guard(&ctx->grant, 4096);
+      if (guard.Reserve(est_bytes)) {
+        // Lean proof: lean/TinylambOpt/OuterOrBranches.lean
+        //   (outer_or_branches_sound)
+        auto idx = std::make_unique<DisjunctiveJoinIndex>();
+        idx->mem_guard = std::move(guard);
+        idx->null_right = Row(std::vector<Value>(cross_ctx_->right_width));
+        idx->right_rows.reserve(rcount);
+        idx->buckets.reserve(specs->size());
+        for (auto& spec : *specs) {
+          idx->buckets.emplace_back(std::move(spec));
+          idx->buckets.back().Reserve(rcount);
+        }
+        RETURN_IF_FAIL(cross_ctx_->right_store->ResetCursor());
+        DataChunk rchunk;
+        bool build_ok = true;
+        while (true) {
+          ASSIGN_OR_RETURN(bool, got,
+                           cross_ctx_->right_store->NextChunk(&rchunk));
+          if (!got) {
+            break;
+          }
+          for (size_t i = 0; i < rchunk.Size(); ++i) {
+            const auto r_id = static_cast<uint32_t>(idx->right_rows.size());
+            idx->right_rows.push_back(rchunk.RowAt(i));
+            const Row& stored = idx->right_rows.back();
+            for (auto& b : idx->buckets) {
+              if (!b.AddRightRow(r_id, stored)) {
+                build_ok = false;
+                break;
+              }
+            }
+            if (!build_ok) {
+              break;
+            }
+          }
+          if (!build_ok) {
+            break;
+          }
+        }
+        RETURN_IF_FAIL(cross_ctx_->right_store->ResetCursor());
+        if (build_ok) {
+          disj_index_ = std::move(idx);
+          return Status::kSuccess;
+        }
+      }
+    }
   }
   if (cross_ctx_->kind == JoinKind::kRightOuter ||
       cross_ctx_->kind == JoinKind::kFullOuter) {
@@ -1036,6 +1135,9 @@ Status OocCrossJoinProbeSource::Open(PipelineContext* ctx) {
   }
   right_outer_done_ = false;
   return Status::kSuccess;
+} catch (...) {
+  return StatusFromCurrentException(
+      "cross join probe source open failed unexpectedly");
 }
 
 StatusOr<bool> OocCrossJoinProbeSource::PairPasses(const Row& left_row,
@@ -1057,39 +1159,151 @@ StatusOr<bool> OocCrossJoinProbeSource::PairPasses(const Row& left_row,
 }
 
 Status OocCrossJoinProbeSource::FillNextLeftBlock(PipelineContext* ctx) {
-  left_block_.clear();
-  const size_t max_bytes =
-      std::max<size_t>(kMinJoinMemBudget, cross_ctx_->budget_bytes / 2);
-  size_t cur_bytes = 0;
+  try {
+    left_block_.clear();
+    const size_t max_bytes =
+        std::max<size_t>(kMinJoinMemBudget, cross_ctx_->budget_bytes / 2);
+    size_t cur_bytes = 0;
 
-  while (cur_bytes < max_bytes) {
-    if (in_left_idx_ >= in_left_chunk_.Size()) {
-      in_left_chunk_.Reset();
-      in_left_idx_ = 0;
-      if (left_eof_) {
-        break;
+    while (cur_bytes < max_bytes) {
+      if (in_left_idx_ >= in_left_chunk_.Size()) {
+        in_left_chunk_.Reset();
+        in_left_idx_ = 0;
+        if (left_eof_) {
+          break;
+        }
+        ASSIGN_OR_RETURN(
+            bool, got,
+            PullStreamChunk(ctx, left_.source.get(), left_.operators,
+                            &in_left_chunk_, kDefaultVectorSize, &left_eof_));
+        if (!got || in_left_chunk_.Empty()) {
+          left_eof_ = true;
+          break;
+        }
       }
-      ASSIGN_OR_RETURN(
-          bool, got,
-          PullStreamChunk(ctx, left_.source.get(), left_.operators,
-                          &in_left_chunk_, kDefaultVectorSize, &left_eof_));
-      if (!got || in_left_chunk_.Empty()) {
-        left_eof_ = true;
+      if (left_block_.capacity() == 0) {
+        left_block_.reserve(std::min(in_left_chunk_.Size() - in_left_idx_,
+                                     max_bytes / sizeof(LeftEntry)));
+      }
+      Row r = in_left_chunk_.RowAt(in_left_idx_);
+      const RowPosition pos = in_left_chunk_.PositionAt(in_left_idx_);
+      ++in_left_idx_;
+      cur_bytes += EstimateRowMemoryBytes(r) + sizeof(LeftEntry);
+      left_block_.push_back(LeftEntry{.row = std::move(r), .pos = pos});
+    }
+    return Status::kSuccess;
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "cross join left block allocation failed");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "cross join left block is too large");
+  }
+}
+
+StatusOr<bool> OocCrossJoinProbeSource::NextDisjunctiveBatch(
+    PipelineContext* ctx, DataChunk* out, size_t max_rows) {
+  DisjunctiveJoinIndex& idx = *disj_index_;
+  out->Reset(cross_ctx_->output_schema, max_rows);
+
+  while (out->Size() < max_rows) {
+    if (!idx.has_cur_left) {
+      if (in_left_idx_ >= in_left_chunk_.Size()) {
+        in_left_chunk_.Reset();
+        in_left_idx_ = 0;
+        if (left_eof_) {
+          disj_index_.reset();
+          break;
+        }
+        ASSIGN_OR_RETURN(
+            bool, got,
+            PullStreamChunk(ctx, left_.source.get(), left_.operators,
+                            &in_left_chunk_, kDefaultVectorSize, &left_eof_));
+        if (!got || in_left_chunk_.Empty()) {
+          left_eof_ = true;
+          disj_index_.reset();
+          break;
+        }
+      }
+      idx.cur_left_row = in_left_chunk_.RowAt(in_left_idx_);
+      idx.cur_left_pos = in_left_chunk_.PositionAt(in_left_idx_);
+      ++in_left_idx_;
+      idx.has_cur_left = true;
+      idx.cur_left_matched = false;
+      idx.branch_idx = 0;
+      idx.probe_initialized = false;
+    }
+
+    if (idx.branch_idx >= idx.buckets.size()) {
+      if (!idx.cur_left_matched && cross_ctx_->kind == JoinKind::kLeftOuter) {
+        out->Append(idx.cur_left_row + idx.null_right, idx.cur_left_pos);
+      }
+      idx.has_cur_left = false;
+      continue;
+    }
+
+    if (!idx.probe_initialized) {
+      idx.cand_idx = 0;
+      idx.candidates = {};
+      idx.linear_fallback =
+          !idx.buckets[idx.branch_idx].Probe(idx.cur_left_row, &idx.candidates);
+      idx.probe_initialized = true;
+    }
+
+    const size_t total_cands =
+        idx.linear_fallback ? idx.right_rows.size() : idx.candidates.size();
+    if (idx.cand_idx >= total_cands) {
+      ++idx.branch_idx;
+      idx.probe_initialized = false;
+      continue;
+    }
+
+    const uint32_t r_idx = idx.linear_fallback
+                               ? static_cast<uint32_t>(idx.cand_idx)
+                               : idx.candidates[idx.cand_idx];
+    ++idx.cand_idx;
+    const Row& r_row = idx.right_rows[r_idx];
+    idx.combined_scratch.values_.clear();
+    idx.combined_scratch.values_.reserve(idx.cur_left_row.values_.size() +
+                                         r_row.values_.size());
+    idx.combined_scratch.values_.insert(idx.combined_scratch.values_.end(),
+                                        idx.cur_left_row.values_.begin(),
+                                        idx.cur_left_row.values_.end());
+    idx.combined_scratch.values_.insert(idx.combined_scratch.values_.end(),
+                                        r_row.values_.begin(),
+                                        r_row.values_.end());
+
+    ASSIGN_OR_RETURN(Value, res,
+                     idx.buckets[idx.branch_idx].Spec().expr->TryEvaluate(
+                         idx.combined_scratch, cross_ctx_->combined_schema));
+    if (res.IsNull() || !res.Truthy()) {
+      continue;
+    }
+    bool prior_matched = false;
+    for (size_t j = 0; j < idx.branch_idx; ++j) {
+      ASSIGN_OR_RETURN(Value, prev,
+                       idx.buckets[j].Spec().expr->TryEvaluate(
+                           idx.combined_scratch, cross_ctx_->combined_schema));
+      if (!prev.IsNull() && prev.Truthy()) {
+        prior_matched = true;
         break;
       }
     }
-    Row r = in_left_chunk_.RowAt(in_left_idx_);
-    const RowPosition pos = in_left_chunk_.PositionAt(in_left_idx_);
-    ++in_left_idx_;
-    cur_bytes += EstimateRowMemoryBytes(r) + sizeof(LeftEntry);
-    left_block_.push_back(LeftEntry{.row = std::move(r), .pos = pos});
+    if (prior_matched) {
+      continue;
+    }
+    idx.cur_left_matched = true;
+    out->Append(idx.combined_scratch, idx.cur_left_pos);
   }
-  return Status::kSuccess;
+  return !out->Empty();
 }
 
 StatusOr<bool> OocCrossJoinProbeSource::NextBatch(PipelineContext* ctx,
                                                   DataChunk* out,
                                                   size_t max_rows) {
+  if (disj_index_ != nullptr) {
+    return NextDisjunctiveBatch(ctx, out, max_rows);
+  }
   const JoinKind kind = cross_ctx_->kind;
   const bool left_outer =
       kind == JoinKind::kLeftOuter || kind == JoinKind::kFullOuter;
@@ -1304,6 +1518,8 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
   constexpr size_t kMaxRows = 10'000'000;
 
   if (body_->UnionAll().empty()) {
+    // An anchor without recursive terms is an ordinary finite query. Only
+    // rows inserted into the recursive work table count toward kMaxRows.
     ASSIGN_OR_RETURN(
         relational_detail::Relation, executed,
         relational_detail::ExecuteQuery(*ctx->txn, *body_, nullptr, {}));
@@ -1391,6 +1607,10 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         return StatusError(StatusCode::kInvalidArgument,
                            "sort key column index out of range");
       }
+      // collation defaults to kNone on purpose: SortKeyOrder::Compare still
+      // resolves a case-insensitive peer rule from the operand Values' own
+      // tags, matching WorkTableIndex's EqualUnderCollation. This keeps the
+      // spilled set identical to the resident one across the spill boundary.
       keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(c)});
     }
     ExternalSorter::Options sopts;
@@ -1464,14 +1684,26 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         return true;  // Deferred to ExternalSorter merge anti-join.
       }
       if (!work_index.Insert(payload)) {
+        // Insert returns false when the index already held this peer; the
+        // Contains check above normally catches that first.
         return false;
       }
-      // The row already lives in `work_index`; only account for its
-      // approximate footprint here (no parallel copy).
+      // Insert just stored a new row (with its own copy), so account for its
+      // approximate footprint here.
       mem_seen_bytes += add;
       return true;
     }
     return true;  // Deferred to ExternalSorter merge anti-join when spilled.
+  };
+
+  size_t total_emitted = 0;
+  auto count_work_row = [&]() -> Status {
+    if (total_emitted == kMaxRows) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "recursive CTE " + cte_name_ + " exceeded the row budget");
+    }
+    ++total_emitted;
+    return Status::kSuccess;
   };
 
   auto merge_spilled_candidates = [&](ExternalSorter* cand_sorter,
@@ -1524,6 +1756,9 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
 
     auto cmp_rows = [&](const Row& a, const Row& b) {
       for (size_t c = 0; c < working_cols; ++c) {
+        // kNone is the *static* key collation; SortKeyOrder::Compare resolves
+        // the runtime collation from the operand tags on top of it, so an
+        // anti-join peer here matches WorkTableIndex's EqualUnderCollation.
         const SortKeyOrder ord(true, true, Collation::kNone);
         const int cm = ord.Compare(a[c], b[c]);
         if (cm != 0) {
@@ -1563,6 +1798,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         RETURN_IF_FAIL(adv_reached());
         RETURN_IF_FAIL(adv_cand());
       } else if (cm < 0) {
+        RETURN_IF_FAIL(count_work_row());
         Row stored = cand;
         if (track_depth) {
           stored.values_.emplace_back(row_depth);
@@ -1583,6 +1819,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
       }
     }
     while (c_valid) {
+      RETURN_IF_FAIL(count_work_row());
       Row stored = cand;
       if (track_depth) {
         stored.values_.emplace_back(row_depth);
@@ -1623,13 +1860,14 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
   auto delta = std::make_shared<relational_detail::Relation>(
       ctx->txn->execution_runtime());
   delta->schema = work_schema;
-  uint64_t total_emitted = 0;
-
   std::unique_ptr<ExternalSorter> anchor_sorter;
   auto ensure_anchor_sorter = [&]() -> Status {
     if (anchor_sorter != nullptr) {
       return Status::kSuccess;
     }
+    // kNone static collation is intentional: SortKeyOrder resolves the
+    // runtime peer rule from each operand Value's tag (as WorkTableIndex
+    // does), so collated strings stay adjacent across the external sort.
     std::vector<OocSortKey> keys;
     keys.reserve(working_cols);
     for (size_t c = 0; c < working_cols; ++c) {
@@ -1670,6 +1908,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
           return anchor_sorter->AddRow(r);
         }
       }
+      RETURN_IF_FAIL(count_work_row());
       Row stored = r;
       if (track_depth) {
         stored.values_.emplace_back(int64_t{0});
@@ -1679,7 +1918,6 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
           (depth_spec_->lower <= 0 && 0 <= depth_spec_->upper)) {
         RETURN_IF_FAIL(result_store_->AppendRow(stored));
       }
-      ++total_emitted;
       return Status::kSuccess;
     }();
   });
@@ -1691,13 +1929,16 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
     uint64_t anchor_merged = 0;
     anchor_st = merge_spilled_candidates(anchor_sorter.get(), 0, delta.get(),
                                          &anchor_merged);
-    total_emitted += anchor_merged;
   }
   if (anchor_st != Status::kSuccess) {
     cleanup_reached();
     return anchor_st;
   }
-  RETURN_IF_FAIL(delta->FinishSpill());
+  if (const Status status = delta->FinishSpill();
+      status != Status::kSuccess) {
+    cleanup_reached();
+    return status;
+  }
 
   for (size_t iteration = 0; iteration < kMaxIterations; ++iteration) {
     if (delta->TotalRows() == 0) {
@@ -1719,6 +1960,8 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
       if (cand_sorter != nullptr) {
         return Status::kSuccess;
       }
+      // Same peer rule as the anchor sorter and WorkTableIndex: kNone is only
+      // the static key collation, runtime tags are resolved by SortKeyOrder.
       std::vector<OocSortKey> keys;
       keys.reserve(working_cols);
       for (size_t c = 0; c < working_cols; ++c) {
@@ -1780,6 +2023,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
               return cand_sorter->AddRow(row);
             }
           }
+          RETURN_IF_FAIL(count_work_row());
           Row stored = row;
           if (track_depth) {
             stored.values_.emplace_back(row_depth);
@@ -1810,13 +2054,10 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
         return mst;
       }
     }
-    RETURN_IF_FAIL(next_delta->FinishSpill());
-    total_emitted += added_this_round;
-    if (total_emitted > kMaxRows) {
+    if (const Status status = next_delta->FinishSpill();
+        status != Status::kSuccess) {
       cleanup_reached();
-      return StatusError(
-          StatusCode::kInvalidArgument,
-          "recursive CTE " + cte_name_ + " exceeded the row budget");
+      return status;
     }
     if (added_this_round == 0 && next_delta->TotalRows() == 0) {
       break;

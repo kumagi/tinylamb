@@ -107,7 +107,7 @@ std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
 std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
 
 return {PlanAlternative{.plan = std::move(join),
-                        .local_cost = (l_rows * r_rows) + l_rows + r_rows,
+                        .local_cost = (l_rows * r_rows * 0.8) + l_rows + r_rows,
                         .estimated_rows = estimated_rows}};
 ```
 

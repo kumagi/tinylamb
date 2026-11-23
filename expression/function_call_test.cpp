@@ -1,15 +1,20 @@
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "common/unwind_guard.hpp"
 #include "database/database.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/constant_value.hpp"
@@ -38,17 +43,38 @@ class ScalarFunctionSqlTest : public ::testing::Test {
 
   void TearDown() override {
     db_.reset();
-    std::filesystem::remove(db_name_ + ".db");
+    std::error_code ec;
+    std::filesystem::remove(db_name_ + ".db", ec);
+    if (ec) {
+      ADD_FAILURE() << "Failed to remove " << db_name_
+                    << ".db: " << ec.message();
+    }
     tinylamb::RemoveLogAndSegments(db_name_ + ".log");
-    std::filesystem::remove(db_name_ + ".last_checkpoint");
+    std::filesystem::remove(db_name_ + ".last_checkpoint", ec);
+    if (ec) {
+      ADD_FAILURE() << "Failed to remove " << db_name_
+                    << ".last_checkpoint: " << ec.message();
+    }
     // Compaction/eviction leave <db>.db.lsm.<gen> / <db>.db.blocks.<gen>
     // fragments behind; RemoveLogAndSegments only covers the WAL family.
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
-      const std::string name = entry.path().filename().string();
-      if (name.starts_with(db_name_ + ".db.lsm.") ||
-          name.starts_with(db_name_ + ".db.blocks.")) {
-        std::filesystem::remove(entry.path(), ec);
+    // Check the enumeration error before iterating: a failed enumeration
+    // would silently leak every fragment into the next test's workspace.
+    std::filesystem::directory_iterator it(".", ec);
+    if (ec) {
+      ADD_FAILURE() << "Failed to enumerate LSM fragments for " << db_name_
+                    << ": " << ec.message();
+    } else {
+      for (const auto& entry : it) {
+        const std::string name = entry.path().filename().string();
+        if (name.starts_with(db_name_ + ".db.lsm.") ||
+            name.starts_with(db_name_ + ".db.blocks.")) {
+          ec.clear();
+          std::filesystem::remove(entry.path(), ec);
+          if (ec) {
+            ADD_FAILURE() << "Failed to remove " << entry.path() << ": "
+                          << ec.message();
+          }
+        }
       }
     }
   }
@@ -72,7 +98,7 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     } else {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
     }
-    ctx.txn_.Abort();
+    EXPECT_SUCCESS(ctx.txn_.Abort());
     return rows;
   }
 
@@ -90,7 +116,7 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     SqlEngine engine(*db_);
     auto prepared = engine.Prepare(ctx, sql);
     if (!prepared.HasValue()) {
-      ctx.txn_.Abort();
+      EXPECT_SUCCESS(ctx.txn_.Abort());
       return true;
     }
     Row row;
@@ -98,7 +124,7 @@ class ScalarFunctionSqlTest : public ::testing::Test {
     // An error raised while producing the first row is a failure; a clean
     // zero-row result is not (the caller asserts the query must error).
     const bool failed = prepared.Value()->GetStatus() != Status::kSuccess;
-    ctx.txn_.Abort();
+    EXPECT_SUCCESS(ctx.txn_.Abort());
     return failed || !has_row;
   }
 
@@ -276,6 +302,17 @@ TEST(FunctionCallAstTest, RegexpReplacementViewsPreserveValuesAndNulls) {
   }
 }
 
+// The function evaluator's ParseCivilTime used to zero subsecond_nanos while
+// folding a leap second into the next minute, unlike CAST and the comparison
+// path which keep the fraction. The same literal then denoted two instants.
+TEST_F(ScalarFunctionSqlTest, FractionalLeapSecondKeepsSubsecondInStringValue) {
+  const Expression call = FunctionCallExp(
+      "string", {ConstantValueExp(Value("2000-02-29 23:59:60.5+00")),
+                 ConstantValueExp(Value("UTC"))});
+  ASSIGN_OR_ASSERT_FAIL(Value, actual, call->TryEvaluate(Row{}, Schema{}));
+  EXPECT_EQ(actual, Value("2000-03-01 00:00:00.500+00"));
+}
+
 TEST_F(ScalarFunctionSqlTest, RegexpNestedRepetitionRejected) {
   // Bug 70: std::regex's backtracking executor takes exponential time on
   // patterns that apply an unbounded quantifier to an already-repetitious
@@ -303,6 +340,30 @@ TEST_F(ScalarFunctionSqlTest, RegexpNestedRepetitionRejected) {
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('abab', '(ab)+')"), Value(true));
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('aab', 'a{2,}b')"), Value(true));
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('aab', 'a+?b')"), Value(true));
+}
+
+TEST(FunctionCallAstTest, StringDateRejectsOutOfRangeWithoutThrowing) {
+  const Expression call = FunctionCallExp(
+      "string", {ConstantValueExp(Value::DateFromDays(-2147483648LL))});
+  const Row row;
+  const Schema schema;
+  EXPECT_EQ(call->TryEvaluate(row, schema).GetStatus(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(call->TryEvaluate(&row, schema, &row, schema).GetStatus(),
+            StatusCode::kInvalidArgument);
+}
+
+TEST(FunctionCallAstTest, LengthDateRejectsOutOfRangeWithoutThrowing) {
+  const Row row;
+  const Schema schema;
+  for (const char* name : {"length", "char_length", "character_length",
+                           "byte_length", "octet_length"}) {
+    const Expression call = FunctionCallExp(
+        name, {ConstantValueExp(Value::DateFromDays(-2147483648LL))});
+    EXPECT_EQ(call->TryEvaluate(row, schema).GetStatus(),
+              StatusCode::kInvalidArgument)
+        << name;
+  }
 }
 
 TEST(FunctionCallAstTest, MathFunctionsAstParity) {
@@ -839,6 +900,30 @@ TEST_F(ScalarFunctionSqlTest, RoundMinimumPrecisionMatchesScalarEvaluator) {
             Value(0).WithUnsigned());
 }
 
+TEST(FunctionCallTest, CurrentUserIsStableWhenEnvironmentChanges) {
+  const auto initial_user = ExecuteFunction("current_user", {});
+  ASSERT_TRUE(initial_user.HasValue());
+  std::vector<std::pair<const char*, std::optional<std::string>>> saved;
+  const UnwindGuard restore([&] {
+    for (const auto& [key, value] : saved) {
+      if (value) {
+        EXPECT_EQ(platform::SetEnv(key, value->c_str(), 1), 0);
+      } else {
+        EXPECT_EQ(platform::UnsetEnv(key), 0);
+      }
+    }
+  });
+  for (const char* key : {"USER", "LOGNAME"}) {
+    const char* old = std::getenv(key);
+    saved.emplace_back(key,
+                       (old != nullptr) ? std::optional<std::string>(old) : std::nullopt);
+    ASSERT_EQ(platform::SetEnv(key, "", 1), 0);
+  }
+  const auto user = ExecuteFunction("current_user", {});
+  ASSERT_TRUE(user.HasValue());
+  EXPECT_EQ(user.Value(), initial_user.Value());
+}
+
 TEST(FunctionCallTest, GenerateArrayKeepsExactIntegerBounds) {
   for (const int64_t start :
        {INT64_MIN, int64_t{9007199254740993}, INT64_MAX - 2}) {
@@ -893,6 +978,20 @@ TEST(FunctionCallTest, TimestampArrayHandlesHugeDaySteps) {
   ASSERT_TRUE(backward.HasValue());
   ASSERT_EQ(backward.Value().ArrayElements().size(), 1U);
   EXPECT_EQ(backward.Value().ArrayElements()[0], end);
+}
+
+TEST(FunctionCallTest, TimestampArrayRejectsExtremeDateEndpoints) {
+  const Value epoch = Value::DateFromDays(0);
+  for (int64_t days : {-106751991LL, -106751992LL, 106751992LL}) {
+    // DateFromDays clamps. Exercise the function's checks on the payload
+    // itself, including dates that fit in int64 but not in microseconds.
+    Value endpoint = epoch;
+    endpoint.value.int_value = days;
+    const auto result =
+        ExecuteFunction("generate_timestamp_array", {endpoint, epoch});
+    ASSERT_FALSE(result.HasValue()) << days;
+    EXPECT_EQ(result.GetStatus().GetCode(), StatusCode::kInvalidArgument);
+  }
 }
 
 TEST(FunctionCallTest, GenerateArrayDefaultStepAndNaNValidation) {
@@ -1300,6 +1399,9 @@ TEST_F(ScalarFunctionSqlTest, BitwiseAndShiftOperatorsConformance) {
   EXPECT_TRUE(u_shr.IsUnsigned());
   EXPECT_EQ(u_shr.value.int_value, 0);
 
+  // The "-1" here is a SQL literal, not a C++ shift count: EvaluateBinary
+  // rejects a signed negative shift amount with kInvalidArgument before any
+  // shift is performed, so these queries must fail at SQL level.
   EXPECT_TRUE(SqlFails("SELECT 1 << -1"));
   EXPECT_TRUE(SqlFails("SELECT 1 >> -1"));
 

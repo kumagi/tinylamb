@@ -73,20 +73,7 @@ graph TD
 
 インメモリ戦略（`kInMemory`）とハイブリッド戦略（`kHybrid`）の双方が生成されます。局所コスト（`local_cost`）は走査コスト $|L| + |R|$ を基本とし、インメモリ戦略においてビルド側の推定フットプリントがメモリ予算を超過する場合はスピルペナルティ（$|R| \times 3$）が加算されます。
 
-推定出力行数は、左側行数 $|L|$ と等値キーのカーディナリティ推定値の最小値として算出されます。
-
-```cpp
-      const double estimate =
-          kind == JoinAlternativeKind::kAnti
-              ? l_rows
-              : (kind == JoinAlternativeKind::kLeftOuter ||
-                         kind == JoinAlternativeKind::kRightOuter ||
-                         kind == JoinAlternativeKind::kFullOuter
-                     ? std::max(l_rows, r_rows)
-                     : std::min(l_rows, equi_estimate));
-```
-
-右側の一致件数がいかに多くとも左側の入力行数 $|L|$ を超えることはないため、`std::min(l_rows, equi_estimate)` によって出力行数に上限をかけます。
+推定出力行数は `JoinAlternatives` が生成する物理プランの `EmitRowCount()` を使います。SEMI は左側の行数を超えず、ANTI も左側の行数を上限とします。
 
 物理特性の伝播では、`ProductPlan::IsOrderedBy` が semi/anti 結合のプローブ側（左子）の順序をそのまま継承します（`plan/product_plan.cpp` の `IsSemiOrAnti` 分岐）。右側との照合後も左側の順序が変わらないため、上流のソート要求を満たす追加処理を省けます。
 

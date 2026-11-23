@@ -226,4 +226,44 @@ theorem boundary_examples :
     markNotIn (some 7) (markStateOfList [some 5]) = .tTrue := by
   decide
 
+def buildBucket (inner : List (OVal × OVal)) (corr : OVal) : List OVal :=
+  (inner.filter (fun row => (sqlEq corr row.1).inWhere)).map Prod.snd
+
+theorem built_mark_join (inner : List (OVal × OVal)) (rows : List OuterRow) :
+    let bucket := buildBucket inner
+    rows.filter (fun r => (markNotInFor bucket r.corrKey r.probe).inWhere) =
+      rows.filter (fun r => (refNotIn bucket r.corrKey r.probe).inWhere) ∧
+    rows.map (fun r => sqlBoolToVal (markNotInFor bucket r.corrKey r.probe)) =
+      rows.map (fun r => sqlBoolToVal (refNotIn bucket r.corrKey r.probe)) := by
+  apply (nullable_mark_join_sound _ _ rows).2
+  simp [buildBucket, sqlEq, SqlBool.inWhere]
+
+/-- Build one mark table by a right fold; each inner row updates only its
+    non-NULL correlation key. The outer rows can reuse the resulting table. -/
+def buildMarks : List (OVal × OVal) → OVal → Bool × List Int
+  | [] => fun _ => (false,[])
+  | (key,value) :: rs =>
+    let table := buildMarks rs
+    fun k =>
+      if (sqlEq k key).inWhere then
+        match value with
+        | none => (true,(table k).2)
+        | some v => ((table k).1,v :: (table k).2)
+      else table k
+
+theorem built_marks_correct (rs : List (OVal × OVal)) (k : OVal) :
+    buildMarks rs k = markStateOfList (buildBucket rs k) := by
+  induction rs with
+  | nil => rfl
+  | cons x xs ih =>
+    obtain ⟨key,v⟩ := x
+    cases h : (sqlEq k key).inWhere <;> cases v <;>
+      simp_all [buildMarks,buildBucket,markStateOfList]
+
+theorem correlated_not_in_rows (rs : List (OVal × OVal)) (outer : List OuterRow) :
+    let t := buildMarks rs
+    outer.map (fun row => markNotIn row.probe (t row.corrKey)) =
+      outer.map (fun row => (evalInList row.probe (buildBucket rs row.corrKey)).not) := by
+  simp only [built_marks_correct,mark_matches_reference_list]
+
 end TinylambOpt.NullableMarkJoin

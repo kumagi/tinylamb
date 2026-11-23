@@ -31,7 +31,7 @@ graph TD
 パターンは `Selection(Aggregation(Any(), "agg"))` で、`target` は
 `kSelection` です。変換ラムダ内の条件は次のとおりです。
 
-1. 子グループに実際に `kAggregation` の代替があること。
+1. 子グループに `grouping_sets` が非空の `kAggregation` 代替があること。スカラー集約は空入力でも 1 行を返すため、Selection をその下へ押し込めません。
 2. 連言を分解し、各連言について:
    - `RewriteThroughOutputs(conjunct, grouping)` で「grouping 出力への
      列参照」を下の式に書き換えられること。`grouping` は
@@ -100,12 +100,21 @@ graph TD
                   group,
                   LogicalExpression{.operation = LogicalOperator::kAggregation,
                                     .children = {filtered},
-                                    .target_list = aggregation.target_list});
+                                    .predicate = aggregation.predicate,
+                                    .target_list = aggregation.target_list,
+                                    .output_schema = aggregation.output_schema,
+                                    .partition_by = aggregation.partition_by,
+                                    .grouping_sets =
+                                        aggregation.grouping_sets});
               continue;
             }
             // ...(省略: residual 用に集約を再作成し、その上に Selection(residual) を置く 2 つの AddExpression)...
 ```
 
+- 再構成する Aggregation には `target_list` だけでなく
+  `predicate`（HAVING）/ `output_schema` / `partition_by` / `grouping_sets` も
+  元の値を引き継ぎます。これらを落とすと HAVING やパーティション指定が
+  失われ、誤った集約になります。
 - `filtered` は `sel-below-agg:` + 押し込み述語の指紋をタグに持つ派生
   グループで、その下には集約の入力 `input` が直接繋がります。
 - `residual` が空でない場合、集約をもう一度(今度は `filtered` を子に)

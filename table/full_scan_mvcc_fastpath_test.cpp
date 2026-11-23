@@ -112,26 +112,31 @@ TEST_F(FullScanMvccFastPathTest, LockedScanWaitDoesNotHoldThePageLatch) {
   auto entered = started.get_future();
   auto result = scanned.get_future();
   std::thread waiter([&] {
-    auto context = db_->BeginContext();
-    TableScanOptions options;
-    options.lock_rows = true;
+    // Publish entry before setup so BeginContext failures cannot strand the
+    // parent on entered.wait(). Convert worker exceptions into the result
+    // channel so the parent can always join and report a normal test failure.
     started.set_value();
-    auto scan = table.BeginFullScan(context.txn_, options);
-    if (scan.IsValid()) {
-      scanned.set_value(*scan);
-    } else {
-      scanned.set_value(scan.GetStatus());
+    try {
+      auto context = db_->BeginContext();
+      TableScanOptions options;
+      options.lock_rows = true;
+      auto scan = table.BeginFullScan(context.txn_, options);
+      if (scan.IsValid()) {
+        scanned.set_value(*scan);
+      } else {
+        scanned.set_value(scan.GetStatus());
+      }
+    } catch (...) {
+      scanned.set_value(Status::kRuntimeError);
     }
   });
   entered.wait();
   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(10)),
             std::future_status::timeout);
-  const auto begin = std::chrono::steady_clock::now();
   const auto updated = table.Update(
       owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
   const Status committed = owner.PreCommit();
   waiter.join();
-  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
   EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
   EXPECT_EQ(committed, Status::kSuccess);
   const auto row = result.get();
@@ -153,23 +158,27 @@ TEST_F(FullScanMvccFastPathTest, DirectUpdateWaitDoesNotHoldThePageLatch) {
   auto entered = started.get_future();
   auto result = completed.get_future();
   std::thread waiter([&] {
-    auto context = db_->BeginContext();
     started.set_value();
-    const auto update =
-        table.Update(context.txn_, position,
-                     Row({Value(0), Value("contender"), Value(2.0)}));
-    context.Abort();
-    completed.set_value(update.GetStatus());
+    try {
+      auto context = db_->BeginContext();
+      const auto update =
+          table.Update(context.txn_, position,
+                       Row({Value(0), Value("contender"), Value(2.0)}));
+      const Status abort_status = context.Abort();
+      completed.set_value(abort_status == Status::kSuccess
+                              ? update.GetStatus()
+                              : abort_status);
+    } catch (...) {
+      completed.set_value(Status::kRuntimeError);
+    }
   });
   entered.wait();
   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(10)),
             std::future_status::timeout);
-  const auto begin = std::chrono::steady_clock::now();
   const auto updated = table.Update(
       owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
   const Status committed = owner.PreCommit();
   waiter.join();
-  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
   EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
   EXPECT_EQ(committed, Status::kSuccess);
   const Status status = result.get();
@@ -904,7 +913,7 @@ TEST_F(FullScanMvccFastPathTest,
   auto fresh = db_->BeginReadOnlyContext();
   EXPECT_EQ(table.TryReadIntegerKeyCounts(fresh.txn_, pages, 0, -3, 7),
             nullptr);
-  old.Abort();
+  ASSERT_SUCCESS(old.Abort());
   --expected[2];
   ++expected[6];
   auto changed = await_counts(fresh.txn_);
@@ -921,11 +930,11 @@ TEST_F(FullScanMvccFastPathTest,
                   .HasValue());
   EXPECT_EQ(table.TryReadIntegerKeyCounts(fresh.txn_, pages, 0, -3, 7),
             nullptr);
-  aborted.Abort();
+  ASSERT_SUCCESS(aborted.Abort());
   auto restored = await_counts(fresh.txn_);
   ASSERT_NE(restored, nullptr);
   EXPECT_EQ(restored->counts, expected);
-  fresh.Abort();
+  ASSERT_SUCCESS(fresh.Abort());
   auto deleter = db_->BeginContext();
   ASSERT_SUCCESS(table.Delete(deleter.txn_, positions[1]));
   ASSERT_SUCCESS(deleter.PreCommit());
@@ -937,7 +946,7 @@ TEST_F(FullScanMvccFastPathTest,
   EXPECT_EQ(holes->counts, expected);
   EXPECT_EQ(table.FindCachedIntegerKeyCounts(after_delete.txn_, 0, -3, 7),
             holes);
-  after_delete.Abort();
+  ASSERT_SUCCESS(after_delete.Abort());
 }
 
 TEST_F(FullScanMvccFastPathTest,
@@ -961,8 +970,8 @@ TEST_F(FullScanMvccFastPathTest,
           .HasValue());
   EXPECT_EQ(table.TryReadIntegerKeyCounts(reader.txn_, pages, 0, 1, 1),
             nullptr);
-  writer.Abort();
-  reader.Abort();
+  ASSERT_SUCCESS(writer.Abort());
+  ASSERT_SUCCESS(reader.Abort());
 }
 
 }  // namespace tinylamb

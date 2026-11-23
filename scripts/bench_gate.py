@@ -26,8 +26,9 @@ New results file:
   - anything else: one "key<TAB>value" pair per line ("#" comments OK);
     whitespace-delimited lines are also accepted, with the value last.
 
-Direction: keys containing tps/qps/tpm/rps/ops are higher-is-better;
-everything else is treated as time (lower-is-better).
+Direction: keys with tps/qps/tpm/rps/ops as a complete token are
+higher-is-better, unless the key also contains error/fail/drop; everything
+else is treated as time (lower-is-better).
 
 Exit codes: 0 pass, 1 regression / no comparable metric (unless
 --allow-empty), 2 usage error or malformed/missing baseline data.
@@ -92,7 +93,7 @@ def extract_baseline(history_path: Path) -> dict:
         body = "\n".join(trusted_lines)
         # "| `tps` | 821.1 |" style rows (first cell label, second cell number)
         for match in re.finditer(
-                r"^\s*\|\s*`?([^|`]+)`?\s*\|\s*([0-9][0-9,.]*)\s*(?:\||$)",
+                r"^\s*\|\s*`?([^|`]+)`?\s*\|\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*[.,;:]?\s*(?:\||$)",
                 body, re.MULTILINE):
             value = parse_number(match.group(2))
             if value is not None:
@@ -100,7 +101,7 @@ def extract_baseline(history_path: Path) -> dict:
 
         # "- **Label:** **81.30 s**" / "- **Label:** 126.39 s total" bullets
         for match in re.finditer(
-                r"\*\*([^*:]+):\*\*\s*(?:\*\*)?~?([0-9][0-9,.]*)\s*(ms|s)\b",
+                r"\*\*([^*:]+):\*\*\s*(?:\*\*)?~?([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:\*\*)?\s*(ms|s)\b",
                 body):
             value = parse_number(match.group(2))
             if value is None:
@@ -122,7 +123,10 @@ def parse_results(path: Path) -> dict:
             if isinstance(value, bool):
                 continue
             num = value if isinstance(value, (int, float)) else parse_number(str(value))
-            if isinstance(num, (int, float)):
+            # json.loads accepts NaN/Infinity literals; they compare false
+            # against every gate limit, so reject them just like parse_number
+            # does for text measurements.
+            if isinstance(num, (int, float)) and math.isfinite(num):
                 parsed[normalize_key(key)] = float(num)
         return parsed
     parsed = {}
@@ -130,17 +134,32 @@ def parse_results(path: Path) -> dict:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        fields = line.split("\t") if "\t" in line else line.rsplit(None, 1)
+        if "\t" in line:
+            fields = line.split("\t")
+            if len(fields) != 2:
+                # The documented format is exactly key<TAB>value; a wider
+                # TSV would silently mis-key the metric under fields[0].
+                continue
+        else:
+            fields = line.rsplit(None, 1)
         if len(fields) < 2:
             continue
-        value = parse_number(fields[1])
+        value = parse_number(fields[-1])
         if value is not None:
             parsed[normalize_key(fields[0])] = value
     return parsed
 
 
 def is_higher_better(key: str) -> bool:
-    return any(token in key for token in HIGHER_IS_BETTER_TOKENS)
+    # A token must be a full component at the start or after a delimiter, but
+    # a following "_" is a legitimate compound-metric suffix (tps_p95,
+    # qps_avg, tpm_total are all higher-is-better). Only error/failure counts
+    # such as "ops_errors" invert the direction despite matching a token.
+    lowered = key.lower()
+    if any(word in lowered for word in ("error", "fail", "drop")):
+        return False
+    return any(re.search(rf"(?<![a-z0-9]){token}(?![a-z0-9])", key)
+               for token in HIGHER_IS_BETTER_TOKENS)
 
 
 def main() -> int:
@@ -182,6 +201,13 @@ def main() -> int:
         comparable += 1
         base_value = baseline[key]
         new_value = results[key]
+        if base_value == 0:
+            # A zero baseline makes the ratio gate meaningless: limit 0
+            # fails every positive lower-is-better sample and passes every
+            # higher-is-better one. Almost always a parse artifact.
+            print(f"warning: {key}: zero baseline, skipping gate",
+                  file=sys.stderr)
+            continue
         higher_better = is_higher_better(key)
         limit = (base_value * (1 + args.threshold_pct / 100.0)
                  if not higher_better

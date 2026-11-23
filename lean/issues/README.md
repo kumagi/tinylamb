@@ -1,10 +1,13 @@
 # 最適化の未証明問題 — すべて解決済み
 
-このディレクトリに置かれていた 30 件の未証明問題は、すべて Lean 4 で証明されました。
-各定理は `lean/TinylambOpt/` 以下の対応するモジュールにあり、`TinylambOpt.lean` から
-インポートされています。`cd lean && lake build` で検証できます（`sorry` / `admit` /
-`axiom` は使用していません）。証明と反例（素朴な lowering が壊れる具体例）の
-一覧・モデル前提は [RESULTS.md](RESULTS.md) を参照してください。
+このディレクトリに置かれていた 30 件の未証明問題について、個別の証明または反例を
+Lean 4 で登録しました。対応する結果とモデル前提は [RESULTS.md](RESULTS.md) を参照してください。
+
+以前未完了の `sorry` を含んでいた `ResearchProofs/FirstKeyBlock.lean` と
+`ResearchProofs/PackedRadix2x32BatchAgg.lean` も証明が完了し、現在 `lake build`
+（CheckProofs によるパッケージ全体の `sorryAx` 検査）は成功する。
+
+各定理の達成範囲と適用条件は [仕様監査](AUDIT.md)、追加研究の課題一覧は [研究 Issue](research/README.md)、新規提案 8 件は [提案 Issue](proposals/README.md) にまとめています。
 
 ## SQL 書き換えと集約
 
@@ -28,7 +31,7 @@
 - [更新差分を含むスナップショットでのブロック除外](../TinylambOpt/SnapshotZoneMap.lean) — `snapshot_zone_map_sound`
 - [三値とエラーを含む複合述語のブロック判定](../TinylambOpt/BlockKleene.lean) — `block_kleene_sound`
 - [必須 trigram がないブロックを LIKE 検索から外す](../TinylambOpt/TrigramSkip.lean) — `trigram_skip_sound`
-- [複合順序キーの上界で Top-N の残りブロックを飛ばす](../TinylambOpt/TopnBlockFence.lean) — `topn_block_fence_sound`
+- [複合順序キーの上界で Top-N の残りブロックを飛ばす](../TinylambOpt/TopNBlockFenceExplicitTerms.lean) — `topn_block_fence_sound`
 - [二つの Bloom ビット集合からマッチ不能なブロックを判定する](../TinylambOpt/BloomBlockIntersection.lean) — `bloom_block_intersection_sound`
 - [RLE のランと可視行マスクを交差して走査を省く](../TinylambOpt/RleRunSkip.lean) — `rle_run_skip_sound`
 

@@ -12,25 +12,43 @@
 namespace tinylamb {
 
 size_t ValuesExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
-  if (schema_.ColumnCount() == 0 && !rows_.empty()) {
-    std::vector<Column> cols;
-    cols.reserve(rows_.front().values_.size());
-    for (const Value& v : rows_.front().values_) {
-      Column col("", v.type);
-      // The row-level type tags are part of the value's identity. Dropping
-      // them here would infer a schema that disagrees with the data seen by
-      // downstream comparison and JIT paths.
-      col.SetUnsigned(v.IsUnsigned());
-      col.SetInterval(v.IsInterval());
-      cols.push_back(std::move(col));
-    }
-    // Every VALUES row must agree with the anchor row's width; otherwise a
-    // later row would silently lose its extra cells (or assert) on Append.
+  if (!schema_initialized_ && !rows_.empty()) {
+    schema_initialized_ = true;
+    const size_t width = rows_.front().Count();
     for (const Row& row : rows_) {
-      if (row.values_.size() != cols.size()) {
+      if (row.Count() != width) {
+        destination->Reset();
+        offset_ = rows_.size();
         FailWith(StatusError(StatusCode::kInvalidArgument,
                              "values row width mismatch"));
         return 0;
+      }
+    }
+    std::vector<Column> cols;
+    cols.reserve(width);
+    for (size_t i = 0; i < width; ++i) {
+      const Value* sample = nullptr;
+      for (const Row& row : rows_) {
+        const Value& value = row[i];
+        if (value.IsNull()) {
+          continue;
+        }
+        if (sample == nullptr) {
+          sample = &value;
+        } else if (value.type != sample->type ||
+                   value.IsUnsigned() != sample->IsUnsigned() ||
+                   value.IsInterval() != sample->IsInterval()) {
+          // Let each batch infer a mixed column from its actual cells, so
+          // the first cell of the batch cannot inherit another row's flags.
+          sample = nullptr;
+          break;
+        }
+      }
+      Column& col = cols.emplace_back("", (sample != nullptr) ? sample->type
+                                                 : ValueType::kNull);
+      if (sample != nullptr) {
+        col.SetUnsigned(sample->IsUnsigned());
+        col.SetInterval(sample->IsInterval());
       }
     }
     schema_ = Schema("", std::move(cols));

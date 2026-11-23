@@ -17,11 +17,10 @@ not sound: a boundary-key row with several matches is dropped.
 
 C++ checks: `executor/topn.cpp` keeps the whole equal-key run when
 `with_ties_` is set (`TopN::Consume` / the `with_ties_` branch); the caller
-must supply `K > 0`, no OFFSET, a single left-only non-NULL sort key with the
-same comparator on both sides, and no post-FETCH filter.  NULL ordering is
-modelled here by making the key an `Int` (total order), i.e. by strengthening
-the agreement hypothesis; mixing a unique ID into the tie test is a
-different comparator and is not covered.
+supplies no OFFSET, an ordered left stream, the same left-only comparator on
+both sides, and no intervening filter. SQL NULL ordering for a signed INT64
+column is represented by ranks outside its value range. Adding a unique ID
+to the tie test changes the comparator.
 -/
 
 namespace TinylambOpt.OuterFetchTies
@@ -36,14 +35,14 @@ def join {L R : Type} (on : L → R → Bool) (Ls : List L) (Rs : List R) : List
 def fetchTies {L R : Type} (key : L → Int) (K : Nat) (J : List (L × R)) : List (L × R) :=
   if J.length < K then J else
     match (J.take K).getLast? with
-    | none => J
+    | none => []
     | some (l0, _) => J.filter (fun (l, _) => key l ≤ key l0)
 
 /-- The analogous left-side frontier and pre-filter. -/
 def leftTies {L : Type} (key : L → Int) (K : Nat) (Ls : List L) : List L :=
   if Ls.length < K then Ls else
     match (Ls.take K).getLast? with
-    | none => Ls
+    | none => []
     | some l0 => Ls.takeWhile (fun l => key l ≤ key l0)
 
 private theorem mem_of_getLast?_eq_some {α : Type} :
@@ -339,7 +338,7 @@ private theorem join_padded (on : L → R → SqlBool) (ls : List L) (rs : List 
   unfold join leftOuterJoin
   apply congrArg (fun f => ls.flatMap f)
   funext l
-  simp only [List.filter_cons, List.filter_map, Function.comp_def, paddedOn, List.map_map]
+  simp only [List.filter_cons, List.filter_map, Function.comp_def, paddedOn]
   cases h : rs.filter (fun r => (on l r).inWhere) <;> simp [Function.comp_def]
 
 private theorem paddedOn_live (on : L → R → SqlBool) (rs : List R) (l : L) :
@@ -366,16 +365,29 @@ theorem null_rank_extreme (x : Int64) :
 
 theorem sql_outer_fetch_ties_sound (on : L → R → SqlBool) (key : L → Int)
     (K : Nat) (ls : List L) (rs : List R)
-    (hsorted : ls.Pairwise (fun a b => key a ≤ key b)) (hK : 0 < K) :
+    (hsorted : ls.Pairwise (fun a b => key a ≤ key b)) :
     fetchTies key K (leftOuterJoin on (leftTies key K ls) rs) =
       fetchTies key K (leftOuterJoin on ls rs) := by
-  simpa only [join_padded] using outer_fetch_ties_sound (paddedOn on rs) key K ls
-    (none :: rs.map some) hK hsorted (fun l _ => paddedOn_live on rs l)
+  by_cases hK : 0 < K
+  · simpa only [join_padded] using outer_fetch_ties_sound (paddedOn on rs) key K ls
+      (none :: rs.map some) hK hsorted (fun l _ => paddedOn_live on rs l)
+  · have : K = 0 := by omega
+    simp [this, fetchTies]
 
 theorem unmatched_null_ties_regression :
     let ls : List (Option Int64) := [none, none, some 2]
     let key := nullableRank true
     fetchTies key 1 (leftOuterJoin (fun _ (_ : Nat) => .tNull) (leftTies key 1 ls) [0]) =
       [(none, none), (none, none)] := by decide
+
+/-- The boundary contains both a matched row (twice) and an unmatched row.
+    The last left row lies beyond the NULLS LAST frontier. -/
+theorem mixed_boundary_regression :
+    let ls : List (Nat × Option Int64) := [(0,some 1),(1,some 1),(2,none)]
+    let onRow := fun (l : Nat × Option Int64) (r : Nat) =>
+      if l.1 = r then SqlBool.tTrue else SqlBool.tFalse
+    let key := fun (l : Nat × Option Int64) => nullableRank false l.2
+    fetchTies key 1 (leftOuterJoin onRow (leftTies key 1 ls) [0,0]) =
+      [((0,some 1),some 0), ((0,some 1),some 0), ((1,some 1),none)] := by decide
 
 end TinylambOpt.OuterFetchTies

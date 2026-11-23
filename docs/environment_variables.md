@@ -6,16 +6,18 @@ fast path so a suspected optimization can be isolated without a rebuild.
 They exist for debugging and benchmarking only; most change only speed (and
 error timing), but a few opt-in knobs are known-incomplete and can change
 results (see `TINYLAMB_SCALAR_FN_CASCADES` below). Check each entry before
-using a knob in an A/B comparison or production.  Most bool hatches test presence (`getenv != nullptr`), so even an empty value or `0` enables them; knobs with value parsing document their own rules. A few defaults are opt-out instead: `TINYLAMB_FUSE_SIBLING_AGG=0` disables that rewrite. Check the individual entry before assuming `=0` is a no-op.
+using a knob in an A/B comparison or production.  Boolean hatches use different conventions: some test presence (`getenv != nullptr`), while others parse specific values such as `1` or `0`. An empty value or `0` therefore does not have one global meaning; check each entry. A few defaults are opt-out instead: `TINYLAMB_FUSE_SIBLING_AGG=0` disables that rewrite. Check the individual entry before assuming `=0` is a no-op.
 
 ## Storage / buffer pool / WAL
 
 | Variable | Meaning |
 | --- | --- |
-| `TINYLAMB_PAGE_POOL_BYTES` | Retired (ignored no-op): replaced by `TINYLAMB_MEMORY_LIMIT_BYTES` / `TINYLAMB_BUFFER_POOL_BYTES` (note: older comparison runner scripts in `benchmark/comparison/` still pass it as a harmless legacy no-op). |
+| `TINYLAMB_PAGE_POOL_BYTES` | Retired (ignored no-op): replaced by `TINYLAMB_MEMORY_LIMIT_BYTES` / `TINYLAMB_BUFFER_POOL_BYTES`. |
 | `TINYLAMB_TLCS_MMAP_LIMIT_BYTES` | Override byte threshold above which `TlcsFile` uses paged `platform::Pread` + bounded LRU cache instead of mmap resident storage (default `min(ColumnarPoolLimit() / 2, 1 GiB)`). |
 | `TINYLAMB_DISABLE_ADAPTIVE_TLCS_READ` | Use coalesced windows by default for paged TLCS projections. Explicit direct reads still use their requested mode. |
-| `TINYLAMB_LOG_SEGMENT_BYTES` | WAL segment file size override. |
+| `TINYLAMB_AUTO_TLCS` | Automatic TLCS enablement (`database/database.cpp`, `AutoTlcsEnabled`): on by default when unset/empty; values `0`, `false`, `FALSE`, `off`, `OFF`, `no`, `NO` turn it off. |
+| `TINYLAMB_ANALYZE_AUTO_TLCS` | Allow `ANALYZE` to auto-compact a table to TLCS when nonempty and not starting with `0`; `TINYLAMB_AUTO_TLCS` must also be enabled. |
+| `TINYLAMB_LOG_SEGMENT_BYTES` | WAL segment size override in bytes; values below the 32 KiB page size or invalid values use the 16 MiB default. |
 | `TINYLAMB_CHECKPOINT_SECONDS` | Legacy interval parameter passed from `PageStorage` to `CheckpointManager` (default `10`, parsed integer); checkpoints are actually driven by LSM compaction / committed-mutation thresholds, not a periodic timer. |
 | `TINYLAMB_WAL_RETENTION_WARN_BYTES` | Warn threshold (bytes; default `64 MiB`, `0` disables) for WAL segments pinned by long-running active transactions (`recovery/checkpoint_manager.cpp`). |
 | `TINYLAMB_DISABLE_EOR_CHECKPOINT` | Skip the end-of-recovery checkpoint. |
@@ -68,8 +70,19 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | `TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH` | Index-scan look-ahead heap-page prefetcher (a second cursor warms the pages the serial `IndexScan` is about to fetch). |
 | `TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN` | ParallelIndexScan for large ascending single-range index scans (falls back to the serial `IndexScan`). |
 | `TINYLAMB_DISABLE_INT_KEY_JOIN` | Fixed-width int-key fast path in the parallel hash join. |
+| `TINYLAMB_DISABLE_PACKED2X32_HJ` | Disable the `kPacked2x32` two-INT64 hash-join key mode in `executor/detail/planning_heuristics.cpp`; two-int joins then use the multi-INT64 composite key path. |
 | `TINYLAMB_DISABLE_JOIN_FLIP` | Hash-join build/probe flip. |
 | `TINYLAMB_DISABLE_ORDERED_INNER_FLIP` | Presence-based A/B hatch: disable smaller-build inner join flip in `planning_heuristics.cpp`. |
+| `TINYLAMB_DISABLE_DISTINCT_ON_TOP1` | Disable the ordered-winner fast path for `DISTINCT ON`; enabled when the value starts with `1`. |
+| `TINYLAMB_DISABLE_BLOCK_KLEENE` | Presence-based A/B hatch: disable block Kleene predicate evaluation in parallel scans. |
+| `TINYLAMB_DISABLE_FAST_LIKE` | Disable the literal-pattern LIKE fast path when the value starts with `1`; re-read by the explicit runtime reload helper. |
+| `TINYLAMB_DISABLE_FAST_REGEX` | Disable the fast regex search path when the value starts with `1`; re-read by the explicit runtime reload helper. |
+| `TINYLAMB_DISABLE_OUTER_JOIN_COUNTS` | Disable the grouped outer-join count-to-histogram rewrite; enabled when the value is nonempty and does not start with `0`. |
+| `TINYLAMB_DISABLE_OUTER_OR_BRANCHES` | Disable outer-join OR-branch expansion when the value starts with `1`. |
+| `TINYLAMB_DISABLE_QUALIFY_PUSHDOWN` | Disable partition-only QUALIFY-to-WHERE pushdown; enabled when the value is nonempty and does not start with `0`. |
+| `TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE` | Disable the sliding DISTINCT window inverse path when the value starts with `1`. |
+| `TINYLAMB_DISABLE_OUTER_FETCH_TIES` | Disable streaming `FETCH ... WITH TIES` when set to a nonempty value not starting with `0`; unset, empty, or `0`-prefixed values keep the streaming path enabled. |
+| `TINYLAMB_DISABLE_WINDOW_HALO` | Disable bounded window halo optimization. The executor disables it when the value starts with `1`; the planner disables its halo rule for any nonempty value not starting with `0`. Use `1` to disable both. |
 | `TINYLAMB_DISABLE_GROUPED_JOIN_FUSION` | Grouped-join fusion. |
 | `TINYLAMB_DISABLE_PARALLEL_PROBE` | Parallel hash-join probe. |
 | `TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER` | Correlated-subquery domain filter. |
@@ -95,13 +108,17 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | `TINYLAMB_DISABLE_DELIMITED_CAPTURE_JIT` | Use the checked regex evaluator for anchored group keys that can be lowered to a delimited capture. |
 | `TINYLAMB_DISABLE_FUSED_CAPTURE_HAVING` | Keep the ordinary two-stage aggregate for delimited capture group keys and do not collect reusable bucket proposals. |
 | `TINYLAMB_DISABLE_GROUP_HASH_JIT` | Use scalar hashing and the shared bitmap for near-unique TLCS numeric-key groups. |
+| `TINYLAMB_DISABLE_JIT_DENSE_SPLIT` | Disable the JIT dense-split path for fused grouped joins (`executor/detail/fused_grouped_join.cpp`); falls back to the non-dense grouped-join execution. |
+| `TINYLAMB_DISABLE_JIT_PACKED_DEDUP` | Disable the JIT packed 2x32 radix dedup kernels for streaming grouped joins (`executor/detail/fused_grouped_join_stream.cpp`). |
+| `TINYLAMB_DISABLE_JIT_RADIX_AGG` | Disable the JIT radix-key aggregate kernel in `fused_grouped_join.cpp`. Distinct from `TINYLAMB_DISABLE_RADIX_AGG`, which gates the non-JIT radix aggregation path. |
 | `TINYLAMB_DISABLE_SHARDED_DUPLICATE_SIEVE` | Keep the shared duplicate bitmap and full-key replay when the ordinal-based sharded path is eligible. |
 | `TINYLAMB_DISABLE_DATE_PART_HASH_JIT` | Use ordinary timestamp extraction and mixed-key hashing for eligible UTC group keys. |
 | `TINYLAMB_DISABLE_STRING_FINGERPRINT_JIT` | Use full-string hashes for eligible TLCS single-string Top-N count sweeps. |
 | `TINYLAMB_DISABLE_TLCS_BOUNDARY_AGG` | Use ordinary execution for aggregates eligible for exact TLCS boundary frequencies or extrema. |
 | `TINYLAMB_DISABLE_TLCS_DUPLICATE_SIEVE` | Disable duplicate screening for nearly unique numeric keys in a TLCS `ORDER BY COUNT(*) DESC LIMIT` query. |
 | `TINYLAMB_JIT_DUMP_DIR` | Write optimized LLVM IR and native object files for newly compiled JIT kernels into this directory; failed diagnostic writes do not affect execution. |
-| `TINYLAMB_DISABLE_BYTECODE` | Disable bytecode evaluation globally (AST fallback; also flips fuzz oracles). |
+| `TINYLAMB_DISABLE_BYTECODE` | Set to `1` to disable bytecode evaluation globally (AST fallback; also flips fuzz oracles). |
+| `TINYLAMB_DISABLE_FILTER_ORDER` | Disable residual scan-filter predicate reordering only when the value starts with `1`; unset or other values keep the default ordering optimization. |
 
 ## Planner diagnostics
 
@@ -121,7 +138,7 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | `TINYLAMB_FOLD_TRACE` | Trace expression fold decisions in the engine. |
 | `TINYLAMB_TRACE_ROUTE` | Log why `PostRewriteNeedsRelational` kept a statement on the relational route (source shape). |
 | `TINYLAMB_SCALAR_FN_CASCADES` | A/B hatch (default off; requires the literal value `1`): ordinary scalar functions cross the Cascades bridge instead of forcing the relational route, and the M5+ join-core derived-table flattener fires (TPC-H Q9 reaches `GroupByFinish`). Known-incomplete: TPC-DS rank-boundary determinism and cross-product avoidance fail under it, and Q9 runs ~1.7x slower than the relational route (bridge join-order quality), so keep it off outside A/B runs. |
-| `TINYLAMB_FUSE_SIBLING_AGG` | `=0` disables sibling derived-aggregate fusion in `sql_engine.cpp` (same-group derived tables aggregated in separate members are rewritten into one fused scan). Unlike the `DISABLE_*` hatches this one is on by default and opted out with `=0`. |
+| `TINYLAMB_FUSE_SIBLING_AGG` | `=0` disables sibling derived-aggregate fusion in `query/select_rewrites.cpp` (`FuseSiblingDerivedAggregates`; same-group derived tables aggregated in separate members are rewritten into one fused scan). The rewrite is invoked from `query/sql_engine.cpp`. Unlike the `DISABLE_*` hatches this one is on by default and opted out with `=0`. |
 
 ## Memory / temp
 
@@ -137,7 +154,7 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | `TINYLAMB_QUERY_FLOOR_PCT` | Minimum `M_t` percentage guaranteed for `query` pool (default `25`). |
 | `TINYLAMB_TX_FLOOR_PCT` | Minimum `M_t` percentage guaranteed for `tx` pool (default `5`). |
 | `TINYLAMB_COLUMNAR_FLOOR_PCT` | Minimum `M_t` percentage guaranteed for `columnar` pool (default `0`). |
-| `TINYLAMB_GRANT_WAIT_TIMEOUT_MS` | Admission wait timeout in milliseconds for `QueryMemoryCoordinator::AcquireGrant` before failing with `kMemoryLimitExceeded` (default `30000`). |
+| `TINYLAMB_GRANT_WAIT_TIMEOUT_MS` | Admission wait timeout in milliseconds for `QueryMemoryCoordinator::AcquireGrant` before failing with `kMemoryLimitExceeded` (default `30000`; `0` means no wait / fail immediately). |
 | `TINYLAMB_TEMP_LIMIT_BYTES` | Maximum temporary disk bytes allowed for spill files/stores (`0` = unlimited). Exceeding it fails with `kNoSpace` ([ADR 0005](adr/0005-spill-store-placement.md)). |
 | `TINYLAMB_OP_MEMORY_BYTES` | Test/diagnostic override for per-operator working memory budget `B_op` (`0` = automatic). |
 | `TINYLAMB_ALWAYS_SPILL` | Any non-empty value other than exactly "0" forces out-of-core spill paths even on small inputs (string comparison, not numeric) (testing/diagnostic knob). |
@@ -150,6 +167,7 @@ using a knob in an A/B comparison or production.  Most bool hatches test presenc
 | --- | --- |
 | `TINYLAMB_MAX_CONNECTIONS` | PostgreSQL server connection cap. |
 | `TINYLAMB_PARSE_TIMEOUT_SEC` | External GoogleSQL parse child timeout in seconds (default 5). |
+| `TINYLAMB_DISABLE_AUTO_ZYGOTE` | Disable automatic GoogleSQL parser-zygote startup only when the value is exactly `1`; explicit socket or binary overrides also skip auto-start. |
 
 ## Tests / fuzzers
 

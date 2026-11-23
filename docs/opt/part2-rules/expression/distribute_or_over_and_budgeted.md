@@ -82,7 +82,7 @@ for (const Expression& conjunct : *and_side) {
 return CombineConjuncts(distributed);
 ```
 
-元の連言の出現順序は完全に保持され、左から順に `(c_1 OR z)`, `(c_2 OR z)`, … と連なる平衡な AND 木が生成されます。
+元の連言の出現順序は完全に保持され、左から順に `(c_1 OR z)`, `(c_2 OR z)`, … と連なる左結合の AND 木が生成されます。
 
 ## 最適化効果
 

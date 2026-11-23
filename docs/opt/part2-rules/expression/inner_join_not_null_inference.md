@@ -93,7 +93,7 @@ graph TD
 
 推論処理は、抽出された等式ごとに $l \text{ IS NOT NULL}$ と $r \text{ IS NOT NULL}$ を生成し、`already_present` の判定結果に応じて未登録の述語のみを連言列へ追加します（両方未登録、左のみ、右のみの分岐制御）。
 
-走査終了後、変更フラグ `changed` が立っている場合のみ `CombineConjuncts` により連言列を平衡な AND 二分木へ再構成して返します。変更がない場合は空式（`Expression{}`）を返し、無用なオブジェクト生成を抑制します。
+走査終了後、変更フラグ `changed` が立っている場合のみ `CombineConjuncts` により連言列を左結合の AND 二分木へ再構成して返します。変更がない場合は空式（`Expression{}`）を返し、無用なオブジェクト生成を抑制します。
 
 ## 最適化効果
 

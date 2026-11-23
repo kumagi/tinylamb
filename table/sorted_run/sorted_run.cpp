@@ -191,19 +191,19 @@ StatusOr<Row> SortedRun::Find(std::string_view key, const Schema& sc) const {
 }
 
 std::string SortedRun::Iterator::Key() const {
-  if (!IsValid()) {
-    // An exhausted iterator has no entry: return a sentinel like IsDeleted()
-    // instead of throwing past the SortedRun Status boundary.
-    return {};
-  }
+  // An empty key is a legitimate value at a valid position, so returning an
+  // empty sentinel here would make "past the end" indistinguishable from a
+  // real empty key. Reading an exhausted/default iterator is a caller
+  // precondition violation (not a data error), so fail loudly at this
+  // no-Status boundary; callers must gate reads on IsValid().
+  CHECK_MSG(IsValid(), "SortedRun::Iterator::Key on invalid iterator");
   return GetEntry().BuildKey(parent_->Blob());
 }
 
 Row SortedRun::Iterator::Value() const {
-  if (!IsValid()) {
-    // Same sentinel convention as Key()/IsDeleted() at an invalid position.
-    return {};
-  }
+  // Same precondition as Key(): an empty Row can be a real decoded value, so
+  // an exhausted iterator must never masquerade as one.
+  CHECK_MSG(IsValid(), "SortedRun::Iterator::Value on invalid iterator");
   // A corrupt blob makes DeserializeBounded throw; translate it at this
   // reader boundary like SortedRun::Lookup() already does.
   try {

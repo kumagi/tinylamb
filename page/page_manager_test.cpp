@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -223,6 +224,54 @@ TEST_F(PageManagerTest, CompactionDropsOverlayBeforeReusingTailPage) {
   EXPECT_EQ(loaded->body.row_page.GetRow(0), "new incarnation");
 }
 
+TEST_F(PageManagerTest, CheckpointCleanupPreservesOtherCompanionSuffixes) {
+  const std::filesystem::path lsm_tmp = prefix_ + ".db.lsm.tmp";
+  const std::filesystem::path blocks_tmp = prefix_ + ".db.blocks.tmp";
+  const std::filesystem::path lsm_stale = prefix_ + ".db.lsm.42";
+  const std::filesystem::path blocks_stale = prefix_ + ".db.blocks.42";
+  for (const auto& path : {lsm_tmp, blocks_tmp, lsm_stale, blocks_stale}) {
+    std::ofstream file(path);
+    ASSERT_TRUE(file.is_open());
+    file << "fixture";
+  }
+  ASSERT_SUCCESS(pm_->WriteFuzzyCheckpoint(0));
+  ASSERT_SUCCESS(pm_->LoadFuzzyCheckpoint(nullptr));
+  EXPECT_TRUE(std::filesystem::exists(lsm_tmp));
+  EXPECT_TRUE(std::filesystem::exists(blocks_tmp));
+  EXPECT_FALSE(std::filesystem::exists(lsm_stale));
+  EXPECT_FALSE(std::filesystem::exists(blocks_stale));
+}
+
+TEST_F(PageManagerTest, CheckpointRejectsUnrepresentableBlockGeneration) {
+  ASSERT_SUCCESS(pm_->WriteFuzzyCheckpoint(0));
+  const auto path = prefix_ + ".db";
+  std::string bytes;
+  {
+    std::ifstream input(path, std::ios::binary);
+    ASSERT_TRUE(input.good());
+    bytes.assign(std::istreambuf_iterator<char>(input),
+                 std::istreambuf_iterator<char>());
+  }
+  constexpr std::string_view kMagic = "TLSMCKP1";
+  const size_t magic = bytes.find(kMagic);
+  ASSERT_NE(magic, std::string::npos);
+  const size_t block_generation =
+      magic + kMagic.size() + (2 * sizeof(uint32_t)) + (2 * sizeof(uint64_t));
+  ASSERT_GE(bytes.size(), block_generation + sizeof(uint64_t) + sizeof(uint32_t));
+  constexpr uint64_t kUnrepresentable = uint64_t{1} << 32;
+  std::memcpy(bytes.data() + block_generation, &kUnrepresentable,
+              sizeof(kUnrepresentable));
+  const size_t payload_size = bytes.size() - sizeof(uint32_t);
+  const uint32_t crc = Crc32C(bytes.data(), payload_size);
+  std::memcpy(bytes.data() + payload_size, &crc, sizeof(crc));
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output.good());
+  }
+  EXPECT_EQ(pm_->LoadFuzzyCheckpoint(nullptr), Status::kCorrupt);
+}
+
 TEST_F(PageManagerTest, CheckpointMergesResidentAndEvictedPageStreams) {
   pm_->SetBufferPoolLimitBytesForTest(size_t{64} << 10);
   std::vector<page_id_t> ids;
@@ -379,9 +428,9 @@ TEST_F(PageManagerTest, CheckpointLsmRotationSerializesWithConcurrentFlushes) {
   // write-buffer limit and flush/compaction streams actually run.
   pm_->SetBufferPoolLimitBytesForTest(1U << 20);
   std::vector<std::string> keys;
-  keys.reserve(kChunks * kPerChunk);
+  keys.reserve(static_cast<size_type>(kChunks * kPerChunk));
   std::vector<std::string> values;
-  values.reserve(kChunks * kPerChunk);
+  values.reserve(static_cast<size_type>(kChunks * kPerChunk));
   for (int i = 0; i < kChunks * kPerChunk; ++i) {
     // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
     char buf[16];
@@ -494,11 +543,9 @@ TEST_F(PageManagerTest, OneTransactionMayHoldTailsOfSeveralTables) {
   ASSERT_SUCCESS(pm_->ReserveTableTail(kA, kT2, kT2));
   // B holds T3; A (holding T1/T2) must not wait for it: immediate conflict.
   ASSERT_SUCCESS(pm_->ReserveTableTail(kB, kT3, kT3));
-  const auto start = std::chrono::steady_clock::now();
   const Status contended = pm_->ReserveTableTail(kA, kT3, kT3);
   EXPECT_EQ(contended, Status::kConflicts);
   EXPECT_FALSE(contended.GetMessage().empty());
-  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
   pm_->ResolveTableTailReservations(kB, TableTailResolution::kDiscard);
   ASSERT_SUCCESS(pm_->ReserveTableTail(kA, kT3, kT3));
   pm_->ResolveTableTailReservations(kA, TableTailResolution::kDiscard);

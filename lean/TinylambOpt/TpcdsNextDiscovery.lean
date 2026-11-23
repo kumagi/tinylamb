@@ -409,7 +409,7 @@ private theorem shared_cte_disjunct_pushdown_both {Row : Type}
         · simpa [select, h1, h2, or_inWhere] using ih.1
         · simpa [select, h1, h2, or_inWhere] using ih.2
 
-/-- **ルール D（意味保存）**: 和押し込み後に 2 Siteを `UNION ALL` しても行多重度は不变。 -/
+/-- **ルール D（意味保存）**: 和を押し込んだ後に 2 箇所を `UNION ALL` しても行多重度は不変。 -/
 theorem shared_cte_disjunct_pushdown_sound {Row : Type}
     (body : Rel Row) (w1 w2 : Row → SqlBool) :
     let shared := body.filter (fun r => ((w1 r).or (w2 r)).inWhere)

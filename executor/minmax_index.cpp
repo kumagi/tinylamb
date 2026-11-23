@@ -11,6 +11,24 @@
 
 namespace tinylamb {
 
+namespace {
+// Guard for the "first non-NULL value is the extremum" contract. Only the
+// scalar types whose Value::operator< agrees with the index's memcomparable
+// key order are checked: VARCHAR's canonical (collated) order, FLOAT64's NaN
+// canonicalization and unsigned integers can legitimately disagree with that
+// byte order, so comparing them here would raise false alarms. This is a
+// miswiring check, not a replacement for a full sort validation.
+bool OutOfOrderForExtremum(const Value& first, const Value& later,
+                           bool descending) {
+  if (first.type != later.type ||
+      (first.type != ValueType::kInt64 && first.type != ValueType::kDate) ||
+      first.IsUnsigned() || later.IsUnsigned()) {
+    return false;
+  }
+  return descending ? (later > first) : (later < first);
+}
+}  // namespace
+
 size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   if (GetStatus() != Status::kSuccess) {
@@ -32,17 +50,33 @@ size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   DataChunk batch;
   while (source_->NextBatch(&batch, kDefaultVectorSize) != 0) {
     if (value_slot_ >= batch.ColumnCount()) {
-      continue;
+      FailWith(StatusError(StatusCode::kInvalidArgument,
+                           "MinMaxIndexExecutor: value column missing"));
+      return 0;
     }
     const ColumnVector& column = batch.ColumnAt(value_slot_);
     for (size_t i = 0; i < batch.Size(); ++i) {
-      if (!column.IsNull(i)) {
-        // Valid only because the source is ordered on value_slot_ (ascending
-        // for MIN / descending for MAX) -- see the constructor contract.
-        destination->Append(Row({column.ValueAt(i)}));
-        emitted_ = true;
-        return 1;
+      if (column.IsNull(i)) {
+        continue;
       }
+      // Valid only because the source is ordered on value_slot_ (ascending
+      // for MIN / descending for MAX) -- see the constructor contract.
+      // Check the neighbours already in this batch: an unordered child no
+      // longer silently turns an arbitrary value into MIN/MAX.
+      const Value first = column.ValueAt(i);
+      for (size_t j = i + 1; j < batch.Size(); ++j) {
+        if (column.IsNull(j)) {
+          continue;
+        }
+        if (OutOfOrderForExtremum(first, column.ValueAt(j), descending_)) {
+          FailWith(StatusError(StatusCode::kInvalidArgument,
+                               "MinMaxIndexExecutor: unordered source"));
+          return 0;
+        }
+      }
+      destination->Append(Row({first}));
+      emitted_ = true;
+      return 1;
     }
   }
   if (source_->GetStatus() != Status::kSuccess) {

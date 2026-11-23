@@ -30,8 +30,10 @@ verification; otherwise it downloads a pinned release and verifies its SHA-256
 checksum. Bazel is not required. GoogleSQL AST mode is required by the
 SQL executable; configuring with `-DTINYLAMB_ENABLE_GOOGLESQL=OFF` still
 builds every library, executable and test binary, but the SQL frontend
-becomes unavailable at runtime (statements fail to parse) and frontend-driven
-tests fail rather than skip, so keep the default ON when running ctest.
+becomes unavailable at runtime (statements fail to parse). The frontend-driven
+GoogleSQL compliance cases are not compiled into the test binary in this
+configuration; parser-only compliance-file tests remain available. Keep the
+default ON when running frontend integration coverage.
 
 The SQL execution path supports the TPC-C transaction query shapes (excluding
 stored procedures) and all 22 TPC-H queries. This includes inner and left
@@ -123,16 +125,18 @@ psql -X "host=127.0.0.1 port=54321 user=tinylamb dbname=warehouse sslmode=prefer
 
 The server supports PostgreSQL startup negotiation, trust authentication,
 simple queries, text result rows and NULLs, command tags, error responses,
-and `BEGIN`/`COMMIT`/`ROLLBACK`. Autocommit `SELECT` messages run on a
-worker pool (statements that start with `WITH` or `EXPLAIN` take the normal
-execution path because they can wrap writes), so independent clients execute
-read-only transactions in parallel
-without blocking the epoll I/O loop. The default worker count is the detected
-hardware concurrency capped at 16, and can be set with `--read-workers`
-(accepted range 1..1024; values above the server cap of 16 are clamped to 16
-with a warning at startup). TLS/GSS encryption
+and `BEGIN`/`COMMIT`/`ROLLBACK`. Read-only `SELECT` messages and ordinary
+session statements (`INSERT`/`UPDATE`/`DELETE`/`MERGE`, transaction control,
+and `SET`) run on a shared worker pool, with one in-flight task per session,
+so independent clients do not block the epoll I/O loop. `WITH`/`EXPLAIN`
+that can wrap writes, DDL/catalog changes, and sessions that created TEMP
+objects stay on the event-loop path. The pool is configured with the
+historical `--read-workers` flag (also called `read_worker_threads`): the
+default is the detected hardware concurrency capped at 16. The flag accepts 1..1024;
+values above the server cap of 16 are clamped to 16
+with a warning at startup. TLS/GSS encryption
 requests are declined and
-clients continue over plain TCP. The default bind address is therefore
+clients continue over plain TCP. The default bind address is
 `127.0.0.1`; binding to a non-loopback address should only be done on a trusted
 network. PostgreSQL extended-query messages, `COPY`, catalog compatibility for
 psql backslash commands such as `\dt`, and PostgreSQL user/password management

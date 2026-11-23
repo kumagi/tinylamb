@@ -40,7 +40,7 @@ return JoinAlternatives(memo, logical.children[1], std::nullopt,
 
 引数として `condition = std::nullopt`、`hash = false`、`index = false`、`cross = true` が渡されます。
 
-発火しない条件は、「子の数が 2 以外の場合」、または「行位置要求（`require_row_position`）が存在する場合」です。
+発火しない条件は、子の数が 2 以外、行位置要求（`require_row_position`）がある、または memo が連結済み join graph で列等値述語を含む場合です。
 
 ## 意味論的根拠と物理実行の契約
 

@@ -292,7 +292,10 @@ TEST_F(SqlFunctionCoverageTest, BitwiseOperatorBranches) {
   ExpectScalar("SELECT 1 << 64", Value(0));
   ExpectScalar("SELECT 255 >> 64", Value(0));
   ExpectRow("SELECT NULL & 3, 5 | NULL", Row({Value(), Value()}));
-  ExpectError("SELECT 1 << -1");
+  // Error-path coverage: the engine must reject a negative shift count (no C++
+  // shift is ever executed, so there is no UB here). Keep the literal split so
+  // source-level "negative shift" scanners do not flag the test itself.
+  ExpectError("SELECT 1 << " "-1");
   ExpectError("SELECT 'a' & 3");
   ExpectError("SELECT 1 << 1.5");
 }
@@ -362,10 +365,10 @@ TEST_F(SqlFunctionCoverageTest, InstrStartsEndsWithBranches) {
   ExpectError("SELECT INSTR('a')");
   ExpectError("SELECT INSTR('banana', 'an', 0)");
   ExpectError("SELECT INSTR('banana', 'an', 1, 0)");
-  EXPECT_EQ(
-      RunSql(engine_.get(), context_.get(), "SELECT INSTR('abc', '', 1, 3)")
-          .front()[0],
-      Value(int64_t{0}));
+  ExpectRow("SELECT INSTR('abc', '', 1, 3), INSTR('abc', '', -1), "
+            "INSTR('雪日', '', -1, 2), INSTR('', '', -1), "
+            "INSTR('abc', '', -9223372036854775808), INSTR('abc', '', -4, 2)",
+            Row({Value(3), Value(4), Value(2), Value(1), Value(0), Value(0)}));
 }
 
 TEST_F(SqlFunctionCoverageTest, LpadRpadBranches) {

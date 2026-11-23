@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -302,9 +303,26 @@ Status AssembleColumnarWindowOutput(
     }
     out_table->AppendKeepalive(input.columnar);
   }
-  out_table->chunks.reserve(src_table.chunks.size());
+  const auto nonempty_chunks = static_cast<size_t>(std::ranges::count_if(
+      src_table.chunks,
+      [](const ColumnarChunk& chunk) { return chunk.rows != 0; }));
+  out_table->chunks.reserve(nonempty_chunks);
 
   std::vector<size_t> ref_counts;
+  // kept_slots indexes chunk columns directly below; a slot at or past a
+  // chunk's width would be an out-of-bounds read/write, so reject ragged
+  // input up front instead of guarding each use.
+  for (const ColumnarChunk& chunk : src_table.chunks) {
+    if (chunk.rows == 0) {
+      continue;
+    }
+    for (const size_t s : kept_slots) {
+      if (s >= chunk.columns.size()) {
+        return StatusError(StatusCode::kCorrupt,
+                           "window kept slot exceeds chunk column count");
+      }
+    }
+  }
   size_t row_off = 0;
   for (size_t ci = 0; ci < src_table.chunks.size(); ++ci) {
     const ColumnarChunk& src_chunk = src_table.chunks[ci];
@@ -948,7 +966,7 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       }
     }
     if (can_dense_part_agg) {
-      const size_t workers = std::min<size_t>(
+      const auto workers = std::min<size_t>(
           {8, n / 4096,
            QueryParallelWorkerLimit(std::thread::hardware_concurrency())});
       const int64_t* pvals = part_col.vals;
@@ -993,14 +1011,14 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       int64_t max_k = std::numeric_limits<int64_t>::min();
       bool has_any_nonnull = false;
       for (size_t w = 0; w < workers; ++w) {
-        if (w_has[w]) {
+        if (w_has[w] != 0u) {
           if (!has_any_nonnull) {
             min_k = w_min[w];
             max_k = w_max[w];
             has_any_nonnull = true;
           } else {
-            if (w_min[w] < min_k) min_k = w_min[w];
-            if (w_max[w] > max_k) max_k = w_max[w];
+            min_k = std::min(w_min[w], min_k);
+            max_k = std::max(w_max[w], max_k);
           }
         }
       }
@@ -1008,10 +1026,15 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
                                 ? (static_cast<uint64_t>(max_k) -
                                    static_cast<uint64_t>(min_k) + 1ULL)
                                 : 0ULL;
-      if (span <= 16384ULL) {
-        const size_t null_slot = static_cast<size_t>(span);
+      // The subtraction is modulo 2^64 and yields the correct span for every
+      // int64 interval except the full [INT64_MIN, INT64_MAX] range, whose
+      // span is exactly 2^64 and wraps to 0. Without this guard the dense
+      // path would allocate 0..1 slots and index them with a huge offset.
+      const bool span_overflowed = has_any_nonnull && span == 0ULL;
+      if (!span_overflowed && span <= 16384ULL) {
+        const auto null_slot = static_cast<size_t>(span);
         const size_t num_slots = null_slot + (part_col.any_null ? 1 : 0);
-        const uint64_t base_k = static_cast<uint64_t>(min_k);
+        const auto base_k = static_cast<uint64_t>(min_k);
         for (size_t w = 0; w < win_count; ++w) {
           const FlatWindowSpec& spec = specs[w];
           if (spec.out_type == ValueType::kNull) {
@@ -1071,7 +1094,7 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
               int64_t* cnt = w_cnt[worker].data();
               if (!part_col.any_null && !src.any_null) {
                 for (size_t r = begin; r < end; ++r) {
-                  const size_t slot = static_cast<size_t>(
+                  const auto slot = static_cast<size_t>(
                       static_cast<uint64_t>(pvals[r]) - base_k);
                   sum[slot] += svals[r];
                   ++cnt[slot];
@@ -1116,7 +1139,7 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
               bool local_null = false;
               if (!part_col.any_null && !any_slot_null) {
                 for (size_t r = begin; r < end; ++r) {
-                  const size_t slot = static_cast<size_t>(
+                  const auto slot = static_cast<size_t>(
                       static_cast<uint64_t>(pvals[r]) - base_k);
                   dst[r] = slot_val[slot];
                 }
@@ -1222,8 +1245,11 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
               win_any_null[w] = 1;
             }
           }
+          // Mark the dense path as done only inside the span guard above: a
+          // partition-key span over the dense-array cap must still run the
+          // bucket fallback below instead of emitting zero-initialized output.
+          done_dense_part_agg = true;
         }
-        done_dense_part_agg = true;
       }
     }
     const bool nonnull_part_and_ord = !part_col.any_null && !check_ord_null;
@@ -1759,8 +1785,8 @@ StatusOr<std::optional<Relation>> TryComputeMultiKeyColumnarWindows(
     Kind kind{Kind::kPrefix};
     PrefixOp prefix_op{PrefixOp::kSum};
     PrefixFrameMode frame_mode{PrefixFrameMode::kRows};
-    size_t arg_col_idx{SIZE_MAX};  // SIZE_MAX for arg-less functions / COUNT(*)
-                                   // / const LAG/LEAD
+    size_t arg_col_idx{SIZE_MAX};  // SIZE_MAX for arg-less functions /
+                                   // COUNT(*) / const LAG/LEAD
     uint64_t lag_offset{1};
     int64_t lag_const_int{0};
     ValueType out_type{ValueType::kNull};
@@ -3206,7 +3232,7 @@ StatusOr<Relation> RunGeneralColumnarWindows(
           ColumnarColumn& dst = dst_chunk->columns[kept_width + w];
           const WindowColTypeSummary& summary = final_types[w];
           if (summary.mixed) {
-            dst.Init(ValueType::kArray, false, false, chunk_rows);
+            dst.InitFallback(summary.first_type, chunk_rows);
           } else if (summary.seen_non_null) {
             dst.Init(summary.type, summary.is_unsigned, summary.is_interval,
                      chunk_rows);

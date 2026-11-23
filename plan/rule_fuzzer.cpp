@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -80,9 +82,22 @@ class PushdownDb {
   ~PushdownDb() {
     db_.reset();
     std::error_code ec;
-    std::filesystem::remove(name_ + ".log", ec);
-    std::filesystem::remove(name_ + ".db", ec);
-    std::filesystem::remove(name_ + ".last_checkpoint", ec);
+    const std::filesystem::path base(name_);
+    const auto parent = base.parent_path().empty()
+                            ? std::filesystem::path(".")
+                            : base.parent_path();
+    const std::string prefix = base.filename().string();
+    for (std::filesystem::directory_iterator it(parent, ec), end;
+         !ec && it != end; it.increment(ec)) {
+      const std::string filename = it->path().filename().string();
+      if (filename == prefix + ".db" || filename == prefix + ".log" ||
+          filename.starts_with(prefix + ".log.") ||
+          filename == prefix + ".last_checkpoint" ||
+          filename == prefix + ".last_checkpoint.tmp") {
+        std::error_code remove_error;
+        std::filesystem::remove(it->path(), remove_error);
+      }
+    }
   }
 
   Database& GetDb() { return *db_; }
@@ -140,33 +155,37 @@ class PushdownDb {
 
     // Create indexes on tables for index scan / index join rules. A silently
     // missing index would quietly drop the index-side NoREC coverage, so any
-    // failure must make Setup fail rather than leave the sweep green.
-    bool setup_ok = true;
+    // failure must abort Setup instead of leaving the sweep green on a
+    // partially indexed database.
     auto add_idx = [&](std::string_view tbl, std::string_view idx_name,
                        const std::vector<slot_t>& cols,
-                       IndexMode mode = IndexMode::kUnique) {
+                       IndexMode mode = IndexMode::kUnique) -> bool {
       Status s =
           db_->CreateIndex(ctx, tbl, IndexSchema(idx_name, cols, {}, mode));
       if (s != Status::kSuccess) {
         std::cerr << "Setup index failed on " << tbl << " (" << idx_name
                   << ")\n";
-        setup_ok = false;
+        return false;
       }
+      return true;
     };
-    add_idx("t1", "t1_pk", {0}, IndexMode::kUnique);
-    add_idx("t2", "t2_pk", {0}, IndexMode::kUnique);
-    add_idx("t3", "t3_pk", {0}, IndexMode::kUnique);
-    // Secondary indexes are what make NoREC's WHERE side take a range,
-    // prefix, or join lookup while the CASE reference still reads every row.
-    add_idx("t1", "t1_val", {1}, IndexMode::kNonUnique);
-    add_idx("t1", "t1_flag", {2}, IndexMode::kNonUnique);
-    add_idx("t1", "t1_note", {3}, IndexMode::kNonUnique);
-    add_idx("t1", "t1_val_flag", {1, 2}, IndexMode::kNonUnique);
-    add_idx("t2", "t2_fk", {1}, IndexMode::kNonUnique);
-    add_idx("t2", "t2_val", {2}, IndexMode::kNonUnique);
-    add_idx("t2", "t2_note", {4}, IndexMode::kNonUnique);
-    add_idx("t3", "t3_fk", {1}, IndexMode::kNonUnique);
-    add_idx("t3", "t3_val", {2}, IndexMode::kNonUnique);
+    // Short-circuit: do not create further indexes or ANALYZE once one failed.
+    if (!add_idx("t1", "t1_pk", {0}, IndexMode::kUnique) ||
+        !add_idx("t2", "t2_pk", {0}, IndexMode::kUnique) ||
+        !add_idx("t3", "t3_pk", {0}, IndexMode::kUnique) ||
+        // Secondary indexes are what make NoREC's WHERE side take a range,
+        // prefix, or join lookup while the CASE reference still reads every row.
+        !add_idx("t1", "t1_val", {1}, IndexMode::kNonUnique) ||
+        !add_idx("t1", "t1_flag", {2}, IndexMode::kNonUnique) ||
+        !add_idx("t1", "t1_note", {3}, IndexMode::kNonUnique) ||
+        !add_idx("t1", "t1_val_flag", {1, 2}, IndexMode::kNonUnique) ||
+        !add_idx("t2", "t2_fk", {1}, IndexMode::kNonUnique) ||
+        !add_idx("t2", "t2_val", {2}, IndexMode::kNonUnique) ||
+        !add_idx("t2", "t2_note", {4}, IndexMode::kNonUnique) ||
+        !add_idx("t3", "t3_fk", {1}, IndexMode::kNonUnique) ||
+        !add_idx("t3", "t3_val", {2}, IndexMode::kNonUnique)) {
+      return false;
+    }
     for (const char* table : {"t1", "t2", "t3"}) {
       StatusOr<QueryResult> analyzed =
           engine.Execute(ctx, std::string("ANALYZE ") + table + ";");
@@ -175,10 +194,10 @@ class PushdownDb {
       } else {
         std::cerr << "Setup ANALYZE failed on " << table
                   << " err: " << engine.LastError() << "\n";
-        setup_ok = false;
+        return false;
       }
     }
-    return setup_ok;
+    return true;
   }
 
   std::string name_;
@@ -201,6 +220,14 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
   while (result.Value().Next(&row)) {
     rows.push_back(row);
   }
+  // Next() returns false at EOF and on failure alike: a mid-iteration error
+  // must not be mistaken for a short (but valid) result.
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    if (error != nullptr) {
+      *error = "row iteration failed: " + ToString(result.Value().GetStatus());
+    }
+    return std::nullopt;
+  }
   if (rows.size() != 1 || rows[0].Size() == 0) {
     if (error != nullptr) {
       *error = "expected 1 row, got " + std::to_string(rows.size());
@@ -222,7 +249,10 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
 
 bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
                            std::string* mismatch_report) {
-  const int flavor = static_cast<int>(rng() % 33);
+  // Keep the historical % 32 range: committed *.test repro files pin a
+  // --seed and rely on the exact seed -> flavour (and downstream rng) map.
+  // Widening it remaps every old seed and destroys regression replay.
+  const int flavor = static_cast<int>(rng() % 32);
   std::string from_clause;
   std::string predicate;
   // Shapes whose two sides are not the same predicate on the same FROM
@@ -327,8 +357,16 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       }
       int64_t actual_rows = 0;
       Row r;
-      while (ref_res.Value().Next(&r) && actual_rows < 3) {
+      while (actual_rows < 3 && ref_res.Value().Next(&r)) {
         ++actual_rows;
+      }
+      // A truncated reference stream caused by a row-decoding error is a
+      // failure, not a valid "fewer than 3 rows" answer to compare against.
+      if (actual_rows < 3 && ref_res.Value().GetStatus() != Status::kSuccess) {
+        *mismatch_report = "[NoREC QUERY ERROR]\n  reference: " + ref_sql +
+                           "\n  error=" +
+                           ToString(ref_res.Value().GetStatus()) + "\n";
+        return false;
       }
       if (*opt_cnt != actual_rows) {
         *mismatch_report =
@@ -725,9 +763,10 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       *mismatch_report += "\n";
       return false;
     }
-    case 32: {
-      // Flavour 32: self-join with triangle conditions. Kept reachable in
-      // the flavour range instead of living in the (unreachable) default.
+    default: {
+      // Self-join with triangle conditions. This shape stays in `default`
+      // (unreachable with % 32) on purpose: giving it a numbered flavour
+      // changes the seed -> flavour mapping and breaks committed replays.
       from_clause = "t1 AS a JOIN t1 AS b ON a.flag = b.flag";
       static const std::array<const char*, 3> kPreds = {
           "a.id < b.id AND a.val + b.val > 20",
@@ -735,12 +774,6 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
           "a.val IS NOT NULL AND b.val IS NOT NULL AND a.val > b.val",
       };
       predicate = kPreds[rng() % kPreds.size()];
-      break;
-    }
-    default: {
-      // Defensive fallback; flavor is always within [0, 32].
-      from_clause = "t1";
-      predicate = "val > 0";
       break;
     }
   }
@@ -1057,6 +1090,11 @@ int main(int argc, char** argv) {
   }
   if (const char* env_threads = std::getenv("FUZZ_THREADS")) {
     num_threads = parse_int(env_threads, num_threads);
+  }
+  if (num_threads <= 0) {
+    std::cerr << "Invalid thread count: --threads/FUZZ_THREADS must be "
+                 "positive\n";
+    return 2;
   }
 
   std::random_device rd;

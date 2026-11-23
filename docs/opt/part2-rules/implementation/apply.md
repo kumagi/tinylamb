@@ -1,6 +1,6 @@
 # apply
 
-- 状態: draft   /   執筆基準リビジョン: `3880673` (2026-09-12)
+- 状態: draft   /   執筆基準リビジョン: `43dd7d4` (2026-10-16)
 - 定義位置: `plan/implementation_rules.cpp` の `DefaultImplementationRules()` 内の
   登録 `"apply"`（パターン: `Pattern::Op(kApply, {})`）
 
@@ -69,7 +69,8 @@ if (children.size() == 1) {
 コストおよび推定行数の算出は以下のとおりです。
 
 ```cpp
-const double rows = children[0].estimated_rows * 10.0;
+const double rows = children[0].estimated_rows *
+                    ApplyPlan::RowsPerOuterRowEstimate(kind);
 return std::vector<PlanAlternative>{
     PlanAlternative{.plan = std::move(plan),
                     .local_cost = children[0].estimated_rows * 2.0,
@@ -77,7 +78,7 @@ return std::vector<PlanAlternative>{
 ```
 
 - **局所コスト**: `children[0].estimated_rows * 2.0`。外側の 1 行ごとに内側の実行を開始する基本オーバーヘッドを定式化しています。
-- **推定出力行数**: `children[0].estimated_rows * 10.0`。内側サブクエリによる行数膨張を保守的に見積もる係数として 10 倍を設定しています。
+- **推定出力行数**: `children[0].estimated_rows * ApplyPlan::RowsPerOuterRowEstimate(kind)`。SEMI/ANTI は外側行ごとに最大 1 行、その他は保守的に 10 行を見積もります。
 
 1 子形の `ApplyPlan` は、実行時において `ApplyPlan::EmitExecutor` により `SelectStatement` からサブパイプラインを起動します。この際、外側の同一パラメータに対するサブクエリ評価結果をキャッシュする相関キャッシュ機構が働き、冗長な再計算を防止します。
 
@@ -89,7 +90,7 @@ return std::vector<PlanAlternative>{
 
 ## 関連 Rule との相互作用
 
-- **非相関化・派生表の平坦化**: 相関のない `FROM` サブクエリや平坦化可能な構造は計画前処理で通常の結合や `FlattenDerivedSources` へ降り、`apply` には到達しません。残余の相関式のみが本 Rule で `ApplyPlan` として物理化されます。
+- **非相関化・派生表の平坦化**: 相関のない `FROM` サブクエリや平坦化可能な構造は計画前処理で通常の結合や `FlattenDerivedSources` へ降り、この実装 Rule には到達しません。残余の相関式のみが本 Rule で `ApplyPlan` として物理化されます。
 
 ## 検証テスト
 

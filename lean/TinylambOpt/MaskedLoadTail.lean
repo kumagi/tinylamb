@@ -165,4 +165,36 @@ theorem full_width_load_violates_tail_access {α : Type} [Zero α] (mem : Nat �
       exact ⟨W - 1, List.mem_range.mpr (Nat.sub_one_lt (Nat.ne_of_gt hWpos)), rfl⟩
     · omega
 
+/-- Operational read trace of a masked instruction. Inactive lanes emit no
+    memory event. Mask construction and decoding use opposite representations. -/
+def maskedEvents (base : Nat) (mask : BitVec w) :=
+  ((List.range w).filter mask.getLsbD).map (base + ·)
+
+theorem generated_tail_load (base live width : Nat) (fits : live ≤ width) :
+    let mask := BitVec.ofBoolListLE ((List.range width).map (fun i => decide (i < live)))
+    maskedEvents base mask = refEvents base live := by
+  intro mask
+  unfold maskedEvents refEvents
+  simp only [List.length_map,List.length_range]
+  congr 1
+  have heq : (List.range width).filter mask.getLsbD =
+      (List.range width).filter (fun i => decide (i < live)) := by
+    apply List.filter_congr
+    intro i hi
+    unfold mask
+    rw [BitVec.getLsbD_ofBoolListLE,List.getD_eq_getElem?_getD]
+    simp [List.mem_range.mp hi]
+  rw [heq]
+  have split : List.range width = List.range live ++
+      (List.range (width-live)).map (live+·) := by rw [← List.range_add]; congr 1; omega
+  rw [split,List.filter_append]
+  have yes : (List.range live).filter (fun i => decide (i < live)) = List.range live :=
+    List.filter_eq_self.mpr (fun i hi => decide_eq_true (List.mem_range.mp hi))
+  have no : ((List.range (width-live)).map (live+·)).filter (fun i => decide (i < live)) = [] := by
+    apply List.filter_eq_nil_iff.mpr
+    intro i hi
+    obtain ⟨j,_,rfl⟩ := List.mem_map.mp hi
+    simp
+  simp [yes,no]
+
 end TinylambOpt.MaskedLoadTail

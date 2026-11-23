@@ -309,6 +309,10 @@ void LogRecord::SerializeTo(std::string* dst) const {
 }
 
 std::string LogRecord::Serialize() const {
+  // Convenience wrapper for non-hot callers (tests, dumps). The WAL append
+  // path uses SerializeTo() with a reused scratch buffer instead, so no
+  // temporary string is allocated per record there. NRVO applies to `out`,
+  // so this wrapper itself does not copy the payload a second time.
   std::string out;
   SerializeTo(&out);
   return out;
@@ -321,6 +325,14 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
   // from a previous decode cannot be mistaken for the skipped record.
   const auto fail = [this]() -> size_t {
     *this = LogRecord{};
+    // A default LogRecord carries kUnknownRecordLsn (UINT64_MAX), the marker
+    // for a live in-memory record that has not been assigned an LSN yet.
+    // ApplyTransactionCommitRecord substitutes the commit LSN for that
+    // marker, so a corrupt/partially decoded record must never keep it:
+    // mirror the pre-sentinel behaviour and leave a small, harmless LSN.
+    // type is already kUnknown, which makes the record unapplicable in every
+    // switch case as well.
+    record_lsn = 0;
     return size_t{0};
   };
   *this = LogRecord{};

@@ -64,7 +64,7 @@ TEST(RowSchemaExtraTest, ConstraintsSurviveSchemaSerialization) {
   Schema restored;
   Decoder decoder(buffer);
   decoder >> restored;
-  ASSERT_TRUE(buffer);
+  ASSERT_FALSE(decoder.Failed());
   ASSERT_EQ(restored.ColumnCount(), 3U);
   EXPECT_TRUE(restored.GetColumn(0).GetConstraint().IsUnique());
   EXPECT_EQ(restored.GetColumn(0).GetConstraint().ctype, Constraint::kPrimaryKey);

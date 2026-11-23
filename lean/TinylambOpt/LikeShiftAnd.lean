@@ -464,4 +464,42 @@ theorem boundary_widths :
   decide
 
 
+/-- One pass with early termination on the first accepting boundary. -/
+def scanUntilHit (needle : List Byte) (w : Nat) (hw : 1 ≤ w)
+    (st : List (BitVec w)) : List Byte → Bool
+  | [] => bitAt w st (needle.length - 1)
+  | b :: bs => bitAt w st (needle.length - 1) ||
+      scanUntilHit needle w hw (machineStep needle w hw st b) bs
+
+private theorem scan_prefix (needle : List Byte) (w : Nat) (hw : 1 ≤ w)
+    (st : List (BitVec w)) (input : List Byte) :
+    scanUntilHit needle w hw st input = true ↔ ∃ p t, input = p ++ t ∧
+      bitAt w (p.foldl (machineStep needle w hw) st) (needle.length - 1) = true := by
+  induction input generalizing st with
+  | nil => simp [scanUntilHit]
+  | cons b bs ih =>
+    rw [scanUntilHit, Bool.or_eq_true, ih]
+    constructor
+    · rintro (h | ⟨p,t,rfl,h⟩)
+      · exact ⟨[],_,rfl,h⟩
+      · exact ⟨b::p,t,rfl,h⟩
+    · rintro ⟨p,t,he,h⟩
+      cases p with
+      | nil => exact Or.inl h
+      | cons c p =>
+        obtain ⟨rfl,ht⟩ := List.cons.inj he
+        exact Or.inr ⟨p,t,ht,h⟩
+
+theorem shift_and_contains (needle input : List Byte) (hne : needle ≠ [])
+    (w k : Nat) (hw : 1 ≤ w) (hfit : needle.length ≤ w*k) :
+    scanUntilHit needle w hw (List.replicate k (0#w)) input = true ↔
+      ∃ pre post, input = pre ++ needle ++ post := by
+  rw [scan_prefix]
+  constructor
+  · rintro ⟨p,t,rfl,h⟩
+    obtain ⟨a,rfl⟩ := (like_shift_and_sound needle hne w k hw hfit p).mp h
+    exact ⟨a,t,rfl⟩
+  · rintro ⟨p,t,rfl⟩
+    exact ⟨_,t,rfl,(like_shift_and_sound needle hne w k hw hfit _).mpr ⟨p,rfl⟩⟩
+
 end TinylambOpt.LikeShiftAnd

@@ -777,4 +777,46 @@ theorem nulls_placement_example :
       better vf nf = false ∧ better nl vl = false ∧ better df vf = false := by
   decide
 
+/-- Merge-based reference Top-N on two runs of payload rows. A certified
+    retained prefix is emitted before any row of the skipped run. -/
+private theorem take_merge_left (k : Nat) (xs ys : List α) (cmp : α → α → Bool)
+    (len : k ≤ xs.length) (front : ∀ x ∈ xs.take k, ∀ y ∈ ys, cmp x y = true) :
+    (xs.merge ys cmp).take k = xs.take k := by
+  induction k generalizing xs with
+  | zero => simp
+  | succ k ih =>
+    cases xs with
+    | nil => simp at len
+    | cons x xs =>
+      cases ys with
+      | nil => simp
+      | cons y ys =>
+        have hxy := front x (by simp) y (by simp)
+        rw [List.merge, if_pos hxy]
+        simp only [List.take_succ_cons, List.cons.injEq, true_and]
+        apply ih _ (by simpa using len)
+        intro z hz t ht
+        exact front z (by simp [hz]) t ht
+
+theorem sorted_payload_fence (key : α → Key) (k : Nat) (pre block : List α) (f : Fence)
+    (hkb : specOf f.kth = specOf f.bound)
+    (schema : ∀ x ∈ pre ++ block, specOf (key x) = specOf f.kth)
+    (enough : k ≤ pre.length)
+    (front : ∀ x ∈ (pre.mergeSort (fun a b => leKey (key a) (key b))).take k,
+      leKey (key x) f.kth = true)
+    (bound : ∀ y ∈ block, leKey f.bound (key y) = true)
+    (strict : better f.kth f.bound = true) :
+    let cmp := fun a b => leKey (key a) (key b)
+    ((pre.mergeSort cmp).merge (block.mergeSort cmp) cmp).take k =
+      (pre.mergeSort cmp).take k := by
+  intro cmp
+  apply take_merge_left _ _ _ _ (by simpa using enough)
+  intro x hx y hy
+  have hxpre : x ∈ pre := List.mem_mergeSort.mp (List.mem_of_mem_take hx)
+  have hyb : y ∈ block := List.mem_mergeSort.mp hy
+  have sx := schema x (List.mem_append_left _ hxpre)
+  have sy := schema y (List.mem_append_right _ hyb)
+  exact leKey_trans _ _ _ sx sy.symm (front x hx)
+    (leKey_trans _ _ _ hkb (hkb.symm.trans sy.symm) (leKey_of_better _ _ strict) (bound y hyb))
+
 end TinylambOpt.TopNBlockFence

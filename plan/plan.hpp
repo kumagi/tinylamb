@@ -142,11 +142,11 @@ class PlanBase {
   // crashed the observer instead of printing it.  Rendering truncates at
   // the cap; execution is untouched.
   static constexpr int kMaxPlanDumpDepth = 512;
-  void DumpChild(
+  static void DumpChild(
       std::ostream& o,
       const PlanBase&
           child,  // NOLINT(readability-convert-member-functions-to-static)
-      int child_indent) const {
+      int child_indent) {
     // `indent` alone is not a depth bound: a plan's ToString() may re-enter
     // Dump() with indent 0 (ApplyPlan is one such shape), restarting the
     // counter while the C++ stack keeps growing. Track active child walks as

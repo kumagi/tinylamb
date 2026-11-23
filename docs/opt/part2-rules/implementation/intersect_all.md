@@ -60,7 +60,7 @@ return std::vector<PlanAlternative>{
 ```
 
 - **`local_cost = input_rows`**: 全入力リレーションの行数の総和です。マルチセット積の計算では全入力行を走査して頻度マップを作成・照合するため、入力総行数に応じた線形コストを支払います。
-- **`estimated_rows = children.front().estimated_rows`**: マルチセット共通部分の行数はどの入力の行数をも超えません（$\sum \min(\text{cnt}_L(x), \text{cnt}_R(x)) \le \sum \text{cnt}_L(x)$）。したがって、先頭の子の行数が厳密な上界となります。
+- **`estimated_rows`**: マルチセット共通部分の行数はどの入力の行数をも超えません（$\sum \min_i \text{cnt}_i(x) \le \sum \text{cnt}_i(x)$）。実装は全子の `estimated_rows` の最小値を使い、最も小さい入力上界を採用します。
 - **物理表現**: 生成された物理演算子は `SetOperationPlan::ToString` により `IntersectAll` と出力されます。
 
 ## 最適化効果

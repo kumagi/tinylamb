@@ -95,11 +95,13 @@ class ExpressionBase {
   [[nodiscard]] virtual std::unordered_set<ColumnName> TouchedColumns() const;
   [[nodiscard]] virtual Value Evaluate(const Row& row,
                                        const Schema& schema) const = 0;
-  [[nodiscard]] virtual Value Evaluate(const Row* /*unused*/,
-                                       const Schema& /*unused*/,
+  // Nodes that have not migrated to the two-row overload are evaluated on
+  // the left row, matching the context-aware default below. Throwing here
+  // would let an exception escape across a Status boundary.
+  [[nodiscard]] virtual Value Evaluate(const Row* left, const Schema& schema,
                                        const Row* /*unused*/,
                                        const Schema& /*unused*/) const {
-    throw std::runtime_error("not implemented");
+    return left == nullptr ? Value() : Evaluate(*left, schema);
   }
   // Context-aware evaluation: subqueries and aggregates
   // are resolved through the abstract EvaluationContext instead of database
@@ -114,29 +116,45 @@ class ExpressionBase {
   }
 
   // No-exception evaluation contract: nodes override TryEvaluate and route
-  // their Evaluate through the EXC-SHIM wrapper; the default here forwards to
-  // the still-throwing Evaluate. TryEvaluate is the interface callers should
-  // use for Status-based error handling.
+  // their Evaluate through the EXC-SHIM wrapper; the default here adapts the
+  // throwing Evaluate into StatusOr via try/catch. TryEvaluate is the
+  // interface callers should use for Status-based error handling.
   [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema) const {
-    return Evaluate(row, schema);
+    try {
+      return Evaluate(row, schema);
+    } catch (...) {
+      return StatusError(StatusCode::kRuntimeError,
+                         "Evaluate(row, schema) threw");
+    }
   }
   [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
       const Row* left, const Schema& left_schema, const Row* right,
       const Schema& right_schema) const {
-    return Evaluate(left, left_schema, right, right_schema);
+    try {
+      return Evaluate(left, left_schema, right, right_schema);
+    } catch (...) {
+      return StatusError(StatusCode::kRuntimeError, "two-row Evaluate threw");
+    }
   }
   [[nodiscard]] virtual StatusOr<Value> TryEvaluate(
       const Row& row, const Schema& schema, EvaluationContext& context) const {
-    return Evaluate(row, schema, context);
+    try {
+      return Evaluate(row, schema, context);
+    } catch (...) {
+      return StatusError(StatusCode::kRuntimeError,
+                         "context-aware Evaluate threw");
+    }
   }
+  // Report an unknown type instead of throwing across planning/Status
+  // boundaries; concrete nodes override this with their real static type.
   [[nodiscard]] virtual tinylamb::Type ResultType(
       const Schema& /*unused*/) const {
-    throw std::runtime_error("not implemented");
+    return {TypeTag::kInvalid};
   }
   [[nodiscard]] virtual tinylamb::Type ResultType(
       const Schema& /*unused*/, const Schema& /*unused*/) const {
-    throw std::runtime_error("not implemented");
+    return {TypeTag::kInvalid};
   }
   // Validates the expression against the schema, resolving function
   // signatures through EvaluationContext (the database

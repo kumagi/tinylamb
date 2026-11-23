@@ -34,7 +34,7 @@ class SamplePlan final : public PlanBase {
     return child_->ScanSource();
   }
   [[nodiscard]] const TableStatistics& GetStats() const override {
-    return child_->GetStats();
+    return stats_;
   }
   [[nodiscard]] const Schema& GetSchema() const override {
     return output_schema_;
@@ -91,6 +91,7 @@ class SamplePlan final : public PlanBase {
   Plan child_;
   TableSampleSpec spec_;
   Schema output_schema_;
+  TableStatistics stats_;
 };
 
 }  // namespace tinylamb

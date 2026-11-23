@@ -60,6 +60,9 @@ def wait_quiet():
                 quiet_since = time.monotonic()
             if time.monotonic() - quiet_since >= 5:
                 return
+        # Competing build/test/profiler work runs in other processes, so there
+        # is no in-process condition variable to wait on; the 5-second quiet
+        # window above bounds this poll.
         time.sleep(1)
 
 
@@ -175,22 +178,26 @@ def main():
     for s in sockets:
         s.bind(('127.0.0.1', 0))
     ports = [s.getsockname()[1] for s in sockets]
-    for s in sockets:
-        s.close()
     args = SimpleNamespace(server=str(a.server.resolve()), scratch=str(ROOT/'build/benchmarks'),
         server_cpus=a.server_cpus, tiny_port=ports[0], pg_port=ports[1], mysql_port=ports[2],
         read_workers=8, tiny_query_memory_mib=256, data_cache_mib=512, server_metrics=True,
         postgres_image='postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4',
         mysql_image='mysql@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7')
     stack = Stack(args, out)
+    stack.port_reservations = dict(zip(('tinylamb', 'postgresql', 'mysql'), sockets))
     clone(a.fixture, stack.work / 'database')
     try:
         stack.start()
         meta = stack.metadata()
         meta['tpcc_args'] = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}
         meta['client_sha256'] = hashlib.sha256(a.client.read_bytes()).hexdigest()
-        meta['fixture_sha256'] = {p.name: hashlib.file_digest(p.open('rb'), 'sha256').hexdigest()
-                                 for p in a.fixture.parent.glob(a.fixture.name + '.*') if p.is_file()}
+        fixture_hashes = {}
+        for path in a.fixture.parent.glob(a.fixture.name + '.*'):
+            if path.is_file():
+                with path.open('rb') as fixture_file:
+                    fixture_hashes[path.name] = hashlib.file_digest(
+                        fixture_file, 'sha256').hexdigest()
+        meta['fixture_sha256'] = fixture_hashes
         meta['runtime_source_sha256'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in runtime.iterdir()}
         meta['mysql_c_library'] = subprocess.check_output(['ldd', str(a.client)], text=True)
         library = re.search(r'libmysqlclient\.so\.\d+ => (\S+)', meta['mysql_c_library'])
@@ -228,6 +235,8 @@ def main():
                 argv += ['--mysql', '1']
             result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             (out / f'transport-{engine}.log').write_text(result.stdout + result.stderr)
+            # No check=True here: validate the exit code explicitly so the
+            # failing command's output is still saved to transport-*.log.
             if result.returncode:
                 raise RuntimeError(f'{engine} transport test failed: {result.stdout} {result.stderr}')
         for trial in range(1, a.trials + 1):
@@ -238,7 +247,7 @@ def main():
             db = stack.work / f'database-{trial}'
             clone(a.fixture, db)
             env = {k:v for k,v in os.environ.items() if not k.startswith('TINYLAMB_')}
-            env.update(TINYLAMB_PAGE_POOL_BYTES=str(512 << 20), TINYLAMB_QUERY_MEMORY_BYTES=str(256 << 20), TINYLAMB_SERVER_METRICS='1')
+            env.update(TINYLAMB_BUFFER_POOL_BYTES=str(512 << 20), TINYLAMB_QUERY_MEMORY_BYTES=str(256 << 20), TINYLAMB_SERVER_METRICS='1')
             argv = ['taskset', '-c', a.server_cpus, str(a.server.resolve()), str(db), '--port', str(ports[0]), '--read-workers', '8']
             append_json(out/'commands.jsonl', dict(argv=argv, env={k:v for k,v in env.items() if k.startswith('TINYLAMB_')}))
             stack.process = subprocess.Popen(argv, env=env, stdout=stack.log, stderr=subprocess.STDOUT, cwd=ROOT)
@@ -297,6 +306,9 @@ def main():
                 c = Client(engine, stack.ports, 120)
                 state = check(c)
                 c.close()
+                # Popen has no check= argument: the client is short-lived, and
+                # its exit status is checked explicitly here (and recorded in
+                # results.jsonl) rather than being ignored.
                 valid = process.returncode == 0 and state['valid']
                 append_json(out/'results.jsonl', dict(kind='tpcc', engine=engine, trial=trial, clients=a.clients,
                     seconds=a.seconds, warmup=a.warmup, metrics=metrics, invariants=state, exit_code=process.returncode,

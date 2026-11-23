@@ -90,8 +90,8 @@ Memo は追記型のデータ構造であるため、元の `Join(L, R)` は保�
 ## 検証テスト
 
 - `plan/cascades_test_part*.cpp` の `DefaultRulesEnumerateEquivalentJoinTreesInMemo`
-  — 3 表の Group を探索すると `ExpressionCount(root) >= 4` となり、
-  元の順・交換した順の式が揃うことを検査します。
+  — 3 表の Group を探索し、式数と Group 数の下限を検査します。各式の子 Group
+  順序までは比較しないため、元の順と交換した順の両方が揃うことは直接検証しません。
 - `plan/cascades_test_part*.cpp` の `AppliedRuleNamesTrackFiredRules` —
   `search.AppliedRuleNames().contains("join_commutativity")` で実際に
   発火したことを記録ベースで検査します。

@@ -79,6 +79,9 @@ class ParallelPool {
   }
 
   bool Submit(TaskBatch* batch) {
+    if (batch->count < 2) {
+      return false;
+    }
     size_t helpers = 0;
     bool wake_all = false;
     {
@@ -89,17 +92,19 @@ class ParallelPool {
       helpers =
           std::min<size_t>({batch->count - 1, kMaxPoolWorkers,
                             std::max(1U, std::thread::hardware_concurrency())});
+      // Grow the pool before publishing the batch. A worker that has already
+      // claimed an index must never observe a Submit() failure: the caller
+      // would take the serial path and destroy the stack-allocated TaskBatch
+      // while that worker was still using it (use-after-free).
       try {
-        batches_.push_back(batch);
         while (threads_.size() < helpers) {
           threads_.emplace_back([this] { Work(); });
         }
+        batches_.push_back(batch);
       } catch (...) {
-        // Workers already started belong to the shared pool. Joining one
-        // here would deadlock while it waits for this mutex.
-        if (!batches_.empty() && batches_.back() == batch) {
-          batches_.pop_back();
-        }
+        // No batch was published, so no worker can reference `batch` here.
+        // Threads created so far stay idle in the shared pool; joining one
+        // while holding this mutex would deadlock.
         return false;
       }
       wake_all = (helpers >= threads_.size());

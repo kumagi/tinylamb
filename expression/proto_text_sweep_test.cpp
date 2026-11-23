@@ -151,7 +151,8 @@ TEST(ProtoTextFormatTest, TimestampOffsetsAreAppliedBeforeEncodingFields) {
   constexpr int64_t k125Millis = 125'000'000;
   for (const char* text :
        {"1970-01-01T05:30:00.125+0530", "1970-01-01 05:30:00.125+05:30",
-        "1969-12-31T21:00:00.125-03", "1970-01-01T00:00:00.125Z"}) {
+        "1970-01-01T05:30:11.125+05:30:11", "1969-12-31T21:00:00.125-03",
+        "1970-01-01T00:00:00.125Z"}) {
     const auto nanos = ParseTimestampTextNanos(text);
     ASSERT_TRUE(nanos.has_value()) << text;
     EXPECT_TRUE(nanos.value() == k125Millis) << text;
@@ -170,7 +171,7 @@ TEST(ProtoTextFormatTest, TimestampOffsetsAreAppliedBeforeEncodingFields) {
   EXPECT_NE(constructed.Value().find("millis_default: 125"), std::string::npos);
 
   for (const char* bad :
-       {"1970-01-01T00:00:00+05:30:00", "1970-01-01T00:00:00+0560",
+       {"1970-01-01T00:00:00+05:30:60", "1970-01-01T00:00:00+0560",
         "1970-01-01T00:00:00Zextra"}) {
     EXPECT_FALSE(ParseTimestampTextNanos(bad).has_value()) << bad;
     EXPECT_EQ(TryProtoTextSetField("seconds_default: 5", {"seconds_default"},
@@ -266,47 +267,61 @@ TEST(ProtoTextHasFieldTest, PresenceIsCaseInsensitive) {
 
 TEST(ProtoTextSetFieldTest, UpdatesCreatesAndClears) {
   // Update an existing scalar in place.
-  auto updated = TryProtoTextSetField("a: 1 b: 2", {"b"}, Value(int64_t{9}), "")
-                     .MoveValue();
+  auto updated_or =
+      TryProtoTextSetField("a: 1 b: 2", {"b"}, Value(int64_t{9}), "");
+  ASSERT_TRUE(updated_or.HasValue()) << updated_or.GetStatus();
+  auto updated = updated_or.MoveValue();
   ASSERT_TRUE(updated.has_value());
-  assert(updated.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*updated, "a: 1 b: 9");
 
   // Append a new field at the end.
-  auto appended =
-      TryProtoTextSetField("a: 1", {"c"}, Value(int64_t{3}), "").MoveValue();
+  auto appended_or = TryProtoTextSetField("a: 1", {"c"}, Value(int64_t{3}), "");
+  ASSERT_TRUE(appended_or.HasValue()) << appended_or.GetStatus();
+  auto appended = appended_or.MoveValue();
   ASSERT_TRUE(appended.has_value());
-  assert(appended.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*appended, "a: 1 c: 3");
 
   // A NULL clears the field.
-  auto cleared =
-      TryProtoTextSetField("a: 1 b: 2", {"a"}, Value(), "").MoveValue();
+  auto cleared_or = TryProtoTextSetField("a: 1 b: 2", {"a"}, Value(), "");
+  ASSERT_TRUE(cleared_or.HasValue()) << cleared_or.GetStatus();
+  auto cleared = cleared_or.MoveValue();
   ASSERT_TRUE(cleared.has_value());
-  assert(cleared.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*cleared, "b: 2");
 
   // Dotted paths reach into nested messages.
-  auto nested = TryProtoTextSetField("m { inner: 1 }", {"m", "inner"},
-                                     Value(int64_t{5}), "")
-                    .MoveValue();
+  auto nested_or = TryProtoTextSetField("m { inner: 1 }", {"m", "inner"},
+                                        Value(int64_t{5}), "");
+  ASSERT_TRUE(nested_or.HasValue()) << nested_or.GetStatus();
+  auto nested = nested_or.MoveValue();
   ASSERT_TRUE(nested.has_value());
-  assert(nested.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_NE(nested->find("inner: 5"), std::string::npos);
   Value out;
-  assert(nested.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-  ASSERT_TRUE(TryProtoTextExtractField(*nested, "m", &out).MoveValue());
+  auto extracted = TryProtoTextExtractField(*nested, "m", &out);
+  ASSERT_TRUE(extracted.HasValue()) << extracted.GetStatus();
+  EXPECT_TRUE(extracted.Value());
   EXPECT_NE(out.AsString().find("inner: 5"), std::string::npos);
 
   // Empty path is a no-op.
-  auto noop =
-      TryProtoTextSetField("a: 1", {}, Value(int64_t{2}), "").MoveValue();
+  auto noop_or = TryProtoTextSetField("a: 1", {}, Value(int64_t{2}), "");
+  ASSERT_TRUE(noop_or.HasValue()) << noop_or.GetStatus();
+  auto noop = noop_or.MoveValue();
   EXPECT_FALSE(noop.has_value());
+}
+
+TEST(ProtoTextSetFieldTest, SetsLeafInEveryRepeatedParent) {
+  // The reader visits every parent with the same name, so a dotted SET must
+  // rewrite all of them. Returning after the first match used to leave the
+  // second `m { inner: ... }` stale.
+  auto updated = TryProtoTextSetField("m { inner: 1 } m { inner: 2 }",
+                                      {"m", "inner"}, Value(int64_t{9}), "");
+  ASSERT_TRUE(updated.HasValue()) << updated.GetStatus();
+  ASSERT_TRUE(updated.Value().has_value());
+  const std::string& text = *updated.Value();
+  const size_t first = text.find("inner: 9");
+  ASSERT_NE(first, std::string::npos) << text;
+  EXPECT_NE(text.find("inner: 9", first + 1), std::string::npos) << text;
+  EXPECT_EQ(text.find("inner: 1"), std::string::npos) << text;
+  EXPECT_EQ(text.find("inner: 2"), std::string::npos) << text;
 }
 
 TEST(ProtoTextSetFieldTest, AuditMalformedPayloadNeverBecomesReplacement) {
@@ -441,10 +456,78 @@ TEST(ProtoTextExtractFieldTest, DateDecimalConversionReturnsStatusNotThrow) {
   EXPECT_TRUE(null_out.IsNull());
 }
 
+TEST(ProtoTextExtractFieldTest, DateDecimalDecodesYearsBefore1000) {
+  // A YYYYMMDD decimal is only five to seven digits for years 1..999; the
+  // read conversion used to return the raw INT64 for those values, breaking
+  // the DATE round-trip through a DATE_DECIMAL-annotated field.
+  for (const char* text : {"0999-01-01", "0500-12-31", "0001-01-01"}) {
+    const Value original =
+        Value::DateFromDays(TryParseDateDays(text).MoveValue());
+    const auto serialized =
+        TryProtoTextSetField("date_decimal: 0", {"date_decimal"}, original, "");
+    ASSERT_TRUE(serialized.HasValue() && serialized.Value().has_value());
+    Value decoded;
+    ASSERT_TRUE(
+        TryProtoTextExtractField(*serialized.Value(), "date_decimal", &decoded)
+            .MoveValue())
+        << text << " -> " << *serialized.Value();
+    EXPECT_EQ(decoded.type, ValueType::kDate) << text;
+    EXPECT_EQ(decoded, original) << text << " -> " << *serialized.Value();
+  }
+}
+
+TEST(ProtoTextSetFieldTest, DateDecimalWritePreservesFiveDigitYears) {
+  const Value original =
+      Value::DateFromDays(TryParseDateDays("10000-03-15").MoveValue());
+  const auto serialized =
+      TryProtoTextSetField("date_decimal: 0", {"date_decimal"}, original, "");
+  ASSERT_TRUE(serialized.HasValue() && serialized.Value().has_value());
+  EXPECT_EQ(*serialized.Value(), "date_decimal: 100000315");
+  Value decoded;
+  ASSERT_TRUE(
+      TryProtoTextExtractField(*serialized.Value(), "date_decimal", &decoded)
+          .MoveValue());
+  EXPECT_EQ(decoded, original);
+
+  Value out_of_range(kDateMaxDays + 1);
+  out_of_range.type = ValueType::kDate;
+  const auto invalid = TryProtoTextSetField("date_decimal: 0", {"date_decimal"},
+                                            out_of_range, "");
+  EXPECT_EQ(invalid.GetStatus(), StatusCode::kInvalidArgument);
+}
+
 // T3665: nested reads must follow the WHOLE path the way the SetField side
 // descends; passing only the leaf name looked for a top-level field and
 // missed anything inside a message (nested DML could write msg.a.b but the
 // matching read never found it).
+TEST(ProtoTextParseTest, WireDecoderRejectsAnIncompleteKnownSubmessage) {
+  const std::string type = "googlesql_test.KitchenSinkPB";
+  // The first two fields are valid. Field 22 carries a known nested message.
+  const std::string complete = "\x08\x01\x10\x02\xb2\x01\x02\x08\x07";
+  const auto decoded = DecodeProtoWireBytes(type, complete);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_NE(decoded->find("nested_int64: 7"), std::string::npos);
+  const std::string incomplete = "\x08\x01\x10\x02\xb2\x01\x01\x08";
+  EXPECT_FALSE(DecodeProtoWireBytes(type, incomplete).has_value());
+}
+
+TEST(ProtoTextParseTest, WireDecoderKeepsNegativeAndLargeProto2EnumMembers) {
+  const std::string type = "googlesql_test.KitchenSinkEnumPB";
+  // Field 1 (required_test_enum), varint. -1 is encoded as the 10-byte
+  // two's-complement varint; 2147483647 as FF FF FF FF 07.
+  const std::string negative = "\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01";
+  const std::string large = "\x08\xff\xff\xff\xff\x07";
+  for (const auto& [wire, name] : {std::pair{negative, "TESTENUMNEGATIVE"},
+                                   std::pair{large, "TESTENUM2147483647"}}) {
+    auto decoded = DecodeProtoWireBytes(type, wire);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_NE(decoded->find(std::string("required_test_enum: ") + name),
+              std::string::npos)
+        << *decoded;
+    EXPECT_EQ(decoded->find("1: "), std::string::npos) << *decoded;
+  }
+}
+
 TEST(ProtoTextParseTest, GetFieldPathDescendsNestedMessages) {
   Value out;
   ASSERT_TRUE(

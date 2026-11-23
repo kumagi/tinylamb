@@ -170,4 +170,20 @@ theorem bloom_disjoint_does_not_exclude_null_null_match :
     bs.any (fun i => i ∈ ps) = false ∧ nullSafeEq JoinKey.nul JoinKey.nul = true := by
   decide
 
+def nullSafeSkip (cfg : BloomCfg) (bs ps : List JoinKey) : Bool :=
+  bloomSkip (sigOfKeys cfg bs) (sigOfKeys cfg ps) true &&
+    !(bs.contains .nul && ps.contains .nul)
+
+theorem nullSafeSkip_sound (cfg : BloomCfg) (bs ps : List JoinKey)
+    (bits : ∀ k, ∃ i, i ∈ keyBits cfg k) (hs : nullSafeSkip cfg bs ps = true)
+    (x y : JoinKey) (hx : x ∈ bs) (hy : y ∈ ps) :
+    (match x, y with
+     | .nul, .nul => True
+     | .val a, .val b => cfg.normalize a = cfg.normalize b
+     | _, _ => False) → False := by
+  simp only [nullSafeSkip, Bool.and_eq_true] at hs
+  have h := bloomSkip_sound cfg cfg bs ps _ true (fun _ => rfl) bits
+    (fun k hk => keyBits_subset_sigOfKeys cfg ps k hk) hs.1 x hx y hy
+  cases x <;> cases y <;> simp_all
+
 end TinylambOpt.BloomBlockIntersection

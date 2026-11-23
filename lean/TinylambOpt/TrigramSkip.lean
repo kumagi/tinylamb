@@ -1,4 +1,5 @@
 import Std.Tactic
+import TinylambOpt.LikeUnderscore
 
 /-!
 # Skipping LIKE blocks whose mandatory trigram is absent from a block summary
@@ -136,5 +137,89 @@ theorem trigram_skip_sound
   have htrow : tri ∈ trigrams3 row :=
     mandatory_trigram_present row segs hmatch seg hseg tri htseg
   exact htri_missing (hSummary row hrow tri htrow)
+
+/-- Compute the signature from the visible physical rows. Multiple trigrams
+    may hash to one bit, which only causes extra scans. -/
+theorem built_trigram_skip (block : List (List Byte)) (visible : List Byte → Bool)
+    (hash : List Byte → Nat) (segs : List (List Byte)) {tri : List Byte}
+    (mand : ∃ seg ∈ segs, tri ∈ trigrams3 seg)
+    (miss : hash tri ∉ ((block.filter visible).flatMap trigrams3).map hash) :
+    ∀ row ∈ block, visible row = true → ¬ ChainMatch row segs := by
+  intro row hr hv hm
+  obtain ⟨seg,hs,ht⟩ := mand
+  apply miss
+  exact List.mem_map_of_mem (List.mem_flatMap.mpr
+    ⟨row, List.mem_filter.mpr ⟨hr,hv⟩, mandatory_trigram_present row segs hm seg hs tri ht⟩)
+
+open LikeUnderscore in
+private theorem literal_prefix (lit row : List Byte) (post : List Tok)
+    (h : ByteLikeRef row (lit.map Tok.lit ++ post) = true) :
+    ∃ suffix, row = lit ++ suffix := by
+  induction lit generalizing row with
+  | nil => exact ⟨row,rfl⟩
+  | cons c lit ih =>
+    cases row with
+    | nil => simp [ByteLikeRef] at h
+    | cons b bs =>
+      simp [ByteLikeRef] at h
+      obtain ⟨s,rfl⟩ := ih _ h.2
+      exact ⟨s,by simp [h.1]⟩
+
+open LikeUnderscore in
+private theorem matched_segment (row lit : List Byte) (pre post : List Tok)
+    (h : ByteLikeRef row (pre ++ lit.map Tok.lit ++ post) = true) :
+    ∃ a b, row = a ++ lit ++ b := by
+  cases hp : pre with
+  | nil =>
+    obtain ⟨s,hs⟩ := literal_prefix lit row post (by simpa [hp] using h)
+    exact ⟨[],s,hs⟩
+  | cons t ts =>
+    have liftDrop (n : Nat) (hsub : ∃ a b, row.drop n = a ++ lit ++ b) :
+        ∃ a b, row = a ++ lit ++ b := by
+      obtain ⟨a,b,eq⟩ := hsub
+      exact ⟨row.take n ++ a,b,by simpa [List.append_assoc, ← eq] using
+        (List.take_append_drop n row).symm⟩
+    cases ht : t with
+    | lit c =>
+      cases hr : row with
+      | nil => simp [hp, ht, hr, ByteLikeRef] at h
+      | cons b bs =>
+        simp [hp, ht, hr, ByteLikeRef] at h
+        obtain ⟨a,z,rfl⟩ := matched_segment bs lit ts post (by simpa [List.append_assoc] using h.2)
+        exact ⟨b::a,z,rfl⟩
+    | under =>
+      cases hr : row with
+      | nil => simp [hp, ht, hr, ByteLikeRef] at h
+      | cons b bs =>
+        apply (hr ▸ liftDrop) (charWidth b bs)
+        exact matched_segment _ _ ts post (by simpa [hp,ht,hr,ByteLikeRef] using h)
+    | percent =>
+      cases hr : row with
+      | nil =>
+        exact matched_segment [] lit ts post (by simpa [hp,ht,hr,ByteLikeRef] using h)
+      | cons b bs =>
+        simp only [hp,ht,hr,List.cons_append,ByteLikeRef, Bool.or_eq_true] at h
+        rcases h with h | h
+        · exact matched_segment _ lit ts post h
+        · apply (hr ▸ liftDrop) (1 + (charWidth b bs - 1))
+          simpa [Nat.add_comm 1, List.drop_succ_cons] using
+            matched_segment (bs.drop (charWidth b bs - 1)) lit (.percent :: ts) post h
+termination_by (pre.length,row.length)
+decreasing_by all_goals simp_all [Prod.lex_def] <;> omega
+
+open LikeUnderscore in
+theorem raw_trigram_skip (rows : List (List Byte)) (pattern lit tri : List Byte)
+    (pre post : List Tok) (split : tokenize pattern = pre ++ lit.map Tok.lit ++ post)
+    (ht : tri ∈ trigrams3 lit) (hash : List Byte → Nat)
+    (absent : hash tri ∉ (rows.flatMap trigrams3).map hash) :
+    ∀ row ∈ rows, ByteLikeRef row (tokenize pattern) = false := by
+  intro row hr
+  cases h : ByteLikeRef row (tokenize pattern) with
+  | false => rfl
+  | true =>
+    rw [split] at h
+    obtain ⟨a,b,rfl⟩ := matched_segment _ _ _ _ h
+    exact False.elim (absent (List.mem_map_of_mem (List.mem_flatMap.mpr
+      ⟨_,hr,trigrams3_of_infix a lit b tri ht⟩)))
 
 end TinylambOpt.TrigramSkip

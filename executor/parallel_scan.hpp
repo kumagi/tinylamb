@@ -37,6 +37,8 @@ class ParallelScan final : public ExecutorBase {
   ParallelScan& operator=(const ParallelScan&) = delete;
   ParallelScan(ParallelScan&&) = delete;
   ParallelScan& operator=(ParallelScan&&) = delete;
+  // The query owns the transaction and table handles for the lifetime of
+  // this executor. Its destructor stops workers before releasing the lease.
   ParallelScan(Transaction& txn, const Table& table,
                size_t worker_count = std::thread::hardware_concurrency(),
                size_t pages_per_morsel = 8,
@@ -140,8 +142,8 @@ class ParallelScan final : public ExecutorBase {
   std::vector<IntegerPeekCompare> peek_compares_;
   bool ordered_{false};
   std::vector<Table::ScanMorsel> morsels_;
-  size_t worker_count_;
-  size_t max_ready_chunks_;
+  size_t worker_count_{1};
+  size_t max_ready_chunks_{2};
 
   // Row predicate decided in the decode workers (see SetRowFilter).  Set
   // once before Start(); read-only afterwards.

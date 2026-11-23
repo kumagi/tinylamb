@@ -91,7 +91,7 @@ tinylamb の実行時評価器における `IntervalValue` の算術演算は、
 
 ## 関連 Rule との相互作用
 
-- `datetime_and_string_fold_extent`: 日時関数と `INTERVAL` の計算を畳み込みます。本 Rule による事前の INTERVAL 単一化が下流の前提条件となります。
+- `datetime_and_string_fold_extent`: 文字列関数の呼び出しに含まれる定数引数を畳み込みます。本 Rule が正規化する INTERVAL 計算は対象外です。
 - `fold_binary`: 通常の数値二項演算を畳み込みますが、`INTERVAL` 型をオペランドに含む演算は本 Rule が特化して処理を担当します。
 
 ## 検証テスト

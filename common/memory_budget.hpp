@@ -3,6 +3,7 @@
 #ifndef TINYLAMB_COMMON_MEMORY_BUDGET_HPP
 #define TINYLAMB_COMMON_MEMORY_BUDGET_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -186,17 +187,17 @@ class ProcessMemoryBudget {
   [[nodiscard]] size_t PoolFloorBytes(MemoryPoolKind pool) const noexcept;
   // Registers fixed outbound socket-buffer reserve (`max_connections *
   // per_connection_buffer_bytes`) into the D1 `kTx` floor (ooca-v2.md §5.6).
-  void AddServerBufferFloorBytes(size_t bytes) noexcept {
+  // Returns false on overflow, leaving existing reservations intact.
+  [[nodiscard]] bool TryAddServerBufferFloorBytes(size_t bytes) noexcept {
     size_t cur = server_tx_floor_.load(std::memory_order_acquire);
-    do {
-      const size_t max = std::numeric_limits<size_t>::max();
-      const size_t next = bytes > max - cur ? max : cur + bytes;
-      if (server_tx_floor_.compare_exchange_weak(cur, next,
+    while (bytes <= std::numeric_limits<size_t>::max() - cur) {
+      if (server_tx_floor_.compare_exchange_weak(cur, cur + bytes,
                                                  std::memory_order_release,
                                                  std::memory_order_acquire)) {
-        break;
+        return true;
       }
-    } while (true);
+    }
+    return false;
   }
   void SubServerBufferFloorBytes(size_t bytes) noexcept {
     size_t cur = server_tx_floor_.load(std::memory_order_acquire);
@@ -494,16 +495,19 @@ class ProcessMemoryCharge {
     if (this == &dst || pool_ != dst.pool_) {
       return 0;
     }
-    const size_t xfer = bytes < bytes_ ? bytes : bytes_;
+    const size_t xfer = std::min(
+        {bytes, bytes_, std::numeric_limits<size_t>::max() - dst.bytes_});
     bytes_ -= xfer;
     dst.bytes_ += xfer;
     return xfer;
   }
   [[nodiscard]] size_t Bytes() const noexcept { return bytes_; }
   // True when the most recent reservation through this handle succeeded
-  // (ctor, TryAdd, TryAddWithReclaim). A failed reservation leaves the charge
-  // not holding those bytes and flips this flag (T1838); a later successful
-  // TryAdd/TryAddWithReclaim flips it back so a recovered charge reports Ok().
+  // (ctor, TryAdd, TryAddWithReclaim, AddForced, including the 0-byte forms).
+  // A failed reservation leaves the charge not holding those bytes and flips
+  // this flag (T1838); a later successful reservation flips it back so a
+  // recovered charge reports Ok(). Ok() is therefore NOT an accumulator of
+  // every past failure — a retry is expected to clear a transient one.
   [[nodiscard]] bool Ok() const noexcept { return valid_; }
 
  private:

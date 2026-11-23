@@ -41,24 +41,40 @@ def main():
     (args.output / "tracked-changes.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT))
     for rows in args.sizes:
         with tempfile.TemporaryDirectory(prefix="tinylamb-profile-") as work, (args.output / f"server-{rows}.log").open("w") as log:
-            with socket.socket() as listener:
-                listener.bind(("127.0.0.1", 0))
-                port = listener.getsockname()[1]
-            process = subprocess.Popen(["taskset", "-c", ",".join(map(str, cpus)), str(args.server.resolve()),
-                                        str(Path(work) / "database"), "--port", str(port), "--read-workers", "8"],
-                                       env=environment, stdout=log, stderr=log, cwd=ROOT)
+            # The bind-probe/close -> server-bind sequence has an inherent
+            # TOCTOU window: another process can claim the ephemeral port
+            # before the server binds it. Retry the spawn with a fresh port
+            # when the server exits during startup.
+            process = None
             client = None
-            try:
+            for attempt in range(3):
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    port = listener.getsockname()[1]
+                process = subprocess.Popen(["taskset", "-c", ",".join(map(str, cpus)), str(args.server.resolve()),
+                                            str(Path(work) / "database"), "--port", str(port), "--read-workers", "8"],
+                                           env=environment, stdout=log, stderr=log, cwd=ROOT)
+                client = None
+                early_exit = False
                 for _ in range(400):
                     try:
                         client = Client("tinylamb", {"tinylamb": port}, 60)
                         break
                     except Exception:
                         if process.poll() is not None:
-                            raise RuntimeError("profile server exited during startup")
+                            early_exit = True
+                            break
                         time.sleep(.05)
-                if client is None:
+                if client is not None:
+                    break
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait()
                     raise RuntimeError("profile server did not start")
+                exit_code = process.returncode
+                if attempt == 2 or not early_exit:
+                    raise RuntimeError(f"profile server exited during startup: {exit_code}")
+            try:
                 for ddl in schema():
                     client.execute(ddl)
                 load_rows(client, "accounts", accounts(min(rows, 10000)))
@@ -87,6 +103,12 @@ def main():
             finally:
                 if client:
                     client.close()
+                # Popen has no check= argument: this server is long-lived and
+                # its startup is probed above. Still surface an abnormal exit
+                # during the run instead of silently profiling against a dead
+                # server.
+                if process.poll() is not None and process.returncode != 0:
+                    print(f"WARN: profile server exited with {process.returncode}", flush=True)
                 process.terminate()
                 try:
                     process.wait(timeout=30)

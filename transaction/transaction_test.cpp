@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <ranges>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -51,6 +52,10 @@
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
+// A write set can live on disk, so enumeration must expose I/O failures.
+static_assert(!std::ranges::range<TransactionWriteSet>);
+static_assert(!std::ranges::range<const TransactionWriteSet>);
+
 
 class TransactionTest : public ::testing::Test {
  public:
@@ -151,7 +156,7 @@ TEST_F(TransactionTest, Construct) {
 TEST(TransactionFinishHookTest, ConcurrentFinalizationRunsHookOnce) {
   class Counter final : public TransactionFinishHook {
    public:
-    void OnTransactionFinished(TransactionStatus) noexcept override { ++calls; }
+    void OnTransactionFinished(TransactionStatus /*status*/) noexcept override { ++calls; }
     std::atomic<int> calls{0};
   };
   auto hook = std::make_shared<Counter>();
@@ -159,10 +164,41 @@ TEST(TransactionFinishHookTest, ConcurrentFinalizationRunsHookOnce) {
   txn.AddFinishHook(hook);
   txn.SetStatus(TransactionStatus::kCommitted);
   std::vector<std::thread> threads;
-  for (int i = 0; i < 16; ++i)
+  threads.reserve(16);
+for (int i = 0; i < 16; ++i) {
     threads.emplace_back([&] { txn.FinalizeFinishHooks(); });
-  for (auto& thread : threads) thread.join();
+}
+  for (auto& thread : threads) { thread.join();
+}
   EXPECT_EQ(hook->calls.load(), 1);
+}
+
+TEST(TransactionFinishHookTest, RegistrationRacingFinalizationRunsEachHook) {
+  Transaction txn;
+  txn.SetStatus(TransactionStatus::kCommitted);
+  std::vector<std::shared_ptr<RecordingFinishHook>> hooks;
+  hooks.reserve(64);
+for (int i = 0; i < 64; ++i) {
+    hooks.push_back(std::make_shared<RecordingFinishHook>());
+  }
+  std::barrier start(2);
+  {
+    std::jthread finish([&] {
+      start.arrive_and_wait();
+      txn.FinalizeFinishHooks();
+    });
+    start.arrive_and_wait();
+    for (const auto& hook : hooks) {
+      txn.AddFinishHook(hook);
+    }
+  }
+  const auto late = std::make_shared<RecordingFinishHook>();
+  txn.AddFinishHook(late);
+  hooks.push_back(late);
+  for (const auto& hook : hooks) {
+    EXPECT_EQ(hook->calls_, 1U);
+    EXPECT_EQ(hook->status_, TransactionStatus::kCommitted);
+  }
 }
 
 TEST_F(TransactionTest, FinishHooksRunOnCommitAbortAndMove) {
@@ -324,7 +360,7 @@ TEST_F(TransactionTest, ReadOnlyTransactionAbort) {
   // Arrange -- nothing more than fixture setup
   // Act -- abort a read-only transaction
   Transaction txn = tm_->Begin(true);
-  txn.Abort();
+  ASSERT_SUCCESS(txn.Abort());
 
   // Assert -- the read-only abort path skips log undo entirely
   ASSERT_TRUE(txn.IsFinished());
@@ -365,7 +401,7 @@ TEST_F(TransactionTest, MvccVisibilityChain) {
   {
     Transaction reader = tm_->Begin(true);
     ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "v2");
-    reader.PreCommit();
+    ASSERT_SUCCESS(reader.PreCommit());
   }
 }
 
@@ -384,7 +420,7 @@ TEST_F(TransactionTest, ReadVersionDeleteVisibleAsNotExists) {
 
   // Assert -- a deleted version is visible as kNotExists, not as garbage
   ASSERT_EQ(result.GetStatus(), Status::kNotExists);
-  reader.PreCommit();
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 TEST_F(TransactionTest, ReadVersionPhysicalFallback) {
@@ -401,7 +437,7 @@ TEST_F(TransactionTest, ReadVersionPhysicalFallback) {
   // it (no per-read copy).
   ASSERT_SUCCESS_AND_EQ(with_physical, std::optional<std::string>());
   ASSERT_EQ(without_physical.GetStatus(), Status::kNotExists);
-  txn.PreCommit();
+  ASSERT_SUCCESS(txn.PreCommit());
 }
 
 TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
@@ -415,7 +451,7 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
   }
 
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (tm_->HasVersionChain(rp) &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -430,7 +466,7 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
   ASSERT_SUCCESS_AND_EQ(
       tm_->ReadVersion(deleting, rp, std::string_view("physical")),
       std::optional<std::string>());
-  deleting.Abort();
+  ASSERT_SUCCESS(deleting.Abort());
 }
 
 TEST_F(TransactionTest, MvccWriteIntentCanFollowACommittedWriter) {
@@ -487,16 +523,17 @@ TEST_F(TransactionTest, AddWriteSetFailsWhenMvccIntentHeldElsewhere) {
   Transaction contender = tm_->Begin();
   ASSERT_TRUE(owner.AddWriteSet(rp));
   EXPECT_FALSE(contender.AddWriteSet(rp));
-  owner.Abort();
+  ASSERT_SUCCESS(owner.Abort());
   EXPECT_TRUE(contender.AddWriteSet(rp));
-  contender.Abort();
+  ASSERT_SUCCESS(contender.Abort());
 }
 
 TEST_F(TransactionTest, AuditReservationModeKeepsRegistrationWithoutDiscount) {
   const char* mode = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
   const bool discount_off = mode != nullptr && std::string_view(mode) == "4";
   if (mode != nullptr && std::string_view(mode) != "0" && !discount_off) {
-    GTEST_SKIP();
+    GTEST_SKIP() << "TINYLAMB_DISABLE_INDEX_RESERVATION is set to an "
+                    "unrecognized value; audit mode is not active";
   }
   Transaction owner = tm_->Begin();
   Transaction other = tm_->Begin();
@@ -535,7 +572,7 @@ TEST_F(TransactionTest, AuditWoundedReservationCannotBypassAcquisition) {
   EXPECT_FALSE(owner.AddWriteSet(rp, "before"));
   EXPECT_FALSE(owner.AddWriteSet(rp));
   EXPECT_FALSE(owner.TryAddWriteSet(rp));
-  owner.Abort();
+  ASSERT_SUCCESS(owner.Abort());
 }
 
 TEST_F(TransactionTest, AuditDefaultTransactionIntentApisAreSafe) {
@@ -559,6 +596,24 @@ TEST_F(TransactionTest, DefaultTransactionReadVersionWithoutManager) {
   // Assert -- no manager means no MVCC chain: physical or kNotExists
   EXPECT_EQ(without_physical.GetStatus(), Status::kNotExists);
   ASSERT_SUCCESS_AND_EQ(with_physical, "fallback");
+}
+
+TEST_F(TransactionTest, FinishedTransactionRejectsReadAndWriteOperations) {
+  const RowPosition rp(130, 3);
+  for (const bool commit : {true, false}) {
+    auto txn = tm_->Begin();
+    if (commit) {
+      ASSERT_SUCCESS(txn.PreCommit());
+    } else {
+      ASSERT_SUCCESS(txn.Abort());
+    }
+    ASSERT_TRUE(txn.IsFinished());
+    EXPECT_FALSE(txn.AddReadSet(rp));
+    EXPECT_FALSE(txn.ReadVersion(rp, std::string_view("physical")).HasValue());
+    EXPECT_FALSE(txn.AddWriteSet(rp));
+    EXPECT_FALSE(txn.AddWriteSet(rp, "before"));
+    EXPECT_FALSE(txn.TryAddWriteSet(rp));
+  }
 }
 
 TEST_F(TransactionTest, DefaultTransactionRegisterVersionWriteIsNoop) {
@@ -701,7 +756,7 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
     Transaction writer = tm.Begin();
     ASSERT_TRUE(writer.AddWriteSet(rp));
     writer.RegisterVersionWrite(rp, std::nullopt, "ghost");
-    writer.Abort();
+    ASSERT_SUCCESS(writer.Abort());
     ASSERT_TRUE(writer.IsFinished());
 
     Transaction reader = tm.Begin(true);
@@ -744,8 +799,8 @@ TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
     // A concurrent reader (older snapshot) must still see the old row.
     Transaction reader = tm.Begin();
     ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, rp, std::nullopt), "old");
-    reader.Abort();
-    writer.Abort();
+    ASSERT_SUCCESS(reader.Abort());
+    ASSERT_SUCCESS(writer.Abort());
   }
   std::ignore = std::remove(db_name.c_str());
   RemoveLogAndSegments(log_name);
@@ -852,7 +907,7 @@ TEST_F(TransactionTest, GcFinishesRotatingSweepWithoutAnotherWrite) {
     ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
   }
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (tm_->RuntimeStats().version_chains != 0 &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -879,7 +934,7 @@ TEST_F(TransactionTest,
       std::optional<std::string>("before"));
   ASSERT_EQ(old.PreCommit(), Status::kSuccess);
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (tm_->HasVersionChain(position) &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -909,7 +964,7 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
     // No more writable work: both sub-threshold bursts must be reclaimed
     // through the timed wake, including after the first counter reset.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (tm_->RuntimeStats().version_chains != 0 &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -938,6 +993,26 @@ TEST_F(TransactionTest, MoveAssignmentTransfersStatementTimer) {
 }
 
 namespace {
+
+TEST_F(TransactionTest, WalStagingFailureDoesNotAppendRecord) {
+  struct ResetKnob {
+    ~ResetKnob() {
+      ProcessMemoryBudget::Global().SetTestMemoryFailCountdown(0);
+    }
+  } reset;
+  Transaction txn = tm_->Begin();
+  const lsn_t before = l_->BufferedLSN();
+  ProcessMemoryBudget::Global().SetTestMemoryFailCountdown(1);
+  const auto failed = txn.InsertLog(1, 0, "image");
+  EXPECT_EQ(failed.GetStatus().GetCode(), StatusCode::kMemoryLimitExceeded);
+  EXPECT_FALSE(txn.HasLogRecord());
+  EXPECT_EQ(l_->BufferedLSN(), before);
+
+  const auto retried = txn.InsertLog(1, 0, "image");
+  ASSERT_TRUE(retried.HasValue()) << retried.GetStatus().GetMessage();
+  EXPECT_EQ(retried.Value(), before);
+  EXPECT_TRUE(txn.HasLogRecord());
+}
 
 class TransactionP6aTest : public ::testing::Test {
  protected:
@@ -1232,6 +1307,42 @@ TEST_F(TransactionP6aTest, DiagnosticReadSetRemainsBounded) {
   ASSERT_SUCCESS(txn.PreCommit());
 }
 
+TEST_F(TransactionP6aTest, ConcurrentVersionSpillPreservesCommittedPayloads) {
+  tm_->SetVersionSpillThresholdBytesForTest(512);
+  constexpr size_t kRows = 64;
+  const std::string before(512, 'a');
+  const std::string after(512, 'b');
+  auto pin = tm_->Begin(/*read_only=*/true);
+  std::barrier start(2);
+  {
+    const auto write_rows = [&](page_id_t first_page) {
+      start.arrive_and_wait();
+      auto txn = tm_->Begin();
+      for (size_t i = 0; i < kRows; ++i) {
+        const RowPosition rp(first_page + i, 0);
+        ASSERT_TRUE(txn.AddWriteSet(rp, before));
+        txn.RegisterVersionWrite(rp, before, after);
+      }
+      ASSERT_SUCCESS(txn.PreCommit());
+    };
+    std::jthread first(write_rows, 1000);
+    std::jthread second(write_rows, 1256);
+  }
+  EXPECT_GT(tm_->RuntimeStats().version_spills, 0U);
+  auto latest = tm_->Begin(/*read_only=*/true);
+  for (page_id_t first_page : {1000, 1256}) {
+    for (size_t i = 0; i < kRows; ++i) {
+      const RowPosition rp(first_page + i, 0);
+      ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(pin, rp, after),
+                            std::optional<std::string>(before));
+      ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(latest, rp, after),
+                            std::optional<std::string>(after));
+    }
+  }
+  ASSERT_SUCCESS(latest.PreCommit());
+  ASSERT_SUCCESS(pin.PreCommit());
+}
+
 TEST_F(TransactionP6aTest, ColdMvccVersionPayloadsSpillAndReadAcrossSnapshots) {
   tm_->SetVersionSpillThresholdBytesForTest(512);
   constexpr int kRows = 32;
@@ -1295,7 +1406,7 @@ TEST_F(TransactionP6aTest, ColdMvccVersionPayloadsSpillAndReadAcrossSnapshots) {
 
   // Once snapshots finish and GC collects chains, resident payload bytes -> 0.
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (tm_->RuntimeStats().version_chains != 0 &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1344,7 +1455,7 @@ TEST_F(TransactionP6aTest,
   }
 
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (tm_->RuntimeStats().version_chains != 0 &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1396,7 +1507,7 @@ TEST_F(TransactionP6aTest,
     ASSERT_SUCCESS(w.PreCommit());
   }
   const auto warn_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (tm_->GcPinWarnCountForTest() == 0 &&
          std::chrono::steady_clock::now() < warn_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));

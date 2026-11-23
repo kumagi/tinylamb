@@ -42,9 +42,10 @@ endif()
 
 find_program(MOLD_PROGRAM mold)
 if(MOLD_PROGRAM AND NOT APPLE)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR
-       (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
-        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12.1"))
+    if(NOT CMAKE_CROSSCOMPILING AND
+       (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR
+        (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+         CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12.1")))
         add_link_options(-fuse-ld=mold)
         message(STATUS "Linker: mold (${MOLD_PROGRAM})")
     endif()
@@ -559,6 +560,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/detail/planning_columnar_keys.cpp
         executor/detail/build_input.cpp
         executor/detail/build_input_joins.cpp
+        executor/detail/analytics_factorized_join.cpp
         executor/detail/fused_grouped_join.cpp
         executor/detail/fused_grouped_join_stream.cpp
         executor/detail/typed_column_eval.cpp
@@ -693,7 +695,7 @@ target_link_libraries(tinylamb_sql PUBLIC tinylamb::core)
 if(TINYLAMB_ENABLE_GOOGLESQL)
 # Runtime path embedded into the frontend. Defaults to the build-tree
 # copy; override it when cross-compiling and the target machine keeps the
-# helper somewhere else (e.g. /tmp/tinylamb-execute-query on a Pi).
+# parser helper somewhere else.
     set(TINYLAMB_GOOGLESQL_EXECUTABLE_PATH "${_googlesql_executable}"
         CACHE STRING
         "Runtime path of the execute_query helper embedded into tinylamb_sql")
@@ -840,6 +842,11 @@ add_executable(tinylamb_tpcds_compare EXCLUDE_FROM_ALL
 tinylamb_apply_options(tinylamb_tpcds_compare)
 target_link_libraries(tinylamb_tpcds_compare PRIVATE tinylamb::sql)
 
+add_executable(tinylamb_lean_opt_benchmark EXCLUDE_FROM_ALL
+        benchmark/lean_opt_benchmark.cpp)
+tinylamb_apply_options(tinylamb_lean_opt_benchmark)
+target_link_libraries(tinylamb_lean_opt_benchmark PRIVATE tinylamb::sql)
+
 # Isolated bounded-SPSC aggregate pipeline experiment; not an executor path.
 add_executable(tinylamb_spsc_aggregation_benchmark EXCLUDE_FROM_ALL
         benchmark/spsc_aggregation_benchmark.cpp)
@@ -868,6 +875,13 @@ target_link_libraries(tinylamb_ooc_baseline_measure PRIVATE tinylamb::sql)
 add_executable(sql_ooc_fuzz EXCLUDE_FROM_ALL query/sql_ooc_fuzz_main.cpp)
 tinylamb_apply_options(sql_ooc_fuzz)
 target_link_libraries(sql_ooc_fuzz PRIVATE tinylamb::sql)
+
+# Maintenance tool for refreshing stale committed session-fuzzer traces after
+# intentional MVCC semantic changes. Kept out of the default build.
+add_executable(sql_session_regression_refresh EXCLUDE_FROM_ALL
+        tools/sql_session_regression_refresh.cpp)
+tinylamb_apply_options(sql_session_regression_refresh)
+target_link_libraries(sql_session_regression_refresh PRIVATE tinylamb::sql)
 
 ########################################
 ## Bench
@@ -998,6 +1012,7 @@ if(BUILD_TESTING)
             get_filename_component(target_name ${filename} NAME_WE)
         endif()
         add_executable(${target_name} ${file_path} ${SCALE_TEST_SOURCES}
+                ${SCALE_TEST_UNPARSED_ARGUMENTS}
                 "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
         tinylamb_apply_options(${target_name})
         if(SCALE_TEST_LIBS)
@@ -1089,8 +1104,8 @@ add_simple_test(expression/bytecode_test.cpp)
 add_simple_test(expression/jit_test.cpp)
 add_simple_test(expression/parameter_slot_test.cpp)
 # Issue #33: expression_fuzzer differential replay corpus (see
-# expression/expression_fuzzer.hpp; corpus dir wired via
-# TINYLAMB_EXPR_FUZZ_REGRESSION_DIR below).
+# expression/expression_fuzzer.hpp; its regression directory is included
+# in the test environment configured earlier in this file).
 add_simple_test(expression/expression_fuzzer_test.cpp
         SOURCES expression/expression_fuzzer.cpp)
 add_simple_test(executor/executor_test_part1.cpp
@@ -1395,7 +1410,8 @@ function(add_replay_test file_path input_mode)
     endif()
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
-    add_executable(${target_name} ${file_path})
+    add_executable(${target_name} ${file_path}
+            "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
 # -UNDEBUG keeps the harness assertions alive; see add_fuzzer_test.
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
             -UNDEBUG)
@@ -1411,6 +1427,7 @@ function(add_replay_test file_path input_mode)
         file(WRITE "${replay_input}" "x")
     endif()
     add_test(NAME ${target_name} COMMAND ${target_name} "${replay_input}")
+    set_tests_properties(${target_name} PROPERTIES TIMEOUT 60)
 endfunction()
 
 add_replay_test(recovery/logger_fuzzer_replay.cpp FILE)

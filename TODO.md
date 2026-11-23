@@ -85,10 +85,10 @@
 |---|---|---|
 | 演算子木 | `ExecutorBase::NextBatch(DataChunk*, 1024)` を実装するクラスが 66 個（[`executor/`](executor/)）。`PlanBase::EmitExecutor` の本体は [`executor/relational_factory.cpp`](executor/relational_factory.cpp) | Tier 0（ベクトル解釈）の演算子本体として残し、駆動だけパイプラインスケジューラへ移す |
 | 文駆動の経路 | `RelationalExecutor`（[`executor/relational.cpp`](executor/relational.cpp) 7.7k 行、[`detail/build_input.cpp`](executor/detail/build_input.cpp) 7.3k 行、[`detail/typed_stream_aggregate.cpp`](executor/detail/typed_stream_aggregate.cpp) 10.7k 行、[`detail/fused_grouped_join.cpp`](executor/detail/fused_grouped_join.cpp) 7.0k 行）。集約つき文は既定でこちら（`TINYLAMB_GROUPED_ROUTE`）。`ProgramShape` が `mul_one_minus_col0` / `profit_col0..3` のような**手で認識した式の形**ごとに融合ループを持つ | 手書きの融合形はコード生成で置き換え、最後に削除する（S10） |
-| 式 | AST が正本、bytecode がバッチ IR、LLVM ORC JIT は INT64 比較 / 線形射影 / SUM の 3 カーネルだけ（[`expression/jit.hpp`](expression/jit.hpp)）。コンパイル約 2.36 ms、昇格は累積 2,000 万行（[`docs/jit_profile.md`](docs/jit_profile.md)） | bytecode → WASM の変換に置き換える。「JIT は bytecode の compiler」という契約は維持 |
+| 式 | AST が正本、bytecode がバッチ IR。LLVM ORC JIT には Filter / Projection / Sum / MaskedSum / FilterProjectSum / FilterHashProbe / ProjectionChecked / SumChecked の 8 compile entry point がある（[`expression/jit.hpp`](expression/jit.hpp)）。コンパイル約 2.36 ms、昇格は累積 2,000 万行（[`docs/jit_profile.md`](docs/jit_profile.md)） | bytecode → WASM の変換に置き換える。「JIT は bytecode の compiler」という契約は維持 |
 | 並列 | 演算子ごとに `RunParallelTasks`（[`common/parallel_work.hpp`](common/parallel_work.hpp)）と行数閾値（[`plan/parallel_thresholds.hpp`](plan/parallel_thresholds.hpp)）。semi / anti / outer / residual つき join は逐次 | クエリ単位の共有プールとパイプライン DAG に置き換える |
 | WASM | [`table/fragment/fragment.hpp`](table/fragment/fragment.hpp) に `Runtime { kNative, kWasm }` と `Capabilities` があり、`PaxChunk` は「WASM から無コピーで辿れる」形式として設計済み。ただし**このリポジトリには `.wasm` / `.wat` も CMake の WASM ビルド規則も WASM 実行エンジンも無い**。`Calibrate()` は両方 1.0 の仮値 | エンジンの組み込みとランタイムライブラリのビルドを S0 / S3 で新設。Fragment IR は S8 でパイプラインのスキャン前段として統合 |
-| 開発機の道具 | clang 21（`wasm32` / `wasm64` ターゲットあり）、`wasm-ld`、`wat2wasm` は導入済み。`wasmtime` は未導入 | S0 で不足分を入れる |
+| WASM 実行環境 | スパイクで Wasmtime 50.0.1 を使用済み（[`benchmark/wasm_spike/requirements.txt`](benchmark/wasm_spike/requirements.txt) に固定）。ただし、本番 Executor へのランタイム統合や CMake の WASM ビルドルールは未実装 | S0 / S3 で本番用ランタイムを組み込む |
 
 温かい 2 周目の TPC-DS SF=1・8 スレッド合計は 3110–3134 ms、DuckDB は 964 ms（付録 A §1.1）。
 
@@ -871,11 +871,11 @@ flowchart LR
   subgraph target [目標]
     Shared[共有workerプール]
     Shared --> ScanM[morsel scan]
-    Shared --> ProbeM[join probe]
+    Shared --> Probe[join probe]
     Shared --> PartM[partitioned agg merge]
     Kernels[列SIMDと熱いJIT]
     ScanM --> Kernels
-    ProbeM --> Kernels
+    Probe --> Kernels
   end
 ```
 

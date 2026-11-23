@@ -16,6 +16,10 @@ namespace tinylamb {
 
 TEST(QueryGrantTest, PoolFloorsProtectGuaranteedMinimums) {
   ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
+  struct ResetGuard {
+    ProcessMemoryBudget& budget;
+    ~ResetGuard() { budget.ResetForTest(0); }
+  } reset_guard{b};
   b.ResetForTest(/*limit_bytes=*/1000, /*storage_limit_bytes=*/0,
                  /*columnar_limit_bytes=*/0, /*check_rss_pressure=*/false);
   // M_t = 800. Floors: storage 200 (25%), query 200 (25%), tx 40 (5%).
@@ -38,6 +42,12 @@ TEST(QueryGrantTest, PoolFloorsProtectGuaranteedMinimums) {
 
 TEST(QueryGrantTest, ReclaimHooksExecuteInOrderOnPressure) {
   ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
+  // ASSERT below must not strand the 800 bytes reserved on the global budget:
+  // a later test would then start with an unexpectedly depleted allowance.
+  struct ResetBudgetOnExit {
+    ProcessMemoryBudget& budget;
+    ~ResetBudgetOnExit() { budget.ResetForTest(0); }
+  } reset{b};
   b.ResetForTest(/*limit_bytes=*/1000, /*storage_limit_bytes=*/0,
                  /*columnar_limit_bytes=*/0, /*check_rss_pressure=*/false);
   ASSERT_TRUE(b.TryReserve(MemoryPoolKind::kColumnar, 400));
@@ -103,7 +113,9 @@ TEST(QueryGrantTest, CoordinatorAdmitsWaitsWakesAndTimesOut) {
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
     g1.Value().ReleaseGrant();
   });
-  auto g2 = coord.AcquireGrant(500, 500, std::numeric_limits<uint64_t>::max());
+  // Bounded wait: uint64_t::max would hang past the 60s ctest limit if the
+  // releaser thread never runs; 30s is ample headroom over the 15ms release.
+  auto g2 = coord.AcquireGrant(500, 500, /*wait_timeout_ms=*/30000);
   releaser.join();
   ASSERT_TRUE(g2.HasValue());
   EXPECT_EQ(g2.Value().GrantedBytes(), 500U);
@@ -132,6 +144,11 @@ TEST(QueryGrantTest, CoordinatorDestroyedWhileReleaseListenersFire) {
       (void)coord.AcquireGrant(0);
     }
   });
+  // Join on every exit path: an ASSERT failure inside the loop returns early,
+  // and destroying a joinable std::thread would std::terminate before gtest
+  // can report the failure.
+  const std::unique_ptr<std::thread, void (*)(std::thread*)> join_churn(
+      &churn, [](std::thread* t) { t->join(); });
   QueryMemoryCoordinator keeper(&b);
   for (int i = 0; i < 20000; ++i) {
     auto grant = keeper.AcquireGrant(1024, 1024, /*wait_timeout_ms=*/5000);
@@ -139,8 +156,20 @@ TEST(QueryGrantTest, CoordinatorDestroyedWhileReleaseListenersFire) {
     grant.Value().ReleaseGrant();  // runs NotifyReleaseListeners()
   }
   stop.store(true, std::memory_order_relaxed);
-  churn.join();
   b.ResetForTest(0);
+}
+
+TEST(QueryGrantTest, LocalBatchCacheKeepsReservationsRepresentable) {
+  QueryMemoryGrant grant;
+  QueryMemoryGrant::LocalBatchCache cache(&grant);
+  constexpr size_t max_bytes = std::numeric_limits<size_t>::max();
+  ASSERT_TRUE(cache.Reserve(max_bytes - 1));
+  cache.Release(1);
+  ASSERT_TRUE(cache.Reserve(1));
+  EXPECT_FALSE(cache.Reserve(2));
+  EXPECT_EQ(cache.HeldBytes(), max_bytes - 1);
+  cache.ReleaseAll();
+  EXPECT_EQ(grant.UsedBytes(), 0U);
 }
 
 TEST(QueryGrantTest, DynamicSharingLocalBatchCacheAndEffectiveDop) {

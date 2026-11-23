@@ -37,12 +37,14 @@ ExactSetRuntimeFilter::ExactSetRuntimeFilter(
   if (skip_hash_table || keys_.empty()) {
     return;
   }
+  const size_t max_slots = std::bit_floor(table_.max_size());
+  if (keys_.size() > std::numeric_limits<uint32_t>::max() ||
+      keys_.size() > max_slots / 2 || max_slots < 16) {
+    return;
+  }
   // Linear probing at <= 50% load: expected ~1.5 probes for a hit and ~2.5
   // for a miss (the common Reject() path), even with a good hash.
-  size_t slots = 16;
-  while (slots < keys_.size() * 2) {
-    slots <<= 1U;
-  }
+  const size_t slots = std::bit_ceil(std::max(size_t{16}, keys_.size() * 2));
   table_.assign(slots, 0);
   table_mask_ = slots - 1;
   for (size_t i = 0; i < keys_.size(); ++i) {
@@ -108,7 +110,7 @@ uint64_t BloomRuntimeFilter::Hash(int64_t key, unsigned probe) {
   // One splitmix64 finalizer per key; probe k > 0 advances the state by an
   // key-dependent odd stride, so keys colliding at the first position need
   // not collide at the second. Reject still pays for a single mix and inlines
-  // formula -- keep the two in sync.
+  // the formula -- keep the two in sync.
   auto z = static_cast<uint64_t>(key);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
@@ -198,16 +200,14 @@ RuntimeFilterGroup::RuntimeFilterGroup(
     std::vector<std::unique_ptr<RuntimeFilter>> parts,
     const std::vector<int64_t>* sorted_distinct_keys)
     : parts_(std::move(parts)) {
+  std::erase(parts_, nullptr);
   for (const auto& part : parts_) {
-    if (!part) {
-      continue;
-    }
     switch (part->Kind()) {
       case RuntimeFilterKind::kRejectAll:
         reject_all_ = true;
         break;
       case RuntimeFilterKind::kMinMax: {
-        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(
+        const auto& mm = dynamic_cast<const MinMaxRuntimeFilter&>(
             *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         if (!has_bounds_) {
           has_bounds_ = true;
@@ -220,7 +220,7 @@ RuntimeFilterGroup::RuntimeFilterGroup(
         break;
       }
       case RuntimeFilterKind::kExactSet: {
-        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(
+        const auto& exact = dynamic_cast<const ExactSetRuntimeFilter&>(
             *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& keys = exact.Keys();
         if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
@@ -297,14 +297,19 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       dense_bits_(std::move(prebuilt_dense_bits)),
       lo_(lo),
       hi_(hi),
-      has_bounds_(true),
-      has_dense_bits_(!dense_bits_.empty()) {
+      has_bounds_(lo <= hi) {
+  if (has_bounds_) {
+    const uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+    has_dense_bits_ = span <= kMaxDenseSpan &&
+                      dense_bits_.size() == (span >> 6) + 1;
+  }
+  std::erase(parts_, nullptr);
   for (const auto& part : parts_) {
-    if (!part) {
-      continue;
+    if (part->Kind() == RuntimeFilterKind::kRejectAll) {
+      reject_all_ = true;
     }
     if (part->Kind() == RuntimeFilterKind::kExactSet) {
-      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(
+      const auto& exact = dynamic_cast<const ExactSetRuntimeFilter&>(
           *part);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& keys = exact.Keys();
       if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
@@ -312,17 +317,24 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       }
     }
   }
+  if (!has_dense_bits_ || reject_all_) {
+    has_dense_bits_ = false;
+    std::vector<uint64_t>().swap(dense_bits_);
+  }
 }
 
 bool RuntimeFilterGroup::Has(RuntimeFilterKind kind) const {
-  return std::ranges::any_of(
-      parts_, [&](const auto& part) { return part->Kind() == kind; });
+  return std::ranges::any_of(parts_, [&](const auto& part) {
+    return part != nullptr && part->Kind() == kind;
+  });
 }
 
 size_t RuntimeFilterGroup::DistinctKeys() const {
   size_t distinct = 0;
   for (const std::unique_ptr<RuntimeFilter>& part : parts_) {
-    distinct = std::max(distinct, part->DistinctKeys());
+    if (part != nullptr) {
+      distinct = std::max(distinct, part->DistinctKeys());
+    }
   }
   return distinct;
 }
@@ -360,7 +372,9 @@ std::string RuntimeFilterGroup::Describe() const {
 }
 
 void RuntimeFilterBuilder::Observe(int64_t key) {
-  ++observations_;
+  if (observations_ < std::numeric_limits<size_t>::max()) {
+    ++observations_;
+  }
   if (!has_key_) {
     has_key_ = true;
     lo_ = key;
@@ -391,7 +405,8 @@ void RuntimeFilterBuilder::Observe(std::span<const int64_t> keys) {
   if (keys.empty()) {
     return;
   }
-  observations_ += keys.size();
+  observations_ +=
+      std::min(keys.size(), std::numeric_limits<size_t>::max() - observations_);
   int64_t low = keys.front(), high = keys.front();
   for (int64_t key : keys) {
     low = std::min(low, key);
@@ -409,7 +424,9 @@ void RuntimeFilterBuilder::Observe(std::span<const int64_t> keys) {
 }
 
 void RuntimeFilterBuilder::ObserveNull() {
-  ++observations_;
+  if (observations_ < std::numeric_limits<size_t>::max()) {
+    ++observations_;
+  }
   saw_null_ = true;
 }
 

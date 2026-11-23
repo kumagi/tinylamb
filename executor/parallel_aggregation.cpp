@@ -45,6 +45,18 @@ namespace {
 
 using relational_detail::CheckedDoubleSumAdd;
 
+double DoubleSumInput(const Value& value) {
+  if (value.IsNull()) {
+    return 0.0;
+  }
+  if (value.type == ValueType::kDouble) {
+    return value.value.double_value;
+  }
+  return value.IsUnsigned()
+             ? static_cast<double>(static_cast<uint64_t>(value.value.int_value))
+             : static_cast<double>(value.value.int_value);
+}
+
 StatusOr<double> CheckedDoubleSumOperand(double lhs, double rhs, double value) {
   if (std::isinf(value) && std::isfinite(lhs) && std::isfinite(rhs)) {
     return StatusError(StatusCode::kIsInfinity,
@@ -60,6 +72,13 @@ StatusOr<platform::ExtendedFloat> StatInputToLongDouble(const Value& value) {
     return static_cast<platform::ExtendedFloat>(value.value.double_value);
   }
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
+    if (value.IsUnsigned()) {
+      // UINT64 shares the int64_t payload; without the unsigned reinterpret
+      // the serial accumulator and the per-row replay path both turn large
+      // unsigned keys negative, collapsing their spread.
+      return static_cast<platform::ExtendedFloat>(
+          static_cast<uint64_t>(value.value.int_value));
+    }
     return static_cast<platform::ExtendedFloat>(value.value.int_value);
   }
   return StatusError(StatusCode::kInvalidArgument, "numeric value required");
@@ -263,6 +282,13 @@ Status ParallelAggregationExecutor::AccumulateValue(PartialState* state,
     case AggregationType::kSum:
       if (state->values[index].IsNull()) {
         state->values[index] = value;
+      } else if (state->values[index].type == ValueType::kDouble ||
+                 value.type == ValueType::kDouble) {
+        ASSIGN_OR_RETURN(
+            double, next,
+            CheckedDoubleSumAdd(DoubleSumInput(state->values[index]),
+                                DoubleSumInput(value)));
+        state->values[index] = Value(next);
       } else {
         // Same Status (kIsInfinity) as the serial executor, and no exception
         // on the main-thread Merge replay, which runs outside any try/catch.
@@ -348,7 +374,8 @@ Status ParallelAggregationExecutor::Accumulate(PartialState* state,
   }
   for (const size_t index : int64_column_indices_) {
     const AggregateInput& input = inputs_[index];
-    if (chunk.ColumnAt(input.column).Type() == ValueType::kInt64) {
+    if (const ColumnVector& col = chunk.ColumnAt(input.column);
+        col.Type() == ValueType::kInt64 && !col.IsHeterogeneous()) {
       RETURN_IF_FAIL(
           AccumulateInt64Column(state, index, chunk.ColumnAt(input.column)));
     } else {
@@ -357,7 +384,8 @@ Status ParallelAggregationExecutor::Accumulate(PartialState* state,
   }
   for (const size_t index : double_column_indices_) {
     const AggregateInput& input = inputs_[index];
-    if (chunk.ColumnAt(input.column).Type() == ValueType::kDouble) {
+    if (const ColumnVector& col = chunk.ColumnAt(input.column);
+        col.Type() == ValueType::kDouble && !col.IsHeterogeneous()) {
       RETURN_IF_FAIL(
           AccumulateDoubleColumn(state, index, chunk.ColumnAt(input.column)));
     } else {
@@ -368,7 +396,8 @@ Status ParallelAggregationExecutor::Accumulate(PartialState* state,
     const AggregateInput& input = inputs_[index];
     const ColumnVector& lhs = chunk.ColumnAt(input.column);
     const ColumnVector& rhs = chunk.ColumnAt(input.trailing_column);
-    if (lhs.Type() == ValueType::kDouble && rhs.Type() == ValueType::kDouble) {
+    if (lhs.Type() == ValueType::kDouble && rhs.Type() == ValueType::kDouble &&
+        !lhs.IsHeterogeneous() && !rhs.IsHeterogeneous()) {
       RETURN_IF_FAIL(AccumulateDoubleBinaryColumn(state, index, lhs, rhs,
                                                   input.binary_op));
     } else if (lhs.Type() != ValueType::kNull &&
@@ -521,6 +550,14 @@ Status ParallelAggregationExecutor::AccumulateInt64Column(
       break;
     }
     case AggregationType::kSum: {
+      if (state->values[aggregate_index].type == ValueType::kDouble) {
+        for (size_t row = 0; row < column.Size(); ++row) {
+          RETURN_IF_FAIL(AccumulateValue(state, aggregate_index,
+                                         column.ValueAt(row),
+                                         /*apply_distinct=*/false));
+        }
+        break;
+      }
       if (column.IsUnsigned()) {
         uint64_t sum = 0;
         bool any = false;
@@ -652,7 +689,7 @@ Status ParallelAggregationExecutor::AccumulateDoubleColumn(
     }
     case AggregationType::kSum: {
       Value& total = state->values[aggregate_index];
-      double sum = total.IsNull() ? 0.0 : total.value.double_value;
+      double sum = DoubleSumInput(total);
       bool any = false;
       for (size_t row = 0; row < column.Size(); ++row) {
         if (column.IsNull(row)) {
@@ -751,7 +788,7 @@ Status ParallelAggregationExecutor::AccumulateDoubleBinaryColumn(
     }
     case AggregationType::kSum: {
       Value& total = state->values[aggregate_index];
-      double sum = total.IsNull() ? 0.0 : total.value.double_value;
+      double sum = DoubleSumInput(total);
       bool any = false;
       for (size_t row = 0; row < lhs.Size(); ++row) {
         if (lhs.IsNull(row) || rhs.IsNull(row)) {
@@ -995,7 +1032,7 @@ Status ParallelAggregationExecutor::AccumulateLSTableBlock(
       }
       case AggregationType::kSum: {
         Value& total = state->values[index];
-        double sum = total.IsNull() ? 0.0 : total.value.double_value;
+        double sum = DoubleSumInput(total);
         bool any = false;
         for (size_t i = 0; i < count; ++i) {
           const uint32_t row =
@@ -1124,7 +1161,7 @@ Status ParallelAggregationExecutor::AccumulateLSTableBlock(
       }
       case AggregationType::kSum: {
         Value& total = state->values[index];
-        double sum = total.IsNull() ? 0.0 : total.value.double_value;
+        double sum = DoubleSumInput(total);
         bool any = false;
         for (size_t i = 0; i < count; ++i) {
           const uint32_t row =
@@ -1133,8 +1170,8 @@ Status ParallelAggregationExecutor::AccumulateLSTableBlock(
               (rhs_col.has_null && rhs_col.IsNull(row))) {
             continue;
           }
-          const double a = std::bit_cast<double>(lhs_data[row]);
-          const double b = std::bit_cast<double>(rhs_data[row]);
+          const auto a = std::bit_cast<double>(lhs_data[row]);
+          const auto b = std::bit_cast<double>(rhs_data[row]);
           ASSIGN_OR_RETURN(double, addend,
                            CheckedDoubleSumOperand(a, b, eval(a, b)));
           ASSIGN_OR_RETURN(double, next, CheckedDoubleSumAdd(sum, addend));
@@ -1228,12 +1265,18 @@ Status ParallelAggregationExecutor::AccumulateStatColumns(
     PartialState* state, size_t aggregate_index, const ColumnVector& child,
     const ColumnVector* trailing) {
   const bool child_is_double = child.Type() == ValueType::kDouble;
+  // IntegerData() stores UINT64 bit patterns in int64_t cells. Treat them as
+  // unsigned here just like the SUM fast path does, otherwise a large
+  // unsigned key becomes negative and poisons every variance/covariance sum.
+  const bool child_is_unsigned = !child_is_double && child.IsUnsigned();
   const std::vector<int64_t>* child_ints =
       child_is_double ? nullptr : &child.IntegerData();
   const std::vector<double>* child_doubles =
       child_is_double ? &child.DoubleData() : nullptr;
   const bool trailing_is_double =
       trailing != nullptr && trailing->Type() == ValueType::kDouble;
+  const bool trailing_is_unsigned =
+      trailing != nullptr && !trailing_is_double && trailing->IsUnsigned();
   const std::vector<int64_t>* trailing_ints =
       trailing != nullptr && !trailing_is_double ? &trailing->IntegerData()
                                                  : nullptr;
@@ -1257,6 +1300,9 @@ Status ParallelAggregationExecutor::AccumulateStatColumns(
     const platform::ExtendedFloat y =
         child_is_double
             ? static_cast<platform::ExtendedFloat>((*child_doubles)[row])
+        : child_is_unsigned
+            ? static_cast<platform::ExtendedFloat>(
+                  static_cast<uint64_t>((*child_ints)[row]))
             : static_cast<platform::ExtendedFloat>((*child_ints)[row]);
     if (trailing == nullptr) {
       // Single-input forms (VAR_* / STDDEV_*) fold into the x slot exactly
@@ -1267,6 +1313,9 @@ Status ParallelAggregationExecutor::AccumulateStatColumns(
       const platform::ExtendedFloat x =
           trailing_is_double
               ? static_cast<platform::ExtendedFloat>((*trailing_doubles)[row])
+          : trailing_is_unsigned
+              ? static_cast<platform::ExtendedFloat>(
+                    static_cast<uint64_t>((*trailing_ints)[row]))
               : static_cast<platform::ExtendedFloat>((*trailing_ints)[row]);
       sy += y;
       syy += y * y;
@@ -1464,7 +1513,9 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
         return {};
       }
       const platform::ExtendedFloat mean = sx / count;
-      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat ssd =
+          std::max(platform::ExtendedFloat{0},
+                   sxx - (count * mean * mean));
       return Value(static_cast<double>(ssd / count));
     }
     case AggregationType::kVarSamp: {
@@ -1472,7 +1523,9 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
         return {};
       }
       const platform::ExtendedFloat mean = sx / count;
-      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat ssd =
+          std::max(platform::ExtendedFloat{0},
+                   sxx - (count * mean * mean));
       return Value(static_cast<double>(ssd / (count - 1)));
     }
     case AggregationType::kStddevPop: {
@@ -1480,7 +1533,9 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
         return {};
       }
       const platform::ExtendedFloat mean = sx / count;
-      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat ssd =
+          std::max(platform::ExtendedFloat{0},
+                   sxx - (count * mean * mean));
       return Value(static_cast<double>(platform::Sqrt(ssd / count)));
     }
     case AggregationType::kStddevSamp: {
@@ -1488,7 +1543,9 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
         return {};
       }
       const platform::ExtendedFloat mean = sx / count;
-      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat ssd =
+          std::max(platform::ExtendedFloat{0},
+                   sxx - (count * mean * mean));
       return Value(static_cast<double>(platform::Sqrt(ssd / (count - 1))));
     }
     case AggregationType::kCovarPop: {
@@ -1516,8 +1573,13 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       const platform::ExtendedFloat mx = sx / count;
       const platform::ExtendedFloat my = sy / count;
       const platform::ExtendedFloat sdd = sxy - (count * mx * my);
-      const platform::ExtendedFloat vx = sxx - (count * mx * mx);
-      const platform::ExtendedFloat vy = syy - (count * my * my);
+      const platform::ExtendedFloat vx =
+          std::max(platform::ExtendedFloat{0}, sxx - (count * mx * mx));
+      const platform::ExtendedFloat vy =
+          std::max(platform::ExtendedFloat{0}, syy - (count * my * my));
+      if (vx == 0 || vy == 0) {
+        return {};
+      }
       return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }
     case AggregationType::kRegrCount:

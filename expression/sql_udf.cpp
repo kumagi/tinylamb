@@ -76,8 +76,16 @@ StatusOr<SqlUdfBinding> BindSqlUdfArguments(const SqlScalarFunction& function,
           StatusCode::kInvalidArgument,
           "missing required argument to function " + function.name);
     }
+    std::vector<Column> scope_columns;
+    scope_columns.reserve(position);
+    for (size_t i = 0; i < position; ++i) {
+      scope_columns.emplace_back(function.params[i], arguments[i].type);
+    }
+    const Row scope_row(arguments);
+    const Schema scope_schema("", std::move(scope_columns));
     ASSIGN_OR_RETURN(Value, evaluated,
-                     function.defaults[position]->TryEvaluate(Row(), Schema()));
+                     function.defaults[position]->TryEvaluate(scope_row,
+                                                              scope_schema));
     arguments.push_back(std::move(evaluated));
   }
   std::vector<Column> columns;
@@ -112,8 +120,7 @@ int SqlUdfDepthGuard::CurrentDepth() { return tls_udf_depth; }
 
 std::string EncodeStructJson(
     const std::vector<std::pair<std::string, Value>>& fields) {
-  auto escape = [](std::string_view text) {
-    std::string out;
+  auto escape_into = [](std::string& out, std::string_view text) {
     for (const char c : text) {
       if (c == '"' || c == '\\') {
         out.push_back('\\');
@@ -129,20 +136,24 @@ std::string EncodeStructJson(
         out.push_back(c);
       }
     }
-    return out;
   };
 
   std::string json_out = "{";
   // This runs per row for UDF STRUCT binding / equality: pre-size the buffer
   // from the field count so the += chain does not reallocate once per field.
-  json_out.reserve(2 + (fields.size() * 32));
+  constexpr size_t kEstimatedFieldBytes = 32;
+  if (fields.size() <= (json_out.max_size() - 2) / kEstimatedFieldBytes) {
+    json_out.reserve(2 + (fields.size() * kEstimatedFieldBytes));
+  }
   bool first = true;
   for (const auto& [name, value] : fields) {
     if (!first) {
       json_out += ",";
     }
     first = false;
-    json_out += "\"" + escape(name) + "\":";
+    json_out += '"';
+    escape_into(json_out, name);
+    json_out += "\":";
     if (value.IsNull()) {
       json_out += "null";
       continue;
@@ -204,7 +215,13 @@ std::string EncodeStructJson(
         text = value.AsString();
         break;
     }
-    json_out += is_string ? "\"" + escape(text) + "\"" : text;
+    if (is_string) {
+      json_out += '"';
+      escape_into(json_out, text);
+      json_out += '"';
+    } else {
+      json_out += text;
+    }
   }
   json_out += "}";
   return json_out;

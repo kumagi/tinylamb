@@ -61,7 +61,7 @@ std::string RunSingleCellSql(const std::string& sql) {
   // Scalar SELECTs yield one row; only the first cell carries the projected
   // value (repo convention, cf. sql_oracle_fuzzer RunScalar and query_test
   // RunScalar, which both read [0][0]).
-  if (row.Size() < 1) {
+  if (row.Count() < 1) {
     ADD_FAILURE() << "empty row returned: " << sql;
     return "";
   }
@@ -473,6 +473,10 @@ TEST_P(ExprOracleExtendedTest, SeededExtendedOpsHoldOracles) {
   EXPECT_EQ(ran,
             (iterations + kExtendedOpsShards - 1 - shard) / kExtendedOpsShards);
   if (ran > 0) {
+    // With one seed per shard, ran / 2 == 0, so the ratio check alone was
+    // vacuous: the engine arm could skip every seed and still pass.
+    EXPECT_GT(engine_ran, 0)
+        << "extended-op sweep must execute the engine oracle at least once";
     EXPECT_GT(engine_ran, ran / 2)
         << "extended-op sweep must execute the engine oracle";
   }

@@ -32,6 +32,7 @@
 #include <queue>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -82,8 +83,14 @@ namespace pax_detail {
 // stl_vector.h push_back rather than to the encoder itself.
 TINYLAMB_ALWAYS_INLINE char* BufTail(std::vector<char>& buf, size_t n) {
   const size_t old = buf.size();
-  if (old + n > buf.capacity()) {
-    buf.reserve(old + n + (old >> 1) + 16);
+  const size_t max_size = buf.max_size();
+  if (n > max_size - old) {
+    throw std::length_error("PAX output buffer exceeds its maximum size");
+  }
+  const size_t new_size = old + n;
+  if (new_size > buf.capacity()) {
+    const size_t spare = std::min((old >> 1) + 16, max_size - new_size);
+    buf.reserve(new_size + spare);
   }
   if (n <= 8) {
     // Small appends (the AppendBE* header writes, n a compile-time
@@ -97,7 +104,7 @@ TINYLAMB_ALWAYS_INLINE char* BufTail(std::vector<char>& buf, size_t n) {
   } else {
     // Bulk planes (AppendPackBits appends whole bit-planes): one memset
     // beats per-byte stores by orders of magnitude.
-    buf.resize(old + n);
+    buf.resize(new_size);
   }
   return buf.data() + old;
 }
@@ -138,6 +145,23 @@ inline uint64_t ReadBE64(const char* p) {
   return be64toh(v);
 }
 
+// The caller has checked that width is at most eight and that the
+// available bytes cover the offset.
+inline uint64_t ReadForByteOffset(const char* p, uint32_t width,
+                                  bool can_read_word) {
+  if (can_read_word) {
+    uint64_t raw = 0;
+    std::memcpy(&raw, p, sizeof(raw));
+    return le64toh(raw) & (width == 8 ? ~0ULL : ((1ULL << (8U * width)) - 1));
+  }
+  uint64_t offset = 0;
+  for (uint32_t byte = 0; byte < width; ++byte) {
+    offset |= static_cast<uint64_t>(static_cast<uint8_t>(p[byte]))
+              << (byte * 8U);
+  }
+  return offset;
+}
+
 inline int BitsNeeded(uint64_t maxv) {
   int w = 0;
   while (maxv != 0) {
@@ -158,14 +182,18 @@ inline void AppendPackBits(std::vector<char>& out,
     return;
   }
   const auto width = static_cast<uint32_t>(w);
-  const size_t total_bits = vals.size() * static_cast<size_t>(width);
+  size_t total_bits = 0;
+  if (__builtin_mul_overflow(vals.size(), static_cast<size_t>(width),
+                             &total_bits)) {
+    throw std::length_error("PAX packed bit count exceeds size_t");
+  }
   // Same MSB-first bit stream as the old __int128 shift register, but the
   // accumulator lives in one u64 kept left-aligned so a full word flushes
   // with a single bswap store instead of one shift+mask store per byte.
   const uint64_t mask = width == 64 ? ~0ULL : ((1ULL << width) - 1);
   uint64_t acc = 0;  // `fill` bits of stream, MSB-aligned
   uint32_t fill = 0;
-  char* base = BufTail(out, (total_bits + 7) / 8);
+  char* base = BufTail(out, (total_bits / 8) + (total_bits % 8 != 0 ? 1 : 0));
   for (uint64_t value : vals) {
     const uint64_t v = value & mask;
     if (fill + width <= 64) {
@@ -262,12 +290,12 @@ struct Rle8Run {
 };
 struct Rle8Region {
   Rle8Region()  // NOLINT(cppcoreguidelines-pro-type-member-init)
-      : n(0), total_runs(0), plane_runs{}, plane_offsets{} {}
+       {}
 
-  uint32_t n;
-  uint32_t total_runs;
-  std::array<uint32_t, 8> plane_runs;
-  std::array<uint32_t, 8> plane_offsets;
+  uint32_t n{0};
+  uint32_t total_runs{0};
+  std::array<uint32_t, 8> plane_runs{};
+  std::array<uint32_t, 8> plane_offsets{};
   std::array<Rle8Run, PaxChunk::kRowGroupSize * 8> runs;
 };
 struct RleDeltaRun {

@@ -268,8 +268,8 @@ TEST_F(TransactionCoverageTest, TryAddWriteSetLosesToForeignIntent) {
   // blocking and counts as a conflict.
   EXPECT_FALSE(contender.TryAddWriteSet(rp));
   EXPECT_FALSE(contender.AddWriteSet(rp));
-  owner.Abort();
-  contender.Abort();
+  ASSERT_EQ(owner.Abort(), Status::kSuccess);
+  ASSERT_EQ(contender.Abort(), Status::kSuccess);
 }
 
 TEST_F(TransactionCoverageTest, DirectIntentAcquisitionIsIdempotentForOwner) {
@@ -314,7 +314,7 @@ TEST_F(TransactionCoverageTest, ReleaseWriteIntentKeepsForeignIntent) {
   ASSERT_TRUE(owner.AddWriteSet(rp));
   EXPECT_FALSE(tm_->ReleaseWriteIntent(outsider, rp));
   EXPECT_TRUE(tm_->HasVersionChain(rp));
-  owner.Abort();
+  ASSERT_EQ(owner.Abort(), Status::kSuccess);
 }
 
 TEST_F(TransactionCoverageTest, ReleaseWriteIntentKeepsStagedIntent) {
@@ -349,7 +349,7 @@ TEST_F(TransactionCoverageTest, TransactionReleaseRemovesWriteSetEntry) {
   // held and this foreign reservation would fail.
   Transaction other = tm_->Begin();
   EXPECT_TRUE(other.TryAddWriteSet(rp));
-  other.Abort();
+  ASSERT_EQ(other.Abort(), Status::kSuccess);
   ASSERT_EQ(tm_->Abort(txn), Status::kSuccess);
 }
 
@@ -361,7 +361,7 @@ TEST_F(TransactionCoverageTest, TransactionReleaseIgnoresForeignIntent) {
   // Must be a silent no-op: the reservation belongs to someone else.
   outsider.ReleaseWriteIntent(rp);
   EXPECT_TRUE(tm_->HasVersionChain(rp));
-  owner.Abort();
+  ASSERT_EQ(owner.Abort(), Status::kSuccess);
   ASSERT_EQ(tm_->Abort(outsider), Status::kSuccess);
 }
 
@@ -376,7 +376,7 @@ TEST_F(TransactionCoverageTest, ReacquireWithBeforeImageInstallsIt) {
   {
     Transaction reader = tm_->Begin(true);
     ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(reader, rp, std::nullopt), "img");
-    reader.PreCommit();
+    ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   }
   ASSERT_EQ(tm_->Abort(writer), Status::kSuccess);
 }
@@ -546,7 +546,7 @@ TEST_F(TransactionCoverageTest, ReadVersionEmptyChainFallsBackToPhysical) {
                           std::optional<std::string>());
     EXPECT_EQ(tm_->ReadVersion(reader, rp, std::nullopt).GetStatus(),
               Status::kNotExists);
-    reader.PreCommit();
+    ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   }
   ASSERT_EQ(tm_->Abort(writer), Status::kSuccess);
 }
@@ -623,7 +623,7 @@ TEST_F(TransactionCoverageTest, SnapshotOlderThanEveryVersionSeesNothing) {
   EXPECT_EQ(tm_->ReadVersion(reader, rp, std::nullopt).GetStatus(),
             Status::kNotExists);
   EXPECT_FALSE(reader.SnapshotSeesRow(rp));
-  reader.PreCommit();
+  ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
 }
 
 // ---------------------------------------------------------------------------
@@ -656,7 +656,7 @@ TEST_F(TransactionCoverageTest, SnapshotSeesRowVisibleValueAndTombstone) {
   {
     Transaction reader = tm_->Begin(true);
     EXPECT_TRUE(reader.SnapshotSeesRow(rp));
-    reader.PreCommit();
+    ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   }
   Transaction w2 = tm_->Begin();
   ASSERT_TRUE(w2.AddWriteSet(rp));
@@ -934,7 +934,7 @@ TEST_F(TransactionCoverageTest, GcTrimsOldVersionsBehindPinnedSnapshot) {
       },
       std::chrono::seconds(5)));
   ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(pin, rp, std::nullopt), "v2");
-  pin.Abort();
+  ASSERT_EQ(pin.Abort(), Status::kSuccess);
 }
 
 TEST_F(TransactionCoverageTest, GcErasesShellLeftByAbortedIntent) {

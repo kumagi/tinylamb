@@ -42,6 +42,7 @@
 #include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/full_scan.hpp"
 #include "gtest/gtest.h"
 #include "iterator.hpp"
 #include "page/page_manager.hpp"
@@ -49,6 +50,7 @@
 #include "recovery/recovery_manager.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
+#include "table/tlcs_file.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
 #include "type/row.hpp"
@@ -57,6 +59,30 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(TypedCellBatchTest, VarcharOnlyReadsAvailableCells) {
+  TypedCellBatch batch;
+  batch.Configure(1, {ValueType::kVarChar}, {false});
+  batch.varchar_bytes[0] = {'a'};
+  batch.varchar_ends[0] = {1, 1};
+  batch.rows = 2;
+
+  EXPECT_EQ(batch.Varchar(0, 0), "a");
+  EXPECT_TRUE(batch.Varchar(1, 0).empty());
+  EXPECT_TRUE(batch.Varchar(2, 0).empty());
+  EXPECT_TRUE(batch.Varchar(0, 1).empty());
+  batch.Reset();
+  EXPECT_TRUE(batch.Varchar(0, 0).empty());
+}
+
+TEST(TableIteratorTest, NullIteratorCanBeLogged) {
+  const Iterator iterator(nullptr);
+  std::ostringstream out;
+  out << iterator;
+  EXPECT_FALSE(iterator.IsValid());
+  EXPECT_EQ(iterator.GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(out.str(), "Invalid iterator");
+}
 namespace {
 
 void ForceScanWalFailure(Logger* logger) {
@@ -517,8 +543,8 @@ TEST_F(FullScanIteratorTest,
   // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
   // operands bounded
   constexpr size_t cap =
-      2 * 1024 *
-      1024;  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
+      static_cast<const size_t>(2 * 1024 *
+      1024);  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   ASSERT_LT(budget.ColumnarUsed(), cap - 65536);
   // Model a large old image without putting MiB of row payload in a unit test.
   ASSERT_TRUE(
@@ -1048,10 +1074,18 @@ TEST_F(FullScanIteratorTest, BeginFullScan_AllRows_ScansSuccessfully) {
             .GetStatus());
   }
   Iterator it = table.BeginFullScan(ctx.txn_);
+  size_t scanned = 0;
   while (it.IsValid()) {
-    LOG(TRACE) << *it;
+    const Row& row = *it;
+    ASSERT_EQ(row.values_.size(), 3U);
+    EXPECT_EQ(row[0], Value(static_cast<int64_t>(scanned)));
+    EXPECT_EQ(row[1], Value("v" + std::to_string(scanned)));
+    EXPECT_DOUBLE_EQ(row[2].value.double_value, 0.1 + scanned);
+    ++scanned;
     ++it;
   }
+  EXPECT_EQ(scanned, 130U);
+  ASSERT_SUCCESS(it.GetStatus());
 }
 
 TEST_F(FullScanIteratorTest,
@@ -1214,14 +1248,23 @@ TEST_F(FullScanIteratorTest, ReadVersionFailureTerminatesScanSticky) {
     Table table(Schema("failure_table", {Column("value", ValueType::kInt64)}),
                 page_id);
     ASSERT_SUCCESS(table.Insert(seed, Row({Value(7)})).GetStatus());
+    ASSERT_SUCCESS(table.Insert(seed, Row({Value(8)})).GetStatus());
     ASSERT_SUCCESS(seed.PreCommit());
 
     Transaction reader = transactions.Begin(true);
-    Transaction broken = transactions.Begin();
-    ASSERT_TRUE(broken.AddWriteSet(RowPosition(page_id + 1000, 0)));
-    ForceScanWalFailure(logger.get());
-    EXPECT_NE(broken.PreCommit(), Status::kSuccess);
-    ASSERT_TRUE(transactions.FailStopped());
+    {
+      FullScan execution_scan(reader, table);
+      Transaction broken = transactions.Begin();
+      ASSERT_TRUE(broken.AddWriteSet(RowPosition(page_id + 1000, 0)));
+      ForceScanWalFailure(logger.get());
+      EXPECT_NE(broken.PreCommit(), Status::kSuccess);
+      ASSERT_TRUE(transactions.FailStopped());
+
+      DataChunk output;
+      EXPECT_EQ(execution_scan.NextBatch(&output, 2), 0U);
+      EXPECT_EQ(execution_scan.GetStatus(), Status::kIOError);
+      EXPECT_EQ(output.Size(), 0U);
+    }
 
     Iterator scan = table.BeginFullScan(reader);
     EXPECT_FALSE(scan.IsValid());
@@ -1528,6 +1571,134 @@ TEST_F(FullScanIteratorTest,
   EXPECT_EQ(tbl.GetCachedLSTableColumn(1, gen), nullptr);
   EXPECT_NE(tbl.GetCachedLSTableColumn(0, gen), nullptr);
   ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(
+    FullScanIteratorTest,
+    PerColumnCacheGlobalLruEvictsColdTableAndAllowsRebuildAndZeroDecodeHits) {
+  auto make_schema = [](const std::string& name) {
+    return Schema(
+        name, {Column("c0", ValueType::kInt64), Column("c1", ValueType::kInt64),
+               Column("c2", ValueType::kInt64)});
+  };
+  {
+    auto setup = db_->BeginContext();
+    for (const char* tname : {"ColdLruTbl", "HotLruTbl"}) {
+      ASSERT_SUCCESS(db_->CreateTable(setup, make_schema(tname)).GetStatus());
+      ASSIGN_OR_ASSERT_FAIL(Table, tbl, db_->GetTable(setup, tname));
+      for (int64_t i = 0; i < 200; ++i) {
+        ASSERT_SUCCESS(tbl.Insert(setup.txn_, Row({Value(i + 1), Value(i * 2),
+                                                   Value(i * 3)}))
+                           .GetStatus());
+      }
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  {
+    auto ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CompactTableToTlcs(ctx, "ColdLruTbl"));
+    ASSERT_SUCCESS(db_->CompactTableToTlcs(ctx, "HotLruTbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, cold, db_->GetTable(reader, "ColdLruTbl"));
+  ASSIGN_OR_ASSERT_FAIL(Table, hot, db_->GetTable(reader, "HotLruTbl"));
+  const uint64_t cold_gen = cold.LayoutGeneration();
+  const uint64_t hot_gen = hot.LayoutGeneration();
+
+  // Evict resident stores (both on TableIncarnation and TlcsFile) so both
+  // tables exercise the lazy per-column cache + valid_tlcs path.
+  ASSERT_NE(cold.GetBackingTlcsStore(), nullptr);
+  ASSERT_NE(hot.GetBackingTlcsStore(), nullptr);
+  cold.SetLSTableStore(nullptr);
+  hot.SetLSTableStore(nullptr);
+  (void)cold.GetBackingTlcsStore()->EvictDecodedCacheForTest(size_t{1} << 40);
+  (void)hot.GetBackingTlcsStore()->EvictDecodedCacheForTest(size_t{1} << 40);
+
+  // Evicting ResidentStore must not make a small TLCS table get blacklisted
+  // when requested with projection == nullptr.
+  {
+    const auto cold_full =
+        GetOrBuildLSTableStore(reader.txn_, cold, true, nullptr);
+    ASSERT_NE(cold_full, nullptr);
+    EXPECT_FALSE(cold.LSTableCapacityRejected(cold_gen));
+  }
+
+  // Clear ColdLruTbl's full view & cached columns, then populate {0, 1} and {2}
+  // in separate scopes so assembling {1, 2} hits cached columns under
+  // allow_lazy_build=false with zero TLCS decodes.
+  (void)cold.EvictIdleColumnarHeadroom(size_t{1} << 40);
+  const std::vector<slot_t> p01 = {0, 1};
+  const std::vector<slot_t> p2 = {2};
+  const std::vector<slot_t> p12 = {1, 2};
+  {
+    auto s01 = GetOrBuildLSTableStore(reader.txn_, cold, true, &p01);
+    ASSERT_NE(s01, nullptr);
+  }
+  {
+    auto s2 = GetOrBuildLSTableStore(reader.txn_, cold, true, &p2);
+    ASSERT_NE(s2, nullptr);
+  }
+  TlcsFile::ResetDecodeCallsForTest();
+  {
+    const auto s12 = GetOrBuildLSTableStore(reader.txn_, cold, false, &p12);
+    ASSERT_NE(s12, nullptr);
+    EXPECT_FALSE(s12->HasColumn(0));
+    EXPECT_TRUE(s12->HasColumn(1));
+    EXPECT_TRUE(s12->HasColumn(2));
+    EXPECT_EQ(TlcsFile::DecodeCallsForTest(), 0U);
+  }
+
+  // Drop ColdLruTbl's cached columns, keep only column 0 per table, and
+  // populate HotLruTbl after ColdLruTbl so HotLruTbl has newer global recency.
+  // Keep charge additions inside inner scopes so no local shared_ptr keeps
+  // memory_charge alive across reclaim.
+  (void)cold.EvictIdleColumnarHeadroom(size_t{1} << 40);
+  (void)hot.EvictIdleColumnarHeadroom(size_t{1} << 40);
+  const std::vector<slot_t> p0 = {0};
+  const size_t charge_bytes = size_t{2} << 20;
+  {
+    auto cold_s0 = GetOrBuildLSTableStore(reader.txn_, cold, true, &p0);
+    ASSERT_NE(cold_s0, nullptr);
+    ASSERT_FALSE(cold_s0->column_owners.empty());
+    ASSERT_NE(cold_s0->column_owners[0], nullptr);
+    ASSERT_NE(cold_s0->column_owners[0]->memory_charge, nullptr);
+    ASSERT_TRUE(cold_s0->column_owners[0]->memory_charge->TryAdd(charge_bytes));
+  }
+  {
+    auto hot_s0 = GetOrBuildLSTableStore(reader.txn_, hot, true, &p0);
+    ASSERT_NE(hot_s0, nullptr);
+    ASSERT_FALSE(hot_s0->column_owners.empty());
+    ASSERT_NE(hot_s0->column_owners[0], nullptr);
+    ASSERT_NE(hot_s0->column_owners[0]->memory_charge, nullptr);
+    ASSERT_TRUE(hot_s0->column_owners[0]->memory_charge->TryAdd(charge_bytes));
+  }
+
+  // Touch HotLruTbl after ColdLruTbl so ColdLruTbl is strictly older globally.
+  EXPECT_NE(cold.GetCachedLSTableColumn(0, cold_gen), nullptr);
+  EXPECT_NE(hot.GetCachedLSTableColumn(0, hot_gen), nullptr);
+
+  auto& budget = ProcessMemoryBudget::Global();
+  struct RestoreColumnarLimit {
+    size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
+    ~RestoreColumnarLimit() {
+      ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
+    }
+  } restore_limit;
+  const size_t current_used = budget.ColumnarUsed();
+  budget.SetColumnarPoolLimitForTest(current_used + (size_t{512} << 10));
+
+  // Reserving 1 MiB must trigger global reclaim and evict ColdLruTbl first
+  // while leaving HotLruTbl cached.
+  ASSERT_TRUE(
+      budget.TryReserveWithReclaim(MemoryPoolKind::kColumnar, size_t{1} << 20));
+  budget.Release(MemoryPoolKind::kColumnar, size_t{1} << 20);
+  EXPECT_EQ(cold.CachedColumnCountForTest(), 0U);
+  EXPECT_EQ(hot.CachedColumnCountForTest(), 1U);
+  EXPECT_EQ(cold.GetCachedLSTableColumn(0, cold_gen), nullptr);
+  EXPECT_NE(hot.GetCachedLSTableColumn(0, hot_gen), nullptr);
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 }  // namespace tinylamb

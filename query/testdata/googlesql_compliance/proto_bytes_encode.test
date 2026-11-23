@@ -10,7 +10,7 @@
 [name=str_value_is_no_nullable_int]
 SELECT TO_HEX(CAST('str_value: "x" int32_val1: 7' AS BYTES)) AS hex_bytes
 --
-ARRAY<STRING>["1a01780807"]
+ARRAY<STRING>["7374725f76616c75653a2022782220696e7433325f76616c313a2037"]
 ==
 
 [name=required_enum_without_numeric_form]
@@ -48,7 +48,7 @@ ARRAY<PROTO<googlesql_test.KitchenSinkEnumPB>>[{required_test_enum: TESTENUM1 }]
 [name=bytes_round_trip_preserves_proto3_enum_name]
 SELECT CAST(FROM_HEX('900301') AS googlesql_test.Proto3KitchenSink) AS msg
 --
-ARRAY<PROTO<googlesql_test.Proto3KitchenSink>>[{test_enum: 1 }]
+ARRAY<PROTO<googlesql_test.Proto3KitchenSink>>[{test_enum: ENUM1 }]
 ==
 
 [name=nullable_int_still_encodes]

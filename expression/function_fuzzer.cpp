@@ -23,6 +23,7 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -148,6 +149,7 @@ const auto kStrictFunctions = std::to_array<const char* const>({
     "date_add",
     "date_sub",
     "generate_array",
+    "generate_series",
     "generate_date_array",
     "json_extract",
     "json_query",
@@ -218,8 +220,26 @@ Value MakeArg(Cursor& c, bool bounded_sequence = false) {
       }
       return Value(std::move(s));
     }
-    case 5:
-      return Value::DateFromDays(static_cast<int64_t>(c.Next()));
+    case 5: {
+      // One byte only reached days 0..255. Consume four bytes for the day
+      // value plus a selector byte, mixing in documented DATE bounds so
+      // date_add/date_sub reach negative years and near-boundary values.
+      uint32_t raw = 0;
+      for (size_t i = 0; i < 4; ++i) {
+        raw = (raw << 8) | c.Next();
+      }
+      switch (c.Next() % 3) {
+        case 0:
+          return Value::DateFromDays(kDateMinDays +
+                                     static_cast<int64_t>(raw % 1000));
+        case 1:
+          return Value::DateFromDays(kDateMaxDays -
+                                     static_cast<int64_t>(raw % 1000));
+        default:
+          return Value::DateFromDays(static_cast<int64_t>(raw) -
+                                     (int64_t{1} << 31));
+      }
+    }
     case 6: {
       // Small array (occasional NULL / mixed-type / nested elements) so
       // array-taking builtins (code_points_to_*, greatest/least) reach their

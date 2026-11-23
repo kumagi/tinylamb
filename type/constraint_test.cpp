@@ -72,28 +72,28 @@ TEST(ConstraintTest, SerializeDeserialize_RemainingTypes_PreservesEquality) {
 }
 
 TEST(ConstraintTest, Size_ForAllConstraintKinds_MatchesByteFootprint) {
-  const size_t nothing_size = Constraint(Constraint::kNothing).Size();
-  const size_t not_null_size = Constraint(Constraint::kNotNull).Size();
-  const size_t unique_size = Constraint(Constraint::kUnique).Size();
-  const size_t pk_size = Constraint(Constraint::kPrimaryKey).Size();
-  const size_t index_size = Constraint(Constraint::kIndex).Size();
-  const size_t expected_val_size = sizeof(Constraint::ConstraintType) +
-                                   sizeof(ValueType) + Value("hello").Size();
-  const size_t default_size =
-      Constraint(Constraint::kDefault, Value("hello")).Size();
-  const size_t foreign_size =
-      Constraint(Constraint::kForeign, Value("t(id)")).Size();
-  const size_t check_size =
-      Constraint(Constraint::kCheck, Value("c > 0")).Size();
-
-  ASSERT_EQ(nothing_size, 1);
-  ASSERT_EQ(not_null_size, 1);
-  ASSERT_EQ(unique_size, 1);
-  ASSERT_EQ(pk_size, 1);
-  ASSERT_EQ(index_size, 1);
-  ASSERT_EQ(default_size, expected_val_size);
-  ASSERT_EQ(foreign_size, expected_val_size);
-  ASSERT_EQ(check_size, expected_val_size);
+  auto encoded_size = [](const Constraint& c) {
+    std::stringstream ss;
+    tinylamb::Encoder arc(ss);
+    arc << c;
+    return ss.str().size();
+  };
+  const std::vector<Constraint> constraints = {
+      Constraint(Constraint::kNothing),
+      Constraint(Constraint::kNotNull),
+      Constraint(Constraint::kUnique),
+      Constraint(Constraint::kPrimaryKey),
+      Constraint(Constraint::kIndex),
+      Constraint(Constraint::kDefault, Value("hello")),
+      Constraint(Constraint::kDefault, Value()),
+      Constraint(Constraint::kForeign, Value("t(id)")),
+      Constraint(Constraint::kCheck, Value("c > 0")),
+      Constraint(Constraint::kDefault, Value(int64_t{42})),
+      Constraint(Constraint::kDefault, Value(1.5)),
+  };
+  for (const Constraint& c : constraints) {
+    EXPECT_EQ(c.Size(), encoded_size(c)) << "ctype=" << static_cast<int>(c.ctype);
+  }
 }
 
 TEST(ConstraintTest,

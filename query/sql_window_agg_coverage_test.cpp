@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -23,6 +24,7 @@
 #include "executor/data_chunk.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/relational_sort_limit.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
@@ -35,6 +37,7 @@
 #include "expression/named_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/plan_cache.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
 #include "type/column.hpp"
@@ -49,9 +52,9 @@ namespace {
 // execution failure surfaces as a runtime_error carrying the diagnostic.
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
-  // One retry for empty diagnostics: a failed Prepare with no LastError is
-  // the external parse child being transiently unavailable under load, not
-  // a legitimate SQL error (real errors always carry a message).
+  // One retry for empty diagnostics: an empty LastError can indicate that an
+  // external parse child is transiently unavailable under load. Other paths
+  // may also return an empty diagnostic, so this retry is deliberately bounded.
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
     if (engine->LastError().empty()) {
@@ -957,6 +960,20 @@ TEST_F(WindowSqlCov, StringAggWindowUsesFirstOrderedDelimiter) {
   }
 }
 
+TEST_F(WindowSqlCov, ApproxTopGroupedAggregatesRejectWrongArityOnEmptyInput) {
+  for (const char* call :
+       {"APPROX_TOP_COUNT(v)", "APPROX_TOP_COUNT(v, 1, 2)",
+        "APPROX_TOP_SUM(v, 1)", "APPROX_TOP_SUM(v, 1, 2, 3)"}) {
+    const auto rows = TryRunSql(
+        engine_.get(), context_.get(),
+        std::string("SELECT ") + call + " FROM UNNEST([1]) AS v WHERE FALSE");
+    EXPECT_FALSE(rows.HasValue()) << call;
+    EXPECT_NE(rows.GetStatus().GetMessage().find("aggregate arity"),
+              std::string::npos)
+        << call;
+  }
+}
+
 TEST_F(WindowSqlCov, ArrayAndSketchWindowAggregates) {
   const auto rows = TryRunSql(
       engine_.get(), context_.get(),
@@ -1190,7 +1207,7 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
     SpillKnobGuard(const SpillKnobGuard&) = delete;
     SpillKnobGuard& operator=(const SpillKnobGuard&) = delete;
     ~SpillKnobGuard() { Restore(); }
-    void Restore() {
+    void Restore() const {
       auto& b = ProcessMemoryBudget::Global();
       b.SetTestAlwaysSpill(always_spill);
       b.SetTestOpMemoryBytes(op_bytes);
@@ -1246,8 +1263,24 @@ TEST_F(WindowSqlCov, SpilledSlidingSumsForgetDepartedUnsignedValues) {
   EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
   ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
   auto& budget = ProcessMemoryBudget::Global();
-  const bool saved_spill = budget.AlwaysSpillEnabled();
-  const size_t saved_bytes = budget.OpMemoryOverrideBytes();
+  // RAII, not a manual restore: an early ASSERT before the end of this test
+  // must not leave the process-global budget in always-spill/4096 mode and
+  // silently push later tests in the same binary onto the spill path.
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) RAII knob guard
+  struct SpillKnobGuard {
+    SpillKnobGuard()
+        : always_spill(ProcessMemoryBudget::Global().AlwaysSpillEnabled()),
+          op_bytes(ProcessMemoryBudget::Global().OpMemoryOverrideBytes()) {}
+    SpillKnobGuard(const SpillKnobGuard&) = delete;
+    SpillKnobGuard& operator=(const SpillKnobGuard&) = delete;
+    ~SpillKnobGuard() {
+      auto& b = ProcessMemoryBudget::Global();
+      b.SetTestAlwaysSpill(always_spill);
+      b.SetTestOpMemoryBytes(op_bytes);
+    }
+    bool always_spill;
+    size_t op_bytes;
+  } spill_knobs;
   budget.SetTestAlwaysSpill(true);
   budget.SetTestOpMemoryBytes(4096);
   const std::string frame =
@@ -1255,8 +1288,6 @@ TEST_F(WindowSqlCov, SpilledSlidingSumsForgetDepartedUnsignedValues) {
   const auto rows = TryRunSql(engine_.get(), context_.get(),
                               "SELECT SUM(" + input + frame + ", AVG(" + input +
                                   frame + " FROM wu ORDER BY k");
-  budget.SetTestAlwaysSpill(saved_spill);
-  budget.SetTestOpMemoryBytes(saved_bytes);
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
   constexpr double big = 9223372036854775808.0;
   ASSERT_EQ(rows.Value().size(), 200U);
@@ -1264,7 +1295,7 @@ TEST_F(WindowSqlCov, SpilledSlidingSumsForgetDepartedUnsignedValues) {
   EXPECT_EQ(rows.Value()[1], (Row{Value(big), Value(big / 2)}));
   EXPECT_EQ(rows.Value()[2], (Row{Value(big), Value(big / 2)}));
   for (size_t i = 3; i < rows.Value().size(); ++i) {
-    const double key = static_cast<double>(i + 1);
+    const auto key = static_cast<double>(i + 1);
     EXPECT_EQ(rows.Value()[i], (Row{Value(2 * key), Value(key)}));
   }
 }
@@ -1873,6 +1904,11 @@ TEST_F(DirectWinCov, PercentileRespectNullsAndInterpolation) {
   rows = Apply(*context_, percentile, {Value(), Value(10)});
   ASSERT_TRUE(rows.HasValue());
   EXPECT_DOUBLE_EQ(rows.Value()[0].value.double_value, 10.0);
+  rows = Apply(*context_, percentile, {Value(), Value()});
+  ASSERT_TRUE(rows.HasValue());
+  ASSERT_EQ(rows.Value().size(), 2U);
+  EXPECT_TRUE(rows.Value()[0].IsNull());
+  EXPECT_TRUE(rows.Value()[1].IsNull());
 
   // PERCENTILE_DISC at p=1 with RESPECT NULLS must still see the non-NULL
   // value (the frame is {NULL, 10}); a moved-from `values` would return NULL.
@@ -2209,6 +2245,18 @@ TEST_F(AggSmallCov, EmptyInputScalarAggregates) {
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
   ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
   EXPECT_NE(dump->find("input_rows=0"), std::string::npos) << *dump;
+}
+
+TEST_F(AggSmallCov, PercentileAndQuantilesReturnNullOnEmptyInput) {
+  const auto rows =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT PERCENTILE_CONT(a, 0.5), PERCENTILE_DISC(a, 0.5), "
+                "APPROX_QUANTILES(a, 2) FROM med WHERE FALSE");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus();
+  ASSERT_EQ(rows.Value().size(), 1U);
+  for (const auto& value : rows.Value()[0].values_) {
+    EXPECT_TRUE(value.IsNull());
+  }
 }
 
 TEST_F(AggSmallCov, SingleSumUsesCheckedTypedFoldPath) {
@@ -2990,6 +3038,306 @@ TEST_F(ScanFilterDirectTest, SplitAndCombineDisjuncts) {
   Expression combined = relational_detail::CombineDisjuncts(parts);
   EXPECT_EQ(relational_detail::SplitDisjuncts(combined).size(), 3U);
   EXPECT_FALSE(relational_detail::CombineDisjuncts({}));
+}
+
+TEST(LeanPhase3ParityTest,
+     WindowDistinctInverseMatchesAcrossNullsDuplicatesAndExclusions) {
+  // The body toggles this knob repeatedly and unsets it at the end; the guard
+  // restores any externally supplied value even on an early ASSERT exit.
+  EnvGuard wdi_env("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+  auto db_or = Database::Create("lean_wdi_" + RandomString());
+  ASSERT_EQ(db_or.GetStatus(), Status::kSuccess);
+  auto db = db_or.MoveValue();
+  {
+    TransactionContext ctx = db->BeginContext();
+    SqlEngine engine(*db);
+    ASSERT_TRUE(
+        engine.Execute(ctx, "CREATE TABLE t (id INT64, v INT64);").HasValue());
+    ASSERT_TRUE(engine
+                    .Execute(ctx,
+                             "INSERT INTO t VALUES "
+                             "(1, 10), (2, 10), (3, NULL), (4, -5), (5, 20), "
+                             "(6, 10), (7, 20), (8, NULL), (9, 30), (10, -5);")
+                    .HasValue());
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+
+  const std::vector<std::string> queries = {
+      "SELECT id, "
+      "COUNT(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 "
+      "FOLLOWING), "
+      "SUM(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 "
+      "FOLLOWING) "
+      "FROM t ORDER BY id;",
+      "SELECT id, "
+      "COUNT(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 "
+      "PRECEDING), "
+      "SUM(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 3 "
+      "FOLLOWING) "
+      "FROM t ORDER BY id;",
+      "SELECT id, "
+      "COUNT(DISTINCT s) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND "
+      "CURRENT ROW) "
+      "FROM (SELECT id, CASE WHEN v IS NULL THEN NULL WHEN v < 0 THEN 'neg' "
+      "WHEN v = 10 THEN 'ten' ELSE 'pos' END AS s FROM t) sub "
+      "ORDER BY id;"};
+
+  for (const std::string& q : queries) {
+    auto eval = [&](bool disable) -> std::vector<Row> {
+      if (disable) {
+        setenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
+      } else {
+        unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+      }
+      PreparedPlanCache::Instance().Clear();
+      CurrentCompiledPlans().clear();
+      TransactionContext ctx = db->BeginReadOnlyContext();
+      SqlEngine engine(*db);
+      auto rows = RunSql(&engine, &ctx, q);
+      ctx.txn_.PreCommit();
+      return rows;
+    };
+    const auto on_rows = eval(false);
+    const auto off_rows = eval(true);
+    EXPECT_EQ(on_rows, off_rows) << q;
+  }
+
+  // Test EXCLUDE CURRENT ROW via AST + ApplyWindows (parser rejects EXCLUDE).
+  {
+    auto cnt_w = MakeWindow("COUNT", {ColumnValueExp("v")});
+    cnt_w->distinct = true;
+    cnt_w->order_by = {WindowOrderTerm{.expression = ColumnValueExp("id"),
+                                       .ascending = true,
+                                       .nulls_first = std::nullopt}};
+    cnt_w->has_frame = true;
+    cnt_w->frame_unit = WindowFrameUnit::kRows;
+    cnt_w->frame_start = OffsetBound(WindowFrameBoundType::kOffsetPreceding, 2);
+    cnt_w->frame_end = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 2);
+    cnt_w->exclusion = WindowFrameExclusion::kCurrentRow;
+
+    auto sum_w = MakeWindow("SUM", {ColumnValueExp("v")});
+    sum_w->distinct = true;
+    sum_w->order_by = cnt_w->order_by;
+    sum_w->has_frame = true;
+    sum_w->frame_unit = WindowFrameUnit::kRows;
+    sum_w->frame_start = cnt_w->frame_start;
+    sum_w->frame_end = cnt_w->frame_end;
+    sum_w->exclusion = WindowFrameExclusion::kCurrentRow;
+
+    SelectStatement stmt({NamedExpression("id", ColumnValueExp("id")),
+                          NamedExpression("c", Expression(cnt_w)),
+                          NamedExpression("s", Expression(sum_w))},
+                         {}, nullptr);
+    const Schema schema(
+        "t", {Column("id", ValueType::kInt64), Column("v", ValueType::kInt64)});
+    const std::vector<Row> base_rows{
+        Row({Value(1), Value(10)}), Row({Value(2), Value(10)}),
+        Row({Value(3), Value()}),   Row({Value(4), Value(-5)}),
+        Row({Value(5), Value(20)}), Row({Value(6), Value(10)}),
+        Row({Value(7), Value(20)}), Row({Value(8), Value()})};
+    auto run_excl = [&](bool disable) -> std::vector<Row> {
+      if (disable) {
+        setenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
+      } else {
+        unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+      }
+      TransactionContext ctx = db->BeginReadOnlyContext();
+      relational_detail::Relation rel;
+      rel.schema = schema;
+      rel.rows = base_rows;
+      auto res_or = relational_detail::ApplyWindows(ctx, stmt, std::move(rel),
+                                                    nullptr, {});
+      if (!res_or.HasValue()) {
+        ADD_FAILURE() << res_or.GetStatus();
+        return {};
+      }
+      std::vector<Row> out;
+      res_or.Value().input.ForEachRow([&](const Row& r) { out.push_back(r); });
+      ctx.txn_.PreCommit();
+      return out;
+    };
+    const auto on_excl = run_excl(false);
+    const auto off_excl = run_excl(true);
+    EXPECT_EQ(on_excl.size(), base_rows.size());
+    EXPECT_EQ(on_excl, off_excl);
+  }
+  unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+  db->DeleteAll();
+}
+
+TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
+  // The bodies below toggle these knobs repeatedly; the guards restore any
+  // externally supplied values even on an early ASSERT exit.
+  EnvGuard halo_env("TINYLAMB_DISABLE_WINDOW_HALO");
+  EnvGuard distinct_on_env("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
+  EnvGuard or_branches_env("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
+  auto db_or = Database::Create("lean_p3sql_" + RandomString());
+  ASSERT_EQ(db_or.GetStatus(), Status::kSuccess);
+  auto db = db_or.MoveValue();
+  {
+    TransactionContext ctx = db->BeginContext();
+    SqlEngine engine(*db);
+    ASSERT_TRUE(
+        engine.Execute(ctx, "CREATE TABLE w (id INT64, grp INT64, val INT64);")
+            .HasValue());
+    ASSERT_TRUE(
+        engine.Execute(ctx, "CREATE TABLE lo (a INT64, b INT64, c INT64);")
+            .HasValue());
+    ASSERT_TRUE(
+        engine.Execute(ctx, "CREATE TABLE ro (a INT64, b INT64, d INT64);")
+            .HasValue());
+    std::string inserts = "INSERT INTO w VALUES ";
+    for (int i = 1; i <= 60; ++i) {
+      if (i > 1) { inserts += ", ";
+}
+      const std::string val_str =
+          (i % 9 == 0) ? "NULL" : std::to_string(((i * 17) % 50) - 15);
+      inserts += "(" + std::to_string(i) + ", " + std::to_string(i % 7) + ", " +
+                 val_str + ")";
+    }
+    inserts += ";";
+    ASSERT_TRUE(engine.Execute(ctx, inserts).HasValue());
+    ASSERT_TRUE(
+        engine
+            .Execute(ctx,
+                     "INSERT INTO lo VALUES "
+                     "(1, 10, 1), (NULL, 20, 1), (99, 99, 1), (2, 30, -5);")
+            .HasValue());
+    ASSERT_TRUE(
+        engine
+            .Execute(ctx,
+                     "INSERT INTO ro VALUES "
+                     "(1, 10, 1), (50, 20, 1), (50, 20, 2), (2, 30, 3);")
+            .HasValue());
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+
+  auto eval_sorted = [&](const std::string& q, const char* disable_var,
+                         bool disable) -> std::vector<Row> {
+    if (disable) {
+      setenv(disable_var, "1", 1);
+    } else {
+      unsetenv(disable_var);
+    }
+    PreparedPlanCache::Instance().Clear();
+    CurrentCompiledPlans().clear();
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    SqlEngine engine(*db);
+    auto rows = RunSql(&engine, &ctx, q);
+    ctx.txn_.PreCommit();
+    return rows;
+  };
+
+  // WindowHalo on direct relational ApplyWindows path (both Row-backed and
+  // Columnar-backed inputs) and SQL path.
+  {
+    auto win = MakeWindow("AVG", {ColumnValueExp("val")});
+    win->order_by = {WindowOrderTerm{.expression = ColumnValueExp("id"),
+                                     .ascending = true,
+                                     .nulls_first = std::nullopt}};
+    win->has_frame = true;
+    win->frame_unit = WindowFrameUnit::kRows;
+    win->frame_start = OffsetBound(WindowFrameBoundType::kOffsetPreceding, 2);
+    win->frame_end = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 2);
+
+    SelectStatement stmt({NamedExpression("id", ColumnValueExp("id")),
+                          NamedExpression("a", Expression(win))},
+                         {}, nullptr);
+    stmt.SetOrderBy({{ColumnValueExp("id"), true, std::nullopt}});
+    stmt.SetLimit(7);
+    stmt.SetOffset(12);
+
+    const Schema schema("w", {Column("id", ValueType::kInt64),
+                              Column("val", ValueType::kInt64)});
+    std::vector<Row> base_rows;
+    base_rows.reserve(60);
+    for (int i = 60; i >= 1; --i) {  // intentionally unsorted input
+      base_rows.push_back(Row(
+          {Value(int64_t{i}), (i % 7 == 0) ? Value() : Value(int64_t{static_cast<int64_t>(i * 3)})}));
+    }
+
+    auto run_apply = [&](bool disable) -> std::vector<Row> {
+      if (disable) {
+        setenv("TINYLAMB_DISABLE_WINDOW_HALO", "1", 1);
+      } else {
+        unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+      }
+      TransactionContext ctx = db->BeginReadOnlyContext();
+      relational_detail::Relation rel;
+      rel.schema = schema;
+      rel.rows = base_rows;
+      auto win_or = relational_detail::ApplyWindows(
+          ctx, stmt, std::move(rel), nullptr, {}, /*allow_window_halo=*/true);
+      EXPECT_TRUE(win_or.HasValue()) << win_or.GetStatus();
+      auto win_res = win_or.MoveValue();
+      EXPECT_EQ(relational_detail::ApplyOrderBy(ctx, *win_res.statement,
+                                                &win_res.input, nullptr, {}),
+                Status::kSuccess);
+      auto fin_or = relational_detail::LimitedRows(
+          *win_res.statement, std::move(win_res.input), &ctx, nullptr, {});
+      EXPECT_TRUE(fin_or.HasValue()) << fin_or.GetStatus();
+      std::vector<Row> out;
+      fin_or.Value().ForEachRow([&](const Row& r) { out.push_back(r); });
+      ctx.txn_.PreCommit();
+      return out;
+    };
+
+    const auto on_halo = run_apply(false);
+    const auto off_halo = run_apply(true);
+    EXPECT_EQ(on_halo.size(), 7U);
+    EXPECT_EQ(on_halo, off_halo);
+  }
+  for (const std::string& wq :
+       {"SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 2 "
+        "FOLLOWING) AS a "
+        "FROM w ORDER BY id LIMIT 10 OFFSET 15;",
+        "SELECT id, SUM(val) OVER (ORDER BY id DESC ROWS BETWEEN 2 PRECEDING "
+        "AND 4 FOLLOWING) AS s, "
+        "COUNT(val) OVER (ORDER BY id DESC ROWS BETWEEN 1 PRECEDING AND "
+        "CURRENT ROW) AS c "
+        "FROM w ORDER BY id DESC LIMIT 12 OFFSET 5;"}) {
+    const auto on_rows = eval_sorted(wq, "TINYLAMB_DISABLE_WINDOW_HALO", false);
+    const auto off_rows = eval_sorted(wq, "TINYLAMB_DISABLE_WINDOW_HALO", true);
+    EXPECT_EQ(on_rows, off_rows) << wq;
+  }
+  unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+
+  // DistinctOnTop1 parity (ties, DESC + NULLS FIRST/LAST, ordinals, expression
+  // keys).
+  for (const std::string& dq :
+       {"SELECT DISTINCT ON (grp) grp, id, val FROM w ORDER BY grp, val DESC "
+        "NULLS LAST, id ASC;",
+        "SELECT DISTINCT ON (grp) grp, id, val FROM w ORDER BY grp DESC, val "
+        "ASC NULLS FIRST, id DESC;",
+        "SELECT DISTINCT ON (MOD(grp, 3)) grp, id, COALESCE(val, -1) FROM w "
+        "ORDER BY 1, id DESC;"}) {
+    const auto on_rows =
+        eval_sorted(dq, "TINYLAMB_DISABLE_DISTINCT_ON_TOP1", false);
+    const auto off_rows =
+        eval_sorted(dq, "TINYLAMB_DISABLE_DISTINCT_ON_TOP1", true);
+    EXPECT_EQ(on_rows, off_rows) << dq;
+  }
+  unsetenv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
+
+  // OuterOrBranches end-to-end through SqlEngine (PipelineLowering
+  // OocCrossJoinProbeSource).
+  for (const std::string& jq :
+       {"SELECT lo.a, lo.b, ro.a, ro.b, ro.d FROM lo LEFT JOIN ro ON lo.a = "
+        "ro.a OR lo.b = ro.b;",
+        "SELECT lo.a, lo.b, ro.d FROM lo INNER JOIN ro ON (lo.a = ro.a AND "
+        "lo.c > 0) OR (lo.b = ro.b AND ro.d < 5);"}) {
+    auto on_rows = eval_sorted(jq, "TINYLAMB_DISABLE_OUTER_OR_BRANCHES", false);
+    auto off_rows = eval_sorted(jq, "TINYLAMB_DISABLE_OUTER_OR_BRANCHES", true);
+    auto cmp = [](const Row& x, const Row& y) {
+      return x.ToString() < y.ToString();
+    };
+    std::ranges::sort(on_rows, cmp);
+    std::ranges::sort(off_rows, cmp);
+    EXPECT_EQ(on_rows, off_rows) << jq;
+  }
+  unsetenv("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
+
+  db->DeleteAll();
 }
 
 }  // namespace tinylamb

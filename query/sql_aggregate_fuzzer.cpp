@@ -90,21 +90,34 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
   }
   std::vector<std::vector<Value>> rows;
   Row row;
-  while (result.Value().Next(&row)) {
-    std::vector<Value> cells;
-    cells.reserve(row.values_.size());
-    for (size_t i = 0; i < row.values_.size(); ++i) {
-      cells.push_back(row[i]);
+  // Next()/Drain() can still escape an exception through the transitional
+  // EXC-SHIM boundary. These queries are always valid, so an exception is a
+  // finding: record it as an error for the caller instead of letting the
+  // libFuzzer process terminate before the mismatch is reported (same guard
+  // as sql_join_fuzzer.cpp).
+  try {
+    while (result.Value().Next(&row)) {
+      std::vector<Value> cells;
+      cells.reserve(row.values_.size());
+      for (size_t i = 0; i < row.values_.size(); ++i) {
+        cells.push_back(row[i]);
+      }
+      rows.push_back(std::move(cells));
     }
-    rows.push_back(std::move(cells));
-  }
-  // QueryResult is lazy: a mid-stream error is not a rejected query but a
-  // truncated result.  Generated SELECTs cannot legitimately fail, so mark
-  // it distinctly — the caller reports instead of skipping.
-  if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
-    *error = "stream-error: " + (st.GetMessage().empty()
-                                     ? std::string(ToString(st.GetCode()))
-                                     : std::string(st.GetMessage()));
+    // QueryResult is lazy: a mid-stream error is not a rejected query but a
+    // truncated result.  Generated SELECTs cannot legitimately fail, so mark
+    // it distinctly — the caller reports instead of skipping.
+    if (Status st = result.Value().GetStatus(); st != Status::kSuccess) {
+      *error = "stream-error: " + (st.GetMessage().empty()
+                                       ? std::string(ToString(st.GetCode()))
+                                       : std::string(st.GetMessage()));
+      return std::nullopt;
+    }
+  } catch (const std::exception& e) {
+    *error = "stream exception: " + std::string(e.what());
+    return std::nullopt;
+  } catch (...) {
+    *error = "stream exception: unknown";
     return std::nullopt;
   }
   return rows;
@@ -343,8 +356,10 @@ struct WPred {
         const bool is_null = CellOf(r, col) == kNullRepr;
         return (negated ? !is_null : is_null) ? 'T' : 'F';
       }
-      case Kind::kNot:
-        return left->Eval(r) == 'T' ? 'F' : (left->Eval(r) == 'F' ? 'T' : 'N');
+      case Kind::kNot: {
+        const char value = left->Eval(r);
+        return value == 'T' ? 'F' : (value == 'F' ? 'T' : 'N');
+      }
       case Kind::kBin: {
         const char l = left->Eval(r);
         const char rr = right->Eval(r);
@@ -2374,7 +2389,7 @@ bool ParseAggregateTest(std::string_view text, uint64_t* seed, AggTrace* trace,
       return false;
     }
   }
-  return saw_header && !trace->setup.empty();
+  return saw_header && !trace->setup.empty() && !trace->queries.empty();
 }
 
 void AggregateFuzzTry(const uint8_t* data, size_t size, bool verbose) {
@@ -2382,7 +2397,9 @@ void AggregateFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   for (size_t i = 0; i < size; ++i) {
     seed = (seed * 257) + data[i] + 1;
   }
-  std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
+  std::seed_seq seed_words{static_cast<uint32_t>(seed),
+                           static_cast<uint32_t>(seed >> 32)};
+  std::mt19937 rng(seed_words);
   AggTrace trace;
   std::string report = RunAggregateIteration(rng, verbose, nullptr, &trace);
   if (report.empty()) {
@@ -2401,7 +2418,8 @@ void AggregateFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   } else {
     verify = ReplayAggregateTrace(parsed, false);
     if (verify.empty()) {
-      verify = "internal error: serialized aggregate replay holds (flaky)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized aggregate replay holds (flaky)");
     }
   }
   const std::string path =

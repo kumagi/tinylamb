@@ -38,15 +38,17 @@ std::filesystem::path SpillFile::TempDirectory() {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
-    // The caller will fail OpenForWrite with an unclear path; surface the
-    // real cause (permissions / not-a-directory) here instead.
+    // An empty directory signals that temporary storage is unavailable.
     return {};
   }
   return dir;
 }
 
 SpillFile::SpillFile() {
-  path_ = TempDirectory() / ("tinylamb-spill-" + RandomSuffix() + ".bin");
+  const std::filesystem::path dir = TempDirectory();
+  if (!dir.empty()) {
+    path_ = dir / ("tinylamb-spill-" + RandomSuffix() + ".bin");
+  }
 }
 
 SpillFile::SpillFile(SpillFile&& other) noexcept
@@ -54,6 +56,7 @@ SpillFile::SpillFile(SpillFile&& other) noexcept
       stream_(std::move(other.stream_)),
       count_(other.count_),
       file_bytes_(other.file_bytes_),
+      finish_error_(other.finish_error_),
       writing_(other.writing_),
       finished_(other.finished_),
       has_positions_(other.has_positions_) {
@@ -61,6 +64,7 @@ SpillFile::SpillFile(SpillFile&& other) noexcept
   // otherwise destroying `other` would delete the file still in use here.
   other.count_ = 0;
   other.file_bytes_ = 0;
+  other.finish_error_ = Status::kSuccess;
   other.path_.clear();
   other.writing_ = false;
   other.finished_ = false;
@@ -84,11 +88,13 @@ SpillFile& SpillFile::operator=(SpillFile&& other) noexcept {
     stream_ = std::move(other.stream_);
     count_ = other.count_;
     file_bytes_ = other.file_bytes_;
+    finish_error_ = other.finish_error_;
     writing_ = other.writing_;
     finished_ = other.finished_;
     has_positions_ = other.has_positions_;
     other.count_ = 0;
     other.file_bytes_ = 0;
+    other.finish_error_ = Status::kSuccess;
     other.path_.clear();
     other.writing_ = false;
     other.finished_ = false;
@@ -134,16 +140,27 @@ Status SpillWriteStatus(const char* context,
 }  // namespace
 
 Status SpillFile::OpenForWrite() {
+  if (finish_error_ != Status::kSuccess) {
+    return finish_error_;
+  }
   if (writing_) {
     return Status::kSuccess;
+  }
+  if (path_.empty()) {
+    return StatusError(StatusCode::kIOError,
+                       "temporary spill directory is unavailable");
   }
   stream_.open(path_, std::ios::binary | std::ios::out | std::ios::trunc);
   if (!stream_) {
     return SpillWriteStatus("failed to create spill file", path_);
   }
   // Placeholder for count; rewritten in FinishWriting.
+  // Copy into a char buffer rather than reinterpret_casting the integer:
+  // byte-wise memcpy avoids aliasing/alignment assumptions about the stream.
   const uint64_t zero = 0;
-  stream_.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
+  char zero_bytes[sizeof(zero)];
+  std::memcpy(zero_bytes, &zero, sizeof(zero));
+  stream_.write(zero_bytes, sizeof(zero_bytes));
   if (!stream_) {
     return SpillWriteStatus("spill write failed", path_);
   }
@@ -160,9 +177,13 @@ Status SpillFile::Append(const Row& row) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SpillFile position mode mismatch");
   }
+  // Validate before changing the file so a rejected row can be skipped and
+  // the rows already in the file remain readable.
+  RETURN_IF_FAIL(row.CheckSerializable());
   RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row;
+  RETURN_IF_FAIL(enc.GetStatus());
   if (!stream_) {
     return SpillWriteStatus("spill write failed", path_);
   }
@@ -184,10 +205,17 @@ Status SpillFile::Append(const Row& row, const RowPosition& position) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SpillFile position mode mismatch");
   }
+  RETURN_IF_FAIL(row.CheckSerializable());
   RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row << position;
+  const Status encode_status = enc.GetStatus();
+  if (encode_status != Status::kSuccess) {
+    finished_ = true;
+    return encode_status;
+  }
   if (!stream_) {
+    finished_ = true;
     return SpillWriteStatus("spill write failed", path_);
   }
   // Same as the row-only Append: publish the layout only on a successful
@@ -199,6 +227,9 @@ Status SpillFile::Append(const Row& row, const RowPosition& position) {
 }
 
 Status SpillFile::FinishWriting() {
+  if (finish_error_ != Status::kSuccess) {
+    return finish_error_;
+  }
   if (finished_) {
     return Status::kSuccess;
   }
@@ -221,7 +252,9 @@ Status SpillFile::FinishWriting() {
     return StatusError(StatusCode::kIOError,
                        "failed to seek spill file: " + path_.string());
   }
-  stream_.write(reinterpret_cast<const char*>(&count_), sizeof(count_));
+  char count_bytes[sizeof(count_)];
+  std::memcpy(count_bytes, &count_, sizeof(count_));
+  stream_.write(count_bytes, sizeof(count_bytes));
   stream_.flush();
   if (!stream_) {
     return StatusError(StatusCode::kIOError,
@@ -229,8 +262,11 @@ Status SpillFile::FinishWriting() {
   }
   stream_.close();
   if (!stream_) {
-    return StatusError(StatusCode::kIOError,
-                       "failed to close spill file: " + path_.string());
+    finish_error_ = StatusError(StatusCode::kIOError,
+                                "failed to close spill file: " +
+                                    path_.string());
+    writing_ = false;
+    return finish_error_;
   }
   writing_ = false;
   finished_ = true;
@@ -241,11 +277,15 @@ Status SpillFile::FinishWriting() {
     std::error_code ec;
     const uint64_t sz = std::filesystem::file_size(path_, ec);
     if (ec) {
-      return StatusError(StatusCode::kIOError,
-                         "failed to size spill file: " + path_.string() + " (" +
-                             ec.message() + ")");
+      // The file itself is complete and closed; only the size probe failed.
+      // Returning an error here would be self-defeating: finished_ is already
+      // set, so a caller's retry would short-circuit to kSuccess and keep a
+      // stale size.  Clear file_bytes_ so OpenRowReader takes its existing
+      // real-on-disk-size fallback instead.
+      file_bytes_ = 0;
+    } else {
+      file_bytes_ = sz;
     }
-    file_bytes_ = sz;
   }
   return Status::kSuccess;
 }
@@ -287,12 +327,14 @@ StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
                        "failed to open spill file: " + path_.string());
   }
   uint64_t stored = 0;
-  reader.stream_->read(reinterpret_cast<char*>(&stored), sizeof(stored));
+  char stored_bytes[sizeof(stored)];
+  reader.stream_->read(stored_bytes, sizeof(stored_bytes));
   if (reader.stream_->gcount() !=
-      static_cast<std::streamsize>(sizeof(stored))) {
+      static_cast<std::streamsize>(sizeof(stored_bytes))) {
     return StatusError(StatusCode::kCorrupt,
                        "truncated spill file header: " + path_.string());
   }
+  std::memcpy(&stored, stored_bytes, sizeof(stored));
   if (stored != count_) {
     return StatusError(StatusCode::kCorrupt,
                        "spill file header mismatch: " + path_.string());
@@ -353,11 +395,13 @@ Status SpillFile::EnsureReader() {
 
 StatusOr<uint64_t> SpillFile::ReadStoredCount() {
   uint64_t stored = 0;
-  stream_.read(reinterpret_cast<char*>(&stored), sizeof(stored));
-  if (stream_.gcount() != static_cast<std::streamsize>(sizeof(stored))) {
+  char stored_bytes[sizeof(stored)];
+  stream_.read(stored_bytes, sizeof(stored_bytes));
+  if (stream_.gcount() != static_cast<std::streamsize>(sizeof(stored_bytes))) {
     return StatusError(StatusCode::kCorrupt,
                        "truncated spill file header: " + path_.string());
   }
+  std::memcpy(&stored, stored_bytes, sizeof(stored));
   // The header was rewritten by this process; a mismatch means the file is
   // corrupt. It also bounds the loop below by a value we trust.
   if (stored != count_) {

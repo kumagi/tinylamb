@@ -123,7 +123,7 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 
 ## 7. 問い合わせ作業メモリとプロセス予算
 
-既定のパイプライン／OOC 実行では `ProcessMemoryBudget`（`common/memory_budget.hpp`：`kStorage`/`kColumnar`/`kQuery`/`kTx` プール）と `QueryMemoryCoordinator` / `QueryMemoryGrant`（`common/query_grant.hpp`）がクエリごとの入場制御（$G_q$）と演算子予算配分（$B_{op}$、メモリ不足時の `ReclaimStage` 回収および `kMemoryLimitExceeded` 返却）を担う（[ADR 0003](../adr/0003-memory-budget-thresholds.md)、[ADR 0004](../adr/0004-query-memory-grants.md)）。
+ここで $G_q$ は QueryMemoryCoordinator が管理するクエリ単位の入場 grant、$B_{op}$ は QueryMemoryGrant から個々の演算子へ分配されるバイト予算を表す。既定のパイプライン／OOC 実行では `ProcessMemoryBudget`（`common/memory_budget.hpp`：`kStorage`/`kColumnar`/`kQuery`/`kTx` プール）と `QueryMemoryCoordinator` / `QueryMemoryGrant`（`common/query_grant.hpp`）がクエリごとの入場制御（$G_q$）と演算子予算配分（$B_{op}$、メモリ不足時の `ReclaimStage` 回収および `kMemoryLimitExceeded` 返却）を担う（[ADR 0003](../adr/0003-memory-budget-thresholds.md)、[ADR 0004](../adr/0004-query-memory-grants.md)）。
 
 旧経路向けには `QueryMemoryBudget`（`executor/query_memory.hpp`）も `kQuery` プールの窓口として残る。行の概算サイズは、固定長値、文字列の内容、配列要素などを合計して求める。メモリアロケータが実際に確保した量とは一致しないが、すべての演算子が同じ尺度で判断するための近似値になる。
 

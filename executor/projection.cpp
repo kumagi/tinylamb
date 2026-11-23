@@ -122,6 +122,18 @@ void CountCseCandidates(  // NOLINT(misc-no-recursion)
     ++(*counts)[key];
     samples->try_emplace(key, expression);
   }
+  // Only expressions reached on every row may be evaluated ahead of the
+  // projection. A CASE arm or a lazy function argument may never be read.
+  if (expression->Type() == tinylamb::TypeTag::kBinaryExp) {
+    const auto& binary = expression->AsBinaryExpression();
+    if (binary.Op() == tinylamb::BinaryOperation::kAnd ||
+        binary.Op() == tinylamb::BinaryOperation::kOr) {
+      CountCseCandidates(binary.Left(), counts, samples);
+      return;
+    }
+  } else if (expression->Type() != tinylamb::TypeTag::kUnaryExp) {
+    return;
+  }
   for (const tinylamb::Expression& child :
        tinylamb::ExpressionChildren(expression)) {
     CountCseCandidates(child, counts, samples);

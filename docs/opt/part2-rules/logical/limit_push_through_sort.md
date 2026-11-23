@@ -44,6 +44,8 @@ graph TD
    ```
 2. **ソートノードの適合性**: 子グループ内の論理式が `kSort` であり、単一の子を持ち、かつその子が現在のグループ自身を指していないこと（`sort.children[0] != group` による自己参照防止）。
 
+元の Limit に `WITH TIES` がある場合も、その指定を TopN へ引き継ぎ、境界値と同順位の行を保持します。
+
 ## 意味論的根拠と押し込み禁止の理由
 
 ### 1. 意味論の保存と不健全な押し込みの排除
@@ -52,7 +54,7 @@ SQL における `ORDER BY ... LIMIT n` は「ソート順序における最小�
 Limit を Sort の下へそのまま押し込むと、式は $\text{Sort}(\text{Limit}_n(X))$ となり、「入力関係 $X$ から任意の $n$ 行を取り出してソートする」という別の意味になります。この不正なプランは計算量が小さく、コストモデルに選ばれやすいため、生成してはいけません。本 Rule は下位へ押し込むのではなく、整列後の上位 $n$ 件だけを取り出す $\text{TopN}$ へ融合します。
 
 ### 2. OFFSET の分離性
-$\text{OFFSET } m$ は「ソート順序確定後の先頭 $m$ 行をスキップする」操作であり、ソート前に入力タプルをスキップすることは不可能です。現行の $\text{TopN}$ 物理実装（優先度付きキューによる $k$-選択）はオフセットを含まない先頭 $n$ 行の抽出に特化しているため、`offset != 0` の場合は本 Rule の発火を抑止し、ソート後のストリームに対する明示的な `Limit` 演算子として維持します。
+$\text{OFFSET } m$ はソート後に適用する必要があり、ソート前の入力行を先に捨てることはできません。現行 Rule は offset 0 の `TopN` のみを生成するため、`offset != 0` では発火を抑止し、ソート後のストリームに対する明示的な `Limit` として維持します。物理 `TopNPlan` 自体は offset を保持できますが、この論理 Rule はまだ offset 付き `TopN` を生成しません。
 
 ## 実装の詳細
 
@@ -68,6 +70,7 @@ $\text{OFFSET } m$ は「ソート順序確定後の先頭 $m$ 行をスキッ�
                                   .sort_nulls_first = sort.sort_nulls_first,
                                   .limit_count = expression.limit_count,
                                   .limit_offset = 0,
+                                  .with_ties = expression.with_ties,
                                   .output_schema = sort.output_schema});
             return;
 ```
@@ -87,7 +90,7 @@ $\text{OFFSET } m$ は「ソート順序確定後の先頭 $m$ 行をスキッ�
 
 ## 検証テスト
 
-`plan/cascades_test_part3.cpp` にて以下の動作が検証されています。
+`plan/cascades_test_part3.cpp` では OFFSET がある場合の不発火のみを検証しています。`Limit(Sort(X))` から `TopN(X)` を生成する成功ケースはこのテストでは検証していません。
 
 - `CascadesTest.LimitPushThroughSortKeepsOffsetOnTop`:
   `OFFSET > 0` を含むクエリにおいて、誤った下位押し込みが発生せず、ソート後に Limit 演算子が保持されることを確認します。

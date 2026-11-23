@@ -123,7 +123,13 @@ size_t ScaleCount(size_t count, double multiplier) {
     return 0;
   }
   const long double scaled = static_cast<long double>(count) * multiplier;
-  if (scaled >= static_cast<long double>(std::numeric_limits<size_t>::max())) {
+  // llround() returns long long: feeding it a value above LLONG_MAX (which a
+  // 64-bit size_t permits) is undefined behaviour.  Clamp to the same
+  // saturating result before rounding, while still honouring a narrower
+  // size_t limit on platforms where one exists.
+  if (scaled >= static_cast<long double>(std::numeric_limits<size_t>::max()) ||
+      scaled >=
+          static_cast<long double>(std::numeric_limits<long long>::max())) {
     return std::numeric_limits<size_t>::max();
   }
   return static_cast<size_t>(std::llround(scaled));
@@ -282,8 +288,16 @@ class ColumnCollector {
                        : observed + ((f1 * (f1 - 1.0)) / 2.0);
       }
     }
-    const double capped = std::clamp(estimate, static_cast<double>(runs.size()),
-                                     static_cast<double>(non_null_count_));
+    const long double capped = std::clamp(
+        static_cast<long double>(estimate),
+        static_cast<long double>(runs.size()),
+        static_cast<long double>(non_null_count_));
+    const auto llround_max =
+        static_cast<size_t>(std::numeric_limits<long long>::max());
+    if (capped >=
+        static_cast<long double>(std::numeric_limits<long long>::max())) {
+      return std::min(non_null_count_, llround_max);
+    }
     return static_cast<size_t>(std::llround(capped));
   }
 
@@ -1183,7 +1197,7 @@ ColumnStats ColumnStats::FromRawParts(
   return stats;
 }
 
-TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
+TableStatistics::TableStatistics(const Schema& schema)  {
   stats_->reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     stats_->emplace_back(schema.GetColumn(i).Type());
@@ -1261,16 +1275,24 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     collectors.emplace_back(schema.GetColumn(i).Type());
   }
 
-  // Collect into locals first: a row that trips the type-mismatch CHECK
-  // aborts the process anyway, but any other error keeps the previous
-  // statistics intact instead of half-clearing them.
+  // Collect into locals first so any malformed row leaves the previous
+  // statistics intact instead of publishing a partial rebuild.
   size_t scanned_rows = 0;
   Iterator iterator = target.BeginFullScan(txn);
   for (; iterator.IsValid(); ++iterator) {
     const Row& row = *iterator;
     if (row.Count() != collectors.size()) {
+      // Collectors are locals; nothing is committed to stats_/row_count_
+      // until every row has been scanned successfully below, so this early
+      // return leaves the previous statistics completely intact.
       return StatusError(StatusCode::kCorrupt,
                          "row column count does not match table schema");
+    }
+    for (size_t i = 0; i < collectors.size(); ++i) {
+      if (!row[i].IsNull() && row[i].type != schema.GetColumn(i).Type()) {
+        return StatusError(StatusCode::kCorrupt,
+                           "row value type does not match table schema");
+      }
     }
     ++scanned_rows;
     for (size_t i = 0; i < collectors.size(); ++i) {
@@ -1670,7 +1692,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
 std::ostream& operator<<(std::ostream& out, const ColumnStats& stats) {
   // T2112: the old render printed the raw ValueType integer and three
   // counters, dropping exactly the fields the optimizer judges with:
-  // Unmeasured() (both counters zero means "never measured", NOT "empty"),
+  // Unmeasured() (both counters zero means "never measured"; an all-NULL
+  // column has a nonzero null count and is measured),
   // correlation / clustering, and the boundary / most-common value lists.
   out << "Type: " << ValueTypeToString(stats.type_);
   if (stats.Unmeasured()) {
@@ -1784,6 +1807,11 @@ void StreamingStatsCollector::AddVarChar(slot_t col, std::string_view val) {
         val.size() > kStoredStringPrefixLength
             ? val.substr(0, kStoredStringPrefixLength)
             : val;
+    // The streaming path sees raw TLCS bytes with no Value tag, unlike
+    // AddRow()->ColumnCollector::Add(), which calls CompactValue and may carry
+    // an existing collation over the truncation.  There is no column-level
+    // collation in Schema to recover here, so a binary VARCHAR is the only
+    // faithful representation of these bytes.
     impl_->collectors[col].Add(Value(std::string(prefix)));
   }
 }

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <cstdlib>
+#include <limits>
 #include <ostream>
 #include <queue>
 #include <utility>
@@ -58,30 +60,143 @@ Status TopNExecutor::Materialize() {
   };
   size_t sequence = 0;
   if (with_ties_) {
-    DataChunk chunk;
-    while (source_->NextBatch(&chunk) != 0) {
-      for (size_t i = 0; i < chunk.Size(); ++i) {
-        ++input_rows_;
-        Candidate candidate{.row = chunk.RowAt(i),
-                            .position = chunk.PositionAt(i),
-                            .keys = {},
-                            .sequence = sequence++};
-        candidate.keys.reserve(keys_.size());
-        for (const Key& key : keys_) {
-          StatusOr<Value> key_value =
-              key.expression->TryEvaluate(candidate.row, schema_);
-          if (!key_value.HasValue()) {
-            const Status key_error = key_value.GetStatus();
-            FailWith(key_error);
-            return key_error;
+    // Lean proof: lean/TinylambOpt/OuterFetchTies.lean
+    // (sql_outer_fetch_ties_sound) Stream WITH TIES using a bounded heap of
+    // size `capacity = offset + limit` plus `boundary_ties` holding rows equal
+    // on sort keys to `heap.top()`.
+    const char* disable_ties = std::getenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+    const bool use_streaming_ties =
+        (disable_ties == nullptr || disable_ties[0] == '\0' ||
+         disable_ties[0] == '0') &&
+        !keys_.empty() && capacity < std::numeric_limits<size_t>::max();
+    if (use_streaming_ties) {
+      auto key_compare = [&orders](const Candidate& left,
+                                   const Candidate& right) {
+        for (size_t i = 0; i < left.keys.size(); ++i) {
+          const int cmp = orders[i].Compare(left.keys[i], right.keys[i]);
+          if (cmp != 0) {
+            return cmp;
           }
-          candidate.keys.push_back(key_value.MoveValue());
         }
-        rows_.push_back(std::move(candidate));
+        return 0;
+      };
+      std::vector<size_t> ties_direct_cols;
+      ties_direct_cols.reserve(keys_.size());
+      for (const Key& key : keys_) {
+        if (key.expression->Type() != TypeTag::kColumnValue) {
+          break;
+        }
+        const int col_offset =
+            schema_.Offset(key.expression->AsColumnValue().GetColumnName());
+        if (col_offset < 0) {
+          break;
+        }
+        ties_direct_cols.push_back(static_cast<size_t>(col_offset));
       }
+      const bool use_direct = ties_direct_cols.size() == keys_.size();
+
+      std::priority_queue<Candidate, std::vector<Candidate>,
+                          decltype(worse_first)>
+          ties_heap(worse_first);
+      std::vector<Candidate> boundary_ties;
+      Candidate probe;
+      probe.keys.reserve(keys_.size());
+
+      DataChunk chunk;
+      while (source_->NextBatch(&chunk) != 0) {
+        for (size_t i = 0; i < chunk.Size(); ++i) {
+          ++input_rows_;
+          probe.keys.clear();
+          probe.sequence = sequence++;
+          if (use_direct) {
+            for (size_t k = 0; k < keys_.size(); ++k) {
+              probe.keys.push_back(
+                  chunk.ColumnAt(ties_direct_cols[k]).ValueAt(i));
+            }
+          } else {
+            const Row row = chunk.RowAt(i);
+            for (const Key& key : keys_) {
+              StatusOr<Value> key_value =
+                  key.expression->TryEvaluate(row, schema_);
+              if (!key_value.HasValue()) {
+                const Status key_error = key_value.GetStatus();
+                FailWith(key_error);
+                return key_error;
+              }
+              probe.keys.push_back(key_value.MoveValue());
+            }
+          }
+          RETURN_IF_FAIL(ObserveSortKeys(orders, probe.keys));
+          if (ties_heap.size() < capacity) {
+            probe.row = chunk.RowAt(i);
+            probe.position = chunk.PositionAt(i);
+            ties_heap.push(std::move(probe));
+            probe = Candidate{};
+            probe.keys.reserve(keys_.size());
+          } else {
+            const int cmp = key_compare(probe, ties_heap.top());
+            if (cmp < 0) {
+              probe.row = chunk.RowAt(i);
+              probe.position = chunk.PositionAt(i);
+              Candidate evicted =
+                  std::move(const_cast<Candidate&>(ties_heap.top()));
+              ties_heap.pop();
+              ties_heap.push(std::move(probe));
+              probe = Candidate{};
+              probe.keys.reserve(keys_.size());
+              if (key_compare(evicted, ties_heap.top()) == 0) {
+                boundary_ties.push_back(std::move(evicted));
+              } else {
+                boundary_ties.clear();
+              }
+            } else if (cmp == 0) {
+              probe.row = chunk.RowAt(i);
+              probe.position = chunk.PositionAt(i);
+              boundary_ties.push_back(std::move(probe));
+              probe = Candidate{};
+              probe.keys.reserve(keys_.size());
+            }
+          }
+        }
+      }
+      FailWithChildOf(*source_);
+      rows_.reserve(ties_heap.size() + boundary_ties.size());
+      while (!ties_heap.empty()) {
+        rows_.push_back(std::move(const_cast<Candidate&>(ties_heap.top())));
+        ties_heap.pop();
+      }
+      for (Candidate& tie : boundary_ties) {
+        rows_.push_back(std::move(tie));
+      }
+      std::ranges::sort(rows_, precedes);
+    } else {
+      DataChunk chunk;
+      while (source_->NextBatch(&chunk) != 0) {
+        rows_.reserve(rows_.size() + chunk.Size());
+        for (size_t i = 0; i < chunk.Size(); ++i) {
+          ++input_rows_;
+          Candidate candidate{.row = chunk.RowAt(i),
+                              .position = chunk.PositionAt(i),
+                              .keys = {},
+                              .sequence = sequence++};
+          candidate.keys.reserve(keys_.size());
+          for (const Key& key : keys_) {
+            StatusOr<Value> key_value =
+                key.expression->TryEvaluate(candidate.row, schema_);
+            if (!key_value.HasValue()) {
+              const Status key_error = key_value.GetStatus();
+              FailWith(key_error);
+              return key_error;
+            }
+            candidate.keys.push_back(key_value.MoveValue());
+          }
+          RETURN_IF_FAIL(ObserveSortKeys(orders, candidate.keys));
+          rows_.push_back(std::move(candidate));
+        }
+      }
+      FailWithChildOf(*source_);
+      std::ranges::sort(rows_, precedes);
     }
-    FailWithChildOf(*source_);
-    std::ranges::sort(rows_, precedes);
     output_index_ = std::min(offset_, rows_.size());
     output_end_ = output_index_;
     if (output_index_ < rows_.size()) {
@@ -496,6 +611,7 @@ Status TopNExecutor::Materialize() {
         for (size_t key = 0; key < keys_.size(); ++key) {
           candidate.keys[key] = chunk.ColumnAt(direct_columns[key]).ValueAt(i);
         }
+        RETURN_IF_FAIL(ObserveSortKeys(orders, candidate.keys));
         // Most rows lose to the boundary. Materialize their payload only
         // when admitted, and reuse key storage on every rejected row.
         if (heap.size() < capacity || precedes(candidate, heap.top())) {
@@ -529,6 +645,7 @@ Status TopNExecutor::Materialize() {
           }
           candidate.keys.push_back(key_value.MoveValue());
         }
+        RETURN_IF_FAIL(ObserveSortKeys(orders, candidate.keys));
         if (heap.size() < capacity) {
           heap.push(std::move(candidate));
         } else if (capacity != 0 && precedes(candidate, heap.top())) {

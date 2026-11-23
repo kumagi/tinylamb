@@ -3,12 +3,14 @@
 #define TINYLAMB_INTERVAL_EXPRESSION_HPP
 
 #include <cstdint>
+#include <cctype>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "expression/expression.hpp"
 #include "type/interval.hpp"
+#include "type/value.hpp"
 
 namespace tinylamb {
 
@@ -28,7 +30,7 @@ class IntervalExpression : public ExpressionBase {
       value_ = ExcShimUnwrap(IntervalValue::TryFromInteger(amount_, unit_),
                              "IntervalValue::TryFromInteger");
     }
-    text_ = value_.ToString();
+    cached_value_ = Value(value_.ToString()).WithInterval();
   }
   [[nodiscard]] TypeTag NodeKind() const override {
     return TypeTag::kIntervalExp;
@@ -59,7 +61,7 @@ class IntervalExpression : public ExpressionBase {
   std::string unit_;
   std::string raw_amount_;
   IntervalValue value_;
-  std::string text_;
+  Value cached_value_;
 };
 
 }  // namespace tinylamb

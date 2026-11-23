@@ -37,8 +37,7 @@ LIMIT の押し込みは ON 述語の評価回数を減らします。揮発性�
 次のとおりです。
 
 (1) 式が `kLimit` で子を 1 個持ち、`total_limit = count + offset > 0`。
-さらに順序要件のゲートがあり、順序付き Limit(`sort_ascending` /
-`sort_nulls_first` が非空)と `WITH TIES` は弾かれる。これは本 Rule が
+さらに順序要件のゲートがあり、順序付き Limit（`target_list`、`sort_ascending`、`sort_nulls_first` のいずれかが非空）と `WITH TIES` は弾かれる。これは本 Rule が
 生成する Limit が順序情報を引き継がないためで、順序付き Limit を
  JOIN 下へ押し込むと上位で復元される順序が失われる(D5 監査表)。
 
@@ -91,8 +90,7 @@ LIMIT の押し込みは ON 述語の評価回数を減らします。揮発性�
 (5) 派生グループ(`ojoin_limit_left:<total>` と `ojoin_limited_left`)が
 循環を作る形(自分自身・入力・左側そのもの)ならスキップします。
 
-発火しないケース: 右側キーの一意性が証明できない / ON 条件に等式が無い /
-join_type が LEFT 以外 / 左側が既に切られている、です。
+発火しないケースには、左右いずれかが単一リレーションでない、右側キーの一意性や参照包含を証明できない、ON に等式以外の連言が混在する、等式が無い、LEFT JOIN 以外、順序付きまたは WITH TIES、左側が既に切られている、派生 Group が循環する場合があります。
 
 ## 意味論的根拠と一意キー制約
 
@@ -115,7 +113,7 @@ LEFT OUTER JOIN は「左側の行を 1 行も落とさず、各行につきマ�
 **少なく**なり、意味が変わります。LEFT JOIN では非マッチ行も NULL 埋めで
 必ず 1 行出力されるため、この反例が成立せず、押し込みが許される — という
 対比です。この Rule は「LEFT に限定する」ことで、証明できない前提
-(referential integrity)を要求しない設計になっています。
+(referential integrity)を避ける設計ではありません。右側キーの一意性に加え、左側の非 NULL join key が右側 UNIQUE key に含まれることを `IsProvenOneToOne` で証明できる場合だけ発火します。
 
 一意性の証明材料は `LogicalProperties`(カタログの PK / UNIQUE 制約から
 派生されます。第 1 部 20 章)です。証明できない場合は発火しません。「証明
@@ -125,12 +123,16 @@ LEFT OUTER JOIN は「左側の行を 1 行も落とさず、各行につきマ�
 ## 実装の詳細
 
 右側結合キーの収集は、ON 条件を連言に分解し、等式の左右どちらかの辺が右側
-グループのリレーションに属する列であるものを集めます。
+グループのリレーションに属する列であるものを集めます。登録には
+`InsertColumnMatcherNames` を用います。
 
 ```cpp
             std::unordered_set<std::string> right_join_cols;
             const auto& right_rels = memo.Get(right_id).relations;
-            for (const auto& conjunct : SplitConjuncts(*ojoin.predicate)) {
+            const std::vector<Expression> conjuncts =
+                SplitConjuncts(*ojoin.predicate);
+            right_join_cols.reserve(conjuncts.size() * 2);
+            for (const auto& conjunct : conjuncts) {
               if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
                 continue;
               }
@@ -138,7 +140,28 @@ LEFT OUTER JOIN は「左側の行を 1 行も落とさず、各行につきマ�
               if (bin.Op() != BinaryOperation::kEquals) {
                 continue;
               }
+              if (bin.Left()->Type() == TypeTag::kColumnValue) {
+                const auto& col = bin.Left()->AsColumnValue().GetColumnName();
+                if (std::ranges::find(right_rels, col.schema) !=
+                    right_rels.end()) {
+                  InsertColumnMatcherNames(right_join_cols, col);
+                }
+              }
+              if (bin.Right()->Type() == TypeTag::kColumnValue) {
+                const auto& col = bin.Right()->AsColumnValue().GetColumnName();
+                if (std::ranges::find(right_rels, col.schema) !=
+                    right_rels.end()) {
+                  InsertColumnMatcherNames(right_join_cols, col);
+                }
+              }
+            }
 ```
+
+`InsertColumnMatcherNames` は修飾名 `schema.name` と非修飾名 `name` の
+**両方の綴り**を登録します（無修飾なら `name` のみ）。ON 等式に修飾名と
+非修飾名が混在しても一意キー判定へ渡す列名が正規化され、`IsUniqueOn` が
+同じ列を確実に認識できるためです。このヘルパー名を省くとガードの再実装が
+壊れます。
 
 集まった列に対して `IsUniqueOn` で一意性を確認したあと、左側 Limit と
 書き換えた LEFT JOIN を構築し、外側グループには元と同じ count/offset の

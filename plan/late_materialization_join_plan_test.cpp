@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <ranges>
 #include <sstream>
@@ -128,6 +129,11 @@ TEST_F(LateMaterializationPlanTest, RulePublishesLogicalPlanForWideSmallBuild) {
   dump << *plan;
   EXPECT_NE(dump.str().find("LMPLeft"), std::string::npos) << dump.str();
   EXPECT_NE(dump.str().find("LMPRight"), std::string::npos) << dump.str();
+  // Matching rows alone is not enough: the fallback branch below asserts the
+  // rule's absence, so this branch must assert its presence with the same
+  // operator name or a rule that never fires would pass both halves.
+  EXPECT_NE(dump.str().find("LateMaterializationJoin"), std::string::npos)
+      << dump.str();
   Executor executor = plan->EmitExecutor(*context_);
   const std::vector<Row> rows = Drain(executor);
   EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
@@ -137,7 +143,7 @@ TEST_F(LateMaterializationPlanTest, RulePublishesLogicalPlanForWideSmallBuild) {
     actual.emplace_back(row[0].value.int_value, row[1].value.int_value);
   }
   std::vector<std::pair<int64_t, int64_t>> expected;
-  expected.reserve(40 * 4);
+  expected.reserve(static_cast<size_type>(40 * 4));
   for (int64_t i = 0; i < 40; ++i) {
     for (int64_t key = 1; key <= 4; ++key) {
       if (i % 10 == key) {
@@ -260,7 +266,7 @@ TEST_F(LateMaterializationPlanTest, RuleRejectsRowPositionOuterAndArrayShapes) {
                           array_children, cascades::PhysicalProperties{},
                           array_context)
                   .empty());
-  array_statistics.txn_.Abort();
+  ASSERT_SUCCESS(array_statistics.txn_.Abort());
 }
 
 }  // namespace

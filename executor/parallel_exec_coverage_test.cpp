@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -21,9 +22,8 @@
 namespace tinylamb {
 namespace {
 
-// T996: this binary was an EXPECT_EQ(1,1) scaffold.  It now covers
-// ParallelAggregationExecutor directly: one independent per-worker state
-// plus a deterministic merge.  The merge contract that matters is that
+// This binary covers ParallelAggregationExecutor directly: one independent
+// per-worker state plus a deterministic merge.  The merge contract that matters is that
 // DISTINCT sets are merged by VALUE, so duplicates spanning morsels stay
 // correct for every team size -- exactly the path a per-shard "count of
 // partial counts" shortcut would break.
@@ -67,7 +67,7 @@ TEST(ParallelExecCoverageTest, DistinctAndSumMergesAreTeamSizeInvariant) {
   Schema schema("nums", {Column("k", ValueType::kInt64),
                          Column("v", ValueType::kDouble)});
   constexpr size_t kRows = 2048;
-  // sum over i%7 for 2048 rows: 2048 = 292*7 + 4 full cycles
+  // sum over i%7 for 2048 rows: 2048 = 292*7 + 4 remaining rows
   int64_t expected_sum_k = 0;
   for (size_t i = 0; i < kRows; ++i) {
     expected_sum_k += static_cast<int64_t>(i % 7);
@@ -77,7 +77,7 @@ TEST(ParallelExecCoverageTest, DistinctAndSumMergesAreTeamSizeInvariant) {
     expected_sum_distinct_v += static_cast<double>(d);
   }
 
-  QueryMemoryCharge unrelated_reservation(1024 * 1024);
+  QueryMemoryCharge unrelated_reservation(static_cast<size_t>(1024 * 1024));
   const size_t expected_charge = QueryMemoryBudget::Global().Used();
   for (const size_t workers : {size_t{1}, size_t{4}, size_t{16}}) {
     ParallelAggregationExecutor executor(std::make_shared<NumberSource>(kRows),
@@ -124,6 +124,39 @@ TEST(ParallelExecCoverageTest, DoubleSumDetectsOverflowAndKeepsRealInfinity) {
     ASSERT_EQ(out.Count(), 1U);
     EXPECT_EQ(out[0], Value(infinity));
   }
+}
+
+TEST(ParallelExecCoverageTest, DoubleSumContinuesAfterIntegerBatch) {
+  class MixedBatchSource final : public ExecutorBase {
+   public:
+    size_t NextBatch(DataChunk* output, size_t max_rows) override {
+      output->Reset();
+      if (max_rows == 0 || offset_ == values_.size()) {
+        return 0;
+      }
+      const Value& value = values_[offset_++];
+      output->Append(Row({value}));
+      return 1;
+    }
+    void Dump(std::ostream& /*o*/, int /*indent*/) const override {}
+
+   private:
+    const std::vector<Value> values_{Value(5), Value(0.5), Value(2)};
+    size_t offset_{0};
+  };
+
+  const Schema schema("numbers", {Column("v", ValueType::kDouble)});
+  const Expression v = ColumnValueExp("v");
+  const Expression doubled = BinaryExpressionExp(v, BinaryOperation::kAdd, v);
+  ParallelAggregationExecutor executor(
+      std::make_shared<MixedBatchSource>(), schema,
+      {{"sum", AggregateExpressionExp(AggregationType::kSum, v)},
+       {"sum_twice", AggregateExpressionExp(AggregationType::kSum, doubled)}},
+      1);
+  Row out;
+  ASSERT_TRUE(executor.Next(&out, nullptr));
+  EXPECT_EQ(out, Row({Value(7.5), Value(15.0)}));
+  EXPECT_EQ(executor.GetStatus(), Status::kSuccess);
 }
 
 TEST(ParallelExecCoverageTest, EmptyInputStillEmitsOneRow) {

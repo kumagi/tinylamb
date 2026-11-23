@@ -117,7 +117,9 @@ bool EventPoller::Open() {
   if (poll_fd_ >= 0) {
     return true;
   }
-  poll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+  do {
+    poll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+  } while (poll_fd_ < 0 && errno == EINTR);
   return poll_fd_ >= 0;
 }
 
@@ -145,6 +147,10 @@ bool EventPoller::Remove(SocketFd fd) {
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
 int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
+  if (out.empty()) {
+    errno = EINVAL;
+    return -1;
+  }
   std::array<epoll_event, kMaxBatch> events{};
   const int capacity = static_cast<int>(std::min(out.size(), events.size()));
   const int count = ::epoll_wait(poll_fd_, events.data(), capacity, timeout_ms);
@@ -171,10 +177,8 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
-  // Publish -1 before the close so a concurrent Wake() either skips or
-  // writes an fd that is still open or just closed (EBADF) — never a torn
-  // fd number. Callers must still ensure every Wake() source is joined
-  // before the Waker dies (the server stops its read workers first).
+  // The caller has joined all Wake() sources. Clear the descriptor before
+  // releasing it so subsequent Wake() calls on the closed object are no-ops.
   write_fd_.store(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) {
     ::close(read_fd_);
@@ -216,7 +220,7 @@ bool EventPoller::Open() {
 
 bool EventPoller::Add(SocketFd fd, uint32_t interest) {
   std::scoped_lock lock(mu_);
-  if (poll_fd_ < 0 || fd < 0) {
+  if (poll_fd_ < 0 || !IsValidSocketFd(fd)) {
     errno = EBADF;
     return false;
   }
@@ -253,6 +257,9 @@ bool EventPoller::Remove(SocketFd fd) {
     return false;
   }
   interest_.erase(found);
+  // Match Add/Modify: a waiter blocked in Wait must re-evaluate the cached
+  // WSAPOLLFD set as soon as a descriptor disappears, not at the next timeout.
+  interest_changed_.notify_all();
   return true;
 }
 
@@ -264,19 +271,19 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(std::max(0, timeout_ms));
   // WSAPoll blocks inside the kernel, so a condition_variable notification
-  // from Add/Modify/Remove cannot wake a thread already polling. For an
-  // infinite wait, wake periodically and rebuild the cached WSAPOLLFD array
-  // so interest changes become visible instead of hanging forever.
+  // from Add/Modify/Remove cannot wake a thread already inside PollSockets.
+  // With registered descriptors the cached WSAPOLLFD array is therefore
+  // refreshed at least every 250 ms (a WSAPoll-only limitation, unlike the
+  // epoll/kqueue paths). With an empty interest set there is nothing to poll,
+  // so block on the condition variable until a registration or Close arrives
+  // instead of waking on every refresh tick.
   const bool infinite_wait = timeout_ms < 0;
   for (;;) {
     {
       std::unique_lock lock(mu_);
       const auto ready = [&] { return poll_fd_ < 0 || !interest_.empty(); };
       if (infinite_wait) {
-        interest_changed_.wait_for(lock, std::chrono::milliseconds(250), ready);
-        if (!ready()) {
-          continue;
-        }
+        interest_changed_.wait(lock, ready);
       } else if (!interest_changed_.wait_until(lock, deadline, ready)) {
         return 0;
       }
@@ -310,8 +317,10 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
       }
     }
     if (timeout_ms >= 0) {
+      // Round the remaining time down: rounding up can push each iteration
+      // past the caller's deadline when Wait is retried after a wake-up.
       timeout_ms = static_cast<int>(
-          std::max<int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
+          std::max<int64_t>(0, std::chrono::floor<std::chrono::milliseconds>(
                                    deadline - std::chrono::steady_clock::now())
                                    .count()));
     }
@@ -368,6 +377,17 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
       if ((rev & POLLOUT) != 0) {
         bits |= kPollWritable;
       }
+      if ((rev & POLLPRI) != 0) {
+        // Out-of-band/urgent data is still something the owner must read.
+        bits |= kPollReadable;
+      }
+      if (bits == 0U) {
+        // WSAPoll reported activity but only with bits this layer does not
+        // translate. Surface it as kPollError instead of dropping the entry:
+        // returning 0 would make the caller treat a live descriptor as a
+        // timeout, and the level-triggered condition would repeat forever.
+        bits |= kPollError;
+      }
       if (bits != 0U) {
         out[static_cast<size_t>(written++)] = {.fd = fd, .events = bits};
       }
@@ -379,7 +399,7 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
 Waker::~Waker() { Close(); }
 
 bool Waker::Open() {
-  if (read_fd_ >= 0) return true;
+  if (IsValidSocketFd(read_fd_)) return true;
   std::array<SocketFd, 2> fds{-1, -1};
   if (OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}) != 0) {
     return false;
@@ -390,17 +410,16 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
-  // Exchange first so a concurrent Wake() never reads a torn fd; see the
-  // Linux implementation for the full ordering rationale.
+  // All Wake() sources have joined before the descriptor is released.
   const SocketFd write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
-  if (read_fd_ >= 0) CloseSocket(read_fd_);
-  if (write_fd >= 0) CloseSocket(write_fd);
+  if (IsValidSocketFd(read_fd_)) CloseSocket(read_fd_);
+  if (IsValidSocketFd(write_fd)) CloseSocket(write_fd);
   read_fd_ = -1;
 }
 
 void Waker::Wake() const {
   const SocketFd fd = write_fd_.load(std::memory_order_relaxed);
-  if (fd < 0) return;
+  if (!IsValidSocketFd(fd)) return;
   const char one = 1;
   ssize_t written = 0;
   do {
@@ -409,7 +428,7 @@ void Waker::Wake() const {
 }
 
 void Waker::Drain() const {
-  if (read_fd_ < 0) return;
+  if (!IsValidSocketFd(read_fd_)) return;
   std::array<char, 256> buffer{};
   for (;;) {
     const ssize_t got = RecvSocket(read_fd_, buffer.data(), buffer.size());
@@ -461,7 +480,15 @@ bool EventPoller::Open() {
   poll_fd_ = ::kqueue();
   if (poll_fd_ < 0) return false;
   const int flags = ::fcntl(poll_fd_, F_GETFD);
-  if (flags >= 0) (void)::fcntl(poll_fd_, F_SETFD, flags | FD_CLOEXEC);
+  if (flags < 0 || ::fcntl(poll_fd_, F_SETFD, flags | FD_CLOEXEC) < 0) {
+    // A kqueue fd without FD_CLOEXEC leaks into RunProcess children, so an
+    // fcntl failure must not be silently treated as a successful Open().
+    const int saved_errno = errno;
+    ::close(poll_fd_);
+    poll_fd_ = -1;
+    errno = saved_errno;
+    return false;
+  }
   return true;
 }
 
@@ -501,6 +528,10 @@ bool EventPoller::Remove(SocketFd fd) {
 }
 
 int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
+  if (out.empty()) {
+    errno = EINVAL;
+    return -1;
+  }
   std::array<struct kevent, kMaxBatch> events{};
   const int capacity = static_cast<int>(std::min(out.size(), events.size()));
   timespec timeout{};
@@ -518,9 +549,15 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
     const struct kevent& event = events[static_cast<size_t>(i)];
     const int fd = static_cast<int>(event.ident);
     uint32_t bits = 0;
+    int error = 0;
     if ((event.flags & EV_ERROR) != 0) {
       bits |= kPollError;
-    } else if (event.filter == EVFILT_READ) {
+      // kqueue puts the failing syscall's errno in data, not in fflags.
+      error = static_cast<int>(event.data);
+    }
+    // EV_ERROR events keep their original filter. Keep the interest bit as
+    // well, as FromEpoll() independently ORs EPOLLIN/EPOLLOUT and EPOLLERR.
+    if (event.filter == EVFILT_READ) {
       bits |= kPollReadable;
       if ((event.flags & EV_EOF) != 0) {
         bits |= kPollPeerClosed;
@@ -535,16 +572,20 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
     }
     // Merge the read and write filters of one descriptor into one result,
     // as epoll does; callers may close the fd while handling the first.
-    bool merged = false;
+    int merged_at = -1;
     for (int j = 0; j < written; ++j) {
       if (out[static_cast<size_t>(j)].fd == fd) {
-        out[static_cast<size_t>(j)].events |= bits;
-        merged = true;
+        merged_at = j;
         break;
       }
     }
-    if (!merged) {
-      out[static_cast<size_t>(written++)] = {.fd = fd, .events = bits};
+    if (merged_at >= 0) {
+      PollResult& result = out[static_cast<size_t>(merged_at)];
+      result.events |= bits;
+      if (error != 0 && result.error == 0) result.error = error;
+    } else {
+      out[static_cast<size_t>(written++)] = {
+          .fd = fd, .events = bits, .error = error};
     }
   }
   return written;
@@ -564,8 +605,7 @@ bool Waker::Open() {
 }
 
 void Waker::Close() {
-  // Exchange first so a concurrent Wake() never reads a torn fd; see the
-  // Linux implementation for the full ordering rationale.
+  // All Wake() sources have joined before the descriptor is released.
   const SocketFd write_fd = write_fd_.exchange(-1, std::memory_order_relaxed);
   if (read_fd_ >= 0) ::close(read_fd_);
   if (write_fd >= 0) ::close(write_fd);

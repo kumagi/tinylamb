@@ -97,13 +97,15 @@ class WindowExecutor : public ExecutorBase {
   // The PARTITION BY list every call shares, or nullptr when the calls
   // disagree (then the input cannot be split without cutting a partition).
   const std::vector<Expression>* SharedPartitionKey() const;
-  // Internal-only inference helper for the window calls: recover the input
-  // schema by stripping the per-call suffix columns from the output schema.
-  // Not part of the public API -- callers must go through NextChunk(), which
-  // sets up rows_/outputs_ consistently before this is used (see window.cpp
-  // for the underflow guard).
+  // Internal-only inference helper: recover the input schema by stripping the
+  // per-call suffix columns from schema_. Pure over schema_/outputs_ (no rows_
+  // state), so ComputeColumns(), DrainIntoSpills() and NextChunk() may call it
+  // directly; the narrow-schema underflow guard lives in window.cpp.
   [[nodiscard]] StatusOr<Schema> InputSchema() const;
 
+  // Borrowed, not owned: the context must outlive this executor (and anything
+  // it is shared/moved into) because NextBatch() evaluates window calls
+  // through it. The child, by contrast, is owned via its shared_ptr.
   TransactionContext& context_;
   Executor child_;
   Schema schema_;

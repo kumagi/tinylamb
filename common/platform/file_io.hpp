@@ -40,12 +40,21 @@ struct OpenFlags {
 
 // Opens `path` in binary mode with close-on-exec (non-inheritable handle on
 // Windows) and full POSIX-like sharing (read/write/delete on Windows).
+// POSIX applies `mode` and the process umask on creation. Windows uses the
+// inherited filesystem ACL and the caller's Windows access token.
 // Returns a file descriptor >= 0 on success, or -1 with errno set on failure.
 int OpenFile(const std::filesystem::path& path, OpenFlags flags,
              int mode = 0666);
 
 // Closes a descriptor returned by OpenFile / OpenUnlinkedTempFile.
 int CloseFile(int fd);
+
+// Best-effort close for cleanup paths (e.g. destructors) that cannot report an
+// error to a caller. On POSIX this retries on EINTR; on Windows it additionally
+// closes the underlying OS handle when _close() fails, since the CRT may leave
+// the handle open in that case. The descriptor/handle is released on return
+// regardless; the return value is informational only.
+void ReleaseFile(int fd);
 
 // Opens a writable, unlinked temporary file whose backing blocks are reclaimed
 // automatically on CloseFile or process exit. If `dir` is empty, selects
@@ -80,6 +89,8 @@ ssize_t Write(int fd, const void* buf, size_t count);
 
 // Positional read/write without relying on the caller's stream state.
 // Returns bytes transferred (0 at EOF for Pread), or -1 with errno set.
+// Windows synchronous handles may advance the underlying sequential file
+// pointer. Concurrent positional calls still use their own absolute offsets.
 ssize_t Pread(int fd, void* buf, size_t count, int64_t offset);
 ssize_t Pwrite(int fd, const void* buf, size_t count, int64_t offset);
 

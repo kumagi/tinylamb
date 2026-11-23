@@ -70,7 +70,7 @@ graph TD
 ```
 
 - **推定出力行数（`estimated_rows`）**: 入力行数 `children[0].estimated_rows` をそのまま引き継ぎます。
-- **局所コスト（`local_cost`）**: パーティション内ソートを前提とし、外部ソート相当の $N \log_2 N$（`rows * std::log2(std::max(2.0, rows))`）を見積もります。`std::max(2.0, rows)` は極小行数におけるゼロ除算や負数コストを防止する下限ガードです。
+- **局所コスト（`local_cost`）**: パーティション内ソートを前提とし、外部ソート相当の $N \log_2 N$（`rows * std::log2(std::max(2.0, rows))`）を見積もります。`std::max(2.0, rows)` は対数の定義域を保ち、極小行数でもコストを非負にする下限ガードです。
 
 順序プロパティについて、buffered 形の `WindowPlan::IsOrderedBy` は子の判定結果をそのまま返します。パーティション分割スピル形はパーティションごとに出力順が変わるため `IsOrderedBy` は `false` を返します。
 

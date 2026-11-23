@@ -58,6 +58,11 @@ class Column {
     type_ = type;
     if (type_ != ValueType::kVarChar) {
       text_domain_ = TextDomain::kUnspecified;
+      interval_ = false;
+    }
+    if (type_ != ValueType::kInt64) {
+      unsigned_ = false;
+      integer_bits_ = 64;
     }
   }
   [[nodiscard]] TextDomain GetTextDomain() const { return text_domain_; }
@@ -69,8 +74,8 @@ class Column {
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   [[nodiscard]] bool IsInterval() const { return interval_; }
   void SetInterval(bool value) {
-    interval_ = value;
-    if (value) {
+    interval_ = value && type_ == ValueType::kVarChar;
+    if (interval_) {
       text_domain_ = TextDomain::kUnspecified;
     }
   }
@@ -79,10 +84,13 @@ class Column {
   void SetIntegerBits(uint8_t bits) {
     // Only 8/16/32/64 are representable in the 2-bit serializer; any other
     // width normalizes to the default 64-bit domain.
-    integer_bits_ = (bits == 8 || bits == 16 || bits == 32) ? bits : 64;
+    integer_bits_ =
+        type_ == ValueType::kInt64 && (bits == 8 || bits == 16 || bits == 32)
+            ? bits
+            : 64;
   }
   [[nodiscard]] bool IntegerValueFits(const Value& value) const;
-  void SetUnsigned(bool value) { unsigned_ = value; }
+  void SetUnsigned(bool value) { unsigned_ = value && type_ == ValueType::kInt64; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
   [[nodiscard]] AccessHint Hint() const { return hint_; }
   void SetHint(AccessHint h) { hint_ = h; }

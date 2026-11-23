@@ -29,6 +29,7 @@
 #include "common/constants.hpp"
 #include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
+#include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/sorted_run/sorted_run.hpp"
@@ -93,6 +94,10 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
   for (size_t i = 0; i < mask_len; ++i) {
     bytes[i] ^= static_cast<char>(data[i]);
   }
+  // Re-sign the checksums after mutating the payload: otherwise every nonzero
+  // mutation is rejected by ValidateChunkBytes and the early return below
+  // makes the Read/PointLookup/LowerBound hammer path unreachable.
+  fuzz::ResignChunkCrc(bytes);
   PaxChunk bad(bytes, kGood.GetFooter());
 
   const Status v1 = PaxChunk::ValidateChunkBytes(bytes);

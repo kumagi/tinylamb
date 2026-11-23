@@ -43,32 +43,18 @@ abbrev Byte := Nat
 
 /-- Byte width of a UTF-8 lead byte (`Utf8SequenceLength` in C++). -/
 def utf8Len (b : Byte) : Nat :=
-  if b < 128 then 1 else if b < 224 then 2 else if b < 240 then 3 else 4
+  if b < 128 then 1 else if b < 194 then 1 else if b < 224 then 2
+  else if b < 240 then 3 else if b ≤ 244 then 4 else 1
 
 theorem utf8Len_pos (b : Byte) : 0 < utf8Len b := by
   unfold utf8Len
-  split
-  · omega
-  split
-  · omega
-  split
-  · omega
-  omega
+  grind
 
 theorem ascii_width_one (b : Byte) (h : b < 128) : utf8Len b = 1 := by
   simp [utf8Len, h]
 
-/-- A lead byte outside ASCII is never a one-byte character: consuming only
-    its first byte would resume in the middle of a UTF-8 sequence. -/
-theorem nonascii_width_gt_one (b : Nat) (h : 128 ≤ b) : 1 < utf8Len b := by
-  by_cases h1 : b < 128
-  · exfalso
-    omega
-  · by_cases h2 : b < 224
-    · simp [utf8Len, h1, h2]
-    · by_cases h3 : b < 240
-      · simp [utf8Len, h1, h2, h3]
-      · simp [utf8Len, h1, h2, h3]
+theorem nonascii_width_gt_one (b : Nat) (lo : 194 ≤ b) (hi : b ≤ 244) :
+    1 < utf8Len b := by unfold utf8Len; grind
 
 /-- Width of the first character of `b :: bs`, clamped to the bytes present. -/
 def charWidth (b : Byte) (bs : List Byte) : Nat := min (utf8Len b) (bs.length + 1)
@@ -129,7 +115,7 @@ def ByteLikeRef (v : List Byte) (p : List Tok) : Bool :=
   match p with
   | [] => v.isEmpty
   | Tok.percent :: rest =>
-      ByteLikeRef v rest || (match v with | [] => false | _ :: vs => ByteLikeRef vs (Tok.percent :: rest))
+      ByteLikeRef v rest || (match v with | [] => false | b :: bs => ByteLikeRef (bs.drop (charWidth b bs - 1)) (Tok.percent :: rest))
   | Tok.under :: rest => match v with
       | [] => false
       | b :: bs => ByteLikeRef ((b :: bs).drop (charWidth b bs)) rest
@@ -139,7 +125,7 @@ decreasing_by
   all_goals
     simp only [List.length_cons]
     rw [Prod.lex_def]
-    simp
+    simp_all [List.length_drop] <;> omega
 
 /-- Reference matcher over decoded characters: `_` consumes one character. -/
 def CharLike (v : List (List Byte)) (p : List Tok) : Bool :=
@@ -186,7 +172,8 @@ theorem byteRef_eq_fast (v : List Byte) (p : List Tok) (hv : ∀ b ∈ v, b < 12
               have hbs : ∀ x ∈ bs, x < 128 := by intro x hx; exact hv x (by simp [hx])
               have hz_full := ihp (b :: bs) hv
               have hpct := ihv hbs
-              simp [ByteLikeRef, ByteLikeFast, hz_full, hpct]
+              have hb : b < 128 := hv b (by simp)
+              simp [ByteLikeRef, ByteLikeFast, hz_full, hpct, charWidth, utf8Len, hb]
 
 /-- On an ASCII region the fast path and the character-level reference agree;
     in particular a fast-path `_` consumes exactly the one character `[b]`. -/
@@ -254,5 +241,21 @@ theorem like_underscore_sound (v : List Byte) (p : List Tok) (hv : ∀ b ∈ v, 
     ByteLikeFast v p = CharLike (splitUtf8 v) p ∧
     OptimizedLike v p = ByteLikeRef v p :=
   ⟨(byteRef_eq_fast v p hv).symm, fast_eq_char v p hv, optimized_preserves_result v p⟩
+
+/-- Escape processing shared by both paths. A final backslash is literal,
+    matching EscapedLikeMatch's lookahead rule. -/
+def tokenize : List Byte → List Tok
+  | 92 :: c :: cs => .lit c :: tokenize cs
+  | 37 :: cs => .percent :: tokenize cs
+  | 95 :: cs => .under :: tokenize cs
+  | c :: cs => .lit c :: tokenize cs
+  | [] => []
+
+theorem raw_like_fast_sound (row pattern : List Byte) :
+    OptimizedLike row (tokenize pattern) = ByteLikeRef row (tokenize pattern) :=
+  optimized_preserves_result ..
+
+example : tokenize [92,37,92,95,92] = [.lit 37,.lit 95,.lit 92] ∧
+    utf8Len 128 = 1 ∧ utf8Len 245 = 1 := by decide
 
 end TinylambOpt.LikeUnderscore

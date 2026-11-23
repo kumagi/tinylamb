@@ -30,7 +30,9 @@ set(CMAKE_C_COMPILER clang)
 set(CMAKE_CXX_COMPILER clang++)
 
 set(_tinylamb_win_triple x86_64-w64-windows-gnu)
-set(_tinylamb_win_flags "--target=${_tinylamb_win_triple}")
+# -D_UCRT makes mingw-w64 headers import the Universal CRT (ucrt) instead of
+# the legacy msvcrt; without it a UCRT64 sysroot build links msvcrt.dll.
+set(_tinylamb_win_flags "--target=${_tinylamb_win_triple} -D_UCRT")
 set(CMAKE_C_FLAGS_INIT "${_tinylamb_win_flags}")
 set(CMAKE_CXX_FLAGS_INIT "${_tinylamb_win_flags}")
 # Link the runtime consistently: the previous -Wl,-Bstatic -lwinpthread

@@ -32,9 +32,12 @@ graph TD
 
 ```cpp
     // merge_adjacent_windows: Fuse Window_1(Window_2(X)) into a single
-    // Window(X) when both windows have identical PARTITION BY and sort
-    // specifications, and Window_1 does not reference Window_2's outputs.
+    // Window(X) when both windows have identical PARTITION BY and Window_1
+    // does not reference Window_2's outputs. ORDER BY/frame specifications
+    // remain on each target's WindowFunctionCallExpression.
 ```
+
+登録コメントが述べるのは PARTITION BY と出力参照の一致です。ORDER BY / フレーム仕様はノードではなく各ターゲットの `WindowFunctionCallExpression` に残るため、ノード側の `sort_ascending` / `sort_nulls_first` は明示的に与えられた IR 向けの保守的なガード（後述の条件3）です。
 
 変換ラムダ内で以下のガード条件を厳格に判定します。
 

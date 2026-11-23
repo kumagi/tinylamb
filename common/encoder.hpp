@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -48,15 +49,31 @@ class Encoder {
   Encoder& operator<<(ValueType v);
   Encoder& operator<<(bool v);
 
+  // A format error stops further writes. The record must be discarded on
+  // failure. Stream I/O errors are reported separately by the ostream.
+  [[nodiscard]] Status GetStatus() const {
+    if (format_error_ != nullptr) {
+      return StatusError(StatusCode::kTooBigData, format_error_);
+    }
+    return Status::kSuccess;
+  }
+
   template <typename T>
   Encoder& operator<<(const std::vector<T>& vec) {
-    // Decoder::operator>> rejects more than kMaxDecodedElements (1<<20).
-    // Encoder has no failure channel, so callers must keep vectors below
-    // that bound; a record that exceeds it cannot be read back.
-    uint64_t size = vec.size();
+    if (format_error_ != nullptr) {
+      return *this;
+    }
+    const uint64_t size = vec.size();
+    if (size > kMaxSerializedVectorElements) {
+      format_error_ = "too many vector elements to encode";
+      return *this;
+    }
     *this << size;
     for (const auto& elm : vec) {
       *this << elm;
+      if (format_error_ != nullptr) {
+        break;
+      }
     }
     return *this;
   }
@@ -69,6 +86,9 @@ class Encoder {
 
  private:
   void Write(const char* data, size_t size) {
+    if (format_error_ != nullptr) {
+      return;
+    }
     if (bytes_ != nullptr) {
       bytes_->append(data, size);
     } else {
@@ -77,14 +97,23 @@ class Encoder {
   }
   std::ostream* os_{nullptr};
   std::string* bytes_{nullptr};
+  const char* format_error_{nullptr};
 };
 
 template <typename T>
-std::string Encode(const T& src) {
+StatusOr<std::string> TryEncode(const T& src) {
   std::string bytes;
   Encoder enc(bytes);
   enc << src;
+  RETURN_IF_FAIL(enc.GetStatus());
   return bytes;
+}
+
+// For values that are known to fit, e.g. values already checked on insert.
+// Callers encoding arbitrary input use TryEncode to keep failures recoverable.
+template <typename T>
+std::string Encode(const T& src) {
+  return TryEncode(src).MoveValue();
 }
 
 }  // namespace tinylamb

@@ -110,7 +110,7 @@ TEST_F(ExecutorTest, IndexScanRejectedPredicateReleasesWriteIntent) {
 
   TransactionContext contender = rs_->BeginContext();
   EXPECT_TRUE(contender.txn_.TryAddWriteSet(candidate));
-  contender.Abort();
+  EXPECT_SUCCESS(contender.Abort());
   find_context.Abort();
   scan_context.Abort();
 }
@@ -365,6 +365,37 @@ TEST_F(ExecutorTest, IndexOnlyDistinctKeysBatchesReverseAndResidualGate) {
       EXPECT_FALSE(residual.TryEnableKeyDeduplication());
     }
   }
+}
+
+TEST_F(ExecutorTest, IndexOnlyResidualFailureDiscardsPartialBatch) {
+  auto seed = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      rs_->CreateTable(seed, Schema("IndexResidualError",
+                                    {Column("k", ValueType::kInt64)})));
+  ASSERT_SUCCESS(table.Insert(seed.txn_, Row({Value(1)})).GetStatus());
+  ASSERT_SUCCESS(table.Insert(seed.txn_, Row({Value(2)})).GetStatus());
+  ASSERT_SUCCESS(rs_->CreateIndex(seed, "IndexResidualError",
+                                  IndexSchema("i", {0}, {})));
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, current,
+                        rs_->GetTable(reader, "IndexResidualError"));
+  const Expression divisor = BinaryExpressionExp(
+      ConstantValueExp(Value(2)), BinaryOperation::kSubtract, ColumnValueExp("k"));
+  const Expression predicate = BinaryExpressionExp(
+      ConstantValueExp(Value(1)), BinaryOperation::kDivide, divisor);
+  IndexOnlyScan scan(reader.txn_, current, current.GetIndex(0), Value(),
+                     Value(), true, predicate, current.GetSchema());
+  DataChunk output;
+  EXPECT_EQ(scan.NextBatch(&output), 0U);
+  EXPECT_EQ(output.Size(), 0U);
+  const Status status = scan.GetStatus();
+  ASSERT_FALSE(status.ok());
+  EXPECT_NE(status.GetMessage().find("division by zero"), std::string::npos);
+  EXPECT_EQ(scan.NextBatch(&output), 0U);
+  EXPECT_EQ(scan.GetStatus(), status);
 }
 
 TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
@@ -2741,10 +2772,7 @@ TEST_F(ExecutorTest, ParallelScanProjectedColumns) {
   ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 
-TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
-  // Row::DeserializeProjected assumes an ascending projection column list, so
-  // a reordered projection like {1, 0} yields a projected row narrower than the
-  // chunk layout ParallelScan initializes, and the worker throws.
+TEST_F(ExecutorTest, ParallelScanRejectsReorderedProjection) {
   constexpr std::string_view kTable = "ParallelProjectionTable";
   constexpr int64_t kRows = 800;
   {
@@ -2768,10 +2796,8 @@ TEST_F(ExecutorTest, ParallelScanReorderedProjectionThrows) {
   const std::shared_ptr<Table>& table = table_status.Value();
   ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{1, 0});
   DataChunk chunk;
-  // A reordered projection is a caller contract violation; the worker
-  // aborts on the layout check instead of emitting misaligned rows.
-  EXPECT_DEATH(std::ignore = scan.NextBatch(&chunk, 64),
-               "data chunk row width mismatch");
+  EXPECT_EQ(scan.NextBatch(&chunk, 64), 0U);
+  EXPECT_EQ(scan.GetStatus().GetCode(), StatusCode::kInvalidArgument);
   ASSERT_SUCCESS(reader.txn_.PreCommit());
 }
 

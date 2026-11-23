@@ -27,7 +27,8 @@
   - `recovery/logger.hpp` — セグメント系列 `<db>.log.<index>` への `Logger`。
     `AddLog`(LSN は WAL 全体のバイトオフセット、セグメント先頭ではない)、
     `WaitForDurable(lsn)`(group commit 待ち)、
-    `DurableLSN()/BufferedLSN()`。fsync は最大 10ms バッチ。
+    `DurableLSN()/BufferedLSN()`。group commit の初期間隔は 1ms。
+    idle 時は worker の待ち時間が段階的に延び、最大 100ms になる。
   - `recovery/log_record.hpp` — `LogType` 17 種。txn 毎の `prev_lsn` 逆連鎖。
     レコードは `kCurrentVersion`(=7)と CRC32C チェックサム・長さ枠を持つ
     (D9、docs/wal_format.md 参照)。複製では §5.2 のヘッダ拡張を再利用する。
@@ -35,26 +36,31 @@
     `SinglePageRecovery`
     (CRC 不良ページのログ再構築)。page_lsn ガードで REDO 冪等
     (2026-08 当時は recovery_manager.cpp:74、現行は
-    page/page_manager.cpp:5603 の `ReplayCommittedRecord`)。
-  - `recovery/checkpoint_manager.hpp` — fuzzy checkpoint。master record の
-    checkpoint LSN は `RecoverFrom` の起点として読まれる
-    (page_storage.cpp:52)。WAL 切り詰めも存在しない(§8)。
-  - `transaction/transaction_manager.cpp:465` — `PreCommit` は
-    ①kCommit 記録(`AddLog`、:525)→ ②`CommitVersions`(MVCC 可視化、:586)
-    → ③`WaitForDurable`(:633) の順(D4、docs/commit_durability.md 参照)。
+    recovery/recovery_manager.cpp:763 の `RecoverFrom` と
+    page/page_manager.cpp:5747 の `ReplayCommittedRecord`)。
+  - `recovery/checkpoint_manager.hpp` — fuzzy checkpoint。
+    `RecoveryManager::RecoverFrom` は `PageManager::LoadFuzzyCheckpoint` 経由で
+    checkpoint の replay LSN を読み込み、WAL 再生の起点として使う。
+    checkpoint 起点の WAL セグメント回収は既存機能(§8)。任意バイト位置での
+    切り詰めや分散 epoch 境界での回収は未実装。
+  - `transaction/transaction_manager.cpp:481` — `PreCommit` は
+    ①kCommit 記録(`logger_->AddLog`、:542)→ ②`CommitVersions`(MVCC 可視化、:607)
+    → ③同期 WAL 待ち(`WaitForWalDurable`、:654) の順(D4、docs/commit_durability.md 参照)。
     **可視化はログ追記の後**である点は §5.4 でも維持する。
-    また `Abort`(transaction_manager.cpp:732) は終端に `kAbort` **型**のレコードを
-    書く(記録は transaction_manager.cpp:806、wal_format.md:66)。
+    また `Abort`(transaction/transaction_manager.cpp:753) は、recovery/logger があり、txn にログレコードがある場合に終端 `kAbort` **型**のレコードを追記する(:825-831、wal_format.md:66)。
     undo は online CLR 完了済みのため物理的には無害だが、
     複製・回復の意味論で明示的に扱う(§5.4)。
-  - `transaction/transaction_manager.cpp:429`(Begin、ロック取得は :446) —
+  - `transaction/transaction_manager.cpp:443` の `TransactionManager::Begin` —
     snapshot 取得(Begin)と commit_timestamp 出版(CommitVersions)は同一
-    `transaction_table_lock` で
+    `transaction_table_lock`(:461) で
     原子化。この規律は §5.6 で保持する。
-  - `database/page_storage.hpp:51` — PageStorage が Logger/Recovery/Transaction/
-    Checkpoint 各 manager を所有。`EmulateCrash()` あり。
-  - `server/postgres_server.cpp` — 単一 epoll スレッド + 読み取り専用 worker pool。
-    コミットの durability 待ちは epoll スレッド上で同期(`WaitForDurable`)。
+  - `database/page_storage.hpp:80-86` — PageStorage が Logger/Recovery/Transaction/
+    Checkpoint 各 manager を所有。障害注入の `EmulateCrash()` は PageStorage ではなく
+    `database/database.hpp:205` の `Database` のメソッド。
+  - `server/postgres_server.cpp` — 単一 epoll スレッド + 共有 worker pool。SELECT だけでなく
+    INSERT/UPDATE/DELETE/MERGE と BEGIN/COMMIT/ROLLBACK/SET も `ScheduleSessionQuery` で
+    worker へ渡り、ワーカ側の `ExecuteReadTask` が `SqlEngine::Execute` とコミットを実行する。
+    コミットの durability 待ちも epoll スレッドではなくワーカ上で起きる。
     seal 待ち化には callback 完了への改修が要る(§9)。
 - コンパイル規約・スタイルはリポジトリ従来通り(Apache 2.0 ヘッダ、clang-format、
   コメント最小限)。CMake は `add_simple_test`(CMakeLists.txt:903)と
@@ -225,7 +231,9 @@ router や admin からの構成読み取りは制御ノードの ReadIndex
 - **トランザクションはストリームを跨ぎ得る**(修正: 旧版は「1 txn = 1 stream」と
   記していたが、複数ページに触る txn は所有権写像上必ず複数ストリームに分散する)。
   扱いは次の通り:
-  - `kBegin` / `kCommit` は txn の**ホームストリーム**(`txn_id % num_streams`)へ。
+  - `kCommit` は txn の**ホームストリーム**(`txn_id % num_streams`)へ。
+    現行の単一ノード WAL は `kBegin` を発行しない(`LogType` の列挙値だけが残る)。
+    分散モードで begin marker が必要なら、その記録・回復上の意味を新規に定義する。
   - 各変更レコードと CLR は対象ページの所有ストリームへ。
   - `prev_lsn` は `(stream_id, stream_lsn)` の組に拡張する。
   - コミット判定はホームストリームの kCommit の durability + その epoch の seal。
@@ -267,8 +275,8 @@ class EpochManager {
 
 ### 5.4 コミットプロトコル(最重要)
 
-現行 `PreCommit`(transaction_manager.cpp:465)は ①kCommit 記録(`AddLog`、:525)
-→ ②CommitVersions(MVCC 可視化、:586)→ ③durability 待ち(:633) の順である
+現行 `PreCommit`(transaction/transaction_manager.cpp:481)は ①kCommit 記録(`logger_->AddLog`、:542)
+→ ②CommitVersions(MVCC 可視化、:607)→ ③同期 WAL 待ち(`WaitForWalDurable`、:654) の順である
 (D4、docs/commit_durability.md 参照)。**分散版はこの順序を変えず、
 ログ追記と可視化を 3 段階に分割する**:
 
@@ -289,7 +297,7 @@ void FinalizeCommit(Transaction&);  // seal 待ち解放後に呼ぶ:
   ack 前なのでクライアントには不定(rollback 相当)と見なせる。
 - 読み取り専用 txn は seal 待ち不要。
 - **Abort の扱い**: Abort は online CLR で物理 undo した後、終端として
-  `kAbort` **型**のレコードを書く(transaction_manager.cpp:748、現行の性質)。
+  `kAbort` **型**のレコードを書く(transaction/transaction_manager.cpp:825-831、recovery/logger があり txn に既存ログがある場合)。
   分散版でもこの形式を維持する(フォーマット変更を避ける)。abort のレコード群は
   seal を待たず複製される(best effort)。あるエポック境界で未 seal 末尾が破棄
   されても、「その位置でクラッシュした」状態と等しいため、既存の ARIES 回復が
@@ -322,10 +330,11 @@ void FinalizeCommit(Transaction&);  // seal 待ち解放後に呼ぶ:
 - ロック解放は LogCommit 直後(現行の Strict 2PL から変えない)。
 - MVCC 可視化(`CommitVersions`)のみ FinalizeCommit、すなわち seal 後とする。
   未 seal txn の更新は `VersionChain::pending` のまま残り、他 txn からは見えない。
-- commit_timestamp の発行と出版は引き続き `transaction_table_lock` の下で
-  行い、`Begin` の snapshot 取得との原子性(transaction_manager.cpp:46-52 の
-  既存規律)を保持する。可視化の順序は seal 完了順=エポック順になるため
-  commit_ts の単調性は保たれる。
+- snapshot 値の取得と active snapshot 登録は `Begin` が
+  `transaction_table_lock` の下で行う(transaction_manager.cpp:461-466)。一方、
+  commit timestamp の割当・公開は `pending_commits_mutex_` と
+  `stable_timestamp_` で順序付ける(:2516-2538)。分散版でもこの二つの規律を混同せず、
+  seal 完了順=エポック順に公開して commit_ts の単調性を保つ。
 - I-6/I-8 により、未 seal でもロック早期解放による矛盾は生じない
   (crash すればページ状態は REDO で巻き戻る)。
 

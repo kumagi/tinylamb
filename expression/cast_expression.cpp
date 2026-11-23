@@ -102,7 +102,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
 
   int first = 0;
   const size_t before_year = s.size();
-  if (!number(&first, 4)) {
+  if (!number(&first, 5)) {
     return false;
   }
   const size_t year_digits = before_year - s.size();
@@ -110,7 +110,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
   if (take('-')) {
     // The date form is fixed-width YYYY-MM-DD; time-only inputs take the
     // else branch below and must not be subjected to this check.
-    if (year_digits != 4 || s.size() < 5 || s[2] != '-' ||
+    if ((year_digits < 4 || year_digits > 5) || s.size() < 5 || s[2] != '-' ||
         (std::isdigit(static_cast<unsigned char>(s[0])) == 0) ||
         (std::isdigit(static_cast<unsigned char>(s[1])) == 0) ||
         (std::isdigit(static_cast<unsigned char>(s[3])) == 0) ||
@@ -119,7 +119,8 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
     }
     int month = 0;
     int day = 0;
-    if (first < 1 || first > 9999 || !number(&month, 2) || !take('-') ||
+    if (first < 1 || first > static_cast<int>(std::chrono::year::max()) ||
+        !number(&month, 2) || !take('-') ||
         !number(&day, 2) || month < 1 || month > 12 || day < 1 || day > 31) {
       return false;
     }
@@ -187,7 +188,7 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
           const char ch = s[i];
           // NOLINTNEXTLINE(readability-implicit-bool-conversion) explicit
           // intent
-          if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != ':' &&
+          if ((std::isdigit(static_cast<unsigned char>(ch)) == 0) && ch != ':' &&
               (std::isspace(static_cast<unsigned char>(ch)) == 0)) {
             return false;
           }
@@ -210,7 +211,8 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct, std::string_view* zone,
     return false;
   }
   if (ct->second == 60) {
-    ct->subsecond_nanos = 0;
+    // Keep the fractional part: the comparison path (CivilToNanos) folds
+    // ":60.5" into the next minute with .5 intact, so CAST must agree.
     ct->second = 0;
     if (++ct->minute == 60) {
       ct->minute = 0;
@@ -319,7 +321,9 @@ StatusOr<Value> CastCivilTime(std::string_view text, std::string_view target) {
       ct = ShiftCivilTimeSeconds(ct, local_offset);
     }
   }
-  if (ct.year < 1 || ct.year > 9999) {
+  if (ct.year < 1 ||
+      (target == "DATE" ? ct.year > static_cast<int>(std::chrono::year::max())
+                        : ct.year > 9999)) {
     return invalid();
   }
   if (target == "TIME") {
@@ -330,6 +334,9 @@ StatusOr<Value> CastCivilTime(std::string_view text, std::string_view target) {
     const std::chrono::year_month_day ymd{std::chrono::year{ct.year},
                                           std::chrono::month{ct.month},
                                           std::chrono::day{ct.day}};
+    if (!ymd.ok()) {
+      return invalid();
+    }
     return Value::DateFromDays(
         std::chrono::sys_days{ymd}.time_since_epoch().count());
   }
@@ -641,7 +648,11 @@ std::string TrimCastWhitespace(std::string_view text) {
 std::vector<std::pair<std::string, std::string>> SplitStructMembers(
     const std::string& body) {
   std::vector<std::pair<std::string, std::string>> members;
-  members.reserve(body.size() + 1);
+  // Every member needs at least one ':', so the number of colons is a tight
+  // upper bound. Reserving body.size()+1 overallocated a ~64-byte pair per
+  // input character for typical {"a":1,...} text.
+  members.reserve(static_cast<size_t>(
+      std::count(body.begin(), body.end(), ':')));
   int depth = 0;
   bool in_string = false;
   size_t segment_begin = 0;
@@ -690,7 +701,8 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
 }
 
 // Decodes a struct-member scalar: quoted strings are unescaped, everything
-// else keeps its raw text (nested objects/arrays stay textual).
+// else keeps its raw text (nested objects/arrays stay textual). Always returns
+// a string (with an unescape fallback), so there is no error to propagate.
 std::string DecodeStructMemberText(const std::string& raw) {
   if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
     // The canonical struct text (EncodeStructJson) escapes control bytes as
@@ -786,7 +798,9 @@ std::string EncodeStructMemberText(const Value& value) {
 }
 
 // Parses the field list of a STRUCT<...> target type into
-// (field-name-or-empty, type-text) pairs, honoring nested brackets.
+// (field-name-or-empty, type-text) pairs, honoring nested brackets. This is a
+// pure text classifier: a non-STRUCT spelling yields an empty vector, which
+// callers check via fields.size(); there is no Status to propagate.
 std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
     const std::string& upper_type) {
   const size_t open = upper_type.find('<');
@@ -843,6 +857,9 @@ std::vector<std::pair<std::string, std::string>> ParseStructTypeFields(
   return fields;
 }
 
+// Pure, total type-name classifier: every name maps to a (ValueType,
+// TypeTag) pair and unknown names fall back to int64. There is no Status /
+// StatusOr error channel, so callers use .first / .second directly.
 std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
   std::string upper = ToUpper(type_name);
   if (upper.starts_with("ARRAY<")) {
@@ -891,9 +908,8 @@ std::pair<ValueType, TypeTag> ParseType(const std::string& type_name) {
     // UUID values are stored as their canonical lowercase text form.
     return {ValueType::kVarChar, TypeTag::kVarChar};
   }
-  if (upper.starts_with("ARRAY<")) {
-    return {ValueType::kArray, TypeTag::kArray};
-  }
+  // ARRAY<...> was returned by the early check above; this duplicate was
+  // unreachable and only risked divergent behavior if that check moved.
   // Enums or user types default to int64 or varchar
   return {ValueType::kInt64, TypeTag::kBigInt};
 }
@@ -1124,8 +1140,12 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           }
           continue;
         }
-        const bool quoted_input =
-            raw_member.size() >= 2 && raw_member.front() == '"';
+        const bool starts_quoted = !raw_member.empty() && raw_member.front() == '"';
+        const bool ends_quoted = !raw_member.empty() && raw_member.back() == '"';
+        if (starts_quoted != ends_quoted) {
+          return fail();
+        }
+        const bool quoted_input = raw_member.size() >= 2 && starts_quoted;
         Value member_value;
         if (quoted_input) {
           member_value = Value(std::move(raw));
@@ -1223,8 +1243,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
     }
     return val;
   }
-  // ENUM-typed targets accept their textual member names verbatim: this
-  // engine stores enums as their member-name strings.  Message protos whose
+  // Fallback for dotted ENUM type paths without registered enum metadata:
+  // member-name strings are still accepted verbatim. Message protos whose
   // names merely contain "ENUM" (KitchenSinkEnumPB) are excluded.
   const bool dotted_type = upper.find('.') != std::string::npos;
   const bool enum_target = !is_bool &&
@@ -1321,6 +1341,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         const std::string raw = val.type == ValueType::kVarChar
                                     ? std::string(val.value.varchar_value)
                                     : val.AsString();
+        // DecodeProtoWireBytes returns std::optional; a failed decode is
+        // checked via has_value() and falls through to the TEXT path below.
         if (std::optional<std::string> decoded =
                 DecodeProtoWireBytes(type_name, raw);
             decoded.has_value()) {
@@ -1464,8 +1486,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             if (hex_negative) {
               // Two's-complement of the magnitude; the narrowed widths must
               // still hold the resulting negative value (INT8 "-0x80" is
-              // fine, "-0x81" is not).
-              const auto signed_value = static_cast<int64_t>(~magnitude + 1);
+              // fine, "-0x81" is not). bit_cast keeps the uint64->int64
+              // reinterpretation well-defined even at 0x8000000000000000.
+              const auto signed_value = std::bit_cast<int64_t>(~magnitude + 1);
               RETURN_IF_FAIL(ValidateIntWidth(upper, signed_value));
               return Value(signed_value);
             }
@@ -1583,8 +1606,9 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             return StatusError(StatusCode::kInvalidArgument,
                                "invalid float string: " + s);
           }
-          if (errno == ERANGE && (parsed == HUGE_VAL || parsed == -HUGE_VAL)) {
-            return StatusError(StatusCode::kIsInfinity, "float overflow: " + s);
+          if (errno == ERANGE) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "float out of range: " + s);
           }
           return finish_double(parsed);
         }
@@ -1679,10 +1703,25 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
             length_base = upper_element.substr(0, elem_paren);
             if (length_base == "STRING" || length_base == "BYTES") {
               try {
-                length_limit = static_cast<size_t>(
-                    std::stoll(element_type.substr(elem_paren + 1)));
+                const int64_t declared =
+                    std::stoll(element_type.substr(elem_paren + 1));
+                if (declared < 0) {
+                  // A negative N must not wrap into a SIZE_MAX limit.
+                  if (!safe) {
+                    return StatusError(StatusCode::kInvalidArgument,
+                                       "invalid length in " + element_type);
+                  }
+                  return Value();
+                }
+                length_limit = static_cast<size_t>(declared);
               } catch (const std::exception&) {
-                length_limit = 0;
+                // Same contract as a negative N: malformed length is an
+                // invalid type -- error, or NULL under SAFE_CAST.
+                if (!safe) {
+                  return StatusError(StatusCode::kInvalidArgument,
+                                     "invalid length in " + element_type);
+                }
+                return Value();
               }
             } else {
               length_base.clear();
@@ -1768,11 +1807,18 @@ CastExpression::CastExpression(Expression child, std::string target_type_name,
 }
 
 std::unordered_set<ColumnName> CastExpression::TouchedColumns() const {
+  if (!child_) {
+    return {};
+  }
   return child_->TouchedColumns();
 }
 
 StatusOr<Value> CastExpression::TryEvaluate(const Row& row,
                                             const Schema& schema) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cast expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, val, child_->TryEvaluate(row, schema));
   return TryCastValue(val, target_type_name_, target_value_type_,
                       return_null_on_error_);
@@ -1782,6 +1828,10 @@ StatusOr<Value> CastExpression::TryEvaluate(const Row* left,
                                             const Schema& left_schema,
                                             const Row* right,
                                             const Schema& right_schema) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cast expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, val,
                    child_->TryEvaluate(left, left_schema, right, right_schema));
   return TryCastValue(val, target_type_name_, target_value_type_,
@@ -1791,6 +1841,10 @@ StatusOr<Value> CastExpression::TryEvaluate(const Row* left,
 StatusOr<Value> CastExpression::TryEvaluate(const Row& row,
                                             const Schema& schema,
                                             EvaluationContext& context) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cast expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, val, child_->TryEvaluate(row, schema, context));
   return TryCastValue(val, target_type_name_, target_value_type_,
                       return_null_on_error_);
@@ -1829,8 +1883,9 @@ tinylamb::Type CastExpression::ResultType(const Schema& /*unused*/,
 }
 
 std::string CastExpression::ToString() const {
-  return (return_null_on_error_ ? "SAFE_CAST(" : "CAST(") + child_->ToString() +
-         " AS " + target_type_name_ + ")";
+  return (return_null_on_error_ ? "SAFE_CAST(" : "CAST(") +
+         (child_ ? child_->ToString() : std::string("<null>")) + " AS " +
+         target_type_name_ + ")";
 }
 
 void CastExpression::Dump(std::ostream& o) const { o << ToString(); }

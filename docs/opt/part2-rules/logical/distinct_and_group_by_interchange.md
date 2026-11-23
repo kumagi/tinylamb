@@ -76,9 +76,22 @@ graph TD
               memo.AddExpression(group, std::move(aggregation));
 ```
 
-方向 2 では、派生 Group として射影式を生成した上で、その上位に `kDistinct` 式を配置します。
+方向 2 では、派生 Group として射影式を生成した上で、その上位に `kDistinct` 式を配置します。派生グループのタグには **子グループ ID と target list の指紋** が含まれます。
 
 ```cpp
+              // Content-addressed (D1): a tag carrying only the target
+              // count let every group-by-only Aggregation over the same
+              // relation set share one projection group -- e.g. the two
+              // per-branch aggregates aggregate_union_transpose builds over
+              // an or_to_union split -- so each branch's Distinct could pick
+              // the OTHER branch's rows and the union lost one partition.
+              const GroupId proj_group = memo.EnsureDerivedGroup(
+                  memo.Get(child).relations,
+                  "distinct-group-by-proj:" + std::to_string(child) + ":" +
+                      TargetListFingerprint(expression.target_list));
+              if (proj_group == group || proj_group == child) {
+                return;
+              }
               memo.AddExpression(
                   proj_group,
                   LogicalExpression{.operation = LogicalOperator::kProjection,
@@ -90,6 +103,8 @@ graph TD
                   LogicalExpression{.operation = LogicalOperator::kDistinct,
                                     .children = {proj_group}});
 ```
+
+タグを `std::to_string(child)` と `TargetListFingerprint(expression.target_list)` で_content-addressed_にするのは D1 契約のためです。target 数だけをタグにすると、`or_to_union` が同一リレーション集合上に作る 2 つの per-branch 集約（`aggregate_union_transpose`）が 1 つの派生射影グループを共有し、各分岐の `Distinct` が**他方の分岐の行**を拾って Union の片方のパーティションが消える実バグになります。子 ID と target list の指紋を含めることで各分岐が隔離され、この回復経路が保たれます。
 
 ## 最適化効果
 

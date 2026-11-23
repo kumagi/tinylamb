@@ -31,7 +31,9 @@ TEST(ParallelWorkTest, ReusesHelpersAndExecutesEveryIndex) {
   // IDs must not be compared across submissions. Reuse is pinned instead by
   // the number of distinct threads observed over many submissions: a pool
   // that spawned new helpers each time would blow past its 16-worker cap.
-  std::array<std::thread::id, 4> ids{};
+  // Use more than 16 helper slots in one submission: a regression that raises
+  // the pool cap above 16 must be observable on hosts with that many CPUs.
+  std::array<std::thread::id, 65> ids{};
   std::unordered_set<std::thread::id> seen;
   for (int repeat = 0; repeat < 32; ++repeat) {
     ids = {};
@@ -43,7 +45,7 @@ TEST(ParallelWorkTest, ReusesHelpersAndExecutesEveryIndex) {
   EXPECT_GE(seen.size(), 2U);
   EXPECT_LE(seen.size(), 17U);  // 16 pool helpers + the calling thread.
 
-  std::array<std::atomic<int>, 17> counts{};
+  std::array<std::atomic<int>, 65> counts{};
   ASSERT_TRUE(
       RunParallelTasks(counts.size(), [&](size_t i) { ++counts[i]; }).ok());
   for (const auto& count : counts) {
@@ -118,6 +120,9 @@ TEST(ParallelWorkTest, ReusedHelpersFollowChangedCpuAffinity) {
   } restore{*original};
   const auto single = platform::CpuSet::Single(original->First());
   ASSERT_TRUE(single.ApplyToCurrentThread());
+  if (platform::CpuSet::CurrentThread() != single) {
+    GTEST_SKIP() << "runtime did not apply the requested single-CPU affinity";
+  }
   EXPECT_EQ(ParallelWorkerCount(1000), 1U);
   ASSERT_TRUE(RunParallelTasks(2, [&](size_t) {
                 EXPECT_EQ(platform::CpuSet::CurrentThread(), single);

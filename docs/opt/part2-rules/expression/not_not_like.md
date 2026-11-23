@@ -74,4 +74,4 @@ $x$ または $p$ が NULL のとき、$x \text{ NOT LIKE } p$ は `UNKNOWN`（N
 - `expression/rewrite_test.cpp` の `ExpressionRewriteTest.NotPushdownRewritesLikeAndNullChecks`:
   `NOT(name NOT LIKE 'a%')` が `kLike` 二項式ノードへと正規化されることを確認します。
 - `expression/differential_test.cpp` の `DifferentialTest.Evaluate_LikePatterns_MatchesAcrossPaths`:
-  AST 評価器とバイトコード評価器の間で、NOT LIKE および二重否定を含む式木の評価結果が完全に一致することを検証します。
+  AST 評価器とバイトコード評価器の間で、LIKE と NOT LIKE の評価結果が一致することを検証します。`NOT(name NOT LIKE 'a%')` の rewrite は上記の `NotPushdownRewritesLikeAndNullChecks` が確認します。

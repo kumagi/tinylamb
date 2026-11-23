@@ -9,7 +9,8 @@
 // Phase 2-1: compiled-plan cache ("prepared plans"), the compiled-plan cache
 // design notes.
 //
-// Key:    SQL fingerprint + database schema/statistics epoch.
+// Key:    SQL fingerprint, database and schema/statistics epoch, optimizer
+//         toggles, and memory settings used to select the physical plan.
 // Value:  a CompiledPlan, one of
 //           (a) kSelect/kUpdate/kDelete: a plan whose bindable literals are
 //               ParameterSlots. Replay binds the incoming values into those
@@ -51,6 +52,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -60,10 +63,11 @@
 #include <utility>
 #include <vector>
 
-#include "common/string_util.hpp"
+#include "common/memory_budget.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -72,6 +76,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/parameter_slot.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "plan/plan.hpp"
 #include "query/statement.hpp"
@@ -107,16 +112,21 @@ struct PlanCacheCounters {
   // verbatim, so it is neither a hit nor a fill).
   std::atomic<uint64_t> template_fills{0};
   std::atomic<uint64_t> template_hits{0};
+  // Shard-capacity evictions from the parsed-tree cache (distinct from the
+  // compiled-plan `evictions` above).
+  std::atomic<uint64_t> template_evictions{0};
 };
 
 inline PlanCacheCounters& PlanCacheStats() {
+  // Function-local statics are initialized thread-safely, and every field of
+  // PlanCacheCounters is std::atomic, so concurrent callers need no extra lock.
   static PlanCacheCounters counters;
   return counters;
 }
 
 // Rebuilds `expression` so every ParameterSlot reads from `values`. Slot-free
-// subtrees are shared (trees are immutable); only nodes on paths carrying
-// slots are copied.
+// subtrees are shared under the compiled-plan cache's immutable-tree
+// convention; only nodes on paths carrying slots are copied.
 inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
     const Expression& expression,
     const std::shared_ptr<const PreparedValues>& values) {
@@ -180,10 +190,11 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
         args.push_back(CloneWithPreparedValues(arg, values));
       }
       // FunctionCallExpression is already fully desugared by the frontend:
-      // named arguments (`name => value`) are resolved to positional order
-      // and `SAFE.<fn>` becomes nulliferror(<fn>) at call-build time. It
-      // carries only the folded name and args, so rebuilding from those two
-      // fields is lossless -- there is no separate metadata to preserve.
+      // named arguments (`name => value`) are resolved to positional order,
+      // and `SAFE.<fn>` is represented by a nulliferror(<fn>) expression.
+      // There is no separate SAFE/error-mode metadata to copy. If unrelated
+      // metadata is added to this node later, preserve it in this rebuild (and
+      // the parallel one in expression/parameter_slot.hpp) as well.
       return FunctionCallExp(call.FuncName(), std::move(args));
     }
     case TypeTag::kArrayExp: {
@@ -215,10 +226,7 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
   switch (expression->Type()) {
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
-      // The frontend lowercases function names, but hand-built expressions
-      // (and internal nodes) need not: compare case-insensitively so a
-      // non-deterministic call can never slip into the compiled-plan cache.
-      if (IdentifierEquals(call.FuncName(), "current_timestamp")) {
+      if (GetFunctionVolatility(call.FuncName()) != Volatility::kImmutable) {
         return true;
       }
       return std::ranges::any_of(call.Args(), [](const Expression& arg) {
@@ -233,9 +241,34 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
     case TypeTag::kUnaryExp:
       return ContainsNonDeterministicCall(
           expression->AsUnaryExpression().Child());
-    case TypeTag::kAggregateExp:
-      return ContainsNonDeterministicCall(
-          expression->AsAggregateExpression().Child());
+    case TypeTag::kAggregateExp: {
+      // A non-deterministic call can hide in any of the aggregate's modifiers,
+      // not just its child (cf. the parallel deep scan in ContainsParameterSlot
+      // in expression/parameter_slot.hpp). Missing one here would let a plan
+      // filled with, say, ARRAY_AGG(x ORDER BY RAND()) or SUM(x WHERE f()),
+      // be replayed with the fill-time value.
+      const auto& aggregate = expression->AsAggregateExpression();
+      if (ContainsNonDeterministicCall(aggregate.Child()) ||
+          ContainsNonDeterministicCall(aggregate.SecondaryArg()) ||
+          ContainsNonDeterministicCall(aggregate.WhereFilter()) ||
+          ContainsNonDeterministicCall(aggregate.HavingCondition())) {
+        return true;
+      }
+      for (const Expression& extra : aggregate.TrailingArgs()) {
+        if (ContainsNonDeterministicCall(extra)) {
+          return true;
+        }
+      }
+      return std::ranges::any_of(
+                 aggregate.InnerOrderBy(),
+                 [](const WindowOrderTerm& term) {
+                   return ContainsNonDeterministicCall(term.expression);
+                 }) ||
+             std::ranges::any_of(aggregate.InnerGroupBy(),
+                                 [](const Expression& key) {
+                                   return ContainsNonDeterministicCall(key);
+                                 });
+    }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       for (const auto& clause : searched.when_clauses_) {
@@ -279,6 +312,19 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
 // ---------------------------------------------------------------------------
 // Cached artifact.
 // ---------------------------------------------------------------------------
+struct PlanMemorySettings {
+  size_t process_limit;
+  size_t operator_limit;
+  bool always_spill;
+
+  static PlanMemorySettings Current() noexcept {
+    const auto& budget = ProcessMemoryBudget::Global();
+    return {.process_limit=budget.Limit(), .operator_limit=budget.OpMemoryOverrideBytes(),
+            .always_spill=budget.AlwaysSpillEnabled()};
+  }
+  bool operator==(const PlanMemorySettings&) const = default;
+};
+
 struct CompiledPlan {
   enum class Kind : uint8_t { kSelect, kInsert, kUpdate, kDelete };
 
@@ -290,6 +336,10 @@ struct CompiledPlan {
   // plan compiled for another database instance from being replayed here.
   const Database* database{nullptr};
   uint64_t epoch{0};
+  // Optimizer/bytecode toggle bitmask active at compile time
+  // (PlanCacheToggleInvalidation.lean).
+  uint64_t opt_bits{0};
+  PlanMemorySettings memory_settings = PlanMemorySettings::Current();
   // Fill-time parameter values. When `parameter_slots` is non-empty the plan
   // is parametric and these values are only the sniffed bindings from the
   // fill. When it is empty, a non-INSERT hit still requires exact equality.
@@ -301,6 +351,10 @@ struct CompiledPlan {
   // First successful SELECT replay's elapsed time. Later replays that are
   // both above the floor and several times this baseline drop the entry.
   mutable std::atomic<uint64_t> reuse_baseline_ns{0};
+  // A replay that ends in error is not a timing sample, but repeated errors
+  // (spill/OOM under memory pressure) still signal a plan that must be
+  // replanned instead of being replayed forever. A successful replay clears it.
+  mutable std::atomic<uint32_t> reuse_error_streak{0};
   // An immutable SELECT artifact can be shared across workers. Retiring the
   // artifact itself also prevents another worker from reviving a slow plan.
   mutable std::atomic<bool> retired{false};
@@ -429,6 +483,14 @@ inline bool SelectReuseExceededThreshold(uint64_t elapsed_ns,
   if (baseline_ns == 0 || elapsed_ns <= kSelectReuseLatencyFloorNs) {
     return false;
   }
+  // Guard the product against wraparound: a corrupted/overflowed baseline can
+  // be larger than UINT64_MAX / factor, in which case no measurable elapsed_ns
+  // could ever exceed the true threshold. Letting it wrap would make the
+  // safety valve fire on a tiny bogus threshold instead.
+  if (baseline_ns >
+      std::numeric_limits<uint64_t>::max() / kSelectReuseLatencyFactor) {
+    return false;
+  }
   return elapsed_ns > baseline_ns * kSelectReuseLatencyFactor;
 }
 
@@ -466,14 +528,96 @@ inline void DemoteVolatileFingerprint(const std::string& fingerprint,
   }
 }
 
-inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
-                                              const Database* database,
-                                              uint64_t epoch) {
-  const auto found = CurrentCompiledPlans().find(fingerprint);
+// A compile that folds session data permanently excludes this fingerprint
+// from reuse, including when compilation exits by throwing.
+class ScopedFoldFingerprint {
+ public:
+  ScopedFoldFingerprint(const std::string& fingerprint, const bool& folded)
+      : fingerprint_(fingerprint),
+        folded_(folded),
+        fresh_(!fingerprint.empty() && MarkFingerprintVolatile(fingerprint)) {}
+  ~ScopedFoldFingerprint() {
+    DemoteVolatileFingerprint(fingerprint_, fresh_ && !folded_);
+  }
+  ScopedFoldFingerprint(const ScopedFoldFingerprint&) = delete;
+  ScopedFoldFingerprint& operator=(const ScopedFoldFingerprint&) = delete;
+
+ private:
+  const std::string& fingerprint_;
+  const bool& folded_;
+  const bool fresh_;
+};
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/PlanCacheToggleInvalidation.lean
+//   (sound)
+[[nodiscard]] inline uint64_t CurrentPlanOptToggleBits() noexcept {
+  auto bits = static_cast<uint64_t>(BytecodeOptToggleBits());
+  if (!BytecodeEnabled()) {
+    bits |= uint64_t{1} << 8U;
+  }
+  const auto env_on = [](const char* name) noexcept {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0';
+  };
+  if (env_on("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN")) { bits |= uint64_t{1} << 9U;
+}
+  if (env_on("TINYLAMB_DISABLE_DISTINCT_ON_TOP1")) { bits |= uint64_t{1} << 10U;
+}
+  if (env_on("TINYLAMB_DISABLE_OUTER_OR_BRANCHES")) { bits |= uint64_t{1} << 11U;
+}
+  if (env_on("TINYLAMB_DISABLE_OUTER_FETCH_TIES")) { bits |= uint64_t{1} << 12U;
+}
+  if (env_on("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS")) { bits |= uint64_t{1} << 13U;
+}
+  if (env_on("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE")) {
+    bits |= uint64_t{1} << 14U;
+}
+  if (env_on("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME")) { bits |= uint64_t{1} << 15U;
+}
+  if (env_on("TINYLAMB_DISABLE_RANGE_DISTINCT_INDEX")) {
+    bits |= uint64_t{1} << 16U;
+}
+  if (env_on("TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY")) {
+    bits |= uint64_t{1} << 17U;
+}
+  if (env_on("TINYLAMB_DISABLE_DEMAND_SCALAR")) { bits |= uint64_t{1} << 18U;
+}
+  if (env_on("TINYLAMB_DISABLE_SKYLINE_ANTIJOIN")) { bits |= uint64_t{1} << 19U;
+}
+  if (env_on("TINYLAMB_DISABLE_INTERVAL_COUNT_SWEEP")) {
+    bits |= uint64_t{1} << 20U;
+}
+  if (env_on("TINYLAMB_DISABLE_PACKED_ORDER_KEY")) { bits |= uint64_t{1} << 21U;
+}
+  if (env_on("TINYLAMB_DISABLE_WINDOW_HALO")) { bits |= uint64_t{1} << 22U;
+}
+  if (env_on("TINYLAMB_DISABLE_GROUPED_JOIN_FUSION")) {
+    bits |= uint64_t{1} << 23U;
+}
+  if (env_on("TINYLAMB_DISABLE_BLOCK_KLEENE")) { bits |= uint64_t{1} << 24U;
+}
+  return bits;
+}
+
+[[nodiscard]] inline std::string PlanCacheKeyWithOptBits(
+    const std::string& fingerprint, uint64_t opt_bits) {
+  if (opt_bits == 0) {
+    return fingerprint;
+  }
+  return fingerprint + "\x1fopt:" + std::to_string(opt_bits);
+}
+
+inline CompiledPlanPtr FindThreadCompiledPlan(
+    const std::string& fingerprint, const Database* database, uint64_t epoch,
+    uint64_t opt_bits = CurrentPlanOptToggleBits()) {
+  const std::string key = PlanCacheKeyWithOptBits(fingerprint, opt_bits);
+  const auto found = CurrentCompiledPlans().find(key);
   if (found == CurrentCompiledPlans().end()) {
     return nullptr;
   }
-  if (found->second->database != database || found->second->epoch != epoch) {
+  if (found->second->database != database || found->second->epoch != epoch ||
+      found->second->opt_bits != opt_bits ||
+      found->second->memory_settings != PlanMemorySettings::Current()) {
     CurrentCompiledPlans().erase(found);
     PlanCacheStats().epoch_invalidations.fetch_add(1,
                                                    std::memory_order_relaxed);
@@ -485,13 +629,15 @@ inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
 
 inline void RememberThreadCompiledPlan(const std::string& fingerprint,
                                        CompiledPlanPtr plan) {
+  const uint64_t opt_bits = plan ? plan->opt_bits : CurrentPlanOptToggleBits();
+  const std::string key = PlanCacheKeyWithOptBits(fingerprint, opt_bits);
   if (CurrentCompiledPlans().size() >= ((active_plan_session != nullptr)
                                             ? 64
                                             : kThreadCompiledPlanCapacity) &&
-      !CurrentCompiledPlans().contains(fingerprint)) {
+      !CurrentCompiledPlans().contains(key)) {
     CurrentCompiledPlans().clear();
   }
-  CurrentCompiledPlans().insert_or_assign(fingerprint, std::move(plan));
+  CurrentCompiledPlans().insert_or_assign(key, std::move(plan));
 }
 
 inline void StoreThreadCompiledPlan(const std::string& fingerprint,
@@ -500,8 +646,10 @@ inline void StoreThreadCompiledPlan(const std::string& fingerprint,
   PlanCacheStats().fills.fetch_add(1, std::memory_order_relaxed);
 }
 
-inline void ForgetThreadCompiledPlan(const std::string& fingerprint) {
-  CurrentCompiledPlans().erase(fingerprint);
+inline void ForgetThreadCompiledPlan(
+    const std::string& fingerprint,
+    uint64_t opt_bits = CurrentPlanOptToggleBits()) {
+  CurrentCompiledPlans().erase(PlanCacheKeyWithOptBits(fingerprint, opt_bits));
 }
 
 // ---------------------------------------------------------------------------
@@ -514,23 +662,33 @@ class PreparedPlanCache {
   static constexpr size_t kCapacityPerShard = kCapacity / kShards;
 
   static PreparedPlanCache& Instance() {
+    // The function-local static is initialized thread-safely and every access
+    // to its contents goes through a per-shard mutex (Find/Store/Clear), so it
+    // is safe to share across threads without thread_local or an outer lock.
     static PreparedPlanCache cache;
     return cache;
   }
 
   // Returns the entry for `fingerprint` when present AND stamped with
-  // `epoch`; stale entries are dropped here (lazy invalidation).
+  // `epoch` and `opt_bits`; stale entries are dropped here.
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/PlanCacheToggleInvalidation.lean
+  //   (sound)
   CompiledPlanPtr Find(const std::string& fingerprint, const Database* database,
-                       uint64_t epoch) {
-    Shard& shard = shard_for(fingerprint);
+                       uint64_t epoch,
+                       uint64_t opt_bits = CurrentPlanOptToggleBits()) {
+    const std::string key = PlanCacheKeyWithOptBits(fingerprint, opt_bits);
+    Shard& shard = shard_for(key);
     std::scoped_lock lock(shard.mutex);
-    const auto found = shard.index.find(fingerprint);
+    const auto found = shard.index.find(key);
     if (found == shard.index.end()) {
       PlanCacheStats().misses.fetch_add(1, std::memory_order_relaxed);
       return nullptr;
     }
     if (found->second->plan->database != database ||
-        found->second->plan->epoch != epoch) {
+        found->second->plan->epoch != epoch ||
+        found->second->plan->opt_bits != opt_bits ||
+        found->second->plan->memory_settings != PlanMemorySettings::Current()) {
       shard.lru.erase(found->second);
       shard.index.erase(found);
       PlanCacheStats().epoch_invalidations.fetch_add(1,
@@ -544,9 +702,12 @@ class PreparedPlanCache {
   }
 
   void Store(const std::string& fingerprint, CompiledPlanPtr plan) {
-    Shard& shard = shard_for(fingerprint);
+    const uint64_t opt_bits =
+        plan ? plan->opt_bits : CurrentPlanOptToggleBits();
+    const std::string key = PlanCacheKeyWithOptBits(fingerprint, opt_bits);
+    Shard& shard = shard_for(key);
     std::scoped_lock lock(shard.mutex);
-    const auto found = shard.index.find(fingerprint);
+    const auto found = shard.index.find(key);
     if (found != shard.index.end()) {
       found->second->plan = std::move(plan);
       shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
@@ -554,8 +715,8 @@ class PreparedPlanCache {
       return;
     }
     shard.lru.push_front(
-        CacheEntry{.fingerprint = fingerprint, .plan = std::move(plan)});
-    shard.index.emplace(fingerprint, shard.lru.begin());
+        CacheEntry{.fingerprint = key, .plan = std::move(plan)});
+    shard.index.emplace(key, shard.lru.begin());
     if (shard.lru.size() > kCapacityPerShard) {
       shard.index.erase(shard.lru.back().fingerprint);
       shard.lru.pop_back();

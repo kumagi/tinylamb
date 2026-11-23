@@ -76,11 +76,11 @@ INTERSECT が共通行と判定します。EXCEPT（差）でも同様に、値�
             for (const GroupId child : setop.children) {
               const GroupId projected = memo.EnsureDerivedGroup(
                   memo.Get(child).relations,
-                  "setop-projection:" +
+                  "setop-projection:" + std::to_string(child) + ":" +
                       TargetListFingerprint(expression.target_list));
 ```
 
-派生グループのタグに `TargetListFingerprint(expression.target_list)`
+派生グループのタグに子 Group ID と `TargetListFingerprint(expression.target_list)`
 (出力名と式の文字列を連結した指紋)を含めるので、**同じ分岐に違う target
 list の射影が来れば別グループに隔離**されます。次に各分岐の射影式を追加し、
 最後に集合演算の子を差し替えた式を元のグループへ加えます。
@@ -114,7 +114,7 @@ list の射影が来れば別グループに隔離**されます。次に各分�
 
 ## 関連 Rule との相互作用
 
-- `merge_projections` / `merge_projections`: 分岐内の射影が
+- `merge_projections`: 分岐内の射影が
   分岐側の既存射影と隣接した場合に合成されます。
 - `union_all_merge`: 隣接する UNION ALL を 1 つにまとめ、分配後の
   多分岐形を正規化します。

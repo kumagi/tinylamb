@@ -109,14 +109,16 @@ bool BatchMayMatch(  // NOLINT(misc-no-recursion)
   if (offset < 0) {
     return true;
   }
-  // Zone maps over stored INT64 payloads use signed bounds. UINT64 shares
-  // that storage, so pruning it here can discard values above INT64_MAX.
-  if (schema.GetColumn(static_cast<size_t>(offset)).IsUnsigned() ||
-      (*constant)->AsConstantValue().GetValue().IsUnsigned()) {
+  const auto slot = static_cast<size_t>(offset);
+  const ColumnVector& values = chunk.ColumnAt(slot);
+  const Value& bound = (*constant)->AsConstantValue().GetValue();
+  // A declared type match alone does not establish an ordering for mixed
+  // values or guarantee that an INT64 slot actually carries signed values.
+  if (values.IsHeterogeneous() || values.IsUnsigned() || bound.IsUnsigned() ||
+      schema.GetColumn(slot).IsUnsigned()) {
     return true;
   }
-  return chunk.ZoneMapAt(static_cast<size_t>(offset))
-      .MayMatch(operation, (*constant)->AsConstantValue().GetValue());
+  return chunk.ZoneMapAt(slot).MayMatch(operation, bound);
 }
 
 }  // namespace
@@ -216,11 +218,10 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
   }
   std::optional<ColumnVector> predicates;
   rows_seen_ += input.Size();
-  if (simd_filter_.enabled) {
+  if (simd_filter_.enabled && input.HasLayout(schema_)) {
     const ColumnVector& simd_column = input.ColumnAt(simd_filter_.column);
     const ZoneMap& simd_zone = input.ZoneMapAt(simd_filter_.column);
-    if (input.HasLayout(schema_) &&
-        simd_column.Type() == schema_.GetColumn(simd_filter_.column).Type() &&
+    if (simd_column.Type() == schema_.GetColumn(simd_filter_.column).Type() &&
         !simd_column.IsUnsigned() && simd_zone.Initialized() &&
         simd_zone.NullCount() == 0) {
       ValidityBitmap mask;
@@ -302,8 +303,9 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
   // storage.  Only fire when the runtime batch really carries a signed
   // INT64 layout: an unsigned column under a signed schema would compare
   // UINT64 > INT64_MAX keys wrong with ICmpSLT/SGT.
-  if (jit_filter_ && input.ColumnAt(jit_column_).Type() == ValueType::kInt64 &&
-      !input.ColumnAt(jit_column_).IsUnsigned() && input.HasLayout(schema_) &&
+  if (jit_filter_ && input.HasLayout(schema_) &&
+      input.ColumnAt(jit_column_).Type() == ValueType::kInt64 &&
+      !input.ColumnAt(jit_column_).IsUnsigned() &&
       input.ZoneMapAt(jit_column_).Initialized() &&
       input.ZoneMapAt(jit_column_).NullCount() == 0) {
     jit_keep_bytes_.resize(input.Size());
@@ -520,8 +522,10 @@ void Selection::AppendSelected(const DataChunk& input, DataChunk* destination) {
 
 void Selection::DumpHeader(std::ostream& o, int indent,
                            bool leading_indent) const {
-  std::string predicate = exp_->ToString();
-  if (exp_->Type() == TypeTag::kBinaryExp) {
+  // A null expression is tolerated by the rest of the operator (conjuncts_
+  // may be empty), so Dump must not dereference it unconditionally.
+  std::string predicate = exp_ ? exp_->ToString() : "<no predicate>";
+  if (exp_ && exp_->Type() == TypeTag::kBinaryExp) {
     const BinaryOperation op = exp_->AsBinaryExpression().Op();
     if (op == BinaryOperation::kIsDistinctFrom) {
       predicate = "NullSafeNotEqual";

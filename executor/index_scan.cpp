@@ -59,6 +59,7 @@ namespace {
 inline constexpr size_t kIndexScanPrefetchDistance = 8;
 
 bool IndexScanPrefetchDisabled() {
+  // Environment configuration is sampled once; set it before the first scan.
   static const bool disabled =
       std::getenv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
   return disabled;
@@ -204,9 +205,12 @@ IndexScan::IndexScan(
   CompileIntegerPeeks();
   range_count_ = ranges.size();
   if (!ranges.empty()) {
+    // Open the prefetch from the untouched first range before moving any of
+    // the remaining ranges into pending_, so a later widening of the move
+    // range cannot feed a moved-from key here.
+    OpenPrefetch(ranges.front().first, ranges.front().second);
     pending_.assign(std::make_move_iterator(ranges.begin()) + 1,
                     std::make_move_iterator(ranges.end()));
-    OpenPrefetch(ranges.front().first, ranges.front().second);
   }
 }
 

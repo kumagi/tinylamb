@@ -86,6 +86,6 @@ graph TD
 `expression/rewrite_test.cpp` において以下のテストケースにより動作が検証されています。
 
 - `ExpressionRewriteTest.NullCheckCompositionCollapsesToConstant`:
-  `(x IS NULL) IS NOT NULL` および `(x IS NOT NULL) IS NOT NULL` が定数 `TRUE` へと正常に畳み込まれることを確認します。
+  `(x IS NULL) IS NOT NULL` が定数 `TRUE` に畳み込まれ、`(x IS NOT NULL) IS NULL` が定数 `FALSE` に畳み込まれることを確認します。
 - `ExpressionRewriteTest.NullCheckOfNullCheckPreservesRaise`:
   例外を送出する部分式（`CAST(-inf AS INT64)`）を含む場合、畳み込みが安全に抑止されることを確認します。

@@ -42,6 +42,7 @@ Memo 上では、`filter-before-distinct:` タグの派生グループに
             const GroupId filtered = memo.EnsureDerivedGroup(
                 memo.Get(distinct.children[0]).relations,
                 "filter-before-distinct:" +
+                    GroupIdsTag({distinct.children[0]}) +
                     (*expression.predicate)->ToString());
             if (filtered == group || filtered == distinct.children[0]) {
               continue;

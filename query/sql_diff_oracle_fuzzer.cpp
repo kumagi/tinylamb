@@ -83,12 +83,28 @@ std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
   }
   std::vector<Row> rows;
   Row row;
-  while (result.Value().Next(&row)) {
-    rows.push_back(row);
-  }
-  if (result.Value().GetStatus() != Status::kSuccess) {
+  // Next()/Drain() can escape an exception through the transitional
+  // EXC-SHIM boundary; record it as an error so the diff report is written
+  // instead of the libFuzzer process terminating (same guard as
+  // sql_join_fuzzer.cpp).
+  try {
+    while (result.Value().Next(&row)) {
+      rows.push_back(row);
+    }
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      if (error != nullptr) {
+        *error = result.Value().GetStatus().GetMessage();
+      }
+      return std::nullopt;
+    }
+  } catch (const std::exception& e) {
     if (error != nullptr) {
-      *error = result.Value().GetStatus().GetMessage();
+      *error = "stream exception: " + std::string(e.what());
+    }
+    return std::nullopt;
+  } catch (...) {
+    if (error != nullptr) {
+      *error = "stream exception: unknown";
     }
     return std::nullopt;
   }
@@ -150,12 +166,17 @@ std::string Pair(int64_t left, bool right_null, int64_t right) {
   return Row(std::move(cells)).ToString();
 }
 
-std::set<int64_t> IdSet(const std::vector<Row>& rows) {
+// A malformed id is itself an oracle violation: dropping such rows silently
+// made both sides of a subset/equality check collapse to the same set and hid
+// NULL-propagation / type regressions. Report it through `error` instead.
+std::optional<std::set<int64_t>> IdSet(const std::vector<Row>& rows,
+                                       std::string* error) {
   std::set<int64_t> ids;
   for (const Row& row : rows) {
     if (row.Count() < 1 || row[0].IsNull() ||
         row[0].type != ValueType::kInt64) {
-      continue;
+      *error = "subset query returned a row without an INT64 id";
+      return std::nullopt;
     }
     ids.insert(row[0].value.int_value);
   }
@@ -242,7 +263,7 @@ std::string CheckSubset(Database& db, TransactionContext& ctx,
     if (!rows.has_value()) {
       return std::nullopt;
     }
-    return IdSet(*rows);
+    return IdSet(*rows, &error);
   };
   auto note = [&](const char* tag, const std::string& left_sql,
                   const std::string& right_sql) {
@@ -887,7 +908,11 @@ bool ParseDiffOracleTest(std::string_view text, uint64_t* seed,
       return false;
     }
   }
-  return saw && !trace->setup.empty();
+  // An empty query/expect pair would make replay compare zero rows and call
+  // a corrupted regression file "fixed". Require a real test body, matching
+  // sql_plan_cache_fuzzer's ParseTrace.
+  return saw && !trace->setup.empty() && !trace->queries.empty() &&
+         !trace->expect.empty();
 }
 
 void DiffOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
@@ -895,7 +920,9 @@ void DiffOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   for (size_t i = 0; i < size; ++i) {
     seed = (seed * 257) + data[i] + 1;
   }
-  std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
+  std::seed_seq seed_words{static_cast<uint32_t>(seed),
+                           static_cast<uint32_t>(seed >> 32)};
+  std::mt19937 rng(seed_words);
   const int kind = size == 0 ? 0 : static_cast<int>(data[0] % 4);
   DiffOracleTrace trace;
   std::string report;
@@ -919,24 +946,22 @@ void DiffOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   DiffOracleTrace parsed;
   std::string summary;
   std::string verify;
+  bool replay_skipped = false;
   if (!ParseDiffOracleTest(text, &parsed_seed, &parsed, &summary)) {
     verify = "internal error: serialized diff-oracle trace does not parse";
   } else {
-    bool skipped = false;
-    verify = ReplayDiffOracleTrace(parsed, false, &skipped);
-    if (skipped) {
-      // No database could be created during verification (quota pressure),
-      // so no query actually ran. An empty report there is NOT a clean
-      // replay: labelling it "flaky" would silently discard a real finding.
-      verify =
-          "internal error: replay skipped (no database; resource pressure)";
+    verify = ReplayDiffOracleTrace(parsed, false, &replay_skipped);
+    if (replay_skipped) {
+      verify = "replay skipped (no database; resource pressure)";
     } else if (verify.empty()) {
-      verify = "internal error: serialized diff-oracle replay holds (flaky)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized diff-oracle replay holds (flaky)");
     }
   }
   const std::string path =
       "sql_diff_oracle_fuzz-repro-" + std::to_string(seed) + ".test";
-  EmitFuzzFinding("sql_diff_oracle_fuzz", seed, path, text, report, verify);
+  EmitFuzzFinding("sql_diff_oracle_fuzz", seed, path, text, report, verify,
+                  replay_skipped);
 }
 
 }  // namespace tinylamb

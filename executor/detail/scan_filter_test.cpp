@@ -237,9 +237,7 @@ TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
     const auto expression =
         BinaryExpressionExp(ColumnValueExp("d"), op, ConstantValueExp(literal));
     const auto compiled = TryCompileSimpleCompare(expression, schema);
-    if (!compiled) {
-      FAIL() << "date comparison did not compile";
-    }
+    ASSERT_TRUE(compiled.has_value()) << "date comparison did not compile";
     EXPECT_TRUE(compiled->date_string_payload);
     EXPECT_EQ(compiled->constant, literal);
     for (const Value& value :
@@ -751,7 +749,7 @@ TEST(ScanFilterTest,
   ASSERT_TRUE(
       compiled
           ->date_string_payload);  // NOLINT(bugprone-unchecked-optional-access)
-  // A parameter rebind can replace the parsed literal with an unparseable
+  // A parameter rebind can replace the parsed literal with an unparsable
   // string after compilation; the failed coercion must surface as an error,
   // not a clean per-row reject.
   SimpleComparePredicate rebound =

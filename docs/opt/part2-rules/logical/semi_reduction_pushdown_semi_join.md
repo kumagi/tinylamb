@@ -26,7 +26,8 @@ graph LR
 1. `expression.operation == LogicalOperator::kSemiJoin`（兄弟規則 `semi_reduction_pushdown_anti_join` は `kAntiJoin`）で、`expression.predicate` が存在すること。
 2. 親グループ `group` の `relations.size() == 2` であり、親タグに `"semi_reduce"` を含まないこと（二重適用防止）。
 3. probe 子グループ `probe_id` が親自身ではなく、タグが `"semi_reduce_probe:"` で始まらないこと（不動点ガード）。
-4. 結合述語の連言に左右別の子リレーションにまたがる等値比較 `col_a = col_b` が少なくとも 1 つあり、probe 側に属するキー列集合 `probe_keys` が空でないこと（自己結合や定数比較のみでは抽出されない）。
+4. probe 側に対応する関係が 1 つで、`sample_barrier` がなく、その関係の `kScan` 式が probe Group にあること。
+5. 結合述語の連言に左右別の子リレーションにまたがる等値比較 `col_a = col_b` が少なくとも 1 つあり、probe 側に属するキー列集合 `probe_keys` が空でないこと（自己結合や定数比較のみでは抽出されない）。
 
 ## 意味論的根拠（D5）
 

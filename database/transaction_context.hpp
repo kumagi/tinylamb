@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "common/string_util.hpp"
 #include "database/catalog_reader.hpp"
 #include "transaction/transaction.hpp"
 // #include "transaction/transaction_manager.hpp"
@@ -55,6 +56,10 @@ class TransactionContext {
         execution_runtime_(o.execution_runtime_) {
     o.evaluation_context_ = nullptr;
     o.execution_runtime_ = nullptr;
+    // A moved-from map is valid but its contents are unspecified; clear it so
+    // this handle cannot observe stale snapshot-bound Table/Stats pointers.
+    o.tables_.clear();
+    o.stats_.clear();
   }
   TransactionContext& operator=(TransactionContext&& o) noexcept {
     if (this == &o) {
@@ -71,9 +76,25 @@ class TransactionContext {
     o.stats_.clear();
     evaluation_context_ = nullptr;
     execution_runtime_ = nullptr;
+    o.evaluation_context_ = nullptr;
+    o.execution_runtime_ = nullptr;
     return *this;
   }
   CatalogReader* GetCatalog() const { return catalog_; }
+  // Guards tables_/stats_; DDL-side cache mutation must take this lock too
+  // (GetTable/GetStats already do) or it races parallel readers on the same
+  // context.
+  std::mutex& CacheMutex() const { return cache_mutex_; }
+  // Drops both cached images for `name` under cache_mutex_. Cache keys are
+  // always AsciiToLower'd by GetTable/GetStats, so a lowercased erase covers
+  // every variant a reader could have inserted.
+  void EraseCachedRelation(std::string_view name) {
+    std::scoped_lock lock(cache_mutex_);
+    const std::string key = AsciiToLower(name);
+    tables_.erase(key);
+    stats_.erase(key);
+  }
+  StatusOr<bool> TableExists(std::string_view name);
   StatusOr<std::shared_ptr<Table>> GetTable(std::string_view table_name);
   StatusOr<std::shared_ptr<TableStatistics>> GetStats(
       std::string_view table_name);

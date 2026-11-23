@@ -205,10 +205,10 @@ def init_duckdb(args):
 def duck_worker(args):
     import duckdb
     connection = duckdb.connect(str(args.duckdb.resolve()), read_only=True)
-    connection.execute(f'SET threads={args.threads}')
-    connection.execute("SET TimeZone='UTC'")
-    print(json.dumps({'ready': True}), flush=True)
     try:
+        connection.execute(f'SET threads={args.threads}')
+        connection.execute("SET TimeZone='UTC'")
+        print(json.dumps({'ready': True}), flush=True)
         for line in sys.stdin:
             try:
                 sql = json.loads(line)
@@ -246,15 +246,19 @@ def init_clickhouse(args):
         raise ValueError('database must be a simple identifier')
     if args.threads < 1 or args.http_port == args.native_port:
         raise ValueError('threads must be positive and server ports distinct')
-    for port in (args.http_port, args.native_port):
-        with socket.socket() as reservation:
+    reservations = []
+    try:
+        for port in (args.http_port, args.native_port):
+            reservation = socket.socket()
+            reservations.append(reservation)
+            reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             reservation.bind(('127.0.0.1', port))
-    metadata = json.loads((args.dataset / 'metadata.json').read_text())
-    root = args.root.resolve()
-    root.mkdir(parents=True, exist_ok=False)
-    for directory in ('data', 'tmp', 'user_files'):
-        (root / directory).mkdir()
-    config = f"""<clickhouse>
+        metadata = json.loads((args.dataset / 'metadata.json').read_text())
+        root = args.root.resolve()
+        root.mkdir(parents=True, exist_ok=False)
+        for directory in ('data', 'tmp', 'user_files'):
+            (root / directory).mkdir()
+        config = f"""<clickhouse>
 <logger><level>warning</level><log>{escape(str(root / 'server.log'))}</log>
 <errorlog>{escape(str(root / 'error.log'))}</errorlog></logger>
 <timezone>UTC</timezone>
@@ -275,8 +279,16 @@ def init_clickhouse(args):
 <queries>0</queries><errors>0</errors><result_rows>0</result_rows><read_rows>0</read_rows>
 <execution_time>0</execution_time></interval></default></quotas>
 </clickhouse>"""
-    (root / 'config.xml').write_text(config)
+        (root / 'config.xml').write_text(config)
+    finally:
+        # Keep both ports bound through setup, then release them only as the
+        # server is about to start. This minimizes the bind-and-close race.
+        for reservation in reservations:
+            reservation.close()
     with (root / 'stdout.log').open('w') as log:
+        # Popen has no check= argument: this is a long-lived server, not a
+        # one-shot command. Its exit status is polled in the readiness loop
+        # below, and every subsequent client command uses check=True.
         process = subprocess.Popen([str(args.binary.resolve()), 'server',
                                     '--config-file=' + str(root / 'config.xml')],
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -289,6 +301,9 @@ def init_clickhouse(args):
                 raise RuntimeError('ClickHouse exited; inspect ' + str(root / 'stdout.log'))
             if client.query('SELECT 1').get('rows') == [[1]]:
                 break
+            # Cross-process readiness poll: no in-process condition variable
+            # can signal the HTTP port coming up, and the deadline above bounds
+            # the wait to 60 seconds.
             time.sleep(.2)
         else:
             raise TimeoutError('ClickHouse startup exceeded 60 seconds')
@@ -463,7 +478,12 @@ def plot(records, out, rows, reference='clickhouse'):
     ax.set_yscale('log')
     ax.set_ylabel('Median query time (ms, log scale)')
     ax.legend()
-    ratios = [r[reference]['median_ms'] / r['tinylamb']['median_ms'] if r.get('correct') else float('nan') for r in records]
+    ratios = [
+        r[reference]['median_ms'] / r['tinylamb']['median_ms']
+        if r.get('correct') and r['tinylamb']['median_ms'] > 0
+        else float('nan')
+        for r in records
+    ]
     speed.bar(x, ratios, color=['#23856c' if r > 1 else '#b85450' for r in ratios])
     speed.set_yscale('log')
     speed.axhline(1, color='black', linewidth=.8)
@@ -510,7 +530,15 @@ def run(args):
     for name, digest in metadata['query_sha256'].items():
         if sha(dataset / name) != digest:
             raise ValueError('query changed after preparation: ' + name)
-    cpus = {int(x) for x in args.cpus.split(',')}
+    cpus = set()
+    for part in args.cpus.split(','):
+        limits = [int(value) for value in part.split('-')]
+        if len(limits) == 1:
+            cpus.add(limits[0])
+        elif len(limits) == 2 and limits[0] <= limits[1]:
+            cpus.update(range(limits[0], limits[1] + 1))
+        else:
+            parser.error('--cpus must be a comma-separated list of CPUs or ranges')
     os.sched_setaffinity(0, cpus)
     if args.server_pid:
         # Pin all current server threads, and the main thread inherited by new
@@ -584,7 +612,7 @@ def run(args):
         path = Path(relative)
         if path.suffix not in ('.cpp', '.hpp') or not path.parts or path.parts[0] not in {
                 'benchmark', 'common', 'database', 'executor', 'expression', 'index',
-                'page', 'plan', 'query', 'recovery', 'server', 'table', 'transaction', 'type'}:
+                'page', 'plan', 'query', 'server', 'table', 'type'}:
             continue
         frozen = additional / path
         frozen.parent.mkdir(parents=True, exist_ok=True)

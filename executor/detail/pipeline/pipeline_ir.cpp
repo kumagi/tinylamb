@@ -13,7 +13,7 @@ PipelineContext::PipelineContext(TransactionContext* txn_in,
     : txn(txn_in),
       spill_store(std::move(spill_options)),
       grant(std::move(grant_in)),
-      effective_dop(1),
+      
       permitted_dop(std::max<size_t>(1, dop_in)) {}
 
 size_t PipelineContext::OperatorBudgetBytes(size_t b_min) const noexcept {
@@ -25,13 +25,23 @@ size_t PipelineContext::OperatorBudgetBytes(size_t b_min) const noexcept {
   if (!grant.Unlimited()) {
     return grant.OperatorBudgetBytes(b_min);
   }
-  // An explicitly unlimited grant (e.g. a pre-acquired one) must not be
-  // silently quartered. Cap it by the query pool when that is known, but let
-  // the operator use the whole pool rather than a 1/(4 * consumers) slice.
+  // An unlimited grant (e.g. a default/pre-acquired one) still has to respect
+  // ADR 0004 #5: the query pool is shared among the operators that buffer
+  // input concurrently *and* among concurrent queries. Handing each operator
+  // the whole pool lets N OOC sinks each buffer up to the entire pool, which
+  // blows past the planner's budget and can OOM. Keep the conservative
+  // 1/(4 * active consumers) slice so the per-operator budget stays a slice of
+  // the query-wide frame.
+  // b_min is a caller's hard minimum, not a soft target: an unlimited grant
+  // has no TryConsume ceiling, so honouring it here cannot advertise memory
+  // the grant would refuse. A limited grant takes the branch above, where
+  // QueryMemoryGrant::OperatorBudgetBytes() deliberately ignores b_min and
+  // returns only the fair share actually available in the grant.
   const size_t pool_max = ProcessMemoryBudget::Global().EffectivePoolMaxBytes(
       MemoryPoolKind::kQuery);
   if (pool_max > 0) {
-    return std::max(b_min, pool_max);
+    const size_t active = std::max<size_t>(1, grant.ActiveConsumerCount());
+    return std::max<size_t>(b_min, pool_max / (4 * active));
   }
   return std::max<size_t>(b_min, size_t{64} << 20);
 }
@@ -101,26 +111,27 @@ class ScopedRenderExecutor {
 }  // namespace
 
 void DeferredPipelineSource::DumpExplain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (tl_render_executor != nullptr && upstream_stage_id_.has_value()) {
     tl_render_executor->RenderStageTree(*upstream_stage_id_, out, indent,
                                         /*is_dump=*/true);
     return;
   }
-  out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
-      << Describe() << "\n";
+  out << std::string(static_cast<size_t>(indent), ' ') << Describe() << "\n";
 }
 
 void DeferredPipelineSource::Explain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (tl_render_executor != nullptr && upstream_stage_id_.has_value()) {
     tl_render_executor->RenderStageTree(*upstream_stage_id_, out, indent,
                                         /*is_dump=*/false);
     return;
   }
-  out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
-      << Describe() << "\n";
+  out << std::string(static_cast<size_t>(indent), ' ') << Describe() << "\n";
 }
 
 void StreamingExecutorSource::DumpExplain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (exec_) {
     exec_->Dump(out, indent);
   } else {
@@ -129,6 +140,7 @@ void StreamingExecutorSource::DumpExplain(std::ostream& out, int indent) const {
 }
 
 void StreamingExecutorSource::Explain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (exec_) {
     exec_->Explain(out, indent);
   } else {
@@ -169,6 +181,7 @@ StatusOr<bool> LegacySource::NextBatch(PipelineContext* ctx, DataChunk* out,
 }
 
 void LegacySource::DumpExplain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (exec_) {
     exec_->Dump(out, indent);
   } else {
@@ -177,6 +190,7 @@ void LegacySource::DumpExplain(std::ostream& out, int indent) const {
 }
 
 void LegacySource::Explain(std::ostream& out, int indent) const {
+  indent = std::max(0, indent);
   if (exec_) {
     exec_->Explain(out, indent);
   } else {
@@ -333,17 +347,18 @@ Status PipelineExecutor::Initialize() {
     grant = std::move(acquired);
   }
 
-  const size_t tmp_op_budget =
-      ProcessMemoryBudget::Global().OpMemoryOverrideBytes() > 0
-          ? ProcessMemoryBudget::Global().OpMemoryOverrideBytes()
-          : (grant.Unlimited() ? (size_t{64} << 20)
-                               : grant.OperatorBudgetBytes());
+  // Build the context first and derive the DOP from the very budget the
+  // sinks will observe via ctx->OperatorBudgetBytes(). Using a separate
+  // 64 MiB constant for an unlimited grant here made ComputeEffectiveDop
+  // pick a worker count on a different scale from the real per-operator
+  // budget (too many workers -> each requesting the whole pool -> OOM, or
+  // too few -> lost parallelism).
+  ctx_ = std::make_unique<PipelineContext>(txn_, std::move(grant));
+
   const size_t min_dop_bytes =
       std::max<size_t>(size_t{64} << 10, graph_.min_grant_bytes);
-  const size_t dop = QueryMemoryGrant::ComputeEffectiveDop(
-      graph_.requested_dop, tmp_op_budget, min_dop_bytes);
-
-  ctx_ = std::make_unique<PipelineContext>(txn_, std::move(grant), dop);
+  ctx_->permitted_dop = QueryMemoryGrant::ComputeEffectiveDop(
+      graph_.requested_dop, ctx_->OperatorBudgetBytes(), min_dop_bytes);
   OocQueryScope ooc_scope(&ctx_->ooc_metrics);
 
   if (graph_.stages.empty()) {
@@ -574,15 +589,24 @@ void PipelineExecutor::RenderStageTree(size_t stage_idx, std::ostream& out,
   }
 }
 
+const std::string& PipelineExecutor::PlanExplainText() const {
+  if (!graph_.plan_explain_text.empty() || !graph_.plan_explain_producer) {
+    return graph_.plan_explain_text;
+  }
+  std::call_once(plan_explain_once_, [this] {
+    lazy_plan_explain_text_ = graph_.plan_explain_producer();
+  });
+  return lazy_plan_explain_text_;
+}
+
 void PipelineExecutor::Dump(std::ostream& output, int indent) const {
   ScopedRenderExecutor render_guard(this);
-  const std::string pad(static_cast<size_t>(std::max(0, indent)), ' ');
-  if (graph_.plan_explain_text.empty() && graph_.plan_explain_producer) {
-    graph_.plan_explain_text = graph_.plan_explain_producer();
-  }
-  if (!graph_.plan_explain_text.empty()) {
-    output << graph_.plan_explain_text;
-    if (graph_.plan_explain_text.back() != '\n') {
+  indent = std::max(0, indent);
+  const std::string pad(static_cast<size_t>(indent), ' ');
+  const std::string& plan_text = PlanExplainText();
+  if (!plan_text.empty()) {
+    output << plan_text;
+    if (plan_text.back() != '\n') {
       output << '\n';
     }
   } else if (!graph_.stages.empty()) {
@@ -604,11 +628,10 @@ void PipelineExecutor::Dump(std::ostream& output, int indent) const {
 
 void PipelineExecutor::Explain(std::ostream& output, int indent) const {
   ScopedRenderExecutor render_guard(this);
-  if (graph_.plan_explain_text.empty() && graph_.plan_explain_producer) {
-    graph_.plan_explain_text = graph_.plan_explain_producer();
-  }
-  if (!graph_.plan_explain_text.empty()) {
-    output << graph_.plan_explain_text;
+  indent = std::max(0, indent);
+  const std::string& plan_text = PlanExplainText();
+  if (!plan_text.empty()) {
+    output << plan_text;
     return;
   }
   if (!graph_.stages.empty()) {

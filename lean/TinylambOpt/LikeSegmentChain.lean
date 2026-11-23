@@ -22,11 +22,9 @@ Optimized procedures:
 * `greedyChainBack` — scan backward from the tail anchor, always taking the
   *latest* occurrence that fits before the next segment.
 
-The main theorem shows that greedy search decides the reference match in both
-modes.  In particular the two boundary cases of the issue are handled:
-`%aa%aa%` fails on `aaa` because the two `aa` runs must be disjoint, and
-`%ab` on `abab` is accepted because the anchored tail is found by the
-backward search (the first `ab` is *not* frozen as the tail candidate).
+The forward and backward searches decide ordered non-overlapping occurrences.
+For a row-end anchor the match must end exactly at the boundary. anchoredChain
+strips the specified head and tail and runs the forward search on the interior.
 
 Sufficient hypotheses (checked by the C++ implementation): binary collation
 (byte equality), non-NULL single-row input, escape interpretation already
@@ -360,18 +358,32 @@ theorem head_anchored_chain_sound (s : List Byte) (seg0 : List Byte)
   rw [greedyChain_iff]
   exact ⟨fun h => ⟨h0, h⟩, fun h => h.2⟩
 
-/-- **Soundness of the `%`-segment chain compilation.**
-
-    The forward conjunct covers a pattern with a trailing `%` (e.g.
-    `%aa%aa%`), the backward conjunct a pattern whose last literal is
-    anchored at the row end (e.g. `%ab`).  Both statements are equivalences:
-    the generated search accepts exactly the rows accepted by the reference
-    LIKE evaluator, so no false positives and no false negatives. -/
+/-- Forward and backward occurrence searches for a chain of binary literals.
+    anchored_chain_iff below handles the exact row boundaries. -/
 theorem like_segment_chain_sound (s : List Byte) (segs : List (List Byte)) (start : Nat)
     (_hnz : ∀ seg ∈ segs, 0 < seg.length) :
     ((∃ ps, greedyChain s segs start = some ps) ↔ ChainMatchFrom s segs start) ∧
     ((∃ ps, greedyChainBack s segs.reverse s.length = some ps) ↔
       ChainMatchBack s segs.reverse s.length) :=
   ⟨greedyChain_iff s segs start, greedyChainBack_iff s segs.reverse s.length⟩
+
+/-- Pattern head % seg1 % ... % segN % tail. Empty head or tail
+    denotes an open end. Strip both anchors before searching the interior. -/
+def anchoredChain (s head tail : List Byte) (segs : List (List Byte)) : Bool :=
+  let body := (s.drop head.length).take (s.length - head.length - tail.length)
+  decide (s = head ++ body ++ tail) && (greedyChain body segs 0).isSome
+
+theorem anchored_chain_iff (s head tail : List Byte) (segs : List (List Byte)) :
+    anchoredChain s head tail segs = true ↔
+      ∃ body, s = head ++ body ++ tail ∧ ChainMatchFrom body segs 0 := by
+  simp only [anchoredChain, Bool.and_eq_true, decide_eq_true_eq, Option.isSome_iff_exists]
+  constructor
+  · rintro ⟨h, hm⟩
+    exact ⟨_, h, (greedyChain_iff ..).mp hm⟩
+  · rintro ⟨body, rfl, hm⟩
+    simpa [List.append_assoc, Nat.add_assoc] using (greedyChain_iff ..).mpr hm
+
+example : anchoredChain [97,98,97] [] [97,98] [] = false ∧
+    anchoredChain [97,98,97,98] [] [97,98] [] = true := by decide
 
 end TinylambOpt.LikeSegmentChain

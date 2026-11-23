@@ -88,4 +88,4 @@ searched CASE 式 `CASE WHEN a = b THEN NULL ELSE a END` において、式 $a$ 
 - `ExpressionRewriteTest.CoalesceAndNullifSimplification`:
   `NULLIF(x, x)` $\to$ NULL、`NULLIF(42, 42)` $\to$ NULL、`NULLIF(42, 99)` $\to$ 42、`NULLIF(x, NULL)` $\to$ $x$、ならびに `NULLIF(NaN, NaN)` が NaN を維持することを検証します。
 - `ExpressionRewriteTest.DeterministicFunctionCse`:
-  例外を送出し得る式（`CAST(-inf AS INT64)`）や非決定性関数を含む式において、不適切な定数縮退が抑止されることを確認します。
+  NULLIF と同一式の簡約で、例外を抑止してしまう式や NaN を含む列式を保守的に残すことを確認します。`CAST(-inf AS INT64)` の具体例はこのテストには含まれません。

@@ -21,10 +21,12 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "benchmark/tpcds_fixture.hpp"
@@ -99,14 +101,14 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       return false;
     }
   }
+  std::unordered_set<std::string_view> seen_queries;
   for (const std::string& requested : options->only_queries) {
     const bool known = std::ranges::any_of(
         tinylamb::tpcds::kQueries,
         [&requested](const tinylamb::tpcds::TpcdsQuery& query) {
           return query.name == requested;
         });
-    if (!known || std::count(options->only_queries.begin(),
-                             options->only_queries.end(), requested) != 1) {
+    if (!known || !seen_queries.insert(requested).second) {
       return false;
     }
   }
@@ -232,8 +234,10 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
   tinylamb::Table destination = std::move(found.Value());
   int64_t in_transaction = 0;
   for (const tinylamb::Row& row : rows) {
-    if (!destination.Insert(context.txn_, row).HasValue()) {
-      *error = "insert failed for " + std::string(table);
+    const auto inserted = destination.Insert(context.txn_, row);
+    if (!inserted.HasValue()) {
+      *error = "insert failed for " + std::string(table) + ": " +
+               inserted.GetStatus().GetMessage();
       context.Abort();
       return false;
     }
@@ -315,7 +319,11 @@ size_t MetricValue(std::string_view text, std::string_view metric) {
   size_t value = 0;
   while (position < text.size() && text[position] >= '0' &&
          text[position] <= '9') {
-    value = (value * 10) + static_cast<size_t>(text[position] - '0');
+    const auto digit = static_cast<size_t>(text[position] - '0');
+    if (value > (std::numeric_limits<size_t>::max() - digit) / 10) {
+      return std::numeric_limits<size_t>::max();
+    }
+    value = (value * 10) + digit;
     ++position;
   }
   return value;
@@ -436,6 +444,7 @@ int main(int argc, char** argv) {
       continue;
     }
     QueryProfile best;
+    best.name = query.name;
     best.milliseconds = -1;
     bool any_ok = false;
     bool any_failed = false;
@@ -453,9 +462,6 @@ int main(int argc, char** argv) {
         if (first_error.empty()) {
           first_error = profile.error;
         }
-        if (best.milliseconds < 0) {
-          best = std::move(profile);
-        }
         continue;
       }
       any_ok = true;
@@ -463,11 +469,16 @@ int main(int argc, char** argv) {
         best = std::move(profile);
       }
     }
-    if (!any_ok || any_failed) {
+    if (!any_ok) {
       ++failed;
       std::cout << "TPCDS_PROFILE " << best.name << " ERROR "
                 << (first_error.empty() ? best.error : first_error) << '\n';
       continue;
+    }
+    if (any_failed) {
+      std::cerr << "warning: " << query.name
+                << " had a failed trial; reporting the best successful run"
+                << " (" << first_error << ")\n";
     }
     if (best.plan.empty()) {
       best.plan = std::move(first_plan);

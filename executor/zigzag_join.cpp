@@ -99,10 +99,8 @@ bool ZigZagJoin::LoadLeft() {
     }
     const Value& value = candidate.row[left_key_];
     if (value.IsNull()) {
-      if (left_order_.previous.has_value()) {
-        return FailWith(StatusError(StatusCode::kInvalidArgument,
-                                    "ZigZagJoin left input is not ordered"));
-      }
+      // NULL keys never participate in the merge. Ignore them for monotonic
+      // validation so either NULLS FIRST or NULLS LAST input is accepted.
       continue;
     }
     if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
@@ -151,10 +149,8 @@ bool ZigZagJoin::LoadRight() {
       }
       const Value& value = candidate.row[right_key_];
       if (value.IsNull()) {
-        if (right_order_.previous.has_value()) {
-          return FailWith(StatusError(StatusCode::kInvalidArgument,
-                                      "ZigZagJoin right input is not ordered"));
-        }
+        // NULL keys are never materialized into the searchable right side.
+        // Their placement must not affect ordering of non-NULL keys.
         continue;
       }
       if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
@@ -168,7 +164,16 @@ bool ZigZagJoin::LoadRight() {
                                     "ZigZagJoin right input is not ordered"));
       }
       right_order_.previous = key;
-      right_charge_.Add(EstimateRowBytes(candidate.row) + sizeof(RowPosition));
+      // The whole ordered right side stays resident for binary search, so it
+      // must be budget-charged like BandJoin's materialization: force-charging
+      // with Add() used to let a huge right input grow until the process OOMed
+      // instead of failing cleanly at the query memory limit.
+      if (!right_charge_.TryAdd(EstimateRowBytes(candidate.row) +
+                                sizeof(RowPosition))) {
+        return FailWith(StatusError(
+            StatusCode::kMemoryLimitExceeded,
+            "ZigZagJoin right input exceeds query memory budget"));
+      }
       right_rows_.push_back(std::move(candidate));
     }
   }

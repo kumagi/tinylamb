@@ -146,7 +146,7 @@ on election_timeout():            // follower のみ
         → 過半の grant が揃うまで待つ(タイムアウト=再度引き直してやり直し)
   過半に満たない場合: 何も状態変更せず待機し直す。
   // 効果: リーダーから分離されたノードが term を無闇に増やして
-  //        復帰後に集群を攪乱するのを防ぐ(§14 E-2)。
+  //        復帰後にクラスタを攪乱するのを防ぐ(§14 E-2)。
 
   // 第 2 段: 本選挙
   current_term += 1; voted_for = self; persist_meta();   // ←fsync 必須
@@ -164,7 +164,7 @@ on RequestVote(pre_vote, term, candidate, last_log_index, last_log_term):
       last_log_term > LogLastTerm() ||
       (last_log_term == LogLastTerm() && last_log_index >= LogLastIndex());
       // 「ログが自分以上に新しい」判定。古いログの候補者はリーダーになれない
-      // (コミット済みエントリの上書き防止、選出安全性 P-2)。
+      // (コミット済みエントリの上書き防止、選出安全性 P-1)。
   if (pre_vote) {
     grant = up_to_date && (最後の leader 通信から election_timeout 経過);
     reply(current_term, grant);                       // 永続化しない
@@ -221,7 +221,7 @@ on AppendEntriesReply(rpc_seq, term, success, match, conflict_*):
 を課さずに過半複製だけでコミットすると、term 2 の一時過半が作ったエントリが、
 term 3 の正リーダーによって別内容に上書きされ、既に適用済みのノードと分岐する
 構成が存在する(Raft 論文 figure 8)。no-op 導入とこの条件の組み合わせにより、
-「選出されたリーダーのログはコミット済みログ全体を必ず含む」(P-3)が成立する。
+「選出されたリーダーのログはコミット済みログ全体を必ず含む」(P-2)が成立する。
 
 ### 7.2 受信者側(フォロワー/learner)
 
@@ -239,7 +239,7 @@ on AppendEntries(term, leader, prev_log_index, prev_log_term, entries, leader_co
     if (自分のログに index(e) がある) {
       if (log[e.index].term != e.term)
         { log を index(e) 以降で切り詰め; 以降の e を追記; }
-      // term が一致する既存エントリは内容も一致する(ログ整合性 P-4)。スキップ。
+      // term が一致する既存エントリは内容も一致する(ログ整合性 P-3)。スキップ。
     } else log.push_back(e);
   persist_log();                    // ←fsync。これが成功応答の耐久性の本体。
   if (leader_commit > commit_index) {

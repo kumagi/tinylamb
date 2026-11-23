@@ -132,8 +132,7 @@ struct RPred {
   bool between_hi_null{false};
   std::vector<int64_t> in_list{};
   int64_t str_const{0};  // index into kStrPool
-  int str_pattern{
-      0};  // 0 = '%', 1 = '_', 2 = 'a%', 3 = '%b', 4 = 'b%', 5 = 'bb', 6 = 'c%'
+  int str_pattern{0};  // Index into the five patterns rendered below.
   bool bool_positive{true};
   int64_t mask{1};
   int64_t arith_const{0};
@@ -620,7 +619,7 @@ RPredPtr LeafPredicate(Gen& g) {
 }
 
 // `flavour` biases the search space (driven by the plan-feedback bandit):
-// 0 = default, 1 = shallower trees, 2 = boolean-heavy (no NOT nodes).
+// 0 = default, 1 = shallower trees, 2 = AND-heavy trees (no NOT nodes).
 RPredPtr GenPredicate(Gen& g, int depth, int flavour) {
   if (depth <= 0 || g.Chance(40 + (flavour * 10))) {
     return LeafPredicate(g);
@@ -2627,12 +2626,16 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose,
   }
   ScopedDb sdb("sql_oracle_replay");
   if (sdb.get() == nullptr) {
-    // Resource pressure: replay skipped, not a mismatch. Report the skip so
-    // the caller does not count the iteration's families as executed.
+    // Resource pressure: no oracle ran, so this is not a mismatch. The
+    // generation path consults `skipped` before looking at the report, but
+    // regression guards call this with `skipped == nullptr` (and expect a
+    // non-empty report only when something actually reproduced); return a
+    // diagnostic there so a replay that never opened a database cannot be
+    // mistaken for "all oracles hold".
     if (skipped != nullptr) {
       *skipped = true;
     }
-    return "";
+    return "replay skipped: could not create database (resource pressure)";
   }
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
@@ -2878,7 +2881,11 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
     out += "-- xmode: " + sql + "\n";
   }
   if (!failure_summary.empty()) {
-    out += "-- failure: " + failure_summary + "\n";
+    out += "-- failure: ";
+    for (const char ch : failure_summary) {
+      out += (ch == '\n' || ch == '\r') ? ' ' : ch;
+    }
+    out += "\n";
   }
   return out;
 }
@@ -3142,11 +3149,14 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
                    ";");
   }
 
-  // Execute each equivalent variant once so the oracle still exercises the
-  // engine, but do NOT turn wall-clock timing into a finding: scheduler noise
-  // and concurrent ctest load make a time-based MISMATCH flaky, and a flaky
-  // regression guard is worse than none (it fails clean seeds under load).
-  for (const std::string& sql : sqls) {
+  // Execute each equivalent variant and compare their result rows: the
+  // mirror proved the predicates equivalent, so divergent COUNT(*) values are
+  // a real optimizer/executor bug. Do NOT turn wall-clock timing into a
+  // finding, though: scheduler noise and concurrent ctest load make a
+  // time-based MISMATCH flaky, and a flaky guard is worse than none.
+  std::vector<std::string> baseline;
+  for (size_t i = 0; i < sqls.size(); ++i) {
+    const std::string& sql = sqls[i];
     std::string error;
     auto rows = RunRows(db, ctx, sql, &error);
     if (!rows.has_value()) {
@@ -3154,6 +3164,28 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
         std::cerr << "[sql_oracle][amoeba-skip]\n";
       }
       return "";
+    }
+    std::vector<std::string> got;
+    got.reserve(rows->size());
+    for (const Row& r : *rows) {
+      got.push_back(r.ToString());
+    }
+    if (i == 0) {
+      baseline = std::move(got);
+      continue;
+    }
+    if (got != baseline) {
+      std::string report =
+          "[AMOEBA MISMATCH] equivalent predicates returned different rows\n";
+      report += "  baseline: " + sqls[0] + "\n";
+      for (const std::string& r : baseline) {
+        report += "    " + r + "\n";
+      }
+      report += "  variant:  " + sql + "\n";
+      for (const std::string& r : got) {
+        report += "    " + r + "\n";
+      }
+      return report;
     }
   }
   return "";
@@ -3182,9 +3214,18 @@ void OracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   if (!ParseOracleTest(text, &parsed_seed, &parsed, &summary)) {
     verify = "internal error: serialized test does not parse";
   } else {
-    verify = ReplayOracleTrace(parsed, false);
-    if (verify.empty()) {
-      verify = "internal error: serialized test replay holds (flaky mismatch)";
+    bool skipped = false;
+    verify = ReplayOracleTrace(parsed, false, &skipped);
+    if (skipped) {
+      // Verification never ran (e.g. quota pressure prevented a fresh
+      // ScopedDb). An empty report there is NOT a clean replay, and labelling
+      // it "flaky" would silently discard a real finding — keep the finding
+      // and say exactly why the replay was inconclusive.
+      verify =
+          "internal error: replay skipped (no database; resource pressure)";
+    } else if (verify.empty()) {
+      verify = MakeFlakyVerify(
+          "internal error: serialized test replay holds (flaky mismatch)");
     }
   }
 

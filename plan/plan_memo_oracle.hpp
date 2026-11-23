@@ -27,8 +27,10 @@ namespace tinylamb {
 //      conditions match the stored conjuncts);
 //   2. determinism (rebuild + re-explore yields identical group/expression
 //      counts);
-//   3. monotonicity (a reduced rule set never enumerates more root
-//      alternatives than the default rule set).
+//   3. deterministic re-exploration (rebuilding and exploring again yields
+//      the same group and root-expression counts);
+//   4. reduced-rule-set sanity (removing associativity must not empty or
+//      collapse a multi-alternative root to one alternative).
 //
 // Any non-empty return is a logic bug. ShrinkJoinGraph reduces a failing
 // graph while the mismatch (as reported by CheckExploreEquivalence) is
@@ -65,7 +67,8 @@ std::string CheckMemoInvariants(const cascades::Memo& memo,
 
 // Full oracle for one generated graph: fresh-build invariants, Explore with
 // the default rule set, post-explore structural invariants, determinism, and
-// rule-subset monotonicity. Returns "" when all properties hold.
+// a reduced-rule-set sanity check (removing the two associativity rules must
+// still leave the root non-empty). Returns "" when all properties hold.
 std::string CheckExploreEquivalence(const GeneratedJoinGraph& graph);
 
 // Bounded delta-shrinker: greedily drops conjuncts one by one, then relations

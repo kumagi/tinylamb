@@ -119,9 +119,14 @@ TEST_F(LoggerTest, AuditFuzzerWaitsForAcknowledgedPayloads) {
 }
 
 TEST_F(LoggerTest, Construct) {
-  // Arrange -- nothing to set up; default Logger constructed by SetUp()
-  // Act -- nothing to execute; default constructed via SetUp()
-  // Assert -- nothing to verify; gtest green on pass, death on crash
+  // SetUp() creates a Logger on a fresh random log; a successful construction
+  // must leave all three LSN clocks at zero.  Every other test relies on this
+  // starting state, so pin it here instead of leaving the case empty.
+  ASSERT_NE(l_, nullptr);
+  EXPECT_EQ(l_->BufferedLSN(), 0U);
+  EXPECT_EQ(l_->CommittedLSN(), 0U);
+  EXPECT_EQ(l_->DurableLSN(), 0U);
+  EXPECT_EQ(l_->RingFloorLSN(), 0U);
 }
 
 TEST_F(LoggerTest, AppendOne) {
@@ -224,7 +229,7 @@ TEST_F(LoggerTest, Verify) {
   std::string written_log = RandomString(1024);
 
   // Act -- append the string; wait for commit; read back via ifstream
-  l_->AddLog(written_log);
+  ASSERT_SUCCESS(l_->AddLog(written_log).GetStatus());
   WaitForCommit(written_log.size());
   std::ifstream file;
   file.open(log_name_);
@@ -247,8 +252,8 @@ TEST_F(LoggerTest, WaitForDurableObservesFsync) {
 
 TEST_F(LoggerTest, FinishDrainsWithoutSpin) {
   std::string payload(4096, 'z');
-  l_->AddLog(payload);
-  l_->Finish();
+  ASSERT_SUCCESS(l_->AddLog(payload).GetStatus());
+  ASSERT_SUCCESS(l_->Finish());
   EXPECT_EQ(l_->CommittedLSN(), payload.size());
   EXPECT_GE(l_->DurableLSN(), payload.size());
   l_.reset();
@@ -265,7 +270,7 @@ TEST_F(LoggerTest, ReopenExistingWalKeepsContent) {
   // append zero-filled buffer bytes over the tail of the log.
   const std::string first(128, 'x');
   ASSERT_EQ(l_->AddLog(first).Value(), 0);
-  l_->WaitForDurable(first.size());
+  ASSERT_SUCCESS(l_->WaitForDurable(first.size()));
   l_.reset();
 
   auto second = Logger::Create(log_name_, 32, 1).MoveValue();
@@ -332,7 +337,7 @@ TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
   auto logger = Logger::Create(log_name_, kBufSize, 1).MoveValue();
 
   // Arrange -- exactly fill the ring buffer so both producers must park.
-  logger->AddLog(std::string(kBufSize, 'f'));
+  ASSERT_SUCCESS(logger->AddLog(std::string(kBufSize, 'f')).GetStatus());
   lsn_t first_lsn = 0;
   lsn_t second_lsn = 0;
 
@@ -343,7 +348,7 @@ TEST_F(LoggerTest, AddLogReturnsFreshLsnAfterBufferFullWait) {
       [&] { second_lsn = logger->AddLog(std::string(16, 'b')).Value(); });
   a.join();
   b.join();
-  logger->WaitForDurable(kBufSize + 32);
+  ASSERT_SUCCESS(logger->WaitForDurable(kBufSize + 32));
 
   // Assert -- distinct, non-overlapping start positions covering
   // [kBufSize, kBufSize + 32); a stale LSN would collide with the sibling's.
@@ -404,7 +409,7 @@ TEST_F(LoggerTest, D1NoRecordsInterleavedAcrossProducers) {
   for (auto& th : producers) {
     th.join();
   }
-  logger->Finish();
+  ASSERT_SUCCESS(logger->Finish());
 
   // Assert -- sequential parse: magic, length and fill bytes must match for
   // every record; an interleaved fragment fails this walk immediately.
@@ -624,7 +629,8 @@ TEST_F(LoggerTest, TryCopyBufferedNeverServesPreopenBytes) {
   {
     auto first = Logger::Create(log_name_, 512, 60'000).MoveValue();
     ASSERT_TRUE(first != nullptr);
-    first->AddLog("seeded bytes below the reopen point");
+    ASSERT_SUCCESS(
+        first->AddLog("seeded bytes below the reopen point").GetStatus());
     ASSERT_SUCCESS(first->WaitForDurable(first->BufferedLSN()));
   }
   auto reopened = Logger::Create(log_name_, 512, 60'000).MoveValue();
@@ -844,7 +850,7 @@ TEST_F(LoggerTest, FixedFrameWithoutMetadataIsNeverMigratedAsLegacyBytes) {
     ASSERT_SUCCESS(fixed->AddLog("committed").GetStatus());
     ASSERT_SUCCESS(fixed->Finish());
   }
-  std::filesystem::remove(Logger::SegmentMetadataPath(log_name_));
+  EXPECT_TRUE(std::filesystem::remove(Logger::SegmentMetadataPath(log_name_)));
   EXPECT_FALSE(Logger::Create(log_name_, 32, 1, 2048).HasValue());
   EXPECT_EQ(std::filesystem::file_size(log_name_), 4160);
   EXPECT_FALSE(std::filesystem::exists(Logger::SegmentPath(log_name_, 1)));

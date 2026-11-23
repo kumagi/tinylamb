@@ -199,11 +199,14 @@ class ChunkedCharge {
   ChunkedCharge(ChunkedCharge&&) = delete;
   ChunkedCharge& operator=(ChunkedCharge&&) = delete;
   ~ChunkedCharge() {
-    if (slack_ != 0) {
+    if (charge_ != nullptr && slack_ != 0) {
       charge_->Release(slack_);
     }
   }
   [[nodiscard]] bool TryAdd(size_t bytes) {
+    if (charge_ == nullptr) {
+      return true;
+    }
     if (bytes <= slack_) {
       slack_ -= bytes;
       return true;
@@ -216,6 +219,9 @@ class ChunkedCharge {
     return charge_->TryAdd(bytes);  // close to the limit: stay exact
   }
   void Add(size_t bytes) {
+    if (charge_ == nullptr) {
+      return;
+    }
     if (bytes <= slack_) {
       slack_ -= bytes;
       return;

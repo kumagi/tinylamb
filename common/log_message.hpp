@@ -116,8 +116,9 @@ class LogStream {
 
   template <size_t N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
-    if (!enabled_)
+    if (!enabled_) {
       return *this;  // NOLINT(readability-braces-around-statements)
+}
     // Route through string_view with the explicit array extent: streaming the
     // raw array pointer would make the ostream call strlen(), reading past the
     // array when it is not NUL-terminated and truncating embedded NUL bytes.
@@ -127,8 +128,9 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::unordered_set<T>& rhs) {
-    if (!enabled_)
+    if (!enabled_) {
       return *this;  // NOLINT(readability-braces-around-statements)
+}
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -144,8 +146,9 @@ class LogStream {
 
   template <typename K, typename V>
   LogStream& operator<<(const std::unordered_map<K, V>& rhs) {
-    if (!enabled_)
+    if (!enabled_) {
       return *this;  // NOLINT(readability-braces-around-statements)
+}
     message_ << "{";
     bool first = true;
     for (const auto& r : rhs) {
@@ -161,8 +164,9 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const std::vector<T>& rhs) {
-    if (!enabled_)
+    if (!enabled_) {
       return *this;  // NOLINT(readability-braces-around-statements)
+}
     message_ << "[";
     bool first = true;
     for (const auto& r : rhs) {
@@ -178,8 +182,9 @@ class LogStream {
 
   template <typename T>
   LogStream& operator<<(const T& rhs) {
-    if (!enabled_)
+    if (!enabled_) {
       return *this;  // NOLINT(readability-braces-around-statements)
+}
     message_ << rhs;
     return *this;
   }

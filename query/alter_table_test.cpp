@@ -88,7 +88,8 @@ TEST_F(AlterTableTest, RenameTableMovesRowsAndDropsOldName) {
   StatusOr<Executor> stale = engine_->Prepare(*context_, "SELECT * FROM base;");
   EXPECT_FALSE(stale.HasValue());
   Commit();
-  // The rename persists across a reopen (close first: WAL single-writer).
+  // The rename persists across a reopen. Tear down the engine, context, and
+  // database before reopening so PagePool can retire its in-memory pages.
   engine_.reset();
   context_.reset();
   database_.reset();

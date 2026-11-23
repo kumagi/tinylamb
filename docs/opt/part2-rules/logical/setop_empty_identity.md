@@ -52,7 +52,7 @@ graph TD
 
 1. 子ノード数が 2 以上であり、少なくとも 1 つの子グループが `LogicalOperator::kEmpty` 式を保持していること。
 2. **UNION ALL**: 空でない残存分岐（survivors）の関係集合の和集合が、ルートグループの関係集合と一致すること。残存分岐数が 1 の場合はその分岐の式をルートへ複製（`copy_child`）し、2 以上の場合は空分岐を除去した `kUnionAll` を登録します。全分岐が空の場合は発火しません。
-3. **UNION（DISTINCT）**: 残存分岐数が 1 の場合はその分岐の上に `kDistinct` を配置した式を登録し、2 以上の場合は派生グループ（`"setop-empty-union-all"`）に空除去後の `kUnionAll` を作成した上で `kDistinct` を被せる。
+3. **UNION（DISTINCT）**: 残存分岐数が 1 の場合はその分岐の上に `kDistinct` を配置した式を登録し、2 以上の場合は派生グループ（`"setop-empty-union-all:" + GroupIdsTag(survivors)`）に空除去後の `kUnionAll` を作成した上で `kDistinct` を被せる。タグに残存分岐の Group ID 列を含めることで、同じリレーション集合でも残存分岐構成が異なる UNION 同士が派生グループを誤って共有するのを防ぎます。
 4. **EXCEPT ALL**: 末尾の子（右側の減算対象）が空であり、先頭分岐（左入力）の関係集合がルートグループと一致する場合に限り、先頭分岐の式をルートへ複製します。先頭（左側）が空の場合は本 Rule の対象外です。
 5. **EXCEPT（DISTINCT）**: 右側が空の場合に限り、先頭分岐の上に `kDistinct` を配置した式を登録します。
 

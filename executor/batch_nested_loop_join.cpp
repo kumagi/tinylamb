@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,6 +14,7 @@
 #include "common/join_kind.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/disjunctive_join_branches.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/join_kind.hpp"
@@ -40,15 +42,14 @@ BatchNestedLoopJoin::BatchNestedLoopJoin(Executor left, Schema left_schema,
       block_size_(std::max<size_t>(16, block_size)),
       combined_schema_(left_schema_ + right_schema_) {}
 
-bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
-                                            const Row& right) const {
+StatusOr<bool> BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
+                                                      const Row& right) {
   if (!predicate_) {
     return true;
   }
   // Predicate errors (e.g. division by zero) must propagate to the caller:
   // swallowing them as FALSE corrupts Anti-join output (a failed match would
-  // emit the outer row instead of erroring).  The error is recorded in the
-  // sticky predicate_error_ and re-surfaced by Next().
+  // emit the outer row instead of erroring).
   predicate_scratch_.values_.clear();
   predicate_scratch_.values_.reserve(left.values_.size() +
                                      right.values_.size());
@@ -61,26 +62,140 @@ bool BatchNestedLoopJoin::EvaluatePredicate(const Row& left,
     // An inner-join predicate is a WHERE-level filter: conjuncts may have
     // been reordered by canonicalization, so a sibling that cleanly rejects
     // the pair suppresses errors from the rest (commutative semantics).
-    StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
+    return relational_detail::EvaluateConjunctsTolerant(
         predicate_conjuncts_, [&](const Expression& conjunct) {
           return conjunct->TryEvaluate(combined, combined_schema_);
         });
-    if (!pass.HasValue()) {
-      if (predicate_error_.ok()) {
-        predicate_error_ = pass.GetStatus();
-      }
-      return false;
-    }
-    return pass.Value();
   }
   StatusOr<Value> res = predicate_->TryEvaluate(combined, combined_schema_);
   if (!res.HasValue()) {
-    if (predicate_error_.ok()) {
-      predicate_error_ = res.GetStatus();
-    }
-    return false;
+    return res.GetStatus();
   }
   return !res.Value().IsNull() && res.Value().Truthy();
+}
+
+bool BatchNestedLoopJoin::TryExecuteDisjunctiveHashJoin(
+    const std::vector<std::pair<Row, RowPosition>>& right_rows) {
+  if (kind_ != JoinKind::kInner && kind_ != JoinKind::kLeftOuter) {
+    return false;
+  }
+  if (right_rows.empty() ||
+      right_rows.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  auto specs = relational_detail::ExtractDisjunctiveJoinBranches(
+      predicate_, left_schema_, right_schema_, combined_schema_);
+  if (!specs.has_value()) {
+    return false;
+  }
+
+  // Lean proof: lean/TinylambOpt/OuterOrBranches.lean (outer_or_branches_sound)
+  const size_t branch_count = specs->size();
+  std::vector<relational_detail::DisjunctiveBranchBuckets> buckets;
+  buckets.reserve(branch_count);
+  for (size_t b = 0; b < branch_count; ++b) {
+    buckets.emplace_back(std::move((*specs)[b]));
+    buckets.back().Reserve(right_rows.size());
+  }
+  for (size_t r = 0; r < right_rows.size(); ++r) {
+    const Row& r_row = right_rows[r].first;
+    for (size_t b = 0; b < branch_count; ++b) {
+      if (!buckets[b].AddRightRow(static_cast<uint32_t>(r), r_row)) {
+        return false;
+      }
+    }
+  }
+
+  const Row null_right(std::vector<Value>(right_schema_.ColumnCount()));
+  size_t total_bytes = 0;
+  DataChunk left_batch;
+
+  while (left_ != nullptr && left_->NextBatch(&left_batch, block_size_) != 0) {
+    for (size_t li = 0; li < left_batch.Size(); ++li) {
+      const Row l_row = left_batch.RowAt(li);
+      const RowPosition l_pos = left_batch.PositionAt(li);
+      bool matched_any = false;
+
+      auto eval_candidate = [&](size_t branch_idx, uint32_t r_idx) -> Status {
+        const Row& r_row = right_rows[r_idx].first;
+        predicate_scratch_.values_.clear();
+        predicate_scratch_.values_.reserve(l_row.values_.size() +
+                                           r_row.values_.size());
+        predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
+                                          l_row.values_.begin(),
+                                          l_row.values_.end());
+        predicate_scratch_.values_.insert(predicate_scratch_.values_.end(),
+                                          r_row.values_.begin(),
+                                          r_row.values_.end());
+
+        StatusOr<Value> res = buckets[branch_idx].Spec().expr->TryEvaluate(
+            predicate_scratch_, combined_schema_);
+        if (!res.HasValue()) {
+          return res.GetStatus();
+        }
+        if (res.Value().IsNull() || !res.Value().Truthy()) {
+          return Status::kSuccess;
+        }
+        // Exclusive branch guard (Lean `orBranch1`): emit on branch_idx iff
+        // IS_TRUE(d_{branch_idx}) AND NOT IS_TRUE(d_j) for every j <
+        // branch_idx.
+        for (size_t j = 0; j < branch_idx; ++j) {
+          StatusOr<Value> prev = buckets[j].Spec().expr->TryEvaluate(
+              predicate_scratch_, combined_schema_);
+          if (!prev.HasValue()) {
+            return prev.GetStatus();
+          }
+          if (!prev.Value().IsNull() && prev.Value().Truthy()) {
+            return Status::kSuccess;
+          }
+        }
+        StatusOr<bool> exact_match = EvaluatePredicate(l_row, r_row);
+        if (!exact_match.HasValue()) {
+          return exact_match.GetStatus();
+        }
+        if (!exact_match.Value()) {
+          return Status::kSuccess;
+        }
+        matched_any = true;
+        output_.emplace_back(Row(predicate_scratch_), l_pos);
+        total_bytes += EstimateRowBytes(output_.back().first);
+        return Status::kSuccess;
+      };
+
+      for (size_t b = 0; b < branch_count; ++b) {
+        std::span<const uint32_t> cands;
+        if (buckets[b].Probe(l_row, &cands)) {
+          for (const uint32_t r_idx : cands) {
+            const Status st = eval_candidate(b, r_idx);
+            if (!st.ok()) {
+              output_.clear();
+              FailWith(st);
+              return true;
+            }
+          }
+        } else {
+          for (size_t r_idx = 0; r_idx < right_rows.size(); ++r_idx) {
+            const Status st = eval_candidate(b, static_cast<uint32_t>(r_idx));
+            if (!st.ok()) {
+              output_.clear();
+              FailWith(st);
+              return true;
+            }
+          }
+        }
+      }
+      if (!matched_any && kind_ == JoinKind::kLeftOuter) {
+        output_.emplace_back(l_row + null_right, l_pos);
+        total_bytes += EstimateRowBytes(output_.back().first);
+      }
+    }
+  }
+  if (left_ != nullptr && FailWithChildOf(*left_)) {
+    output_.clear();
+    return true;
+  }
+  charge_.Add(total_bytes);
+  return true;
 }
 
 void BatchNestedLoopJoin::ExecuteBlockJoin() {
@@ -91,12 +206,17 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
   std::vector<std::pair<Row, RowPosition>> right_rows;
   DataChunk batch;
   while (right_ && right_->NextBatch(&batch) != 0) {
+    // No reserve: reserve(size()+batch) fills capacity exactly, forcing a
+    // full reallocation+copy of every materialized Row on the next batch.
+    // push_back's geometric growth is already amortized.
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_rows.emplace_back(batch.RowAt(i), batch.PositionAt(i));
     }
   }
-  if (right_ != nullptr && right_->GetStatus() != Status::kSuccess) {
-    predicate_error_ = right_->GetStatus();
+  if (right_ != nullptr && FailWithChildOf(*right_)) {
+    return;
+  }
+  if (TryExecuteDisjunctiveHashJoin(right_rows)) {
     return;
   }
 
@@ -123,8 +243,8 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
                               left_batch.PositionAt(left_batch_idx));
       ++left_batch_idx;
     }
-    if (left_ != nullptr && left_->GetStatus() != Status::kSuccess) {
-      predicate_error_ = left_->GetStatus();
+    if (left_ != nullptr && FailWithChildOf(*left_)) {
+      output_.clear();
       return;
     }
     if (left_block.empty()) {
@@ -139,7 +259,14 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
     for (size_t r = 0; r < right_rows.size(); ++r) {
       const auto& r_item = right_rows[r];
       for (size_t i = 0; i < left_block.size(); ++i) {
-        if (EvaluatePredicate(left_block[i].first, r_item.first)) {
+        const auto matches =
+            EvaluatePredicate(left_block[i].first, r_item.first);
+        if (!matches.HasValue()) {
+          output_.clear();
+          FailWith(matches.GetStatus());
+          return;
+        }
+        if (matches.Value()) {
           ++left_match_counts[i];
           right_matched[r] = true;
           if (kind_ == JoinKind::kInner || kind_ == JoinKind::kLeftOuter ||
@@ -148,12 +275,6 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
                                  left_block[i].second);
             total_bytes += EstimateRowBytes(output_.back().first);
           }
-        }
-        if (!predicate_error_.ok()) {
-          // Stop as soon as a predicate fails: the sticky error will fail the
-          // whole operator in NextBatch(), so evaluating the remaining pairs
-          // only pays for useless Row concatenation/copies.
-          return;
         }
       }
     }
@@ -218,8 +339,7 @@ size_t BatchNestedLoopJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   destination->Reset();
   EnsureMaterialized();
-  if (!predicate_error_.ok()) {
-    FailWith(predicate_error_);
+  if (!ok()) {
     return 0;
   }
   if (output_offset_ >= output_.size()) {

@@ -139,7 +139,7 @@ tinylamb の最適化処理では、独立した 3 種類の Rule セットを�
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
 | 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 70（2026-11-21 作業ツリー、旧 71 から `if_to_case` 削除済み） | スカラー式の正規化および定数畳み込み（例: `1 + 2` を `3` に変換、`NOT (a AND b)` の展開） |
-| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 95（2026-11-19 作業ツリー） | Memo に結果が等価となる別の論理表現を追加（結合順序の交換、述語の押し込みなど） |
+| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 97（2026-11-23 作業ツリー） | Memo に結果が等価となる別の論理表現を追加（結合順序の交換、述語の押し込みなど） |
 | 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を具体的な物理演算子（HashJoin や IndexScan など）へ変換し、コスト評価対象とする |
 
 論理 Rule の典型例である結合順序の交換（`join_commutativity`）の登録コードを以下に示します（`plan/cascades.cpp` の `RuleSet::Default()`）。
@@ -347,7 +347,7 @@ flowchart TB
 - **文脈に応じた規則の除外**: 前述の `inner_join_not_null_inference` のように、フィルタ条件としては安全であっても射影値の算出としては不安全な規則は、処理文脈に応じて適用対象から除外されます。
 - **差分テストとファジングによる検証**: 網羅的なオラクル走行器（`plan/rule_fuzzer.cpp`）やランダムクエリを用いたファザー（`sql_oracle_fuzzer_libfuzzer`）を実行し、最適化の前後で結果が一致することを継続的に検証しています。
 
-特に注意を要するのは、単一テーブルのスキャングループです。tinylamb ではスキャン述語が Group 内で集約されるため、単一テーブルに対するフィルタの変形は、後段で再評価されない唯一の評価点となります。したがって、単一テーブルのフィルタ変更はコストの最適化ではなく結果の正しさに直結します。各 Rule の解説においても、この安全条件の根拠を重点的に記述します。
+単一テーブルではスキャン述語が Group 内で全アクセスパスに適用され、Optimizer は必要に応じて根に `kSelection` も構築します。したがってスキャンへの述語押し下げ後も根 Selection が再評価する経路があり、その経路での押し下げは性能最適化です。各 Rule は経路ごとの適用条件を満たす必要があります。
 
 ## 1-8. 表記上の約束と本書の構成
 

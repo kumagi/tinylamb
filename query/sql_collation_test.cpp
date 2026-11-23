@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/memory_budget.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -113,6 +114,35 @@ class SqlCollationTest : public ::testing::Test {
 };
 
 }  // namespace
+
+TEST_F(SqlCollationTest, ConflictingOrderKeyCollationsReturnSqlError) {
+  auto& budget = ProcessMemoryBudget::Global();
+  struct RestoreSpill {
+    bool previous;
+    ~RestoreSpill() { ProcessMemoryBudget::Global().SetTestAlwaysSpill(previous); }
+  } restore{budget.AlwaysSpillEnabled()};
+  for (bool spill : {false, true}) {
+    budget.SetTestAlwaysSpill(spill);
+    for (const char* suffix : {"", " LIMIT 1", " LIMIT 2 WITH TIES"}) {
+      auto ctx = Begin();
+      SqlEngine engine(database());
+      const std::string sql =
+          "SELECT id FROM words ORDER BY CASE WHEN id = 1 THEN "
+          "COLLATE(s, 'und:ci') ELSE s END" + std::string(suffix);
+      SCOPED_TRACE(sql + (spill ? " (spill)" : " (resident)"));
+      auto result = engine.Prepare(ctx, sql);
+      Status status = result.GetStatus();
+      if (result.HasValue()) {
+        Row row;
+        while (result.Value()->Next(&row, nullptr)) {}
+        status = result.Value()->GetStatus();
+      }
+      EXPECT_EQ(status, Status::kInvalidArgument) << engine.LastError();
+      EXPECT_NE(status.GetMessage().find("collation"), std::string::npos)
+          << status;
+    }
+  }
+}
 
 TEST_F(SqlCollationTest, CollatedOrderFoldsAndBinaryOrderDoesNot) {
   // 'APPLE' and 'apple' are peers under und:ci, so the fold puts 'apple'

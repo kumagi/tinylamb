@@ -42,6 +42,8 @@ struct SpillStoreStats {
   uint64_t bytes_read{0};
   uint64_t current_active_bytes{0};
   uint64_t peak_active_bytes{0};
+  // Backing file length and its peak, including uncommitted bytes written by
+  // a failed append until the file is truncated.
   uint64_t physical_file_bytes{0};
   uint64_t peak_physical_file_bytes{0};
   uint64_t segments_created{0};
@@ -56,9 +58,10 @@ struct SpillStoreStats {
 // Uses at most one open file descriptor for an unlinked temp file regardless
 // of how many logical spill segments (partitions, sorted runs, hash buckets)
 // exist simultaneously. The descriptor is opened lazily by the first Append
-// and closed again once the store is empty, so the *maximum* is constant but
-// no descriptor is held while idle. Space from dropped segments is recycled
-// at 64 KiB block granularity via an internal free list.
+// and kept until store destruction. When the store becomes empty, the backing
+// file is normally truncated to zero (a failed best-effort truncation may
+// leave stale bytes). Space from dropped segments is recycled at 64 KiB block
+// granularity via an internal free list.
 class SpillStore {
  public:
   static constexpr size_t kBlockSize = 64ULL * 1024ULL;
@@ -107,6 +110,7 @@ class SpillStore {
   void Clear() noexcept;
 
   [[nodiscard]] SpillStoreStats Stats() const;
+  // A return value of zero means temporary storage has no configured limit.
   [[nodiscard]] size_t EffectiveTempLimitBytes() const noexcept;
 
   // Total blocks handed to platform::AdviseDontNeed since construction.
@@ -126,7 +130,8 @@ class SpillStore {
       // A live token from a *different* store must not authorize dropping a
       // segment in this one with a coincidentally equal id.
       const auto live = token.lock();
-      if (!live) return;
+      if (!live) { return;
+}
       const auto& own = store->alive_token_;
       if (own && live == own) {
         store->DropSegment(id);
@@ -140,12 +145,13 @@ class SpillStore {
     uint64_t logical_bytes{0};
     bool write_in_progress{false};
     bool pending_drop{false};
-    // Number of Read() calls that copied this segment's block numbers into
-    // a plan and are still preading outside mu_. DropSegment/Clear/Append
+    // Number of in-flight operations that copied this segment's block numbers
+    // into a plan and are still using them outside mu_ (Read()'s PreadAll and
+    // ReleaseSegmentPageCache()'s AdviseDontNeed). DropSegment/Clear/Append
     // must not return these blocks to the free list (or truncate the file)
     // until the count reaches zero, or a reader would see another
-    // segment's rewritten bytes. Guarded by mu_; mutable so the const
-    // Read path can advance it.
+    // segment's rewritten bytes and a stale hint could evict its pages.
+    // Guarded by mu_; mutable so the const Read/release paths can advance it.
     mutable size_t active_reads{0};
     // Count of blocks already handed to AdviseDontNeed by
     // ReleaseSegmentPageCache; each block is advised at most once per
@@ -220,9 +226,8 @@ class SpillSegmentWriter {
   [[nodiscard]] Status Flush();
 
   // Flushes remaining bytes and transfers ownership of the completed
-  // `SpillSegmentId` to the caller (returns `kInvalidSpillSegmentId` if zero
-  // bytes were written unless `EnsureOpen` was explicitly called with
-  // the keep-empty option).
+  // `SpillSegmentId` to the caller. A zero-byte store returns
+  // `kInvalidSpillSegmentId` unless keep_empty is true (the default).
   [[nodiscard]] StatusOr<SpillSegmentId> Finish(bool keep_empty = true);
 
   // Explicit cleanup discarding buffered data and dropping any opened segment.

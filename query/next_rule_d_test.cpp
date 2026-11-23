@@ -36,7 +36,7 @@ TEST_F(QueryTest, SharedGroupedCteTakesGroupingKeyRestriction) {
   EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 1U);
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(30), Value(30)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SharedGroupedCteRefusesAggregateOutputRestriction) {
@@ -64,7 +64,7 @@ TEST_F(QueryTest, SharedGroupedCteRefusesAggregateOutputRestriction) {
   EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
   EXPECT_EQ(rows[1], Row({Value(2), Value(2)}));
   EXPECT_EQ(rows[2], Row({Value(3), Value(3)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

@@ -891,6 +891,36 @@ TEST(ExpressionTest, CaseExpression_Inspect_ReturnsTouchedColumnsAndString) {
   EXPECT_EQ(oss.str(), "CASE WHEN a THEN b ELSE c END");
 }
 
+TEST(ExpressionTest, CaseExpression_NullClauseNodesDoNotCrash) {
+  Schema schema("s", {Column("v", ValueType::kInt64)});
+  Row row({Value(5)});
+  const auto truthy = ConstantValueExp(Value(true));
+  const auto value = ConstantValueExp(Value(7));
+
+  // Damaged tree: null WHEN condition, null THEN expression.
+  Expression damaged = CaseExpressionExp(
+      {{nullptr, value}, {truthy, nullptr}, {nullptr, nullptr}}, value);
+
+  EXPECT_NO_THROW(damaged->TouchedColumns());
+  EXPECT_NO_THROW(damaged->ToString());
+  EXPECT_EQ(damaged->ToString(),
+            "CASE WHEN <null> THEN 7 WHEN 1 THEN <null> WHEN <null> THEN "
+            "<null> ELSE 7 END");
+  // Clause 2's condition is true but its THEN is missing -> NULL result.
+  EXPECT_TRUE(damaged->Evaluate(row, schema).IsNull());
+  EXPECT_EQ(damaged->ResultType(schema).GetType(), TypeTag::kBigInt);
+  EXPECT_EQ(damaged->ResultType(schema, schema).GetType(), TypeTag::kBigInt);
+
+  // A true condition with a missing THEN yields NULL, not the ELSE branch.
+  Expression missing_then = CaseExpressionExp({{truthy, nullptr}}, value);
+  EXPECT_TRUE(missing_then->Evaluate(row, schema).IsNull());
+
+  // All branches damaged: type is invalid, evaluation falls through to ELSE.
+  Expression all_damaged = CaseExpressionExp({{nullptr, nullptr}}, nullptr);
+  EXPECT_EQ(all_damaged->ResultType(schema).GetType(), TypeTag::kInvalid);
+  EXPECT_TRUE(all_damaged->Evaluate(row, schema).IsNull());
+}
+
 TEST(ExpressionTest,
      IntervalExpression_EvaluateAndToString_ReturnsFormattedInterval) {
   Row row;
@@ -1161,7 +1191,7 @@ TEST(ExpressionTest, FunctionCall_CoalesceAndConcat_EvaluatesCorrectly) {
   Expression concat_null = FunctionCallExp(
       "concat", {ConstantValueExp(Value("a")), ConstantValueExp(Value())});
 
-  EXPECT_EQ(coalesce->Evaluate(row, schema), Value("b"));
+  EXPECT_EQ(coalesce->TryEvaluate(row, schema).GetStatus(), Status::kInvalidArgument);
   EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
   EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   EXPECT_TRUE(concat_null->Evaluate(row, schema).IsNull());
@@ -1791,19 +1821,16 @@ TEST(ExpressionTest, ExpressionCastsKeepDerivedNodesAndRejectFalseTags) {
   EXPECT_THROW((void)extension.AsColumnValue(), std::bad_cast);
 }
 
-TEST(ExpressionTest, ExpressionBase_DefaultImplementations_ThrowRuntimeError) {
+TEST(ExpressionTest, ExpressionBase_DefaultEvaluationAndTypeInference) {
   BareExpression bare;
   Row row;
   Schema schema;
 
-  EXPECT_THROW(
-      static_cast<void>((void)bare.Evaluate(&row, schema, &row, schema)),
-      std::runtime_error);
-  EXPECT_THROW(static_cast<void>((void)bare.ResultType(schema)),
-               std::runtime_error);
-  EXPECT_THROW(static_cast<void>((void)bare.ResultType(schema, schema)),
-               std::runtime_error);
-  EXPECT_EQ(bare.TouchedColumns().size(), 0);
+  EXPECT_EQ(bare.Evaluate(&row, schema, &row, schema), bare.Evaluate(row, schema));
+  EXPECT_TRUE(bare.Evaluate(nullptr, schema, &row, schema).IsNull());
+  EXPECT_EQ(bare.ResultType(schema).GetType(), TypeTag::kInvalid);
+  EXPECT_EQ(bare.ResultType(schema, schema).GetType(), TypeTag::kInvalid);
+  EXPECT_TRUE(bare.TouchedColumns().empty());
 }
 
 TEST(ExpressionTest, NamedExpression_OutputOperator_StreamsExpectedFormat) {
@@ -1890,7 +1917,7 @@ TEST(ExpressionTest, FunctionCall_ResultTypeWithTwoSchemas_InfersCorrectType) {
       FunctionCallExp("coalesce", {ColumnValueExp("i"), ColumnValueExp("v")})
           ->ResultType(left, right)
           .GetType(),
-      TypeTag::kBigInt);
+      TypeTag::kInvalid);
   EXPECT_EQ(FunctionCallExp("concat", {})->ResultType(left, right).GetType(),
             TypeTag::kVarChar);
   EXPECT_EQ(FunctionCallExp("substr", {})->ResultType(left, right).GetType(),
@@ -2456,6 +2483,14 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
       eval("parse_timestamp", {Value("%Y-%m-%d %H:%M:%S"),
                                Value("2023-06-15 10:00:00"), Value("UTC")}),
       Value("2023-06-15 10:00:00+00"));
+  EXPECT_EQ(eval("parse_timestamp", {Value("%%%z %Y-%m-%d"),
+                                     Value("%+0000 2000-01-01"),
+                                     Value("Asia/Tokyo")}),
+            Value("2000-01-01 00:00:00+00"));
+  EXPECT_EQ(eval("parse_timestamp", {Value("%%z %Y-%m-%d"),
+                                     Value("%z 2000-01-01"),
+                                     Value("Asia/Tokyo")}),
+            Value("1999-12-31 15:00:00+00"));
 }
 
 TEST(ExpressionTest,
@@ -3089,6 +3124,20 @@ TEST(ExpressionTest, QuantifiedComparisonShortCircuitsBeforeLaterConflict) {
   EXPECT_FALSE(all.Value().Truthy());
 }
 
+TEST(ExpressionTest, QuantifiedComparisonPreservesComparisonFailure) {
+  const Value array = Value::Array({Value(3)}, "INT64");
+  const auto checked = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kLessThan, QuantifierMode::kAny, Value(2), {array});
+  ASSERT_FALSE(checked.HasValue());
+  EXPECT_EQ(checked.GetStatus().GetCode(), StatusCode::kInvalidArgument);
+
+  const auto decided = TryEvaluateQuantifiedComparison(
+      BinaryOperation::kLessThan, QuantifierMode::kAny, Value(2),
+      {Value(3), array});
+  ASSERT_TRUE(decided.HasValue()) << decided.GetStatus();
+  EXPECT_TRUE(decided.Value().Truthy());
+}
+
 // Bug 10783: bare enum member-name lookups are case sensitive (like
 // EnumValueForMember); only the enum *type* name folds case. Lowercase
 // spellings must not be accepted as member names.
@@ -3145,6 +3194,15 @@ TEST(ExpressionTest, WindowFunctionResultTypeDeclaredFromFunctionName) {
       win("FIRST_VALUE", ColumnValueExp("s"))->ResultType(schema).GetType(),
       TypeTag::kVarChar);
   EXPECT_EQ(win("STRING_AGG")->ResultType(schema).GetType(), TypeTag::kVarChar);
+  // Array-valued window aggregates produce Value::Array at runtime; the
+  // static type must be kArray, not the element type or VARCHAR.
+  EXPECT_EQ(win("ARRAY_AGG", ColumnValueExp("x"))->ResultType(schema).GetType(),
+            TypeTag::kArray);
+  EXPECT_EQ(
+      win("ARRAY_CONCAT_AGG", ColumnValueExp("x"))->ResultType(schema).GetType(),
+      TypeTag::kArray);
+  EXPECT_EQ(win("APPROX_QUANTILES")->ResultType(schema).GetType(),
+            TypeTag::kArray);
   // The two-schema overload stays in sync.
   EXPECT_EQ(win("ROW_NUMBER")->ResultType(schema, schema).GetType(),
             TypeTag::kBigInt);

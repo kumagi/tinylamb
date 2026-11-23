@@ -76,10 +76,9 @@ StatusOr<Value> TryEvaluateQuantifiedComparison(
                            "Collation conflict between the quantified "
                            "comparison operands");
       }
-      // A comparison error on one row is UNKNOWN for that row (three-valued
-      // logic), matching the old catch-all around the throwing evaluator.
-      auto compared = TryEvaluateBinary(op, test_value, candidate);
-      result = compared.HasValue() ? compared.MoveValue() : Value();
+      ASSIGN_OR_RETURN(Value, compared,
+                       TryEvaluateBinary(op, test_value, candidate));
+      result = std::move(compared);
     }
     if (result.IsNull()) {
       saw_unknown = true;

@@ -78,6 +78,8 @@ struct Row {
   size_t Serialize(char* dst) const;
   [[nodiscard]] StatusOr<size_t> TryDeserialize(const char* src,
                                                 const Schema& sc);
+  // Storage column slots must be strictly ascending (no duplicates) and in
+  // range.
   [[nodiscard]] StatusOr<size_t> TryDeserializeProjected(
       const char* src, const Schema& sc, const std::vector<slot_t>& columns);
   // Projected decode against a precomputed RowDecodePlan (same image

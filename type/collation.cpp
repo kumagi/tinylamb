@@ -55,9 +55,11 @@ Collation CollationFromName(std::string_view spec) {
     return Collation::kNone;
   }
   const auto resolved = CollationOfSpec(spec);
-  // The engine has no locale collation: every non-binary spec folds (see
+  // Physical-property names are lenient: the engine has no locale collation
+  // and every non-binary spec folds (see
   // CollationTest.NamesRoundTripAndSpecResolution), so an unknown language
   // name behaves as case-insensitive instead of silently using binary order.
+  // This differs from CollationOfSpec, which rejects unknown COLLATE specs.
   return resolved ? *resolved : Collation::kCaseInsensitive;
 }
 
@@ -118,7 +120,7 @@ int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
     const int left_rank = EnumRank(left);
     const int right_rank = EnumRank(right);
     if (left_rank >= 0 && right_rank >= 0) {
-      return (left_rank > right_rank) - (left_rank < right_rank);
+      return static_cast<int>(left_rank > right_rank) - static_cast<int>(left_rank < right_rank);
     }
     if (left_rank >= 0 || right_rank >= 0) {
       // Order every string by one key function so the comparator stays a
@@ -137,6 +139,11 @@ int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
       if (const int cmp = left_key.compare(right_key); cmp != 0) {
         return cmp < 0 ? -1 : 1;
       }
+      // The two keys are identical (e.g. ENUM "TESTENUM1" vs the raw string
+      // "TESTENUM\x01"). They are peers in the key space; falling through to
+      // the raw-byte comparison would order them by the ENUM member's
+      // spelling instead and break the strict-weak-ordering key contract.
+      return 0;
     }
   }
   if (case_insensitive) {
@@ -203,6 +210,28 @@ bool EqualUnderCollation(const Value& left, const Value& right) {
   return left == right;
 }
 
+namespace {
+Collation EffectiveSortCollation(Collation key, const Value& value) {
+  const Collation tag = CollationOf(value);
+  return tag != Collation::kNone ? tag :
+         key != Collation::kNone ? key : Collation::kBinary;
+}
+}  // namespace
+
+Status SortKeyOrder::Observe(const Value& value) {
+  if (value.type != ValueType::kVarChar || value.IsInterval()) {
+    return Status::kSuccess;
+  }
+  const Collation effective = EffectiveSortCollation(collation_, value);
+  if ((collation_ != Collation::kNone && effective != collation_) ||
+      (observed_ != Collation::kNone && observed_ != effective)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "incompatible collations in ORDER BY key");
+  }
+  observed_ = effective;
+  return Status::kSuccess;
+}
+
 int SortKeyOrder::Compare(const Value& left, const Value& right) const {
   if (left.IsNull() || right.IsNull()) {
     if (left.IsNull() && right.IsNull()) {
@@ -211,8 +240,15 @@ int SortKeyOrder::Compare(const Value& left, const Value& right) const {
     const int null_side = left.IsNull() ? -1 : 1;
     return nulls_first_ ? null_side : -null_side;
   }
-  const Collation resolved = ResolveCollation(
-      collation_, ResolveCollation(CollationOf(left), CollationOf(right)));
+  const Collation resolved = EffectiveSortCollation(collation_, left);
+  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
+    const Collation rhs = EffectiveSortCollation(collation_, right);
+    if (resolved != rhs) {
+      // Ingestion reports incompatible keys. Keep the primitive transitive
+      // even for callers comparing unchecked values.
+      return (resolved < rhs) == ascending_ ? -1 : 1;
+    }
+  }
   const int cmp = CompareUnderCollation(left, right, resolved);
   return ascending_ ? cmp : -cmp;
 }

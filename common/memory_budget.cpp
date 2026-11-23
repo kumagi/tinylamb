@@ -3,6 +3,7 @@
 #include "common/memory_budget.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -14,6 +15,7 @@
 
 #include "common/log_message.hpp"
 #include "common/platform/process.hpp"
+#include "common/unwind_guard.hpp"
 
 namespace tinylamb {
 
@@ -26,6 +28,14 @@ constexpr size_t PercentOf(size_t x, size_t pct) {
              100;             // NOLINT(readability-math-missing-parentheses)
 }
 
+// Saturating addition for atomic pool floors/limits: a floor can be set near
+// SIZE_MAX by tests, and a wrapped sum would silently drop reserved bytes.
+constexpr size_t SaturatingAdd(size_t a, size_t b) noexcept {
+  return a > std::numeric_limits<size_t>::max() - b
+             ? std::numeric_limits<size_t>::max()
+             : a + b;
+}
+
 thread_local bool tl_in_reclaim_hook = false;
 
 size_t ReadEnvBytes(const char* name, size_t fallback) noexcept {
@@ -33,13 +43,23 @@ size_t ReadEnvBytes(const char* name, size_t fallback) noexcept {
   if (raw == nullptr || raw[0] == '\0') {
     return fallback;
   }
-  char* end = nullptr;
-  if (raw[0] == '-') {
-    return fallback;  // negative values wrap to SIZE_MAX via strtoull
+  // strtoull skips leading whitespace and accepts a leading '-', wrapping
+  // negative values to ULLONG_MAX. Reject a sign after those spaces too.
+  const char* first = raw;
+  while (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r' ||
+         *first == '\f' || *first == '\v') {
+    ++first;
   }
+  if (*first == '-' || *first == '+') {
+    return fallback;  // signs are rejected: '-' wraps via strtoull, '+' is
+                      // inconsistent
+  }
+  char* end = nullptr;
+  errno = 0;
   const unsigned long long parsed = std::strtoull(raw, &end, 10);
-  if (end == raw || *end != '\0') {
-    return fallback;
+  if (errno == ERANGE || end == raw || *end != '\0' ||
+      parsed > std::numeric_limits<size_t>::max()) {
+    return fallback;  // overflow: do not silently turn a bad value into a limit
   }
   return static_cast<size_t>(parsed);
 }
@@ -56,9 +76,8 @@ thread_local OocQueryScope* tl_ooc_query_scope = nullptr;
 template <typename Fn>
 void ForEachActiveQueryMetrics(Fn&& fn) noexcept {
   // The scope chain can revisit the same metrics non-contiguously (M1->M2->M1).
-  // Dedup against all seen pointers; a fixed array keeps this noexcept.
-  OocQueryMetrics* seen[128]{};  // NOLINT(modernize-avoid-c-arrays)
-  size_t seen_count = 0;
+  // Look back through the scopes already visited instead of keeping a fixed
+  // array: unbounded depth, no allocation, still noexcept.
   for (OocQueryScope* s = tl_ooc_query_scope; s != nullptr;
        s = s->PrevScope()) {
     OocQueryMetrics* m = s->Metrics();
@@ -66,17 +85,14 @@ void ForEachActiveQueryMetrics(Fn&& fn) noexcept {
       continue;
     }
     bool duplicate = false;
-    for (size_t i = 0; i < seen_count; ++i) {
-      if (seen[i] == m) {
+    for (OocQueryScope* p = tl_ooc_query_scope; p != s; p = p->PrevScope()) {
+      if (p->Metrics() == m) {
         duplicate = true;
         break;
       }
     }
     if (duplicate) {
       continue;
-    }
-    if (seen_count < std::size(seen)) {
-      seen[seen_count++] = m;
     }
     fn(*m);
   }
@@ -195,7 +211,8 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
   size_t q_pct = ReadEnvBytes("TINYLAMB_QUERY_FLOOR_PCT", 25);
   size_t t_pct = ReadEnvBytes("TINYLAMB_TX_FLOOR_PCT", 5);
   size_t c_pct = ReadEnvBytes("TINYLAMB_COLUMNAR_FLOOR_PCT", 0);
-  if (s_pct + q_pct + t_pct + c_pct > 100) {
+  if (std::max({s_pct, q_pct, t_pct, c_pct}) > 100 ||
+      s_pct + q_pct + t_pct + c_pct > 100) {
     s_pct = 25;
     q_pct = 25;
     t_pct = 5;
@@ -307,9 +324,12 @@ size_t ProcessMemoryBudget::PoolFloorBytes(MemoryPoolKind pool) const noexcept {
         return wanted;
       }
       const size_t soft = ComputeSoftLimit(lim);
-      const size_t other = storage_floor_.load(std::memory_order_acquire) +
-                           columnar_floor_.load(std::memory_order_acquire) +
-                           query_floor_.load(std::memory_order_acquire);
+      // Saturate: individually large floors must not wrap the sum into a
+      // small value that would let tx claim the whole soft limit.
+      const size_t other = SaturatingAdd(
+          SaturatingAdd(storage_floor_.load(std::memory_order_acquire),
+                        columnar_floor_.load(std::memory_order_acquire)),
+          query_floor_.load(std::memory_order_acquire));
       const size_t max_tx = soft > other ? soft - other : base;
       const size_t granted = std::min(wanted, std::max(base, max_tx));
       // T1845: with a limit set, other pools' floors can clamp the server
@@ -346,7 +366,7 @@ size_t ProcessMemoryBudget::ProtectedFloorForOthers(
     }
     const size_t used = PoolCounter(k).load(std::memory_order_acquire);
     if (fl > used) {
-      reserved_for_others += fl - used;
+      reserved_for_others = SaturatingAdd(reserved_for_others, fl - used);
     }
   }
   return reserved_for_others;
@@ -367,7 +387,7 @@ size_t ProcessMemoryBudget::EffectivePoolMaxBytes(
   for (MemoryPoolKind k : {MemoryPoolKind::kStorage, MemoryPoolKind::kColumnar,
                            MemoryPoolKind::kQuery, MemoryPoolKind::kTx}) {
     if (k != pool) {
-      other_floors += PoolFloorBytes(k);
+      other_floors = SaturatingAdd(other_floors, PoolFloorBytes(k));
     }
   }
   size_t max_bytes = soft > other_floors ? soft - other_floors : 0;
@@ -614,6 +634,12 @@ bool ProcessMemoryBudget::TryReserveNoFault(MemoryPoolKind pool, size_t bytes,
          protected_other > effective_total_cap - cur_total - bytes)) {
       return false;
     }
+    // With no cap the subtraction above is skipped, so guard the addition
+    // itself: a wrapped total_used_ breaks peak telemetry and every later
+    // limit check.
+    if (bytes > std::numeric_limits<size_t>::max() - cur_total) {
+      return false;
+    }
     if (total_used_.compare_exchange_weak(cur_total, cur_total + bytes,
                                           std::memory_order_acq_rel,
                                           std::memory_order_acquire)) {
@@ -720,6 +746,7 @@ size_t ProcessMemoryBudget::InvokeReclaimHooks(size_t target_bytes) noexcept {
     return 0;
   }
   tl_in_reclaim_hook = true;
+  UnwindGuard clear_reclaim_flag([] { tl_in_reclaim_hook = false; });
   size_t reclaimed_total = 0;
   for (ReclaimStage stage :
        {ReclaimStage::kColumnar, ReclaimStage::kCleanStorage,
@@ -759,7 +786,7 @@ size_t ProcessMemoryBudget::InvokeReclaimHooks(size_t target_bytes) noexcept {
         break;
       }
       try {
-        reclaimed_total += cb(need);
+        reclaimed_total = SaturatingAdd(reclaimed_total, cb(need));
       } catch (...) {
         // Reclaim hooks run inside memory-pressure paths marked noexcept;
         // count suppressed throws rather than crashing recovery paths.
@@ -772,6 +799,7 @@ size_t ProcessMemoryBudget::InvokeReclaimHooks(size_t target_bytes) noexcept {
     }
   }
   tl_in_reclaim_hook = false;
+  clear_reclaim_flag.Disarm();
   if (reclaimed_total > 0) {
     RecordReclaim(reclaimed_total);
   }
@@ -813,8 +841,11 @@ bool ProcessMemoryBudget::TryReserveWithReclaim(MemoryPoolKind pool,
     // RSS-gated refusals count memory the allocator still retains after
     // free().  Hand it back to the OS and re-sample before giving up, or a
     // retaining allocator can starve every later reservation indefinitely.
-    if (check_rss_pressure_.load(std::memory_order_acquire)) {
-      (void)platform::ReleaseFreeHeapToOs();
+    if (check_rss_pressure_.load(std::memory_order_acquire) &&
+        platform::ReleaseFreeHeapToOs()) {
+      // Only re-sample when the trim actually released heap back to the OS;
+      // otherwise the forced refresh just adds another /proc read on an
+      // already-failing hot path.
       (void)SampledRssBytes(/*force_refresh=*/true);
     }
     if (TryReserve(pool, bytes, /*respect_soft_limit=*/true)) {
@@ -871,9 +902,13 @@ void ProcessMemoryBudget::ReleaseEmergency(MemoryPoolKind pool,
   size_t released = 0;
   while (cur != 0) {
     const size_t next = cur > bytes ? cur - bytes : 0;
-    released = cur - next;
     if (emergency_used_.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      // compare_exchange_weak leaves `cur` at the observed value only on
+      // success.  On failure it overwrites `cur` with the new ledger value
+      // and this iteration removed nothing; crediting `cur - next` then
+      // would hand back bytes this thread never took from the ledger.
+      released = cur - next;
       break;
     }
   }
@@ -961,6 +996,9 @@ void ProcessMemoryBudget::ResetForTest(size_t limit_bytes,
   peak_rss_bytes_.store(0, std::memory_order_release);
   peak_unaccounted_rss_bytes_.store(0, std::memory_order_release);
   last_rss_ns_.store(0, std::memory_order_release);
+  // Reset the sampling phase too: `(tick & 255) == 0` otherwise carries over
+  // between tests and makes RSS-pressure checks order-dependent.
+  rss_sample_tick_.store(0, std::memory_order_release);
 }
 
 bool ProcessMemoryBudget::ConsumeInjectedMemoryFailure() noexcept {
@@ -1041,7 +1079,7 @@ std::filesystem::path ProcessMemoryBudget::ResolveTempDirectory() {
 
 ProcessMemoryCharge::ProcessMemoryCharge(MemoryPoolKind pool, size_t bytes,
                                          bool forced) noexcept
-    : pool_(pool), bytes_(0), valid_(true) {
+    : pool_(pool) {
   if (bytes == 0) {
     return;
   }
@@ -1068,6 +1106,7 @@ ProcessMemoryCharge& ProcessMemoryCharge::operator=(
 bool ProcessMemoryCharge::TryAdd(size_t bytes,
                                  bool respect_soft_limit) noexcept {
   if (bytes == 0) {
+    valid_ = true;  // a no-op reservation still succeeds; keep APIs consistent
     return true;
   }
   if (!ProcessMemoryBudget::Global().TryReserve(pool_, bytes,
@@ -1086,6 +1125,7 @@ bool ProcessMemoryCharge::TryAdd(size_t bytes,
 
 bool ProcessMemoryCharge::TryAddWithReclaim(size_t bytes) {
   if (bytes == 0) {
+    valid_ = true;  // same recovery semantics as TryAdd(0)
     return true;
   }
   if (!ProcessMemoryBudget::Global().TryReserveWithReclaim(pool_, bytes)) {
@@ -1103,6 +1143,9 @@ void ProcessMemoryCharge::AddForced(size_t bytes) noexcept {
   }
   ProcessMemoryBudget::Global().ReserveForced(pool_, bytes);
   bytes_ += bytes;
+  // Forced reservation cannot fail, so it is a successful reservation and
+  // restores Ok() after a transient normal-reservation failure.
+  valid_ = true;
 }
 
 void ProcessMemoryCharge::Release(size_t bytes) noexcept {

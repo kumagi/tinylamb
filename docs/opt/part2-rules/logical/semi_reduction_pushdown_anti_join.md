@@ -25,6 +25,7 @@ graph LR
 2. `memo.Get(group).relations.size() == 2` かつ親タグに `"semi_reduce"` が含まれないこと。
 3. probe 子グループ `probe_id != group` かつ `memo.Get(probe_id).tag` が `"semi_reduce_probe:"` で始まらないこと。
 4. 結合述語の連言から、左右の子をまたぐ `col_a = col_b` 等値キーのうち probe 側の列 `probe_keys` を 1 つ以上抽出できること。
+5. probe グループが単一リレーションで、`sample_barrier` がなく、そのリレーションに対応する `kScan` 論理式が存在すること。
 
 ## 意味論的根拠（D5）
 

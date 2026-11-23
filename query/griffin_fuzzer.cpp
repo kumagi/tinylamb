@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/platform/process.hpp"
@@ -643,10 +644,18 @@ std::string SubstituteIdentifiers(const std::string& sql,
       out.push_back(c);
       ++i;
       while (i < sql.size()) {
-        out.push_back(sql[i]);
-        const bool quote = sql[i] == '\'';
+        const char literal_char = sql[i];
+        out.push_back(literal_char);
         ++i;
-        if (quote) {
+        if (literal_char == '\\' && i < sql.size()) {
+          out.push_back(sql[i++]);
+          continue;
+        }
+        if (literal_char == '\'') {
+          if (i < sql.size() && sql[i] == '\'') {
+            out.push_back(sql[i++]);
+            continue;
+          }
           break;
         }
       }
@@ -730,17 +739,17 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
     return outcome;  // rejected: skip, not a finding
   }
   try {
-    std::vector<Row> rows;
+    // Serialize each row as it is drained instead of first materializing a
+    // second std::vector<Row> and copying it into strings afterwards.
+    std::vector<std::string> rows;
     Row row;
     while (result.Value().Next(&row)) {
-      rows.push_back(row);
+      rows.push_back(row.ToString());
     }
     if (result.Value().GetStatus() != Status::kSuccess) {
       return outcome;  // rejected during execution
     }
-    for (Row& r : rows) {
-      outcome.rows.push_back(r.ToString());
-    }
+    outcome.rows = std::move(rows);
     std::sort(outcome.rows.begin(), outcome.rows.end());
     outcome.ran = true;
   } catch (const std::exception& error) {
@@ -773,15 +782,13 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
   return outcome;
 }
 
-// Environment switch for oracle (2). Returns the previous state so nested
-// callers (replay inside fuzz try) restore correctly.
+// Switch for oracle (2). Returns the previous state so nested callers
+// (replay inside fuzz try) restore correctly. Uses the thread-safe in-process
+// override instead of setenv/unsetenv: the latter races the getenv in morsel
+// workers that call BytecodeEnabled() while a parallel SELECT is running.
 bool SetBytecodeDisabled(bool disabled) {
-  const bool was = std::getenv("TINYLAMB_DISABLE_BYTECODE") != nullptr;
-  if (disabled) {
-    platform::SetEnv("TINYLAMB_DISABLE_BYTECODE", "1");
-  } else {
-    platform::UnsetEnv("TINYLAMB_DISABLE_BYTECODE");
-  }
+  const bool was = !BytecodeEnabled();
+  SetBytecodeDisabledForProcess(disabled);
   return was;
 }
 
@@ -1177,7 +1184,10 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose,
   // The prefix check above alone accepts a file whose trailing statements
   // were trimmed: a shorter prefix still matches the seed, yet the recorded
   // failure may no longer be reached. The cut position recorded at capture
-  // time pins the exact length, so reject any mismatch here.
+  // time pins the exact length, so reject any mismatch here. At capture time
+  // RunSession records executed_count at the failing (last) statement, so a
+  // clean file has both counts equal; trimming trailing `-- stmt:` lines while
+  // leaving this field untouched is exactly what this gate detects.
   if (trace.executed_count != 0 &&
       trace.executed_count != trace.statements.size()) {
     return "tampered trace: statement count does not match recorded cut";
@@ -1279,7 +1289,7 @@ bool ParseGriffinTest(std::string_view text, GriffinTrace* trace) {
       try {
         size_t used = 0;
         const auto n = std::stoull(value, &used);
-        if (used != value.size() || n > SIZE_MAX) {
+        if (used != value.size() || !std::in_range<size_t>(n)) {
           return false;
         }
         trace->executed_count = static_cast<size_t>(n);
@@ -1301,7 +1311,6 @@ void GriffinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
     seed = (seed * 257) + data[i] + 1;
   }
   const auto seed32 = static_cast<uint32_t>(seed ^ (seed >> 32));
-  std::mt19937 rng(seed32);
   GriffinTrace trace;
   trace.seed = (static_cast<uint64_t>(seed32) << 32) | seed32;
   std::mt19937 run_rng(seed32);
@@ -1323,7 +1332,8 @@ void GriffinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
     const std::string replay_report =
         ReplayGriffinTrace(parsed, false, &replay_skipped);
     if (!replay_skipped && replay_report.empty()) {
-      verify = "internal error: serialized test replay holds (flaky mismatch)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized test replay holds (flaky mismatch)");
     }
   }
 

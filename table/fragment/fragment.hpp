@@ -62,9 +62,9 @@ namespace tinylamb {
 // module expose the same contract with different kernel coverage.
 enum class Runtime { kNative, kWasm };
 
-// The capability bits. Taken once per session; a bit
-// answers "does THIS build of THIS runtime have the kernel for that
-// operator", never "which scheme is this column encoded with".
+// The capability bits for one runtime. A bit answers "does THIS build of
+// THIS runtime have the kernel for that operator", never "which scheme is
+// this column encoded with". GetCapabilities constructs this value on demand.
 struct Capabilities {
   uint32_t interface_version = 1;
   Runtime runtime = Runtime::kNative;
@@ -86,7 +86,7 @@ struct Capabilities {
   bool agg_approx_count_distinct = true;
 
   bool group_by_single_column = true;
-  bool group_by_multi_column = false;  // enabled by the N-key group-by work
+  bool group_by_multi_column = true;  // supported by both runtimes
   bool order_limit_single_column = true;
 
   bool artifacts_chunk = true;

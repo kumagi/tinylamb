@@ -30,7 +30,7 @@ struct ProtoFieldSchema {
 struct EnumSchema {
   std::string short_name;                                // e.g. "TestEnum"
   std::vector<std::pair<std::string, int64_t>> members;  // (name, ordinal)
-  bool closed{true};  // proto2 closed vs proto3 open enum
+  bool closed{true};  // true for proto2 closed enums; false for proto3 open enums
 };
 
 // The full enum registry (single source of truth; T4465: callers must not

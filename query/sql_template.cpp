@@ -54,7 +54,7 @@ bool TryParseDouble(std::string_view token, double* out) {
   // strtod preserves the old decimal and range behavior, including ERANGE
   // for underflow. Most tokens fit on the stack. Very long literals still
   // use the same parser with an owned NUL-terminated buffer.
-  std::array<char, 64> stack;
+  std::array<char, 64> stack{};
   std::string fallback;
   const char* text = nullptr;
   if (token.size() < stack.size()) {
@@ -163,18 +163,28 @@ StatusOr<Expression> BindExpression(
       // same '?' slot. The forward direction is repaired above; the reverse
       // (cached string constant, new SQL carries a date literal) would
       // silently swap the comparison type, so reject it -- the engine falls
-      // back to parsing the statement verbatim. ExtractSqlTemplate currently
-      // emits VARCHAR parameters for DATE literals too, so this arm is a
-      // defensive guard for hand-built binding calls, not a normal Prepare
-      // path; keep it in sync if parameter typing changes.
+      // back to parsing the statement verbatim. The scanner only normalizes
+      // TIMESTAMP text; DATE literals become plain VARCHAR parameters, so
+      // this reverse-direction guard is unreachable from ExtractSqlTemplate
+      // today. It protects hand-built binding calls; keep it in sync if
+      // parameter typing changes.
       if (current.type == ValueType::kVarChar &&
           parameter.type == ValueType::kDate) {
         return Status(Status::kInvalidArgument,
                       "SQL template literal type mismatch: date "
                       "literal bound into a string slot");
       }
-      return std::make_shared<ConstantValue>(
-          std::move(parameter), expression->AsConstantValue().GetTextDomain());
+      // Only a VARCHAR literal can carry a text domain.  The cached
+      // constant's domain must not be inherited by a rebound INT64/DOUBLE/
+      // DATE value (e.g. after the DATE repair above), which would stamp a
+      // stale type interpretation on the new statement.  TIMESTAMP/STRING
+      // literals are distinguished by their own text in the fingerprint, so
+      // two different domains never share one template in the first place.
+      const TextDomain domain =
+          parameter.type == ValueType::kVarChar
+              ? expression->AsConstantValue().GetTextDomain()
+              : TextDomain::kUnspecified;
+      return std::make_shared<ConstantValue>(std::move(parameter), domain);
     }
     case TypeTag::kColumnValue:
       return ColumnValueExp(expression->AsColumnValue().GetColumnName());
@@ -305,10 +315,11 @@ StatusOr<Expression> BindExpression(
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
       const std::string& func = call.FuncName();
+      const size_t struct_width = StructJsonFieldWidth(call);
       std::vector<Expression> args;
       args.reserve(call.Args().size());
       for (size_t i = 0; i < call.Args().size(); ++i) {
-        if (IsStructuralCallArg(func, i, call.Args().size())) {
+        if (IsStructuralCallArg(func, i, struct_width)) {
           args.push_back(call.Args()[i]);
         } else {
           ASSIGN_OR_RETURN(Expression, h_arg,
@@ -529,7 +540,10 @@ bool SelectHasBindableConstant(
       [](const auto&
              entry) {  // NOLINT(misc-no-recursion) // Recursive statement-tree
                        // scan by design; trees are parser-bounded in depth.
-        return SelectHasBindableConstant(*entry.second);
+        // Hand-built trees may carry a null CTE body; BindSelect rejects it,
+        // but this scan must not dereference it first.
+        return entry.second != nullptr &&
+               SelectHasBindableConstant(*entry.second);
       });
 }
 
@@ -597,8 +611,9 @@ bool ContainsBindableConstant(
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
+      const size_t struct_width = StructJsonFieldWidth(call);
       for (size_t i = 0; i < call.Args().size(); ++i) {
-        if (IsStructuralCallArg(call.FuncName(), i, call.Args().size())) {
+        if (IsStructuralCallArg(call.FuncName(), i, struct_width)) {
           continue;
         }
         if (ContainsBindableConstant(call.Args()[i])) {
@@ -722,10 +737,13 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
           return li < ri;
         });
     for (const std::string& name : names) {
-      ASSIGN_OR_RETURN(
-          std::shared_ptr<SelectStatement>, hv16241_0,
-          (BindSelect(*select.WithQueries().at(name), parameters, index)));
-      auto bound = std::move(hv16241_0);
+      const auto body = select.WithQueries().find(name);
+      if (body == select.WithQueries().end() || body->second == nullptr) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "SQL template CTE has no body: " + name);
+      }
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, bound,
+                       BindSelect(*body->second, parameters, index));
       withs.emplace_back(name, std::move(bound));
       if (const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name)) {
         // The depth modifier follows the body in the text, so its bounds are
@@ -789,6 +807,12 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
       }
       copied.sample = std::move(sample);
     }
+    // UNNEST array constructors are expressions too: ExtractSqlTemplate
+    // parameterizes their literals, so BindSelect must consume those
+    // parameters in the same text order or every later binding shifts.
+    ASSIGN_OR_RETURN(Expression, bound_unnest,
+                     (BindExpression(source.unnest, parameters, index)));
+    copied.unnest = std::move(bound_unnest);
     ASSIGN_OR_RETURN(
         Expression, hv16867_0,
         (BindExpression(source.join_condition, parameters, index)));
@@ -893,6 +917,7 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     auto tree = std::make_shared<SetOperationTree>();
     tree->kinds = source_tree->kinds;
     tree->grouped = source_tree->grouped;
+    tree->disjoint_ordered_by_head = source_tree->disjoint_ordered_by_head;
     // The visitor keeps two views of one set operation: the flat branch
     // vectors and this tree, and both hold the SAME branch nodes (plus a
     // pre-branch copy of the head as `first`).  Binding both views consumed
@@ -1137,12 +1162,9 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
         auto decoded =
             DecodeStringEscapes(raw_literal, is_bytes_prefix, is_triple, quote);
         if (!decoded.HasValue()) {
-          // T2541: decline templating but keep scanning — an early return
-          // left the fingerprint truncated at this literal, and the
-          // compiled-plan lookup (sql_engine.cpp) still keys on the
-          // fingerprint when parameters is empty.  Record the raw text in
-          // the parameter slot so parameters stay aligned with the '?'
-          // placeholders the fingerprint accumulates.
+          // T2541: decline templating but keep scanning so the fingerprint
+          // still covers the rest of the statement. Keep the raw text in the
+          // parameter slot to preserve alignment with accumulated '?' slots.
           result.templatable = false;
           result.parameters.emplace_back(std::move(literal));
           result.fingerprint += "'?'";
@@ -1175,9 +1197,8 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
           // An invalid TIMESTAMP literal must not enter the template cache:
           // a cached slot would rebind the raw text without the visitor's
           // validation.  Decline templating so every run parses verbatim and
-          // surfaces the diagnostic.  T2541: same truncated-fingerprint
-          // hazard as the decode-failure path; finish the scan instead of
-          // returning mid-statement.
+          // surfaces the diagnostic. T2541: finish the scan instead of
+          // returning mid-statement so the statement fingerprint is complete.
           result.templatable = false;
           result.parameters.emplace_back(std::move(literal));
           result.fingerprint += "'?'";
@@ -1297,12 +1318,34 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
           break;
         }
       }
+      // Comments are copied verbatim into the fingerprint by the scanner
+      // above, so treat a leading line/block comment as whitespace when
+      // deciding whether CREATE/DROP starts the statement; otherwise a
+      // commented DDL silently enters the literal template cache.
       bool only_whitespace = true;
-      for (size_t j = stmt_begin; j < i; ++j) {
+      for (size_t j = stmt_begin; j < i;) {
+        if (sql[j] == '-' && j + 1 < i && sql[j + 1] == '-') {
+          j += 2;
+          while (j < i && sql[j] != '\n') {
+            ++j;
+          }
+          continue;
+        }
+        if (sql[j] == '/' && j + 1 < i && sql[j + 1] == '*') {
+          j += 2;
+          while (j < i && (sql[j] != '*' || j + 1 >= i || sql[j + 1] != '/')) {
+            ++j;
+          }
+          if (j < i) {
+            j += 2;
+          }
+          continue;
+        }
         if (std::isspace(static_cast<unsigned char>(sql[j])) == 0) {
           only_whitespace = false;
           break;
         }
+        ++j;
       }
       if (only_whitespace) {
         result.templatable = false;
@@ -1521,6 +1564,7 @@ StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
       auto bound_merge = std::make_unique<MergeStatement>(
           merge.TargetTable(), std::move(bound_source), merge.SourceAlias(),
           std::move(bound_on));
+      bound_merge->SetTargetAlias(merge.TargetAlias());
       std::vector<MergeWhenClause> clauses;
       clauses.reserve(merge.Clauses().size());
       for (const MergeWhenClause& clause : merge.Clauses()) {

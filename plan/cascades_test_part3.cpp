@@ -1,4 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include <cstdlib>
+
 #include "plan/cascades_test.hpp"
 
 namespace tinylamb::cascades {
@@ -508,6 +510,31 @@ TEST(CascadesTest, GroupLogicalPropertiesPropagation) {
   EXPECT_FALSE(props.IsUniqueOn({"users.email"}));
   EXPECT_TRUE(props.IsNotNull("users.id"));
   EXPECT_FALSE(props.IsUniqueOn({"users.name"}));
+}
+
+TEST(CascadesTest, RepeatedTryBuildRebuildsLogicalProperties) {
+  Memo memo;
+  const Schema users("users", {Column("id", ValueType::kInt64,
+                                      Constraint(Constraint::kPrimaryKey)),
+                               Column("name", ValueType::kVarChar)});
+  memo.SetTableSchemas({{"users", users}});
+  const ConjunctInfo by_name{.conjunct=UnaryExpressionExp(ColumnValueExp("users.name"),
+                                                UnaryOperation::kIsNotNull),
+                             .relations={"users"}};
+  const GroupId group = memo.Build({"users"}, {by_name});
+  ASSERT_FALSE(memo.Get(group).logical_properties_stale);
+
+  // A second TryBuild replaces the conjunct set and rewrites the group's scan
+  // filter. The stale flag alone is not observed by the rules that read
+  // logical_properties directly, so the rebuild must happen here (as it does
+  // in MergeScanFilter/AddExpression) instead of being deferred to Explore.
+  const ConjunctInfo by_id{.conjunct=UnaryExpressionExp(ColumnValueExp("users.id"),
+                                              UnaryOperation::kIsNotNull),
+                           .relations={"users"}};
+  memo.Build({"users"}, {by_id});
+  EXPECT_FALSE(memo.Get(group).logical_properties_stale);
+  EXPECT_EQ(memo.Get(group).logical_properties_expression_count,
+            memo.Get(group).expressions.size());
 }
 
 TEST(CascadesTest, IncrementalPropertiesRefreshChangedChildren) {
@@ -1208,6 +1235,45 @@ TEST(CascadesTest, PushLimitThroughUnionAll) {
   EXPECT_TRUE(found_pushed_limit);
 }
 
+TEST(CascadesTest, LimitWithTiesIsNeitherPushedNorMerged) {
+  for (const bool inner_ties : {false, true}) {
+    Memo memo;
+    (void)memo.Build({"t"});
+    const GroupId base = memo.EnsureGroup({"t"});
+    const GroupId setop = memo.EnsureDerivedGroup({"t"}, "union_all");
+    memo.AddExpression(
+        setop, LogicalExpression{.operation = LogicalOperator::kUnionAll,
+                                 .children = {base, base}});
+    const GroupId with_ties = memo.EnsureDerivedGroup({"t"}, "with_ties");
+    memo.AddExpression(with_ties,
+                       LogicalExpression{.operation = LogicalOperator::kLimit,
+                                         .children = {setop},
+                                         .limit_count = 7,
+                                         .with_ties = true});
+
+    const GroupId input =
+        inner_ties ? with_ties
+                   : memo.EnsureDerivedGroup({"t"}, "inner_plain_limit");
+    if (!inner_ties) {
+      memo.AddExpression(input,
+                         LogicalExpression{.operation = LogicalOperator::kLimit,
+                                           .children = {base},
+                                           .limit_count = 7});
+    }
+    const GroupId root = memo.EnsureDerivedGroup({"t"}, "outer_limit");
+    memo.AddExpression(root,
+                       LogicalExpression{.operation = LogicalOperator::kLimit,
+                                         .children = {input},
+                                         .limit_count = 3,
+                                         .with_ties = !inner_ties});
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(with_ties);
+    search.Explore(root);
+    EXPECT_FALSE(search.AppliedRuleNames().contains("union_all_push_limit"));
+    EXPECT_FALSE(search.AppliedRuleNames().contains("merge_limits"));
+  }
+}
+
 TEST(CascadesTest, InferFilterFromEquivalenceClass) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
@@ -1883,12 +1949,18 @@ TEST(CascadesTest, ExtractYearSargableAddsScanRange) {
                                  ConstantValueExp(Value(int64_t{2024})))}));
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(sel);
-  // The year predicate stays (residual) while the scan filter gains the
-  // half-open date range on top of any pushed extract conjunct.
-  const Expression filter = search.GetMemo().Get(input).filter;
+  // The Selection's scan alternative owns the bounds. Another consumer of
+  // the shared input must still see rows outside the year.
+  EXPECT_FALSE(search.GetMemo().Get(input).filter);
+  const Expression filter = search.GetMemo().Get(sel).filter;
   ASSERT_TRUE(filter);
   EXPECT_GE(SplitConjuncts(filter).size(), 2U);
-  EXPECT_NE(filter->ToString().find("2024"), std::string::npos);
+  EXPECT_FALSE(
+      filter->Evaluate(Row({Value::Date("2023-12-31")}), schema).Truthy());
+  EXPECT_TRUE(
+      filter->Evaluate(Row({Value::Date("2024-01-01")}), schema).Truthy());
+  EXPECT_FALSE(
+      filter->Evaluate(Row({Value::Date("2025-01-01")}), schema).Truthy());
 }
 
 TEST(CascadesTest, ComparisonSelfPredicatesFold) {
@@ -2525,6 +2597,212 @@ TEST(CascadesTest, EliminateTrueSelectionPreservesInputScanFilter) {
     copied_scan |= expr.operation == LogicalOperator::kScan;
   }
   EXPECT_TRUE(copied_scan);
+}
+
+TEST(CascadesTest, WindowHaloTopNPushesSliceAndPreservesOffset) {
+  unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+  Memo memo;
+  const GroupId scan = memo.Build({"t"});
+
+  auto make_call = []() {
+    auto c = std::make_shared<WindowFunctionCallExpression>();
+    c->function = "AVG";
+    c->args = {ColumnValueExp(ColumnName("t", "val"))};
+    c->order_by = {
+        WindowOrderTerm{.expression = ColumnValueExp(ColumnName("t", "id")),
+                        .ascending = true}};
+    c->has_frame = true;
+    c->frame_unit = WindowFrameUnit::kRows;
+    c->frame_start =
+        WindowFrameBound{.type = WindowFrameBoundType::kOffsetPreceding,
+                         .offset = ConstantValueExp(Value(int64_t{2}))};
+    c->frame_end =
+        WindowFrameBound{.type = WindowFrameBoundType::kOffsetFollowing,
+                         .offset = ConstantValueExp(Value(int64_t{3}))};
+    return c;
+  };
+  auto call = make_call();
+
+  const GroupId win_group = memo.EnsureDerivedGroup({"t"}, "window|halo");
+  ASSERT_TRUE(memo.AddExpression(
+      win_group,
+      LogicalExpression{.operation = LogicalOperator::kWindow,
+                        .children = {scan},
+                        .target_list = {NamedExpression("$win0", call)}}));
+
+  const GroupId topn_group = memo.EnsureDerivedGroup({"t"}, "topn_halo");
+  ASSERT_TRUE(memo.AddExpression(
+      topn_group,
+      LogicalExpression{.operation = LogicalOperator::kTopN,
+                        .children = {win_group},
+                        .target_list = {NamedExpression(
+                            "", ColumnValueExp(ColumnName("t", "id")))},
+                        .sort_ascending = {true},
+                        .limit_count = 50,
+                        .limit_offset = 1000,
+                        .with_ties = false}));
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(topn_group);
+  EXPECT_TRUE(search.AppliedRuleNames().contains("window_halo_topn"));
+
+  bool found_outer_slice = false;
+  for (const auto& expr : search.GetMemo().Get(topn_group).expressions) {
+    if (expr.operation == LogicalOperator::kTopN && !expr.children.empty() &&
+        search.GetMemo()
+            .Get(expr.children[0])
+            .tag.starts_with("window-halo-window:")) {
+      EXPECT_EQ(expr.limit_count, 50U);
+      EXPECT_EQ(expr.limit_offset, 2U);
+      const GroupId halo_win_id = expr.children[0];
+      for (const auto& hw : search.GetMemo().Get(halo_win_id).expressions) {
+        if (hw.operation == LogicalOperator::kWindow && !hw.children.empty()) {
+          const GroupId halo_topn_id = hw.children[0];
+          for (const auto& ht :
+               search.GetMemo().Get(halo_topn_id).expressions) {
+            if (ht.operation == LogicalOperator::kTopN) {
+              EXPECT_EQ(ht.limit_count, 55U);
+              EXPECT_EQ(ht.limit_offset, 998U);
+              found_outer_slice = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(found_outer_slice);
+
+  // Must decline on UNBOUNDED PRECEDING, non-empty PARTITION BY, or mismatched
+  // ORDER BY.
+  for (int bad_case = 0; bad_case < 3; ++bad_case) {
+    Memo bad_memo;
+    const GroupId bad_scan = bad_memo.Build({"t"});
+    auto bad_call = make_call();
+    if (bad_case == 0) {
+      bad_call->frame_start = WindowFrameBound{
+          .type = WindowFrameBoundType::kUnboundedPreceding, .offset = nullptr};
+    } else if (bad_case == 1) {
+      bad_call->partition_by = {ColumnValueExp(ColumnName("t", "grp"))};
+    } else {
+      bad_call->order_by[0].ascending = false;
+    }
+    const GroupId bad_win = bad_memo.EnsureDerivedGroup({"t"}, "bad_win");
+    ASSERT_TRUE(bad_memo.AddExpression(
+        bad_win,
+        LogicalExpression{.operation = LogicalOperator::kWindow,
+                          .children = {bad_scan},
+                          .target_list = {NamedExpression("$win0", bad_call)},
+                          .partition_by = bad_call->partition_by}));
+    const GroupId bad_topn = bad_memo.EnsureDerivedGroup({"t"}, "bad_topn");
+    ASSERT_TRUE(bad_memo.AddExpression(
+        bad_topn,
+        LogicalExpression{.operation = LogicalOperator::kTopN,
+                          .children = {bad_win},
+                          .target_list = {NamedExpression(
+                              "", ColumnValueExp(ColumnName("t", "id")))},
+                          .sort_ascending = {true},
+                          .limit_count = 50,
+                          .limit_offset = 1000}));
+    SearchEngine bad_search(std::move(bad_memo), RuleSet::Default());
+    bad_search.Explore(bad_topn);
+    EXPECT_FALSE(bad_search.AppliedRuleNames().contains("window_halo_topn"));
+  }
+}
+
+TEST(CascadesTest, OuterFetchTiesPushesThroughLeftJoin) {
+  unsetenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+  for (const bool with_ties : {false, true}) {
+    Memo memo;
+    (void)memo.Build({"l", "r"});
+    const GroupId l_scan = memo.EnsureGroup({"l"});
+    const GroupId r_scan = memo.EnsureGroup({"r"});
+    const GroupId ojoin = memo.EnsureDerivedGroup({"l", "r"}, "left_outer");
+    ASSERT_TRUE(memo.AddExpression(
+        ojoin, LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                                 .children = {l_scan, r_scan},
+                                 .predicate = BinaryExpressionExp(
+                                     ColumnValueExp(ColumnName("l", "id")),
+                                     BinaryOperation::kEquals,
+                                     ColumnValueExp(ColumnName("r", "id"))),
+                                 .join_type = 0}));
+    const GroupId topn = memo.EnsureDerivedGroup({"l", "r"}, "topn_left_join");
+    ASSERT_TRUE(memo.AddExpression(
+        topn,
+        LogicalExpression{.operation = LogicalOperator::kTopN,
+                          .children = {ojoin},
+                          .target_list = {NamedExpression(
+                              "", ColumnValueExp(ColumnName("l", "score")))},
+                          .sort_ascending = {false},
+                          .limit_count = 5,
+                          .limit_offset = 2,
+                          .with_ties = with_ties}));
+
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(topn);
+    EXPECT_TRUE(search.AppliedRuleNames().contains(
+        "push_topn_with_ties_through_left_join"));
+
+    bool found_pushed_left_ties = false;
+    for (const auto& expr : search.GetMemo().Get(topn).expressions) {
+      if (expr.operation == LogicalOperator::kTopN && !expr.children.empty() &&
+          search.GetMemo()
+              .Get(expr.children[0])
+              .tag.starts_with("ojoin_topn_ties_join:")) {
+        EXPECT_EQ(expr.with_ties, with_ties);
+        EXPECT_EQ(expr.limit_count, 5U);
+        EXPECT_EQ(expr.limit_offset, 2U);
+        const GroupId pushed_join_id = expr.children[0];
+        for (const auto& je :
+             search.GetMemo().Get(pushed_join_id).expressions) {
+          if (je.operation == LogicalOperator::kOuterJoin &&
+              !je.children.empty()) {
+            const GroupId pushed_left_id = je.children[0];
+            for (const auto& le :
+                 search.GetMemo().Get(pushed_left_id).expressions) {
+              if (le.operation == LogicalOperator::kTopN) {
+                EXPECT_TRUE(le.with_ties);
+                EXPECT_EQ(le.limit_count, 7U);
+                EXPECT_EQ(le.limit_offset, 0U);
+                found_pushed_left_ties = true;
+              }
+            }
+          }
+        }
+      }
+    }
+    EXPECT_TRUE(found_pushed_left_ties);
+  }
+
+  // Must decline when ORDER BY touches right-side column `r.v`.
+  Memo bad_memo;
+  (void)bad_memo.Build({"l", "r"});
+  const GroupId l_scan = bad_memo.EnsureGroup({"l"});
+  const GroupId r_scan = bad_memo.EnsureGroup({"r"});
+  const GroupId ojoin = bad_memo.EnsureDerivedGroup({"l", "r"}, "left_outer");
+  ASSERT_TRUE(bad_memo.AddExpression(
+      ojoin, LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                               .children = {l_scan, r_scan},
+                               .predicate = BinaryExpressionExp(
+                                   ColumnValueExp(ColumnName("l", "id")),
+                                   BinaryOperation::kEquals,
+                                   ColumnValueExp(ColumnName("r", "id"))),
+                               .join_type = 0}));
+  const GroupId bad_topn =
+      bad_memo.EnsureDerivedGroup({"l", "r"}, "topn_right");
+  ASSERT_TRUE(bad_memo.AddExpression(
+      bad_topn,
+      LogicalExpression{.operation = LogicalOperator::kTopN,
+                        .children = {ojoin},
+                        .target_list = {NamedExpression(
+                            "", ColumnValueExp(ColumnName("r", "v")))},
+                        .sort_ascending = {false},
+                        .limit_count = 5,
+                        .limit_offset = 0,
+                        .with_ties = true}));
+  SearchEngine bad_search(std::move(bad_memo), RuleSet::Default());
+  bad_search.Explore(bad_topn);
+  EXPECT_FALSE(bad_search.AppliedRuleNames().contains(
+      "push_topn_with_ties_through_left_join"));
 }
 
 }  // namespace tinylamb::cascades

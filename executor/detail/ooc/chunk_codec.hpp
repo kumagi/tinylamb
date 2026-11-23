@@ -16,22 +16,22 @@ namespace tinylamb {
 // buffers, variable-length string/nested Value payloads, and row positions.
 [[nodiscard]] size_t EstimateChunkMemoryBytes(const DataChunk& chunk) noexcept;
 
-// Encodes `chunk` (columnar types, unsigned/heterogeneous flags, valid
-// RowPositions, NULL bitmaps, column collation, and column payloads) onto
-// `dst`. Fallback values also carry their individual tags.
+// Appends one encoded chunk to `dst`, preserving any existing prefix.
+// The payload includes column types and flags, positions, nulls, collation,
+// and column data. Fallback values also carry their individual tags.
 [[nodiscard]] Status EncodeDataChunk(const DataChunk& chunk, std::string* dst);
 
-// Decodes one DataChunk emitted by `EncodeDataChunk` from `src`, resetting
-// `chunk_out` and advancing `src` past the consumed bytes.
+// Decodes one DataChunk emitted by `EncodeDataChunk` from `src`. On success,
+// replaces `chunk_out` and advances `src`. A malformed payload leaves `src`
+// at the original position and clears `chunk_out`.
 [[nodiscard]] Status DecodeDataChunk(std::string_view* src,
                                      DataChunk* chunk_out);
 
-// Writes one framed DataChunk into `SpillSegmentWriter`:
+// Writes one or more framed DataChunks into `SpillSegmentWriter`:
 //   [uint32_t frame_bytes][chunk_payload]
-// When `max_frame_bytes` > 0 and the encoded chunk exceeds it, the rows are
-// split across multiple frames (each holding a row-contiguous sub-chunk) so a
-// reader loop reassembles the same rows without ever materializing a frame
-// much larger than the cap (only a single oversized row can still exceed it).
+// Splits rows into contiguous ranges to fit the codec's row limit and any
+// nonzero `max_frame_bytes` limit. A single oversized row can exceed the byte
+// limit.
 [[nodiscard]] Status WriteDataChunk(SpillSegmentWriter* writer,
                                     const DataChunk& chunk,
                                     std::string* scratch_buffer = nullptr,

@@ -53,6 +53,7 @@
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
+#include "table/tlcs_file.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -495,11 +496,31 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     const auto scan_begin = std::chrono::steady_clock::now();
     bool loaded_from_lstable = false;
     if (!context.txn_.HasAnyPageVersionChains()) {
+      const uint64_t gen = tables[build]->LayoutGeneration();
+      const page_id_t first_pid = tables[build]->FirstPageId();
+      const bool clean_txn =
+          context.txn_.IsReadOnly() || context.txn_.WriteSetEmpty();
+      if (dimension_stride == 1 && build_int_filters.empty() && gen != 0 &&
+          !tables[build]->RowsRewrittenInPlace() && clean_txn) {
+        if (const auto tlcs = tables[build]->GetBackingTlcsStore();
+            tlcs != nullptr && tlcs->LayoutGeneration() == gen &&
+            tlcs->FirstPageId() == first_pid && tlcs->TotalRows() > 0 &&
+            tlcs->HasColumnSynopses() &&
+            projections[build][0] < tlcs->ColumnSynopses().size() &&
+            tlcs->ColumnSynopses()[projections[build][0]].is_identity_1_to_n) {
+          build_is_identity_1_to_n = true;
+          identity_dimension_rows = static_cast<size_t>(tlcs->TotalRows());
+          loaded_from_lstable = true;
+        }
+      }
       std::shared_ptr<const LSTableStore> bstore =
-          GetOrBuildLSTableStore(context.txn_, *tables[build], true);
-      if (bstore != nullptr && bstore->uncommitted_owner_txn == 0 &&
-          bstore->layout_generation == tables[build]->LayoutGeneration() &&
-          bstore->first_pid == tables[build]->FirstPageId()) {
+          loaded_from_lstable
+              ? nullptr
+              : GetOrBuildLSTableStore(context.txn_, *tables[build], true,
+                                       &projections[build]);
+      if (!loaded_from_lstable && bstore != nullptr &&
+          bstore->uncommitted_owner_txn == 0 &&
+          bstore->layout_generation == gen && bstore->first_pid == first_pid) {
         if (dimension_stride == 1 && build_int_filters.empty() &&
             projections[build][0] < bstore->column_is_identity_1_to_n.size() &&
             bstore->column_is_identity_1_to_n[projections[build][0]] != 0 &&
@@ -2216,21 +2237,24 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
             }
             const LSTableColumnBlock& gk_col = blk.columns[full_gk0];
             if (!gk_col.has_min_max ||
-                gk_col.int_cells.size() < blk.row_count) {
+                (!store.ColumnIsLazy(full_gk0) &&
+                 gk_col.int_cells.size() < blk.row_count)) {
               can_single_bitset = false;
               break;
             }
             if (gk_col.type != gk_types[0]) {
               gk_type_uniform_match = false;
             }
-            if (has_join_key &&
+            if (has_join_key && !store.ColumnIsLazy(full_jk0) &&
                 blk.columns[full_jk0].int_cells.size() < blk.row_count) {
               can_single_bitset = false;
               break;
             }
             for (const BsRfSpec& spec : other_rfs) {
               if (spec.full_col >= blk.columns.size() ||
-                  blk.columns[spec.full_col].int_cells.size() < blk.row_count) {
+                  (!store.ColumnIsLazy(spec.full_col) &&
+                   blk.columns[spec.full_col].int_cells.size() <
+                       blk.row_count)) {
                 can_single_bitset = false;
                 break;
               }
@@ -2241,7 +2265,9 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
             if (peek_ptr != nullptr) {
               for (const IntegerPeekCompare& pred : *peek_ptr) {
                 if (pred.column >= blk.columns.size() ||
-                    blk.columns[pred.column].int_cells.size() < blk.row_count) {
+                    (!store.ColumnIsLazy(static_cast<slot_t>(pred.column)) &&
+                     blk.columns[pred.column].int_cells.size() <
+                         blk.row_count)) {
                   can_single_bitset = false;
                   break;
                 }
@@ -2379,6 +2405,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
                                               : 0;
               const size_t n_active = active_blocks.size();
               std::atomic<size_t> next_ab{0};
+              std::atomic<bool> bs_io_error{false};
               const auto run_bs_scan = [&](size_t w) {
                 uint64_t* __restrict wbits = (*worker_bitsets)[w].data();
                 uint8_t local_saw_null = 0;
@@ -2554,13 +2581,21 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
                       }
                     };
 
+                LSTableStore::LazyBlockScratch lazy_scratch;
                 while (true) {
                   const size_t ai =
                       next_ab.fetch_add(1, std::memory_order_relaxed);
                   if (ai >= n_active) {
                     break;
                   }
-                  const LSTablePageBlock& blk = store.blocks[active_blocks[ai]];
+                  lazy_scratch.transient.clear();
+                  const LSTablePageBlock* mat = store.MaterializeBlockView(
+                      active_blocks[ai], &lazy_scratch);
+                  if (mat == nullptr) {
+                    bs_io_error.store(true, std::memory_order_relaxed);
+                    break;
+                  }
+                  const LSTablePageBlock& blk = *mat;
                   const LSTableColumnBlock& gk_col = blk.columns[full_gk0];
                   const LSTableColumnBlock* const jk_col =
                       has_join_key ? &blk.columns[full_jk0] : nullptr;
@@ -3007,6 +3042,9 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
               } else {
                 RETURN_IF_FAIL(RunParallelTasks(use_workers, run_bs_scan));
               }
+              if (bs_io_error.load(std::memory_order_relaxed)) {
+                return Status::kIOError;
+              }
             }
 
             bool any_null = worker_saw_null[0] != 0;
@@ -3441,6 +3479,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
     };
     std::atomic<size_t> dist_next_block{0};
     std::atomic<size_t> dist_next_chunk{0};
+    std::atomic<bool> dist_io_error{false};
     const auto run_dist_scan = [&](size_t w) {
       auto& wp = worker_parts[w];
       constexpr size_t kL1Cap = 2048;
@@ -3516,17 +3555,19 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
         std::array<const LSTableColumnBlock*, 16> proj_cols{};
         std::array<const int64_t*, 16> proj_int_ptrs{};
         std::array<uint8_t, 16> proj_has_null{};
+        LSTableStore::LazyBlockScratch lazy_scratch;
         while (true) {
           const size_t bi =
               dist_next_block.fetch_add(1, std::memory_order_relaxed);
           if (bi >= total_blocks) {
             break;
           }
-          const LSTablePageBlock& blk = store.blocks[bi];
-          if (blk.row_count == 0) {
+          const LSTablePageBlock& meta_blk = store.blocks[bi];
+          if (meta_blk.row_count == 0) {
             continue;
           }
-          if (!blk.MatchesZoneMaps(peek_ptr, active_rf_group, full_rf_col)) {
+          if (!meta_blk.MatchesZoneMaps(peek_ptr, active_rf_group,
+                                        full_rf_col)) {
             continue;
           }
           bool extra_zm_reject = false;
@@ -3539,8 +3580,8 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
               break;
             }
             const slot_t ext_full = deferred_left_probe->projection[ext.column];
-            if (ext_full < blk.columns.size()) {
-              const LSTableColumnBlock& mcol = blk.columns[ext_full];
+            if (ext_full < meta_blk.columns.size()) {
+              const LSTableColumnBlock& mcol = meta_blk.columns[ext_full];
               // RejectRange speaks the int64 key domain; a block column of
               // any other type must not feed it (same guard as the sister
               // delayed-scan loop above and RuntimeFilterGroup::Reject).
@@ -3560,8 +3601,8 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
           if (!singleton_probe && use_dense_int_rows &&
               !dense_int_idxs.empty() && off0 == 0) {
             const slot_t full_key = deferred_left_probe->projection[jk0];
-            if (full_key < blk.columns.size()) {
-              const LSTableColumnBlock& jk = blk.columns[full_key];
+            if (full_key < meta_blk.columns.size()) {
+              const LSTableColumnBlock& jk = meta_blk.columns[full_key];
               if (jk.has_min_max) {
                 const uint64_t span = dense_int_idxs.size();
                 const bool above =
@@ -3578,7 +3619,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
           bool peek_all_pass = true;
           if (peek_ptr != nullptr) {
             for (const IntegerPeekCompare& pred : *peek_ptr) {
-              const LSTableColumnBlock& pcol = blk.columns[pred.column];
+              const LSTableColumnBlock& pcol = meta_blk.columns[pred.column];
               if (pcol.has_null || !pcol.has_min_max ||
                   !eval_int_peek(pred.op, pcol.min_int, pred.constant) ||
                   !eval_int_peek(pred.op, pcol.max_int, pred.constant)) {
@@ -3587,6 +3628,14 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
               }
             }
           }
+          lazy_scratch.transient.clear();
+          const LSTablePageBlock* mat =
+              store.MaterializeBlockView(bi, &lazy_scratch);
+          if (mat == nullptr) {
+            dist_io_error.store(true, std::memory_order_relaxed);
+            break;
+          }
+          const LSTablePageBlock& blk = *mat;
           for (size_t c = 0; c < base_proj_cols; ++c) {
             const LSTableColumnBlock& cblk =
                 blk.columns[deferred_left_probe->projection[c]];
@@ -4029,6 +4078,9 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
     } else {
       RETURN_IF_FAIL(RunParallelTasks(scan_workers, run_dist_scan));
     }
+    if (dist_io_error.load(std::memory_order_relaxed)) {
+      return Status::kIOError;
+    }
     std::vector<std::vector<DistinctIntEntry>> unique_parts(kParts);
     std::vector<std::vector<int64_t>> unique_k0(kParts);
     std::vector<std::vector<int64_t>> unique_k1(kParts);
@@ -4089,7 +4141,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
                   p_ht_keys.assign(new_cap, 0);
                   p_ht_gens.assign(new_cap, 0);
                   p_cur_gen = 1;
-                  const uint64_t nmask = static_cast<uint64_t>(new_cap - 1);
+                  const auto nmask = static_cast<uint64_t>(new_cap - 1);
                   for (uint32_t j = 0; j < n_occ; ++j) {
                     const uint64_t pk =
                         (static_cast<uint64_t>(static_cast<uint32_t>(
@@ -4294,7 +4346,8 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
         } else {
           RETURN_IF_FAIL(RunParallelTasks(emit_workers, run_sink_emit));
         }
-        for (const Status& st : emit_errors) RETURN_IF_FAIL(st);
+        for (const Status& st : emit_errors) { RETURN_IF_FAIL(st);
+}
         if (auto* runtime = context.execution_runtime()) {
           runtime->pushed_group_rows += total_unique;
         }

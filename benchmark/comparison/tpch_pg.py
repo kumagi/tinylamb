@@ -31,6 +31,14 @@ class PipeRows:
         return result
 
 
+def validate_fixture_counts(client, engine, counts):
+    for table, expected in counts.items():
+        actual = client.execute(f'SELECT COUNT(*) FROM {table}')[0][0]
+        if actual != expected:
+            raise ValueError(f'{engine} {table}: expected {expected} rows, got {actual}')
+        client.execute(('VACUUM (ANALYZE) ' if engine == 'postgresql' else 'ANALYZE ') + table)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
@@ -44,6 +52,8 @@ def main():
     p.add_argument('--fixture-indexed', action='store_true', help='Tiny fixture already has the common secondary indexes')
     p.add_argument('--bounded-duplicate-indexes', action='store_true', help='append identity columns to the two high-duplicate SF1 keys on BOTH engines')
     p.add_argument('--measure-gate', type=Path, help='wait for this file after preparation; keep builds/tests out of timings')
+    p.add_argument('--measure-gate-timeout', type=float, default=600,
+                   help='maximum seconds to wait for --measure-gate (default: 600)')
     p.add_argument('--server-cpus', default='0-15')
     p.add_argument('--timeout', type=int, default=60)
     p.add_argument('--postgres-image', default='postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4')
@@ -55,8 +65,6 @@ def main():
     for s in sockets:
         s.bind(('127.0.0.1', 0))
     ports = dict(zip(('tinylamb', 'postgresql'), (s.getsockname()[1] for s in sockets)))
-    for s in sockets:
-        s.close()
     name = f'tinylamb-pg-{os.getpid()}'
     tiny = None
     commands = []
@@ -76,6 +84,7 @@ def main():
             if f.is_file():
                 shutil.copy2(f, work / ('database' + f.name[len(a.fixture.name):]))
         image = a.postgres_image
+        sockets[1].close()  # release immediately before PostgreSQL binds it
         call(['docker', 'run', '-d', '--name', name, '--network', 'host',
               '--cpuset-cpus', a.server_cpus, '-e', 'POSTGRES_HOST_AUTH_METHOD=trust',
               '-e', 'POSTGRES_USER=bench', '-e', 'POSTGRES_DB=bench', image,
@@ -84,16 +93,22 @@ def main():
               '-c', 'max_parallel_workers_per_gather=4', '-c', 'jit=on',
               '-c', 'fsync=on', '-c', 'synchronous_commit=on'])
         env = {k: v for k, v in os.environ.items() if not k.startswith('TINYLAMB_')}
-        env.update(TINYLAMB_PAGE_POOL_BYTES=str(4 << 30), TINYLAMB_QUERY_MEMORY_BYTES=str(2 << 30))
+        env.update(TINYLAMB_BUFFER_POOL_BYTES=str(4 << 30), TINYLAMB_QUERY_MEMORY_BYTES=str(2 << 30))
         argv = ['taskset', '-c', a.server_cpus, str(a.server.resolve()), str(work / 'database'),
                 '--port', str(ports['tinylamb']), '--read-workers', '8']
         commands.append(dict(argv=argv, env={k: v for k, v in env.items() if k.startswith('TINYLAMB_')}))
         (out / 'commands.json').write_text(json.dumps(commands, indent=2))
         with (out / 'tinylamb-server.log').open('w') as log:
+            sockets[0].close()  # release immediately before TinyLamb binds it
             tiny = subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
             for engine in ports:
                 deadline = time.monotonic() + 120
                 while True:
+                    # Popen has no check= argument: fail fast if the long-lived
+                    # server dies during startup instead of polling until the
+                    # 120-second deadline expires.
+                    if tiny.poll() is not None:
+                        raise RuntimeError(f'tinylamb server exited during startup: {tiny.returncode}')
                     try:
                         c = run.Client(engine, ports, a.timeout); c.close(); break
                     except Exception:
@@ -114,10 +129,7 @@ def main():
                     for sql in indexes:
                         print('index', engine, sql, flush=True)
                         c.execute(sql)
-                for table in counts:
-                    actual = c.execute(f'SELECT COUNT(*) FROM {table}')[0][0]
-                    assert actual == counts[table], (engine, table, actual)
-                    c.execute(('VACUUM (ANALYZE) ' if engine == 'postgresql' else 'ANALYZE ') + table)
+                validate_fixture_counts(c, engine, counts)
                 c.close()
             settings = pg.execute("SELECT name, setting FROM pg_settings WHERE name IN ('server_version','shared_buffers','work_mem','max_parallel_workers_per_gather','jit','fsync','synchronous_commit','full_page_writes','wal_sync_method') ORDER BY name")
             meta = dict(args={k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
@@ -130,17 +142,26 @@ def main():
             (out / 'prepared.json').write_text(json.dumps(dict(prepared=True, timestamp=time.time())))
             if a.measure_gate:
                 print('prepared; waiting for measure gate', a.measure_gate, flush=True)
+                # The gate file is created by an external orchestrator, so
+                # there is no in-process condition variable to wait on; every
+                # preparation command above already checked its exit status.
+                deadline = time.monotonic() + a.measure_gate_timeout
                 while not a.measure_gate.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"measure gate timeout: {a.measure_gate}")
                     time.sleep(.2)
             run.ENGINES = ('tinylamb', 'postgresql')
             queries = tpch_queries(a.scale)
             if a.queries:
                 queries = {q: sql for q, sql in queries.items() if q in a.queries}
-                assert set(queries) == set(a.queries)
+                unknown = set(a.queries) - queries.keys()
+                if unknown:
+                    raise ValueError(f'unknown TPC-H queries: {sorted(unknown)}')
             args = SimpleNamespace(timeout=a.timeout, repeats=a.repeats, seed=20261030, explain_analyze=True)
             run.run_olap(SimpleNamespace(ports=ports), args, out, a.scale, queries, 'tpch')
             records = [json.loads(s) for s in (out / 'results.jsonl').read_text().splitlines()]
-            assert all(r['correct'] for r in records), 'incorrect or failed results; inspect records'
+            if not records or any(not r['correct'] for r in records):
+                raise ValueError('missing, incorrect or failed results; inspect results.jsonl')
             (out / 'finished.json').write_text(json.dumps(dict(correct=len(records), load_end=os.getloadavg()), indent=2))
     finally:
         if tiny is not None:
@@ -150,8 +171,12 @@ def main():
             except subprocess.TimeoutExpired:
                 tiny.kill(); tiny.wait()
         with (out / 'postgres.log').open('w') as log:
-            subprocess.run(['docker', 'logs', name], stdout=log, stderr=subprocess.STDOUT)
-        subprocess.run(['docker', 'rm', '-fv', name], stdout=subprocess.DEVNULL)
+            logs = subprocess.run(['docker', 'logs', name], stdout=log, stderr=subprocess.STDOUT)
+            if logs.returncode:
+                print(f'WARN: docker logs {name} exited with {logs.returncode}', flush=True)
+        cleanup = subprocess.run(['docker', 'rm', '-fv', name], stdout=subprocess.DEVNULL)
+        if cleanup.returncode:
+            print(f'WARN: docker rm {name} exited with {cleanup.returncode}', flush=True)
 
 
 if __name__ == '__main__':

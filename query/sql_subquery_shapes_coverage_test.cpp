@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,14 +18,19 @@
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/expression_eval.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/spill_file.hpp"
+#include "expression/constant_value.hpp"
+#include "expression/query_expression.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -65,6 +71,38 @@ std::string JoinFirstColumn(const std::vector<Row>& rows) {
   return out;
 }
 }  // namespace
+
+TEST(SqlSubquerySpillTest, ReadFailureReachesScalarArrayAndQuantifiedConsumers) {
+  using namespace relational_detail;
+  auto statement = std::make_shared<SelectStatement>();
+  auto relation = std::make_shared<Relation>();
+  relation->schema = Schema("", {Column("v", ValueType::kInt64)});
+  relation->spill = std::make_shared<SpillFile>();
+  ASSERT_EQ(relation->spill->Append(Row({Value(1)})), Status::kSuccess);
+  ASSERT_EQ(relation->spill->FinishWriting(), Status::kSuccess);
+  std::error_code error;
+  std::filesystem::resize_file(relation->spill->Path(), 0, error);
+  ASSERT_FALSE(error) << error.message();
+  ExecutionRuntime runtime;
+  runtime.uncorrelated_results.emplace(statement.get(), relation);
+  TransactionContext context(Transaction{}, nullptr);
+  context.set_execution_runtime(&runtime);
+
+  auto scalar = std::make_shared<QueryExpression>(statement, Expression{},
+                                                  false, false);
+  auto array = std::make_shared<QueryExpression>(statement, Expression{},
+                                                 false, false);
+  array->SetArrayResult(true);
+  auto quantified = std::make_shared<QueryExpression>(
+      statement, ConstantValueExp(Value(1)), false, false,
+      BinaryOperation::kEquals, QuantifierMode::kAny);
+  for (const auto& expression : {scalar, array, quantified}) {
+    const auto result = TryEvaluate(expression, Scope{}, nullptr, context, {});
+    EXPECT_FALSE(result.HasValue());
+    EXPECT_EQ(result.GetStatus(), StatusCode::kCorrupt);
+  }
+  EXPECT_TRUE(runtime.uncorrelated_scalar_by_node.empty());
+}
 
 class SqlSubqueryShapesCoverageTest : public ::testing::Test {
  protected:
@@ -139,10 +177,13 @@ TEST_F(SqlSubqueryShapesCoverageTest, CorrelatedScalarSubquery) {
       "SELECT id FROM orders o WHERE amt >= "
       "(SELECT MAX(amt) FROM orders o2 WHERE o2.cust = o.cust) ORDER BY id",
       "2,3,4");
-  ExpectColumn(
-      "SELECT o.id, (SELECT name FROM custs c WHERE c.id = o.cust) "
-      "FROM orders o ORDER BY o.id",
-      "1,2,3,4,5");
+  EXPECT_EQ(Query("SELECT o.id, (SELECT name FROM custs c WHERE c.id = o.cust) "
+                  "FROM orders o ORDER BY o.id"),
+            (std::vector<Row>{Row({Value(1), Value("a")}),
+                              Row({Value(2), Value("a")}),
+                              Row({Value(3), Value("b")}),
+                              Row({Value(4), Value()}),
+                              Row({Value(5), Value()})}));
 }
 
 TEST_F(SqlSubqueryShapesCoverageTest, InMembershipAndNullThreeValuedLogic) {
@@ -352,6 +393,13 @@ TEST_F(SqlSubqueryShapesCoverageTest, VolatileUncorrelatedSubqueryIsNotReused) {
 }
 
 TEST_F(SqlSubqueryShapesCoverageTest, SetOperandOrderDeterminesVolatility) {
+  // This is a frontend-shape test: it deliberately goes through the pinned
+  // external parser (GoogleSqlFrontend::Parse -> AST -> Statement) because the
+  // volatility verdict depends on where the parser keeps a set operand's
+  // ORDER BY.  The fixture's SetUp already GTEST_SKIPs the whole suite when
+  // TINYLAMB_GOOGLESQL_EXECUTABLE is unavailable, so a missing parser cannot
+  // make this test red -- it is simply skipped, like the rest of the file.
+  ASSERT_TRUE(GoogleSqlFrontend::Available()) << "fixture SetUp must skip";
   for (const bool volatile_order : {false, true}) {
     const std::string sql = std::string("(SELECT id FROM orders ORDER BY ") +
                             (volatile_order ? "RAND()" : "id") +

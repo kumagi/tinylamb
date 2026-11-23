@@ -1297,6 +1297,25 @@ TEST(GroupedAggregateTest, AKeylessPayloadNeedsNoInputOrder) {
 // ------------------------------------------------------------------ parallel
 // --
 
+TEST(GroupedAggregateTest, ParallelHashBuildReportsNonStandardWorkerFailure) {
+  class ThrowingBatch final : public ExecutorBase {
+   public:
+    size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override { throw 5; }
+    void Dump(std::ostream& /*o*/, int /*indent*/) const override {}
+  };
+
+  GroupedAggregateOptions options;
+  options.worker_count = 4;
+  const auto aggregate = std::make_shared<HashAggregateExecutor>(
+      std::make_shared<ThrowingBatch>(), InputSchema(),
+      std::vector<NamedExpression>{Key("k")},
+      std::vector<NamedExpression>{CountStar(), Sum(V())}, nullptr, options);
+  ASSERT_TRUE(aggregate->ParallelCapable());
+  const Collected collected = Collect(aggregate);
+  EXPECT_EQ(collected.status.GetCode(), StatusCode::kRuntimeError);
+  EXPECT_TRUE(collected.rows.empty());
+}
+
 TEST(GroupedAggregateTest, TheParallelHashBuildMatchesTheSerialOne) {
   const std::vector<Row> rows = MakeManyRows(96, 5);
   const std::vector<NamedExpression> keys = {Key("k")};
@@ -1500,14 +1519,14 @@ class GroupedAggregateSqlTest : public ::testing::Test {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       last_error_ = engine.LastError();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return prepared.GetStatus();
     }
     *rows = Collect(prepared.Value()).rows;
     Status status = prepared.Value()->GetStatus();
     if (status != Status::kSuccess) {
       last_error_ = engine.LastError();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return status;
     }
     const Status committed = context.PreCommit();
@@ -1630,6 +1649,18 @@ TEST_F(GroupedAggregateSqlTest, TheEnginesHavingAndGroupingSetsStillWork) {
 // cross-block StateAt indexing (via growth and Merge adoption) and key
 // stability across rehashes -- both break on an off-by-one in the flat
 // index math or a copied-back key.
+TEST(AggregateGroupTableTest, InvalidGroupAndAggregateReturnStatus) {
+  const Schema schema("input", {});
+  std::vector<const AggregateExpression*> aggregates{nullptr};
+  AggregateGroupTable table(&schema, &aggregates);
+  ASSERT_TRUE(table.FindOrCreate(Row({})).HasValue());
+  EXPECT_EQ(table.StateFor(0, 1).GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(table.StateFor(std::numeric_limits<size_t>::max(), 0).GetStatus(),
+            Status::kInvalidArgument);
+  EXPECT_EQ(table.Accumulate(1, Row({})), Status::kInvalidArgument);
+  EXPECT_EQ(table.Finish(1).GetStatus(), Status::kInvalidArgument);
+}
+
 TEST(AggregateGroupTableTest, StateArenaAndBorrowedKeysSpanBlockBoundaries) {
   const Schema schema(
       "t", {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});

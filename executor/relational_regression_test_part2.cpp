@@ -2152,6 +2152,9 @@ TEST_F(RelationalRegressionTest, RankedRollupFitsPackedGroupingBudget) {
 
   std::atomic<size_t> active{0};
   ScopedQueryParallelismBudget budget(&active, 4);
+  // Isolate the accounting to the packed grouping: building the columnar
+  // input above is not part of the path whose budget compliance we pin.
+  QueryMemoryBudget::Global().ResetForTest(size_t{5} << 20);
   ASSIGN_OR_ASSERT_FAIL(
       std::optional<std::vector<relational_detail::Relation>>, grouped,
       relational_detail::TryCompactGroupingSets(context, sets, input,
@@ -2160,6 +2163,10 @@ TEST_F(RelationalRegressionTest, RankedRollupFitsPackedGroupingBudget) {
     FAIL() << "ranked rollup declined the packed grouping budget";
   }
   ASSERT_EQ(grouped->size(), 3U);
+  // Checking only the grouped values would pass even if the packed path
+  // ignored the limit and kept the whole input resident. Pin the OOC
+  // invariant directly: the grouping's charges must fit its own budget.
+  EXPECT_LE(QueryMemoryBudget::Global().Used(), size_t{5} << 20);
   std::vector<Row> finest;
   for (int64_t i = kRows - 4; i < kRows; ++i) {
     finest.emplace_back(Row({Value(i % 2), Value(i), Value(2047.0)}));

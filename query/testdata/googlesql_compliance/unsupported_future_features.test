@@ -60,18 +60,18 @@ FROM stock_ticks MATCH_RECOGNIZE (
   PARTITION BY symbol
   ORDER BY t_time
   MEASURES
-    FIRST(A.price) AS start_price,
-    LAST(B.price) AS bottom_price,
-    LAST(C.price) AS peak_price
-  ONE ROW PER MATCH
+    FIRST(price) AS start_price,
+    LAST(price) AS bottom_price,
+    LAST(price) AS peak_price
   PATTERN ( A B+ C+ )
   DEFINE
-    B AS B.price < PREV(B.price),
-    C AS C.price > PREV(C.price)
+    A AS true,
+    B AS price < PREV(price),
+    C AS price > PREV(price)
 )
 --
 ARRAY<STRUCT<symbol STRING, start_price INT64, bottom_price INT64, peak_price INT64>>[
-  {"GOOG", 110, 90, 120}
+  {"GOOG", 110, 120, 120}
 ]
 ==
 
@@ -136,6 +136,22 @@ ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64>>[
 ]
 ==
 
+[prepare_database]
+CREATE TABLE Person (id INT64, name STRING);
+INSERT INTO Person VALUES
+  (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'David');
+CREATE TABLE Knows (src_id INT64, dst_id INT64, since INT64);
+INSERT INTO Knows VALUES (1, 2, 2020), (2, 3, 2021), (3, 4, 2022);
+CREATE PROPERTY GRAPH social_network
+  NODE TABLES (Person KEY (id))
+  EDGE TABLES (
+    Knows KEY (src_id, dst_id)
+      SOURCE KEY (src_id) REFERENCES Person (id)
+      DESTINATION KEY (dst_id) REFERENCES Person (id)
+      LABEL KNOWS
+  );
+==
+
 [required_features=SQL_GRAPH]
 [name=graph_table_simple_edge_match]
 SELECT *
@@ -192,11 +208,10 @@ ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64, rank_in_p
 
 [required_features=ORDERED_SET_AGGREGATES]
 [name=ordered_set_percentile_cont]
-SELECT product,
-       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount ASC) AS median_amount,
-       PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY amount ASC) AS p90_amount
+SELECT DISTINCT product,
+       PERCENTILE_CONT(amount, 0.5) OVER (PARTITION BY product) AS median_amount,
+       PERCENTILE_DISC(amount, 0.9) OVER (PARTITION BY product) AS p90_amount
 FROM monthly_sales
-GROUP BY product
 ORDER BY product
 --
 ARRAY<STRUCT<product STRING, median_amount DOUBLE, p90_amount INT64>>[

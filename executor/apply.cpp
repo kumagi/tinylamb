@@ -43,8 +43,7 @@ ApplyExecutor::ApplyExecutor(TransactionContext& context, Schema outer_schema,
   // T3668: with a compiled inner plan there is no ExecuteQuery round to
   // learn the schema from, so seed it from the plan here -- otherwise the
   // route predicate evaluates against a zero-width schema.
-  if (inner_query_ == nullptr && inner_exec_ != nullptr &&
-      inner_exec_schema_.ColumnCount() > 0) {
+  if (inner_query_ == nullptr && inner_exec_ != nullptr) {
     inner_schema_ = inner_alias_.empty()
                         ? inner_exec_schema_
                         : relational_detail::QualifySchema(inner_exec_schema_,
@@ -98,6 +97,8 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
         if (!static_inner_cached_) {
           DataChunk inner_batch;
           while (inner_exec_->NextBatch(&inner_batch) != 0) {
+            // No reserve: reserve(size()+batch) exhausts capacity every
+            // batch and copies all materialized rows; growth is amortized.
             for (size_t i = 0; i < inner_batch.Size(); ++i) {
               static_inner_rows_.push_back(inner_batch.RowAt(i));
             }

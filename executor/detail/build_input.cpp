@@ -680,28 +680,55 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     if (!context.txn_.HasAnyPageVersionChains()) {
       // Uniqueness is only an optimization hint here. Do not scan and
       // materialize the entire table merely to discover it during planning.
+      const uint64_t gen = table.Value()->LayoutGeneration();
+      const page_id_t first_pid = table.Value()->FirstPageId();
+      const bool clean_txn =
+          context.txn_.IsReadOnly() || context.txn_.WriteSetEmpty();
       std::shared_ptr<const LSTableStore> lst_store =
           table.Value()->GetLSTableStore();
-      if (lst_store != nullptr && lst_store->uncommitted_owner_txn == 0 &&
-          lst_store->layout_generation == table.Value()->LayoutGeneration() &&
-          lst_store->first_pid == table.Value()->FirstPageId()) {
-        bool any_promoted = false;
-        std::vector<Column> cols;
-        cols.reserve(base_schema.ColumnCount());
-        for (size_t ci = 0; ci < base_schema.ColumnCount(); ++ci) {
-          Column col = base_schema.GetColumn(ci);
-          if (col.GetConstraint().ctype == Constraint::kNothing &&
-              ci < lst_store->column_is_unique_nonnull.size() &&
-              lst_store->column_is_unique_nonnull[ci] != 0) {
+      const bool valid_store = lst_store != nullptr &&
+                               lst_store->uncommitted_owner_txn == 0 &&
+                               lst_store->layout_generation == gen &&
+                               lst_store->first_pid == first_pid;
+      std::shared_ptr<const TlcsFile> backing_tlcs =
+          table.Value()->GetBackingTlcsStore();
+      const bool valid_tlcs =
+          gen != 0 && !table.Value()->RowsRewrittenInPlace() && clean_txn &&
+          backing_tlcs != nullptr && backing_tlcs->LayoutGeneration() == gen &&
+          backing_tlcs->FirstPageId() == first_pid &&
+          backing_tlcs->HasColumnSynopses();
+      bool any_promoted = false;
+      std::vector<Column> cols;
+      cols.reserve(base_schema.ColumnCount());
+      for (size_t ci = 0; ci < base_schema.ColumnCount(); ++ci) {
+        Column col = base_schema.GetColumn(ci);
+        if (col.GetConstraint().ctype == Constraint::kNothing) {
+          bool is_unique_nonnull =
+              valid_store && ci < lst_store->column_is_unique_nonnull.size() &&
+              lst_store->column_is_unique_nonnull[ci] != 0;
+          if (!is_unique_nonnull && valid_tlcs &&
+              ci < backing_tlcs->ColumnSynopses().size() &&
+              backing_tlcs->ColumnSynopses()[ci].is_unique_nonnull) {
+            is_unique_nonnull = true;
+          }
+          if (!is_unique_nonnull && gen != 0 &&
+              !table.Value()->RowsRewrittenInPlace() && clean_txn) {
+            if (auto cached = table.Value()->GetCachedLSTableColumn(
+                    static_cast<slot_t>(ci), gen);
+                cached != nullptr && cached->is_unique_nonnull) {
+              is_unique_nonnull = true;
+            }
+          }
+          if (is_unique_nonnull) {
             col = Column(col.Name(), col.Type(),
                          Constraint(Constraint::kPrimaryKey));
             any_promoted = true;
           }
-          cols.push_back(std::move(col));
         }
-        if (any_promoted) {
-          base_schema = Schema(base_schema.Name(), std::move(cols));
-        }
+        cols.push_back(std::move(col));
+      }
+      if (any_promoted) {
+        base_schema = Schema(base_schema.Name(), std::move(cols));
       }
     }
     relations[i].schema = qualifier.empty()
@@ -2362,7 +2389,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           const uint64_t d_outer =
               need_dense ? parts[pair_pa].set_bits : outer_span1;
           const uint64_t total_bits = d_outer * pair_stride1;
-          const size_t pair_words =
+          const auto pair_words =
               static_cast<size_t>((total_bits + 63ULL) >> 6);
           const size_t charge_bytes =
               (pair_words * sizeof(uint64_t)) +
@@ -2382,7 +2409,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 uint64_t w = parts[pair_pa].words[wi];
                 const size_t base = wi << 6;
                 while (w != 0) {
-                  const unsigned b = static_cast<unsigned>(std::countr_zero(w));
+                  const auto b = static_cast<unsigned>(std::countr_zero(w));
                   pair_outer_dense[base + b] = dense_next++;
                   w &= (w - 1);
                 }
@@ -2450,7 +2477,25 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       if (!table.HasValue()) {
         return std::optional<Relation>{};
       }
-      auto store = GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+      std::vector<slot_t> probe_proj;
+      const auto add_probe_col = [&](slot_t col) {
+        if (std::ranges::find(probe_proj, col) == probe_proj.end()) {
+          probe_proj.push_back(col);
+        }
+      };
+      for (const slot_t col : projections[index]) {
+        add_probe_col(col);
+      }
+      for (const auto& part : parts) {
+        add_probe_col(part.store_column);
+      }
+      for (const auto& fr : fast_residuals) {
+        add_probe_col(fr.right_store_col);
+      }
+      auto store =
+          GetOrBuildLSTableStore(context.txn_, *table.Value(), true,
+                                 !probe_proj.empty() ? &probe_proj : nullptr,
+                                 /*allow_block_lazy=*/true);
       if (context.txn_.HasAnyPageVersionChains()) {
         return std::optional<Relation>{};
       }
@@ -2710,7 +2755,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             for (size_t wi = 0; wi < parts[p_idx].words.size(); ++wi) {
               uint64_t w = parts[p_idx].words[wi];
               while (w != 0) {
-                const unsigned bit = static_cast<unsigned>(std::countr_zero(w));
+                const auto bit = static_cast<unsigned>(std::countr_zero(w));
                 rf_keys.push_back(lo + static_cast<int64_t>((wi << 6) | bit));
                 w &= w - 1;
               }
@@ -3347,6 +3392,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 break;
               }
               block_cands.clear();
+              // Keep candidates in right-row order. Stage 2 gathers distinct
+              // right rows in this order and maps candidates with one cursor.
               for (uint32_t r = 0; r < nrows; ++r) {
                 std::array<uint64_t, CompositeIntKey::kMaxParts> offs{};
                 CompositeIntKey probe_key;
@@ -3638,6 +3685,32 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         }
         return acc != 0;
       };
+      std::vector<slot_t> part_store_cols;
+      part_store_cols.reserve(parts.size());
+      for (const auto& part : parts) {
+        if (std::ranges::find(part_store_cols, part.store_column) ==
+            part_store_cols.end()) {
+          part_store_cols.push_back(part.store_column);
+        }
+      }
+      std::vector<slot_t> payload_store_cols;
+      payload_store_cols.reserve(fast_residuals.size() +
+                                 (emit_columnar ? 0 : right_width));
+      for (const auto& fr : fast_residuals) {
+        if (std::ranges::find(payload_store_cols, fr.right_store_col) ==
+            payload_store_cols.end()) {
+          payload_store_cols.push_back(fr.right_store_col);
+        }
+      }
+      if (!emit_columnar) {
+        for (size_t c = 0; c < right_width; ++c) {
+          const slot_t sc = projections[index][c];
+          if (std::ranges::find(payload_store_cols, sc) ==
+              payload_store_cols.end()) {
+            payload_store_cols.push_back(sc);
+          }
+        }
+      }
       RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
         const size_t begin = nblocks * worker / workers;
         const size_t end = nblocks * (worker + 1) / workers;
@@ -3652,57 +3725,37 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         std::vector<const LSTableColumnBlock*> fast_rcols(fast_residuals.size(),
                                                           nullptr);
         std::vector<int64_t> fast_rvals(fast_residuals.size(), 0);
+        LSTableStore::LazyBlockScratch key_scratch;
+        LSTableStore::LazyBlockScratch payload_scratch;
         for (size_t b = begin; b < end && filter_error.ok() && !layout_bail;
              ++b) {
-          const LSTablePageBlock& block = store->blocks[b];
-          const uint32_t nrows = block.row_count;
+          const LSTablePageBlock& meta_block = store->blocks[b];
+          const uint32_t nrows = meta_block.row_count;
           if (nrows == 0) {
             continue;
           }
-          std::array<const int64_t*, CompositeIntKey::kMaxParts> cells{};
-          std::array<const LSTableColumnBlock*, CompositeIntKey::kMaxParts>
-              key_cols{};
-          bool columns_ok = true;
-          bool all_keys_nonnull = true;
-          for (size_t p = 0; p < parts.size(); ++p) {
-            if (parts[p].store_column >= block.columns.size()) {
-              columns_ok = false;
+          for (auto & part : parts) {
+            if (part.store_column >= meta_block.columns.size()) {
+              layout_bail = 1;
               break;
-            }
-            key_cols[p] = &block.columns[parts[p].store_column];
-            cells[p] = key_cols[p]->int_cells.data();
-            if (cells[p] == nullptr) {
-              columns_ok = false;
-              break;
-            }
-            if (block_col_has_any_null(*key_cols[p], nrows)) {
-              all_keys_nonnull = false;
             }
           }
-          bool all_fast_nonnull = true;
-          for (size_t fp = 0; fp < fast_residuals.size(); ++fp) {
-            const slot_t sc = fast_residuals[fp].right_store_col;
-            if (sc >= block.columns.size()) {
-              columns_ok = false;
+          for (size_t fp = 0; !layout_bail && fp < fast_residuals.size();
+               ++fp) {
+            if (fast_residuals[fp].right_store_col >=
+                meta_block.columns.size()) {
+              layout_bail = 1;
               break;
-            }
-            fast_rcols[fp] = &block.columns[sc];
-            if (fast_rcols[fp]->int_cells.empty()) {
-              columns_ok = false;
-              break;
-            }
-            if (block_col_has_any_null(*fast_rcols[fp], nrows)) {
-              all_fast_nonnull = false;
             }
           }
-          if (!columns_ok) {
-            layout_bail = 1;
+          if (layout_bail != 0) {
             break;
           }
           bool block_miss = false;
           for (size_t idx = 0; idx < parts.size(); ++idx) {
             const size_t p = check_order[idx];
-            const LSTableColumnBlock& column = *key_cols[p];
+            const LSTableColumnBlock& column =
+                meta_block.columns[parts[p].store_column];
             if (!column.has_min_max || column.max_int < column.min_int) {
               continue;
             }
@@ -3757,7 +3810,74 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           if (block_miss) {
             continue;
           }
+          key_scratch.transient.clear();
+          const LSTablePageBlock* key_blk =
+              store->MaterializeBlockView(b, &key_scratch, part_store_cols);
+          if (key_blk == nullptr) {
+            filter_error = Status::kIOError;
+            break;
+          }
+          std::array<const int64_t*, CompositeIntKey::kMaxParts> cells{};
+          std::array<const LSTableColumnBlock*, CompositeIntKey::kMaxParts>
+              key_cols{};
+          bool columns_ok = true;
+          bool all_keys_nonnull = true;
+          for (size_t p = 0; p < parts.size(); ++p) {
+            key_cols[p] = &key_blk->columns[parts[p].store_column];
+            cells[p] = key_cols[p]->int_cells.data();
+            if (cells[p] == nullptr) {
+              columns_ok = false;
+              break;
+            }
+            if (block_col_has_any_null(*key_cols[p], nrows)) {
+              all_keys_nonnull = false;
+            }
+          }
+          const LSTablePageBlock* payload_blk =
+              store->is_block_lazy ? nullptr : &meta_block;
+          bool payload_ready =
+              !store->is_block_lazy || payload_store_cols.empty();
+          bool all_fast_nonnull = true;
+          if (!store->is_block_lazy && columns_ok) {
+            for (size_t fp = 0; fp < fast_residuals.size(); ++fp) {
+              const slot_t sc = fast_residuals[fp].right_store_col;
+              fast_rcols[fp] = &meta_block.columns[sc];
+              if (fast_rcols[fp]->int_cells.empty()) {
+                columns_ok = false;
+                break;
+              }
+              if (block_col_has_any_null(*fast_rcols[fp], nrows)) {
+                all_fast_nonnull = false;
+              }
+            }
+          }
+          if (!columns_ok) {
+            layout_bail = 1;
+            break;
+          }
           auto emit_match_list = [&](uint32_t r, const auto& for_each_lidx) {
+            if (!payload_ready) {
+              payload_scratch.transient.clear();
+              payload_blk = store->MaterializeBlockView(b, &payload_scratch,
+                                                        payload_store_cols);
+              if (payload_blk == nullptr) {
+                filter_error = Status::kIOError;
+                return;
+              }
+              all_fast_nonnull = true;
+              for (size_t fp = 0; fp < fast_residuals.size(); ++fp) {
+                fast_rcols[fp] =
+                    &payload_blk->columns[fast_residuals[fp].right_store_col];
+                if (fast_rcols[fp]->int_cells.empty()) {
+                  layout_bail = 1;
+                  return;
+                }
+                if (block_col_has_any_null(*fast_rcols[fp], nrows)) {
+                  all_fast_nonnull = false;
+                }
+              }
+              payload_ready = true;
+            }
             if (!all_fast_nonnull) {
               for (size_t fp = 0; fp < fast_residuals.size(); ++fp) {
                 const LSTableColumnBlock* rcol = fast_rcols[fp];
@@ -3801,12 +3921,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               }
               for (size_t c = 0; c < right_width; ++c) {
                 const slot_t store_column = projections[index][c];
-                if (store_column >= block.columns.size()) {
+                if (payload_blk == nullptr ||
+                    store_column >= payload_blk->columns.size()) {
                   layout_bail = 1;
                   return false;
                 }
                 right_row.values_[c] =
-                    cell_value(block.columns[store_column], r);
+                    cell_value(payload_blk->columns[store_column], r);
               }
               if (!ordered_local[index].empty() &&
                   !MatchScanFilter(right_row, projected, local_filter, outer,
@@ -4152,6 +4273,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             }
           }
         }
+        std::atomic<bool> chunk_io_error{false};
         auto build_chunk_from_matches =
             [&](std::span<const StreamMatch> ms) -> ColumnarChunk {
           ColumnarChunk chunk;
@@ -4189,11 +4311,22 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             // for every VARCHAR cell -- per matched row, only to copy it
             // into the arena and drop it; CopyFromStringView keeps the scratch
             // buffer warm across rows.
+            std::vector<std::unique_ptr<LSTableLazyDecodedBlock>> mat_transient;
+            uint32_t last_blk = UINT32_MAX;
+            const LSTableColumnBlock* last_col = nullptr;
             Value cell;
             for (size_t k = 0; k < ms.size(); ++k) {
               const StreamMatch& match = ms[k];
-              const LSTableColumnBlock& column =
-                  store->blocks[match.block].columns[store_col];
+              if (match.block != last_blk) {
+                last_col = store->ResolveBlockColumn(match.block, store_col,
+                                                     &mat_transient);
+                if (last_col == nullptr) {
+                  chunk_io_error.store(true, std::memory_order_relaxed);
+                  break;
+                }
+                last_blk = match.block;
+              }
+              const LSTableColumnBlock& column = *last_col;
               if (column.has_null && column.IsNull(match.row)) {
                 cell = Value();
               } else if (column.type == ValueType::kDouble) {
@@ -4264,6 +4397,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               out_col->AppendChunk(std::move(ch));
             }
           }
+        }
+        if (chunk_io_error.load(std::memory_order_relaxed)) {
+          return Status::kIOError;
         }
         bool all_uniform = true;
         for (const ColumnarChunk& ch : out_col->chunks) {
@@ -5899,10 +6035,10 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           const bool other_has_sel = std::ranges::any_of(
               filter_neighbours[other],
               [&](size_t nb) { return loaded[nb] && selective[nb]; });
-          return !(has_selective_neighbour && other_has_sel &&
-                   estimated_rows[other] >= 5000000 &&
-                   effective_load_rows(index) * 2.0 <
-                       effective_load_rows(other));
+          return !has_selective_neighbour || !other_has_sel ||
+                   estimated_rows[other] < 5000000 ||
+                   effective_load_rows(index) * 2.0 >=
+                       effective_load_rows(other);
         });
     if (deferred_derived[index]) {
       return has_selective_neighbour ? 1 : 2;
@@ -6346,10 +6482,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     deferred_probe.reset();
     deferred_probe_rel.reset();
     const bool want_columnar =
-        dp.pk_lookups.empty() &&
-        (dp.columnar_output ||
-         ((columnar_output || (fusion != nullptr && fusion->eligible)) &&
-          plain_inner_sources && !selects_star && join_residual.empty()));
+        dp.columnar_output ||
+        ((columnar_output || (fusion != nullptr && fusion->eligible)) &&
+         plain_inner_sources && !selects_star && join_residual.empty());
     Schema saved_schema = std::move(relations[d_idx].schema);
     ASSIGN_OR_RETURN(Relation, loaded_rel,
                      (LoadSource(context, statement.Sources()[d_idx], outer,
@@ -6358,86 +6493,488 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // A sticky spill error means LoadSource dropped rows; never resolve
     // lookups over a silently truncated relation.
     RETURN_IF_FAIL(loaded_rel.GetStatus());
-    if (loaded_rel.HasSpill()) {
-      // The PK-lookup rewrite below edits `rows` in place and only sees the
-      // in-memory part; under memory pressure LoadSource may have spilled
-      // (EnsureSpill clears `rows`). Bring every row back before rewriting.
-      std::vector<Row> all_rows;
-      all_rows.reserve(loaded_rel.TotalRows());
-      RETURN_IF_FAIL(loaded_rel.ForEachRow(
-          [&](const Row& row) { all_rows.push_back(row); }));
-      loaded_rel.ResetContents();
-      loaded_rel.rows = std::move(all_rows);
-    }
     if (!dp.pk_lookups.empty()) {
       const size_t final_cols = saved_schema.ColumnCount();
-      size_t out_idx = 0;
-      for (size_t ri = 0; ri < loaded_rel.rows.size(); ++ri) {
-        Row& row = loaded_rel.rows[ri];
-        if (row.values_.size() < final_cols) {
-          row.values_.resize(final_cols);
-        }
-        bool row_matched = true;
+      // The PK-lookup path below mutates the ColumnarTable through a
+      // const_pointer_cast, so it is only safe while this Relation holds the
+      // sole reference; a table shared with a CTE cell or retained store must
+      // fall back to the row path instead.
+      bool can_columnar_pk = !loaded_rel.HasSpill() &&
+                             loaded_rel.HasColumnarOnly() &&
+                             loaded_rel.columnar != nullptr &&
+                             loaded_rel.columnar.use_count() == 1;
+      if (can_columnar_pk) {
         for (const DeferredLSTablePkLookup& lkp : dp.pk_lookups) {
-          const Value& pk_v = row.values_[lkp.pk_col];
-          if (pk_v.IsNull()) {
-            row_matched = false;
+          if (lkp.store == nullptr || !lkp.store->HasColumn(lkp.store_pk_col) ||
+              !lkp.store->HasColumn(lkp.payload_col) ||
+              lkp.store_pk_col >= lkp.store->column_min_int.size() ||
+              lkp.store_pk_col >= lkp.store->column_max_int.size() ||
+              lkp.target_proj_col >= final_cols) {
+            can_columnar_pk = false;
             break;
           }
-          const int64_t k = pk_v.value.int_value;
-          const auto& blks = lkp.store->blocks;
-          auto it = std::lower_bound(
-              blks.begin(), blks.end(), k,
-              [&](const LSTablePageBlock& b, int64_t key) {
-                return b.row_count == 0 ||
-                       b.columns[lkp.store_pk_col].max_int < key;
-              });
-          if (it == blks.end() || it->row_count == 0) {
-            row_matched = false;
-            break;
-          }
-          const LSTableColumnBlock& pk_b = it->columns[lkp.store_pk_col];
-          if (k < pk_b.min_int || k > pk_b.max_int) {
-            row_matched = false;
-            break;
-          }
-          const int64_t* begin_p = pk_b.int_cells.data();
-          const int64_t* end_p = begin_p + it->row_count;
-          const int64_t* found_p = std::lower_bound(begin_p, end_p, k);
-          if (found_p == end_p || *found_p != k) {
-            row_matched = false;
-            break;
-          }
-          const auto r_in_b = static_cast<size_t>(found_p - begin_p);
-          const LSTableColumnBlock& pay_b = it->columns[lkp.payload_col];
-          Value resolved;
-          if (!pay_b.IsNull(r_in_b)) {
-            if (lkp.payload_type == ValueType::kVarChar) {
-              const std::string_view sv = pay_b.VarcharAt(r_in_b);
-              resolved.type = ValueType::kVarChar;
-              resolved.value.varchar_value = sv;
-            } else if (lkp.payload_type == ValueType::kDouble) {
-              resolved = Value(std::bit_cast<double>(pay_b.int_cells[r_in_b]));
-            } else if (lkp.payload_type == ValueType::kDate) {
-              resolved = Value::DateFromDays(pay_b.int_cells[r_in_b]);
-            } else {
-              resolved = Value(pay_b.int_cells[r_in_b]);
-              if (lkp.payload_unsigned) {
-                resolved.SetUnsigned();
-              }
+          for (const LSTablePageBlock& blk : lkp.store->blocks) {
+            if (blk.row_count == 0) {
+              continue;
+            }
+            if (lkp.store_pk_col >= blk.columns.size() ||
+                lkp.payload_col >= blk.columns.size() ||
+                blk.columns[lkp.store_pk_col].int_cells.size() <
+                    blk.row_count ||
+                (lkp.payload_type != ValueType::kVarChar &&
+                 blk.columns[lkp.payload_col].int_cells.size() <
+                     blk.row_count)) {
+              can_columnar_pk = false;
+              break;
             }
           }
-          row.values_[lkp.target_proj_col] = std::move(resolved);
-        }
-        if (row_matched) {
-          if (out_idx != ri) {
-            loaded_rel.rows[out_idx] = std::move(row);
+          if (!can_columnar_pk) {
+            break;
           }
-          ++out_idx;
+          for (const ColumnarChunk& ch : loaded_rel.columnar->chunks) {
+            if (ch.rows > 0 && lkp.pk_col >= ch.columns.size()) {
+              can_columnar_pk = false;
+              break;
+            }
+          }
+          if (!can_columnar_pk) {
+            break;
+          }
         }
       }
-      loaded_rel.rows.resize(out_idx);
-      loaded_rel.schema = std::move(saved_schema);
+      if (can_columnar_pk) {
+        auto mutable_tbl =
+            std::const_pointer_cast<ColumnarTable>(loaded_rel.columnar);
+        auto& chunks = mutable_tbl->chunks;
+        for (ColumnarChunk& ch : chunks) {
+          if (ch.columns.size() < final_cols) {
+            ch.columns.resize(final_cols);
+          }
+        }
+        const size_t nchunks = chunks.size();
+        const size_t nworkers = std::max<size_t>(
+            size_t{1},
+            std::min<size_t>(
+                {size_t{16},
+                 QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+                 nchunks}));
+        for (const DeferredLSTablePkLookup& lkp : dp.pk_lookups) {
+          struct DeferredBlkMeta {
+            int64_t min_k{0};
+            int64_t max_k{0};
+            uint32_t row_count{0};
+            uint8_t dense_contiguous{0};
+            uint8_t has_null_payload{0};
+            const int64_t* pk_cells{nullptr};
+            const int64_t* pay_cells{nullptr};
+            const LSTableColumnBlock* pay_blk{nullptr};
+          };
+          std::vector<DeferredBlkMeta> blk_meta;
+          blk_meta.reserve(lkp.store->blocks.size());
+          std::vector<int64_t> blk_max_keys;
+          blk_max_keys.reserve(lkp.store->blocks.size());
+          for (const LSTablePageBlock& blk : lkp.store->blocks) {
+            if (blk.row_count == 0) {
+              continue;
+            }
+            const LSTableColumnBlock& pk_b = blk.columns[lkp.store_pk_col];
+            const LSTableColumnBlock& pay_b = blk.columns[lkp.payload_col];
+            const bool is_dense =
+                (static_cast<uint64_t>(pk_b.max_int) -
+                     static_cast<uint64_t>(pk_b.min_int) + 1ULL ==
+                 blk.row_count);
+            blk_meta.push_back(DeferredBlkMeta{
+                .min_k = pk_b.min_int,
+                .max_k = pk_b.max_int,
+                .row_count = blk.row_count,
+                .dense_contiguous = static_cast<uint8_t>(is_dense),
+                .has_null_payload = static_cast<uint8_t>(pay_b.has_null),
+                .pk_cells = pk_b.int_cells.data(),
+                .pay_cells = pay_b.int_cells.data(),
+                .pay_blk = &pay_b});
+            blk_max_keys.push_back(pk_b.max_int);
+          }
+          const int64_t min_k = lkp.store->column_min_int[lkp.store_pk_col];
+          const int64_t max_k = lkp.store->column_max_int[lkp.store_pk_col];
+          if (blk_meta.empty() || min_k > max_k) {
+            chunks.clear();
+            mutable_tbl->total_rows = 0;
+            break;
+          }
+          const __uint128_t span =
+              static_cast<__uint128_t>(static_cast<uint64_t>(max_k) -
+                                       static_cast<uint64_t>(min_k)) +
+              1;
+          constexpr size_t kDirShift = 12U;
+          constexpr size_t kDirBuckets = size_t{1} << kDirShift;
+          std::array<uint32_t, kDirBuckets + 1> bucket_lo{};
+          const auto nb_count = static_cast<uint32_t>(blk_meta.size());
+          uint32_t cur_nb = 0;
+          for (size_t b = 0; b < kDirBuckets; ++b) {
+            const int64_t b_min =
+                min_k + static_cast<int64_t>(
+                            (static_cast<__uint128_t>(span) * b) >> kDirShift);
+            while (cur_nb + 1 < nb_count && blk_max_keys[cur_nb] < b_min) {
+              ++cur_nb;
+            }
+            bucket_lo[b] = cur_nb;
+          }
+          bucket_lo[kDirBuckets] = nb_count - 1;
+          const ValueType p_type = lkp.payload_type;
+          const bool p_unsigned = lkp.payload_unsigned;
+          const DeferredBlkMeta* const meta_ptr = blk_meta.data();
+
+          auto run_col_lookup = [&](size_t w) {
+            for (size_t ci = w; ci < nchunks; ci += nworkers) {
+              ColumnarChunk& ch = chunks[ci];
+              if (ch.rows == 0) {
+                continue;
+              }
+              const ColumnarColumn& key_col = ch.columns[lkp.pk_col];
+              const bool flat_int_key =
+                  key_col.encoding == ColumnarColumn::Encoding::kFlat &&
+                  key_col.is_uniform && !key_col.is_interval &&
+                  (key_col.type == ValueType::kInt64 ||
+                   key_col.type == ValueType::kDate) &&
+                  key_col.ints.size() >= ch.rows &&
+                  (!key_col.has_null || key_col.nulls.size() >= ch.rows);
+              const int64_t* const kcells =
+                  flat_int_key ? key_col.ints.data() : nullptr;
+              const uint8_t* const knulls = (flat_int_key && key_col.has_null)
+                                                ? key_col.nulls.data()
+                                                : nullptr;
+
+              ColumnarColumn out_col;
+              out_col.type = p_type;
+              out_col.is_uniform = true;
+              out_col.is_unsigned = p_unsigned;
+              out_col.has_null = false;
+              out_col.encoding = ColumnarColumn::Encoding::kFlat;
+              if (p_type == ValueType::kInt64 || p_type == ValueType::kDate) {
+                out_col.ints.resize(ch.rows);
+              } else if (p_type == ValueType::kDouble) {
+                out_col.doubles.resize(ch.rows);
+              } else if (p_type == ValueType::kVarChar) {
+                out_col.strings.resize(ch.rows);
+              }
+              ChunkStringArena* out_arena = (p_type == ValueType::kVarChar)
+                                                ? out_col.EnsureLocalArena()
+                                                : nullptr;
+              std::vector<uint8_t> matched_mask;
+              bool had_unmatched = false;
+              int64_t last_key = std::numeric_limits<int64_t>::min();
+              bool have_last = false;
+              bool last_matched = false;
+              bool last_is_null = false;
+              int64_t last_raw_bits = 0;
+              std::string_view last_sv;
+              uint32_t last_nb = 0;
+              uint32_t last_row_in_blk = 0;
+              auto mark_unmatched = [&](size_t r) {
+                if (!had_unmatched) {
+                  matched_mask.assign(ch.rows, 1);
+                  had_unmatched = true;
+                }
+                matched_mask[r] = 0;
+              };
+              auto mark_out_null = [&](size_t r) {
+                if (!out_col.has_null) {
+                  out_col.has_null = true;
+                  out_col.nulls.assign(ch.rows, 0);
+                }
+                out_col.nulls[r] = 1;
+              };
+              for (size_t r = 0; r < ch.rows; ++r) {
+                int64_t k = 0;
+                if (flat_int_key) {
+                  if ((knulls != nullptr && knulls[r] != 0) ||
+                      kcells[r] < min_k || kcells[r] > max_k) [[unlikely]] {
+                    mark_unmatched(r);
+                    continue;
+                  }
+                  k = kcells[r];
+                } else {
+                  if (!key_col.TryReadNonNullInt(r, &k) || k < min_k ||
+                      k > max_k) [[unlikely]] {
+                    mark_unmatched(r);
+                    continue;
+                  }
+                }
+                if (!have_last || k != last_key) {
+                  bool same_blk_mono = false;
+                  uint32_t nb = 0;
+                  if (have_last && k >= meta_ptr[last_nb].min_k &&
+                      k <= meta_ptr[last_nb].max_k) {
+                    nb = last_nb;
+                    same_blk_mono = (k > last_key);
+                  } else {
+                    const auto b_idx = static_cast<size_t>(
+                        (static_cast<__uint128_t>(static_cast<uint64_t>(k) -
+                                                  static_cast<uint64_t>(min_k))
+                         << kDirShift) /
+                        span);
+                    nb = bucket_lo[b_idx];
+                    while (nb + 1 < nb_count && meta_ptr[nb].max_k < k) {
+                      ++nb;
+                    }
+                  }
+                  last_key = k;
+                  have_last = true;
+                  last_nb = nb;
+                  const DeferredBlkMeta& bm = meta_ptr[nb];
+                  if (k < bm.min_k || k > bm.max_k) [[unlikely]] {
+                    last_matched = false;
+                  } else {
+                    uint32_t row_in_blk = bm.row_count;
+                    if (bm.dense_contiguous != 0) {
+                      row_in_blk = static_cast<uint32_t>(
+                          static_cast<uint64_t>(k) -
+                          static_cast<uint64_t>(bm.min_k));
+                    } else {
+                      const int64_t* const bp = bm.pk_cells;
+                      const int64_t* const ep = bp + bm.row_count;
+                      const int64_t* sb = bp;
+                      const int64_t* se = ep;
+                      if (same_blk_mono && last_row_in_blk < bm.row_count) {
+                        const uint32_t cur_r = last_row_in_blk;
+                        if (bp[cur_r] == k) {
+                          row_in_blk = cur_r;
+                          sb = ep;
+                        } else if (bp[cur_r] < k) {
+                          if (cur_r + 1 < bm.row_count && bp[cur_r + 1] == k) {
+                            row_in_blk = cur_r + 1;
+                            sb = ep;
+                          } else {
+                            sb = bp + cur_r + 1;
+                            if (cur_r + 16 < bm.row_count &&
+                                bp[cur_r + 16] >= k) {
+                              se = bp + cur_r + 17;
+                            }
+                          }
+                        }
+                      }
+                      if (sb < se) {
+                        const int64_t* const fp = std::lower_bound(sb, se, k);
+                        last_row_in_blk = static_cast<uint32_t>(fp - bp);
+                        if (fp != se && *fp == k) [[likely]] {
+                          row_in_blk = last_row_in_blk;
+                        }
+                      } else {
+                        last_row_in_blk = row_in_blk;
+                      }
+                    }
+                    if (row_in_blk >= bm.row_count) [[unlikely]] {
+                      last_matched = false;
+                    } else {
+                      last_matched = true;
+                      last_is_null = (bm.has_null_payload != 0) &&
+                                     bm.pay_blk->IsNull(row_in_blk);
+                      if (!last_is_null) [[likely]] {
+                        if (p_type == ValueType::kVarChar) {
+                          last_sv = bm.pay_blk->VarcharAt(row_in_blk);
+                        } else {
+                          last_raw_bits = bm.pay_cells[row_in_blk];
+                        }
+                      }
+                    }
+                  }
+                }
+                if (!last_matched) [[unlikely]] {
+                  mark_unmatched(r);
+                  continue;
+                }
+                if (last_is_null) [[unlikely]] {
+                  mark_out_null(r);
+                } else if (p_type == ValueType::kInt64 ||
+                           p_type == ValueType::kDate) {
+                  out_col.ints[r] = last_raw_bits;
+                } else if (p_type == ValueType::kDouble) {
+                  out_col.doubles[r] = std::bit_cast<double>(last_raw_bits);
+                } else if (p_type == ValueType::kVarChar) {
+                  out_col.strings[r] = out_arena->Store(last_sv);
+                }
+              }
+              ch.columns[lkp.target_proj_col] = std::move(out_col);
+              if (had_unmatched) {
+                size_t kept = 0;
+                for (size_t r = 0; r < ch.rows; ++r) {
+                  kept += matched_mask[r];
+                }
+                for (ColumnarColumn& col : ch.columns) {
+                  if (!col.is_uniform) {
+                    if (col.fallback.size() == ch.rows) {
+                      size_t out_i = 0;
+                      for (size_t r = 0; r < ch.rows; ++r) {
+                        if (matched_mask[r] != 0) {
+                          if (out_i != r) {
+                            col.fallback[out_i] = std::move(col.fallback[r]);
+                          }
+                          ++out_i;
+                        }
+                      }
+                      col.fallback.resize(out_i);
+                    }
+                    continue;
+                  }
+                  if (col.encoding == ColumnarColumn::Encoding::kConstant) {
+                    col.const_rows = kept;
+                    continue;
+                  }
+                  if (col.type == ValueType::kNull &&
+                      col.encoding == ColumnarColumn::Encoding::kFlat &&
+                      col.nulls.empty()) {
+                    continue;
+                  }
+                  if (col.encoding != ColumnarColumn::Encoding::kFlat) {
+                    col.MaterializeToFlat(ch.rows);
+                  }
+                  if (col.has_null && col.nulls.size() == ch.rows) {
+                    size_t out_i = 0;
+                    for (size_t r = 0; r < ch.rows; ++r) {
+                      if (matched_mask[r] != 0) {
+                        col.nulls[out_i++] = col.nulls[r];
+                      }
+                    }
+                    col.nulls.resize(out_i);
+                  }
+                  if ((col.type == ValueType::kInt64 ||
+                       col.type == ValueType::kDate) &&
+                      col.ints.size() == ch.rows) {
+                    size_t out_i = 0;
+                    for (size_t r = 0; r < ch.rows; ++r) {
+                      if (matched_mask[r] != 0) {
+                        col.ints[out_i++] = col.ints[r];
+                      }
+                    }
+                    col.ints.resize(out_i);
+                  } else if (col.type == ValueType::kDouble &&
+                             col.doubles.size() == ch.rows) {
+                    size_t out_i = 0;
+                    for (size_t r = 0; r < ch.rows; ++r) {
+                      if (matched_mask[r] != 0) {
+                        col.doubles[out_i++] = col.doubles[r];
+                      }
+                    }
+                    col.doubles.resize(out_i);
+                  } else if (col.type == ValueType::kVarChar &&
+                             col.strings.size() == ch.rows) {
+                    size_t out_i = 0;
+                    for (size_t r = 0; r < ch.rows; ++r) {
+                      if (matched_mask[r] != 0) {
+                        col.strings[out_i++] = col.strings[r];
+                      }
+                    }
+                    col.strings.resize(out_i);
+                  }
+                }
+                ch.rows = kept;
+              }
+            }
+          };
+          if (nworkers <= 1) {
+            run_col_lookup(0);
+          } else {
+            std::vector<std::jthread> threads;
+            threads.reserve(nworkers - 1);
+            for (size_t w = 1; w < nworkers; ++w) {
+              threads.emplace_back([&, w] { run_col_lookup(w); });
+            }
+            run_col_lookup(0);
+          }
+        }
+        size_t new_total = 0;
+        for (const ColumnarChunk& ch : chunks) {
+          new_total += ch.rows;
+        }
+        mutable_tbl->total_rows = new_total;
+        loaded_rel.peak_intermediate_rows =
+            std::max(loaded_rel.peak_intermediate_rows, new_total);
+        loaded_rel.schema = std::move(saved_schema);
+      } else {
+        if (loaded_rel.HasColumnarOnly()) {
+          RETURN_IF_FAIL(loaded_rel.EnsureRowsMaterializedChecked());
+        }
+        if (loaded_rel.HasSpill()) {
+          // The PK-lookup rewrite below edits `rows` in place and only sees
+          // the in-memory part; under memory pressure LoadSource may have
+          // spilled (EnsureSpill clears `rows`). Bring every row back before
+          // rewriting.
+          std::vector<Row> all_rows;
+          all_rows.reserve(loaded_rel.TotalRows());
+          RETURN_IF_FAIL(loaded_rel.ForEachRow(
+              [&](const Row& row) { all_rows.push_back(row); }));
+          loaded_rel.ResetContents();
+          loaded_rel.rows = std::move(all_rows);
+        }
+        size_t out_idx = 0;
+        for (size_t ri = 0; ri < loaded_rel.rows.size(); ++ri) {
+          Row& row = loaded_rel.rows[ri];
+          if (row.values_.size() < final_cols) {
+            row.values_.resize(final_cols);
+          }
+          bool row_matched = true;
+          for (const DeferredLSTablePkLookup& lkp : dp.pk_lookups) {
+            const Value& pk_v = row.values_[lkp.pk_col];
+            if (pk_v.IsNull()) {
+              row_matched = false;
+              break;
+            }
+            const int64_t k = pk_v.value.int_value;
+            const auto& blks = lkp.store->blocks;
+            auto it = std::lower_bound(
+                blks.begin(), blks.end(), k,
+                [&](const LSTablePageBlock& b, int64_t key) {
+                  return b.row_count == 0 ||
+                         b.columns[lkp.store_pk_col].max_int < key;
+                });
+            if (it == blks.end() || it->row_count == 0) {
+              row_matched = false;
+              break;
+            }
+            const LSTableColumnBlock& pk_b = it->columns[lkp.store_pk_col];
+            if (k < pk_b.min_int || k > pk_b.max_int) {
+              row_matched = false;
+              break;
+            }
+            const int64_t* begin_p = pk_b.int_cells.data();
+            const int64_t* end_p = begin_p + it->row_count;
+            const int64_t* found_p = std::lower_bound(begin_p, end_p, k);
+            if (found_p == end_p || *found_p != k) {
+              row_matched = false;
+              break;
+            }
+            const auto r_in_b = static_cast<size_t>(found_p - begin_p);
+            const LSTableColumnBlock& pay_b = it->columns[lkp.payload_col];
+            Value resolved;
+            if (!pay_b.IsNull(r_in_b)) {
+              if (lkp.payload_type == ValueType::kVarChar) {
+                const std::string_view sv = pay_b.VarcharAt(r_in_b);
+                resolved.type = ValueType::kVarChar;
+                resolved.value.varchar_value = sv;
+              } else if (lkp.payload_type == ValueType::kDouble) {
+                resolved =
+                    Value(std::bit_cast<double>(pay_b.int_cells[r_in_b]));
+              } else if (lkp.payload_type == ValueType::kDate) {
+                resolved = Value::DateFromDays(pay_b.int_cells[r_in_b]);
+              } else {
+                resolved = Value(pay_b.int_cells[r_in_b]);
+                if (lkp.payload_unsigned) {
+                  resolved.SetUnsigned();
+                }
+              }
+            }
+            row.values_[lkp.target_proj_col] = std::move(resolved);
+          }
+          if (row_matched) {
+            if (out_idx != ri) {
+              loaded_rel.rows[out_idx] = std::move(row);
+            }
+            ++out_idx;
+          }
+        }
+        loaded_rel.rows.resize(out_idx);
+        loaded_rel.schema = std::move(saved_schema);
+      }
     }
     relations[d_idx] = std::move(loaded_rel);
     invalidate_driver_filter_cache(d_idx);
@@ -7025,7 +7562,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                                  std::thread::hardware_concurrency()),
                              nchunks}));
                     auto run_col_absorb = [&](size_t w) {
-                      const uint32_t nb_cnt =
+                      const auto nb_cnt =
                           static_cast<uint32_t>(blk_meta.size());
                       const AbsorbBlockMeta* const meta_ptr = blk_meta.data();
                       for (size_t ci = w; ci < nchunks; ci += nworkers) {
@@ -7094,7 +7631,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                               nb = last_nb;
                               same_blk_mono = (k > last_key);
                             } else {
-                              const size_t b_idx = static_cast<size_t>(
+                              const auto b_idx = static_cast<size_t>(
                                   (static_cast<__uint128_t>(
                                        static_cast<uint64_t>(k) -
                                        static_cast<uint64_t>(min_k))
@@ -8399,8 +8936,15 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         StatusOr<std::shared_ptr<Table>> b_table =
             context.GetTable(statement.Sources()[idx].table);
         if (b_table.HasValue()) {
-          std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
-              context.txn_, *b_table.Value(), true, &projections[idx]);
+          bool allow_block_lazy = false;
+          if (const auto tlcs = b_table.Value()->GetBackingTlcsStore();
+              tlcs != nullptr && tlcs->TotalRows() >= 65536 &&
+              tlcs->HasColumnSynopses()) {
+            allow_block_lazy = true;
+          }
+          std::shared_ptr<const LSTableStore> store =
+              GetOrBuildLSTableStore(context.txn_, *b_table.Value(), true,
+                                     &projections[idx], allow_block_lazy);
           bool store_valid =
               store != nullptr && store->total_rows >= 32768 &&
               store->layout_generation == b_table.Value()->LayoutGeneration() &&
@@ -8735,16 +9279,34 @@ deferred_multi_payload_phase:
       if (!table.HasValue()) {
         continue;
       }
-      auto store = GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+      if (edge->right >= projections[d].size() ||
+          std::ranges::any_of(payloads, [&](slot_t p) {
+            return static_cast<size_t>(p) >= projections[d].size();
+          })) {
+        continue;
+      }
       const auto pk = projections[d][edge->right];
+      std::vector<slot_t> pk_proj;
+      pk_proj.reserve(payloads.size() + 1);
+      pk_proj.push_back(pk);
+      for (slot_t payload : payloads) {
+        if (const slot_t pslot = projections[d][payload]; pslot != pk) {
+          pk_proj.push_back(pslot);
+        }
+      }
+      auto store =
+          GetOrBuildLSTableStore(context.txn_, *table.Value(), true, &pk_proj);
       bool valid =
           store && store->total_rows > 0 &&
           store->layout_generation == table.Value()->LayoutGeneration() &&
           store->first_pid == table.Value()->FirstPageId() &&
-          pk < store->column_is_monotonic.size() &&
+          store->HasColumn(pk) && pk < store->column_is_monotonic.size() &&
           store->column_is_monotonic[pk] != 0 &&
           store->column_is_unique_nonnull[pk] != 0 &&
-          store->column_has_null[pk] == 0;
+          store->column_has_null[pk] == 0 &&
+          std::ranges::all_of(
+              payloads,
+              [&](slot_t p) { return store->HasColumn(projections[d][p]); });
       if (valid) {
         if (store->uncommitted_owner_txn != 0) {
           valid = store->uncommitted_owner_txn == context.txn_.ID();
@@ -9441,12 +10003,18 @@ run_zero_payload_first:
             }
             const auto pk_slot = projections[d][*d_pk_col];
             const auto payload_slot = projections[d][*d_payload_col];
-            auto store =
-                GetOrBuildLSTableStore(context.txn_, *d_table.Value(), true);
+            const std::vector<slot_t> pk_proj =
+                (pk_slot == payload_slot)
+                    ? std::vector<slot_t>{pk_slot}
+                    : std::vector<slot_t>{pk_slot, payload_slot};
+            auto store = GetOrBuildLSTableStore(context.txn_, *d_table.Value(),
+                                                true, &pk_proj);
             bool valid = store && store->total_rows > 0 &&
                          store->layout_generation ==
                              d_table.Value()->LayoutGeneration() &&
                          store->first_pid == d_table.Value()->FirstPageId() &&
+                         store->HasColumn(pk_slot) &&
+                         store->HasColumn(payload_slot) &&
                          pk_slot < store->column_is_monotonic.size() &&
                          store->column_is_monotonic[pk_slot] != 0 &&
                          store->column_is_unique_nonnull[pk_slot] != 0 &&
@@ -10588,6 +11156,7 @@ run_zero_payload_first:
            deferred_probe.has_value())
               ? &*deferred_probe
               : nullptr;
+      const bool tried_deferred_fusion = (dp_ptr != nullptr);
       if (deferred_probe_rel == next && dp_ptr == nullptr) {
         RETURN_IF_FAIL(materialize_deferred());
       }
@@ -10599,6 +11168,15 @@ run_zero_payload_first:
                             : TryFusedGroupedJoin(
                                   context, result, relations[next], applicable,
                                   JoinType::kInner, outer, ctes, fusion)));
+      if (!fused.has_value() && tried_deferred_fusion &&
+          deferred_probe_rel == next) {
+        RETURN_IF_FAIL(materialize_deferred());
+        ASSIGN_OR_RETURN(
+            std::optional<Relation>, retry_fused,
+            (TryFusedGroupedJoin(context, relations[next], result, applicable,
+                                 JoinType::kInner, outer, ctes, fusion)));
+        fused = std::move(retry_fused);
+      }
       if (fused.has_value()) {
         deferred_probe.reset();
         deferred_probe_rel.reset();

@@ -2823,7 +2823,7 @@ TEST_F(ExecutorTest, RelationalAndGroupedFinishNextBatchStreamSpilledRelation) {
     std::vector<Row> rows;
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << "\n" << engine.LastError();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return rows;
     }
     DataChunk chunk;

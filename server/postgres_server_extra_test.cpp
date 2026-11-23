@@ -41,6 +41,30 @@
 namespace tinylamb {
 namespace {
 
+TEST(PostgresServerExtraTest, TempObjectClassifierKeepsSevenWordSpelling) {
+  // The longest spelling the classifier recognizes is seven words; the token
+  // buffer used to be six entries, which silently dropped the trailing
+  // FUNCTION and kept session_has_temp_objects false (the later all-SELECT
+  // message was then offloaded to a worker with an empty thread-local
+  // registry). Keep every spelling here as a direct regression guard.
+  EXPECT_TRUE(PostgresServer::RegistersTempObject(
+      "CREATE OR REPLACE TEMP AGGREGATE TABLE FUNCTION f() AS SELECT 1"));
+  EXPECT_TRUE(PostgresServer::RegistersTempObject(
+      "-- leading comment\nCREATE OR REPLACE TEMP AGGREGATE TABLE FUNCTION "
+      "f()"));
+  EXPECT_TRUE(PostgresServer::RegistersTempObject(
+      "CREATE OR REPLACE TEMPORARY AGGREGATE FUNCTION f()"));
+  EXPECT_TRUE(
+      PostgresServer::RegistersTempObject("CREATE TEMP VIEW v AS SELECT 1"));
+  EXPECT_TRUE(PostgresServer::RegistersTempObject(
+      "CREATE OR REPLACE TEMP CONSTANT c AS 1"));
+
+  EXPECT_FALSE(PostgresServer::RegistersTempObject("SELECT 1"));
+  EXPECT_FALSE(PostgresServer::RegistersTempObject("CREATE TABLE t(x INT64)"));
+  EXPECT_FALSE(PostgresServer::RegistersTempObject(
+      "CREATE OR REPLACE TABLE t(x INT64)"));
+}
+
 bool SendAll(int fd, const std::string& bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
@@ -181,6 +205,28 @@ class StopGuard {
   PostgresServer* server_;
 };
 
+// Closes a client socket on scope exit so an ASSERT early-return cannot leak
+// the descriptor for the rest of the test process.
+class FdGuard {
+ public:
+  explicit FdGuard(int fd) : fd_(fd) {}
+  ~FdGuard() {
+    if (fd_ >= 0) {
+      close(fd_);
+    }
+  }
+
+  FdGuard(const FdGuard&) = delete;
+  FdGuard& operator=(const FdGuard&) = delete;
+  FdGuard(FdGuard&&) = delete;
+  FdGuard& operator=(FdGuard&&) = delete;
+
+  [[nodiscard]] int get() const { return fd_; }
+
+ private:
+  int fd_;
+};
+
 // Hold real fdatasync at the boundary; release before server thread teardown,
 // including ASSERT failures. Shared state keeps an already-copied hook safe.
 class SyncGate {
@@ -229,12 +275,14 @@ TEST(PostgresServerExtraTest, AuditExplicitWorkerCountRespectsBucketCapacity) {
     PostgresServer server("postgres_worker_audit-" + RandomString(), options);
     std::string error;
     ASSERT_TRUE(server.Listen(&error)) << error;
-    // The scheduler has exactly 16 task buckets/condition variables; an
-    // explicit count above that cap must be clamped, not wrap or overflow.
-    const size_t expected_workers = workers < 16 ? workers : 16;
+    // The scheduler has exactly kMaxReadWorkers task buckets/condition
+    // variables; an explicit count above that cap must be clamped, not wrap
+    // or overflow.
+    const size_t expected_workers =
+        workers < kMaxReadWorkers ? workers : kMaxReadWorkers;
     EXPECT_EQ(server.ReadWorkerCount(), expected_workers)
         << "explicit read_worker_threads=" << workers;
-    EXPECT_LE(server.ReadWorkerCount(), 16U);
+    EXPECT_LE(server.ReadWorkerCount(), kMaxReadWorkers);
     std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
     StopGuard stop{&server};
     std::vector<int> clients;
@@ -362,6 +410,8 @@ TEST(PostgresServerExtraTest, MergeDoesNotBlockEventLoopDuringDurability) {
   StopGuard stop{&server};
   const int writer = ConnectClient(server.BoundPort());
   const int control = ConnectClient(server.BoundPort());
+  FdGuard writer_guard{writer};
+  FdGuard control_guard{control};
   ASSERT_GE(writer, 0);
   ASSERT_GE(control, 0);
   ASSERT_TRUE(
@@ -393,8 +443,6 @@ TEST(PostgresServerExtraTest, MergeDoesNotBlockEventLoopDuringDurability) {
             std::string::npos);
   const std::string reply = ReadUntilReady(writer);
   EXPECT_NE(reply.find("MERGE 1"), std::string::npos) << reply;
-  close(control);
-  close(writer);
 }
 
 TEST(PostgresServerExtraTest, FailedDurabilityNeverAcknowledgesCommit) {
@@ -538,6 +586,45 @@ TEST(PostgresServerExtraTest,
     EXPECT_EQ(ReadyForQueryStatus(reply), i == 0 ? 'I' : 'E');
     close(readers[i]);
   }
+  close(writer);
+}
+
+TEST(PostgresServerExtraTest, StreamContinuationWithholdsUndurableRows) {
+  PostgresServerOptions options;
+  options.port = 0;
+  options.read_worker_threads = 2;
+  PostgresServer server("postgres_stream_durable-" + RandomString(), options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+  StopGuard stop{&server};
+  const int writer = ConnectClient(server.BoundPort());
+  const int reader = ConnectClient(server.BoundPort());
+  ASSERT_GE(writer, 0);
+  ASSERT_GE(reader, 0);
+  for (const char* sql : {"CREATE TABLE stream_tail (v BIGINT)",
+                          "INSERT INTO stream_tail VALUES (1)", "BEGIN",
+                          "UPDATE stream_tail SET v = 123456789"}) {
+    ASSERT_TRUE(SendAll(writer, QueryMessage(sql)));
+    ASSERT_EQ(ReadUntilReady(writer).find("ERROR"), std::string::npos);
+  }
+  SyncGate gate(EIO);
+  ASSERT_TRUE(SendAll(writer, QueryMessage("COMMIT")));
+  ASSERT_TRUE(gate.Wait());
+  ASSERT_TRUE(SendAll(
+      reader,
+      QueryMessage("SELECT REPEAT('x', 270000); SELECT v FROM stream_tail")));
+  // The first result exceeds a stream chunk and has no WAL dependency.
+  pollfd descriptor{.fd = reader, .events = POLLIN, .revents = 0};
+  ASSERT_EQ(poll(&descriptor, 1, 5000), 1);
+  gate.Release();
+  const auto reply = ReadUntilReady(reader);
+  EXPECT_NE(reply.find("SELECT 1"), std::string::npos);
+  EXPECT_EQ(reply.find(pgwire::DataRow(Row({Value(123456789)}))),
+            std::string::npos);
+  EXPECT_NE(reply.find("ERROR"), std::string::npos);
+  EXPECT_EQ(ReadyForQueryStatus(reply), 'I');
+  close(reader);
   close(writer);
 }
 
@@ -1573,10 +1660,21 @@ TEST(PostgresServerExtraTest, ShedConnectionReceivesTooManyConnectionsFatal) {
   std::string wire;
   // Bounded wait: if a regression leaves the shed connection open instead of
   // sending FATAL, fall through to the assertions below rather than hanging
-  // until ctest's 60s timeout kills the whole test binary.
+  // until ctest's 60s timeout kills the whole test binary. The deadline is
+  // wall-clock so repeated EINTR restarts cannot extend the wait forever.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (true) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0) {
+      break;
+    }
     pollfd descriptor{.fd = second, .events = POLLIN, .revents = 0};
-    const int ready = poll(&descriptor, 1, 5000);
+    const int timeout_ms =
+        static_cast<int>(std::min<int64_t>(remaining.count(), 5000));
+    const int ready = poll(&descriptor, 1, timeout_ms);
     if (ready < 0 && errno == EINTR) {
       continue;
     }

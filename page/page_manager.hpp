@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
 #include "common/status_or.hpp"
 #include "page/page.hpp"
@@ -77,6 +78,10 @@ struct LsmTreeState {
     std::string value;
     bool deleted{false};
     uint64_t generation{0};
+    // WAL LSN of the mutation that created this uncommitted entry. Kept for
+    // diagnostics so a memtable entry can be correlated with its log record;
+    // committed_lsn is still assigned from the commit record at promotion.
+    lsn_t write_lsn{0};
     // T4580: a single "latest uncommitted txn" scalar was removed here --
     // it was written at five sites, maintained by the reclaim helpers'
     // out-parameter, and read nowhere. uncommitted_owners is the sole
@@ -212,20 +217,23 @@ struct LsmTreeState {
   }
 
   void AppendRunLocked(LsmSortedRun run) {
-    runs_bytes += RunBytes(run);
+    const size_t bytes = RunBytes(run);
     runs.push_back(std::move(run));
+    runs_bytes += bytes;
   }
 
   void ReplaceRunPrefixLocked(size_t prefix_count,
                               std::optional<LsmSortedRun> replacement) {
+    CHECK_MSG(prefix_count <= runs.size(), "LSM replacement exceeds run prefix");
     for (size_t i = 0; i < prefix_count; ++i) {
       runs_bytes -= RunBytes(runs[i]);
     }
     runs.erase(runs.begin(),
                runs.begin() + static_cast<ptrdiff_t>(prefix_count));
     if (replacement.has_value() && !replacement->blocks.empty()) {
-      runs_bytes += RunBytes(*replacement);
+      const size_t bytes = RunBytes(*replacement);
       runs.insert(runs.begin(), std::move(*replacement));
+      runs_bytes += bytes;
     }
   }
 
@@ -408,6 +416,7 @@ class PageManager {
     return max_committed_txn_id_.load(std::memory_order_acquire);
   }
   void DropAllState();
+  // Test hook: clears all manager state, including indexes and spill state.
   void DropAllPages() { DropAllState(); }
   Status FlushAllPagesForTest() { return WriteFuzzyCheckpoint(0); }
   void FlushLsmBuffersForTest(page_id_t hint_tree_id) {
@@ -478,6 +487,16 @@ class PageManager {
   size_t TryEvictForReclaim(size_t bytes_needed) noexcept;
   Status EvictBatch(size_t target_bytes, bool try_locks_only = false);
   Status WaitForDurableLSN(lsn_t lsn);
+  // WAL-before-data for committed images. A commit is reflected into page /
+  // LSM committed state before its kCommit is durable, and committed slot
+  // LSNs name the update records, not the commit. Every blocks-file write and
+  // every snapshot therefore also waits for the newest commit end reflected
+  // so far, read after the image was captured (tlaplus/TxSpill.tla,
+  // CheckpointManagerTest.SnapshotDoesNotPersistCommitWhoseCommitRecordIsNotDurable).
+  void NoteCommitReflected(lsn_t commit_end) noexcept;
+  [[nodiscard]] lsn_t ReflectedCommitDurableTarget() const noexcept {
+    return max_reflected_commit_end_.load(std::memory_order_acquire);
+  }
   void AccountTreeMemoryLocked(LsmTreeState& tree) noexcept;
   void ReleaseAllTreeMemoryLocked() noexcept;
   StatusOr<bool> LsmLookupLiveLocked(const LsmTreeState& tree,
@@ -631,6 +650,9 @@ class PageManager {
   mutable std::atomic<int> lsm_fd_{-1};
   mutable uint64_t lsm_generation_{0};
   mutable uint64_t lsm_append_offset_{0};
+  // Serializes complete SSTable append streams so a failed stream can reclaim
+  // its tail without truncating blocks written by another stream.
+  mutable std::mutex lsm_append_mu_;
   bool lsm_rotating_{false};
   uint32_t lsm_stream_users_{0};
   std::condition_variable lsm_stream_cv_;
@@ -646,6 +668,8 @@ class PageManager {
   static constexpr size_t kCompactionPersistOpsThreshold = 131072;
 
   std::atomic<txn_id_t> max_committed_txn_id_{0};
+  // Largest commit end passed to commit reflection; see NoteCommitReflected.
+  std::atomic<lsn_t> max_reflected_commit_end_{0};
   std::atomic<size_t> unpersisted_committed_ops_{0};
   mutable std::mutex compaction_cb_mu_;
   std::function<void()> compaction_cb_;

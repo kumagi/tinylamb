@@ -83,6 +83,10 @@ class Server:
                       '--threads', str(self.args.duckdb_threads), '--memory-mib', str(self.args.duckdb_memory_mib)]
         self.record(invocation)
         self.log = (self.output / 'duckdb-server.log').open('w')
+        # Popen has no check= argument: this server is long-lived. Its
+        # readiness is probed by run.py (and duckdb_support_test.py), and the
+        # one-shot extension preparation above uses check=True. close()
+        # terminates and reaps the child, escalating to kill after 30 seconds.
         self.process = subprocess.Popen(invocation, stdout=self.log, stderr=subprocess.STDOUT)
 
     def close(self):

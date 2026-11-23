@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -59,11 +60,25 @@
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
 
+// Lock-order note (docs/lock_order.md): this file frequently takes several
+// PageManager mutexes in one function, but they are deliberately scoped in
+// disjoint lexical blocks (or taken with std::try_to_lock) so that no thread
+// ever waits on an inner mutex while holding an outer one.  For example,
+// LSM lookups release trees_mu_ before touching a per-tree mutex, commit/abort
+// replay releases blocks_mu_ before faulting an evicted page back in, and every
+// blocks_mu_ -> Page latch acquisition that could invert the order is a
+// try_to_lock.  The checkpoint path holds checkpoint_io_mu_ as an outermost
+// serializer and releases companion-file / blocks / tree mutexes before the
+// next one.  A proximity scan that only counts mutex acquisitions within 80
+// lines therefore reports false positives here; the actual nesting follows
+// the documented order.
+
 namespace tinylamb {
 
 namespace {
 // The trailing '1' is a historical label; the authoritative format version
-// is kFuzzyCheckpointVersion (currently 4) in the header.
+// is kFuzzyCheckpointVersion (currently 4), defined in this translation
+// unit's anonymous namespace just below (not in page_manager.hpp).
 constexpr std::array<char, 8> kFuzzyCheckpointMagic = {'T', 'L', 'S', 'M',
                                                        'C', 'K', 'P', '1'};
 constexpr uint32_t kFuzzyCheckpointVersion = 4;
@@ -81,6 +96,52 @@ constexpr uint8_t kLsmTreeStorageInline = 0;
 constexpr uint8_t kLsmTreeStorageDisk = 1;
 constexpr auto kTableTailWaitTimeout = std::chrono::milliseconds(5000);
 constexpr auto kTableTailWaitSlice = std::chrono::milliseconds(5);
+
+void CleanupStaleCompanionFiles(const std::filesystem::path& db_path,
+                                std::string_view extension,
+                                uint64_t keep_generation) {
+  const std::filesystem::path parent = db_path.parent_path().empty()
+                                           ? std::filesystem::path(".")
+                                           : db_path.parent_path();
+  std::string base = db_path.filename().string();
+  base.append(extension);
+  const std::string prefix = base + ".";
+  std::error_code ec;
+  const std::filesystem::directory_iterator end;
+  for (std::filesystem::directory_iterator it(parent, ec); !ec && it != end;
+       it.increment(ec)) {
+    const std::string name = it->path().filename().string();
+    uint64_t generation = 0;
+    if (name != base) {
+      if (!name.starts_with(prefix)) {
+        continue;
+      }
+      const std::string_view suffix =
+          std::string_view(name).substr(prefix.size());
+      if (suffix.empty()) {
+        continue;
+      }
+      const auto [parsed, error] = std::from_chars(
+          suffix.data(), suffix.data() + suffix.size(), generation);
+      if (error != std::errc{} || parsed != suffix.data() + suffix.size()) {
+        continue;
+      }
+      // Generation zero uses the unsuffixed path. Companion paths for nonzero
+      // generations are emitted with std::to_string, so padded aliases such
+      // as `.042` are stale even when they parse to the kept generation.
+      if (generation == 0 || suffix != std::to_string(generation)) {
+        std::error_code remove_error;
+        std::filesystem::remove(it->path(), remove_error);
+        continue;
+      }
+    }
+    if (keep_generation == std::numeric_limits<uint64_t>::max() ||
+        generation != keep_generation) {
+      std::error_code remove_error;
+      std::filesystem::remove(it->path(), remove_error);
+    }
+  }
+}
 
 void AppendU32(std::string* dst, uint32_t v) {
   std::array<char, sizeof(uint32_t)> buf{};
@@ -124,8 +185,12 @@ void EncodeUncommittedOverlay(const RowPage& rp, std::string* dst) {
   const PackedSlots& live = rp.LivePacked();
   AppendU64(dst, static_cast<uint64_t>(live.ends.size()));
   if (!live.ends.empty()) {
-    dst->append(reinterpret_cast<const char*>(live.ends.data()),
-                live.ends.size() * sizeof(uint32_t));
+    // Copy the integer array through an explicit byte buffer instead of
+    // reinterpreting its storage as char*: same native-endian bytes, but no
+    // reliance on pointer aliasing or on the vector's alignment.
+    std::string ends_bytes(live.ends.size() * sizeof(uint32_t), '\0');
+    std::memcpy(ends_bytes.data(), live.ends.data(), ends_bytes.size());
+    dst->append(ends_bytes);
   }
   AppendU64(dst, static_cast<uint64_t>(live.blob.size()));
   if (!live.blob.empty()) {
@@ -170,7 +235,8 @@ Status DecodeUncommittedOverlay(std::string_view raw, RowPage* rp) {
   // A hydrated columnar stub keeps every former columnar row as a live slot
   // (up to kMaxColumnarRows), so the overlay shares the committed-record
   // bound rather than the 4096-slot insert cap.
-  if (hole_count > (body_len - off) / sizeof(uint64_t) ||
+  if (hole_count > RowPage::kMaxColumnarRows ||
+      hole_count > (body_len - off) / sizeof(uint64_t) ||
       row_count > RowPage::kMaxColumnarRows ||
       columnar_rows > RowPage::kMaxColumnarRows) {
     return Status::kCorrupt;
@@ -186,6 +252,7 @@ Status DecodeUncommittedOverlay(std::string_view raw, RowPage* rp) {
   }
   uint64_t ends_count = 0;
   if (!ConsumeU64(p, body_len, &off, &ends_count) ||
+      ends_count > RowPage::kMaxColumnarRows ||
       ends_count > (body_len - off) / sizeof(uint32_t)) {
     return Status::kCorrupt;
   }
@@ -297,7 +364,9 @@ class BufferedCheckpointWriter {
 
   Status Finalize() {
     RETURN_IF_FAIL(FlushChunk());
-    RETURN_IF_FAIL(PwriteAllFd(fd_, &crc_, sizeof(crc_), written_offset_));
+    const uint32_t finalized_crc = crc_ ^ 0xffffffffU;
+    RETURN_IF_FAIL(
+        PwriteAllFd(fd_, &finalized_crc, sizeof(finalized_crc), written_offset_));
     written_offset_ += sizeof(crc_);
     return Status::kSuccess;
   }
@@ -317,7 +386,7 @@ class BufferedCheckpointWriter {
   int fd_{-1};
   std::string buf_;
   uint64_t written_offset_{0};
-  uint32_t crc_{0};
+  uint32_t crc_{0xffffffffU};
 };
 
 class StreamingCheckpointReader {
@@ -332,28 +401,33 @@ class StreamingCheckpointReader {
     return pos_ <= payload_size_ ? payload_size_ - pos_ : 0;
   }
 
-  static Status VerifyFileCrc(int fd, uint64_t fsize, uint64_t payload_size) {
+  static Status VerifyFileCrc(int fd, uint64_t payload_size) {
     std::string chunk;
     chunk.resize(std::min<uint64_t>(kStreamingChunkBytes, payload_size));
-    uint32_t crc = 0;
+    uint32_t crc = 0xffffffffU;
+    // Older snapshots used the raw register with a zero seed. Keep accepting
+    // those files while writing the documented standard CRC-32C going
+    // forward.
+    uint32_t legacy_crc = 0;
     uint64_t off = 0;
     while (off < payload_size) {
       const size_t to_read = static_cast<size_t>(
           std::min<uint64_t>(chunk.size(), payload_size - off));
       RETURN_IF_FAIL(PreadAllFd(fd, chunk.data(), to_read, off));
       crc = Crc32CExtend(crc, chunk.data(), to_read);
+      legacy_crc = Crc32CExtend(legacy_crc, chunk.data(), to_read);
       off += to_read;
     }
     uint32_t stored_crc = 0;
-    // The trailing CRC must be the final bytes of the snapshot. Reject both
-    // a truncated file and trailing garbage after the CRC so loading honors
-    // the "complete consumption" recovery invariant.
-    if (payload_size + sizeof(uint32_t) != fsize) {
-      return Status::kCorrupt;
-    }
+    // The caller derives payload_size from the file length after ensuring the
+    // CRC trailer is present. A short payload fails the CRC check; any bytes
+    // left after decoding are rejected by the reader's complete-consumption
+    // check at the end of LoadFuzzyCheckpoint.
     RETURN_IF_FAIL(
         PreadAllFd(fd, &stored_crc, sizeof(stored_crc), payload_size));
-    return crc == stored_crc ? Status::kSuccess : Status::kCorrupt;
+    return (crc ^ 0xffffffffU) == stored_crc || legacy_crc == stored_crc
+               ? Status::kSuccess
+               : Status::kCorrupt;
   }
 
   bool ReadBytes(void* dst, size_t len) {
@@ -443,8 +517,11 @@ void AppendCommittedBlockRecord(page_id_t pid, const RowPage& rp,
     AppendU64(dst, slsn);
   }
   if (nslots > 0) {
-    dst->append(reinterpret_cast<const char*>(packed.ends.data()),
-                nslots * sizeof(uint32_t));
+    // Match DecodeCommittedBlockRecord's memcpy-based reads without casting
+    // the uint32_t array to char*: byte layout is unchanged.
+    std::string ends_bytes(nslots * sizeof(uint32_t), '\0');
+    std::memcpy(ends_bytes.data(), packed.ends.data(), ends_bytes.size());
+    dst->append(ends_bytes);
   }
   AppendU32(dst, static_cast<uint32_t>(packed.blob.size()));
   dst->append(packed.blob);
@@ -802,36 +879,7 @@ void PageManager::CloseLsmFileLocked() {
 }
 
 void PageManager::CleanupStaleLsmFiles(uint64_t keep_generation) const {
-  const std::filesystem::path db_path(db_name_);
-  const std::filesystem::path parent = db_path.parent_path().empty()
-                                           ? std::filesystem::path(".")
-                                           : db_path.parent_path();
-  const std::string base = db_path.filename().string() + ".lsm";
-  std::error_code ec;
-  for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
-    if (ec) {
-      break;
-    }
-    const std::string fname = entry.path().filename().string();
-    // A failed remove must not be confused with a directory-iteration error:
-    // `ec` is shared with the iterator, and a stale value here would break
-    // the loop and leave all later stale files behind. Cleanup is best effort.
-    std::error_code remove_ec;
-    if (fname == base) {
-      if (keep_generation != 0) {
-        std::filesystem::remove(entry.path(), remove_ec);
-      }
-      continue;
-    }
-    const std::string prefix = base + ".";
-    if (fname.starts_with(prefix)) {
-      const std::string gen_str = fname.substr(prefix.size());
-      if (keep_generation == std::numeric_limits<uint64_t>::max() ||
-          gen_str != std::to_string(keep_generation)) {
-        std::filesystem::remove(entry.path(), remove_ec);
-      }
-    }
-  }
+  CleanupStaleCompanionFiles(db_name_, ".lsm", keep_generation);
 }
 
 // Despite being `const`, this helper refreshes the shared cached LSM fd /
@@ -1187,6 +1235,15 @@ Status PageManager::FlushTreeCommittedMemToDisk(page_id_t /*tree_id*/,
   uint64_t entry_count = 0;
   bool has_tombstones = false;
   Status write_st = Status::kSuccess;
+  // Keep the append interval exclusive across all block writes. If a stream
+  // fails partway through, its bytes are then a removable tail rather than
+  // interleaved with another tree's successful run.
+  std::unique_lock append_lk(lsm_append_mu_);
+  uint64_t append_start = 0;
+  {
+    std::scoped_lock file_lk(lsm_file_mu_);
+    append_start = lsm_append_offset_;
+  }
   {
     std::shared_lock read_lk(tree->mutex);
     auto it = tree->immutable_mem.begin();
@@ -1208,6 +1265,21 @@ Status PageManager::FlushTreeCommittedMemToDisk(page_id_t /*tree_id*/,
   }
 
   if (write_st != Status::kSuccess) {
+    {
+      std::scoped_lock file_lk(lsm_file_mu_);
+      const int fd = lsm_fd_.load(std::memory_order_acquire);
+      if (fd >= 0 && append_start <= static_cast<uint64_t>(
+                                       std::numeric_limits<int64_t>::max()) &&
+          platform::Truncate(fd, static_cast<int64_t>(append_start)) == 0) {
+        lsm_append_offset_ = append_start;
+      } else if (fd >= 0) {
+        int64_t file_size = 0;
+        if (platform::FileSize(fd, &file_size) == 0 && file_size >= 0) {
+          lsm_append_offset_ = static_cast<uint64_t>(file_size);
+        }
+      }
+    }
+    append_lk.unlock();
     std::unique_lock tree_lk(tree->mutex);
     if (tree->destroy_epoch == epoch_snap) {
       tree->RestoreImmutableToCommittedLocked();
@@ -1218,6 +1290,7 @@ Status PageManager::FlushTreeCommittedMemToDisk(page_id_t /*tree_id*/,
     AccountTreeMemoryLocked(*tree);
     return write_st;
   }
+  append_lk.unlock();
 
   LsmSortedRun flushed{
       .generation = run_gen,
@@ -1285,10 +1358,14 @@ Status PageManager::CompactTreeRunsToDisk(page_id_t /*tree_id*/,
   std::vector<LsmRunBlockMeta> out_blocks;
   uint64_t entry_count = 0;
   bool has_tombstones = false;
-  Status merge_st = MergeLsmSourcesToFd(
-      lsm_fd_, lsm_file_mu_, lsm_fd_, lsm_file_mu_, &lsm_append_offset_,
-      lsm_cache_, specs, nullptr, drop_tombstones, &out_blocks, &entry_count,
-      &has_tombstones);
+  Status merge_st = Status::kSuccess;
+  {
+    std::scoped_lock append_lk(lsm_append_mu_);
+    merge_st = MergeLsmSourcesToFd(
+        lsm_fd_, lsm_file_mu_, lsm_fd_, lsm_file_mu_, &lsm_append_offset_,
+        lsm_cache_, specs, nullptr, drop_tombstones, &out_blocks, &entry_count,
+        &has_tombstones);
+  }
 
   if (merge_st != Status::kSuccess) {
     std::unique_lock tree_lk(tree->mutex);
@@ -1618,40 +1695,15 @@ void PageManager::CloseBlocksFileLocked() {
 }
 
 void PageManager::CleanupStaleBlocksFiles(uint64_t keep_generation) const {
-  const std::filesystem::path db_path(db_name_);
-  const std::filesystem::path parent = db_path.parent_path().empty()
-                                           ? std::filesystem::path(".")
-                                           : db_path.parent_path();
-  const std::string base = db_path.filename().string() + ".blocks";
-  std::error_code ec;
-  for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
-    if (ec) {
-      break;
-    }
-    const std::string fname = entry.path().filename().string();
-    // Keep the iterator's error_code separate from remove()'s: one temporary
-    // remove failure (EBUSY etc.) must not abort the rest of the sweep.
-    std::error_code remove_ec;
-    if (fname == base) {
-      if (keep_generation != 0) {
-        std::filesystem::remove(entry.path(), remove_ec);
-      }
-      continue;
-    }
-    const std::string prefix = base + ".";
-    if (fname.starts_with(prefix)) {
-      const std::string gen_str = fname.substr(prefix.size());
-      if (keep_generation == std::numeric_limits<uint64_t>::max() ||
-          gen_str != std::to_string(keep_generation)) {
-        std::filesystem::remove(entry.path(), remove_ec);
-      }
-    }
-  }
+  CleanupStaleCompanionFiles(db_name_, ".blocks", keep_generation);
 }
 
 Status PageManager::OpenOrCreateBlocksFileLocked(uint64_t generation,
                                                  bool truncate,
                                                  uint64_t* file_size_out) {
+  if (generation > std::numeric_limits<uint32_t>::max()) {
+    return Status::kCorrupt;
+  }
   if (blocks_fd_ >= 0 && blocks_generation_ == generation && !truncate) {
     if (file_size_out != nullptr) {
       *file_size_out = blocks_append_offset_;
@@ -1689,6 +1741,17 @@ Status PageManager::OpenOrCreateBlocksFileLocked(uint64_t generation,
     *file_size_out = fsize;
   }
   return Status::kSuccess;
+}
+
+void PageManager::NoteCommitReflected(lsn_t commit_end) noexcept {
+  lsn_t cur = max_reflected_commit_end_.load(std::memory_order_relaxed);
+  // Publish before the committed state changes: the page latch / blocks_mu_
+  // that orders the change before an image capture then also orders this
+  // store before the capturer's ReflectedCommitDurableTarget() load.
+  while (commit_end > cur && !max_reflected_commit_end_.compare_exchange_weak(
+                                 cur, commit_end, std::memory_order_acq_rel,
+                                 std::memory_order_relaxed)) {
+  }
 }
 
 Status PageManager::WaitForDurableLSN(lsn_t lsn) {
@@ -1840,6 +1903,8 @@ StatusOr<std::shared_ptr<Page>> PageManager::EnsureEvictedPageResident(
         RETURN_IF_FAIL(sp_store->Read(*uncommitted_seg_id, 0,
                                       overlay_raw.data(), overlay_raw.size()));
       }
+      // DecodeUncommittedOverlay returns kCorrupt for a bad CRC/length; keep
+      // propagating it so a corrupt spill segment never becomes a valid page.
       RETURN_IF_FAIL(
           DecodeUncommittedOverlay(overlay_raw, &fresh->body.row_page));
     }
@@ -1943,7 +2008,19 @@ size_t PageManager::TryEvictForReclaim(size_t bytes_needed) noexcept {
     const size_t before = resident_bytes_.load(std::memory_order_relaxed);
     if (before > 0) {
       const size_t target = before > rem ? before - rem : 0;
-      (void)EvictBatch(target, /*try_locks_only=*/true);
+      // A try-lock miss returns kSuccess (nothing to report), but real
+      // I/O/WAL failures must not be silently dropped just because the
+      // reclaimed byte count is measured from resident_bytes_ below.
+      const Status evict_status = EvictBatch(target, /*try_locks_only=*/true);
+      if (evict_status != Status::kSuccess) {
+        try {
+          LOG(WARN) << "TryEvictForReclaim: EvictBatch(" << target
+                    << " bytes) failed: " << evict_status;
+        } catch (...) {
+          // This reclaim path is noexcept and may run while memory is tight;
+          // a diagnostic allocation failure must not terminate the process.
+        }
+      }
       const size_t after = resident_bytes_.load(std::memory_order_relaxed);
       if (before > after) {
         freed_total += (before - after);
@@ -2166,7 +2243,8 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
 
       if (!dirty_items.empty()) {
         if (any_committed_io) {
-          RETURN_IF_FAIL(WaitForDurableLSN(max_batch_lsn));
+          RETURN_IF_FAIL(WaitForDurableLSN(
+              std::max(max_batch_lsn, ReflectedCommitDurableTarget())));
         }
         for (DirtyCandidate& item : dirty_items) {
           if (!item.has_uncommitted) {
@@ -2313,6 +2391,12 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
             }
           }
           if (dropped_in_race) {
+            // The page stayed resident with its live (possibly uncommitted)
+            // payload and was never entered into evicted_pages_, so no
+            // uncommitted_spills_ registration is needed. Drop the segment we
+            // wrote for this attempt instead of orphaning it; if another
+            // eviction won the race, that path registered its own segment and
+            // this id is no longer ours to drop.
             DropUncommittedSpillSegment(item.uncommitted_seg_id);
             item.uncommitted_seg_id = kInvalidSpillSegmentId;
           }
@@ -2430,6 +2514,7 @@ Status PageManager::EnsureRecoveryStubHydrated(page_id_t pid, lsn_t lsn,
 void PageManager::DropAllState() {
   max_committed_txn_id_.store(0, std::memory_order_release);
   unpersisted_committed_ops_.store(0, std::memory_order_relaxed);
+  max_reflected_commit_end_.store(0, std::memory_order_release);
   std::scoped_lock evict_lk(eviction_mu_);
   lsm_cache_.Clear();
   {
@@ -2538,22 +2623,28 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
   bool created_slot = false;
   {
     std::scoped_lock lk(blocks_mu_);
+    // A stale free id that collides with the old chain, resident pages, or
+    // evicted descriptors cannot be allocated now. Preserve it for a later
+    // attempt, but only reinsert after all target ids are selected: TryPop
+    // returns the highest id, so reinserting inside the loop could pop it
+    // repeatedly.
     std::vector<page_id_t> skipped_free_ids;
     while (free_ids_.TryPop(&pid)) {
       if (pid != 0 && !evicted_pages_.Contains(pid)) {
         recycled = true;
         break;
       }
-      // A free id that still has a lingering evicted descriptor (or a stray
-      // 0) cannot be reused now, but popping it and dropping it would leak it
-      // permanently. Keep it for later. Re-insert only after the loop stops:
-      // TryPop returns the highest id, so putting it back mid-loop would make
-      // us pop the same id again forever.
+      // A nonzero free id with a lingering evicted descriptor cannot be
+      // reused now, so preserve it and retry later. Reserved id 0 is discarded.
+      // Re-insert only after the loop stops: TryPop returns the highest id, so
+      // putting an id back mid-loop would make us pop it again forever.
       if (pid != 0) {
         skipped_free_ids.push_back(pid);
       }
       pid = 0;
     }
+    // BoundedFreeIdSet::Insert is void (std::map-backed): there is no Status
+    // or bool to ignore here, and every id popped above is re-inserted.
     for (page_id_t skipped : skipped_free_ids) {
       free_ids_.Insert(skipped);
     }
@@ -2562,6 +2653,11 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
     }
     auto& slot = blocks_[pid];
     if (slot == nullptr) {
+      // Ids returned to free_ids_ by FinishTransactionCommit have already had
+      // their stale kUnknown shell erased from blocks_. Referrers keep that
+      // old Page alive via their own shared_ptr, so the slot we create here is
+      // genuinely a new object with a fresh latch; an old PageRef cannot
+      // collide with it.
       // Publish only an unavailable placeholder until initialization owns
       // the content latch and the allocation WAL record has been queued.
       slot = std::make_shared<Page>(pid, PageType::kUnknown);
@@ -2581,6 +2677,13 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
     // undoing that, a WAL write failure permanently leaks both the id and
     // the resident shell. Drop the latch first: never take blocks_mu_ while
     // holding a page content latch (see the publication step below).
+    // InvalidatePageVersions() above already destroyed any chains for a
+    // recycled id and AllocatePageLog() may have staged state in the
+    // transaction; that cannot be rolled back here. Mark the transaction
+    // failed so the stale intent/state can never be used by a later
+    // operation (AppendLog rejects failed transactions); its abort still
+    // releases the intent and staged records.
+    txn.MarkFailed();
     initialized.PageUnlock();
     std::scoped_lock lk(blocks_mu_);
     auto it = blocks_.find(pid);
@@ -2601,6 +2704,9 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
       evicted_page_count_.fetch_sub(1, std::memory_order_relaxed);
     }
     initialized->PageInit(pid, new_page_type);
+    // PageInit resets generation-local state, but initialized still holds
+    // the exclusive latch that is returned to the caller.
+    initialized->SetExclusiveOwner(std::this_thread::get_id());
     initialized->SetPageLSN(lsn);
     AccountPageMemoryLocked(*page_sp);
     NotePageTouchedLocked(*page_sp);
@@ -2695,6 +2801,7 @@ PageManager::ReplaceTableChainWithColumnarStubs(
       }
     }
 
+    std::vector<page_id_t> skipped_free_ids;
     for (size_t i = 0; i < target_count; ++i) {
       if (i < old_pids.size()) {
         pids.push_back(old_pids[i]);
@@ -2706,12 +2813,18 @@ PageManager::ReplaceTableChainWithColumnarStubs(
             !evicted_pages_.Contains(pid)) {
           break;
         }
+        if (pid != 0) {
+          skipped_free_ids.push_back(pid);
+        }
         pid = 0;
       }
       if (pid == 0) {
         pid = ++max_page_id_;
       }
       pids.push_back(pid);
+    }
+    for (page_id_t skipped : skipped_free_ids) {
+      free_ids_.Insert(skipped);
     }
     committed_max_page_id_ = std::max(committed_max_page_id_, max_page_id_);
 
@@ -2799,6 +2912,7 @@ PageManager::ReplaceTableChainWithColumnarStubs(
     std::scoped_lock lk(table_tails_mu_);
     table_tails_[first_pid] = pids.back();
   }
+  NoteCommitReflected(commit_lsn);
   return pids;
 }
 
@@ -2930,11 +3044,11 @@ Status PageManager::LsmInsert(Transaction& txn, page_id_t tree_id,
   }
   ASSIGN_OR_RETURN(lsn_t, lsn,
                    txn.LsmPutLog(tree_id, key, value, {}, /*had_prev=*/false));
-  (void)lsn;
   tree->MutateMemtableEntryLocked(key, [&](LsmTreeState::MemEntry& entry) {
     entry.value.assign(value.data(), value.size());
     entry.deleted = false;
     entry.generation = tree->next_generation++;
+    entry.write_lsn = lsn;
     entry.uncommitted_owners.push_back(txn.ID());
   });
   ++tree->active_uncommitted_ops;
@@ -2973,11 +3087,11 @@ Status PageManager::LsmUpdate(Transaction& txn, page_id_t tree_id,
   ASSIGN_OR_RETURN(
       lsn_t, lsn,
       txn.LsmPutLog(tree_id, key, value, existing, /*had_prev=*/true));
-  (void)lsn;
   tree->MutateMemtableEntryLocked(key, [&](LsmTreeState::MemEntry& entry) {
     entry.value.assign(value.data(), value.size());
     entry.deleted = false;
     entry.generation = tree->next_generation++;
+    entry.write_lsn = lsn;
     entry.uncommitted_owners.push_back(txn.ID());
   });
   ++tree->active_uncommitted_ops;
@@ -3012,11 +3126,11 @@ Status PageManager::LsmDelete(Transaction& txn, page_id_t tree_id,
     }
   }
   ASSIGN_OR_RETURN(lsn_t, lsn, txn.LsmDeleteLog(tree_id, key, existing));
-  (void)lsn;
   tree->MutateMemtableEntryLocked(key, [&](LsmTreeState::MemEntry& entry) {
     entry.value.clear();
     entry.deleted = true;
     entry.generation = tree->next_generation++;
+    entry.write_lsn = lsn;
     entry.uncommitted_owners.push_back(txn.ID());
   });
   ++tree->active_uncommitted_ops;
@@ -3101,7 +3215,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
         runs_(std::move(runs)),
         begin_(std::move(begin)),
         end_(std::move(end)),
-        status_(status) {
+        status_(std::move(std::move(status))) {
     run_cursors_.reserve(runs_.size());
     for (const auto& run : runs_) {
       // runs_ elements are heap-allocated, so the blocks span below stays
@@ -3202,15 +3316,15 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
     }
     if (!memtable_.empty()) {
       heap_.push(
-          HeapItem{std::string_view(memtable_.front().first), kSrcMemtable});
+          HeapItem{.key=std::string_view(memtable_.front().first), .src=kSrcMemtable});
     }
     if (!committed_.empty()) {
       heap_.push(
-          HeapItem{std::string_view(committed_.front().first), kSrcCommitted});
+          HeapItem{.key=std::string_view(committed_.front().first), .src=kSrcCommitted});
     }
     if (!immutable_.empty()) {
       heap_.push(
-          HeapItem{std::string_view(immutable_.front().first), kSrcImmutable});
+          HeapItem{.key=std::string_view(immutable_.front().first), .src=kSrcImmutable});
     }
     for (size_t i = 0; i < run_cursors_.size(); ++i) {
       const Status st = begin_.empty() ? run_cursors_[i].SeekToFirst()
@@ -3222,7 +3336,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       if (run_cursors_[i].Valid()) {
         const std::string_view k = run_cursors_[i].Current().key;
         if (!PastEnd(k)) {
-          heap_.push(HeapItem{k, RunSrc(i)});
+          heap_.push(HeapItem{.key=k, .src=RunSrc(i)});
         }
       }
     }
@@ -3234,7 +3348,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       const std::vector<std::pair<std::string, EntryT>>& vec) {
     ++(*pos);
     if (*pos < vec.size()) {
-      heap_.push(HeapItem{std::string_view(vec[*pos].first), src});
+      heap_.push(HeapItem{.key=std::string_view(vec[*pos].first), .src=src});
     }
   }
 
@@ -3260,7 +3374,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
     if (run_cursors_[ri].Valid()) {
       const std::string_view k = run_cursors_[ri].Current().key;
       if (!PastEnd(k)) {
-        heap_.push(HeapItem{k, src});
+        heap_.push(HeapItem{.key=k, .src=src});
       }
     }
   }
@@ -3481,6 +3595,11 @@ void PageManager::BeginTransactionCommit(txn_id_t txn_id) {
 Status PageManager::ApplyTransactionCommitRecord(
     txn_id_t txn_id, lsn_t commit_lsn, const LogRecord& r,
     TransactionCommitState* state) {
+  // Lock-order note: the mutex acquisitions below live in mutually exclusive
+  // switch cases. The only nested pair is blocks_mu_ -> page latch (the
+  // documented outer->inner order, with the latch try-locked), so adjacent
+  // scoped_locks in this function never form an ABBA cycle.
+  NoteCommitReflected(commit_lsn);
   const lsn_t rec_lsn =
       r.record_lsn == LogRecord::kUnknownRecordLsn ? commit_lsn : r.record_lsn;
   switch (r.type) {
@@ -3493,6 +3612,23 @@ Status PageManager::ApplyTransactionCommitRecord(
           auto it = blocks_.find(r.pid);
           if (it != blocks_.end() && it->second != nullptr) {
             Page* const page = it->second.get();
+            // PageInit reinitializes the row-page vectors that GetPage reads
+            // under a shared PageRef latch. Never wait for the page latch
+            // while holding blocks_mu_ (docs/lock_order.md): a latch holder
+            // must be able to take blocks_mu_. Reuse the caller's exclusive
+            // PageRef latch when it already owns this page.
+            const bool caller_owns_page =
+                page->IsExclusivelyOwnedByCurrentThread();
+            std::unique_lock<std::shared_mutex> page_lk;
+            if (!caller_owns_page) {
+              page_lk = std::unique_lock(*page->Latch(), std::try_to_lock);
+              if (!page_lk.owns_lock()) {
+                // Retry without blocks_mu_ held (lock order), but yield the
+                // core instead of spinning on a contended latch.
+                std::this_thread::yield();
+                continue;
+              }
+            }
             // A kUnknown placeholder can reach commit if the allocating
             // writer has not run PageInit yet. Mirror ReplayCommittedRecord
             // and publish it as a row page, otherwise GetPage keeps rejecting
@@ -3503,6 +3639,9 @@ Status PageManager::ApplyTransactionCommitRecord(
                 evicted_page_count_.fetch_sub(1, std::memory_order_relaxed);
               }
               page->PageInit(r.pid, PageType::kRowPage);
+              if (caller_owns_page) {
+                page->SetExclusiveOwner(std::this_thread::get_id());
+              }
               AccountPageMemoryLocked(*page);
             }
             RowPage& rp = page->body.row_page;
@@ -3632,6 +3771,20 @@ Status PageManager::ApplyTransactionCommitRecord(
           auto it = blocks_.find(r.pid);
           if (it != blocks_.end() && it->second != nullptr) {
             Page* page = it->second.get();
+            // Chain links are read by GetPage/EvictBatch under a shared
+            // PageRef latch; publish the next id, its LSN and the commit
+            // sequence as one latched update. Try-lock while holding
+            // blocks_mu_ (docs/lock_order.md), reusing the caller's exclusive
+            // latch when it already owns this page.
+            const bool caller_owns_page =
+                page->IsExclusivelyOwnedByCurrentThread();
+            std::unique_lock<std::shared_mutex> page_lk;
+            if (!caller_owns_page) {
+              page_lk = std::unique_lock(*page->Latch(), std::try_to_lock);
+              if (!page_lk.owns_lock()) {
+                continue;
+              }
+            }
             RowPage& rp = page->body.row_page;
             if (rec_lsn >= rp.committed_link_lsn_) {
               rp.committed_next_page_id_ = r.redo_pid;
@@ -3667,6 +3820,17 @@ Status PageManager::ApplyTransactionCommitRecord(
           auto it = blocks_.find(r.pid);
           if (it != blocks_.end() && it->second != nullptr) {
             Page* page = it->second.get();
+            // Same latch contract as kSetRowPageNext: the previous link and
+            // its LSN must become visible together to chain walkers.
+            const bool caller_owns_page =
+                page->IsExclusivelyOwnedByCurrentThread();
+            std::unique_lock<std::shared_mutex> page_lk;
+            if (!caller_owns_page) {
+              page_lk = std::unique_lock(*page->Latch(), std::try_to_lock);
+              if (!page_lk.owns_lock()) {
+                continue;
+              }
+            }
             RowPage& rp = page->body.row_page;
             if (rec_lsn >= rp.committed_link_lsn_) {
               rp.committed_prev_page_id_ = r.redo_pid;
@@ -3872,6 +4036,9 @@ void PageManager::BeginTransactionAbort(txn_id_t txn_id) {
 
 void PageManager::ApplyTransactionAbortRecord(txn_id_t txn_id,
                                               const LogRecord& r) {
+  // Lock-order note: each switch case takes its mutexes in a self-contained
+  // scope and exactly one case runs per record, so blocks_mu_, trees_mu_ and
+  // the page latches below are never held at the same time (see lock_order.md).
   auto lock_page_if_needed = [](Page* p) {
     return p->IsExclusivelyOwnedByCurrentThread()
                ? std::unique_lock<std::shared_mutex>()
@@ -4131,6 +4298,10 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   (void)blocks_entry_count;
   (void)evicted_entry_count;
 
+  // The blocks_mu_ classification loop has ended. checkpoint_io_mu_ ->
+  // blocks_file_mu_ / trees_mu_ below are separate sequential scopes, and the
+  // later emission blocks_mu_ scopes are entered with no companion-file lock
+  // held, so no lock-order inversion is possible here (see lock_order.md).
   std::scoped_lock io_lk(checkpoint_io_mu_);
   if (lock_fd_ < 0) {
     return Status::kIOError;
@@ -4160,6 +4331,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   // up empty after emission; the next checkpoint can still clean it up.
   const bool compacted_blocks =
       use_disk_blocks && has_open_blocks_file &&
+      current_gen < std::numeric_limits<uint32_t>::max() &&
       current_blocks_size > (uint64_t{64} << 20) &&
       (live_clean_disk_bytes * 2 < current_blocks_size);
   const uint64_t target_blocks_gen =
@@ -4170,6 +4342,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   // classification scan above runs after the caller's outer wait, so a
   // commit racing the scan can raise max_dirty_lsn past the durable point;
   // inline pages need the same re-wait the blocks-file path performs.
+  max_dirty_lsn = std::max(max_dirty_lsn, ReflectedCommitDurableTarget());
   if (max_dirty_lsn > 0) {
     RETURN_IF_FAIL(WaitForDurableLSN(max_dirty_lsn));
   }
@@ -4537,6 +4710,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   page_id_t page_cursor = 0;
   std::vector<BatchItem> batch;
   std::vector<std::pair<page_id_t, EvictedPageDesc>> ev_batch;
+  std::string inline_page;
   batch.reserve(kCheckpointPageBatchSize);
   // Pages can turn dirty after the classification scan, so batches may
   // persist records whose LSNs exceed the scan-time `max_dirty_lsn` — or
@@ -4576,10 +4750,23 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
           if (bit != blocks_.end() && bit->first == epid) {
             if (!ev_batch[ei].second.HasCommittedDiskBlock()) {
               // A concurrent fault-in is folding the descriptor back into
-              // blocks_. The evicted entry has no usable image, so skip it
-              // and emit the resident page on the next iteration instead;
-              // otherwise the pid would be emitted twice (or dropped).
-              page_cursor = epid;
+              // blocks_. The evicted entry has no usable image. Emit the
+              // resident image *now*: leaving `bit` on this pid and counting
+              // on the next iteration is unsafe because a full batch restarts
+              // the resident scan at upper_bound(page_cursor), which skips a
+              // resident entry whose key equals page_cursor. That would drop
+              // the page (and its committed rows) from the snapshot.
+              const page_id_t bpid = bit->first;
+              if (bit->second != nullptr &&
+                  bit->second->body.row_page.committed_allocated_) {
+                batch.push_back(BatchItem{
+                    .pid = bpid,
+                    .is_evicted = false,
+                    .page = bit->second,
+                });
+              }
+              page_cursor = bpid;
+              ++bit;
               ++ei;
               continue;
             }
@@ -4820,7 +5007,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     }
 
     if (write_status == Status::kSuccess && !dirty_metas.empty()) {
-      write_status = WaitForDurableLSN(batch_dirty_lsn);
+      write_status = WaitForDurableLSN(
+          std::max(batch_dirty_lsn, ReflectedCommitDurableTarget()));
       if (write_status == Status::kSuccess) {
         uint64_t write_base = 0;
         uint32_t write_gen = 0;
@@ -4862,7 +5050,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     if (write_status == Status::kSuccess && compacted_blocks &&
         compacted_io_buf.size() >= kEvictionBatchTargetBytes) {
       if (batch_dirty_lsn > 0) {
-        write_status = WaitForDurableLSN(batch_dirty_lsn);
+        write_status = WaitForDurableLSN(
+            std::max(batch_dirty_lsn, ReflectedCommitDurableTarget()));
       }
       if (write_status == Status::kSuccess) {
         write_status = flush_compacted_buf();
@@ -4913,8 +5102,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
           {
             std::scoped_lock lk(blocks_mu_);
             auto it = blocks_.find(rec.pid);
-            if (it != blocks_.end() && it->second != nullptr &&
-                it->second->body.row_page.committed_allocated_) {
+            if (it != blocks_.end() && it->second != nullptr) {
               page = it->second;
             }
           }
@@ -4941,52 +5129,48 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
             if (page == nullptr) {
               auto p_or = EnsureEvictedPageResident(
                   rec.pid, ev_desc.value_or(EvictedPageDesc{}));
-              if (p_or.HasValue() && p_or.Value() != nullptr &&
-                  p_or.Value()->body.row_page.committed_allocated_) {
+              if (p_or.HasValue()) {
                 page = p_or.MoveValue();
               }
             }
           }
-          if (page == nullptr || !page->body.row_page.committed_allocated_) {
+          inline_page.clear();
+          if (page != nullptr) {
+            // committed_* are written under the page content latch by commit
+            // and eviction; blocks_mu_ alone does not order them. Take the
+            // shared latch with no other lock held — page latch -> blocks_mu_
+            // would be the forbidden inner->outer order.
+            std::shared_lock<std::shared_mutex> page_lk(*page->Latch());
+            const RowPage& rp = page->body.row_page;
+            if (rp.committed_allocated_) {
+              const PackedSlots& cp = rp.CommittedPacked();
+              const auto nslots = static_cast<uint32_t>(cp.size());
+              AppendU32(&inline_page, nslots);
+              AppendU64(&inline_page, rp.committed_prev_page_id_);
+              AppendU64(&inline_page, rp.committed_next_page_id_);
+              AppendU64(&inline_page, rp.committed_link_lsn_);
+              for (uint32_t s = 0; s < nslots; ++s) {
+                const lsn_t slsn =
+                    s < rp.committed_lsns_.size() ? rp.committed_lsns_[s] : 0;
+                const std::string_view row = cp.View(s);
+                AppendU64(&inline_page, slsn);
+                AppendU32(&inline_page, static_cast<uint32_t>(row.size()));
+                inline_page.append(row);
+              }
+            }
+          }
+          if (inline_page.empty()) {
             // Unresolvable (concurrently destroyed): fall back to the
             // classification-time chain links with no slots. A tag-0 record
             // with zero links would silently drop the page AND break the
             // recovered chain.
-            write_status = writer.AppendU32(0U);
-            if (write_status == Status::kSuccess) {
-              write_status = writer.AppendU64(rec.prev_pid);
-            }
-            if (write_status == Status::kSuccess) {
-              write_status = writer.AppendU64(rec.next_pid);
-            }
-            if (write_status == Status::kSuccess) {
-              write_status = writer.AppendU64(rec.link_lsn);
-            }
-            continue;
+            AppendU32(&inline_page, 0);
+            AppendU64(&inline_page, rec.prev_pid);
+            AppendU64(&inline_page, rec.next_pid);
+            AppendU64(&inline_page, rec.link_lsn);
           }
-          std::scoped_lock lk(blocks_mu_);
-          const RowPage& rp = page->body.row_page;
-          const PackedSlots& cp = rp.CommittedPacked();
-          const auto nslots = static_cast<uint32_t>(cp.size());
-          write_status = writer.AppendU32(nslots);
-          if (write_status == Status::kSuccess) {
-            write_status = writer.AppendU64(rp.committed_prev_page_id_);
-          }
-          if (write_status == Status::kSuccess) {
-            write_status = writer.AppendU64(rp.committed_next_page_id_);
-          }
-          if (write_status == Status::kSuccess) {
-            write_status = writer.AppendU64(rp.committed_link_lsn_);
-          }
-          for (uint32_t s = 0; s < nslots && write_status == Status::kSuccess;
-               ++s) {
-            const lsn_t slsn =
-                s < rp.committed_lsns_.size() ? rp.committed_lsns_[s] : 0;
-            write_status = writer.AppendU64(slsn);
-            if (write_status == Status::kSuccess) {
-              write_status = writer.AppendString(cp.View(s));
-            }
-          }
+          // Append may flush a full checkpoint buffer to disk.
+          write_status = writer.Append(inline_page.data(), inline_page.size());
         }
       }
     }
@@ -4997,7 +5181,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   }
 
   if (write_status == Status::kSuccess && compacted_blocks) {
-    const lsn_t wait_lsn = std::max(max_dirty_lsn, streamed_dirty_lsn);
+    const lsn_t wait_lsn = std::max(
+        {max_dirty_lsn, streamed_dirty_lsn, ReflectedCommitDurableTarget()});
     if (wait_lsn > 0) {
       write_status = WaitForDurableLSN(wait_lsn);
     }
@@ -5081,6 +5266,14 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     return write_status;
   }
 
+  // Final gate: emission above is fuzzy, so commits reflected after the
+  // earlier waits may be in this snapshot (row images, LSM entries, freed or
+  // allocated pages). Publish it only once all of them are durable.
+  if (const Status st = WaitForDurableLSN(ReflectedCommitDurableTarget());
+      st != Status::kSuccess) {
+    cleanup_tmp(tmp_fd);
+    return st;
+  }
   if (platform::DataSync(tmp_fd) != 0) {
     const int err = errno;
     cleanup_tmp(tmp_fd);
@@ -5258,6 +5451,7 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   std::error_code ec;
   const auto fsize = std::filesystem::file_size(db_name_, ec);
   if (ec || fsize == 0) {
+    max_reflected_commit_end_.store(0, std::memory_order_release);
     return Status::kSuccess;
   }
   constexpr size_t kMinSize = kFuzzyCheckpointMagic.size() +
@@ -5285,8 +5479,7 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   } fd_guard(fd);
 
   const uint64_t payload_size = fsize - sizeof(uint32_t);
-  RETURN_IF_FAIL(
-      StreamingCheckpointReader::VerifyFileCrc(fd, fsize, payload_size));
+  RETURN_IF_FAIL(StreamingCheckpointReader::VerifyFileCrc(fd, payload_size));
 
   StreamingCheckpointReader reader(fd, payload_size);
   std::array<char, 8> magic{};
@@ -5306,6 +5499,7 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   if (!reader.ReadU32(&version) || version != kFuzzyCheckpointVersion ||
       !reader.ReadU64(&replay_lsn) || !reader.ReadU64(&persisted_max_txn) ||
       !reader.ReadU32(&has_blocks_file) || !reader.ReadU64(&ckpt_blocks_gen) ||
+      ckpt_blocks_gen > std::numeric_limits<uint32_t>::max() ||
       has_blocks_file > 1U || !reader.ReadU32(&has_lsm_file) ||
       !reader.ReadU64(&ckpt_lsm_gen) || has_lsm_file > 1U ||
       !reader.ReadU64(&max_pid) || !reader.ReadU32(&free_range_count) ||
@@ -5592,6 +5786,7 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   if (loaded_out != nullptr) {
     *loaded_out = true;
   }
+  max_reflected_commit_end_.store(replay_lsn, std::memory_order_release);
   return Status::kSuccess;
 } catch (const std::bad_alloc&) {
   return Status::kNoSpace;
@@ -5600,6 +5795,9 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
 }
 
 Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
+  // Lock-order note: replay cases are mutually exclusive. Each blocks_mu_ /
+  // trees_mu_ acquisition below belongs to exactly one case and is released
+  // before the next record, so no two of these scopes are ever nested.
   txn_id_t cur_max = max_committed_txn_id_.load(std::memory_order_relaxed);
   while (r.owner > cur_max && !max_committed_txn_id_.compare_exchange_weak(
                                   cur_max, r.owner, std::memory_order_release,
@@ -5996,6 +6194,10 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
           visible_tail == expected ? Status::kSuccess : Status::kConflicts;
       break;
     }
+    if (watcher != nullptr && watcher->NoWaitForConflicts()) {
+      early_result = StatusError(StatusCode::kConflicts, "table tail reservation held by another transaction");
+      break;
+    }
     if (holds_other_tail()) {
       early_result =
           StatusError(StatusCode::kConflicts,
@@ -6166,6 +6368,10 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
       early_result = Status::kSuccess;
       break;
     }
+    if (watcher != nullptr && watcher->NoWaitForConflicts()) {
+      early_result = StatusError(StatusCode::kConflicts, "table tail is unpublished");
+      break;
+    }
     if (watcher != nullptr && watcher->IsWounded()) {
       early_result =
           StatusError(StatusCode::kConflicts,
@@ -6226,6 +6432,9 @@ Status PageManager::WaitForTableTailQuiescence(page_id_t first_page,
 
 void PageManager::ResolveTableTailReservations(txn_id_t owner,
                                                TableTailResolution resolution) {
+  // Table-tail helpers take table_tails_mu_ (a documented leaf lock) alone:
+  // the adjacent helpers' scoped_locks are sequential, never nested, so their
+  // proximity in this file cannot create an acquisition-order cycle.
   std::scoped_lock lock(table_tails_mu_);
   for (auto it = tail_reservations_.begin(); it != tail_reservations_.end();) {
     if (it->second.owner != owner) {

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -53,8 +54,37 @@ inline void AppendJsonString(std::string& out, std::string_view text) {
 
 inline std::string EncodeJsonString(std::string_view text) {
   std::string out;
-  out.reserve(text.size() + 2);
-  AppendJsonString(out, text);
+  const size_t capacity = out.max_size();
+  size_t encoded_size = 2;
+  for (unsigned char byte : text) {
+    size_t bytes = 1;
+    switch (byte) {
+      case '"':
+      case '\\':
+      case '\b':
+      case '\f':
+      case '\n':
+      case '\r':
+      case '\t':
+        bytes = 2;
+        break;
+      default:
+        bytes = byte < 0x20 ? 6 : 1;
+        break;
+    }
+    if (bytes > capacity - encoded_size) {
+      throw std::length_error("encoded JSON string is too large");
+    }
+    encoded_size += bytes;
+  }
+  out.reserve(encoded_size);
+  if (encoded_size - 2 == text.size()) {
+    out.push_back('"');
+    out.append(text);
+    out.push_back('"');
+  } else {
+    AppendJsonString(out, text);
+  }
   return out;
 }
 

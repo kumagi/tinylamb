@@ -18,8 +18,10 @@
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_ast_visitor_internal.hpp"
@@ -33,6 +35,12 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(GoogleSqlAstTest, TimestampNormalizationPreservesFractionAndOffset) {
+  const std::string fraction = "." + std::string(64, '9');
+  EXPECT_EQ(NormalizeTimestampText("2026-01-01 00:00:59" + fraction + "+02:00"),
+            "2025-12-31 22:00:59" + fraction + "+00");
+}
 
 namespace {
 
@@ -97,6 +105,21 @@ TEST(GoogleSqlAstAuditTest, SelectAsValueRequiresOneExpression) {
   EXPECT_NE(visited.GetStatus().GetMessage().find("exactly one expression"),
             std::string::npos);
   EXPECT_NE(VisitSql("SELECT AS VALUE 1"), nullptr);
+}
+
+TEST(GoogleSqlAstAuditTest, RecursiveDepthRejectsValuesOutsideInt64) {
+  constexpr std::string_view sql =
+      "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 3) WITH DEPTH BETWEEN 0 AND 9223372036854775808 "
+      "SELECT n, depth FROM t";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("WITH DEPTH bound"),
+            std::string::npos);
 }
 
 TEST(GoogleSqlAstAuditTest, DuplicateNamedWindowsAreRejected) {
@@ -263,6 +286,56 @@ TEST(GoogleSqlAstAuditTest, SetOperationOffsetFoldsExpression) {
       1U);
 }
 
+TEST(GoogleSqlAstAuditTest, PipeOffsetValidatesOperandsInLegacyWrapper) {
+  const auto find_limit_offset =
+      [](auto&& self, GoogleSqlAstNode& node) -> GoogleSqlAstNode* {
+    if (node.kind == "LimitOffset") {
+      return &node;
+    }
+    for (const auto& child : node.children) {
+      if (auto* found = self(self, *child); found != nullptr) {
+        return found;
+      }
+    }
+    return nullptr;
+  };
+  for (const std::string_view value : {"1", "NULL", "-1"}) {
+    const std::string sql = "FROM t |> LIMIT 5 OFFSET " + std::string(value);
+    const auto parsed = GoogleSqlFrontend::Parse(sql);
+    ASSERT_TRUE(parsed.ok) << parsed.error;
+    const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+    ASSERT_TRUE(ast.HasValue()) << ast.GetStatus();
+    auto* clause = find_limit_offset(find_limit_offset, *ast.Value());
+    ASSERT_NE(clause, nullptr);
+    bool wrapped = false;
+    for (auto& operand : clause->children) {
+      if (operand->kind == "Limit" || operand->kind == "Location" ||
+          operand->kind == "Hint") {
+        continue;
+      }
+      auto wrapper = std::make_unique<GoogleSqlAstNode>();
+      wrapper->kind = "Offset";
+      wrapper->children.push_back(std::move(operand));
+      operand = std::move(wrapper);
+      wrapped = true;
+      break;
+    }
+    ASSERT_TRUE(wrapped);
+    const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+    if (value == "1") {
+      ASSERT_TRUE(visited.HasValue()) << visited.GetStatus();
+      const auto* select =
+          dynamic_cast<const SelectStatement*>(visited.Value().get());
+      ASSERT_NE(select, nullptr);
+      EXPECT_EQ(select->Offset(), 1U);
+    } else {
+      ASSERT_FALSE(visited.HasValue()) << sql;
+      EXPECT_NE(visited.GetStatus().GetMessage().find("OFFSET"),
+                std::string::npos);
+    }
+  }
+}
+
 // The dump parser must reject a depth jump deeper than one level per line
 // instead of grafting the node onto a stale ancestor (depths 0,1,2,1,3).
 TEST(GoogleSqlAstTest, ParserRejectsMalformedDepthJumps) {
@@ -409,6 +482,49 @@ TEST(GoogleSqlAstTest, WhereClauseOperatorForms) {
   EXPECT_NE(where.find("NOT"), std::string::npos) << where;
 }
 
+TEST(GoogleSqlAstTest, NotLikeQuantifiedListUsesDeMorgan) {
+  auto parse_where = [](std::string_view sql) -> Expression {
+    auto statement = VisitSql(sql);
+    if (!statement) {
+      return nullptr;
+    }
+    const auto& select = dynamic_cast<const SelectStatement&>(*statement);
+    return select.WhereClause();
+  };
+
+  // x NOT LIKE ANY (p1, p2) == (x NOT LIKE p1) AND (x NOT LIKE p2).
+  auto any = parse_where("SELECT * FROM t WHERE a NOT LIKE ANY ('x%', 'y%');");
+  ASSERT_TRUE(any);
+  ASSERT_EQ(any->Type(), TypeTag::kBinaryExp);
+  const auto& any_root = any->AsBinaryExpression();
+  EXPECT_EQ(any_root.Op(), BinaryOperation::kAnd);
+  ASSERT_EQ(any_root.Left()->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(any_root.Left()->AsUnaryExpression().Op(), UnaryOperation::kNot);
+  ASSERT_EQ(any_root.Right()->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(any_root.Right()->AsUnaryExpression().Op(), UnaryOperation::kNot);
+
+  // x NOT LIKE ALL (p1, p2) == (x NOT LIKE p1) OR (x NOT LIKE p2).
+  auto all = parse_where("SELECT * FROM t WHERE a NOT LIKE ALL ('x%', 'y%');");
+  ASSERT_TRUE(all);
+  ASSERT_EQ(all->Type(), TypeTag::kBinaryExp);
+  const auto& all_root = all->AsBinaryExpression();
+  EXPECT_EQ(all_root.Op(), BinaryOperation::kOr);
+  ASSERT_EQ(all_root.Left()->Type(), TypeTag::kUnaryExp);
+  EXPECT_EQ(all_root.Left()->AsUnaryExpression().Op(), UnaryOperation::kNot);
+
+  // The non-negated forms keep the original quantifier operators.
+  auto plain_any =
+      parse_where("SELECT * FROM t WHERE a LIKE ANY ('x%', 'y%');");
+  ASSERT_TRUE(plain_any);
+  ASSERT_EQ(plain_any->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(plain_any->AsBinaryExpression().Op(), BinaryOperation::kOr);
+  auto plain_all =
+      parse_where("SELECT * FROM t WHERE a LIKE ALL ('x%', 'y%');");
+  ASSERT_TRUE(plain_all);
+  ASSERT_EQ(plain_all->Type(), TypeTag::kBinaryExp);
+  EXPECT_EQ(plain_all->AsBinaryExpression().Op(), BinaryOperation::kAnd);
+}
+
 TEST(GoogleSqlAstTest, NotBetweenAndInListSemantics) {
   auto not_between = VisitSql("SELECT * FROM t WHERE a NOT BETWEEN 1 AND 2;");
   ASSERT_TRUE(not_between);
@@ -523,6 +639,18 @@ TEST(GoogleSqlAstTest, CountRejectsMultipleArguments) {
   EXPECT_NE(VisitSql("SELECT COUNT(*) OVER (), COUNT(x) OVER () "
                      "FROM UNNEST([1, 2]) AS x"),
             nullptr);
+}
+
+TEST(GoogleSqlAstTest, NestedUpdateRejectsFromBeforeExecution) {
+  constexpr std::string_view sql =
+      "UPDATE t SET (UPDATE arr SET x = 1 FROM other WHERE TRUE) WHERE TRUE";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("nested DML FROM"), std::string::npos);
 }
 
 TEST(GoogleSqlAstTest, NestedInsertRejectsReturningClause) {
@@ -871,7 +999,7 @@ TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
       VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
   ASSERT_EQ(create->Type(), StatementType::kCreateFunction);
   EXPECT_EQ(
-      static_cast<const CreateObjectStatement*>(
+      dynamic_cast<const CreateObjectStatement*>(
           create
               .get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           ->RunSideEffect(),
@@ -950,7 +1078,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
     GTEST_SKIP() << "skipped";
   }
   std::string sql = "SELECT 1";
-  sql.reserve(sql.size() + 600 * 2 + 1);
+  sql.reserve(sql.size() + (static_cast<size_type>(600 * 2)) + 1);
   for (int i = 0; i < 600; ++i) {
     sql += "+1";
   }
@@ -1118,7 +1246,7 @@ TEST(GoogleSqlAstTest, RejectsMultipleUnnestArraysWithoutDroppingOperands) {
       VisitSql("SELECT item, i FROM UNNEST([1, 2]) AS item WITH OFFSET AS i");
   const auto* select = dynamic_cast<const SelectStatement*>(single.get());
   ASSERT_NE(select, nullptr);
-  ASSERT_EQ(select->Sources().size(), 1u);
+  ASSERT_EQ(select->Sources().size(), 1U);
   EXPECT_EQ(select->Sources()[0].alias, "item");
   EXPECT_EQ(select->Sources()[0].offset_alias, "i");
   EXPECT_TRUE(select->Sources()[0].unnest);
@@ -1376,7 +1504,7 @@ TEST(GoogleSqlAstTest, AuditRejectsEmptyOrMalformedUnpivotItems) {
 
 TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {
   // Fuzz regression: an IntervalExpr whose literal/unit resolve to the
-  // unparseable pair ("" amount, "" unit) made the eager
+  // unparsable pair ("" amount, "" unit) made the eager
   // IntervalExpression constructor throw out_of_range straight through
   // Visit(), killing the process instead of surfacing an error.
   const std::string dump =
@@ -1478,6 +1606,31 @@ TEST(GooglesqlSessionRegistryTest, ClearSessionRegistriesIsSessionScoped) {
   EXPECT_TRUE(ViewRegistry().empty());
   EXPECT_TRUE(ast_visitor_detail::SessionConstantExpressions().empty());
   SetUdfSessionScope(0);
+}
+
+// A cataloged view whose definition failed to load is pinned in the registry
+// as an empty marker; resolving it must surface the recorded reason, not a
+// bare "could not be loaded".
+TEST(GooglesqlSessionRegistryTest, FailedViewLoadSurfacesReason) {
+  ViewRegistry()["failed_load_probe"].load_error =
+      "definition parse failed: syntax error near SELECT";
+
+  GoogleSqlParseResult parsed =
+      GoogleSqlFrontend::Parse("SELECT * FROM failed_load_probe");
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
+      GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(),
+                                            "SELECT * FROM failed_load_probe");
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_EQ(visited.GetStatus().GetCode(), StatusCode::kCorrupt);
+  EXPECT_NE(visited.GetStatus().GetMessage().find("failed_load_probe"),
+            std::string::npos);
+  EXPECT_NE(visited.GetStatus().GetMessage().find("syntax error near SELECT"),
+            std::string::npos);
+
+  ViewRegistry().erase("failed_load_probe");
 }
 
 // The legacy string-constant ledger shares the event-loop thread with other

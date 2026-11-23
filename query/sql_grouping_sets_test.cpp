@@ -30,11 +30,10 @@ namespace tinylamb {
 namespace {
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
-  // One retry for empty diagnostics: a failed Execute with no LastError is
-  // the external parse child being transiently unavailable under load.
+  // A transient parser failure happens before the statement executes.
   StatusOr<QueryResult> result = engine->Execute(*ctx, sql);
   if (!result.HasValue()) {
-    if (engine->LastError().empty()) {
+    if (engine->LastErrorIsTransientParseFailure()) {
       result = engine->Execute(*ctx, sql);
     }
     if (!result.HasValue()) {
@@ -217,6 +216,24 @@ TEST_F(SqlGroupingSetsTest, GroupingIdBuildsBitVector) {
     EXPECT_TRUE(rows[i][0].IsNull());
   }
   EXPECT_EQ(rows[11][2], Value(int64_t{3}));
+}
+
+TEST_F(SqlGroupingSetsTest, GroupingIdPreservesTheHighBitOf64Arguments) {
+  std::string sql = "SELECT GROUPING_ID(a";
+  for (size_t i = 1; i < 64; ++i) {
+    sql += ", b";
+  }
+  sql += ") AS gid FROM g GROUP BY GROUPING SETS ((a, b), (b)) ORDER BY gid";
+  const auto rows = Run(sql);
+  ASSERT_EQ(rows.size(), 8U);
+  for (size_t i = 0; i < 4; ++i) {
+    EXPECT_EQ(rows[i][0], Value(0));
+  }
+  for (size_t i = 4; i < rows.size(); ++i) {
+    EXPECT_TRUE(rows[i][0].IsUnsigned());
+    EXPECT_EQ(static_cast<uint64_t>(rows[i][0].value.int_value),
+              uint64_t{1} << 63);
+  }
 }
 
 // CUBE(a, b) enumerates all subsets: (a,b), (a), (b), ().
@@ -503,6 +520,11 @@ TEST_F(SqlGroupingSetsTest, UnsupportedShapesRejectWithDiagnostics) {
   // GROUPING arguments must be grouping keys.
   EXPECT_THROW(Run("SELECT a, GROUPING(b) AS gb FROM g GROUP BY ROLLUP(a)"),
                std::runtime_error);
+  // A selected base column must belong to the union of the grouping sets;
+  // otherwise the engine must reject the query instead of returning an
+  // arbitrary source-row value.
+  EXPECT_THROW(Run("SELECT a, COUNT(*) FROM g GROUP BY GROUPING SETS (())"),
+               std::runtime_error);
 }
 
 // The UNION ALL branches of a grouping-set expansion must not carry their own
@@ -535,6 +557,9 @@ TEST_F(SqlGroupingSetsTest, CteBodyExecutesOncePerGroupingSetExpansion) {
   ASSERT_TRUE(prepared.Value()->Next(&result, nullptr));
   while (prepared.Value()->Next(&result, nullptr)) {
   }
+  // A mid-stream failure also ends Next() with false; without this check a
+  // truncated result would pass the scan_rows assertions below.
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
   std::ostringstream profile;
   prepared.Value()->Dump(profile, 0);
   // One CTE body pass scans g twice (4 rows per scan). Re-execution per

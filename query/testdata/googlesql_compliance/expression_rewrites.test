@@ -15,7 +15,7 @@ ARRAY<STRUCT<id INT64, a INT64, b INT64, flag BOOL, str STRING, dt DATE>>[
 [name=constant_folding_arithmetic_int]
 SELECT 1 + 2 * 3 AS r1, 100 - 45 AS r2, 20 / 4 AS r3, MOD(17, 5) AS r4, -42 + 10 AS r5, (10 + 20) * 3 AS r6
 --
-ARRAY<STRUCT<r1 INT64, r2 INT64, r3 INT64, r4 INT64, r5 INT64, r6 INT64>>[
+ARRAY<STRUCT<r1 INT64, r2 INT64, r3 DOUBLE, r4 INT64, r5 INT64, r6 INT64>>[
   {7, 55, 5, 2, -32, 90}
 ]
 ==
@@ -136,6 +136,7 @@ ARRAY<STRUCT<r1 BOOL, r2 BOOL, r3 BOOL, r4 BOOL, r5 BOOL, r6 BOOL>>[
 ==
 
 [mode=explain]
+[plan_contains=FullScan]
 [name=explain_algebraic_identities_on_table]
 SELECT id,
        a + 0 AS a_plus_zero,
@@ -155,6 +156,7 @@ ARRAY<STRUCT<id INT64, a_plus_zero INT64, zero_plus_a INT64, a_minus_zero INT64,
 ==
 
 [mode=explain]
+[plan_contains=FullScan]
 [name=explain_predicate_in_list_dedupe]
 SELECT id, a FROM expr_test WHERE a IN (10, 20, 10, 0, 0, 20) ORDER BY id
 --
@@ -165,6 +167,7 @@ ARRAY<STRUCT<id INT64, a INT64>>[
 ==
 
 [mode=explain]
+[plan_contains=FullScan]
 [name=explain_predicate_or_of_ranges_to_in]
 SELECT id, a FROM expr_test WHERE (a = 0 OR a = 10 OR a = 99) ORDER BY id
 --
@@ -175,6 +178,7 @@ ARRAY<STRUCT<id INT64, a INT64>>[
 ==
 
 [mode=explain]
+[plan_contains=FullScan]
 [name=explain_predicate_not_in_with_null]
 SELECT id, a, a NOT IN (10, 99) AS not_in_clean, a NOT IN (99, NULL) AS not_in_null
 FROM expr_test
@@ -238,6 +242,7 @@ ARRAY<STRUCT<r1 INT64, r2 STRING, r3 STRING, r4 INT64>>[
 ==
 
 [mode=explain]
+[plan_contains=EmptyResult]
 [name=explain_predicate_contradiction_elimination]
 SELECT id FROM expr_test WHERE a = 10 AND a = 20 ORDER BY id
 --
@@ -245,6 +250,7 @@ ARRAY<STRUCT<id INT64>>[]
 ==
 
 [mode=explain]
+[plan_contains=FullScan]
 [name=explain_predicate_tautology_and_null_checks]
 SELECT id, a FROM expr_test WHERE (a IS NOT NULL OR a IS NULL) ORDER BY id
 --

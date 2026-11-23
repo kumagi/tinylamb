@@ -47,8 +47,13 @@ struct HashedRowRefHash {
 struct HashedRowRefEqual {
   bool operator()(const HashedRowRef& left,
                   const HashedRowRef& right) const noexcept {
-    return left.hash == right.hash &&
-           SetOperationRowEqual{}(*left.row, *right.row);
+    if (left.hash != right.hash) {
+      return false;
+    }
+    if (left.row == nullptr || right.row == nullptr) {
+      return left.row == right.row;
+    }
+    return SetOperationRowEqual{}(*left.row, *right.row);
   }
 };
 
@@ -76,8 +81,6 @@ class SetOperationExecutor : public ExecutorBase {
 
   Status Materialize();
   void AppendAll(const std::vector<Positioned>& source);
-  void AppendDistinct(const std::vector<Positioned>& source,
-                      SetOperationRowSet* seen);
   void AppendIntersection(const std::vector<std::vector<Positioned>>& rows,
                           bool all);
   void AppendExcept(const std::vector<std::vector<Positioned>>& rows, bool all);

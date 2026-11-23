@@ -313,6 +313,23 @@ TEST_F(WindowSpillTest, PrefixAggregatesMatchGeneralFrames) {
   }
 }
 
+TEST_F(WindowSpillTest, BothShapesRejectAnOutputSchemaNarrowerThanTheCalls) {
+  const std::vector<NamedExpression> outputs{
+      NamedExpression("$win0", Expression(RowNumberByGroup()))};
+  for (const bool spill : {false, true}) {
+    SCOPED_TRACE(spill);
+    auto window = std::make_shared<WindowExecutor>(
+        *context_, std::make_shared<ValuesExecutor>(InputRows()), Schema(),
+        outputs, WindowExecutor::Options{.memory_budget_bytes = spill ? 1U : 0U,
+                                         .spill_partition_count = 4});
+    EXPECT_EQ(window->SpillEnabled(), spill);
+    DataChunk output;
+    EXPECT_EQ(window->NextBatch(&output), 0U);
+    EXPECT_EQ(window->GetStatus(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(output.Size(), 0U);
+  }
+}
+
 TEST_F(WindowSpillTest, PartitionedSpillMatchesTheBufferedShape) {
   std::vector<NamedExpression> outputs{
       NamedExpression("$win0", Expression(RowNumberByGroup())),

@@ -4,8 +4,7 @@
 
 ## TPC-Cの3製品比較
 
-2026-11-06 の結果（`benchmark/comparison/results/2026-11-06-tpcc-three-quiet/`）は、DuckDB／Oracleを除く
-Tinylamb C8・PostgreSQL・MySQLのW=1比較。10接続、warmup5秒＋30秒、3試行。
+2026-11-06 の TPC-C W=1 比較（Tinylamb C8・PostgreSQL・MySQL、10 接続、warmup 5 秒＋30 秒、3 試行）は完了済みですが、結果ディレクトリは削除されています。測定条件と履歴は `BenchmarkHistory.md` を参照してください。
 SFはTPC-Hの指定で、TPC-Cは倉庫数Wを使う。
 
 MySQLの開発ヘッダーとC client library（例: `libmysqlclient-dev`）が必要。
@@ -155,7 +154,7 @@ Freeの制限とTPC由来の非認証試験であることは結果レポート�
 
 ## 最新の改善結果
 
-`benchmark/comparison/results/2026-10-30-pg15/` 関連の標準比較:
+2026-10-30のPG15検証ログは削除済みです。以下は当時の比較結果の記録です。
 C34は全種目の標準比較（OLAP 474測定、Tiny/PG OLTP 396試行）を完了し、
 短時間の13残差を同じバイナリの長窓・101反復・PG状態確認で再評価した。
 最終の元161対象／全456比較は今回PG比2倍以内。標準短窓の結果と精密再測定を
@@ -164,7 +163,7 @@ C34は全種目の標準比較（OLAP 474測定、Tiny/PG OLTP 396試行）を�
 UNION ALLではPGの可視性情報とBitmap Heap Scan／Index Only Scanの違いを確認した。
 新規DBで反復だけ増やした遅いPG値を使わず、明示VACUUM後の速い状態で判定する。
 同期writeも数秒の窓だけで判定せず、同期時間と中断数を残して長窓で再確認する。
-生データ・採用元・再現引数はレポートとfinal/provenance内に保存している。
+当時の生データと再現引数は削除済みの結果ディレクトリにあり、現在の作業ツリーからは参照できない。
 
 2026-10-30のTPC-C W=1／TPC-H SF=1の単体測定は
 [BenchmarkHistory](../../BenchmarkHistory.md)に追記した。
@@ -227,7 +226,7 @@ tinylambは既定の同期commit、PostgreSQLは`fsync=on`・`synchronous_commit
 
 PostgreSQL／tinylambはpsycopg2のSimple Query、MySQLはmysql-connector-pythonのC拡張、非prepared COM_QUERYを使用する。SSLを無効化し、接続を再利用し、SQL文を1文ずつ送る。異なる製品間にはプロトコルとドライバの費用差があるため、SELECT 1を通信・ドライバ・サーバ固定費の参考として併記する。製品ごとのprepared statementの最高性能を比較する試験ではない。
 
-各サイズのロード後にANALYZEする。OLAPはクエリごとに最初の実行を`first_ms`として分離し、その後5回の中央値を使う。全行を取得してから時計を止める。最初の実行もロード直後のOSキャッシュを使用し得るため、コールドI/O性能を表さない。各クエリのEXPLAINは計時後に保存する。統計の乱数やプラン選択の揺らぎは固定していない。
+各サイズのロード後にANALYZEする。OLAPはクエリごとに最初の実行を`first_ms`として分離し、`--repeats`で指定した回数（既定値5）の中央値を使う。全行を取得してから時計を止める。最初の実行もロード直後のOSキャッシュを使用し得るため、コールドI/O性能を表さない。各クエリのEXPLAINは計時後に保存する。統計の乱数やプラン選択の揺らぎは固定していない。
 
 OLTPは接続ごとに独立したPythonプロセスを使用する。全接続の準備後に共通の時計でウォームアップと測定窓を開始する。窓内で開始・終了した成功トランザクションだけをTPSと成功時遅延へ数える。境界を跨いだ成功数を別に記録する。失敗は再試行せず、ROLLBACKして次の要求へ進む。失敗数は窓内開始の要求を数えるため、最後に窓外で失敗した要求を含み得る。p50／p95／p99は各試行の成功サンプルからnearest-rank法で算出する。失敗時の遅延はこれらの分位点に含まない。
 
@@ -291,8 +290,9 @@ microはaccountsの`(bucket,id)`、salesの`(account_id)`、
 一製品でも構築に失敗したら実行を失敗させる。既定は従来の追加索引なし。
 索引ありの値は別の出力ディレクトリで扱い、元の表に混ぜない。
 
-`profile.py --output NEW_DIR`はtinylamb単体の診断用で、同じfixtureを使い
-初回を除いた反復時間、全結果、EXPLAIN ANALYZEを保存する。
+`profile.py --output NEW_DIR`はtinylamb単体の診断用で、既存fixtureは使わず
+accounts/salesを指定行数で生成して読み込む。初回を除いた反復時間、全結果、
+EXPLAIN ANALYZEを保存する。
 `--server`で修正前バイナリ、`--memory-mib 64`／`256`で予算を指定できる。
 3製品をその場で照合する比較には`run.py`を使う。
 
@@ -307,7 +307,7 @@ SEARCH／VECTOR、OR REPLACE、OPTIONSは明示的に拒否する。索引名は
 ## PostgreSQLとの中央値の差を抽出する
 
 ```bash
-python3 benchmark/comparison/gaps.py benchmark/comparison/results/2026-10-29 \
+python3 benchmark/comparison/gaps.py benchmark/comparison/results/2026-10-29-full5 \
   --output /var/tmp/tinylamb-pg-gap-new
 ```
 
@@ -327,6 +327,7 @@ p95／p99はtailとして分け、HTAPはreader／transactionの役割別にも�
 
 ### 長時間の差分検証
 
+以下のオプションは`run.py`のもので、上記の`gaps.py`では使用できない。
 `--skip-olap`でOLTP/HTAPだけを実行できる。`--oltp-cases hot_update:1 update:16`
 は選択済みworkload/clientsの組合せを絞り、`--oltp-engines tinylamb postgresql`
 は比較対象を絞る（起動・fixture検証は引き続き3製品）。
@@ -354,8 +355,12 @@ HTAPの1接続は分析reader単独、4/16接続はreader 1＋writer 3/15。
 長時間G/Hは`b7af77d1…`版、最終OLAPとFは空commit・複文エラー修正後の
 `6ce27fb4…`版で、同一バイナリの一括測定ではない。使用版は各`environment.json`で確認する。
 
+`gap_results.py` には `--baseline` が必須（既定値なし）。旧PG固定値を記録した
+`gaps.py` の出力（`gaps.json`）を指定する。
+
 ```bash
 python3 benchmark/comparison/gap_results.py \
+  --baseline benchmark/comparison/results/2026-10-29-gap-final-comparison/gaps.json \
   --run unindexed=benchmark/comparison/results/2026-10-29-gap-post-unindexed-olap \
   --run indexed=benchmark/comparison/results/2026-10-29-gap-post-indexed-olap \
   --run unindexed=benchmark/comparison/results/2026-10-29-gap-final-g-unindexed \
@@ -434,9 +439,9 @@ smokeの性能値は最終比較に混ぜていない。
 全体のフル測定の更新ではなく、この2種類の読み取りと周辺7 OLAPの追測である。
 
 `run.py`のserverパスとoutput名を新しいものへ変えると再実行できる。
-`analyze.py`は3試行のp50／p95／p99／query毎秒を集計する (`run_pairs.py` / `summarize.py` という単体スクリプトは存在しない)。
+`analyze.py`は3試行のp50／p95／p99／query毎秒を集計する。
 計時ハーネスはrange_readのSUMを毎回は照合しないため、SQLオラクル
 (`sql_oracle_fuzzer`) のPQS/DQE検査で全始点とNULL・値更新後の結果を
-計時外に検証する。 (`range_audit.py`という単体スクリプトは存在しない。)
+計時外に検証する。
 `results/2026-10-29-read4-version/`にはC++差分と最終バイナリの指紋、
 `results/2026-10-29-read4-validation/`には全テストとoracleの記録を置いた。

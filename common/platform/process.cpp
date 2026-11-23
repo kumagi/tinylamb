@@ -17,6 +17,8 @@
 #include "common/platform/process.hpp"
 
 #include <fcntl.h>
+
+#include <limits>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -33,12 +35,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
 
 #include "common/platform/os.hpp"
+#include "common/platform/socket.hpp"
 
 #ifdef TINYLAMB_OS_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
@@ -156,9 +163,9 @@ int UnsetEnv(const char* name) {
     errno = EINVAL;
     return -1;
   }
-  // _putenv_s(name, nullptr) removes the variable from the CRT environment;
-  // passing "" leaves an empty value that std::getenv still sees.
-  const errno_t err = ::_putenv_s(name, nullptr);
+  // The CRT removes a variable when its value string is empty. A null value
+  // pointer invokes the invalid-parameter handler.
+  const errno_t err = ::_putenv_s(name, "");
   if (err != 0) {
     errno = err;
     return -1;
@@ -175,7 +182,36 @@ int RunProcess(
     const std::vector<std::string>& args,
     const std::vector<std::pair<std::string, std::string>>& env_overrides,
     std::string* error_out) {
+  // The OS process APIs use NUL-terminated keys and values.
+  for (const auto& [key, value] : env_overrides) {
+    if (key.empty() || key.find('=') != std::string::npos ||
+        key.find('\0') != std::string::npos ||
+        value.find('\0') != std::string::npos) {
+      if (error_out != nullptr) {
+        *error_out = "invalid environment override";
+      }
+      return -1;
+    }
+  }
 #ifdef TINYLAMB_OS_WINDOWS
+  // CreateProcessW takes NUL-terminated strings. A path/argument with an
+  // embedded NUL would be silently truncated at c_str(), launching a
+  // different program than the caller asked for (POSIX rejects the same
+  // input below; keep the two branches equivalent).
+  if (executable.wstring().find(L'\0') != std::wstring::npos) {
+    if (error_out != nullptr) {
+      *error_out = "executable path contains embedded NUL";
+    }
+    return -1;
+  }
+  for (const std::string& arg : args) {
+    if (arg.find('\0') != std::string::npos) {
+      if (error_out != nullptr) {
+        *error_out = "argument contains embedded NUL";
+      }
+      return -1;
+    }
+  }
   auto quote_arg = [](std::wstring_view arg) -> std::wstring {
     if (!arg.empty() &&
         arg.find_first_of(L" \t\n\v\"") == std::wstring_view::npos) {
@@ -210,29 +246,74 @@ int RunProcess(
     cmd.append(quote_arg(std::filesystem::path(a).wstring()));
   }
 
-  std::vector<std::pair<std::string, std::string>> saved_env;
-  saved_env.reserve(env_overrides.size());
-  for (const auto& [k, v] : env_overrides) {
-    // T2621: SetEnv/CommandLine both stop at an embedded NUL; reject up
-    // front like the POSIX branch does instead of applying a truncated
-    // override. Match the POSIX branch's key validation (empty / '=' too) so
-    // an invalid override is reported here rather than silently failing in
-    // SetEnv and then dirtying errno again while restoring it.
-    if (k.empty() || k.find('=') != std::string::npos ||
-        k.find('\0') != std::string::npos ||
-        v.find('\0') != std::string::npos) {
+  std::vector<wchar_t> child_environment;
+  if (!env_overrides.empty()) {
+    const std::unique_ptr<wchar_t, decltype(&::FreeEnvironmentStringsW)> parent(
+        ::GetEnvironmentStringsW(), ::FreeEnvironmentStringsW);
+    if (!parent) {
       if (error_out != nullptr) {
-        *error_out = "invalid environment override";
+        *error_out = "GetEnvironmentStringsW failed";
       }
       return -1;
     }
-    const char* prev = std::getenv(k.c_str());
-    saved_env.emplace_back(k,
-                           prev != nullptr ? std::string(prev) : std::string());
-    if (prev == nullptr) {
-      saved_env.back().first.insert(0, 1, '\0');
+    const auto name_less = [](const std::wstring& a, const std::wstring& b) {
+      return ::CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) ==
+             CSTR_LESS_THAN;
+    };
+    std::map<std::wstring, std::wstring, decltype(name_less)> variables(
+        name_less);
+    for (const wchar_t* entry = parent.get(); *entry != L'\0';) {
+      const std::wstring_view pair(entry);
+      // Windows includes special drive-directory entries such as =C:=C:\\.
+      const size_t split = pair.find(L'=', pair.starts_with(L'=') ? 1 : 0);
+      if (split != std::wstring_view::npos) {
+        variables.emplace(std::wstring(pair.substr(0, split)),
+                          std::wstring(pair.substr(split + 1)));
+      }
+      entry += pair.size() + 1;
     }
-    SetEnv(k.c_str(), v.c_str(), 1);
+    const auto widen =
+        [](std::string_view text) -> std::optional<std::wstring> {
+      if (text.empty()) {
+        return std::wstring{};
+      }
+      if (text.size() > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+      }
+      // Use the same ANSI code page as the previous SetEnvironmentVariableA.
+      const auto length = static_cast<int>(text.size());
+      const int size = ::MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS,
+                                             text.data(), length, nullptr, 0);
+      if (size <= 0) {
+        return std::nullopt;
+      }
+      std::wstring result(static_cast<size_t>(size), L'\0');
+      if (::MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, text.data(),
+                                length, result.data(), size) != size) {
+        return std::nullopt;
+      }
+      return result;
+    };
+    for (const auto& [name, value] : env_overrides) {
+      auto wide_name = widen(name);
+      auto wide_value = widen(value);
+      if (!wide_name || !wide_value) {
+        if (error_out != nullptr) {
+          *error_out = "cannot convert environment override to UTF-16";
+        }
+        return -1;
+      }
+      variables.insert_or_assign(std::move(*wide_name), std::move(*wide_value));
+    }
+    for (const auto& [name, value] : variables) {
+      child_environment.insert(child_environment.end(), name.begin(),
+                               name.end());
+      child_environment.push_back(L'=');
+      child_environment.insert(child_environment.end(), value.begin(),
+                               value.end());
+      child_environment.push_back(L'\0');
+    }
+    child_environment.push_back(L'\0');
   }
 
   STARTUPINFOW si{};
@@ -244,21 +325,12 @@ int RunProcess(
   si.hStdOutput = ::GetStdHandle(STD_OUTPUT_HANDLE);
   si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
   PROCESS_INFORMATION pi{};
+  const bool inherit_environment = child_environment.empty();
   const BOOL ok =
       ::CreateProcessW(executable.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                       0, nullptr, nullptr, &si, &pi);
-
-  for (const auto& [k, v] : saved_env) {
-    const int rc = (!k.empty() && k[0] == '\0')
-                       ? UnsetEnv(k.c_str() + 1)
-                       : SetEnv(k.c_str(), v.c_str(), 1);
-    if (rc != 0) {
-      // Environment overrides must not silently leak into later tests in the
-      // same process. SetEnv/UnsetEnv set errno to the real reason on failure,
-      // so leave it intact for the caller to log. Never overwrite it with the
-      // -1 return code (that would destroy the diagnostic).
-    }
-  }
+                       inherit_environment ? 0 : CREATE_UNICODE_ENVIRONMENT,
+                       inherit_environment ? nullptr : child_environment.data(),
+                       nullptr, &si, &pi);
 
   if (!ok) {
     if (error_out != nullptr) {
@@ -268,9 +340,16 @@ int RunProcess(
   }
   ::WaitForSingleObject(pi.hProcess, INFINITE);
   DWORD exit_code = 1;
-  ::GetExitCodeProcess(pi.hProcess, &exit_code);
+  const BOOL got_exit_code = ::GetExitCodeProcess(pi.hProcess, &exit_code);
   ::CloseHandle(pi.hThread);
   ::CloseHandle(pi.hProcess);
+  if (!got_exit_code) {
+    if (error_out != nullptr) {
+      *error_out = "GetExitCodeProcess failed (Windows error " +
+                   std::to_string(::GetLastError()) + ")";
+    }
+    return -1;
+  }
   // -1 is reserved for "spawn failed"; clamp to the POSIX 0..255 range so
   // ExitProcess(0xFFFFFFFF) does not masquerade as a spawn failure.
   return static_cast<int>(exit_code & 0xffU);
@@ -311,14 +390,6 @@ int RunProcess(
     environment.emplace_back(*entry);
   }
   for (const auto& [key, value] : env_overrides) {
-    if (key.empty() || key.find('=') != std::string::npos ||
-        key.find('\0') != std::string::npos ||
-        value.find('\0') != std::string::npos) {
-      if (error_out != nullptr) {
-        *error_out = "invalid environment override";
-      }
-      return -1;
-    }
     const std::string prefix = key + "=";
     std::erase_if(environment, [&](const std::string& entry) {
       return entry.starts_with(prefix);
@@ -332,8 +403,39 @@ int RunProcess(
   }
   envp.push_back(nullptr);
   pid_t child = 0;
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+  const int spawned = [&] {
+    posix_spawnattr_t attributes{};
+    int rc = InitSpawnAttributes(&attributes);
+    if (rc != 0) {
+      return rc;
+    }
+    posix_spawn_file_actions_t actions{};
+    rc = ::posix_spawn_file_actions_init(&actions);
+    if (rc == 0) {
+      // Explicitly preserve the standard streams that are open and inheritable.
+      for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags >= 0 && (flags & FD_CLOEXEC) == 0) {
+          rc = ::posix_spawn_file_actions_addinherit_np(&actions, fd);
+          if (rc != 0) {
+            break;
+          }
+        }
+      }
+      if (rc == 0) {
+        rc = ::posix_spawn(&child, exe_str.c_str(), &actions, &attributes,
+                           argv.data(), envp.data());
+      }
+      (void)::posix_spawn_file_actions_destroy(&actions);
+    }
+    (void)::posix_spawnattr_destroy(&attributes);
+    return rc;
+  }();
+#else
   const int spawned = ::posix_spawn(&child, exe_str.c_str(), nullptr, nullptr,
                                     argv.data(), envp.data());
+#endif
   if (spawned != 0) {
     if (error_out != nullptr) {
       *error_out = "posix_spawn failed: " + std::string(std::strerror(spawned));
@@ -479,8 +581,12 @@ uint64_t CurrentProcessRssBytes() noexcept {
   if (page_size <= 0) {
     return 0;
   }
-  return static_cast<uint64_t>(resident_pages) *
-         static_cast<uint64_t>(page_size);
+  const auto pages = static_cast<uint64_t>(resident_pages);
+  const auto page_bytes = static_cast<uint64_t>(page_size);
+  if (pages != 0 && page_bytes > std::numeric_limits<uint64_t>::max() / pages) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return pages * page_bytes;
 #else
   return 0;
 #endif
@@ -555,34 +661,40 @@ bool ReleaseFreeHeapToOs() noexcept {
 }
 
 namespace {
-// T2630: cgroup memory limit ("max"/absent/unparseable => 0 = unlimited).
+// T2630: cgroup memory limit ("max"/absent/unparsable => 0 = unlimited).
 // v1 encodes "no limit" as a huge PAGE_COUNTER_MAX sentinel, filtered by
 // the >= 2^60 cutoff.
 uint64_t ReadCgroupMemoryLimit(const char* path) noexcept {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
+  // noexcept boundary: iostream/string allocation failure must degrade to
+  // "no limit" instead of terminating the process.
+  try {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      return 0;
+    }
+    std::string text;
+    std::getline(in, text);
+    while (!text.empty() &&
+           (text.back() == '\r' || text.back() == '\n' || text.back() == ' ')) {
+      text.pop_back();
+    }
+    if (text.empty() || text == "max") {
+      return 0;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    // Reject trailing garbage as well: query_grant.cpp's ReadGrantEnvU64 uses
+    // the same strict "*end == '\0'" rule, so a value like "1073741824garbage"
+    // must not silently become 1073741824 here.
+    if (errno != 0 || end == text.c_str() || *end != '\0' ||
+        value >= (1ULL << 60)) {
+      return 0;
+    }
+    return static_cast<uint64_t>(value);
+  } catch (...) {
     return 0;
   }
-  std::string text;
-  std::getline(in, text);
-  while (!text.empty() &&
-         (text.back() == '\r' || text.back() == '\n' || text.back() == ' ')) {
-    text.pop_back();
-  }
-  if (text.empty() || text == "max") {
-    return 0;
-  }
-  errno = 0;
-  char* end = nullptr;
-  const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
-  // Reject trailing garbage as well: query_grant.cpp's ReadGrantEnvU64 uses
-  // the same strict "*end == '\0'" rule, so a value like "1073741824garbage"
-  // must not silently become 1073741824 here.
-  if (errno != 0 || end == text.c_str() || *end != '\0' ||
-      value >= (1ULL << 60)) {
-    return 0;
-  }
-  return static_cast<uint64_t>(value);
 }
 }  // namespace
 
@@ -592,7 +704,12 @@ uint64_t PhysicalMemoryBytes() noexcept {
   const long page_size = ::sysconf(_SC_PAGESIZE);
   uint64_t total = 0;
   if (pages > 0 && page_size > 0) {
-    total = static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+    const auto page_count = static_cast<uint64_t>(pages);
+    const auto bytes_per_page = static_cast<uint64_t>(page_size);
+    constexpr auto max_bytes = std::numeric_limits<uint64_t>::max();
+    total = page_count > max_bytes / bytes_per_page
+                ? max_bytes
+                : page_count * bytes_per_page;
   }
 #ifdef __linux__
   // T2630: inside a container sysconf reports the HOST's RAM; auto-sized

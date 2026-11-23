@@ -116,7 +116,7 @@ graph TD
 ## 検証テスト
 
 - `plan/plan_extra_test.cpp`:
-  - `SkipScanDistinctPlanExtraTest.StatsDrivenRowCountsAndOrdering`: `SkipScanDistinctPlan` が統計に基づく NDV 行数見積もりと昇順順序プロパティを正しく申告することを検証。
+  - `SkipScanDistinctPlanExtraTest.StatsDrivenRowCountsAndOrdering`: 統計に基づく NDV 行数見積もりと昇順順序プロパティを検証します。実行器のキー走査、実行時間、メモリ使用量を測るテストではありません。
 
 
 2026-10-02 更新: DISTINCT の子にも無制約 index-only scan を候補として渡します。

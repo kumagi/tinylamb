@@ -982,7 +982,7 @@ Executor SortDistinctPlan::EmitExecutor(TransactionContext& ctx) const {
 
 Executor MinMaxIndexPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<MinMaxIndexExecutor>(child_->EmitExecutor(ctx),
-                                               ValueSlot());
+                                               ValueSlot(), Reverse());
 }
 
 Executor IncrementalSortPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -1389,12 +1389,29 @@ Executor MultiIndexCoveringScanPlan::EmitExecutor(
   // sound.
   std::vector<TransactionManager::IndexReadGuard> guards;
   guards.reserve(participants.size());
+  std::vector<bool> guard_moved(held.size(), false);
   for (const BitmapIndexRange& range : participants) {
     const page_id_t root = range.index->Root();
     const auto found = std::ranges::find_if(
         held, [root](const auto& entry) { return entry.first == root; });
-    CHECK_MSG(found != held.end(), "multi-index covering scan guard missing");
-    guards.push_back(std::move(found->second));
+    if (found == held.end()) {
+      // The participant root changed while its ordered guards were being
+      // acquired. The covered scan cannot prove its gates match the indexes;
+      // release the held guards with this scope and use the safe heap path.
+      return full_scan_fallback();
+    }
+    const size_t held_index = static_cast<size_t>(found - held.begin());
+    if (guard_moved[held_index]) {
+      // Several participants can name the same index root (several ranges on
+      // one index). The single real guard stays alive in `held`/`guards` for
+      // the whole scan; a second move would leave this participant with an
+      // empty guard and make IndexScanIterator believe no gate is held.
+      // Borrowed() is the established way to point at an already-held gate.
+      guards.push_back(TransactionManager::IndexReadGuard::Borrowed());
+    } else {
+      guards.push_back(std::move(found->second));
+      guard_moved[held_index] = true;
+    }
   }
   return std::make_shared<MultiIndexCoveringScan>(
       ctx.txn_, table_, std::move(participants), std::move(guards), where_,
@@ -1467,8 +1484,8 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
   // (semi/anti).
   Schema residual_schema =
       Residual() ? Left()->GetSchema() + Right()->GetSchema() : Schema();
-  // Inner equi merge joins without residuals go parallel past the
-  // threshold : the steering partitioner needs enough rows
+  // Inner equi merge joins without residuals go parallel past
+  // kParallelMergeJoinMinRows: the steering partitioner needs enough rows
   // to amortize thread startup. Outer/semi/anti and residual shapes keep
   // the proven sequential executor.
   if (Kind() == JoinKind::kInner && !Residual() &&

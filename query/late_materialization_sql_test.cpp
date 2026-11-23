@@ -88,8 +88,8 @@ TEST_F(LateMaterializationQueryTest,
   ASSERT_SUCCESS(setup.txn_.PreCommit());
 
   TransactionContext statistics = database_->BeginContext();
-  database_->RefreshStatistics(statistics, "lm_fact");
-  database_->RefreshStatistics(statistics, "lm_dim");
+  ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "lm_fact"));
+  ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "lm_dim"));
   ASSERT_SUCCESS(statistics.txn_.PreCommit());
 
   TransactionContext context = database_->BeginContext();
@@ -142,8 +142,8 @@ TEST_F(LateMaterializationQueryTest, OuterJoinFallsBackAndNullKeysNeverMatch) {
       IndexSchema("lm_right_k", {0}, {}, IndexMode::kNonUnique)));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext statistics = database_->BeginContext();
-  database_->RefreshStatistics(statistics, "lm_left");
-  database_->RefreshStatistics(statistics, "lm_right");
+  ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "lm_left"));
+  ASSERT_SUCCESS(database_->RefreshStatistics(statistics, "lm_right"));
   ASSERT_SUCCESS(statistics.txn_.PreCommit());
 
   TransactionContext context = database_->BeginContext();

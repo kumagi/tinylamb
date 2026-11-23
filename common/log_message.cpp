@@ -19,12 +19,12 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cstring>
-#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <mutex>
+#include <string_view>
 #include <tuple>
 
 #ifndef _WIN32
@@ -41,6 +41,7 @@ namespace {
 // One relaxed atomic is enough: a stale read only means a few extra messages
 // around a level change at process startup.
 std::atomic<int> g_min_log_level{static_cast<int>(LogLevel::kTrace)};
+std::once_flag g_log_level_env_once;
 
 LogLevel ParseLogLevelEnv() {
   const char* env = std::getenv("TINYLAMB_LOG_LEVEL");
@@ -65,24 +66,30 @@ LogLevel ParseLogLevelEnv() {
   if (value == "FATAL") return LogLevel::kFatal;  // NOLINT(readability-braces-around-statements)
   return LogLevel::kTrace;
 }
+
+void EnsureLogLevelInitialized() noexcept {
+  std::call_once(g_log_level_env_once, [] {
+    g_min_log_level.store(static_cast<int>(ParseLogLevelEnv()),
+                           std::memory_order_relaxed);
+  });
+}
 }  // namespace
 
 void SetMinLogLevel(LogLevel level) noexcept {
+  EnsureLogLevelInitialized();
   g_min_log_level.store(static_cast<int>(level), std::memory_order_relaxed);
 }
 
 LogLevel MinLogLevel() noexcept {
+  EnsureLogLevelInitialized();
   return static_cast<LogLevel>(g_min_log_level.load(std::memory_order_relaxed));
 }
 
 bool LogLevelEnabled(LogLevel level) noexcept {
+  EnsureLogLevelInitialized();
   const int min = g_min_log_level.load(std::memory_order_relaxed);
   return level == LogLevel::kFatal || static_cast<int>(level) >= min;
 }
-
-struct LogLevelEnvInitializer {
-  LogLevelEnvInitializer() { SetMinLogLevel(ParseLogLevelEnv()); }
-} kLogLevelEnvInitializer;  // NOLINT(cert-err58-cpp,misc-use-internal-linkage)
 
 }  // namespace tinylamb::detail
 
@@ -132,11 +139,15 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
   std::tm now_tm{};
   // localtime() is not thread-safe (shared static buffer); use the reentrant
   // form so concurrent loggers on worker threads do not race.
-  tinylamb::platform::LocalTime(now_time, &now_tm);
-  if (strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm) == 0) {
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.strcpy) intentional pattern in this code
-    std::strcpy(buff.data(), "<time?> ");
-  }
+  const bool local_ok =
+      tinylamb::platform::LocalTime(now_time, &now_tm);
+  const size_t formatted =
+      local_ok ? std::strftime(buff.data(), buff.size(),
+                              "%Y-%m-%d %H:%M:%S ", &now_tm)
+               : 0;
+  const std::string_view timestamp =
+      formatted == 0 ? std::string_view("<time?> ")
+                     : std::string_view(buff.data(), formatted);
 
   switch (log_level) {
     case LogLevel::kFatal:
@@ -182,9 +193,9 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
       }
       break;
     default:
-      assert(!"UNKNOWN LOG LEVEL");
+      break;
   }
-  ls << buff.data() << filename << ":" << lineno << " " << func_name;
+  ls << timestamp << filename << ":" << lineno << " " << func_name;
   switch (log_level) {
     case LogLevel::kFatal:
       ls << " FATAL  ";

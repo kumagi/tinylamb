@@ -136,7 +136,7 @@ def snapshotSkip (snap : Nat) (c : Int) (bs : ZoneSummary)
 
 /-- MAIN: after the skip decision, no row of the reference scan matches
     `x = c`; therefore skipping the block preserves the MVCC scan result. -/
-theorem snapshot_zone_map_sound (snap : Nat) (c : Int) (base : List Version)
+theorem visible_values_excluded (snap : Nat) (c : Int) (base : List Version)
     (deltas : List DeltaBatch) (bs : ZoneSummary)
     (hbase : ∀ v ∈ base, v.ts = bs.gen ∧ bs.lo ≤ v.val ∧ v.val ≤ bs.hi)
     (hdelta : ∀ d ∈ deltas, ∀ v ∈ d.versions,
@@ -144,10 +144,9 @@ theorem snapshot_zone_map_sound (snap : Nat) (c : Int) (base : List Version)
         | some s => s.lo ≤ v.val ∧ v.val ≤ s.hi
         | none => True)
     (hskip : snapshotSkip snap c bs deltas = true) :
-    ∀ kv ∈ referenceScan snap base deltas, kv.2 ≠ c := by
+    ∀ v ∈ visibleVersions snap base deltas, v.val ≠ c := by
   simp [snapshotSkip] at hskip
-  intro kv hkv hc
-  rcases referenceScan_mem snap base deltas hkv with ⟨v, hvvis, hval⟩
+  intro v hvvis hc
   have hvsrc := visibleVersions_mem snap base deltas hvvis
   rcases hvsrc with hbaseSrc | hdeltaSrc
   · rcases hbaseSrc with ⟨hvbase, hvts⟩
@@ -167,6 +166,51 @@ theorem snapshot_zone_map_sound (snap : Nat) (c : Int) (base : List Version)
         simp [hs] at hds hdskip
         have hz : v.val ≠ c := zone_excludes_point s.lo s.hi c v.val hdskip hds.1 hds.2
         exact hz (by omega)
+
+theorem snapshot_zone_map_sound (snap : Nat) (c : Int) (base : List Version)
+    (deltas : List DeltaBatch) (bs : ZoneSummary)
+    (hbase : ∀ v ∈ base, v.ts = bs.gen ∧ bs.lo ≤ v.val ∧ v.val ≤ bs.hi)
+    (hdelta : ∀ d ∈ deltas, ∀ v ∈ d.versions,
+        match d.summary with
+        | some s => s.lo ≤ v.val ∧ v.val ≤ s.hi
+        | none => True)
+    (hskip : snapshotSkip snap c bs deltas = true) :
+    ∀ kv ∈ referenceScan snap base deltas, kv.2 ≠ c := by
+  intro kv hkv
+  obtain ⟨v,hv,eq⟩ := referenceScan_mem snap base deltas hkv
+  rw [eq]
+  exact visible_values_excluded snap c base deltas bs hbase hdelta hskip v hv
+
+/-- Select the greatest visible commit timestamp per key, including delete
+    records. A tombstone hides earlier values. Equal timestamps use stable
+    physical order; normal committed histories have unique per-key stamps. -/
+def readKeyAt (snap key : Nat) (base : List Version) (ds : List DeltaBatch)
+    (deleted : Version → Bool) : Option Int := do
+  let ordered := (visibleVersions snap base ds).mergeSort (fun a b => a.ts ≥ b.ts)
+  let v ← ordered.find? (fun v => v.key == key)
+  if deleted v then none else some v.val
+
+theorem snapshot_skip_with_deletes (snap : Nat) (c : Int) (base : List Version)
+    (deltas : List DeltaBatch) (bs : ZoneSummary)
+    (hbase : ∀ v ∈ base, v.ts = bs.gen ∧ bs.lo ≤ v.val ∧ v.val ≤ bs.hi)
+    (hdelta : ∀ d ∈ deltas, ∀ v ∈ d.versions,
+        match d.summary with
+        | some s => s.lo ≤ v.val ∧ v.val ≤ s.hi
+        | none => True)
+    (hskip : snapshotSkip snap c bs deltas = true) :
+    ∀ k deleted, readKeyAt snap k base deltas deleted ≠ some c := by
+  intro k deleted h
+  unfold readKeyAt at h
+  dsimp only at h
+  generalize he : ((visibleVersions snap base deltas).mergeSort
+    (fun a b => decide (a.ts ≥ b.ts))).find? (fun v => v.key == k) = opt at h
+  cases opt with
+  | none => contradiction
+  | some v =>
+    have hm := List.mem_of_find?_eq_some he
+    simp at hm
+    cases hd : deleted v <;> simp [hd] at h
+    exact visible_values_excluded snap c base deltas bs hbase hdelta hskip v hm h
 
 /-- Boundary example: base values are all 1, but a visible delta contains
     99.  Base-only statistics would skip the block and lose the match;
@@ -205,5 +249,11 @@ theorem future_delta_does_not_block_skip :
     let bs : ZoneSummary := { gen := 1, lo := 1, hi := 1 }
     snapshotSkip 5 99 bs [d] = true := by
   decide
+
+example :
+    let xs : List Version := [⟨1,90,9⟩,⟨1,20,2⟩,⟨1,0,6⟩]
+    let deleted := fun v : Version => v.ts == 6
+    readKeyAt 5 1 xs [] deleted = some 20 ∧ readKeyAt 7 1 xs [] deleted = none ∧
+      readKeyAt 10 1 xs [] deleted = some 90 := by cbv
 
 end TinylambOpt.SnapshotZoneMap

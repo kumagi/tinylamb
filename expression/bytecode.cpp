@@ -1,9 +1,12 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "expression/bytecode.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -23,17 +27,23 @@
 #include "common/constants.hpp"
 #include "common/encoder.hpp"
 #include "common/exc_shim.hpp"
+#include "common/math_utils.hpp"
+#include "common/regex_guard.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
+#include "type/collation.hpp"
 #include "type/date.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -200,6 +210,667 @@ StatusOr<Value> TryExtractDatePart(const Value& value, uint16_t part) {
   return Value(static_cast<int64_t>(static_cast<unsigned>(ymd.day())));
 }
 
+inline bool EnvDisabled(const char* name) noexcept {
+  const char* env = std::getenv(name);
+  return env != nullptr && env[0] == '1';
+}
+
+bool ContainsCollateCall(const Expression& expr) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->Type() == TypeTag::kFunctionCallExp &&
+      expr->AsFunctionCallExpression().FuncName() == "collate") {
+    return true;
+  }
+  return std::ranges::any_of(
+      ExpressionChildren(expr),
+      [](const Expression& ch) { return ContainsCollateCall(ch); });
+}
+
+bool ExprMayBeUnsigned(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema) {
+  if (!expr) {
+    return true;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kColumnValue: {
+      const int offset = schema.Offset(expr->AsColumnValue().GetColumnName());
+      if (offset < 0) {
+        return true;
+      }
+      const Column& col = schema.GetColumn(offset);
+      return col.Type() != ValueType::kInt64 || col.IsUnsigned();
+    }
+    case TypeTag::kConstantValue: {
+      const Value& v = expr->AsConstantValue().GetValue();
+      if (v.IsNull()) {
+        return false;
+      }
+      return v.type != ValueType::kInt64 || v.IsUnsigned();
+    }
+    case TypeTag::kCastExp: {
+      const CastExpression& cast = expr->AsCastExpression();
+      const std::string& target_name = cast.TargetTypeName();
+      constexpr std::string_view kUint = "uint";
+      const auto uint_name = std::search(
+          target_name.begin(), target_name.end(), kUint.begin(), kUint.end(),
+          [](char actual, char expected) {
+            return std::tolower(static_cast<unsigned char>(actual)) == expected;
+          });
+      return cast.TargetValueType() != ValueType::kInt64 ||
+             uint_name != target_name.end();
+    }
+    case TypeTag::kUnaryExp:
+    case TypeTag::kBinaryExp:
+    case TypeTag::kFunctionCallExp: {
+      const auto children = ExpressionChildren(expr);
+      return std::ranges::any_of(children, [&](const Expression& ch) {
+        return ExprMayBeUnsigned(ch, schema);
+      });
+    }
+    default:
+      return true;
+  }
+}
+
+// Static collation of `expr`. CollationOfExpression only sees an explicit
+// COLLATE() call; a constant Value can also carry a collation tag directly,
+// which is what HaveConflictingCollations checks at evaluation time.
+Collation StaticCollationOf(const Expression& expr) {
+  const Collation explicit_col = CollationOfExpression(expr);
+  if (explicit_col != Collation::kNone || !expr ||
+      expr->Type() != TypeTag::kConstantValue) {
+    return explicit_col;
+  }
+  return CollationOf(expr->AsConstantValue().GetValue().Collation());
+}
+
+}  // namespace
+
+// Lean proof: lean/TinylambOpt/FilterEvalOrder.lean (filter_eval_order_sound)
+// Conservative error-free check: returns true only when evaluating `expr` on
+// any row conforming to `schema` cannot raise an error.
+static bool IsErrorFreePredicateForOrdering(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema) {
+  if (!expr) {
+    return false;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kColumnValue:
+      return schema.Offset(expr->AsColumnValue().GetColumnName()) >= 0;
+    case TypeTag::kConstantValue:
+      return true;
+    case TypeTag::kUnaryExp: {
+      const UnaryExpression& unary = expr->AsUnaryExpression();
+      if (unary.Op() != UnaryOperation::kNot &&
+          unary.Op() != UnaryOperation::kIsNull &&
+          unary.Op() != UnaryOperation::kIsNotNull) {
+        return false;
+      }
+      return IsErrorFreePredicateForOrdering(unary.Child(), schema);
+    }
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& bin = expr->AsBinaryExpression();
+      switch (bin.Op()) {
+        case BinaryOperation::kEquals:
+        case BinaryOperation::kNotEquals:
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+        case BinaryOperation::kIsDistinctFrom:
+        case BinaryOperation::kIsNotDistinctFrom: {
+          if (!IsErrorFreePredicateForOrdering(bin.Left(), schema) ||
+              !IsErrorFreePredicateForOrdering(bin.Right(), schema)) {
+            return false;
+          }
+          const ValueType lt = ValueTypeFor(bin.Left()->ResultType(schema));
+          const ValueType rt = ValueTypeFor(bin.Right()->ResultType(schema));
+          // A VARCHAR pair with conflicting explicit collations errors at
+          // evaluation (HaveConflictingCollations in binary_expression.cpp).
+          // It is NOT error-free: reordering it ahead of a FALSE conjunct
+          // would surface the error the AST's left-to-right AND suppresses.
+          if (lt == ValueType::kVarChar && rt == ValueType::kVarChar) {
+            // Row values may carry runtime collation tags that are not
+            // represented in Schema. Keep such comparisons in source order.
+            if (!bin.Left()->TouchedColumns().empty() ||
+                !bin.Right()->TouchedColumns().empty()) {
+              return false;
+            }
+            const Collation lcol = StaticCollationOf(bin.Left());
+            const Collation rcol = StaticCollationOf(bin.Right());
+            if (lcol != Collation::kNone && rcol != Collation::kNone &&
+                lcol != rcol) {
+              return false;
+            }
+          }
+          if (lt == rt && lt != ValueType::kArray) {
+            return true;
+          }
+          const bool both_num =
+              (lt == ValueType::kInt64 || lt == ValueType::kDouble) &&
+              (rt == ValueType::kInt64 || rt == ValueType::kDouble);
+          return both_num || lt == ValueType::kNull || rt == ValueType::kNull;
+        }
+        case BinaryOperation::kAnd:
+        case BinaryOperation::kOr:
+        case BinaryOperation::kXor:
+          return IsErrorFreePredicateForOrdering(bin.Left(), schema) &&
+                 IsErrorFreePredicateForOrdering(bin.Right(), schema);
+        case BinaryOperation::kLike:
+        case BinaryOperation::kNotLike: {
+          if (ContainsCollateCall(bin.Left()) ||
+              ContainsCollateCall(bin.Right())) {
+            return false;
+          }
+          const ValueType lt = ValueTypeFor(bin.Left()->ResultType(schema));
+          const ValueType rt = ValueTypeFor(bin.Right()->ResultType(schema));
+          if (lt != ValueType::kVarChar || rt != ValueType::kVarChar) {
+            return false;
+          }
+          return IsErrorFreePredicateForOrdering(bin.Left(), schema) &&
+                 IsErrorFreePredicateForOrdering(bin.Right(), schema);
+        }
+        default:
+          return false;
+      }
+    }
+    case TypeTag::kInExp: {
+      const InExpression& in = expr->AsInExpression();
+      if (!IsErrorFreePredicateForOrdering(in.child_, schema)) {
+        return false;
+      }
+      const ValueType ct = ValueTypeFor(in.child_->ResultType(schema));
+      for (const Expression& cand : in.list_) {
+        if (!cand || cand->Type() != TypeTag::kConstantValue) {
+          return false;
+        }
+        const Value& cv = cand->AsConstantValue().GetValue();
+        if (!cv.IsNull() && ValueTypeFor(cand->ResultType(schema)) != ct) {
+          return false;
+        }
+      }
+      // IN evaluates HaveConflictingCollations(child, candidate) per candidate
+      // (in_expression.cpp). Static ValueType does not carry collation, so a
+      // mismatched pair is NOT error-free: reordering it ahead of a FALSE
+      // conjunct would surface an error the AST's short circuit suppresses.
+      if (ct == ValueType::kVarChar) {
+        // Column values can carry collation tags that are absent from Schema.
+        if (!in.child_->TouchedColumns().empty()) {
+          return false;
+        }
+        const Collation child_col = StaticCollationOf(in.child_);
+        if (child_col != Collation::kNone) {
+          for (const Expression& cand : in.list_) {
+            const Collation cand_col = StaticCollationOf(cand);
+            if (cand_col != Collation::kNone && cand_col != child_col) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    }
+    case TypeTag::kFunctionCallExp: {
+      const FunctionCallExpression& call = expr->AsFunctionCallExpression();
+      if (call.FuncName() != "regexp_contains" || call.Args().size() != 2) {
+        return false;
+      }
+      if (!IsErrorFreePredicateForOrdering(call.Args()[0], schema) ||
+          !call.Args()[1] ||
+          call.Args()[1]->Type() != TypeTag::kConstantValue) {
+        return false;
+      }
+      const Value& pat = call.Args()[1]->AsConstantValue().GetValue();
+      if (pat.IsNull()) {
+        return true;
+      }
+      if (pat.type != ValueType::kVarChar) {
+        return false;
+      }
+      // Compilation alone does not prove evaluation is error-free: a
+      // compilable pattern can still exhaust the runtime regex step budget
+      // for particular input strings. Preserve source-order short-circuiting
+      // whenever a non-NULL pattern may execute.
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+namespace {
+
+int PredicateOrderCost(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& schema, int* tie_col_out) {
+  *tie_col_out = std::numeric_limits<int>::max();
+  if (!expr) {
+    return 100;
+  }
+  switch (expr->Type()) {
+    case TypeTag::kUnaryExp: {
+      const UnaryExpression& u = expr->AsUnaryExpression();
+      if (u.Op() == UnaryOperation::kIsNull ||
+          u.Op() == UnaryOperation::kIsNotNull) {
+        if (u.Child() && u.Child()->Type() == TypeTag::kColumnValue) {
+          *tie_col_out =
+              schema.Offset(u.Child()->AsColumnValue().GetColumnName());
+        }
+        return 1;
+      }
+      return PredicateOrderCost(u.Child(), schema, tie_col_out) + 1;
+    }
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& bin = expr->AsBinaryExpression();
+      if (bin.Op() == BinaryOperation::kLike ||
+          bin.Op() == BinaryOperation::kNotLike) {
+        return 25;
+      }
+      if (bin.Op() == BinaryOperation::kOr) {
+        int dummy_l = 0;
+        int dummy_r = 0;
+        return std::min(55,
+                        PredicateOrderCost(bin.Left(), schema, &dummy_l) +
+                            PredicateOrderCost(bin.Right(), schema, &dummy_r));
+      }
+      const ValueType lt = ValueTypeFor(bin.Left()->ResultType(schema));
+      const ValueType rt = ValueTypeFor(bin.Right()->ResultType(schema));
+      if (lt == ValueType::kInt64 || lt == ValueType::kDate ||
+          rt == ValueType::kInt64 || rt == ValueType::kDate) {
+        if (bin.Left()->Type() == TypeTag::kColumnValue) {
+          *tie_col_out =
+              schema.Offset(bin.Left()->AsColumnValue().GetColumnName());
+        } else if (bin.Right()->Type() == TypeTag::kColumnValue) {
+          *tie_col_out =
+              schema.Offset(bin.Right()->AsColumnValue().GetColumnName());
+        }
+        return 2;
+      }
+      if (lt == ValueType::kDouble || rt == ValueType::kDouble) {
+        return 3;
+      }
+      return 6;
+    }
+    case TypeTag::kInExp:
+      return 8;
+    case TypeTag::kFunctionCallExp:
+      if (expr->AsFunctionCallExpression().FuncName() == "regexp_contains") {
+        return 60;
+      }
+      return 30;
+    default:
+      return 10;
+  }
+}
+
+void FlattenAndConjuncts(  // NOLINT(misc-no-recursion)
+    const Expression& expr, std::vector<Expression>* out) {
+  if (expr && expr->Type() == TypeTag::kBinaryExp &&
+      expr->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
+    FlattenAndConjuncts(expr->AsBinaryExpression().Left(), out);
+    FlattenAndConjuncts(expr->AsBinaryExpression().Right(), out);
+    return;
+  }
+  out->push_back(expr);
+}
+
+// Lean proof: lean/TinylambOpt/SimdInRange.lean
+//   (simd_in_range_sound, int64_range_lowering)
+bool TryExtractInt64Bound(const Expression& expr, const Schema& schema,
+                          uint16_t* col_out, ValueType* col_type_out,
+                          int64_t* bound_out, bool* is_lower_out) {
+  if (!expr || expr->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const BinaryExpression& bin = expr->AsBinaryExpression();
+  Expression col_expr;
+  Expression const_expr;
+  BinaryOperation op = bin.Op();
+  if (bin.Left() && bin.Left()->Type() == TypeTag::kColumnValue &&
+      bin.Right() && bin.Right()->Type() == TypeTag::kConstantValue) {
+    col_expr = bin.Left();
+    const_expr = bin.Right();
+  } else if (bin.Left() && bin.Left()->Type() == TypeTag::kConstantValue &&
+             bin.Right() && bin.Right()->Type() == TypeTag::kColumnValue) {
+    col_expr = bin.Right();
+    const_expr = bin.Left();
+    switch (op) {
+      case BinaryOperation::kLessThan:
+        op = BinaryOperation::kGreaterThan;
+        break;
+      case BinaryOperation::kLessThanEquals:
+        op = BinaryOperation::kGreaterThanEquals;
+        break;
+      case BinaryOperation::kGreaterThan:
+        op = BinaryOperation::kLessThan;
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        op = BinaryOperation::kLessThanEquals;
+        break;
+      default:
+        return false;
+    }
+  } else {
+    return false;
+  }
+
+  const int offset = schema.Offset(col_expr->AsColumnValue().GetColumnName());
+  if (offset < 0 ||
+      std::cmp_greater(offset, std::numeric_limits<uint16_t>::max())) {
+    return false;
+  }
+  const Column& col = schema.GetColumn(offset);
+  if ((col.Type() != ValueType::kInt64 && col.Type() != ValueType::kDate) ||
+      col.IsUnsigned()) {
+    return false;
+  }
+  const Value& cv = const_expr->AsConstantValue().GetValue();
+  if (cv.IsNull() || cv.IsUnsigned() || cv.type != col.Type()) {
+    return false;
+  }
+
+  const int64_t val = cv.value.int_value;
+  int64_t closed_bound = val;
+  bool is_lower = false;
+  switch (op) {
+    case BinaryOperation::kGreaterThanEquals:
+      is_lower = true;
+      break;
+    case BinaryOperation::kGreaterThan:
+      if (val == std::numeric_limits<int64_t>::max()) {
+        return false;
+      }
+      closed_bound = val + 1;
+      is_lower = true;
+      break;
+    case BinaryOperation::kLessThanEquals:
+      is_lower = false;
+      break;
+    case BinaryOperation::kLessThan:
+      if (val == std::numeric_limits<int64_t>::min()) {
+        return false;
+      }
+      closed_bound = val - 1;
+      is_lower = false;
+      break;
+    default:
+      return false;
+  }
+
+  *col_out = static_cast<uint16_t>(offset);
+  *col_type_out = col.Type();
+  *bound_out = closed_bound;
+  *is_lower_out = is_lower;
+  return true;
+}
+
+bool ParseStrictSignedInt64(std::string_view sv, int64_t* out) noexcept {
+  if (sv.empty()) {
+    return false;
+  }
+  size_t start = 0;
+  if (sv[0] == '-') {
+    if (sv.size() == 1 || sv[1] == '0') {
+      return false;
+    }
+    start = 1;
+  } else if (sv[0] < '0' || sv[0] > '9' || (sv[0] == '0' && sv.size() > 1)) {
+    return false;
+  }
+  for (size_t i = start; i < sv.size(); ++i) {
+    if (sv[i] < '0' || sv[i] > '9') {
+      return false;
+    }
+  }
+  int64_t val = 0;
+  const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+  if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+    return false;
+  }
+  *out = val;
+  return true;
+}
+
+bool ParseStructJsonIntRow(std::string_view json, size_t expected_fields,
+                           std::vector<std::optional<int64_t>>* out_fields) {
+  out_fields->clear();
+  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
+    return false;
+  }
+  size_t i = 1;
+  const size_t end = json.size() - 1;
+  const auto skip_ws = [&]() {
+    while (i < end && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' ||
+                       json[i] == '\r')) {
+      ++i;
+    }
+  };
+  skip_ws();
+  if (i == end) {
+    return false;
+  }
+  while (i < end) {
+    skip_ws();
+    if (i >= end || json[i] != '"') {
+      return false;
+    }
+    ++i;
+    bool closed = false;
+    while (i < end) {
+      if (json[i] == '\\') {
+        if (i + 1 >= end) {
+          return false;
+        }
+        i += 2;
+        continue;
+      }
+      if (json[i] == '"') {
+        ++i;
+        closed = true;
+        break;
+      }
+      ++i;
+    }
+    if (!closed) {
+      return false;
+    }
+    skip_ws();
+    if (i >= end || json[i] != ':') {
+      return false;
+    }
+    ++i;
+    skip_ws();
+    if (i >= end || json[i] == '"' || json[i] == '{' || json[i] == '[') {
+      return false;
+    }
+    const size_t val_start = i;
+    while (i < end && json[i] != ',' && json[i] != ' ' && json[i] != '\t' &&
+           json[i] != '\n' && json[i] != '\r') {
+      ++i;
+    }
+    const std::string_view tok = json.substr(val_start, i - val_start);
+    if (tok == "null") {
+      out_fields->emplace_back(std::nullopt);
+    } else {
+      int64_t parsed = 0;
+      if (!ParseStrictSignedInt64(tok, &parsed)) {
+        return false;
+      }
+      out_fields->emplace_back(parsed);
+    }
+    skip_ws();
+    if (i < end) {
+      if (json[i] != ',') {
+        return false;
+      }
+      ++i;
+      skip_ws();
+      if (i == end) {
+        return false;
+      }
+    }
+  }
+  return out_fields->size() == expected_fields;
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
+bool TryExtractRowInMask(const InExpression& in, const Schema& schema,
+                         std::vector<Expression>* field_exprs,
+                         RowInMaskSpec* spec_out) {
+  if (!in.child_ || in.list_.empty() || in.list_.size() > 256 ||
+      in.child_->Type() != TypeTag::kFunctionCallExp) {
+    return false;
+  }
+  const auto& child_call = in.child_->AsFunctionCallExpression();
+  const size_t stride = StructJsonFieldWidth(child_call);
+  if (stride == 0 || child_call.Args().size() < stride ||
+      child_call.Args().size() % stride != 0) {
+    return false;
+  }
+  const size_t k = child_call.Args().size() / stride;
+  if (k == 0 || k > 64) {
+    return false;
+  }
+  field_exprs->clear();
+  field_exprs->reserve(k);
+  for (size_t c = 0; c < k; ++c) {
+    const Expression& name_arg = child_call.Args()[c * stride];
+    if (!name_arg || name_arg->Type() != TypeTag::kConstantValue) {
+      return false;
+    }
+    if (stride == 3) {
+      const Expression& flag_arg = child_call.Args()[(c * stride) + 2];
+      if (!flag_arg || flag_arg->Type() != TypeTag::kConstantValue) {
+        return false;
+      }
+      const Value& fv = flag_arg->AsConstantValue().GetValue();
+      if (fv.IsNull() || fv.Truthy()) {
+        return false;
+      }
+    }
+    Expression field_expr = child_call.Args()[(c * stride) + 1];
+    if (!field_expr) {
+      return false;
+    }
+    if (field_expr->Type() == TypeTag::kConstantValue) {
+      const Value& cv = field_expr->AsConstantValue().GetValue();
+      if (cv.IsNull()) {
+        field_exprs->push_back(ConstantValueExp(Value()));
+        continue;
+      }
+      if (stride == 3 && cv.type == ValueType::kVarChar &&
+          cv.Collation() == 0 && !cv.IsInterval() &&
+          cv.value.varchar_value == "null") {
+        field_exprs->push_back(ConstantValueExp(Value()));
+        continue;
+      }
+      if (cv.type != ValueType::kInt64 || cv.IsUnsigned()) {
+        return false;
+      }
+      field_exprs->push_back(field_expr);
+      continue;
+    }
+    if (ValueTypeFor(field_expr->ResultType(schema)) != ValueType::kInt64 ||
+        ExprMayBeUnsigned(field_expr, schema) ||
+        ContainsCollateCall(field_expr)) {
+      return false;
+    }
+    field_exprs->push_back(std::move(field_expr));
+  }
+
+  std::vector<std::vector<std::optional<int64_t>>> candidates;
+  candidates.reserve(in.list_.size());
+  std::vector<std::optional<int64_t>> parsed_row;
+  for (const Expression& item : in.list_) {
+    if (!item) {
+      return false;
+    }
+    if (item->Type() == TypeTag::kConstantValue) {
+      const Value& cv = item->AsConstantValue().GetValue();
+      if (cv.IsNull()) {
+        candidates.emplace_back(k, std::nullopt);
+        continue;
+      }
+      if (cv.type != ValueType::kVarChar || cv.Collation() != 0 ||
+          cv.IsInterval() ||
+          !ParseStructJsonIntRow(cv.value.varchar_value, k, &parsed_row)) {
+        return false;
+      }
+      candidates.push_back(parsed_row);
+      continue;
+    }
+    if (item->Type() == TypeTag::kFunctionCallExp &&
+        item->AsFunctionCallExpression().FuncName() == "__struct_json__") {
+      const auto& cand_call = item->AsFunctionCallExpression();
+      const size_t c_stride = StructJsonFieldWidth(cand_call);
+      if (c_stride == 0 || cand_call.Args().size() != k * c_stride) {
+        return false;
+      }
+      parsed_row.assign(k, std::nullopt);
+      for (size_t c = 0; c < k; ++c) {
+        const Expression& name_arg = cand_call.Args()[c * c_stride];
+        const Expression& val_arg = cand_call.Args()[(c * c_stride) + 1];
+        if (!name_arg || name_arg->Type() != TypeTag::kConstantValue ||
+            !val_arg || val_arg->Type() != TypeTag::kConstantValue) {
+          return false;
+        }
+        bool is_quoted_text = false;
+        if (c_stride == 3) {
+          const Expression& flag_arg = cand_call.Args()[(c * c_stride) + 2];
+          if (!flag_arg || flag_arg->Type() != TypeTag::kConstantValue) {
+            return false;
+          }
+          const Value& fv = flag_arg->AsConstantValue().GetValue();
+          if (fv.IsNull()) {
+            return false;
+          }
+          is_quoted_text = fv.Truthy();
+        }
+        const Value& vv = val_arg->AsConstantValue().GetValue();
+        if (vv.IsNull()) {
+          parsed_row[c] = std::nullopt;
+        } else if (vv.type == ValueType::kInt64 && !vv.IsUnsigned()) {
+          parsed_row[c] = vv.value.int_value;
+        } else if (c_stride == 3 && !is_quoted_text &&
+                   vv.type == ValueType::kVarChar && vv.Collation() == 0 &&
+                   !vv.IsInterval() && vv.value.varchar_value == "null") {
+          parsed_row[c] = std::nullopt;
+        } else {
+          return false;
+        }
+      }
+      candidates.push_back(parsed_row);
+      continue;
+    }
+    return false;
+  }
+
+  spec_out->num_fields = static_cast<uint32_t>(k);
+  spec_out->chunks.clear();
+  for (size_t offset = 0; offset < candidates.size(); offset += 64) {
+    const size_t cnt = std::min<size_t>(64, candidates.size() - offset);
+    RowInMaskSpec::Chunk chunk;
+    chunk.count = static_cast<uint32_t>(cnt);
+    chunk.enabled =
+        (cnt == 64) ? ~uint64_t{0} : ((uint64_t{1} << cnt) - uint64_t{1});
+    chunk.columns.resize(k);
+    for (size_t slot = 0; slot < cnt; ++slot) {
+      const uint64_t bit = uint64_t{1} << slot;
+      for (size_t c = 0; c < k; ++c) {
+        if (candidates[offset + slot][c].has_value()) {
+          chunk.columns[c].non_null_mask |= bit;
+          chunk.columns[c].values[slot] = *candidates[offset + slot][c];
+        } else {
+          chunk.columns[c].null_mask |= bit;
+        }
+      }
+    }
+    spec_out->chunks.push_back(std::move(chunk));
+  }
+  return true;
+}
+
 bool CompileNode(  // NOLINT(misc-no-recursion)
     const Expression& expression, const Schema& schema,
     BytecodeProgram* program) {
@@ -235,23 +906,140 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // D7 (docs/design.md): AND/OR compile to short-circuit control flow so
       // the VM skips the right operand exactly when the AST does, keeping the
       // three-valued truth table AND the error-occurrence conditions
-      // identical.  Layout (AND):
-      //     <left>
-      //     JumpIfFalse -> end     (left==FALSE: result FALSE, skip right)
-      //     <right>
-      //     Binary AND             (left TRUE/NULL: merge three-valued)
-      //   end:
+      // identical. AND is flattened to N conjuncts first; when every
+      // conjunct is provably error-free they may be reordered by
+      // PredicateOrderCost (TINYLAMB_DISABLE_FILTER_ORDER=1 keeps source
+      // order). Adjacent bounds on the same INT64 column may be fused into
+      // one range item. Emission puts a JumpIfFalse after each item except
+      // the last, so any FALSE skips the remaining items and the AND merges
+      // TRUE/NULL values as they are evaluated.
       // OR uses JumpIfTrue symmetrically.  The jump peeks the stack (does not
       // pop), so every path reaches `end` with exactly one value.
-      if (binary.Op() == BinaryOperation::kAnd ||
-          binary.Op() == BinaryOperation::kOr) {
+      if (binary.Op() == BinaryOperation::kAnd) {
+        std::vector<Expression> conjuncts;
+        FlattenAndConjuncts(expression, &conjuncts);
+        if (!EnvDisabled("TINYLAMB_DISABLE_FILTER_ORDER") &&
+            conjuncts.size() >= 2 &&
+            std::ranges::all_of(conjuncts, [&](const Expression& c) {
+              return IsErrorFreePredicateForOrdering(c, schema);
+            })) {
+          struct RankedConjunct {
+            int cost{0};
+            int tie_col{0};
+            size_t orig_idx{0};
+            Expression expr;
+          };
+          std::vector<RankedConjunct> ranked;
+          ranked.reserve(conjuncts.size());
+          for (size_t i = 0; i < conjuncts.size(); ++i) {
+            int tie_col = std::numeric_limits<int>::max();
+            const int cost = PredicateOrderCost(conjuncts[i], schema, &tie_col);
+            ranked.push_back({.cost = cost,
+                              .tie_col = tie_col,
+                              .orig_idx = i,
+                              .expr = conjuncts[i]});
+          }
+          std::stable_sort(
+              ranked.begin(), ranked.end(),
+              [](const RankedConjunct& a, const RankedConjunct& b) {
+                return std::tie(a.cost, a.tie_col, a.orig_idx) <
+                       std::tie(b.cost, b.tie_col, b.orig_idx);
+              });
+          for (size_t i = 0; i < conjuncts.size(); ++i) {
+            conjuncts[i] = std::move(ranked[i].expr);
+          }
+        }
+
+        struct AndItem {
+          bool is_range{false};
+          uint16_t col_idx{0};
+          uint16_t range_spec_idx{0};
+          Expression expr;
+        };
+        std::vector<AndItem> items;
+        items.reserve(conjuncts.size());
+        const bool enable_range =
+            !EnvDisabled("TINYLAMB_DISABLE_SIMD_IN_RANGE");
+        for (size_t i = 0; i < conjuncts.size();) {
+          if (enable_range && i + 1 < conjuncts.size()) {
+            uint16_t c1 = 0, c2 = 0;
+            ValueType t1 = ValueType::kNull, t2 = ValueType::kNull;
+            int64_t b1 = 0, b2 = 0;
+            bool lower1 = false, lower2 = false;
+            if (TryExtractInt64Bound(conjuncts[i], schema, &c1, &t1, &b1,
+                                     &lower1) &&
+                TryExtractInt64Bound(conjuncts[i + 1], schema, &c2, &t2, &b2,
+                                     &lower2) &&
+                c1 == c2 && t1 == t2 && lower1 != lower2) {
+              const int64_t lo = lower1 ? b1 : b2;
+              const int64_t hi = lower1 ? b2 : b1;
+              if (lo <= hi) {
+                uint16_t spec_idx = 0;
+                if (!program->AddInt64Range(
+                        {.lo = lo, .hi = hi, .expected_type = t1}, &spec_idx)) {
+                  return false;
+                }
+                items.push_back({.is_range = true,
+                                 .col_idx = c1,
+                                 .range_spec_idx = spec_idx,
+                                 .expr = {}});
+                i += 2;
+                continue;
+              }
+            }
+          }
+          items.push_back({.is_range = false,
+                           .col_idx = 0,
+                           .range_spec_idx = 0,
+                           .expr = conjuncts[i]});
+          ++i;
+        }
+
+        const auto emit_item = [&](const AndItem& item) {
+          if (item.is_range) {
+            program->AddInstruction(
+                {.opcode = BytecodeOp::kLoadColumn, .operand = item.col_idx});
+            program->AddInstruction({.opcode = BytecodeOp::kInt64InRange,
+                                     .operand = item.range_spec_idx});
+            return true;
+          }
+          return CompileNode(item.expr, schema, program);
+        };
+        if (items.size() == 1) {
+          return emit_item(items[0]);
+        }
+        if (!emit_item(items[0])) {
+          return false;
+        }
+        std::vector<size_t> jump_indices;
+        jump_indices.reserve(items.size());
+        jump_indices.push_back(program->Size());
+        program->AddInstruction({.opcode = BytecodeOp::kJumpIfFalse});
+        for (size_t k = 1; k < items.size(); ++k) {
+          if (!emit_item(items[k])) {
+            return false;
+          }
+          program->AddInstruction({.opcode = BytecodeOp::kBinaryInt64,
+                                   .operand = 0,
+                                   .binary = BinaryOperation::kAnd});
+          if (k + 1 < items.size()) {
+            jump_indices.push_back(program->Size());
+            program->AddInstruction({.opcode = BytecodeOp::kJumpIfFalse});
+          }
+        }
+        for (const size_t jump_idx : jump_indices) {
+          program->SetJumpTarget(jump_idx,
+                                 static_cast<int32_t>(program->Size()) -
+                                     static_cast<int32_t>(jump_idx));
+        }
+        return true;
+      }
+      if (binary.Op() == BinaryOperation::kOr) {
         if (!CompileNode(binary.Left(), schema, program)) {
           return false;
         }
         const size_t jump_index = program->Size();
-        program->AddInstruction({.opcode = binary.Op() == BinaryOperation::kAnd
-                                               ? BytecodeOp::kJumpIfFalse
-                                               : BytecodeOp::kJumpIfTrue});
+        program->AddInstruction({.opcode = BytecodeOp::kJumpIfTrue});
         if (!CompileNode(binary.Right(), schema, program)) {
           return false;
         }
@@ -263,6 +1051,30 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
                                static_cast<int32_t>(program->Size()) -
                                    static_cast<int32_t>(jump_index));
         return true;
+      }
+      if (binary.Op() == BinaryOperation::kModulo &&
+          !EnvDisabled("TINYLAMB_DISABLE_RECIPROCAL_DIVMOD") && binary.Left() &&
+          binary.Right() && binary.Right()->Type() == TypeTag::kConstantValue &&
+          ValueTypeFor(binary.Left()->ResultType(schema)) ==
+              ValueType::kInt64 &&
+          !ExprMayBeUnsigned(binary.Left(), schema)) {
+        const Value& dv = binary.Right()->AsConstantValue().GetValue();
+        if (!dv.IsNull() && !dv.IsUnsigned() && dv.type == ValueType::kInt64 &&
+            dv.value.int_value != 0 && dv.value.int_value != 1 &&
+            dv.value.int_value != -1) {
+          if (!CompileNode(binary.Left(), schema, program)) {
+            return false;
+          }
+          uint16_t spec_idx = 0;
+          if (!program->AddReciprocal(
+                  ReciprocalDivModSpec::FromDivisor(dv.value.int_value),
+                  &spec_idx)) {
+            return false;
+          }
+          program->AddInstruction(
+              {.opcode = BytecodeOp::kModInt64Const, .operand = spec_idx});
+          return true;
+        }
       }
       if (!CompileNode(binary.Left(), schema, program) ||
           !CompileNode(binary.Right(), schema, program)) {
@@ -336,6 +1148,9 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // compiler cannot lower (subqueries, unsupported functions) fails
       // compilation and the caller falls back to the AST evaluator.
       const InExpression& in = expression->AsInExpression();
+      if (!in.child_) {
+        return false;
+      }
       if (in.list_.empty()) {
         // The result is a constant FALSE, but the child is deliberately still
         // compiled and evaluated before being popped. The AST's TryMembership
@@ -349,6 +1164,24 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         }
         program->AddInstruction({.opcode = BytecodeOp::kPop});
         return CompileNode(ConstantValueExp(Value(false)), schema, program);
+      }
+      if (!EnvDisabled("TINYLAMB_DISABLE_ROW_IN_MASK")) {
+        std::vector<Expression> field_exprs;
+        RowInMaskSpec row_spec;
+        if (TryExtractRowInMask(in, schema, &field_exprs, &row_spec)) {
+          for (const Expression& field_expr : field_exprs) {
+            if (!CompileNode(field_expr, schema, program)) {
+              return false;
+            }
+          }
+          uint16_t mask_offset = 0;
+          if (!program->AddRowInMask(std::move(row_spec), &mask_offset)) {
+            return false;
+          }
+          program->AddInstruction(
+              {.opcode = BytecodeOp::kRowInMask, .operand = mask_offset});
+          return true;
+        }
       }
       // String IN with uncollated, non-interval string constants lowers to an
       // O(1) flat string hash-set lookup (Lean proof:
@@ -440,6 +1273,9 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         }
       }
       const auto numeric_or_date = [&](const Expression& operand) {
+        if (!operand) {
+          return false;
+        }
         const auto type = ValueTypeFor(operand->ResultType(schema));
         return type == ValueType::kInt64 || type == ValueType::kDouble ||
                type == ValueType::kDate;
@@ -623,6 +1459,34 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         program->AddInstruction({.opcode = BytecodeOp::kCharLength});
         return true;
       }
+      if ((call.FuncName() == "div" || call.FuncName() == "mod") &&
+          call.Args().size() == 2 &&
+          !EnvDisabled("TINYLAMB_DISABLE_RECIPROCAL_DIVMOD") &&
+          call.Args()[0] && call.Args()[1] &&
+          call.Args()[1]->Type() == TypeTag::kConstantValue &&
+          ValueTypeFor(call.Args()[0]->ResultType(schema)) ==
+              ValueType::kInt64 &&
+          !ExprMayBeUnsigned(call.Args()[0], schema)) {
+        const Value& dv = call.Args()[1]->AsConstantValue().GetValue();
+        if (!dv.IsNull() && !dv.IsUnsigned() && dv.type == ValueType::kInt64 &&
+            dv.value.int_value != 0 && dv.value.int_value != 1 &&
+            dv.value.int_value != -1) {
+          if (!CompileNode(call.Args()[0], schema, program)) {
+            return false;
+          }
+          uint16_t spec_idx = 0;
+          if (!program->AddReciprocal(
+                  ReciprocalDivModSpec::FromDivisor(dv.value.int_value),
+                  &spec_idx)) {
+            return false;
+          }
+          program->AddInstruction({.opcode = call.FuncName() == "div"
+                                                 ? BytecodeOp::kDivInt64Const
+                                                 : BytecodeOp::kModInt64Const,
+                                   .operand = spec_idx});
+          return true;
+        }
+      }
       if (call.FuncName() == "abs") {
         if (call.Args().size() != 1 ||
             !CompileNode(call.Args()[0], schema, program)) {
@@ -637,11 +1501,17 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         if (call.Args().size() != 2 && call.Args().size() != 3) {
           return false;
         }
+        if (!call.Args()[0]) {
+          return false;
+        }
         const Type str_t = call.Args()[0]->ResultType(schema);
         if (ValueTypeFor(str_t) != ValueType::kVarChar) {
           return false;
         }
         for (size_t i = 1; i < call.Args().size(); ++i) {
+          if (!call.Args()[i]) {
+            return false;
+          }
           const Type idx_t = call.Args()[i]->ResultType(schema);
           if (ValueTypeFor(idx_t) != ValueType::kInt64) {
             return false;
@@ -678,6 +1548,19 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         for (const auto jump : exits) {
           program->SetJumpTarget(jump, static_cast<int32_t>(program->Size()) -
                                            static_cast<int32_t>(jump));
+        }
+        if (call.FuncName() == "coalesce") {
+          const auto common = call.CoalesceType(schema);
+          if (!common.HasValue()) { return false;
+}
+          if (common.Value() == TypeTag::kDouble) {
+            uint16_t offset = 0;
+            if (!program->AddCast({.target_type_name = "FLOAT64",
+                                   .target_value_type = ValueType::kDouble,
+                                   .return_null_on_error = false}, &offset)) { return false;
+}
+            program->AddInstruction({.opcode = BytecodeOp::kCast, .operand = offset});
+          }
         }
         return true;
       }
@@ -768,6 +1651,11 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
+bool AuditIsErrorFreePredicateForOrdering(const Expression& expr,
+                                          const Schema& schema) {
+  return IsErrorFreePredicateForOrdering(expr, schema);
+}
+
 namespace {
 
 StatusOr<Value> TryAbsValue(const Value& value) {
@@ -811,11 +1699,12 @@ bool IsAllAsciiFast(std::string_view s) noexcept {
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
-//   (ascii_substr_1based_slice_sound)
+// Lean proofs: lean/TinylambOpt/TpcdsExecCodegen.lean
+//   (ascii_substr_1based_slice_sound),
+//   lean/TinylambOpt/ResearchProofs/SubstrAsciiByteSliceEquiv.lean (sound)
 StatusOr<std::string_view> TryEvalSubstrView(
     std::string_view input, int64_t start,
-    std::optional<int64_t> opt_len) noexcept {
+    std::optional<int64_t> opt_len) {
   if (opt_len.has_value()) {
     if (*opt_len < 0) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -895,15 +1784,22 @@ StatusOr<Value> TryEvalSubstrCanonical(const Value& str_v, const Value& start_v,
   }
   if (str_v.type != ValueType::kVarChar || str_v.IsInterval() ||
       str_v.Collation() != 0 || start_v.type != ValueType::kInt64 ||
-      start_v.IsUnsigned() ||
-      (len_v != nullptr &&
-       (len_v->type != ValueType::kInt64 || len_v->IsUnsigned()))) {
+      (len_v != nullptr && len_v->type != ValueType::kInt64)) {
     return StatusError(StatusCode::kInvalidArgument,
                        "SUBSTR argument type mismatch");
   }
+  // AST Evaluate is the semantic reference: SUBSTR accepts UINT64 start/length
+  // (they share the kInt64 tag). The start keeps its raw bit pattern so a
+  // UINT64 near 2^64 still acts as an end-relative negative offset, while the
+  // length uses the same saturating conversion as the AST evaluator.
   const std::optional<int64_t> opt_len =
-      len_v != nullptr ? std::optional<int64_t>(len_v->value.int_value)
-                       : std::nullopt;
+      len_v != nullptr
+          ? std::optional<int64_t>(
+                len_v->IsUnsigned()
+                    ? SaturatingUnsignedToInt64(
+                          static_cast<uint64_t>(len_v->value.int_value))
+                    : len_v->value.int_value)
+          : std::nullopt;
   ASSIGN_OR_RETURN(std::string_view, sliced,
                    TryEvalSubstrView(str_v.value.varchar_value,
                                      start_v.value.int_value, opt_len));
@@ -945,6 +1841,128 @@ StatusOr<Value> TryEvalInStringSetCanonical(const Value& child,
   return spec.has_null ? Value() : Value(false);
 }
 
+// Lean proof: lean/TinylambOpt/SimdInRange.lean
+//   (simd_in_range_sound, int64_range_lowering)
+StatusOr<Value> TryEvalInt64InRangeCanonical(const Value& child,
+                                             const Int64RangeSpec& spec) {
+  if (child.IsNull()) {
+    return Value();
+  }
+  if (child.type != spec.expected_type || child.IsUnsigned()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "int64 range operand type mismatch");
+  }
+  return Value(spec.Contains(child.value.int_value));
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/ReciprocalDivMod.lean
+//   (est_bounds, divModConst_sound)
+StatusOr<Value> TryEvalReciprocalDivModCanonical(
+    const Value& child, const ReciprocalDivModSpec& spec, bool is_div) {
+  if (child.IsNull()) {
+    return Value();
+  }
+  if (child.type != ValueType::kInt64 || child.IsUnsigned()) {
+    if (child.type == ValueType::kInt64 && child.IsUnsigned()) {
+      return is_div ? child.TryArithmetic(Value(spec.divisor),
+                                          BinaryOperation::kDivide)
+                    : child.TryArithmetic(Value(spec.divisor),
+                                          BinaryOperation::kModulo);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "reciprocal div/mod operand type mismatch");
+  }
+  return Value(is_div ? spec.Div(child.value.int_value)
+                      : spec.Mod(child.value.int_value));
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
+StatusOr<Value> TryEvalRowInMaskCanonical(std::span<const Value> fields,
+                                          const RowInMaskSpec& spec) {
+  const uint32_t k = spec.num_fields;
+  if (k == 0 || fields.size() != k) {
+    return StatusError(StatusCode::kCorrupt, "invalid RowInMask arity");
+  }
+  bool all_signed_int_or_null = true;
+  for (uint32_t c = 0; c < k; ++c) {
+    const Value& v = fields[c];
+    if (!v.IsNull() && (v.type != ValueType::kInt64 || v.IsUnsigned())) {
+      all_signed_int_or_null = false;
+      break;
+    }
+  }
+  if (all_signed_int_or_null) {
+    uint64_t any_sure = 0;
+    uint64_t any_possible = 0;
+    for (const RowInMaskSpec::Chunk& chunk : spec.chunks) {
+      uint64_t sure = chunk.enabled;
+      uint64_t possible = chunk.enabled;
+      for (uint32_t c = 0; c < k; ++c) {
+        const Value& xv_val = fields[c];
+        const RowInMaskSpec::Column& col = chunk.columns[c];
+        if (xv_val.IsNull()) {
+          sure = 0;
+        } else {
+          const int64_t xv = xv_val.value.int_value;
+          uint64_t eq = 0;
+          const uint32_t cnt = chunk.count;
+          for (uint32_t i = 0; i < cnt; ++i) {
+            eq |= static_cast<uint64_t>(col.values[i] == xv) << i;
+          }
+          eq &= col.non_null_mask;
+          sure &= eq;
+          possible &= (col.null_mask | eq);
+          if (possible == 0) {
+            break;
+          }
+        }
+      }
+      any_sure |= sure;
+      any_possible |= possible;
+      if (any_sure != 0) {
+        break;
+      }
+    }
+    if (any_sure != 0) {
+      return Value(true);
+    }
+    return any_possible != 0 ? Value() : Value(false);
+  }
+  // Off-schema runtime fallback: match AST StructJsonCompare / InExpression.
+  std::vector<std::pair<std::string, Value>> lhs_fields;
+  lhs_fields.reserve(k);
+  for (uint32_t c = 0; c < k; ++c) {
+    lhs_fields.emplace_back("f" + std::to_string(c + 1), fields[c]);
+  }
+  const Value lhs(EncodeStructJson(lhs_fields));
+  bool saw_null = false;
+  std::vector<std::pair<std::string, Value>> rhs_fields(k);
+  for (uint32_t c = 0; c < k; ++c) {
+    rhs_fields[c].first = "f" + std::to_string(c + 1);
+  }
+  for (const RowInMaskSpec::Chunk& chunk : spec.chunks) {
+    for (uint32_t i = 0; i < chunk.count; ++i) {
+      const uint64_t bit = uint64_t{1} << i;
+      for (uint32_t c = 0; c < k; ++c) {
+        if ((chunk.columns[c].non_null_mask & bit) != 0) {
+          rhs_fields[c].second = Value(chunk.columns[c].values[i]);
+        } else {
+          rhs_fields[c].second = Value();
+        }
+      }
+      const Value rhs(EncodeStructJson(rhs_fields));
+      ASSIGN_OR_RETURN(Value, eq,
+                       TryEvaluateBinary(BinaryOperation::kEquals, lhs, rhs));
+      if (eq.IsNull()) {
+        saw_null = true;
+      } else if (eq.Truthy()) {
+        return Value(true);
+      }
+    }
+  }
+  return saw_null ? Value() : Value(false);
+}
+
 // The fast interpreter supports these opcodes, including control-flow jumps,
 // native DATE EXTRACT and CAST. Remaining VARCHAR/DATE operations delegate to
 // the canonical scalar evaluator.
@@ -969,6 +1987,10 @@ bool FastOpcode(BytecodeOp opcode) {
     case BytecodeOp::kCast:
     case BytecodeOp::kInStringSet:
     case BytecodeOp::kSubstr:
+    case BytecodeOp::kInt64InRange:
+    case BytecodeOp::kDivInt64Const:
+    case BytecodeOp::kModInt64Const:
+    case BytecodeOp::kRowInMask:
       return true;
     default:
       return false;
@@ -976,7 +1998,8 @@ bool FastOpcode(BytecodeOp opcode) {
 }
 
 // Compile-time under-approximation: every instruction is fast-shaped and
-// every constant loaded is numeric (or NULL).  Programs built by hand
+// every constant loaded is numeric, untagged VARCHAR, or NULL.  Programs
+// built by hand
 // (BytecodeProgram{} placeholders) never get the flag.
 bool ProgramIsFastInterpretable(const BytecodeProgram& program) {
   if (program.Instructions().empty()) {
@@ -1056,13 +2079,22 @@ bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
       const ExpressionBase& expr_base = *expression;
       if (typeid(expr_base) != typeid(ConstantValue)) {
         const auto evaluated = expression->TryEvaluate(Row(), Schema());
-        if (!evaluated.HasValue() ||
-            Encode(evaluated.Value()) != Encode(value) ||
+        if (!evaluated.HasValue() || evaluated.Value().type != value.type ||
             evaluated.Value().Collation() != value.Collation()) {
           return false;
         }
+        const auto encoded = TryEncode(evaluated.Value());
+        if (!encoded.HasValue() || encoded.Value() != Encode(value)) {
+          return false;
+        }
       }
-      *encoder << value << value.Collation();
+      // STRING and TIMESTAMP share the VARCHAR representation, so the Value
+      // alone cannot distinguish two constants that the evaluator treats
+      // differently. Fold the logical text domain into the cache key or a
+      // compiled program for one domain would be reused for the other.
+      *encoder << value << value.Collation()
+               << static_cast<uint8_t>(
+                      expression->AsConstantValue().GetTextDomain());
       return true;
     }
     case TypeTag::kBinaryExp: {
@@ -1102,7 +2134,8 @@ bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
           call.FuncName() != "octet_length" && call.FuncName() != "length" &&
           call.FuncName() != "char_length" &&
           call.FuncName() != "character_length" && call.FuncName() != "abs" &&
-          call.FuncName() != "substr" && call.FuncName() != "substring") {
+          call.FuncName() != "substr" && call.FuncName() != "substring" &&
+          call.FuncName() != "__struct_json__") {
         return false;
       }
       *encoder << call.FuncName() << static_cast<uint64_t>(call.Args().size());
@@ -1165,7 +2198,8 @@ std::optional<std::string> ScalarExpressionCacheKey(
   encoder << schema << static_cast<uint64_t>(expressions.size());
   size_t nodes = 0;
   // EncodeCompileTree may evaluate constant-shaped nodes to build the cache
-  // key; a deferred/partially qualified schema can throw there. Mirror
+  // key; TryEvaluate is the no-throw contract, but Encoder allocations
+  // (bad_alloc) and any contract-violating override can still throw. Mirror
   // Compile(): an unsupported shape simply opts out of the cache.
   try {
     for (const auto& expression : expressions) {
@@ -1176,7 +2210,7 @@ std::optional<std::string> ScalarExpressionCacheKey(
   } catch (...) {
     return std::nullopt;
   }
-  if (key.size() > 16384) {
+  if (encoder.GetStatus() != Status::kSuccess || key.size() > 16384) {
     return std::nullopt;
   }
   return key;
@@ -1207,14 +2241,16 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
   std::string key;
   key.reserve(512);
   Encoder encoder(key);
-  encoder << static_cast<uint8_t>(context) << schema;
+  encoder << static_cast<uint8_t>(context) << BytecodeOptToggleBits() << schema;
   size_t nodes = 0;
   // EncodeCompileTree may evaluate constant-shaped nodes to build the key
-  // (see ScalarExpressionCacheKey above). An un-rebound INSERT-shaped
-  // ParameterSlot can throw std::out_of_range during that evaluation; mirror
-  // the cache-key helper and simply opt out of the cache, compiling the
-  // expression normally rather than letting an exception escape this
-  // optional-returning path.
+  // (see ScalarExpressionCacheKey above). TryEvaluate is the no-throw
+  // contract -- an un-rebound ParameterSlot surfaces as a kRuntimeError
+  // Status, not an exception -- but Encoder allocations (bad_alloc) and any
+  // contract-violating override can still throw. Opt out of the cache and
+  // compile normally rather than letting an exception escape this
+  // optional-returning path; Compile is the semantic ground truth, so the
+  // fallback can never change results, only skip the cache.
   try {
     if (!EncodeCompileTree(expression, &encoder, &nodes)) {
       return Compile(expression, schema, context);
@@ -1222,16 +2258,20 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
   } catch (...) {
     return Compile(expression, schema, context);
   }
-  if (key.size() > 16384) {
+  if (encoder.GetStatus() != Status::kSuccess || key.size() > 16384) {
     return Compile(expression, schema, context);
   }
+  struct CacheEntry {
+    std::optional<BytecodeProgram> program;
+    size_t bytes;
+  };
   struct Cache {
     size_t bytes{0};
-    std::unordered_map<std::string, std::optional<BytecodeProgram>> entries;
+    std::unordered_map<std::string, CacheEntry> entries;
   };
   static thread_local Cache cache;
   if (auto found = cache.entries.find(key); found != cache.entries.end()) {
-    return found->second;
+    return found->second.program;
   }
   auto program = Compile(expression, schema, context);
   if (!program && expression &&
@@ -1275,12 +2315,11 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
   while (!cache.entries.empty() &&
          (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes)) {
     const auto victim = cache.entries.begin();
-    const size_t victim_bytes = entry_bytes(victim->first, victim->second);
-    cache.bytes = victim_bytes >= cache.bytes ? 0 : cache.bytes - victim_bytes;
+    cache.bytes -= victim->second.bytes;
     cache.entries.erase(victim);
   }
+  cache.entries.emplace(std::move(key), CacheEntry{.program=program, .bytes=bytes});
   cache.bytes += bytes;
-  cache.entries.emplace(std::move(key), program);
   return program;
 }
 
@@ -1311,7 +2350,7 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     }
     const Expression folded = folded_or.MoveValue();
     BytecodeProgram program;
-    if (!CompileNode(folded, schema, &program)) {
+    if (!folded || !CompileNode(folded, schema, &program)) {
       return std::nullopt;
     }
     const auto uniform_coalesce = [&](const auto& self,
@@ -1324,6 +2363,9 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
         if (call.FuncName() == "coalesce" || call.FuncName() == "ifnull") {
           ValueType common = ValueType::kNull;
           for (const auto& arg : call.Args()) {
+            if (!arg) {
+              return false;
+            }
             const auto type = ValueTypeFor(arg->ResultType(schema));
             if (type == ValueType::kNull) {
               if (arg->Type() != TypeTag::kConstantValue ||
@@ -1382,7 +2424,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         case BytecodeOp::kJumpIfFalse:
         case BytecodeOp::kJumpIfTrue: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           const Value& top = stack.back();
           const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
                                    ? (!top.IsNull() && !top.Truthy())
@@ -1398,7 +2443,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kJumpIfNotNull:
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           if (!stack.back().IsNull()) {
             pc += static_cast<size_t>(instruction.jump_target);
             --pc;
@@ -1414,10 +2462,16 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
         case BytecodeOp::kBinaryDate: {
           // Only compiler-generated programs reach here; an empty stack means
           // a malformed program.
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value right = std::move(stack.back());
           stack.pop_back();
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value left = std::move(stack.back());
           stack.pop_back();
           ASSIGN_OR_RETURN(
@@ -1428,7 +2482,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
         }
         case BytecodeOp::kUnaryInt64:
         case BytecodeOp::kUnaryDouble: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value child = std::move(stack.back());
           stack.pop_back();
           ASSIGN_OR_RETURN(Value, result_value,
@@ -1437,7 +2494,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kExtractDatePart: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value child = std::move(stack.back());
           stack.pop_back();
           ASSIGN_OR_RETURN(Value, part_value,
@@ -1446,7 +2506,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kByteLength: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           const auto& child = stack.back();
           const Value result_value =
               child.IsNull() ? Value()
@@ -1458,7 +2521,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kCharLength: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           const auto& child = stack.back();
           const Value result_value =
               child.IsNull() ? Value()
@@ -1470,23 +2536,35 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kAbs: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           ASSIGN_OR_RETURN(Value, abs_value, TryAbsValue(stack.back()));
           stack.back() = std::move(abs_value);
           break;
         }
         case BytecodeOp::kPop: {
-          assert(stack.size() > instruction.operand);
+          if (stack.size() <= instruction.operand) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "bytecode stack index out of range");
+          }
           stack.erase(stack.end() - 1 - instruction.operand);
           break;
         }
         case BytecodeOp::kDup: {
-          assert(stack.size() > instruction.operand);
+          if (stack.size() <= instruction.operand) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "bytecode stack index out of range");
+          }
           stack.push_back(stack[stack.size() - 1 - instruction.operand]);
           break;
         }
         case BytecodeOp::kCast: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value child = std::move(stack.back());
           stack.pop_back();
           const CastSpec& spec = casts_[instruction.operand];
@@ -1498,7 +2576,10 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           break;
         }
         case BytecodeOp::kInStringSet: {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value child = std::move(stack.back());
           stack.pop_back();
           ASSIGN_OR_RETURN(Value, matched,
@@ -1511,20 +2592,79 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           Value len_v;
           const bool has_len = instruction.operand == 3;
           if (has_len) {
-            assert(!stack.empty());
+            if (stack.empty()) {
+              return StatusError(StatusCode::kCorrupt,
+                                 "bytecode stack underflow");
+            }
             len_v = std::move(stack.back());
             stack.pop_back();
           }
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value start_v = std::move(stack.back());
           stack.pop_back();
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           Value str_v = std::move(stack.back());
           stack.pop_back();
           ASSIGN_OR_RETURN(Value, sub_v,
                            TryEvalSubstrCanonical(str_v, start_v,
                                                   has_len ? &len_v : nullptr));
           stack.push_back(std::move(sub_v));
+          break;
+        }
+        case BytecodeOp::kInt64InRange: {
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
+          if (instruction.operand >= int64_ranges_.size()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode int64-range operand out of bounds");
+          }
+          ASSIGN_OR_RETURN(
+              Value, in_range,
+              TryEvalInt64InRangeCanonical(stack.back(),
+                                           int64_ranges_[instruction.operand]));
+          stack.back() = std::move(in_range);
+          break;
+        }
+        case BytecodeOp::kDivInt64Const:
+        case BytecodeOp::kModInt64Const: {
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
+          if (instruction.operand >= reciprocals_.size()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode reciprocal operand out of bounds");
+          }
+          ASSIGN_OR_RETURN(
+              Value, res,
+              TryEvalReciprocalDivModCanonical(
+                  stack.back(), reciprocals_[instruction.operand],
+                  instruction.opcode == BytecodeOp::kDivInt64Const));
+          stack.back() = std::move(res);
+          break;
+        }
+        case BytecodeOp::kRowInMask: {
+          const RowInMaskSpec& spec = row_in_masks_[instruction.operand];
+          const uint32_t k = spec.num_fields;
+          if (k == 0 || stack.size() < k) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
+          const size_t base = stack.size() - k;
+          ASSIGN_OR_RETURN(
+              Value, res,
+              TryEvalRowInMaskCanonical(
+                  std::span<const Value>(stack.data() + base, k), spec));
+          stack.resize(base);
+          stack.push_back(std::move(res));
           break;
         }
       }
@@ -1569,7 +2709,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       case BytecodeOp::kJumpIfFalse:
       case BytecodeOp::kJumpIfTrue: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const Value& top = stack.back();
         const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
                                  ? (!top.IsNull() && !top.Truthy())
@@ -1584,7 +2726,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kJumpIfNotNull:
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         if (!stack.back().IsNull()) {
           pc += static_cast<size_t>(instruction.jump_target);
           --pc;
@@ -1598,10 +2742,14 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
       case BytecodeOp::kBinaryDouble:
       case BytecodeOp::kBinaryVarchar:
       case BytecodeOp::kBinaryDate: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value right = std::move(stack.back());
         stack.pop_back();
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value left = std::move(stack.back());
         stack.pop_back();
         ASSIGN_OR_RETURN(Value, combined,
@@ -1611,7 +2759,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
       }
       case BytecodeOp::kUnaryInt64:
       case BytecodeOp::kUnaryDouble: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value child = std::move(stack.back());
         stack.pop_back();
         ASSIGN_OR_RETURN(Value, result_value,
@@ -1620,7 +2770,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kExtractDatePart: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value child = std::move(stack.back());
         stack.pop_back();
         ASSIGN_OR_RETURN(Value, part_value,
@@ -1629,7 +2781,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kByteLength: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const auto& child = stack.back();
         const Value result_value =
             child.IsNull() ? Value()
@@ -1641,7 +2795,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kCharLength: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const auto& child = stack.back();
         const Value result_value =
             child.IsNull() ? Value()
@@ -1653,23 +2809,33 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kAbs: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         ASSIGN_OR_RETURN(Value, abs_value, TryAbsValue(stack.back()));
         stack.back() = std::move(abs_value);
         break;
       }
       case BytecodeOp::kPop: {
-        assert(stack.size() > instruction.operand);
+        if (stack.size() <= instruction.operand) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "bytecode stack index out of range");
+        }
         stack.erase(stack.end() - 1 - instruction.operand);
         break;
       }
       case BytecodeOp::kDup: {
-        assert(stack.size() > instruction.operand);
+        if (stack.size() <= instruction.operand) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "bytecode stack index out of range");
+        }
         stack.push_back(stack[stack.size() - 1 - instruction.operand]);
         break;
       }
       case BytecodeOp::kCast: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value child = std::move(stack.back());
         stack.pop_back();
         const CastSpec& spec = casts_[instruction.operand];
@@ -1681,7 +2847,9 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         break;
       }
       case BytecodeOp::kInStringSet: {
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value child = std::move(stack.back());
         stack.pop_back();
         ASSIGN_OR_RETURN(Value, matched,
@@ -1694,20 +2862,72 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         Value len_v;
         const bool has_len = instruction.operand == 3;
         if (has_len) {
-          assert(!stack.empty());
+          if (stack.empty()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "bytecode stack underflow");
+          }
           len_v = std::move(stack.back());
           stack.pop_back();
         }
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value start_v = std::move(stack.back());
         stack.pop_back();
-        assert(!stack.empty());
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         Value str_v = std::move(stack.back());
         stack.pop_back();
         ASSIGN_OR_RETURN(
             Value, sub_v,
             TryEvalSubstrCanonical(str_v, start_v, has_len ? &len_v : nullptr));
         stack.push_back(std::move(sub_v));
+        break;
+      }
+      case BytecodeOp::kInt64InRange: {
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        if (instruction.operand >= int64_ranges_.size()) {
+          return StatusError(StatusCode::kCorrupt,
+                             "bytecode int64-range operand out of bounds");
+        }
+        ASSIGN_OR_RETURN(Value, in_range,
+                         TryEvalInt64InRangeCanonical(
+                             stack.back(), int64_ranges_[instruction.operand]));
+        stack.back() = std::move(in_range);
+        break;
+      }
+      case BytecodeOp::kDivInt64Const:
+      case BytecodeOp::kModInt64Const: {
+        if (stack.empty()) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        if (instruction.operand >= reciprocals_.size()) {
+          return StatusError(StatusCode::kCorrupt,
+                             "bytecode reciprocal operand out of bounds");
+        }
+        ASSIGN_OR_RETURN(Value, res,
+                         TryEvalReciprocalDivModCanonical(
+                             stack.back(), reciprocals_[instruction.operand],
+                             instruction.opcode == BytecodeOp::kDivInt64Const));
+        stack.back() = std::move(res);
+        break;
+      }
+      case BytecodeOp::kRowInMask: {
+        const RowInMaskSpec& spec = row_in_masks_[instruction.operand];
+        const uint32_t k = spec.num_fields;
+        if (k == 0 || stack.size() < k) {
+          return StatusError(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        const size_t base = stack.size() - k;
+        ASSIGN_OR_RETURN(
+            Value, res,
+            TryEvalRowInMaskCanonical(
+                std::span<const Value>(stack.data() + base, k), spec));
+        stack.resize(base);
+        stack.push_back(std::move(res));
         break;
       }
     }
@@ -1730,9 +2950,9 @@ namespace {
 // compares avoid Value construction; collated strings are rejected by
 // FastSlotFromValue and fall back to the AST path.
 struct FastSlot {
-  int64_t bits;
+  int64_t bits{};
   ValueType type;
-  bool is_null;
+  bool is_null{};
   std::string_view text;
   bool is_substring{false};
 };
@@ -1829,7 +3049,10 @@ template <typename LoadColFn>
 FastEvalStatus ExecuteFastProgram(
     const std::vector<BytecodeInstruction>& instructions,
     const std::vector<Value>& constants, const std::vector<CastSpec>& casts,
-    const std::vector<StringSetSpec>& string_sets, LoadColFn&& load_col,
+    const std::vector<StringSetSpec>& string_sets,
+    const std::vector<Int64RangeSpec>& int64_ranges,
+    const std::vector<ReciprocalDivModSpec>& reciprocals,
+    const std::vector<RowInMaskSpec>& row_in_masks, LoadColFn&& load_col,
     FastSlot* out_slot, Status* error) {
   thread_local std::vector<FastSlot> stack;
   stack.clear();
@@ -1854,22 +3077,35 @@ FastEvalStatus ExecuteFastProgram(
     }
     return FastEvalStatus::kError;
   };
+  const auto jump = [&](int32_t offset, size_t* pc) {
+    if (offset <= 0 ||
+        static_cast<size_t>(offset) > instructions.size() - *pc) {
+      return false;
+    }
+    *pc += static_cast<size_t>(offset) - 1;
+    return true;
+  };
   for (size_t pc = 0; pc < instructions.size(); ++pc) {
     const BytecodeInstruction& instruction = instructions[pc];
     switch (instruction.opcode) {
       case BytecodeOp::kJumpIfNotNull:
-        assert(!stack.empty());
-        if (!stack.back().is_null) {
-          pc += static_cast<size_t>(instruction.jump_target);
-          --pc;
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        if (!stack.back().is_null && !jump(instruction.jump_target, &pc)) {
+          return push_error(StatusCode::kCorrupt, "invalid bytecode jump");
         }
         continue;
       case BytecodeOp::kJump:
-        pc += static_cast<size_t>(instruction.jump_target);
-        --pc;
+        if (!jump(instruction.jump_target, &pc)) {
+          return push_error(StatusCode::kCorrupt, "invalid bytecode jump");
+        }
         continue;
       case BytecodeOp::kJumpIfFalse:
       case BytecodeOp::kJumpIfTrue: {
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const FastSlot& top = stack.back();
         const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
                                  ? (!top.is_null && !FastTruthy(top))
@@ -1880,16 +3116,25 @@ FastEvalStatus ExecuteFastProgram(
               .type = ValueType::kInt64,
               .is_null = false,
               .text = {}};
-          pc += static_cast<size_t>(instruction.jump_target);
-          --pc;
+          if (!jump(instruction.jump_target, &pc)) {
+            return push_error(StatusCode::kCorrupt, "invalid bytecode jump");
+          }
         }
         continue;
       }
       case BytecodeOp::kPop: {
+        if (stack.size() <= instruction.operand) {
+          return push_error(StatusCode::kInvalidArgument,
+                            "bytecode stack index out of range");
+        }
         stack.erase(stack.end() - 1 - instruction.operand);
         continue;
       }
       case BytecodeOp::kDup: {
+        if (stack.size() <= instruction.operand) {
+          return push_error(StatusCode::kInvalidArgument,
+                            "bytecode stack index out of range");
+        }
         stack.push_back(stack[stack.size() - 1 - instruction.operand]);
         continue;
       }
@@ -1914,6 +3159,9 @@ FastEvalStatus ExecuteFastProgram(
       case BytecodeOp::kBinaryDouble:
       case BytecodeOp::kBinaryVarchar:
       case BytecodeOp::kBinaryDate: {
+        if (stack.size() < 2) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const FastSlot right = stack.back();
         stack.pop_back();
         const FastSlot left = stack.back();
@@ -2151,6 +3399,9 @@ FastEvalStatus ExecuteFastProgram(
       }
       case BytecodeOp::kUnaryInt64:
       case BytecodeOp::kUnaryDouble: {
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const FastSlot child = stack.back();
         stack.pop_back();
         switch (instruction.unary) {
@@ -2164,9 +3415,9 @@ FastEvalStatus ExecuteFastProgram(
           case UnaryOperation::kIsNotTrue:
           case UnaryOperation::kIsFalse:
           case UnaryOperation::kIsNotFalse: {
-            // T3698: mirror TryEvaluateUnary's domain guard -- only the
-            // INT64 carrier (and NULL) may feed IS [NOT] TRUE/FALSE.
-            if (!child.is_null && child.type != ValueType::kInt64) {
+            // Match TryEvaluateUnary's BOOL domain: NULL and INT64 0 or 1.
+            if (!child.is_null && (child.type != ValueType::kInt64 ||
+                                   child.bits < 0 || child.bits > 1)) {
               return push_error(
                   StatusCode::kInvalidArgument,
                   instruction.unary == UnaryOperation::kIsTrue ||
@@ -2237,6 +3488,9 @@ FastEvalStatus ExecuteFastProgram(
         }
       }
       case BytecodeOp::kExtractDatePart: {
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const FastSlot child = stack.back();
         stack.pop_back();
         if (child.is_null) {
@@ -2265,6 +3519,9 @@ FastEvalStatus ExecuteFastProgram(
       }
       case BytecodeOp::kCast: {
         const CastSpec& spec = casts[instruction.operand];
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         FastSlot& top = stack.back();
         if (top.is_null) {
           continue;
@@ -2291,6 +3548,9 @@ FastEvalStatus ExecuteFastProgram(
         continue;
       }
       case BytecodeOp::kAbs: {
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         FastSlot& top = stack.back();
         if (top.is_null) {
           continue;
@@ -2316,6 +3576,9 @@ FastEvalStatus ExecuteFastProgram(
       case BytecodeOp::kInStringSet: {
         // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
         //   (in_const_set_3vl_sound)
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         const FastSlot child = stack.back();
         stack.pop_back();
         const StringSetSpec& spec = string_sets[instruction.operand];
@@ -2343,6 +3606,9 @@ FastEvalStatus ExecuteFastProgram(
         // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
         //   (ascii_substr_1based_slice_sound)
         const bool has_len = instruction.operand == 3;
+        if (stack.size() < (has_len ? 3 : 2)) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
         FastSlot len_s{};
         if (has_len) {
           len_s = stack.back();
@@ -2376,6 +3642,107 @@ FastEvalStatus ExecuteFastProgram(
             .text = sub_or.Value(),
             .is_substring = true,
         });
+        continue;
+      }
+      case BytecodeOp::kInt64InRange: {
+        // Lean proof: lean/TinylambOpt/SimdInRange.lean
+        //   (simd_in_range_sound, int64_range_lowering)
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        if (instruction.operand >= int64_ranges.size()) {
+          return push_error(StatusCode::kCorrupt,
+                            "bytecode int64-range operand out of bounds");
+        }
+        FastSlot& top = stack.back();
+        if (top.is_null) {
+          continue;
+        }
+        const Int64RangeSpec& spec = int64_ranges[instruction.operand];
+        if (top.type != spec.expected_type) {
+          return FastEvalStatus::kUnsupported;
+        }
+        top.bits = static_cast<int64_t>(spec.Contains(top.bits));
+        top.type = ValueType::kInt64;
+        continue;
+      }
+      case BytecodeOp::kDivInt64Const:
+      case BytecodeOp::kModInt64Const: {
+        // Lean proof: lean/TinylambOpt/ResearchProofs/ReciprocalDivMod.lean
+        //   (est_bounds, divModConst_sound)
+        if (stack.empty()) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        if (instruction.operand >= reciprocals.size()) {
+          return push_error(StatusCode::kCorrupt,
+                            "bytecode reciprocal operand out of bounds");
+        }
+        FastSlot& top = stack.back();
+        if (top.is_null) {
+          continue;
+        }
+        if (top.type != ValueType::kInt64) {
+          return FastEvalStatus::kUnsupported;
+        }
+        const ReciprocalDivModSpec& spec = reciprocals[instruction.operand];
+        top.bits = instruction.opcode == BytecodeOp::kDivInt64Const
+                       ? spec.Div(top.bits)
+                       : spec.Mod(top.bits);
+        continue;
+      }
+      case BytecodeOp::kRowInMask: {
+        // Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
+        const RowInMaskSpec& spec = row_in_masks[instruction.operand];
+        const uint32_t k = spec.num_fields;
+        if (k == 0 || stack.size() < k) {
+          return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
+        }
+        const size_t base = stack.size() - k;
+        for (uint32_t c = 0; c < k; ++c) {
+          const FastSlot& s = stack[base + c];
+          if (!s.is_null && s.type != ValueType::kInt64) {
+            return FastEvalStatus::kUnsupported;
+          }
+        }
+        uint64_t any_sure = 0;
+        uint64_t any_possible = 0;
+        for (const RowInMaskSpec::Chunk& chunk : spec.chunks) {
+          uint64_t sure = chunk.enabled;
+          uint64_t possible = chunk.enabled;
+          for (uint32_t c = 0; c < k; ++c) {
+            const FastSlot& s = stack[base + c];
+            const RowInMaskSpec::Column& col = chunk.columns[c];
+            if (s.is_null) {
+              sure = 0;
+            } else {
+              const int64_t xv = s.bits;
+              uint64_t eq = 0;
+              const uint32_t cnt = chunk.count;
+              for (uint32_t i = 0; i < cnt; ++i) {
+                eq |= static_cast<uint64_t>(col.values[i] == xv) << i;
+              }
+              eq &= col.non_null_mask;
+              sure &= eq;
+              possible &= (col.null_mask | eq);
+              if (possible == 0) {
+                break;
+              }
+            }
+          }
+          any_sure |= sure;
+          any_possible |= possible;
+          if (any_sure != 0) {
+            break;
+          }
+        }
+        stack.resize(base);
+        if (any_sure != 0) {
+          push_int(stack, 1);
+        } else if (any_possible != 0) {
+          push_null(stack);
+        } else {
+          push_int(stack, 0);
+        }
         continue;
       }
       default:
@@ -2431,7 +3798,8 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
     return !unsupported;
   };
   const FastEval status = ExecuteFastProgram(
-      instructions_, constants_, casts_, string_sets_, load_col, &slot, error);
+      instructions_, constants_, casts_, string_sets_, int64_ranges_,
+      reciprocals_, row_in_masks_, load_col, &slot, error);
   if (status == FastEval::kDone) {
     if (slot.is_substring && !slot.is_null &&
         slot.type == ValueType::kVarChar) {
@@ -2801,6 +4169,85 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
     }
   }
 
+  // Tight SIMD-friendly loops for fused 2-instruction unary/specialized ops
+  // (`kInt64InRange`, `kDivInt64Const`, `kModInt64Const`) over NULL-free
+  // uniform columns.
+  if (instructions_.size() == 2 &&
+      instructions_[0].opcode == BytecodeOp::kLoadColumn &&
+      instructions_[0].operand < cols.size() && sink->is_uniform &&
+      sink->ints != nullptr && !sink->is_unsigned && !sink->is_interval &&
+      (sink->type == ValueType::kInt64 ||
+       (sink->type == ValueType::kNull && sink_rows == 0))) {
+    const BytecodeColumnView& v = cols[instructions_[0].operand];
+    if (instructions_[1].opcode == BytecodeOp::kInt64InRange &&
+        instructions_[1].operand < int64_ranges_.size() && v.is_uniform &&
+        !v.is_unsigned && !v.has_null && v.ints != nullptr) {
+      const Int64RangeSpec& spec = int64_ranges_[instructions_[1].operand];
+      if (v.type == spec.expected_type) {
+        sink->type = ValueType::kInt64;
+        if (sink->has_null && (sink->nulls != nullptr)) {
+          sink->nulls->resize(orig_nulls + row_count, 0);
+        }
+        const size_t base = sink->ints->size();
+        sink->ints->resize(base + row_count);
+        int64_t* __restrict dst = sink->ints->data() + base;
+        const int64_t* __restrict src = v.ints;
+        const auto ulo = static_cast<uint64_t>(spec.lo);
+        const uint64_t uwidth = static_cast<uint64_t>(spec.hi) - ulo;
+        if (sel != nullptr) {
+          for (size_t i = 0; i < row_count; ++i) {
+            const uint32_t idx = sel[i];
+            dst[i] = static_cast<int64_t>(
+                (static_cast<uint64_t>(src[idx]) - ulo) <= uwidth);
+          }
+        } else {
+          for (size_t i = 0; i < row_count; ++i) {
+            dst[i] = static_cast<int64_t>(
+                (static_cast<uint64_t>(src[i]) - ulo) <= uwidth);
+          }
+        }
+        return FastEval::kDone;
+      }
+    } else if ((instructions_[1].opcode == BytecodeOp::kDivInt64Const ||
+                instructions_[1].opcode == BytecodeOp::kModInt64Const) &&
+               instructions_[1].operand < reciprocals_.size() &&
+               v.is_uniform && !v.is_unsigned && !v.has_null &&
+               v.type == ValueType::kInt64 && v.ints != nullptr) {
+      const ReciprocalDivModSpec& spec = reciprocals_[instructions_[1].operand];
+      const bool is_div = instructions_[1].opcode == BytecodeOp::kDivInt64Const;
+      sink->type = ValueType::kInt64;
+      if (sink->has_null && (sink->nulls != nullptr)) {
+        sink->nulls->resize(orig_nulls + row_count, 0);
+      }
+      const size_t base = sink->ints->size();
+      sink->ints->resize(base + row_count);
+      int64_t* __restrict dst = sink->ints->data() + base;
+      const int64_t* __restrict src = v.ints;
+      if (is_div) {
+        if (sel != nullptr) {
+          for (size_t i = 0; i < row_count; ++i) {
+            dst[i] = spec.Div(src[sel[i]]);
+          }
+        } else {
+          for (size_t i = 0; i < row_count; ++i) {
+            dst[i] = spec.Div(src[i]);
+          }
+        }
+      } else {
+        if (sel != nullptr) {
+          for (size_t i = 0; i < row_count; ++i) {
+            dst[i] = spec.Mod(src[sel[i]]);
+          }
+        } else {
+          for (size_t i = 0; i < row_count; ++i) {
+            dst[i] = spec.Mod(src[i]);
+          }
+        }
+      }
+      return FastEval::kDone;
+    }
+  }
+
   const auto demote_sink_to_fallback = [&]() {
     if (!sink->is_uniform || sink->fallback == nullptr) {
       return false;
@@ -2936,9 +4383,9 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
   for (size_t i = 0; i < row_count; ++i) {
     current_row = sel != nullptr ? sel[i] : i;
     FastSlot slot{};
-    const FastEval st =
-        ExecuteFastProgram(instructions_, constants_, casts_, string_sets_,
-                           load_col, &slot, error);
+    const FastEval st = ExecuteFastProgram(
+        instructions_, constants_, casts_, string_sets_, int64_ranges_,
+        reciprocals_, row_in_masks_, load_col, &slot, error);
     if (st != FastEval::kDone) {
       rollback();
       return st;
@@ -3100,10 +4547,38 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
   return FastEval::kDone;
 }
 
+// In-process differential harnesses must be able to flip the bytecode switch
+// between two executions of one statement. Mutating the environment with
+// setenv/unsetenv while morsel workers call getenv is a data race (UB); this
+// atomic override gives them a thread-safe channel. The environment variable
+// remains the public, process-external switch.
+static std::atomic<bool> g_bytecode_disabled_override{false};
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/PlanCacheToggleInvalidation.lean
+//   (sound)
+uint8_t BytecodeOptToggleBits() noexcept {
+  uint8_t bits = 0;
+  if (EnvDisabled("TINYLAMB_DISABLE_SIMD_IN_RANGE")) { bits |= 1U << 0U;
+}
+  if (EnvDisabled("TINYLAMB_DISABLE_RECIPROCAL_DIVMOD")) { bits |= 1U << 1U;
+}
+  if (EnvDisabled("TINYLAMB_DISABLE_FILTER_ORDER")) { bits |= 1U << 2U;
+}
+  if (EnvDisabled("TINYLAMB_DISABLE_ROW_IN_MASK")) { bits |= 1U << 3U;
+}
+  return bits;
+}
+
 bool BytecodeEnabled() {
-  // Not cached: the differential harness flips the variable between the two
-  // executions of the same statement inside one process.
-  return std::getenv("TINYLAMB_DISABLE_BYTECODE") == nullptr;
+  if (g_bytecode_disabled_override.load(std::memory_order_acquire)) {
+    return false;
+  }
+  // Not cached: an embedder may set the environment variable at runtime.
+  return !EnvDisabled("TINYLAMB_DISABLE_BYTECODE");
+}
+
+void SetBytecodeDisabledForProcess(bool disabled) {
+  g_bytecode_disabled_override.store(disabled, std::memory_order_release);
 }
 
 StatusOr<Value> TryEvaluateRowAuto(const BytecodeProgram& program,

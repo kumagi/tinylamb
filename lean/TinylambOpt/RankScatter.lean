@@ -1,4 +1,5 @@
 import Std.Tactic
+import TinylambOpt.AdaptiveSelection
 
 /-! Soundness of stable SIMD compression by prefix popcount ("rank scatter").
 
@@ -156,5 +157,94 @@ theorem rank_scatter_sound (mask : List Bool) (rows : List α) (base capacity : 
       (∀ w ∈ scatterWrites base 0 0 mask rows, base ≤ w.1 ∧ w.1 < capacity) := by
   exact ⟨readBack_eq_aux base mask rows 0 0 hlen,
     scatterWrites_within_capacity mask rows base capacity hlen hcap⟩
+
+private theorem count_snoc (xs : List Bool) (b : Bool) :
+    countTrue (xs ++ [b]) = countTrue xs + b.toNat := by
+  induction xs with
+  | nil => cases b <;> rfl
+  | cons x xs ih => cases x <;> simp [countTrue, ih] <;> omega
+
+theorem population_rank (word : BitVec w) (n acc : Nat) :
+    word.cpopNatRec n acc = acc + countTrue ((List.range n).map word.getLsbD) := by
+  induction n generalizing acc with
+  | zero => simp [BitVec.cpopNatRec, countTrue]
+  | succ n ih =>
+    rw [BitVec.cpopNatRec, ih, List.range_succ, List.map_append]
+    simp [count_snoc]
+    omega
+
+/-- Stop before the next selected lane when the destination is full. The
+    physical offset suffices to resume without losing or duplicating a row. -/
+theorem bounded_scatter (mask : List Bool) (rows : List α) (cap : Nat)
+    (hlen : mask.length = rows.length) :
+    let n := AdaptiveSelection.consumedLanes cap mask
+    let part := mask.take n
+    countTrue part ≤ cap ∧
+    readBack (countTrue part) 0 (scatterWrites 0 0 0 part (rows.take n)) ++
+      reference (mask.drop n) (rows.drop n) = reference mask rows := by
+  dsimp only
+  have heq : ∀ n, (mask.take n).length = (rows.take n).length := by simp [hlen]
+  rw [(readBack_eq_aux 0 _ _ 0 0 (heq _))]
+  clear heq
+  induction mask generalizing rows cap with
+  | nil => cases cap <;> simp [AdaptiveSelection.consumedLanes, countTrue, reference]
+  | cons b bs ih =>
+    cases rows with
+    | nil => simp at hlen
+    | cons x xs =>
+      simp at hlen
+      cases cap with
+      | zero => simp [AdaptiveSelection.consumedLanes, countTrue, reference]
+      | succ k =>
+        cases b <;> simp [AdaptiveSelection.consumedLanes, Nat.add_comm 1,
+          List.take_succ_cons, List.drop_succ_cons, reference, countTrue] <;>
+          first | exact ih xs _ hlen | simpa using ih xs _ hlen
+
+/-- Hardware population count on the low bits. Extracting zero bits and all
+    bits are both defined; no shift by the lane width is required. -/
+theorem lower_bits_popcount (word : BitVec w) (i : Nat) :
+    (word.extractLsb' 0 i).cpop.toNat = countTrue ((List.range i).map word.getLsbD) := by
+  rw [BitVec.toNat_cpop, population_rank, Nat.zero_add]
+  congr 1
+  apply List.map_congr_left
+  intro j hj
+  simp [List.mem_range.mp hj]
+
+private theorem selected_write (mask : List Bool) (rows : List α) (base lane rank i : Nat)
+    (hlen : mask.length = rows.length) (sel : mask[i]? = some true) (value : rows[i]? = some v) :
+    (base + (rank + countTrue (mask.take i)),lane+i,v) ∈
+      scatterWrites base lane rank mask rows := by
+  induction mask generalizing rows lane rank i with
+  | nil => simp at sel
+  | cons b bs ih =>
+    cases rows with
+    | nil => simp at hlen
+    | cons a xs =>
+      simp at hlen
+      cases i with
+      | zero =>
+        simp at sel value
+        subst b; subst a
+        simp [countTrue,scatterWrites]
+      | succ i =>
+        simp at sel value
+        cases b with
+        | false =>
+          simpa [scatterWrites,countTrue,Nat.add_assoc,Nat.add_comm 1] using
+            ih xs (lane+1) rank i hlen sel value
+        | true =>
+          apply List.mem_cons_of_mem
+          simpa [countTrue,Nat.add_assoc,Nat.add_comm 1] using
+            ih xs (lane+1) (rank+1) i hlen sel value
+
+theorem packed_scatter_slot (word : BitVec w) (rows : List α) (base i : Nat)
+    (hlen : rows.length = w) (hi : i < w) (sel : word.getLsbD i = true)
+    (value : rows[i]? = some v) :
+    (base + (word.extractLsb' 0 i).cpop.toNat,i,v) ∈
+      scatterWrites base 0 0 ((List.range w).map word.getLsbD) rows := by
+  rw [lower_bits_popcount]
+  simpa [← List.map_take, Nat.min_eq_left (Nat.le_of_lt hi)] using
+    selected_write ((List.range w).map word.getLsbD) rows base 0 0 i
+      (by simp [hlen]) (by simp [hi,sel]) value
 
 end TinylambOpt.RankScatter

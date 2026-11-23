@@ -55,29 +55,35 @@ def main():
     p.add_argument('--seconds', type=int, default=30)
     p.add_argument('--warmup', type=int, default=5)
     p.add_argument('--trials', type=int, default=3)
-    p.add_argument('--measure-gate',type=Path)
+    p.add_argument('--measure-gate', type=Path)
+    p.add_argument('--measure-gate-timeout', type=float, default=600,
+                   help='maximum seconds to wait for --measure-gate (default: 600)')
     a = p.parse_args()
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     sockets = [socket.socket() for _ in range(3)]
     for s in sockets: s.bind(('127.0.0.1', 0))
     ports = [s.getsockname()[1] for s in sockets]
-    for s in sockets: s.close()
     args = SimpleNamespace(server=str(a.server.resolve()), scratch=str(ROOT/'build'/'benchmarks'), server_cpus='0-15',
         tiny_port=ports[0], pg_port=ports[1], mysql_port=ports[2], read_workers=8,
         tiny_query_memory_mib=256, server_metrics=True,
         postgres_image='postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4',
         mysql_image='mysql@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7')
     stack = Stack(args, out)
+    stack.port_reservations = dict(zip(('tinylamb', 'postgresql', 'mysql'), sockets))
     clone(a.fixture, stack.work/'database')
     try:
         stack.start()
-        meta = stack.metadata(); meta['client_sha256'] = hashlib.file_digest(a.client.open('rb'), 'sha256').hexdigest()
+        meta = stack.metadata()
+        with a.client.open('rb') as client_binary:
+            meta['client_sha256'] = hashlib.file_digest(client_binary, 'sha256').hexdigest()
         meta['fixture'] = str(a.fixture)
         metadata=a.fixture.parent/(a.fixture.name+'.log.meta')
         meta['fixture_wal_metadata_hex']=metadata.read_bytes().hex()
         (out/'environment.json').write_text(json.dumps(meta, indent=2))
         tiny = Client('tinylamb', stack.ports, 60)
-        initial = check(tiny); assert initial['valid'], initial
+        initial = check(tiny)
+        if not initial['valid']:
+            raise ValueError(f'invalid tinylamb starting state: {initial}')
         (out/'initial-invariants.json').write_text(json.dumps(initial, indent=2, default=str))
         for table in TABLES:
             rows = tiny.execute(f'SELECT * FROM {table}')
@@ -91,7 +97,8 @@ def main():
         text = source.split('constexpr std::array<std::string_view, 9> schema = {',1)[1].split('};',1)[0]
         ddls = re.findall(r'((?:"[^"\n]*"\s*)+)(?:,|$)',text,re.M)
         schema = [''.join(re.findall(r'"([^"\n]*)"',s)) for s in ddls]
-        assert len(schema)==9, schema
+        if len(schema) != len(TABLES):
+            raise ValueError(f'expected {len(TABLES)} table definitions, found {len(schema)}')
         pg = Client('postgresql',stack.ports,120)
         for ddl in schema:
             ddl = re.sub(r'\bINT64\b','BIGINT',ddl)
@@ -106,12 +113,16 @@ def main():
                 stack.process.terminate(); stack.process.wait(timeout=30)
                 db = stack.work/f'database-{trial}'; clone(a.fixture,db)
                 env={k:v for k,v in os.environ.items() if not k.startswith('TINYLAMB_')}
-                env.update(TINYLAMB_PAGE_POOL_BYTES='536870912',TINYLAMB_QUERY_MEMORY_BYTES=str(256<<20),TINYLAMB_SERVER_METRICS='1')
+                env.update(TINYLAMB_BUFFER_POOL_BYTES='536870912',TINYLAMB_QUERY_MEMORY_BYTES=str(256<<20),TINYLAMB_SERVER_METRICS='1')
                 argv=['taskset','-c','0-15',str(a.server.resolve()),str(db),'--port',str(ports[0]),'--read-workers','8']
                 append_json(out/'commands.jsonl',dict(argv=argv,env={k:v for k,v in env.items() if k.startswith('TINYLAMB_')}))
                 stack.process=subprocess.Popen(argv,env=env,stdout=stack.log,stderr=subprocess.STDOUT,cwd=ROOT)
                 import time
                 for _ in range(600):
+                    # Popen has no check= argument: fail fast when a restarted
+                    # server dies instead of polling for the whole timeout.
+                    if stack.process.poll() is not None:
+                        raise RuntimeError(f'Tiny restart failed: exit {stack.process.returncode}')
                     try:
                         c=Client('tinylamb',stack.ports);c.close();break
                     except Exception:time.sleep(.1)
@@ -122,14 +133,20 @@ def main():
                 with (out/f'fixture-{table}.csv').open() as f:
                     pg.cursor.copy_expert(f'COPY {table} FROM STDIN WITH (FORMAT csv)',f)
                 pg.execute('VACUUM (ANALYZE) '+table)
-            state=check(pg);assert state['valid'] and state['counts']==initial['counts'],state
+            state = check(pg)
+            if not state['valid'] or state['counts'] != initial['counts']:
+                raise ValueError(f'PostgreSQL fixture failed validation for trial {trial}: {state}')
             pg.close()
             if trial==1:
                 (out/'prepared.json').write_text(json.dumps(dict(prepared=True)))
                 if a.measure_gate:
                     import time
                     print('prepared; waiting for measure gate',a.measure_gate,flush=True)
-                    while not a.measure_gate.exists():time.sleep(.2)
+                    deadline=time.monotonic()+a.measure_gate_timeout
+                    while not a.measure_gate.exists():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f'measure gate timeout: {a.measure_gate}')
+                        time.sleep(.2)
             engines=['tinylamb','postgresql'];random.Random(20261030+trial).shuffle(engines)
             for engine in engines:
                 argv=[str(a.client.resolve()),'--port',str(stack.ports[engine]),'--clients','10',
@@ -141,12 +158,15 @@ def main():
                 text=(out/f'{engine}-{trial}.log').read_text()
                 metrics=dict(re.findall(r'^([a-z_0-9.]+)=(.*)$',text,re.M))
                 c=Client(engine,stack.ports,120);state=check(c);c.close()
+                # No check=True: validate the client's exit status explicitly
+                # below so a failed trial is reported with its log and metrics.
                 record=dict(kind='tpcc',engine=engine,trial=trial,seconds=a.seconds,warmup=a.warmup,
                             metrics=metrics,invariants=state,exit_code=result.returncode,
                             valid=result.returncode==0 and state['valid'])
                 append_json(out/'results.jsonl',record)
                 print('DONE',engine,trial,'tps',metrics.get('tps'),'valid',record['valid'],flush=True)
-                assert record['valid'],record
+                if not record['valid']:
+                    raise ValueError(f'{engine} trial {trial} failed validation: {record}')
         (out/'finished.json').write_text(json.dumps(dict(trials=a.trials,engines=2)))
     finally:
         stack.close()

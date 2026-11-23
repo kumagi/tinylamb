@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/test_util.hpp"
 #include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
 #include "query/fuzz_scoped_db.hpp"
@@ -219,7 +220,8 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
 // every generated family as "ran" -- a run that executed nothing would
 // otherwise look like full coverage.
 TEST(SqlOracleFuzzer, ResourcePressureCountsAsSkippedNotRan) {
-  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  ScopedEnvVar force_db_failure(
+      "TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1");
   std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
   OracleIterationStats stats;
   OracleTrace trace;
@@ -231,7 +233,7 @@ TEST(SqlOracleFuzzer, ResourcePressureCountsAsSkippedNotRan) {
         stats.cte_ran}) {
     EXPECT_FALSE(ran) << "family reported as ran with no database";
   }
-  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+  force_db_failure.Set(nullptr);
   // The hatch is off again: the next iteration must run and count normally.
   OracleIterationStats again;
   EXPECT_EQ(RunOracleIteration(rng, false, &again, nullptr), "");
@@ -563,8 +565,8 @@ TEST(SqlOracleFuzzer, ReplayReportsAllArmsSkipped) {
 }
 
 // Execution-failure paths of CheckSkip/CheckTopTies must report "oracle
-// skipped", and CheckTlpAgg's row-shape guard must use the cell count (not the
-// serialized byte length) so a short aggregate row cannot reach r[1]/r[2].
+// skipped", while a short aggregate row must be reported as a shape mismatch
+// (not a skip) so a committed regression cannot replay as a false green.
 TEST(SqlOracleFuzzer, ReplayReportsSkippedSkipToptiesAndShortAggRows) {
   OracleTrace trace;
   trace.table = "t9";
@@ -582,15 +584,35 @@ TEST(SqlOracleFuzzer, ReplayReportsSkippedSkipToptiesAndShortAggRows) {
   const std::string report = ReplayOracleTrace(trace, false);
   EXPECT_NE(report.find("skipped recorded oracle arm"), std::string::npos)
       << report;
-  EXPECT_NE(report.find("TLP_AGG"), std::string::npos) << report;
+  EXPECT_EQ(report.find("TLP_AGG"), std::string::npos) << report;
+  EXPECT_NE(report.find("[TLP AGG ROW SHAPE MISMATCH]"), std::string::npos)
+      << report;
   EXPECT_NE(report.find("SKIP"), std::string::npos) << report;
   EXPECT_NE(report.find("TOP_TIES"), std::string::npos) << report;
+}
+
+TEST(SqlOracleFuzzer, ReplayReportsMissingTlpAggArmsAsSkipped) {
+  OracleTrace trace;
+  trace.table = "t9";
+  trace.setup = {"CREATE TABLE t9 (u INT64, a INT64);",
+                 "INSERT INTO t9 VALUES (1, 2), (3, 4);"};
+  trace.tlp_agg = {"SELECT u FROM t9;", "SELECT u FROM t9;",
+                   "SELECT u FROM t9;"};
+
+  const std::string report = ReplayOracleTrace(trace, false);
+  EXPECT_NE(report.find("skipped recorded oracle arm(s):"),
+            std::string::npos)
+      << report;
+  EXPECT_NE(report.find("TLP_AGG"), std::string::npos) << report;
 }
 
 // A failed Create/CrashAndReopen leaves db_ null while WAL segments,
 // checkpoint temps and LSM/TLCS companions may already be on disk. The sweep
 // must cover the whole Database::DeleteAll() family, not just five suffixes.
 TEST(SqlOracleFuzzer, ScopedDbRemovesFullArtifactFamily) {
+  // ScopedDb::ResolveDbName() appends RandomString(8) to this prefix, so the
+  // actual DB name (and every artifact name derived from sdb.name()) is unique
+  // per test even when several ctest -j workers share the working directory.
   ScopedDb sdb("scoped_db_family");
   ASSERT_TRUE(static_cast<bool>(sdb));
   const std::string name = sdb.name();
@@ -668,12 +690,8 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
       std::filesystem::temp_directory_path() /
       ("tinylamb_fuzz_finding_test_" + RandomString(6));
   std::filesystem::create_directories(tmp_dir);
-  const char* prev_continue = std::getenv("TINYLAMB_FUZZ_CONTINUE");
-  const std::string saved_continue =
-      prev_continue != nullptr ? prev_continue : "";
-  const char* prev_findings = std::getenv("TINYLAMB_FUZZ_FINDINGS_DIR");
-  const std::string saved_findings =
-      prev_findings != nullptr ? prev_findings : "";
+  ScopedEnvVar continue_guard("TINYLAMB_FUZZ_CONTINUE", nullptr);
+  ScopedEnvVar findings_guard("TINYLAMB_FUZZ_FINDINGS_DIR", nullptr);
   ASSERT_EQ(setenv("TINYLAMB_FUZZ_CONTINUE", "1", 1), 0);
   ASSERT_EQ(setenv("TINYLAMB_FUZZ_FINDINGS_DIR", tmp_dir.c_str(), 1), 0);
 
@@ -686,19 +704,13 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
   const std::string stem = fname.substr(0, fname.size() - 5);
   EXPECT_TRUE(std::filesystem::exists(tmp_dir / (stem + ".report.txt")));
 
-  std::filesystem::remove(fname);
-  std::filesystem::remove(stem + ".report.txt");
-  std::filesystem::remove_all(tmp_dir);
-  if (prev_continue != nullptr) {
-    setenv("TINYLAMB_FUZZ_CONTINUE", saved_continue.c_str(), 1);
-  } else {
-    unsetenv("TINYLAMB_FUZZ_CONTINUE");
-  }
-  if (prev_findings != nullptr) {
-    setenv("TINYLAMB_FUZZ_FINDINGS_DIR", saved_findings.c_str(), 1);
-  } else {
-    unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR");
-  }
+  std::error_code remove_error;
+  std::filesystem::remove(tmp_dir / fname, remove_error);
+  EXPECT_FALSE(remove_error) << fname << ": " << remove_error.message();
+  std::filesystem::remove(tmp_dir / (stem + ".report.txt"), remove_error);
+  EXPECT_FALSE(remove_error) << stem << ": " << remove_error.message();
+  std::filesystem::remove_all(tmp_dir, remove_error);
+  EXPECT_FALSE(remove_error) << tmp_dir << ": " << remove_error.message();
 }
 
 TEST(SqlOracleFuzzer, LSTableDictAllPassExcludesNullRows) {

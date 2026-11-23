@@ -426,14 +426,23 @@ inline bool EvaluateTypedDoubleExprCells(const TypedDoubleExprInput& expr,
         stack[sp++] = op.constant;
         break;
       case TypedDoubleExprOp::Kind::kAdd:
+        if (sp < 2) {
+          return false;
+        }
         stack[sp - 2] += stack[sp - 1];
         --sp;
         break;
       case TypedDoubleExprOp::Kind::kSub:
+        if (sp < 2) {
+          return false;
+        }
         stack[sp - 2] -= stack[sp - 1];
         --sp;
         break;
       case TypedDoubleExprOp::Kind::kMul:
+        if (sp < 2) {
+          return false;
+        }
         stack[sp - 2] *= stack[sp - 1];
         --sp;
         break;
@@ -469,6 +478,11 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
         stack[sp++] = op.constant;
         break;
       case TypedIntExprOp::Kind::kAdd: {
+        if (sp < 2) {
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "typed INT expression stack underflow");
+          return false;
+        }
         int64_t v = 0;
         if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1], &v)) {
           *error = StatusError(StatusCode::kInvalidArgument,
@@ -480,6 +494,11 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
         break;
       }
       case TypedIntExprOp::Kind::kSub: {
+        if (sp < 2) {
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "typed INT expression stack underflow");
+          return false;
+        }
         int64_t v = 0;
         if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1], &v)) {
           *error = StatusError(StatusCode::kInvalidArgument,
@@ -491,6 +510,11 @@ inline bool EvaluateTypedIntExprCells(const TypedIntExprInput& expr,
         break;
       }
       case TypedIntExprOp::Kind::kMul: {
+        if (sp < 2) {
+          *error = StatusError(StatusCode::kInvalidArgument,
+                               "typed INT expression stack underflow");
+          return false;
+        }
         int64_t v = 0;
         if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1], &v)) {
           *error = StatusError(StatusCode::kInvalidArgument,

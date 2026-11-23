@@ -386,7 +386,7 @@ TEST_F(TpcdsQueryTest, LeanProvenTpcdsRewritesMatchRelationalFallback) {
       for (const Row& opt : opt_rows) {
         bool matched = false;
         for (size_t j = 0; j < ref_rows.size(); ++j) {
-          if (ref_used[j] || opt.values_.size() != ref_rows[j].values_.size()) {
+          if ((ref_used[j] != 0) || opt.values_.size() != ref_rows[j].values_.size()) {
             continue;
           }
           bool same = true;

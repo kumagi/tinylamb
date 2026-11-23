@@ -83,7 +83,7 @@ size_t EstimateKeyedRowBytes(const KeyedRow& keyed);
 bool KeyedRowPrecedes(const std::vector<SortKeyOrder>& order_specs,
                       const KeyedRow& left, const KeyedRow& right);
 Row EncodeKeyedRunRow(KeyedRow&& keyed);
-KeyedRow DecodeKeyedRunRow(Row&& encoded, size_t key_count);
+StatusOr<KeyedRow> DecodeKeyedRunRow(Row&& encoded, size_t key_count);
 
 template <typename EmitFn>
 Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
@@ -117,9 +117,10 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
         RETURN_IF_FAIL(reader.Next(&first, &has_row));
         readers.push_back(std::move(reader));
         if (has_row) {
-          heap.push_back(
-              HeapItem{.entry = DecodeKeyedRunRow(std::move(first), key_count),
-                       .reader_idx = readers.size() - 1});
+          ASSIGN_OR_RETURN(KeyedRow, decoded,
+                           DecodeKeyedRunRow(std::move(first), key_count));
+          heap.push_back(HeapItem{.entry = std::move(decoded),
+                                  .reader_idx = readers.size() - 1});
         }
       }
       std::make_heap(heap.begin(), heap.end(), heap_greater);
@@ -138,9 +139,10 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
         bool has_row = false;
         RETURN_IF_FAIL(readers[ridx].Next(&next_raw, &has_row));
         if (has_row) {
-          heap.push_back(HeapItem{
-              .entry = DecodeKeyedRunRow(std::move(next_raw), key_count),
-              .reader_idx = ridx});
+          ASSIGN_OR_RETURN(KeyedRow, decoded,
+                           DecodeKeyedRunRow(std::move(next_raw), key_count));
+          heap.push_back(HeapItem{.entry = std::move(decoded),
+                                  .reader_idx = ridx});
           std::push_heap(heap.begin(), heap.end(), heap_greater);
         }
       }
@@ -169,9 +171,9 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
     RETURN_IF_FAIL(reader.Next(&first, &has_row));
     readers.push_back(std::move(reader));
     if (has_row) {
-      heap.push_back(
-          HeapItem{.entry = DecodeKeyedRunRow(std::move(first), key_count),
-                   .reader_idx = idx});
+      ASSIGN_OR_RETURN(KeyedRow, decoded,
+                       DecodeKeyedRunRow(std::move(first), key_count));
+      heap.push_back(HeapItem{.entry = std::move(decoded), .reader_idx = idx});
     }
   }
   std::make_heap(heap.begin(), heap.end(), heap_greater);
@@ -190,9 +192,9 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
     bool has_row = false;
     RETURN_IF_FAIL(readers[ridx].Next(&next_raw, &has_row));
     if (has_row) {
-      heap.push_back(
-          HeapItem{.entry = DecodeKeyedRunRow(std::move(next_raw), key_count),
-                   .reader_idx = ridx});
+      ASSIGN_OR_RETURN(KeyedRow, decoded,
+                       DecodeKeyedRunRow(std::move(next_raw), key_count));
+      heap.push_back(HeapItem{.entry = std::move(decoded), .reader_idx = ridx});
       std::push_heap(heap.begin(), heap.end(), heap_greater);
     }
   }
@@ -219,6 +221,14 @@ class ExternalKeyedSorter {
   }
 
   Status Add(KeyedRow keyed) {
+    // DecodeKeyedRunRow places the sequence at values_[key_count], so a
+    // wider keys vector would silently shift it and corrupt the spill
+    // image; a narrower one makes the order_specs_ loop read out of bounds.
+    if (keyed.keys.size() != order_specs_.size()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "keyed row key count does not match sort keys");
+    }
+    RETURN_IF_FAIL(ObserveSortKeys(order_specs_, keyed.keys));
     keyed.sequence = next_sequence_++;
     const size_t entry_bytes = EstimateKeyedRowBytes(keyed);
     auto& budget = QueryMemoryBudget::Global();
@@ -243,6 +253,10 @@ class ExternalKeyedSorter {
       }
       if (!budget.Unlimited() && !sortable_.empty() &&
           !budget.CanReserve(entry_bytes)) {
+        // Fall back to the ordinary external merge. WITH TIES is never a
+        // bounded request (bounded_requested_ is false for LIMIT ... WITH
+        // TIES), so neither EmitSorted's limit nor FlushRun's emit_limit can
+        // truncate the peer group here; every tie survives the spill.
         top1_with_ties_ = false;
         RETURN_IF_FAIL(FlushRun());
       } else {
@@ -407,6 +421,15 @@ StatusOr<Relation> DistinctOf(Relation input,
                               TransactionContext* ctx = nullptr,
                               const Scope* outer = nullptr,
                               const CteMap* ctes = nullptr);
+
+// Folds `SELECT DISTINCT ON (...) ... ORDER BY ...` into one pass of O(N)
+// winner tracking + sorting only the K group winners by `(order_keys,
+// row_idx)`. The Top1 name refers to one winner per key; this does not impose
+// a global LIMIT 1 and returns every group's winner.
+StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
+                                 const SelectStatement& statement,
+                                 Relation* output, const Scope* outer,
+                                 const CteMap& ctes);
 
 Status ApplyOrderBy(TransactionContext& context,
                     const SelectStatement& statement, Relation* output,

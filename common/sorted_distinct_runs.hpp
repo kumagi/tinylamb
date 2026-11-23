@@ -14,14 +14,17 @@
 #include "common/status_or.hpp"
 
 namespace tinylamb {
-// Exact external union of sorted uint64 runs. Binary carries keep at most
-// 16-way merge keeps at most log2_16(runs) temp files open; every merge has
-// fixed-size I/O buffers. Temporary files are closed/deleted on both success
-// and failure.
+// Exact external union of sorted uint64 runs. Binary carries keep one run per
+// level (at most log2(runs) live files in total); a merge opens at most three
+// at once -- two inputs plus one output -- with fixed-size I/O buffers.
+// Temporary files are closed/deleted on both success and failure.
 class SortedDistinctRuns {
  public:
   Status Add(std::span<const uint64_t> sorted);
   Status Absorb(SortedDistinctRuns&& other);
+  // Visits distinct values in order and consumes the runs on success.
+  // An I/O failure can leave a partially filled destination. Retrying
+  // starts from the first value, so discard the earlier output first.
   Status ForEach(const std::function<void(uint64_t)>& consume);
   [[nodiscard]] bool Empty() const { return levels_.empty(); }
 
@@ -45,7 +48,7 @@ class SortedDistinctRuns {
 
   // Test-only fault injection: makes the next Merge fail before it reads or
   // creates any file, so the strong-guarantee failure path is reproducible.
-  static void SetFailNextMergeForTest(bool fail) {
+  void SetFailNextMergeForTest(bool fail) {
     fail_next_merge_for_test_ = fail;
   }
 
@@ -68,11 +71,11 @@ class SortedDistinctRuns {
   };
   // Merges two runs without taking ownership: the inputs keep their files on
   // failure so callers retain the strong exception guarantee.
-  static StatusOr<Run> Merge(const Run& left, const Run& right);
+  StatusOr<Run> Merge(const Run& left, const Run& right);
   Status Insert(Run run, size_t level);
-  // thread_local so a fault injected by one test/thread cannot leak into an
-  // unrelated concurrently running test's Merge.
-  static inline thread_local bool fail_next_merge_for_test_{false};
+  // Instance-scoped so fault injection in one test cannot be consumed by an
+  // unrelated SortedDistinctRuns object running concurrently.
+  bool fail_next_merge_for_test_{false};
   std::vector<std::optional<Run>> levels_;
 };
 }  // namespace tinylamb

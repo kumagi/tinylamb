@@ -67,7 +67,6 @@ class CheckpointManager {
 
   StatusOr<lsn_t> WriteCheckpoint(const std::function<void()>& func_for_test =
                                       []() {});
-  void SetFlushBudgetMsForTest(size_t /*budget_ms*/) {}
   void SetWalRetentionWarnBytesForTest(uint64_t bytes) noexcept {
     wal_retention_warn_bytes_override_.store(bytes, std::memory_order_release);
     last_wal_retention_warn_ms_.store(0, std::memory_order_release);
@@ -102,7 +101,7 @@ class CheckpointManager {
                                   const CheckpointManager& cm) {
     o << "CheckpointManager(start=" << cm.start_.load()
       << ", interval=" << cm.interval_seconds_
-      << ", path=" << cm.master_record_path << ")";
+      << ", path=" << cm.database_path_ << ")";
     return o;
   }
 
@@ -110,7 +109,7 @@ class CheckpointManager {
   std::atomic<bool> start_{false};
   std::atomic<bool> stop_{false};
   bool compaction_requested_{false};
-  std::string master_record_path;
+  std::string database_path_;
   TransactionManager* const tm_;
   PageManager* const pm_;
   size_t interval_seconds_;
@@ -141,6 +140,9 @@ class CheckpointManager {
   // arrived while the checkpoint was running.
   uint64_t request_generation_ = 0;
   std::atomic<uint64_t> worker_checkpoints_{0};
+  // One-shot diagnostic for a logger-less manager: the worker cannot measure
+  // WAL lag in that configuration, so warn once instead of staying silent.
+  std::atomic<bool> no_logger_warned_{false};
   std::thread checkpoint_worker_;
 };
 

@@ -32,6 +32,18 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
                                          TransactionContext* context,
                                          std::string_view sql) {
   std::vector<std::string> result;
+  // RAII for the route knob: every early return below must leave the engine
+  // as it was found so a failing case cannot leak into later tests sharing
+  // this engine.
+  struct ForceRelationalGuard {
+    explicit ForceRelationalGuard(SqlEngine* e)
+        : engine(e), saved(e->ForceRelationalFallback()) {}
+    ForceRelationalGuard(const ForceRelationalGuard&) = delete;
+    ForceRelationalGuard& operator=(const ForceRelationalGuard&) = delete;
+    ~ForceRelationalGuard() { engine->SetForceRelationalFallback(saved); }
+    SqlEngine* engine;
+    bool saved;
+  } guard(engine);
   // T4446: the loop used to clear() and overwrite `result` per route and
   // return only the last (relational) run, so the documented "identical
   // results" contract was never checked -- a wrong answer on the compiled
@@ -42,15 +54,13 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
     EXPECT_TRUE(prepared.HasValue()) << engine->LastError();
     if (!prepared.HasValue()) {
       result.clear();
-      engine->SetForceRelationalFallback(false);
       return result;
     }
     std::vector<std::string> route_result;
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
-      EXPECT_EQ(row.values_.size(), 1U);
+      EXPECT_EQ(row.values_.size(), 1U) << "route divergence for: " << sql;
       if (row.values_.size() != 1) {
-        engine->SetForceRelationalFallback(false);
         return {};
       }
       route_result.push_back(row[0].AsString());
@@ -63,7 +73,6 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
       result = std::move(route_result);
     }
   }
-  engine->SetForceRelationalFallback(false);
   return result;
 }
 

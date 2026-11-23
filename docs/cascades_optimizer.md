@@ -8,14 +8,15 @@ tinylamb's optimizer is split into three independent rule layers:
 3. `cascades::ImplementationRuleSet` turns logical expressions into physical
    plans, which are costed and cached by required physical properties.
 
-The layers depend on their small pattern and binding APIs, not on one another.
-Adding or removing a scalar rule does not require editing memo exploration,
-and adding a logical equivalence does not require changing the physical
-implementations.
+The layers are separate rule sets, but the implementation layer has explicit
+dependencies on executor and index APIs for some physical alternatives. Adding
+or removing a scalar rule does not require editing memo exploration, and
+adding a logical equivalence does not usually require changing physical
+implementations; changes to physical operators may touch both.
 
 
 The current audit and complete registry are in [optimizer_rule_audit.md](optimizer_rule_audit.md).
-There are 95 logical and 46 physical registrations. Normal single-table queries
+There are 97 logical and 46 physical registrations. Normal single-table queries
 and simple column-key GROUP BY use the same memo as joins; only exact MIN/MAX
 index endpoint retrieval retains its specialized shortcut. Advanced grouped SQL
 keeps the existing relational finish where the narrow memo contract declines.
@@ -52,7 +53,7 @@ rewrites. A pushed scan is added to the Selection result group; it must not
 mutate the shared input group. Scan bounds must remain semantically exact.
 
 The built-in logical rules include (see `RuleSet::Default` in
-`plan/cascades.cpp` for the authoritative list, 95 registrations):
+`plan/cascades.cpp` for the authoritative list):
 
 - `join_commutativity`
 - `join_enumeration`
@@ -87,7 +88,13 @@ The built-in physical rules include (see `plan/implementation_rules.cpp`):
 - `projection`
 - `aggregation`
 - `limit`
-- `hash_join` (inner/outer/semi/anti, bitmap and TopN/Sort/Distinct/SetOp/Window variants)
+- `hash_join` (inner), `outer_hash_join`, `semi_hash_join`,
+  `anti_hash_join` (separate registrations)
+- bitmap scans are alternatives emitted by `index_scan`; `topn`, `sort`,
+  `sort_external_merge`, `sort_incremental`,
+  `distinct`, `sort_distinct`, `skip_scan_distinct`, `window`, and the
+  `union` / `union_all` / `intersect` / `intersect_all` / `except` /
+  `except_all` set-operation rules
 - `band_join` (inner; one signed INT64/DATE ordered comparison, with child SortPlans)
 - `outer_nested_loop` (LEFT non-equi; RIGHT normalizes to LEFT)
 - `index_join`
@@ -95,7 +102,8 @@ The built-in physical rules include (see `plan/implementation_rules.cpp`):
   row identities, then the payload is read above the identity join)
 - `zigzag_join` (inner; two ordered INT64 index inputs, equality or one range)
 - `nested_loop_join`
-- `aggregation` (its third `PlanAlternative` is the scalar stream aggregate beside hash/sort)
+- `aggregation` (hash/sort alternatives plus the scalar stream aggregate as its
+  third `PlanAlternative`)
 - `sort` / `sort_external_merge` (the two memory shapes of one ORDER BY: an
   in-memory `BufferedSortPlan` at or below the policy's row capacity, a
   `ExternalMergeSortPlan` above it; exactly one of the two rules offers an

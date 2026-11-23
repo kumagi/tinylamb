@@ -246,7 +246,7 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
   ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(final_reader, row_b, std::nullopt),
                         std::optional<std::string>(std::to_string(kRounds)));
   ASSERT_EQ(final_reader.PreCommit(), Status::kSuccess);
-  version_pin.Abort();
+  ASSERT_EQ(version_pin.Abort(), Status::kSuccess);
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
 }
 
@@ -669,20 +669,17 @@ TEST_F(QueueTableTest, PointRangeOnKeyPrefixResolvesHeapRows) {
     ASSERT_EQ(probe_ctx.PreCommit(), Status::kSuccess);
   }
 
+  // A disagreement must FAIL the test. The old GTEST_SKIP() turned the known
+  // prefix-descent bug (the 1-client TPC-C Delivery "affected too few rows"
+  // root cause) into a passing run, so a regression could never be detected.
   if (!mismatches.empty()) {
-    GTEST_SKIP()
-        << mismatches.front()
-        << (mismatches.size() > 1
-                ? ", " + std::to_string(mismatches[1]) + ", ..."
-                : ", ...")
-        << " This is the 1-client TPC-C Delivery 'affected too few rows' "
-           "root cause.";
+    ADD_FAILURE() << "prefix range disagrees with heap for orders: "
+                  << mismatches.front()
+                  << (mismatches.size() > 1
+                          ? ", " + std::to_string(mismatches[1]) + ", ..."
+                          : ", ...");
   }
 
-  // Reached only when every prefix probe agreed with the heap; the GTEST_SKIP
-  // above intentionally returns on the known index-descent bug, so this
-  // assertion documents the post-fix contract rather than a reachable failure.
-  EXPECT_TRUE(mismatches.empty());
   ASSERT_EQ(ctx.PreCommit(), Status::kSuccess);
 }
 
@@ -732,7 +729,7 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
   for (const RowPosition& pos : ten) {
     ASSERT_EQ(doomed_table.Value()->Delete(doomed.txn_, pos), Status::kSuccess);
   }
-  doomed.Abort();
+  ASSERT_EQ(doomed.Abort(), Status::kSuccess);
 
   // Precondition: the queue-head slot no longer holds its physical image
   // (undo restored order 10's images into order 9's old holes), yet the row

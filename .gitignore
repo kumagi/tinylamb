@@ -1,11 +1,12 @@
 build/
-/=
 build-*/
 cmake-build-*/
 .idea/
 build-coverage/
 CMakeFiles/
-Testing/
+Testing/Temporary/
+Testing/TAG
+Testing/DartConfiguration.tcl
 *.o
 *.a
 *.so

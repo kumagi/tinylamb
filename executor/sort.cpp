@@ -169,10 +169,10 @@ int CompareSpans(std::string_view a, std::string_view b) {
 
 class SortKeyEncoder {
  public:
-  enum class Kind { kSingleUInt64, kEncoded };
+  enum class Kind { kSingleUInt64, kPackedTwoInt64, kEncoded };
 
   SortKeyEncoder(const std::vector<SortExecutor::Key>& keys,
-                 const Schema& schema)
+                 const Schema& schema, std::vector<SortKeyOrder>* domains)
       : schema_(&schema) {
     specs_.reserve(keys.size());
     for (const SortExecutor::Key& key : keys) {
@@ -184,6 +184,9 @@ class SortKeyEncoder {
       // disagreed with TopNExecutor on the same ORDER BY.
       spec.nulls_first = key.nulls_first.value_or(key.ascending);
       spec.collation = key.collation;
+      spec.order = MakeSortKeyOrder(key);
+      if (domains != nullptr) { spec.shared_order = &domains->at(specs_.size());
+}
       if (key.expression->Type() == TypeTag::kColumnValue) {
         const int offset =
             schema.Offset(key.expression->AsColumnValue().GetColumnName());
@@ -199,11 +202,57 @@ class SortKeyEncoder {
       specs_.push_back(spec);
     }
     single_int_ = specs_.size() == 1 && specs_[0].column >= 0;
-    kind_ = single_int_ ? Kind::kSingleUInt64 : Kind::kEncoded;
+    const char* disable_packed =
+        std::getenv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
+    const bool allow_packed =
+        disable_packed == nullptr || disable_packed[0] != '1';
+    if (!single_int_ && allow_packed && specs_.size() == 2 &&
+        specs_[0].column >= 0 && specs_[1].column >= 0 &&
+        !specs_[0].is_unsigned && !specs_[1].is_unsigned) {
+      kind_ = Kind::kPackedTwoInt64;
+    } else {
+      kind_ = single_int_ ? Kind::kSingleUInt64 : Kind::kEncoded;
+    }
   }
 
   [[nodiscard]] Kind GetKind() const { return kind_; }
   [[nodiscard]] bool SingleNullsFirst() const { return specs_[0].nulls_first; }
+
+  // Packs two nullable signed INT64/DATE keys in [-2^30, 2^30 - 1] with
+  // independent ASC/DESC and NULLS FIRST/LAST into a single unsigned uint64
+  // whose natural < order equals lexicographic SQL ORDER BY order.
+  // Lean proof: lean/TinylambOpt/ResearchProofs/PackedOrderKey.lean (sound)
+  bool TryPackTwoKey(const Row& row, uint64_t* out) const noexcept {
+    static constexpr int64_t kMin31 = -(int64_t{1} << 30);
+    static constexpr int64_t kMax31 = (int64_t{1} << 30) - 1;
+    static constexpr uint64_t kMask31 = (uint64_t{1} << 31) - 1;
+    uint64_t encoded = 0;
+    for (size_t i = 0; i < 2; ++i) {
+      const Value& v = row.values_[static_cast<size_t>(specs_[i].column)];
+      uint64_t tag = 0;
+      uint64_t norm = 0;
+      if (v.IsNull()) {
+        tag = specs_[i].nulls_first ? 0ULL : 1ULL;
+        norm = 0;
+      } else {
+        if (v.IsUnsigned() ||
+            (v.type != ValueType::kInt64 && v.type != ValueType::kDate)) {
+          return false;
+        }
+        const int64_t x = v.value.int_value;
+        if (x < kMin31 || x > kMax31) {
+          return false;
+        }
+        tag = specs_[i].nulls_first ? 1ULL : 0ULL;
+        const auto pos = static_cast<uint64_t>(x - kMin31);
+        norm = specs_[i].ascending ? pos : (kMask31 - pos);
+      }
+      const uint64_t half = (tag << 31) | norm;
+      encoded = (i == 0) ? (half << 32) : (encoded | half);
+    }
+    *out = encoded;
+    return true;
+  }
 
   // A single flipped-sign-bit integer cannot order mixed signedness: signed
   // 1 and unsigned 2^63+1 both map to 0x8000000000000001, and signed 0 and
@@ -259,6 +308,9 @@ class SortKeyEncoder {
         }
         v = &evaluated;
       }
+      if (error != nullptr && error->ok()) {
+        *error = ((spec.shared_order != nullptr) ? *spec.shared_order : spec.order).Observe(*v);
+      }
       // Collation-aware encoding: a case-insensitive key folds its text
       // before the memcomparable form is written, so byte order *is* the
       // collation order. Doing it here (not in the comparator) keeps the
@@ -306,6 +358,8 @@ class SortKeyEncoder {
     int column{-1};
     bool is_unsigned{false};
     Collation collation{Collation::kNone};
+    mutable SortKeyOrder order;
+    SortKeyOrder* shared_order{};
   };
   const Schema* schema_;
   std::vector<Spec> specs_;
@@ -313,6 +367,7 @@ class SortKeyEncoder {
   Kind kind_{Kind::kEncoded};
 };
 
+// Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
 void RadixSortIndices(size_t* begin, const size_t* end,
                       const std::vector<uint64_t>& keys) {
   const auto n = static_cast<size_t>(end - begin);
@@ -321,7 +376,8 @@ void RadixSortIndices(size_t* begin, const size_t* end,
   }
   // Every pass below scatters all n slots of the scratch buffer before any of
   // them is read, so the buffer needs no zero-initialization.
-  std::unique_ptr<size_t[]> scratch(new size_t[n]);  // NOLINT(modernize-avoid-c-arrays)
+  std::unique_ptr<size_t[]> scratch(
+      new size_t[n]);  // NOLINT(modernize-avoid-c-arrays)
   size_t* src = begin;
   size_t* dst = scratch.get();
   for (int pass = 0; pass < 8; ++pass) {
@@ -345,8 +401,9 @@ void RadixSortIndices(size_t* begin, const size_t* end,
 
 class KeyOrdering {
  public:
-  KeyOrdering(const std::vector<SortExecutor::Key>& keys, const Schema& schema)
-      : encoder_(keys, schema) {}
+  KeyOrdering(const std::vector<SortExecutor::Key>& keys, const Schema& schema,
+              std::vector<SortKeyOrder>* domains)
+      : encoder_(keys, schema, domains) {}
 
   void AppendRow(const Row& row, Status* error = nullptr) {
     if (encoder_.GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
@@ -359,6 +416,18 @@ class KeyOrdering {
       bands_.push_back(band);
       raw_keys_.push_back(key);
       null_flags_.push_back(static_cast<uint8_t>(is_null));
+      return;
+    }
+    if (encoder_.GetKind() == SortKeyEncoder::Kind::kPackedTwoInt64) {
+      if (!packed_overflow_) {
+        uint64_t packed = 0;
+        if (encoder_.TryPackTwoKey(row, &packed)) {
+          raw_keys_.push_back(packed);
+          return;
+        }
+        packed_overflow_ = true;
+        std::vector<uint64_t>().swap(raw_keys_);
+      }
       return;
     }
     const size_t begin = blob_.size();
@@ -378,6 +447,7 @@ class KeyOrdering {
     null_flags_.clear();
     bands_.clear();
     mixed_bands_ = false;
+    packed_overflow_ = false;
   }
 
   [[nodiscard]] SortKeyEncoder::Kind GetKind() const {
@@ -385,13 +455,27 @@ class KeyOrdering {
   }
 
   [[nodiscard]] StatusOr<std::vector<size_t>> BuildPermutation(
-      size_t rows, size_t workers) const {
+      size_t rows, size_t workers,
+      const std::vector<PositionedRow>* source_rows = nullptr) {
     std::vector<size_t> perm(rows);
     for (size_t i = 0; i < rows; ++i) {
       perm[i] = i;
     }
     if (rows < 2) {
       return perm;
+    }
+
+    const bool packed_active =
+        GetKind() == SortKeyEncoder::Kind::kPackedTwoInt64 && !packed_overflow_;
+    if (GetKind() == SortKeyEncoder::Kind::kPackedTwoInt64 &&
+        packed_overflow_ && source_rows != nullptr && spans_.empty()) {
+      Status encode_status{Status::kSuccess};
+      for (size_t i = 0; i < rows; ++i) {
+        const size_t begin = blob_.size();
+        encoder_.AppendEncoded((*source_rows)[i].first, &blob_, &encode_status);
+        RETURN_IF_FAIL(encode_status);
+        spans_.emplace_back(begin, blob_.size() - begin);
+      }
     }
 
     size_t sortable_begin = 0;
@@ -433,12 +517,18 @@ class KeyOrdering {
         }
         return raw_keys_[a] < raw_keys_[b];
       }
+      if (packed_active) {
+        return raw_keys_[a] < raw_keys_[b];
+      }
       return CompareSpans(SpanAt(a), SpanAt(b)) < 0;
     };
 
+    const bool use_radix =
+        (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 && !mixed_bands_) ||
+        packed_active;
     const bool parallel = workers > 1 && sortable_rows >= kParallelSortMinRows;
     if (!parallel) {
-      if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 && !mixed_bands_) {
+      if (use_radix) {
         RadixSortIndices(base, base + sortable_rows, raw_keys_);
       } else {
         std::stable_sort(base, base + sortable_rows, index_less);
@@ -460,8 +550,7 @@ class KeyOrdering {
       try {
         threads.emplace_back([&, begin, end] {
           try {
-            if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 &&
-                !mixed_bands_) {
+            if (use_radix) {
               RadixSortIndices(base + begin, base + end, raw_keys_);
             } else {
               std::stable_sort(base + begin, base + end, index_less);
@@ -513,6 +602,7 @@ class KeyOrdering {
   // Mixed signedness needs a band tie-break the 64-bit key cannot express.
   std::vector<uint8_t> bands_;
   bool mixed_bands_{false};
+  bool packed_overflow_{false};
 };
 
 class RunReader {
@@ -583,11 +673,12 @@ Status SortExecutor::Materialize() {
   rows_charge_ = QueryMemoryCharge();
   offset_ = 0;
   materialized_ = false;
-  KeyOrdering ordering(keys_, schema_);
+  KeyOrdering ordering(keys_, schema_, options_.collation_domains.get());
   std::vector<SpillFile> runs;
   const auto write_sorted_run = [&]() -> Status {
-    ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
-                     ordering.BuildPermutation(rows_.size(), worker_count_));
+    ASSIGN_OR_RETURN(
+        std::vector<size_t>, permutation,
+        ordering.BuildPermutation(rows_.size(), worker_count_, &rows_));
     ApplyPermutation(&rows_, permutation);
     SpillFile run;
     for (const auto& item : rows_) {
@@ -654,7 +745,7 @@ Status SortExecutor::Materialize() {
             ? 1
             : std::min(worker_count_, std::max<size_t>(1, rows_.size()));
     ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
-                     ordering.BuildPermutation(rows_.size(), workers));
+                     ordering.BuildPermutation(rows_.size(), workers, &rows_));
     ApplyPermutation(&rows_, permutation);
     rows_charge_ = std::move(charge);
   } else {
@@ -810,8 +901,7 @@ size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) try {
 } catch (const std::exception& error) {
   destination->Reset();
   materialize_failed_ = true;
-  materialize_error_ =
-      StatusError(StatusCode::kRuntimeError, error.what());
+  materialize_error_ = StatusError(StatusCode::kRuntimeError, error.what());
   FailWith(materialize_error_);
   return 0;
 } catch (...) {
@@ -824,9 +914,8 @@ size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) try {
 }
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {
-  output << (worker_count_ > 1 ? "ParallelSort (" : "Sort (")
-         << worker_count_ << " workers, spill="
-         << SpillModeLabel(options_.spill_mode);
+  output << (worker_count_ > 1 ? "ParallelSort (" : "Sort (") << worker_count_
+         << " workers, spill=" << SpillModeLabel(options_.spill_mode);
   if (options_.memory_budget_bytes != 0) {
     output << ", budget=" << options_.memory_budget_bytes << "B";
   }

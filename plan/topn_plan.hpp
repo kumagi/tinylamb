@@ -22,12 +22,13 @@ struct TopNKey {
 class TopNPlan final : public PlanBase {
  public:
   TopNPlan(Plan child, std::vector<TopNKey> keys, size_t limit, size_t offset,
-           bool with_ties = false)
+           bool with_ties = false, size_t prior_offset = 0)
       : child_(std::move(child)),
         keys_(std::move(keys)),
         limit_(limit),
         offset_(offset),
-        with_ties_(with_ties) {}
+        with_ties_(with_ties),
+        prior_offset_(prior_offset) {}
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override;
@@ -55,7 +56,8 @@ class TopNPlan final : public PlanBase {
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] bool EnforcesLimit(size_t limit, size_t offset) const override {
-    return !with_ties_ && limit == limit_ && offset == offset_;
+    return !with_ties_ && limit == limit_ && offset >= prior_offset_ &&
+           offset - prior_offset_ == offset_;
   }
   [[nodiscard]] bool EnforcesDistinct() const override {
     return (!with_ties_ && limit_ <= 1) || child_->EnforcesDistinct();
@@ -66,6 +68,7 @@ class TopNPlan final : public PlanBase {
   [[nodiscard]] size_t Limit() const { return limit_; }
   [[nodiscard]] size_t Offset() const { return offset_; }
   [[nodiscard]] bool WithTies() const { return with_ties_; }
+  [[nodiscard]] size_t PriorOffset() const { return prior_offset_; }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -75,6 +78,7 @@ class TopNPlan final : public PlanBase {
   size_t limit_{0};
   size_t offset_{0};
   bool with_ties_{false};
+  size_t prior_offset_{0};
 };
 
 }  // namespace tinylamb

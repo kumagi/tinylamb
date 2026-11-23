@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_SPILL_FILE_HPP
 #define TINYLAMB_SPILL_FILE_HPP
 
+#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -31,8 +32,23 @@ class SpillFile {
     RowReader() = default;
     RowReader(const RowReader&) = delete;
     RowReader& operator=(const RowReader&) = delete;
-    RowReader(RowReader&&) = default;
-    RowReader& operator=(RowReader&&) = default;
+    RowReader(RowReader&& other) noexcept
+        : path_(std::move(other.path_)),
+          io_buffer_(std::move(other.io_buffer_)),
+          stream_(std::move(other.stream_)),
+          remaining_(std::exchange(other.remaining_, 0)) {}
+    RowReader& operator=(RowReader&& other) noexcept {
+      if (this != &other) {
+        // The old stream borrows io_buffer_. Destroy it before replacing
+        // the storage it refers to.
+        stream_.reset();
+        path_ = std::move(other.path_);
+        io_buffer_ = std::move(other.io_buffer_);
+        stream_ = std::move(other.stream_);
+        remaining_ = std::exchange(other.remaining_, 0);
+      }
+      return *this;
+    }
     ~RowReader() = default;
 
     [[nodiscard]] bool IsOpen() const noexcept { return stream_ != nullptr; }
@@ -70,8 +86,8 @@ class SpillFile {
   StatusOr<std::vector<Row>> ReadAllRows();
   StatusOr<std::vector<std::pair<Row, RowPosition>>> ReadAllPositioned();
 
-  // Stream rows without buffering the full file. A callback returning Status
-  // can stop iteration by returning a failure.
+  // Stream rows without buffering the full file. A callback returning Status,
+  // a Status-convertible value or StatusOr can stop iteration on failure.
   template <typename Fn>
   Status ForEachRow(Fn&& fn) {
     if (count_ == 0) {
@@ -93,20 +109,7 @@ class SpillFile {
             StatusCode::kCorrupt,
             "truncated spill file: " + path_.string());  // NOLINT(readability)
       }
-      if constexpr (std::is_same_v<
-                        std::remove_cvref_t<std::invoke_result_t<Fn&, Row&>>,
-                        Status>) {
-        const Status status = fn(row);
-        if (status != Status::kSuccess) {
-          // A Status callback can stop iteration early; release the fd now
-          // instead of leaving it open until SpillFile is destroyed or the
-          // next ForEachRow reopens it in EnsureReader().
-          stream_.close();
-          return status;
-        }
-      } else {
-        fn(row);
-      }
+      RETURN_IF_FAIL(VisitRow(fn, row));
     }
     return Status::kSuccess;
   }
@@ -133,17 +136,7 @@ class SpillFile {
             StatusCode::kCorrupt,
             "truncated spill file: " + path_.string());  // NOLINT(readability)
       }
-      if constexpr (std::is_same_v<std::remove_cvref_t<std::invoke_result_t<
-                                       Fn&, Row&, RowPosition&>>,
-                                   Status>) {
-        const Status status = fn(row, position);
-        if (status != Status::kSuccess) {
-          stream_.close();
-          return status;
-        }
-      } else {
-        fn(row, position);
-      }
+      RETURN_IF_FAIL(VisitRow(fn, row, position));
     }
     return Status::kSuccess;
   }
@@ -151,6 +144,27 @@ class SpillFile {
   static std::filesystem::path TempDirectory();
 
  private:
+  template <typename Fn, typename... Args>
+  Status VisitRow(Fn& fn, Args&... args) {
+    using Result = std::invoke_result_t<Fn&, Args&...>;
+    Status status = Status::kSuccess;
+    if constexpr (std::is_convertible_v<Result, Status>) {
+      status = fn(args...);
+    } else if constexpr (requires {
+                           {
+                             fn(args...).GetStatus()
+                           } -> std::convertible_to<Status>;
+                         }) {
+      status = fn(args...).GetStatus();
+    } else {
+      fn(args...);
+    }
+    if (status != Status::kSuccess) {
+      stream_.close();
+    }
+    return status;
+  }
+
   Status OpenForWrite();
   Status EnsureReader();
   // Reads and validates the row-count header at the start of the file.
@@ -160,6 +174,7 @@ class SpillFile {
   std::fstream stream_;
   uint64_t count_{0};
   uint64_t file_bytes_{0};
+  Status finish_error_{Status::kSuccess};
   bool writing_{false};
   bool finished_{false};
   bool has_positions_{false};

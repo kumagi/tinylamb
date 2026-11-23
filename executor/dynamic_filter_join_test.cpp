@@ -72,6 +72,34 @@
 namespace tinylamb {
 namespace {
 
+// Restores the previous value on scope exit so a failed EXPECT/EXPLAIN cannot
+// leave TINYLAMB_DISABLE_PARALLEL_SCAN set for a concurrent or later test.
+class ScopedDisableParallelScan {
+ public:
+  ScopedDisableParallelScan() {
+    const char* prev = ::getenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
+    if (prev != nullptr) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    ::setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
+  }
+  ScopedDisableParallelScan(const ScopedDisableParallelScan&) = delete;
+  ScopedDisableParallelScan& operator=(const ScopedDisableParallelScan&) =
+      delete;
+  ~ScopedDisableParallelScan() {
+    if (had_prev_) {
+      ::setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", prev_.c_str(), 1);
+    } else {
+      ::unsetenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
+    }
+  }
+
+ private:
+  bool had_prev_{false};
+  std::string prev_;
+};
+
 constexpr int64_t kMinI64 = std::numeric_limits<int64_t>::min();
 constexpr int64_t kMaxI64 = std::numeric_limits<int64_t>::max();
 
@@ -189,13 +217,13 @@ class DynamicFilterJoinTest : public ::testing::Test {
     SqlEngine engine(*database_);
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return prepared.GetStatus();
     }
     *rows = Drain(prepared.Value().get());
     if (prepared.Value()->GetStatus() != Status::kSuccess) {
       const Status status = prepared.Value()->GetStatus();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return status;
     }
     return context.PreCommit();
@@ -209,14 +237,14 @@ class DynamicFilterJoinTest : public ::testing::Test {
         engine.Prepare(context, "EXPLAIN ANALYZE " + std::string(sql));
     std::ostringstream text;
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return "ERROR: " + engine.LastError();
     }
     std::vector<Row> rows = Drain(prepared.Value().get());
     for (const Row& row : rows) {
       text << row[0] << "\n";
     }
-    context.Abort();
+    EXPECT_SUCCESS(context.Abort());
     return text.str();
   }
 
@@ -465,12 +493,11 @@ TEST_F(DynamicFilterJoinTest, ParallelAndSerialScansAgree) {
   EXPECT_EQ(Text(parallel),
             (std::vector<std::string>{"1|2|10", "2|4|20", "3|6|30"}));
 
-  setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
+  ScopedDisableParallelScan disable_parallel_scan;
   const std::string serial_plan = Explain(sql);
   EXPECT_EQ(serial_plan.find("ParallelScan"), std::string::npos) << serial_plan;
   std::vector<Row> serial;
   const Status serial_status = Run(sql, &serial);
-  unsetenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
   ASSERT_SUCCESS(serial_status);
   EXPECT_EQ(Text(serial), Text(parallel));
 }
@@ -479,7 +506,7 @@ TEST_F(DynamicFilterJoinTest, ParallelAndSerialScansAgree) {
 // The filter actually engages (EXPLAIN ANALYZE evidence).
 // ---------------------------------------------------------------------------
 
-TEST_F(DynamicFilterJoinTest, ProfitableShapePublishesTheFilterToTheScan) {
+TEST_F(DynamicFilterJoinTest, ProfitableShapeExplainsPublishedScan) {
   // dim has 3 rows, wide has 200: build * 4 <= probe, so the rule picks the
   // dynamic filter and the executor publishes it to the probe scan.
   const std::string plan =
@@ -889,7 +916,7 @@ class RuntimeFilterScanTest : public ::testing::Test {
                                       nullptr, &binding);
     ASSERT_TRUE(loaded.HasValue()) << loaded.GetStatus();
     *rows = loaded.Value().rows;
-    context.Abort();
+    EXPECT_SUCCESS(context.Abort());
   }
 
   static ScanRuntimeFilter Binding(

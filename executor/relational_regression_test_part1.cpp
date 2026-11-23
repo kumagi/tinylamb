@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstddef>
+
 #include "executor/detail/relational_sort_limit.hpp"
 #include "executor/relational_regression_test.hpp"
 
@@ -179,7 +181,16 @@ TEST_F(RelationalRegressionTest, DerivedStarKeepsBaseScanProjectionNarrow) {
   EXPECT_EQ(RelationalRun(*rs_, sql),
             std::vector<Row>({Row({Value(1), Value(5)})}));
   const std::string profile = ExplainAnalyze(*rs_, sql);
-  EXPECT_NE(profile.find("scan_values_decoded=8,"), std::string::npos)
+  constexpr std::string_view kDecoded = "scan_values_decoded=";
+  constexpr std::string_view kAvailable = "scan_values_available=";
+  const auto decoded = profile.find(kDecoded);
+  const auto available = profile.find(kAvailable);
+  ASSERT_NE(decoded, std::string::npos) << profile;
+  ASSERT_NE(available, std::string::npos) << profile;
+  // Scalar aggregate fusion may share one scan between the subqueries.
+  // In either plan, the scan decodes k and v and leaves spare unread.
+  EXPECT_LT(std::stoul(profile.substr(decoded + kDecoded.size())),
+            std::stoul(profile.substr(available + kAvailable.size())))
       << profile;
 }
 
@@ -218,6 +229,27 @@ TEST_F(RelationalRegressionTest, SubqueryCacheTracksOnlyReferencedCteBindings) {
   EXPECT_EQ(rebound_result->TotalRows(), 1U);
   EXPECT_EQ(ExecuteCachedUncorrelated(context, subquery, unrelated, false),
             cached);
+
+  // The same statement object only exercises the pointer-keyed fast path. Use
+  // a separately allocated, structurally identical AST to reach the CTE
+  // structural key, and make sure a different CTE binding never reuses it.
+  SelectStatement equivalent(
+      {NamedExpression("k", ColumnValueExp(ColumnName("k")))}, {}, nullptr);
+  SelectSource equivalent_base;
+  equivalent_base.table = "SmallKeys";
+  equivalent.SetSources({equivalent_base});
+  const size_t hits_before = runtime.uncorrelated_cache_hits;
+  const Relation* equivalent_shadowed =
+      ExecuteCachedUncorrelated(context, equivalent, shadowing, false);
+  ASSERT_NE(equivalent_shadowed, nullptr);
+  EXPECT_EQ(equivalent_shadowed, shadowed);
+  EXPECT_GT(runtime.uncorrelated_cache_hits, hits_before);
+  const Relation* equivalent_rebound =
+      ExecuteCachedUncorrelated(context, equivalent, rebound, false);
+  ASSERT_NE(equivalent_rebound, nullptr);
+  EXPECT_EQ(equivalent_rebound->TotalRows(), 1U);
+  EXPECT_EQ(ExecuteCachedUncorrelated(context, equivalent, shadowing, false),
+            shadowed);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -318,12 +350,21 @@ TEST_F(RelationalRegressionTest, ColumnarResidualUsesValueTruthiness) {
   ASSERT_TRUE(source.HasColumnarOnly());
 
   const Expression d = ColumnValueExp(ColumnName("d"));
-  for (const Expression& residual :
+  for (const Expression& predicate :
        {ColumnValueExp(ColumnName("s")), d,
         BinaryExpressionExp(d, BinaryOperation::kAdd,
                             ConstantValueExp(Value(1)))}) {
-    relational_detail::CompiledScanFilter filter;
-    filter.residual.push_back(residual);
+    // Use the real compiler so this pins *where* the predicate lands. Moving
+    // a VARCHAR/DATE truthiness test into the simple/payload path would still
+    // select the same rows here but regress in another query shape.
+    relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter({predicate}, source.schema);
+    ASSERT_EQ(filter.residual.size(), 1U)
+        << "truthiness predicate left the residual path";
+    EXPECT_TRUE(filter.simple.empty());
+    EXPECT_TRUE(filter.prefix_in.empty());
+    EXPECT_TRUE(filter.prebuilt_membership.empty());
+    EXPECT_TRUE(filter.prebuilt_scalar_compare.empty());
     relational_detail::Relation result;
     result.schema = source.schema;
     Status error{Status::kSuccess};
@@ -331,6 +372,9 @@ TEST_F(RelationalRegressionTest, ColumnarResidualUsesValueTruthiness) {
         context, source, filter, source.schema, nullptr, {}, nullptr, &result,
         &error, nullptr));
     ASSERT_SUCCESS(error);
+    // A columnar filter yields a columnar result; a silent fallback to
+    // row-at-a-time evaluation would leave a row-backed result.
+    EXPECT_TRUE(result.HasColumnarOnly());
     std::vector<Row> matched;
     ASSERT_SUCCESS(
         result.ForEachRow([&](const Row& row) { matched.push_back(row); }));
@@ -467,7 +511,7 @@ TEST_F(RelationalRegressionTest, WithTiesStreamsSpilledPeerGroup) {
     size_t limit;
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{budget.Limit()};
-  budget.ResetForTest(64 * 1024);
+  budget.ResetForTest(static_cast<size_t>(64 * 1024));
 
   relational_detail::Relation input;
   input.schema = Schema("sorted", {Column("k", ValueType::kInt64),
@@ -499,6 +543,29 @@ TEST_F(RelationalRegressionTest, WithTiesStreamsSpilledPeerGroup) {
     EXPECT_EQ(row[1], Value(expected_id++));
   }));
   EXPECT_EQ(expected_id, 514);
+
+  // The direct LimitedRows call above pre-spills the input Relation, so it
+  // never runs the ExternalKeyedSorter that the SQL route constructs with
+  // top1_with_ties=true. Cover that path too: a low budget makes the sorter
+  // spill while it adds rows, and every peer of the top row must survive.
+  RelationalRun(*rs_,
+                "CREATE TABLE TieSpill (k INT64, id INT64, payload STRING)");
+  {
+    auto ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          ctx.GetTable("TieSpill"));
+    for (int64_t id = 0; id < 1024; ++id) {
+      ASSERT_SUCCESS(table
+                         ->Insert(ctx.txn_, Row({Value(1), Value(id),
+                                                 Value(std::string(256, 'x'))}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  const auto tied = RelationalRun(
+      *rs_, "SELECT k, id FROM TieSpill ORDER BY k LIMIT 1 WITH TIES",
+      /*force_relational=*/true);
+  ASSERT_EQ(tied.size(), 1024U);
 }
 
 TEST_F(RelationalRegressionTest, BoundedTraversalEarlyExitLeavesTailWritable) {
@@ -507,7 +574,7 @@ TEST_F(RelationalRegressionTest, BoundedTraversalEarlyExitLeavesTailWritable) {
     size_t limit;
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{budget.Limit()};
-  budget.ResetForTest(64 * 1024);
+  budget.ResetForTest(static_cast<size_t>(64 * 1024));
 
   relational_detail::Relation input;
   input.schema = Schema("s", {Column("k", ValueType::kInt64),
@@ -532,6 +599,17 @@ TEST_F(RelationalRegressionTest, BoundedTraversalEarlyExitLeavesTailWritable) {
   input.AddRow(Row({Value(999), Value(std::string(256, 'y'))}));
   EXPECT_SUCCESS(input.GetStatus());
   EXPECT_EQ(input.TotalRows(), before + 1);
+  // A correct row count alone cannot tell an appended tail row from a row
+  // written into a fresh generation (or from a reordered/overwritten one).
+  std::vector<int64_t> keys;
+  keys.reserve(before + 1);
+  ASSERT_SUCCESS(input.ForEachRow(
+      [&](const Row& row) { keys.push_back(row[0].value.int_value); }));
+  ASSERT_EQ(keys.size(), before + 1);
+  for (size_t i = 0; i < before; ++i) {
+    EXPECT_EQ(keys[i], static_cast<int64_t>(i));
+  }
+  EXPECT_EQ(keys.back(), 999);
 }
 
 TEST_F(RelationalRegressionTest, AuditParallelFilterPreservesDeferredRowOrder) {
@@ -1435,6 +1513,15 @@ TEST_F(RelationalRegressionTest, MonotonicDictionarySumKeepsInfinity) {
   for (const auto& row : result) {
     EXPECT_EQ(row[1], Value(row[0] == Value(0) ? infinity : 32768.0));
   }
+  // The monotonic path reads dictionary codes per row. Check its row counter
+  // so the same result from the generic fallback does not pass this check.
+  const std::string sql = "SELECT k, SUM(v) FROM MonoInf GROUP BY k";
+  const std::string profile =
+      ExplainAnalyze(*rs_, sql, /*force_relational=*/true);
+  constexpr std::string_view kCounter = "dictionary_aggregate_rows=";
+  const auto pos = profile.find(kCounter);
+  ASSERT_NE(pos, std::string::npos) << profile;
+  EXPECT_GT(std::stoul(profile.substr(pos + kCounter.size())), 0U) << profile;
 }
 
 TEST_F(RelationalRegressionTest, DirectDoubleWindowOrderKeepsExceptionalPeers) {
@@ -4326,6 +4413,42 @@ TEST_F(RelationalRegressionTest, MoreThanEightSlimAggregatesFoldCorrectly) {
   }
   // LSTable-direct fold over the column store.
   EXPECT_EQ(RelationalRun(*rs_, wide), expected);
+}
+
+// The flat columnar window path computes a dense slot span as
+// uint64(max) - uint64(min) + 1. The full [INT64_MIN, INT64_MAX] range wraps
+// that span to 0, which used to enter the dense path with a 0/1-slot array
+// and write far out of bounds (heap corruption). It must fall back instead.
+TEST_F(RelationalRegressionTest, ColumnarWindowFullInt64PartitionRange) {
+  auto context = rs_->BeginContext();
+  const Schema schema(
+      "w", {Column("p", ValueType::kInt64), Column("k", ValueType::kInt64)});
+  std::vector<Row> rows;
+  rows.reserve(4096);
+  for (int64_t i = 0; i < 4096; ++i) {
+    const int64_t key = (i % 2 == 0) ? std::numeric_limits<int64_t>::min()
+                                     : std::numeric_limits<int64_t>::max();
+    rows.emplace_back(std::vector<Value>{Value(key), Value(i)});
+  }
+  auto table = relational_detail::BuildColumnarTableFromRows(schema, rows);
+  ASSERT_TRUE(table.HasValue());
+  relational_detail::Relation input;
+  input.schema = schema;
+  input.SetColumnarTable(table.MoveValue(), false);
+  ASSERT_TRUE(input.HasColumnarOnly());
+
+  auto window = std::make_shared<WindowFunctionCallExpression>();
+  window->function = "SUM";
+  window->args = {ColumnValueExp(ColumnName("k"))};
+  window->partition_by = {ColumnValueExp(ColumnName("p"))};
+  const std::vector<const WindowFunctionCallExpression*> windows{window.get()};
+  const std::vector<std::string> names{"$win0"};
+
+  auto result = relational_detail::ExtendColumnarRelationWithWindows(
+      context, std::move(input), windows, names, nullptr, {});
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus().GetMessage();
+  EXPECT_EQ(result.Value().TotalRows(), rows.size());
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 }  // namespace

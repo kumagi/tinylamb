@@ -29,7 +29,10 @@ Status ReadPod(std::string_view* src, T* out) {
 }
 
 Status EncodeValueImpl(const Value& val, std::string* dst, int depth) {
-  if (depth <= 0) {
+  // Only arrays consume a nesting level. A scalar at depth 0 is valid and
+  // matches Value::CheckSerializableWithDepth / DecodeSpillValue, so a very
+  // deeply nested array's scalar elements are not rejected at the boundary.
+  if (val.type == ValueType::kArray && depth <= 0) {
     return StatusError(StatusCode::kTooBigData,
                        "value nesting depth exceeds spill codec limit");
   }
@@ -131,9 +134,13 @@ size_t EstimateValueMemoryBytes(const Value& val) noexcept {
     case ValueType::kDouble:
       break;
     case ValueType::kVarChar:
-      // Count the full VARCHAR payload conservatively (including short
-      // strings that may live in SSO) so string-heavy skew never undercounts.
-      total += kHeapPayloadOverhead + val.value.varchar_value.size();
+      // OwnedValuePayload only allocates a StringPayload for a non-empty
+      // string; an empty VARCHAR owns no heap header at all, so charging the
+      // conservative bound for every value (including empty strings in a
+      // string-heavy workload) would inflate the OOC budget estimate.
+      if (!val.value.varchar_value.empty()) {
+        total += kHeapPayloadOverhead + val.value.varchar_value.size();
+      }
       break;
     case ValueType::kArray: {
       const auto& elements = val.ArrayElements();
@@ -173,10 +180,9 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null src in DecodeSpillValue");
   }
-  if (max_depth <= 0) {
-    return StatusError(StatusCode::kCorrupt,
-                       "array nesting depth exceeded during spill decode");
-  }
+  // The depth budget is consumed by arrays only: read the tag first so a
+  // scalar element at max_depth == 0 is still accepted (same boundary as
+  // EncodeValueImpl and Value::CheckSerializableWithDepth).
   uint8_t tag = 0;
   RETURN_IF_FAIL(ReadPod(src, &tag));
   const auto vt = static_cast<ValueType>(tag & 0x07U);
@@ -188,10 +194,12 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
   switch (vt) {
     case ValueType::kNull: {
       Value out;
-      // Tag 3 is the unsigned marker, not a collation: applying it to a NULL
-      // would make IsUnsigned() true on a NULL value. Other collation tags
-      // are meaningful on NULL and round-trip by contract.
-      out.SetCollation(collation == 3 ? 0 : collation);
+      // Keep the tag exactly as Value::operator>> (Decoder) does. Tag 3 is
+      // the unsigned marker rather than a collation, but Value::IsUnsigned()
+      // already requires a non-NULL payload, so preserving it here cannot
+      // turn a NULL into an unsigned value; special-casing it would make the
+      // spill and Encoder/Decoder paths disagree about Collation()/LIKE.
+      out.SetCollation(collation);
       return out;
     }
     case ValueType::kInt64: {
@@ -233,6 +241,10 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
       return out;
     }
     case ValueType::kArray: {
+      if (max_depth <= 0) {
+        return StatusError(StatusCode::kCorrupt,
+                           "array nesting depth exceeded during spill decode");
+      }
       uint32_t type_len = 0;
       RETURN_IF_FAIL(ReadPod(src, &type_len));
       if (src->size() < type_len) {
@@ -244,12 +256,20 @@ StatusOr<Value> DecodeSpillValue(std::string_view* src, int max_depth) {
       uint32_t count = 0;
       RETURN_IF_FAIL(ReadPod(src, &count));
       if (src->size() < count) {
-        // Each element consumes at least 1 byte tag.
+        // Each element consumes at least 1 byte tag, so this is the tightest
+        // format-level validity bound: do not add an arbitrary smaller cap
+        // that would reject valid arrays.
         return StatusError(StatusCode::kCorrupt,
                            "corrupt array count in row spill stream");
       }
       std::vector<Value> elems;
-      elems.reserve(count);
+      // A corrupt count can still be close to the remaining byte count, and
+      // sizeof(Value) * count would then be a huge upfront allocation that
+      // throws bad_alloc instead of returning kCorrupt. Reserve only a small
+      // prefix; the vector grows as elements are actually decoded.
+      constexpr uint32_t kUpfrontElementReserve = 4096;
+      elems.reserve(count < kUpfrontElementReserve ? count
+                                                   : kUpfrontElementReserve);
       for (uint32_t i = 0; i < count; ++i) {
         ASSIGN_OR_RETURN(Value, elem, DecodeSpillValue(src, max_depth - 1));
         elems.push_back(std::move(elem));
@@ -366,6 +386,12 @@ Status WriteRowBlock(SpillSegmentWriter* writer, std::span<const Row> rows,
 StatusOr<bool> ReadRowBlock(SpillSegmentReader* reader,
                             std::vector<Row>* rows_out,
                             std::string* scratch_buffer) {
+  // The header contract promises an empty scratch buffer on every failed
+  // read, including Open()/header failures and the clean EOF path. Clear it
+  // up front so a reused buffer never exposes bytes from a previous block.
+  if (scratch_buffer != nullptr) {
+    scratch_buffer->clear();
+  }
   if (reader == nullptr || rows_out == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null argument in ReadRowBlock");

@@ -113,6 +113,7 @@ class Container:
         os.environ['TINYLAMB_BENCH_ORACLE_PASSWORD'] = password
         env = self.work / 'oracle.env'
         env.touch(mode=0o600)
+        env.chmod(0o600)
         env.write_text('ORACLE_PWD=' + password + '\nENABLE_ARCHIVELOG=false\nENABLE_FORCE_LOGGING=true\n')
         argv = ['docker', 'run', '-d', '--name', self.name,
                 '--cpuset-cpus', self.args.server_cpus, '--shm-size=2g',
@@ -134,6 +135,10 @@ class Container:
                                    f'exit={state.get("ExitCode")})')
             if time.monotonic() > deadline:
                 raise RuntimeError('Oracle Free did not become healthy in 900 seconds')
+            # Bounded poll of Docker's external health state: the state lives
+            # in another process, so there is no in-process condition variable
+            # to wait on. A 2s interval keeps `docker inspect` cheap; the
+            # monotonic deadline above bounds the total wait.
             time.sleep(2)
         # The prebuilt Full database can already be in ARCHIVELOG mode. The
         # environment switch alone does not undo that state. Explicitly match

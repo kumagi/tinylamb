@@ -28,11 +28,9 @@ std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
   StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
   if (!prepared.HasValue()) {
-    if (engine->LastError().empty()) {
-      prepared = engine->Prepare(*ctx, sql);
-    }
     if (!prepared.HasValue()) {
-      throw std::runtime_error(engine->LastError());
+      const std::string& error = engine->LastError();
+      throw std::runtime_error(error.empty() ? "Prepare failed" : error);
     }
   }
   std::vector<Row> rows;

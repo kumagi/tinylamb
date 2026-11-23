@@ -57,9 +57,9 @@ Not C++ layers; ignored by `check_layering.py` (`IGNORED_PREFIXES`).
   controller and supervisor for `ssh oci-small1` and `ssh oci-small2`.
 - `build_gantt.py` — distributed clean-build timeline viewer. Runs a clean
   build through `tools/distcomp` (starts `distcomp_coord --trace`), then
-  renders ONE self-contained HTML Gantt chart: X = elapsed time, Y = one row
-  per CPU core / distcomp slot on both machines (bars = per-file compiles
-  color-coded local/remote/link, idle slots visible, hover detail, zoom).
+  renders ONE self-contained HTML Gantt chart: X = elapsed time, Y = bands for
+  CPU core / distcomp slots on both machines plus link, archive, and other
+  tasks (hover detail, zoom; idle compile slots are visible).
   Data joined from `<build>/.ninja_log` + the coordinator's JSONL trace
   (`<build>/distcomp_trace.jsonl`). Output: `<build>/gantt.html`.
   `--no-build` re-renders from the last run; `--sync-src` rsyncs the source

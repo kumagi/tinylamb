@@ -58,16 +58,26 @@ class IndexScanIterator : public IteratorBase {
   IndexScanIterator& operator=(IndexScanIterator&&) = delete;
   ~IndexScanIterator() override = default;
   bool operator==(const IndexScanIterator& rhs) const {
-    // Two cursors are interchangeable only when their whole positioning state
-    // matches. Comparing just the root page, txn, and (lazily resolved) row
-    // would call an exhausted or oppositely directed cursor "equal" at the
-    // same row.
+    // Two cursors are interchangeable only when their observable positioning
+    // and output state matches: identity/bounds/direction, the current key and
+    // value-list offset, and the key/INCLUDE/resolved-row images. Comparing
+    // just the root page, txn and row would call an exhausted or oppositely
+    // directed cursor "equal" at the same row, and two cursors at the same
+    // position with different projections or integer peeks are not
+    // interchangeable either. Purely internal memoisation (heap-image copies,
+    // last-checked page ids, decode counters, ...) is deliberately excluded:
+    // it cannot change what the iterator yields.
     return bpt_ == rhs.bpt_ && &table_ == &rhs.table_ &&
            &index_ == &rhs.index_ && &txn_ == &rhs.txn_ &&
            ascending_ == rhs.ascending_ && resolve_head_ == rhs.resolve_head_ &&
            is_unique_ == rhs.is_unique_ && invalidated_ == rhs.invalidated_ &&
            status_ == rhs.status_ && value_offset_ == rhs.value_offset_ &&
-           pos_ == rhs.pos_ && keys_ == rhs.keys_ &&
+           begin_ == rhs.begin_ && end_ == rhs.end_ &&
+           entry_loaded_ == rhs.entry_loaded_ &&
+           cache_heap_images_ == rhs.cache_heap_images_ &&
+           integer_peeks_ == rhs.integer_peeks_ &&
+           projection_ == rhs.projection_ && pos_ == rhs.pos_ &&
+           keys_ == rhs.keys_ && include_ == rhs.include_ &&
            current_row_ == rhs.current_row_;
   }
   [[nodiscard]] bool IsValid() const override;
@@ -152,8 +162,14 @@ class IndexScanIterator : public IteratorBase {
   // Set by Clear(): once cleared the iterator must never report valid again
   // even though the underlying LsmIndexIterator may still iterate.
   bool invalidated_{false};
-  // Const resolve paths record failures here; keep it mutable instead of
-  // casting away constness at each call site.
+  // The mutable members in this class are lazy caches filled by the const
+  // resolve paths (ResolveRow / DecodeVisibleRow / TryReadIndexOnly) and by
+  // operator* const: sticky status, the resolved row, the heap-image cache
+  // and the index-only chain-probe memo.  They are per-iterator state: the
+  // copy/move constructors are deleted above and every scan owns its own
+  // iterator, so no two threads ever touch the same instance.  No mutex or
+  // atomic is required -- `mutable` only lets these caches be written from
+  // const methods without casting away constness at each call site.
   mutable Status status_{Status::kSuccess};
   // -1 means "not positioned"; otherwise an index into the non-unique
   // value list of the current key. Signed so the sentinel cannot wrap.

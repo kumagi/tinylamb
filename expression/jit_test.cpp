@@ -120,7 +120,7 @@ TEST(JitTest, GroupHashSimdAndDatePartMatchScalarForPartialVectors) {
     kernel.Hash(groups.data(), raw.data(), starts.data(), parts.data(),
                 hashes.data(), groups.size(), seed);
     for (size_t i = 0; i < groups.size(); ++i) {
-      const uint64_t part = use_minute ? 20 + i % 10 : 1U;
+      const uint64_t part = use_minute ? 20 + (i % 10) : 1U;
       EXPECT_EQ(parts[i], part);
       EXPECT_EQ(hashes[i],
                 mix(mix(seed ^ mix(static_cast<uint64_t>(groups[i]))) ^
@@ -417,6 +417,11 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
       });
   ASSERT_TRUE(ext_mul.has_value());
   ASSERT_TRUE(ext_coal.has_value());
+  constexpr uint8_t kMaxShift = JitDenseSplitRadixAgg::kMaxPartShift;
+  EXPECT_TRUE(JitDenseSplitRadixAgg::CompileScatter(kMaxShift).has_value());
+  EXPECT_TRUE(JitDenseSplitRadixAgg::CompileExtract({
+                  .part_shift = kMaxShift,
+              }).has_value());
 
   // 2 parts * 4 local gids/part = 8 total gids (r_card=4, pk0_card=2).
   // jk_min = 10, key_to_rsubgid: [0, UINT32_MAX, 2, 3] (10->0, 11->skip, 12->2,
@@ -443,27 +448,39 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
   const std::vector<uint8_t> n1{0, 0, 0, 0, 0, 0, 0, 0};
   // sel touches rows 0..7 (skips NULL jk[1], miss jk[2], NULL pk0[4],
   // out-of-range jk[7]). Valid rows: 0 (gid 0, 2.5*3=7.5), 3 (gid 5, 4*5=20.0),
-  // 5 (gid 5, NULL -> all-NULL? wait add another row!), 6 (gid 0, 5*2=10.0).
+  // 5 (gid 5, NULL value -> contributes no total), 6 (gid 0, 5*2=10.0).
+  // hist[1] is 2 because rows 3 and 5 both map to gid 5; only row 3 has a
+  // non-NULL value there.
   const std::vector<uint32_t> sel{0, 1, 2, 3, 4, 6, 7, 5};
   std::vector<uint32_t> out_tg(sel.size(), 0);
   std::vector<double> out_v(sel.size(), 0.0);
   std::array<uint32_t, 2> hist{0, 0};
 
   // Empty count = 0 check.
-  EXPECT_EQ(ext_mul->Run(0, sel.data(), jk_vals.data(), jk_nulls.data(), 10,
+  EXPECT_EQ(ext_mul->Run(0, 8, sel.data(), jk_vals.data(), jk_nulls.data(), 10,
                          key_to_r.size(), key_to_r.data(), pk0_vals.data(),
                          pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(),
                          2, v0.data(), n0.data(), v1.data(), n1.data(), nullptr,
                          nullptr, nullptr, nullptr, 1.0, out_tg.data(),
-                         out_v.data(), hist.data()),
+                         out_v.data(), hist),
             0U);
 
-  const uint32_t m = ext_mul->Run(
-      static_cast<uint32_t>(sel.size()), sel.data(), jk_vals.data(),
-      jk_nulls.data(), 10, key_to_r.size(), key_to_r.data(), pk0_vals.data(),
-      pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(), 2, v0.data(),
-      n0.data(), v1.data(), n1.data(), nullptr, nullptr, nullptr, nullptr, 1.0,
-      out_tg.data(), out_v.data(), hist.data());
+  const auto run_selected = [&](std::span<const uint32_t> selected,
+                                std::span<uint32_t> histogram) {
+    return ext_mul->Run(
+        static_cast<uint32_t>(selected.size()), 8, selected.data(),
+        jk_vals.data(), jk_nulls.data(), 10, key_to_r.size(), key_to_r.data(),
+        pk0_vals.data(), pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(), 2,
+        v0.data(), n0.data(), v1.data(), n1.data(), nullptr, nullptr, nullptr,
+        nullptr, 1.0, out_tg.data(), out_v.data(), histogram);
+  };
+  const std::array<uint32_t, 1> invalid_row{8};
+  const std::array<uint32_t, 1> row_in_second_partition{3};
+  EXPECT_EQ(run_selected(invalid_row, hist),
+            JitDenseSplitRadixAgg::kInvalidExtractCount);
+  EXPECT_EQ(run_selected(row_in_second_partition, std::span(hist).first(1)),
+            JitDenseSplitRadixAgg::kInvalidExtractCount);
+  const uint32_t m = run_selected(sel, hist);
   ASSERT_EQ(m, 4U);
   EXPECT_EQ(hist[0], 2U);  // gid 0 twice
   EXPECT_EQ(hist[1], 2U);  // gid 5 twice (one valid, one NULL)
@@ -524,11 +541,11 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
   std::vector<double> c_val(1);
   std::array<uint32_t, 2> c_hist{0, 0};
   ASSERT_EQ(
-      ext_coal->Run(1, nullptr, c_jk.data(), nullptr, 10, key_to_r.size(),
+      ext_coal->Run(1, 1, nullptr, c_jk.data(), nullptr, 10, key_to_r.size(),
                     key_to_r.data(), c_pk.data(), nullptr, 100, pk0_lut.size(),
                     pk0_lut.data(), 2, c_v0.data(), c_n0.data(), c_v1.data(),
                     c_n1.data(), nullptr, nullptr, nullptr, nullptr, 1.0,
-                    c_tg.data(), c_val.data(), c_hist.data()),
+                    c_tg.data(), c_val.data(), c_hist),
       1U);
   EXPECT_EQ(c_tg[0], 1U);  // sign bit NOT set for COALESCE
   EXPECT_DOUBLE_EQ(c_val[0], 0.0);
@@ -578,7 +595,7 @@ TEST(JitTest, JitPacked2x32HashProbe_ProbeBloomAndBias) {
         pack_pair(build_pairs[bid].first, build_pairs[bid].second);
     const uint64_t h = HashPacked2x32Key(pk);
     InsertPacked2x32Bloom(h, bloom.data(), kBloomMask);
-    size_t slot = static_cast<size_t>(h & kHtMask);
+    auto slot = static_cast<size_t>(h & kHtMask);
     while (ht_heads[slot] != UINT32_MAX) {
       slot = (slot + 1) & kHtMask;
     }
@@ -723,7 +740,7 @@ TEST(JitTest, JitPacked2x32RadixDedup_PackScatterAndGrowResume) {
       ht_cap *= 2;
       ht_keys.assign(ht_cap, 0);
       ht_gens.assign(ht_cap, 0);
-      const uint64_t nmask = static_cast<uint64_t>(ht_cap - 1);
+      const auto nmask = static_cast<uint64_t>(ht_cap - 1);
       for (uint32_t j = 0; j < n_occ; ++j) {
         const uint64_t pk =
             (static_cast<uint64_t>(

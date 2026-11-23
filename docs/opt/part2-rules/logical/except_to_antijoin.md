@@ -53,7 +53,7 @@ graph TD
 意味論の厳密な保持における留意点は以下の通りです。
 
 - **リレーションの排他性と修飾**: 等値述語は `left_rel.col = right_rel.col` の形式で生成されます。左右のリレーション集合が重複している場合、同一列名の参照解決が曖昧になるため、積集合が空であることを必須条件とします。
-- **三値論理と NULL 同値性**: SQL 規格の `EXCEPT` において、NULL 同士の比較は「同値（Distinct でない）」として扱われます。一方、通常の結合等式（`=`）は NULL 同士の比較で UNKNOWN を返すため、右辺に NULL が存在する場合にアンチ結合の判定が乖離する潜在的課題が存在します。tinylamb の現行実装では `kEquals` による等値結合式を生成しており、NULL を含むタプルにおける三値論理の挙動は物理アンチ結合の実装側に依存します。
+- **三値論理と NULL 同値性**: SQL 規格の `EXCEPT` において、NULL 同士の比較は「同値（Distinct でない）」として扱われます。通常の結合等式（`=`）は NULL 同士の比較で UNKNOWN を返すため、素の `=` では右辺に NULL が存在する場合にアンチ結合の判定が乖離します。tinylamb の現行実装は `BuildEqualityOnAllColumns` の `kRowEquality`（`BinaryOperation::kIsNotDistinctFrom`）でこの差を解消しています（NaN を含む DOUBLE 列はこの経路の対象外で、集合演算実装側に委ねられます）。
 - **左入力の重複度（D6 規律）**: 標準 SQL の `EXCEPT DISTINCT` は左入力に重複タプルが存在する場合に 1 件へ重複排除して出力しますが、通常の `AntiJoin` は右辺にマッチしない左辺タプルを重複度を保持したまま通過させます。本 Rule はアンチ結合を派生 Group に置き、その上に `kDistinct` を重ねることでこの差を解消しています。
 
 ## 実装の詳細
@@ -61,6 +61,12 @@ graph TD
 発火処理では、まず左右の子ノードおよび生成された全列等値述語を引き継いだ `kAntiJoin` 式を**派生 Group** へ追加し、その派生 Group を子に持つ `kDistinct` 式を親 Group へ追加します。
 
 ```cpp
+          const std::string tag =
+              "except-anti:" + ChildGroupIdsFingerprint(expression.children) +
+              TargetListFingerprint(expression.target_list) + ":" +
+              (expression.predicate && *expression.predicate
+                   ? (*expression.predicate)->ToString()
+                   : std::string("null"));
           const GroupId join_group =
               memo.EnsureDerivedGroup(memo.Get(group).relations, tag);
           memo.AddExpression(
@@ -75,12 +81,21 @@ graph TD
                                        .children = {join_group}});
 ```
 
-等値条件の構築は `BuildEqualityOnAllColumns` を用いて、`output_schema` の各列に対応する左右リレーションの列参照等式（`BinaryOperation::kEquals`）を連言（AND）で結合します。
+派生グループの `tag` は `"except-anti:"` に子 Group ID の指紋
+(`ChildGroupIdsFingerprint`) と target list の指紋、そして述語文字列を連結した
+ものです。子 ID が入ることで、同じリレーション集合・同じ target list を持つ
+異なる EXCEPT が 1 つの派生グループに衝突するのを防ぎます(D1)。これは
+`intersect_to_semijoin.md` の `intersect-semi:` タグと同じ契約です。
+
+等値条件の構築は `BuildEqualityOnAllColumns` が行います。集合演算は NULL 同士を
+等価とみなすため、素の `=` ではなく `kRowEquality`（`BinaryOperation::kIsNotDistinctFrom`）を
+使い、`output_schema` の各列に対応する左右の列参照を連言（AND）で結合します。
 
 ```cpp
-      conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(left_col),
-                                              BinaryOperation::kEquals,
-                                              ColumnValueExp(right_col)));
+  constexpr BinaryOperation kRowEquality = BinaryOperation::kIsNotDistinctFrom;
+  ...
+      conjuncts.push_back(BinaryExpressionExp(
+          ColumnValueExp(*left_col), kRowEquality, ColumnValueExp(*right_col)));
 ```
 
 ## 最適化効果

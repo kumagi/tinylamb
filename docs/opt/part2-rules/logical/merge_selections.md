@@ -87,5 +87,5 @@ graph TD
 ## 検証テスト
 
 - `plan/cascades_test_part1.cpp`:
-  - `CascadesTest.MergeSelectionsCollapsesSelectionChain`: 外側 Group に統合述語を持つ Selection 式が追加されることを検証。
+  - `CascadesTest.MergeSelectionsCollapsesSelectionChain`: 外側 Group に Selection 式が追加され、子が scan になることを検証します。テストは合成述語の内容を assertion していないため、述語内容の回帰はこのテストでは検出できません。
 

@@ -10,7 +10,7 @@
 - 区分: 実態との乖離
 - 対象: docs/distributed_membership.md:131-145(§5)、:143(「旧設計の kAddNode/kRemoveNode/kShardConfig を廃止」)
 - 問題: 列挙型自体がリポジトリに存在せず、廃止対象も不在。読者は既存 FSM があると誤認しやすい。
-- 根拠: grep で MetaCmdType/ShardConfig/kSealEpoch/DurabilityMode すべて 0 件。nodeid_t も common/constants.hpp:238-242(lsn_t/txn_id_t/page_id_t/slot_t/bin_size_t のエイリアス群)に存在しない。
+- 根拠: grep で MetaCmdType/ShardConfig/kSealEpoch/DurabilityMode すべて 0 件。nodeid_t も common/constants.hpp:253-257(lsn_t/txn_id_t/page_id_t/slot_t/bin_size_t のエイリアス群)に存在しない。
 - 提案: 冒頭に「本書は設計仕様。WP-2a/2b で新設」と注記。§5 を「新設 enum 定義」と明示。
 
 ### M-2: 運用インターフェース(tinylamb_admin)全体が未実装で §7/§8/§9 の手順が実行不可能
@@ -76,12 +76,11 @@
 - 根拠: 上記箇所以外に規定なし。
 - 提案: min は過小でも安全性を損なわない理由を明記。min に入れるのは voter のみ、learner は観測用と明記。
 
-### M-11: 用語・表記の問題(簡体字混入、L1/L2 learner 同名異義)
-- 区分: 不明瞭
-- 対象: docs/distributed_membership.md:90,105,116,235,325(「迁移」); :122-129(learner の二重使用)
-- 問題: 日本語文書に簡体字「迁移」が 5 箇所。L1(Raft)と L2(WAL 受信)の learner が同名だが実体別物(§4.3 が自認)であり、表記上の区別がない。
-- 根拠: 上記行番号の通り。docs/distributed_raft.md:45 の Role も L1 専用。
-- 提案: 「迁移」→「移行」に統一。L2 の learner を文書内で一貫して区別表記(例: shard-learner)にする。
+### M-11: 用語・表記の問題(解決済み)
+- 状態: 解決済み(2026-11-23)
+- 元の指摘: 簡体字「迁移」の混入と、L1/L2 learner の表記上の区別不足。
+- 対応: 現行 `docs/distributed_membership.md` に「迁移」「变更」は残っていない。L1 は「L1 learner」、シャード複製側は「L2 learner」と明記し、§4.3 と §6.2 の見出し・定義で呼び分けた。
+- 注: 元レビューの行番号は当時の記録であり、現行行番号を示すものではない。
 
 ## 未検証事項
 

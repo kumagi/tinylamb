@@ -2,8 +2,11 @@
 #ifndef TINYLAMB_GROUPED_AGGREGATE_HPP
 #define TINYLAMB_GROUPED_AGGREGATE_HPP
 
+#include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -63,6 +66,8 @@ struct GroupedAggregateOptions {
 // NaN one peer, -0 folds, a case-insensitive key folds), so all three shapes
 // agree on what "the same group" means. The aggregate list is referenced, not
 // copied: the owner fills it before the first row and never resizes it again.
+// The count is snapshotted on first use and FindOrCreate rejects a later
+// change, so the flat (group * count + index) state layout cannot go stale.
 class AggregateGroupTable {
  public:
   AggregateGroupTable(const Schema* input_schema,
@@ -85,7 +90,7 @@ class AggregateGroupTable {
   // Folds one input row into an existing group.
   [[nodiscard]] Status Accumulate(size_t group, const Row& row);
   // [group keys..., aggregate results...] for one group.
-  [[nodiscard]] StatusOr<Row> Finish(size_t group) const;
+  [[nodiscard]] StatusOr<Row> Finish(size_t group);
   // Folds `other`'s groups into this one; a group seen by both merges its
   // accumulator state, a group seen by one is adopted. Deterministic in
   // `other`'s group order, so the merge order fixes the output group order.
@@ -93,21 +98,31 @@ class AggregateGroupTable {
 
   [[nodiscard]] size_t size() const { return keys_.size(); }
   [[nodiscard]] bool empty() const { return keys_.empty(); }
-  [[nodiscard]] const Row& Key(size_t group) const { return *keys_[group]; }
-  [[nodiscard]] size_t AggregateCount() const { return aggregates_->size(); }
-  // The accumulator state of one (group, aggregate) pair; the positional fast
-  // path feeds it directly.
-  [[nodiscard]] relational_detail::AggregateAccumulator& StateFor(
-      size_t group, size_t index) {
-    return StateAt((group * aggregates_->size()) + index);
+  [[nodiscard]] const Row& Key(size_t group) const {
+    // at() keeps an out-of-range group from forming a bogus reference even in
+    // release builds; the null check catches a dangling key slot.
+    const Row* key = keys_.at(group);
+    assert(key != nullptr);
+    return *key;
   }
+  [[nodiscard]] size_t AggregateCount() const {
+    return keys_.empty() ? aggregates_->size() : aggregate_count_;
+  }
+  // The accumulator state of one (group, aggregate) pair; the positional fast
+  // path feeds it directly. Both overloads use the snapshotted count and
+  // reject a flat-index overflow before it can alias another group's state.
+  [[nodiscard]] StatusOr<relational_detail::AggregateAccumulator*> StateFor(
+      size_t group, size_t index);
+  [[nodiscard]] StatusOr<const relational_detail::AggregateAccumulator*> StateFor(
+      size_t group, size_t index) const;
   void Clear();
 
  private:
+  // Snapshots the aggregate list size on first use and rejects any later
+  // change, which would invalidate the flat accumulator-state layout.
+  [[nodiscard]] Status CheckAggregateList();
   void AppendGroupStates();
-  [[nodiscard]] relational_detail::AggregateAccumulator& StateAt(size_t flat);
-  [[nodiscard]] const relational_detail::AggregateAccumulator& StateAt(
-      size_t flat) const;
+  [[nodiscard]] StatusOr<size_t> StateIndex(size_t group, size_t index) const;
   // P48: append one accumulator to the chunked state arena.  Blocks are
   // reserved to full capacity on creation, so references handed out by
   // StateAt/StateFor stay valid while later groups append (the property the
@@ -125,6 +140,9 @@ class AggregateGroupTable {
 
   const Schema* input_schema_;
   const std::vector<const AggregateExpression*>* aggregates_;
+  // Set by CheckAggregateList when the first group is created; 0 means the
+  // list has not been observed yet.
+  size_t aggregate_count_{0};
   relational_detail::GroupKeyMap index_{};
   // P50: one key copy lives in the `index_` node; `keys_` points at it
   // (unordered_map nodes keep addresses stable across rehash), so the group
@@ -168,7 +186,8 @@ class GroupedAggregateBase : public ExecutorBase {
   virtual Status Build() = 0;
 
   [[nodiscard]] Status Materialize();
-  // Whether a finished group survives HAVING, or nullopt-style false. The
+  // Whether a finished group survives HAVING; false is a normal value meaning
+  // the group was filtered out (including a NULL predicate result). The
   // filter is a predicate over the group's output row, the same scope a
   // Selection above this node sees, so it may name a group key or an aggregate
   // result column. Three-valued: only TRUE keeps the group.
@@ -220,7 +239,9 @@ class HashAggregateExecutor final : public GroupedAggregateBase {
   // build peaks at the largest single partition's groups -- which is what the
   // partition count in the memory policy is there to keep small. The sort runs
   // keep exactly one group instead.
-  [[nodiscard]] size_t PeakResidentGroups() const { return peak_groups_; }
+  [[nodiscard]] size_t PeakResidentGroups() const {
+    return peak_groups_.load(std::memory_order_relaxed);
+  }
 
  protected:
   Status Build() override;
@@ -255,7 +276,7 @@ class HashAggregateExecutor final : public GroupedAggregateBase {
   bool spilled_{false};
   size_t spill_partitions_{0};
   size_t group_capacity_{0};
-  size_t peak_groups_{0};
+  std::atomic<size_t> peak_groups_{0};
 };
 
 // Sorts the input by the group keys and folds each run of equal keys in one

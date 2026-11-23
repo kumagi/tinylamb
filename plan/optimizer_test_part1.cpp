@@ -323,7 +323,7 @@ TEST_F(OptimizerTest, DoesNotFoldThrowingSelfComparison) {
   while (executor->Next(&row, nullptr)) {
   }
   EXPECT_NE(executor->GetStatus(), Status::kSuccess);
-  context.Abort();
+  ASSERT_SUCCESS(context.Abort());
 }
 
 TEST_F(OptimizerTest, ContradictoryConjunctsBecomeEmptyResult) {
@@ -933,7 +933,11 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
     if (plan_or.GetStatus() == Status::kNotImplemented) {
       return std::optional<std::vector<std::array<int64_t, 3>>>{};
     }
-    EXPECT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    const Status plan_status = plan_or.GetStatus();
+    if (plan_status != Status::kSuccess) {
+      ADD_FAILURE() << "Optimize failed: " << plan_status;
+      return std::optional<std::vector<std::array<int64_t, 3>>>{};
+    }
     Executor executor = plan_or.Value()->EmitExecutor(context);
     std::vector<std::array<int64_t, 3>> rows;
     Row row;

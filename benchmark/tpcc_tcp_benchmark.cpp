@@ -55,17 +55,19 @@ class Session final : public TpccSqlSession {
   Session(Session&&) = delete;
   Session& operator=(Session&&) = delete;
   ~Session() override {
-    if (fd_ >= 0) {
+    if (platform::IsValidSocketFd(fd_)) {
       platform::CloseSocket(fd_);
     }
   }
   Status Connect(int port) {
     fd_ = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-    if (fd_ < 0) {
+    if (!platform::IsValidSocketFd(fd_)) {
       return Status::kIOError;
     }
-    (void)platform::SetSocketTimeout(fd_, SO_RCVTIMEO, 15000);
-    (void)platform::SetSocketTimeout(fd_, SO_SNDTIMEO, 15000);
+    if (platform::SetSocketTimeout(fd_, SO_RCVTIMEO, 15000) < 0 ||
+        platform::SetSocketTimeout(fd_, SO_SNDTIMEO, 15000) < 0) {
+      return StatusError(StatusCode::kIOError, "socket timeout setup failed");
+    }
     (void)platform::SetSocketOptInt(fd_, IPPROTO_TCP, TCP_NODELAY, 1);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -102,7 +104,10 @@ class Session final : public TpccSqlSession {
   }
   void Abort() override {
     std::vector<Row> ignored;
-    (void)Execute("ROLLBACK", &ignored);
+    const Status rollback_status = Execute("ROLLBACK", &ignored);
+    if (!rollback_status.ok()) {
+      error_ = "ROLLBACK failed: " + std::string(ToString(rollback_status));
+    }
   }
   [[nodiscard]] std::string_view LastError() const override { return error_; }
   void TraceTransaction(uint64_t sequence, TpccTransactionType type) {
@@ -177,6 +182,7 @@ class Session final : public TpccSqlSession {
       }
       const uint32_t length = U32(std::string_view(header.data(), 5), 1);
       if (length < 4 || length > 16 * 1024 * 1024) {
+        error_ = "invalid reply length";
         return Status::kCorrupt;
       }
       std::string body(length - 4, '\0');
@@ -276,7 +282,7 @@ class Session final : public TpccSqlSession {
       }
     }
   }
-  int fd_{-1};
+  platform::SocketFd fd_{platform::kInvalidSocketFd};
   std::string error_, tag_;
   bool trace_{false};
   uint64_t trace_sequence_{0};
@@ -296,6 +302,9 @@ int main(int argc, char** argv) {
   uint64_t seed = 20260819;
   bool trace_sql = false, use_mysql = false, transport_test = false;
   int transaction_only = -1;
+  if ((argc - 1) % 2 != 0) {
+    return 2;  // every option needs a value
+  }
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string_view key(argv[i]), value(argv[i + 1]);
     uint64_t n = 0;
@@ -320,7 +329,8 @@ int main(int argc, char** argv) {
       use_mysql = n != 0;
     } else if (key == "--transport-test" && n <= 1) {
       transport_test = n != 0;
-    } else if (key == "--transaction" && n < 5) {
+    } else if (key == "--transaction" &&
+               n < tinylamb::kTpccTransactionTypeCount) {
       transaction_only = static_cast<int>(n);
     } else {
       return 2;
@@ -334,6 +344,14 @@ int main(int argc, char** argv) {
   }
 #ifdef TINYLAMB_TPCC_MYSQL
   if (use_mysql && mysql_library_init(0, nullptr, nullptr) != 0) return 1;
+  struct MysqlLibraryCleanup {
+    bool active;
+    ~MysqlLibraryCleanup() {
+      if (active) {
+        mysql_library_end();
+      }
+    }
+  } mysql_library_cleanup{use_mysql};
 #else
   if (use_mysql) {
     std::cerr << "build with TINYLAMB_TPCC_MYSQL=ON for MySQL\n";
@@ -431,7 +449,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     TpccWorkload check(*session, scale, seed, 0, nurand);
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < tinylamb::kTpccTransactionTypeCount; ++i) {
       const auto result = check.Execute(static_cast<TpccTransactionType>(i));
       if (!result.committed && !result.user_rollback) {
         std::cerr << result.error << '\n';
@@ -442,7 +460,8 @@ int main(int argc, char** argv) {
   std::latch ready(clients), start(1);
   Clock::time_point begin, end;
   std::atomic<bool> failed{false};
-  std::vector<std::array<Metrics, 5>> metrics(static_cast<size_t>(clients));
+  std::vector<std::array<Metrics, tinylamb::kTpccTransactionTypeCount>> metrics(
+      static_cast<size_t>(clients));
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(clients));
   for (int i = 0; i < clients; ++i) {
@@ -468,7 +487,7 @@ int main(int argc, char** argv) {
         // One worker only, diagnostics only. Never use traced latency/TPS in
         // comparisons: trace formatting and output alter the generator's pace.
         if (trace_sql && i == 0) {
-          static_cast<Session*>(
+          dynamic_cast<Session*>(
               session
                   .get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->TraceTransaction(++trace_sequence, t);
@@ -506,7 +525,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   uint64_t total = 0;
-  for (size_t t = 0; t < 5; ++t) {
+  for (size_t t = 0; t < tinylamb::kTpccTransactionTypeCount; ++t) {
     Metrics merged;
     for (auto& worker : metrics) {
       auto& m = worker[t];
@@ -532,12 +551,19 @@ int main(int argc, char** argv) {
     };
     const std::string prefix =
         std::string(ToString(static_cast<TpccTransactionType>(t))) + '.';
+    if (merged.committed > merged.attempted ||
+        merged.user_rollback > merged.attempted - merged.committed) {
+      std::cerr << prefix << "inconsistent transaction counters: attempted="
+                << merged.attempted << " committed=" << merged.committed
+                << " user_rollback=" << merged.user_rollback << '\n';
+      return 1;
+    }
+    const uint64_t engine_aborts =
+        merged.attempted - merged.committed - merged.user_rollback;
     std::cout << prefix << "attempted=" << merged.attempted << '\n'
               << prefix << "committed=" << merged.committed << '\n'
               << prefix << "user_rollback=" << merged.user_rollback << '\n'
-              << prefix << "engine_aborts="
-              << merged.attempted - merged.committed - merged.user_rollback
-              << '\n'
+              << prefix << "engine_aborts=" << engine_aborts << '\n'
               << prefix << "sql=" << merged.sql << '\n'
               << prefix
               << "tps=" << static_cast<double>(merged.committed) / seconds

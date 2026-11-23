@@ -11,6 +11,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -31,12 +32,14 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/string_util.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
+#include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -151,7 +154,7 @@ std::string TargetListFingerprint(const std::vector<NamedExpression>& targets) {
 // therefore carries the child group ids it is derived from.
 std::string GroupIdsTag(std::initializer_list<GroupId> ids) {
   std::string out = "@";
-  out.reserve(1 + ids.size() * 21);
+  out.reserve(1 + (ids.size() * 21));
   for (const GroupId id : ids) {
     AppendInteger(out, id);
     out.push_back(',');
@@ -161,7 +164,7 @@ std::string GroupIdsTag(std::initializer_list<GroupId> ids) {
 
 std::string GroupIdsTag(const std::vector<GroupId>& ids) {
   std::string out = "@";
-  out.reserve(1 + ids.size() * 21);
+  out.reserve(1 + (ids.size() * 21));
   for (const GroupId id : ids) {
     AppendInteger(out, id);
     out.push_back(',');
@@ -600,16 +603,24 @@ void InheritBranchLocal(Memo& memo, GroupId derived, GroupId source) {
   }
 }
 
-// Pushes every single-relation conjunct of `predicate` into the matching scan
-// group's filter. Returns the conjuncts that have no single-relation home and
-// therefore must stay in the Selection. Guard rail (Phase 2): nothing here
-// reasons about null-rejection, so the rule must never be used to push
-// predicates through outer joins (kOuterJoin rules handle null-rejection
-// separately). Extract per-table local conditions from an OR predicate that
-// touches multiple tables.  For each table involved, collect the conjuncts from
-// every OR branch that reference only that table.  If every branch has
-// at least one local conjunct for a given table, the local disjunction
-// is pushed to that table's scan filter as a selective pre-filter.
+// Pushing a single-relation conjunct into a shared scan group is only sound
+// when every join alternative over that group is an inner join. A memo group
+// can hold both kJoin and kOuterJoin alternatives (RIGHT is normalized to a
+// swapped LEFT, FULL is decomposed), and an outer join NULL-supplies one side:
+// filtering that side's scan before the join would remove padded rows.
+bool HasOuterJoinAlternative(const Memo& memo, GroupId group) {
+  return std::ranges::any_of(
+      memo.Get(group).expressions, [](const LogicalExpression& alternative) {
+        return alternative.operation == LogicalOperator::kOuterJoin;
+      });
+}
+
+// Extract per-table local conditions from an OR predicate that touches
+// multiple tables.  For each table involved, collect the conjuncts from every
+// OR branch that reference only that table.  If every branch has at least one
+// local conjunct for a given table, the local disjunction is pushed to that
+// table's scan filter as a selective pre-filter.  Null-rejection is not
+// analyzed here; callers gate this via `relation_enabled`.
 //
 // Example: OR(AND(t1.a=1, t2.b=2), AND(t1.a=3, t2.b=4))
 //   → t1 scan filter: OR(t1.a=1, t1.a=3)
@@ -644,8 +655,10 @@ void PushOrLocalConditions(
     local_branches.reserve(branches.size());
     bool every_branch_has_local = true;
     for (const Expression& branch : branches) {
+      const auto branch_conjuncts = SplitConjuncts(branch);
       std::vector<Expression> local;
-      for (const Expression& conjunct : SplitConjuncts(branch)) {
+      local.reserve(branch_conjuncts.size());
+      for (const Expression& conjunct : branch_conjuncts) {
         std::unordered_set<std::string> touched;
         for (const ColumnName& col : conjunct->TouchedColumns()) {
           if (!col.schema.empty()) {
@@ -682,8 +695,10 @@ void PushOrLocalConditions(
 std::vector<Expression> PushSingleRelationConjuncts(
     Memo& memo, const Expression& predicate,
     const std::function<bool(const std::string&)>& relation_enabled) {
+  const auto conjuncts = SplitConjuncts(predicate);
   std::vector<Expression> residual;
-  for (const Expression& conjunct : SplitConjuncts(predicate)) {
+  residual.reserve(conjuncts.size());
+  for (const Expression& conjunct : conjuncts) {
     std::unordered_set<std::string> touched;
     for (const ColumnName& column : conjunct->TouchedColumns()) {
       if (!column.schema.empty()) {
@@ -923,7 +938,10 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
     }
     const auto& schemas = memo.GetTableSchemas();
     if (schemas.empty()) {
-      return true;
+      // No catalog information means the column type is unknown: a DOUBLE
+      // (including a NaN produced without any table, e.g. 0.0/0.0) could be
+      // present, so this must fail closed like the missing-schema cases below.
+      return false;
     }
     if (col.schema.empty()) {
       return false;
@@ -968,6 +986,8 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
   };
 
   std::vector<Expression> conjuncts;
+  conjuncts.reserve(std::max<size_t>(expression.output_schema.ColumnCount(),
+                                     expression.target_list.size()));
 
   if (expression.output_schema.ColumnCount() > 0) {
     for (size_t i = 0; i < expression.output_schema.ColumnCount(); ++i) {
@@ -1389,9 +1409,19 @@ void AppendIdentityExpression(IdentityBuffer& out,
       AppendIdentityString(out, name.name);
       break;
     }
-    case TypeTag::kConstantValue:
+    case TypeTag::kConstantValue: {
+      // A ParameterSlot is a constant node carrying the currently bound
+      // value. Encoding that value would make every fingerprint depend on the
+      // prepared statement's arguments; identify the slot instead, so the
+      // same prepared plan keeps one identity across rebinding.
+      const auto* slot = dynamic_cast<const ParameterSlot*>(expression.get());
+      if (slot != nullptr) {
+        out << "param:" << slot->Index() << ';';
+        break;
+      }
       AppendIdentityValue(out, expression->AsConstantValue().GetValue());
       break;
+    }
     case TypeTag::kBinaryExp: {
       const auto& binary = expression->AsBinaryExpression();
       out << static_cast<int>(binary.Op()) << ':';
@@ -1515,7 +1545,24 @@ std::string ExpressionIdentity(const Expression& expression) {
 // enum integer would rewrite every fingerprint (and every derived-group tag
 // that embeds one) as soon as a new LogicalOperator value is inserted, so the
 // identity stays textual like the JoinKind ledger in common/join_kind.hpp.
-const char* LogicalOperatorName(LogicalOperator op) {
+// Stable spelling of the legacy outer-join type (0=left, 1=right, 2=full),
+// used by kOuterJoin fingerprints. Keeping it textual means re-ordering
+// JoinKind or any other enum cannot rewrite an existing alternative's
+// fingerprint (and therefore every derived-group tag that embeds it).
+std::string OuterJoinTypeName(uint8_t join_type) {
+  switch (join_type) {
+    case 0:
+      return "left";
+    case 1:
+      return "right";
+    case 2:
+      return "full";
+    default:
+      return "unknown:" + std::to_string(static_cast<unsigned>(join_type));
+  }
+}
+
+std::string LogicalOperatorName(LogicalOperator op) {
   switch (op) {
     case LogicalOperator::kScan:
       return "scan";
@@ -1574,7 +1621,10 @@ const char* LogicalOperatorName(LogicalOperator op) {
     case LogicalOperator::kRelational:
       return "relational";
   }
-  return "unknown";
+  // An unrecognised enum value must still get a distinct fingerprint:
+  // collapsing every bad value to "unknown" would put semantically different
+  // expressions in the same memo group ("one group, one meaning").
+  return "unknown:" + std::to_string(static_cast<unsigned>(op));
 }
 
 }  // namespace
@@ -1586,7 +1636,7 @@ std::string LogicalExpression::Fingerprint() const {
     out << ':' << child;
   }
   if (operation == LogicalOperator::kOuterJoin) {
-    out << "#j:" << static_cast<unsigned>(join_type);
+    out << "#j:" << OuterJoinTypeName(join_type);
   }
   if (predicate && *predicate) {
     out << "#p:" << ExpressionIdentity(*predicate);
@@ -1603,15 +1653,20 @@ std::string LogicalExpression::Fingerprint() const {
     out << "#s:";
     for (size_t i = 0; i < target_list.size(); ++i) {
       out << (i < sort_ascending.size() && sort_ascending[i] ? 'a' : 'd');
-      if (i < sort_nulls_first.size()) {
-        out << (sort_nulls_first[i].value_or(false) ? 'f' : 'l');
+      if (i < sort_nulls_first.size() && sort_nulls_first[i].has_value()) {
+        out << (*sort_nulls_first[i] ? 'f' : 'l');
       } else {
+        // Unspecified (nullopt, or a shorter vector) means the engine default,
+        // which is NOT the same ordering requirement as an explicit NULLS LAST.
         out << 'd';
       }
     }
   }
   if (operation == LogicalOperator::kLimit) {
     out << "#l:" << limit_offset << ',' << limit_count;
+    if (prior_limit_offset != 0) {
+      out << ",prior=" << prior_limit_offset;
+    }
     // WITH TIES exists on kLimit too (limit_push_through_sort forwards it);
     // without this the tied and untied variants collapse into one fingerprint.
     if (with_ties) {
@@ -1620,13 +1675,25 @@ std::string LogicalExpression::Fingerprint() const {
   }
   if (operation == LogicalOperator::kTopN) {
     out << "#l:" << limit_offset << ',' << limit_count;
+    if (prior_limit_offset != 0) {
+      out << ",prior=" << prior_limit_offset;
+    }
     if (with_ties) {
       out << ",ties";
     }
   }
   if (operation == LogicalOperator::kRelational) {
-    out << "#relational:"
-        << static_cast<const void*>(relational_statement.get());
+    // Identity must come from the statement's content, not the shared_ptr
+    // address: two separately parsed/copied but equivalent statements are the
+    // same alternative, and an in-place mutation must change the fingerprint.
+    // Otherwise duplicates survive dedup and burn the expression cap.
+    out << "#relational:";
+    if (relational_statement) {
+      const std::string fp = relational_statement->Fingerprint();
+      out << fp.size() << ':' << fp;
+    } else {
+      out << "<null>";
+    }
   }
   if (operation == LogicalOperator::kValues) {
     out << "#v:" << output_schema.ColumnCount() << ':' << values.size();
@@ -1642,7 +1709,14 @@ std::string LogicalExpression::Fingerprint() const {
           << static_cast<int>(col.GetConstraint().ctype) << ';';
     }
   }
-  if (!partition_by.empty()) {
+  // For kAggregation, AddExpression promotes a partition_by-only spelling to
+  // grouping_sets and, when both are supplied, keeps partition_by merely as
+  // partitioning metadata (grouping_sets is authoritative). Including both
+  // lists here would split otherwise identical aggregates into different
+  // fingerprints, so the metadata is deliberately left out of the key.
+  const bool aggregation_has_grouping_sets =
+      operation == LogicalOperator::kAggregation && !grouping_sets.empty();
+  if (!partition_by.empty() && !aggregation_has_grouping_sets) {
     out << "#pb:";
     for (const Expression& expr : partition_by) {
       out << (expr ? ExpressionIdentity(expr) : std::string()) << ';';
@@ -1668,8 +1742,16 @@ std::string LogicalExpression::Fingerprint() const {
         << depth_spec->upper;
   }
   if (operation == LogicalOperator::kApply) {
-    out << "#apply:" << static_cast<const void*>(relational_statement.get())
-        << ':' << static_cast<int>(join_type);
+    // Same content-based identity as kRelational: a pointer would vary per
+    // process/allocation and defeat memo dedup and plan caching.
+    out << "#apply:";
+    if (relational_statement) {
+      const std::string fp = relational_statement->Fingerprint();
+      out << fp.size() << ':' << fp;
+    } else {
+      out << "<null>";
+    }
+    out << ':' << OuterJoinTypeName(join_type);
   }
   if (operation == LogicalOperator::kSample) {
     out << "#sample:" << TableSampleMethodName(sample_method) << ':'
@@ -1729,16 +1811,17 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
       relation_index_.emplace(normalized[i], i);
     }
   } else {
-    // Every existing group carries a relation_mask expressed in the bit
-    // positions assigned by the first TryBuild. Reassigning those positions
-    // would silently reinterpret all of them, so a repeated build must reuse
-    // the established mapping and only accept the identical relation set.
-    bool same_relations = relation_index_.size() == normalized.size();
-    for (size_t i = 0; same_relations && i < normalized.size(); ++i) {
-      const auto found = relation_index_.find(normalized[i]);
-      same_relations = found != relation_index_.end() && found->second == i;
-    }
-    if (!same_relations) {
+    // Existing groups carry relation_mask values expressed in the bit
+    // positions assigned by the first TryBuild, so a repeated build must reuse
+    // that mapping. A proper subset (a small join built in a memo that already
+    // knows a larger relation set) is fine as long as every relation is known;
+    // requiring the *same* set would reject legitimate subset builds and fail
+    // the whole query through the caller's ASSIGN_OR_RETURN.
+    const bool known_relations =
+        std::ranges::all_of(normalized, [this](const std::string& relation) {
+          return relation_index_.contains(relation);
+        });
+    if (!known_relations) {
       return StatusError(StatusCode::kInvalidArgument,
                          "join graph relations differ from the existing memo");
     }
@@ -1765,6 +1848,32 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
     conjunct_masks_.push_back(mask);
     conjunct_root_only_.push_back(outside ? 1 : 0);
     conjuncts_.push_back(info.conjunct);
+  }
+  // Only the singleton scans in this build have a new set of predicates.
+  // A subset build leaves scans outside its relation mask intact.
+  const uint64_t build_mask = RelationMask(normalized);
+  for (Group& group : groups_) {
+    if (!group.tag.empty() || group.relations.size() != 1 ||
+        (group.relation_mask & build_mask) == 0) {
+      continue;
+    }
+    const Expression refreshed = ScanFilterFor(group);
+    if ((!group.filter && !refreshed) ||
+        (group.filter && refreshed &&
+         group.filter->ToString() == refreshed->ToString())) {
+      continue;
+    }
+    group.filter = refreshed;
+    group.logical_properties_expression_count.reset();
+    group.logical_properties_stale = true;
+    ++revision_;
+    touched_groups_.push_back(group.id);
+    // Readers of logical_properties (IS NOT NULL / uniqueness / equivalence
+    // classes) consult it directly and do not check the stale flag. Leaving
+    // the flag set here would keep a verdict derived from the previous
+    // conjunct set alive across repeated TryBuild calls; mirror
+    // MergeScanFilter/AddExpression and rebuild immediately.
+    DeriveLogicalProperties(group.id);
   }
   return EnsureGroup(relations);
 }
@@ -1853,6 +1962,7 @@ std::pair<std::vector<std::string>, std::vector<std::string>> ConnectedSplit(
     }
     std::vector<std::string> left{pivot};
     std::vector<std::string> right;
+    right.reserve(relations.size() - 1);
     for (const std::string& relation : relations) {
       if (relation != pivot) {
         right.push_back(relation);
@@ -1897,7 +2007,13 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
     return;
   }
   if (target.relations.size() != 1) {
-    CHECK_MSG(false, "scan filter requires a single-relation group");
+    // A filter transfer is an opportunistic rewrite, not a query-level
+    // operation: aborting here would turn an unexpected group shape into a
+    // process crash across a Status boundary. Skip the transfer and leave the
+    // predicate on the source expression, which still enforces it.
+    LOG(WARN) << "MergeScanFilter: expected a single-relation group, got "
+              << target.relations.size() << " (tag=" << target.tag << ")";
+    return;
   }
   const Expression next = CanonicalizeConjuncts(
       target.filter
@@ -1938,16 +2054,7 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
 }
 
 bool Memo::JoinGraphDisconnected() const {
-  for (size_t i = 0; i < conjunct_masks_.size(); ++i) {
-    if (conjunct_root_only_[i] != 0U) {
-      continue;
-    }
-    const uint64_t mask = conjunct_masks_[i];
-    if (mask != 0 && std::popcount(mask) > 1) {
-      return false;
-    }
-  }
-  return true;
+  return !JoinGraphConnected();
 }
 
 bool Memo::JoinGraphConnected() const {
@@ -2112,10 +2219,11 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
   // Physical aggregation accepts the legacy partition_by spelling as a
   // grouping-key list. Canonicalize it before properties, fingerprints and
   // logical rewrites inspect the node; otherwise they mistake it for a scalar
-  // aggregate (and may manufacture an invalid empty projection). When both
-  // spellings are supplied, grouping_sets is authoritative for grouping but
-  // partition_by is kept as the supplied partitioning metadata instead of
-  // being silently discarded.
+  // aggregate (and may manufacture an invalid empty projection). For the
+  // legacy spelling (partition_by only), that list is moved into
+  // grouping_sets and partition_by becomes empty. When both spellings are
+  // supplied, grouping_sets is authoritative for grouping and partition_by
+  // is kept as the supplied partitioning metadata.
   if (expression.operation == LogicalOperator::kAggregation &&
       expression.grouping_sets.empty() && !expression.partition_by.empty()) {
     expression.grouping_sets = std::move(expression.partition_by);
@@ -2239,26 +2347,19 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
         CHECK_MSG(false, "logical operator references its own group");
       }
       const auto& child_rels = Get(expression.children[0]).relations;
-      if (child_rels != target.relations) {
-        // Self-join style operators may reference the same real table under
-        // different aliases, so only enforce the relation-set invariant when
-        // the sets name genuinely different tables (from fix_rules).
-        bool all_same_table = !target.relations.empty() && !child_rels.empty();
-        for (const auto& r : target.relations) {
-          if (!IsSameTable(r, target.relations.front())) {
-            all_same_table = false;
-            break;
-          }
-        }
-        for (const auto& r : child_rels) {
-          if (!IsSameTable(r, target.relations.front())) {
-            all_same_table = false;
-            break;
-          }
-        }
-        if (!all_same_table) {
-          CHECK_MSG(false, "operator must preserve the group's relation set");
-        }
+      // A unary operator preserves the exact relation set. Compare as sets
+      // (the two vectors may list the same aliases in a different order):
+      // the old "all relations name the same physical table" escape hatch
+      // let {t AS a, t AS b} and {t AS a} mix in one chain, violating
+      // "one group, one meaning" for self-joins.
+      const bool same_relation_set =
+          child_rels.size() == target.relations.size() &&
+          std::ranges::all_of(child_rels, [&](const std::string& rel) {
+            return std::ranges::find(target.relations, rel) !=
+                   target.relations.end();
+          });
+      if (!same_relation_set) {
+        CHECK_MSG(false, "operator must preserve the group's relation set");
       }
       if (expression.operation == LogicalOperator::kSelection &&
           (!expression.predicate || !*expression.predicate)) {
@@ -2297,6 +2398,11 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
         if (existing.operation != expression.operation ||
             existing.table != expression.table ||
             existing.children != expression.children) {
+          // Fingerprint() starts with `operator:table:children...`, so this
+          // prefix comparison cannot reject a genuine duplicate. Its payload
+          // is serialized by ExpressionIdentity, which encodes column
+          // qualifiers and collation, so no predicate detail is dropped
+          // before the full comparison below.
           return false;
         }
         if (!fingerprint) {
@@ -2432,7 +2538,10 @@ bool HasCanonicalStoredJoinPredicate(const Memo& memo, GroupId left,
 void EnumerateJoinGroup(Memo& memo, GroupId group,
                         const LogicalExpression& expression) {
   const std::vector<std::string> relations = memo.Get(group).relations;
-  if (relations.size() < 3 || relations.size() > kMaxJoinEnumerationRelations) {
+  if (relations.size() < 3 || relations.size() > kMaxJoinEnumerationRelations ||
+      relations.size() >= std::numeric_limits<uint64_t>::digits) {
+    // Keep the shift below well-defined even if the enumeration ceiling is
+    // raised past the width of the bit mask in a future change.
     return;
   }
   if (!HasCanonicalStoredJoinPredicate(memo, expression.children[0],
@@ -2451,30 +2560,37 @@ void EnumerateJoinGroup(Memo& memo, GroupId group,
     global_bit[i] = memo.RelationMask({relations[i]});
   }
   // A 16-relation group walks 2^15 bipartitions. Precompute the join graph's
-  // adjacency in the *local* bit space once so a disconnected side can be
-  // rejected with a handful of bit tests before building vectors or calling
-  // the memo's connectivity walkers. The authoritative checks below stay in
-  // place, so the candidate set is unchanged -- only the wasted work per
-  // rejected mask goes away.
-  std::vector<uint64_t> adjacent(relations.size(), 0);
-  for (size_t a = 0; a < relations.size(); ++a) {
-    for (size_t b = a + 1; b < relations.size(); ++b) {
-      // Restricting `within` to the pair makes a conjunct with the mask
-      // exactly {a,b} count as an edge too.
-      if (memo.CutConnected(global_bit[a], global_bit[a] | global_bit[b])) {
-        adjacent[a] |= uint64_t{1} << b;
-        adjacent[b] |= uint64_t{1} << a;
+  // adjacency in the *local* bit space once, but only for a connected graph:
+  // this is a constant-factor bit prefilter (it avoids building vectors and
+  // calling the memo's full connectivity walkers for a rejected mask), not a
+  // complexity change -- the local BFS below is still run per bipartition.
+  // A disconnected graph never calls the prefilter, so paying the O(n^2)
+  // CutConnected scan there would be pure overhead.
+  std::vector<uint64_t> adjacent;
+  if (connected) {
+    adjacent.assign(relations.size(), 0);
+    for (size_t a = 0; a < relations.size(); ++a) {
+      for (size_t b = a + 1; b < relations.size(); ++b) {
+        // Restricting `within` to the pair makes a conjunct with the mask
+        // exactly {a,b} count as an edge too.
+        if (memo.CutConnected(global_bit[a], global_bit[a] | global_bit[b])) {
+          adjacent[a] |= uint64_t{1} << b;
+          adjacent[b] |= uint64_t{1} << a;
+        }
       }
     }
   }
   const auto locally_connected = [&adjacent](uint64_t mask) {
+    if (adjacent.empty() || mask == 0) {
+      return false;
+    }
     uint64_t seen = mask & (~mask + 1);  // lowest set bit
     uint64_t frontier = seen;
     while (frontier != 0) {
       uint64_t next = 0;
       uint64_t bits = frontier;
       while (bits != 0) {
-        const size_t i = static_cast<size_t>(std::countr_zero(bits));
+        const auto i = static_cast<size_t>(std::countr_zero(bits));
         next |= adjacent[i];
         bits &= bits - 1;
       }
@@ -2530,9 +2646,10 @@ void EnumerateJoinGroup(Memo& memo, GroupId group,
 // prefix-counting ranking calls) AND truncation can only remove later rows (the
 // child emits rows in partition order).  The helpers below encode each half.
 
-// Length-prefixed ordering signature of one window call (raw separators
-// collide when a key's own text contains them, mirroring the window-layer
-// grouping in optimizer.cpp).
+// Length-prefixed spec signature of one window call (raw separators collide
+// when a key's own text contains them, mirroring the window-layer grouping in
+// optimizer.cpp).  The spec covers PARTITION BY, ORDER BY, the frame and its
+// exclusion; per-call NULLS modifiers live in the gate's identity instead.
 //
 // The frame is part of the spec. The limit-prefix rules feed this signature
 // into derived-group tags; two calls sharing PARTITION BY / ORDER BY but with
@@ -2558,8 +2675,11 @@ std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
     signature += ";";
   }
   // Frame specification: presence, unit, both bounds (kind + length-prefixed
-  // offset text), exclusion and the NULLS modifiers all change a window's
-  // meaning even when its partition/order keys are identical.
+  // offset text) and exclusion all change a window's meaning even when its
+  // partition/order keys are identical. The NULLS RESPECT/IGNORE modifiers
+  // are deliberately NOT part of this shared spec: one Window may legally
+  // mix calls that differ only in NULLS handling, and the gate keeps them
+  // apart in its per-call identity instead (see WindowPrefixGate).
   signature += "frame:";
   signature += call.has_frame ? "1:" : "0:";
   signature += std::to_string(static_cast<int>(call.frame_unit)) + ":";
@@ -2572,8 +2692,6 @@ std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
   append_bound(call.frame_start);
   append_bound(call.frame_end);
   signature += std::to_string(static_cast<int>(call.exclusion)) + ":";
-  signature += call.respect_nulls ? "R" : "r";
-  signature += call.ignore_nulls ? "I" : "i";
   return signature;
 }
 
@@ -2581,21 +2699,25 @@ std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
 // partition's later rows were truncated away?
 bool WindowValueStableUnderTruncation(
     const WindowFunctionCallExpression& call) {
+  // Function names are query identifiers: normalise case before the lookup
+  // so a lower-case `lag` built by a rule (or supplied by a non-SQL producer)
+  // is recognised too. The recognised set is closed, so an unexpected alias
+  // cannot be promoted to stable by case folding.
+  const std::string function = AsciiToUpper(call.function);
   // Ranking values are prefix counts in partition order: ROW_NUMBER numbers
   // the rows 1..m, RANK counts strictly smaller keys (+1), DENSE_RANK counts
   // key groups.  LAG likewise reads only rows at or before the current row,
   // so removing a row strictly after a survivor in partition order cannot
   // change any of them for rows the truncation keeps.
-  if (call.function == "ROW_NUMBER" || call.function == "RANK" ||
-      call.function == "DENSE_RANK" || call.function == "LAG") {
+  if (function == "ROW_NUMBER" || function == "RANK" ||
+      function == "DENSE_RANK" || function == "LAG") {
     return true;
   }
   // These functions ignore ROWS bounds. Even an explicitly backward frame
   // cannot make their partition-size / positional result prefix-stable.
-  if (call.function == "NTILE" || call.function == "PERCENT_RANK" ||
-      call.function == "CUME_DIST" || call.function == "LEAD" ||
-      call.function == "PERCENTILE_CONT" ||
-      call.function == "PERCENTILE_DISC") {
+  if (function == "NTILE" || function == "PERCENT_RANK" ||
+      function == "CUME_DIST" || function == "LEAD" ||
+      function == "PERCENTILE_CONT" || function == "PERCENTILE_DISC") {
     return false;
   }
   // Every other call needs an explicit ROWS frame that starts and ends at or
@@ -2612,8 +2734,20 @@ bool WindowValueStableUnderTruncation(
            type == WindowFrameBoundType::kOffsetPreceding ||
            type == WindowFrameBoundType::kCurrentRow;
   };
+  // The bound *type* alone is not enough: an OFFSET PRECEDING bound whose
+  // offset is a bind variable (or any non-literal expression) can evaluate to
+  // a negative number at execution time, turning a planned backward frame into
+  // a forward one that reads rows after the truncation point.
+  const auto stable_offset = [](const WindowFrameBound& bound) {
+    if (bound.type != WindowFrameBoundType::kOffsetPreceding) {
+      return true;
+    }
+    return bound.offset && bound.offset->Type() == TypeTag::kConstantValue &&
+           !ContainsParameterSlot(bound.offset);
+  };
   return reads_backward(call.frame_start.type) &&
-         reads_backward(call.frame_end.type);
+         reads_backward(call.frame_end.type) &&
+         stable_offset(call.frame_start) && stable_offset(call.frame_end);
 }
 
 // Gate for the two limit-prefix window rules.  Returns nullopt when the
@@ -2624,9 +2758,10 @@ bool WindowValueStableUnderTruncation(
 struct WindowPrefixGateResult {
   std::string spec;
   // Identity of the window *outputs* (function names, args and target
-  // names).  `spec` only captures PARTITION/ORDER, so two different window
-  // calls sharing a spec would otherwise collide on the same derived group
-  // and the parent Limit could pick the wrong window output.
+  // names).  `spec` captures PARTITION/ORDER plus the frame and its
+  // modifiers, so two different window calls that agree on the spec but
+  // compute different values would otherwise collide on the same derived
+  // group and the parent Limit could pick the wrong window output.
   std::string identity;
   size_t order_terms{0};
   bool stable{true};
@@ -2652,8 +2787,17 @@ std::optional<WindowPrefixGateResult> WindowPrefixGate(
     }
     // Length-prefix each component so distinct target sets cannot collide.
     gate.identity += std::to_string(target.name.size()) + "/" + target.name;
-    const std::string expr = target.expression->ToString();
+    // A printed form embeds the bound value of every ParameterSlot (and the
+    // spelled form of literals); prepared plans rebound with other constants
+    // would then land in different derived groups. ExpressionIdentity keeps
+    // the identity structural and value-independent.
+    const std::string expr = ExpressionIdentity(target.expression);
     gate.identity += "/" + std::to_string(expr.size()) + "/" + expr + ";";
+    // NULLS RESPECT/IGNORE is per-call, not part of the shared frame spec:
+    // record it here so a mixed-spec Window is still accepted while its
+    // distinct outputs stay in separate derived groups.
+    gate.identity += call.respect_nulls ? "/R" : "/r";
+    gate.identity += call.ignore_nulls ? "/I" : "/i";
     if (!WindowValueStableUnderTruncation(call)) {
       gate.stable = false;
     }
@@ -2661,13 +2805,48 @@ std::optional<WindowPrefixGateResult> WindowPrefixGate(
   return gate;
 }
 
+// The call-level spec/identity above does not cover the Window node's own
+// output schema or its PARTITION BY list. Two Windows with identical calls can
+// still publish different columns or partition rows differently, so both must
+// be part of the derived-group tag (length-prefixed to avoid collisions).
+std::string WindowNodeIdentity(const LogicalExpression& window) {
+  std::string out = "out:";
+  AppendInteger(out, window.output_schema.ColumnCount());
+  for (size_t i = 0; i < window.output_schema.ColumnCount(); ++i) {
+    const auto& column = window.output_schema.GetColumn(i);
+    const std::string text =
+        column.Name().ToString() + ':' +
+        std::to_string(static_cast<int>(column.Type())) + ':' +
+        std::to_string(static_cast<int>(column.GetConstraint().ctype));
+    AppendInteger(out, text.size());
+    out.push_back('/');
+    out.append(text);
+  }
+  out += ":pb:";
+  AppendInteger(out, window.partition_by.size());
+  for (const Expression& key : window.partition_by) {
+    const std::string text =
+        key ? ExpressionIdentity(key) : std::string("<null>");
+    AppendInteger(out, text.size());
+    out.push_back('/');
+    out.append(text);
+  }
+  return out;
+}
+
 // Any window reachable below the window's child group: the transform only
 // cuts rows between the bound window and its child, so a deeper window
 // feeding this one would see a truncated input without having the same
 // proof made for it — refuse (the gate can learn to recurse later).
 bool ReachableChildHasWindow(const Memo& memo, GroupId start) {
+  // CTE expansion can build a very deep memo. Bound the walk so the
+  // reachability probe cannot consume unbounded time/space; on overflow
+  // answer "yes" (refuse the rewrite) rather than risk truncating a row
+  // stream that a deeper window relies on.
+  constexpr size_t kMaxVisitedGroups = 4096;
   std::vector<char> seen(memo.GroupCount(), 0);
   std::vector<GroupId> pending{start};
+  size_t visited = 0;
   while (!pending.empty()) {
     const GroupId next = pending.back();
     pending.pop_back();
@@ -2675,6 +2854,9 @@ bool ReachableChildHasWindow(const Memo& memo, GroupId start) {
       continue;
     }
     seen[next] = 1;
+    if (++visited > kMaxVisitedGroups) {
+      return true;
+    }
     for (const LogicalExpression& expression : memo.Get(next).expressions) {
       if (expression.operation == LogicalOperator::kWindow) {
         return true;
@@ -3138,7 +3320,8 @@ const RuleSet& RuleSet::Default() {
         "push_selection_through_join", Selection(Join(Any(), Any(), "input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (!SelectionMayStrengthenSharedScans(memo, group)) {
+          if (!SelectionMayStrengthenSharedScans(memo, group) ||
+              HasOuterJoinAlternative(memo, bindings.at("input"))) {
             return;
           }
           std::unordered_set<std::string> left_relations;
@@ -3163,9 +3346,10 @@ const RuleSet& RuleSet::Default() {
     //   (push_and_split_selection_over_join_sound)
     built.Add(Rule(
         "split_selection_over_join", Selection(Join(Any(), Any(), "input")),
-        [](const Bindings&, Memo& memo, GroupId group,
+        [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (!SelectionMayStrengthenSharedScans(memo, group)) {
+          if (!SelectionMayStrengthenSharedScans(memo, group) ||
+              HasOuterJoinAlternative(memo, bindings.at("input"))) {
             return;
           }
           PushSingleRelationConjuncts(memo, *expression.predicate,
@@ -3206,11 +3390,36 @@ const RuleSet& RuleSet::Default() {
             // unavailable the push must refuse.
             const auto touched = (*expression.predicate)->TouchedColumns();
             const auto& schemas = memo.GetTableSchemas();
+            // The published map is normally keyed by the FROM alias (which is
+            // what branch.relations holds), but hand-built memos may key it by
+            // the real table name. Accept either spelling so an alias such as
+            // `t1_1` does not leave matches==0 and reject every push.
+            const auto schema_for =
+                [&](const std::string& relation) -> const Schema* {
+              const auto found = schemas.find(relation);
+              if (found != schemas.end()) {
+                return &found->second;
+              }
+              for (const auto& [key, schema] : schemas) {
+                if (schema.Name() == relation) {
+                  return &schema;
+                }
+              }
+              return nullptr;
+            };
             auto resolves_in_branch = [&](const Group& branch,
                                           const ColumnName& column) {
               if (!column.schema.empty()) {
-                return std::ranges::find(branch.relations, column.schema) !=
-                       branch.relations.end();
+                // "Resolves unambiguously" must check the column itself,
+                // not just that the qualifier names a relation in the
+                // branch: otherwise t.x is pushed where t has no x.
+                if (std::ranges::find(branch.relations, column.schema) ==
+                    branch.relations.end()) {
+                  return false;
+                }
+                const Schema* schema = schema_for(column.schema);
+                return schema != nullptr &&
+                       schema->Offset(ColumnName("", column.name)) >= 0;
               }
               if (schemas.empty()) {
                 return false;
@@ -3221,9 +3430,9 @@ const RuleSet& RuleSet::Default() {
               // one match would be ambiguous, so refuse that case.
               size_t matches = 0;
               for (const auto& rel : branch.relations) {
-                const auto found = schemas.find(rel);
-                if (found != schemas.end() &&
-                    found->second.Offset(ColumnName("", column.name)) >= 0) {
+                const Schema* schema = schema_for(rel);
+                if (schema != nullptr &&
+                    schema->Offset(ColumnName("", column.name)) >= 0) {
                   ++matches;
                 }
               }
@@ -3452,6 +3661,8 @@ const RuleSet& RuleSet::Default() {
                     signature);
             std::vector<NamedExpression> left_targets;
             std::vector<NamedExpression> right_targets;
+            left_targets.reserve(required[0].size());
+            right_targets.reserve(required[1].size());
             for (const ColumnName& column : required[0]) {
               left_targets.emplace_back(column);
             }
@@ -3582,6 +3793,11 @@ const RuleSet& RuleSet::Default() {
         "push_limit_through_projection", Limit(Projection(Any(), "proj")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
+          // WITH TIES needs the pre-projection order and the boundary row to
+          // identify peers; moving the cut below the Projection loses both.
+          if (expression.with_ties) {
+            return;
+          }
           for (const LogicalExpression& projection :
                memo.Get(bindings.at("proj")).expressions) {
             if (projection.operation != LogicalOperator::kProjection) {
@@ -3592,7 +3808,8 @@ const RuleSet& RuleSet::Default() {
                 memo.Get(input).relations,
                 "lim-below-proj:" + GroupIdsTag({input}) +
                     std::to_string(expression.limit_count) + ":" +
-                    std::to_string(expression.limit_offset));
+                    std::to_string(expression.limit_offset) +
+                    ":no-ties");
             if (limited == group || limited == input) {
               continue;
             }
@@ -3648,7 +3865,10 @@ const RuleSet& RuleSet::Default() {
             std::string signature =
                 "topn-below-proj:" + GroupIdsTag({projection.children[0]}) +
                 std::to_string(expression.limit_count) + ":" +
-                std::to_string(expression.limit_offset);
+                std::to_string(expression.limit_offset) +
+                (expression.prior_limit_offset != 0
+                     ? ":p" + std::to_string(expression.prior_limit_offset)
+                     : "");
             for (const NamedExpression& key : translated_keys) {
               const std::string text = key.expression->ToString();
               signature.push_back('|');
@@ -3666,11 +3886,47 @@ const RuleSet& RuleSet::Default() {
                                               : '?');
             }
             signature += expression.with_ties ? "|ties:1" : "|ties:0";
+            // The child group alone does not identify the projection: two
+            // different projections over that child can translate the sort
+            // keys identically yet publish different output columns. Fold
+            // both the target list and the output schema into the tag so
+            // their pushed TopNs never share one derived group.
+            signature += "|projection:";
+            for (const NamedExpression& target : projection.target_list) {
+              const std::string text =
+                  target.expression ? ExpressionIdentity(target.expression)
+                                    : std::string("<null>");
+              AppendInteger(signature, target.name.size());
+              signature.push_back('/');
+              signature.append(target.name);
+              signature.push_back('=');
+              AppendInteger(signature, text.size());
+              signature.push_back(':');
+              signature.append(text);
+              signature.push_back(';');
+            }
+            signature += "|schema:";
+            for (size_t i = 0; i < projection.output_schema.ColumnCount();
+                 ++i) {
+              const auto& column = projection.output_schema.GetColumn(i);
+              const std::string text =
+                  column.Name().ToString() + ":" +
+                  std::to_string(static_cast<int>(column.Type()));
+              AppendInteger(signature, text.size());
+              signature.push_back(':');
+              signature.append(text);
+            }
             const GroupId pushed =
                 memo.EnsureDerivedGroup(input_relations, signature);
             if (pushed == group || pushed == projection.children[0]) {
               continue;
             }
+            // RewriteThroughOutputs rebuilds the key expressions through
+            // WithExpressionChildren, so a COLLATE wrapper on an ORDER BY key
+            // survives the translation. Collation is not a separate logical
+            // field: the physical TopN rule reads it back with
+            // CollationOfExpression on each translated key, and the signature
+            // above length-prefixes the key text (which includes COLLATE).
             memo.AddExpression(
                 pushed, LogicalExpression{
                             .operation = LogicalOperator::kTopN,
@@ -3680,6 +3936,7 @@ const RuleSet& RuleSet::Default() {
                             .sort_nulls_first = expression.sort_nulls_first,
                             .limit_count = expression.limit_count,
                             .limit_offset = expression.limit_offset,
+                            .prior_limit_offset = expression.prior_limit_offset,
                             .with_ties = expression.with_ties});
             memo.AddExpression(
                 group,
@@ -3699,7 +3956,10 @@ const RuleSet& RuleSet::Default() {
         "union_all_push_limit", Limit(Any("input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (expression.limit_count == 0 ||
+          // Capping each UNION ALL branch at offset+count is only sound for a
+          // plain LIMIT. WITH TIES needs rows beyond that cap to keep peers of
+          // the boundary row, so the pushdown must be skipped entirely.
+          if (expression.with_ties || expression.limit_count == 0 ||
               expression.limit_offset >
                   std::numeric_limits<size_t>::max() - expression.limit_count) {
             return;
@@ -3799,10 +4059,12 @@ const RuleSet& RuleSet::Default() {
                 }
               }
             }
+            const auto conjuncts = SplitConjuncts(*expression.predicate);
             std::vector<Expression> pushed;
             std::vector<Expression> residual;
-            for (const Expression& conjunct :
-                 SplitConjuncts(*expression.predicate)) {
+            pushed.reserve(conjuncts.size());
+            residual.reserve(conjuncts.size());
+            for (const Expression& conjunct : conjuncts) {
               std::optional<Expression> rewritten =
                   RewriteThroughOutputs(conjunct, grouping);
               if (rewritten && !ContainsAggregate(*rewritten)) {
@@ -3890,7 +4152,15 @@ const RuleSet& RuleSet::Default() {
           for (const LogicalExpression& inner :
                memo.Get(bindings.at("inner")).expressions) {
             if (inner.operation != LogicalOperator::kLimit ||
-                inner.children.empty() || inner.children[0] == group) {
+                inner.children.empty() || inner.children[0] == group ||
+                inner.prior_limit_offset != 0 ||
+                expression.prior_limit_offset != 0) {
+              continue;
+            }
+            // Composing offsets/counts assumes plain limits. WITH TIES on
+            // either side changes which rows survive (peers of the boundary
+            // row), so the merged limit must not silently drop that flag.
+            if (inner.with_ties || expression.with_ties) {
               continue;
             }
             if (inner.limit_offset >
@@ -4011,6 +4281,11 @@ const RuleSet& RuleSet::Default() {
           // relation set, so the destination is single-relation as well.
           if (input != group && input_group.filter &&
               memo.Get(group).relations.size() == 1) {
+            // The predicate may be branch-local (a set-op branch / OR arm).
+            // Mark the destination before moving it, otherwise a later rule
+            // would treat this group's filter as global and merge it into a
+            // scan shared with the other branches.
+            InheritBranchLocal(memo, group, input);
             memo.MergeScanFilter(group, input_group.filter);
           }
           for (const LogicalExpression& child : input_group.expressions) {
@@ -4051,6 +4326,12 @@ const RuleSet& RuleSet::Default() {
           // INTERSECT empties when ANY branch is empty; EXCEPT only when
           // its LEFT branch is empty (A EXCEPT empty(B) is just A -- adding
           // an Empty alternative there would collapse a non-empty result).
+          // This is intentionally different from setop_empty_identity below:
+          // that rule fires on an empty RIGHT branch and copies the surviving
+          // left input, while this one fires on an empty LEFT branch and
+          // produces Empty. They therefore describe different source states
+          // even though both operate on the same relation set; keeping both
+          // alternatives is deliberate and not a duplicate rule.
           const bool empties =
               intersect
                   ? std::ranges::any_of(
@@ -4202,6 +4483,7 @@ const RuleSet& RuleSet::Default() {
           // UNION DISTINCT: an empty branch can be removed, but the result
           // still needs duplicate elimination.
           std::vector<GroupId> survivors;
+          survivors.reserve(expression.children.size());
           for (GroupId child : expression.children) {
             if (!is_empty(child)) {
               survivors.push_back(child);
@@ -4589,6 +4871,14 @@ const RuleSet& RuleSet::Default() {
             // targets include EVERY grouping key (including computed keys such
             // as `t.b + 1`; skipping non-column keys would drop DISTINCT when
             // two distinct groups share the projected plain-column prefix).
+            // When both spellings are present, AddExpression makes
+            // grouping_sets authoritative for the emitted rows and keeps
+            // partition_by only as partitioning metadata (the aggregation
+            // implementation likewise ignores it). Therefore partition_by is
+            // the fallback key list only for the legacy partition_by-only
+            // spelling; adding its keys here would demand columns that do not
+            // contribute to row uniqueness and keep a genuinely redundant
+            // DISTINCT.
             const auto& keys = agg.grouping_sets.empty() ? agg.partition_by
                                                          : agg.grouping_sets;
             if (keys.empty()) {
@@ -4611,19 +4901,30 @@ const RuleSet& RuleSet::Default() {
               }
               return key->ToString() == proj->ToString();
             };
-            // Every grouping key must map to a DISTINCT projected target, and
-            // each target may stand for only one key. Counting matches avoids
-            // the case where one projected column happens to satisfy two
-            // different keys (expression keys compared by printed form), which
-            // would incorrectly claim DISTINCT is redundant.
-            // NOLINT(readability-braces-around-statements)
+            // Every grouping key must map to a DISTINCT projected target: one
+            // target that happens to match two keys does NOT prove both keys
+            // are projected (GROUP BY a,b with targets [a,a] would otherwise
+            // collapse groups (a=1,b=1) and (a=1,b=2)). Give each key its own
+            // as-yet-unused target so a single heavy-hitter column cannot be
+            // counted twice.
+            std::vector<bool> target_used(agg.target_list.size(), false);
             size_t seen = 0;
             for (const auto& g : keys) {
               if (!g) continue;  // NOLINT(readability-braces-around-statements)
-              for (const auto& t : agg.target_list) {
-                if (matches_key(g, t.expression)) {
-                  ++seen;
+              bool matched = false;
+              for (size_t j = 0; j < agg.target_list.size(); ++j) {
+                if (target_used[j]) {
+                  continue;
                 }
+                if (matches_key(g, agg.target_list[j].expression)) {
+                  target_used[j] = true;
+                  matched = true;
+                  ++seen;
+                  break;
+                }
+              }
+              if (!matched) {
+                break;
               }
             }
             if (seen != keys.size()) {
@@ -4680,20 +4981,14 @@ const RuleSet& RuleSet::Default() {
             // ...and the input: the per-branch aggregates of a union split
             // share both target lists, so without the child id every
             // branch's pushed projection landed in one group.
-            std::string tag = "proj_below_agg:" + GroupIdsTag({agg_child});
-            for (const NamedExpression& target : expression.target_list) {
-              tag += target.name;
-              tag += '=';
-              tag += target.expression ? target.expression->ToString() : "?";
-              tag += ';';
-            }
-            tag += '|';
-            for (const NamedExpression& target : agg.target_list) {
-              tag += target.name;
-              tag += '=';
-              tag += target.expression ? target.expression->ToString() : "?";
-              tag += ';';
-            }
+            // Length-prefix the names/expressions (TargetListFingerprint):
+            // quoted identifiers and string literals may contain '=' or ';',
+            // so the previous raw concatenation could collide two different
+            // target lists into one derived group.
+            std::string tag =
+                "proj_below_agg:" + GroupIdsTag({agg_child}) +
+                "|proj:" + TargetListFingerprint(expression.target_list) +
+                "|agg:" + TargetListFingerprint(agg.target_list);
             std::unordered_set<ColumnName> needed_cols;
             const auto collect_needed = [&](const Expression& e) {
               if (!e) {
@@ -4708,9 +5003,11 @@ const RuleSet& RuleSet::Default() {
             for (const auto& g : agg.grouping_sets) {
               collect_needed(g);
             }
-            for (const auto& p : agg.partition_by) {
-              collect_needed(p);
-            }
+            // partition_by is partitioning metadata once grouping_sets is
+            // present (AddExpression promotes the legacy partition_by-only
+            // spelling into grouping_sets), and the aggregation
+            // implementation ignores it. Carrying its columns through the
+            // pushed-down projection would only widen the aggregation input.
             for (const auto& t : agg.target_list) {
               collect_needed(t.expression);
             }
@@ -4757,14 +5054,21 @@ const RuleSet& RuleSet::Default() {
                                     .children = {agg_child},
                                     .target_list = std::move(below_targets)});
               memo.AddExpression(
-                  new_agg,
-                  LogicalExpression{.operation = LogicalOperator::kAggregation,
-                                    .children = {proj_below},
-                                    .predicate = agg.predicate,
-                                    .target_list = agg.target_list,
-                                    .output_schema = agg.output_schema,
-                                    .partition_by = agg.partition_by,
-                                    .grouping_sets = agg.grouping_sets});
+                  new_agg, LogicalExpression{
+                               .operation = LogicalOperator::kAggregation,
+                               .children = {proj_below},
+                               .predicate = agg.predicate,
+                               .target_list = agg.target_list,
+                               .output_schema = agg.output_schema,
+                               // Keep exactly one grouping spelling:
+                               // Memo::AddExpression treats grouping_sets
+                               // as authoritative when both are present,
+                               // and copying both here would re-create
+                               // that ambiguous state on every rewrite.
+                               .partition_by = agg.grouping_sets.empty()
+                                                   ? agg.partition_by
+                                                   : std::vector<Expression>{},
+                               .grouping_sets = agg.grouping_sets});
               memo.AddExpression(
                   group,
                   LogicalExpression{.operation = LogicalOperator::kProjection,
@@ -4799,6 +5103,13 @@ const RuleSet& RuleSet::Default() {
                 sort.children.size() != 1 || sort.children[0] == group) {
               continue;
             }
+            // Collation is carried by the key expressions themselves (a
+            // COLLATE wrapper is part of the expression tree); the physical
+            // TopN rule derives each key's collation with
+            // CollationOfExpression(target_list[i].expression). Copying the
+            // sort's target_list verbatim therefore keeps the ordering
+            // contract intact -- there is no separate logical collation field
+            // to copy here.
             memo.AddExpression(
                 group,
                 LogicalExpression{.operation = LogicalOperator::kTopN,
@@ -4856,28 +5167,37 @@ const RuleSet& RuleSet::Default() {
             }
             const GroupId input_id = window.children[0];
             const auto gate = WindowPrefixGate(window);
+            // This rule is the `order_terms == 0` half; the ordered rule below
+            // requires `order_terms != 0`. A nullopt gate (e.g. a window whose
+            // ORDER BY syntax the gate cannot interpret) makes both rules
+            // decline silently -- intentionally conservative, since neither
+            // rewrite is sound without a proven spec, and the original
+            // ordered plan remains available in the memo.
             if (!gate.has_value() || !gate->stable || gate->order_terms != 0 ||
                 memo.Get(input_id).tag.starts_with("window-prefix-limit:") ||
                 ReachableChildHasWindow(memo, input_id)) {
               continue;
             }
-            std::string signature =
-                GroupIdsTag({input_id}) + gate->spec + gate->identity;
+            std::string signature = GroupIdsTag({input_id}) + gate->spec +
+                                    gate->identity + WindowNodeIdentity(window);
             AppendInteger(signature, expression.limit_count);
             signature += ':';
             AppendInteger(signature, expression.limit_offset);
-            const GroupId limited =
-                memo.EnsureDerivedGroup(memo.Get(input_id).relations,
-                                        "window-prefix-limit:" + signature);
-            if (limited == group || limited == input_id) {
-              continue;
-            }
             // The inner cut is a PREFIX: the window must still number the
             // OFFSET rows the outer Limit later skips, so keep offset+count
             // rows from the start and let only the outer Limit apply OFFSET.
             size_t prefix_rows = 0;
             if (__builtin_add_overflow(expression.limit_count,
                                        expression.limit_offset, &prefix_rows)) {
+              continue;
+            }
+            // Check overflow before creating a derived group: otherwise a
+            // rejected conversion leaves an empty group keyed by this limit
+            // signature in the memo on every attempt.
+            const GroupId limited =
+                memo.EnsureDerivedGroup(memo.Get(input_id).relations,
+                                        "window-prefix-limit:" + signature);
+            if (limited == group || limited == input_id) {
               continue;
             }
             memo.AddExpression(
@@ -4888,7 +5208,13 @@ const RuleSet& RuleSet::Default() {
             const GroupId windowed =
                 memo.EnsureDerivedGroup(memo.Get(input_id).relations,
                                         "window-prefix-window:" + signature);
-            if (windowed == group) {
+            // The new window must not fold back into the source window group
+            // nor into the prefix/limit group it is built on: a chained rule
+            // may already have claimed this signature. Otherwise a Window
+            // alternative gets added to the original group ("one group, one
+            // meaning") and the search can diverge.
+            if (windowed == group || windowed == window_group_id ||
+                windowed == input_id || windowed == limited) {
               continue;
             }
             memo.AddExpression(
@@ -4967,22 +5293,33 @@ const RuleSet& RuleSet::Default() {
             }
             std::string signature =
                 GroupIdsTag({window_group_id, sort_group_id}) + gate->spec +
-                gate->identity;
+                gate->identity + WindowNodeIdentity(window);
+            // A group can hold several Sort/Window alternatives with the same
+            // spec but different outputs. Mix the *selected* alternatives into
+            // the tag so they never land in one derived group.
+            for (const LogicalExpression* chosen : {&window, sort_node}) {
+              const std::string fp = chosen->Fingerprint();
+              AppendInteger(signature, fp.size());
+              signature.push_back('/');
+              signature.append(fp);
+            }
             AppendInteger(signature, expression.limit_count);
             signature += ':';
             AppendInteger(signature, expression.limit_offset);
-            const GroupId limited =
-                memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,
-                                        "window-prefix-limit:" + signature);
-            if (limited == group || limited == window_group_id ||
-                limited == sort_group_id) {
-              continue;
-            }
             // Prefix cut: keep offset+count rows; OFFSET is applied once, by
             // the outer Limit (see limit_prefix_unordered_window).
             size_t prefix_rows = 0;
             if (__builtin_add_overflow(expression.limit_count,
                                        expression.limit_offset, &prefix_rows)) {
+              continue;
+            }
+            // Refuse overflow before creating a derived group so a failed
+            // conversion does not leave an empty group behind.
+            const GroupId limited =
+                memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,
+                                        "window-prefix-limit:" + signature);
+            if (limited == group || limited == window_group_id ||
+                limited == sort_group_id) {
               continue;
             }
             memo.AddExpression(
@@ -4998,7 +5335,10 @@ const RuleSet& RuleSet::Default() {
             const GroupId windowed =
                 memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,
                                         "window-prefix-window:" + signature);
-            if (windowed == group) {
+            // Same collision guard as the unordered rule: the rewritten
+            // window must stay distinct from every group it derives from.
+            if (windowed == group || windowed == window_group_id ||
+                windowed == sort_group_id || windowed == limited) {
               continue;
             }
             memo.AddExpression(
@@ -5071,7 +5411,9 @@ const RuleSet& RuleSet::Default() {
 
     // eliminate_sort_under_unordered_consumer: Aggregation(Sort(X)) ->
     // Aggregation(X) when the aggregation has no order-sensitive
-    // requirements. The payload (grouping sets, partition, schema) is
+    // requirements. X is the Sort's child group, reused verbatim as the new
+    // Aggregation's input; the rewrite does not rebuild any sort node.
+    // The payload (grouping sets, partition, schema) is
     // copied verbatim; dropping the grouping would turn a GROUP BY
     // aggregate into a scalar one, and order-sensitive aggregates
     // (string_agg / array_agg / WITHIN GROUP / ANY_VALUE / sketches) could
@@ -5090,7 +5432,7 @@ const RuleSet& RuleSet::Default() {
               return true;
             }
             if (expr->Type() == TypeTag::kAggregateExp) {
-              const auto& aggregate = static_cast<const AggregateExpression&>(
+              const auto& aggregate = dynamic_cast<const AggregateExpression&>(
                   *expr);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               if (!aggregate.InnerOrderBy().empty()) {
                 return false;  // WITHIN GROUP orders its own input.
@@ -5572,6 +5914,14 @@ const RuleSet& RuleSet::Default() {
               if (!column.schema.empty() && column.schema == r2) {
                 return;
               }
+              // Both sides scan the same table, so every column name exists
+              // on both sides. An unqualified reference therefore may resolve
+              // to the eliminated right scan; refuse the rewrite instead of
+              // silently binding it to the left scan.
+              if (column.schema.empty() && !column.name.empty() &&
+                  column.name != "*") {
+                return;
+              }
             }
           }
 
@@ -5645,7 +5995,9 @@ const RuleSet& RuleSet::Default() {
           }
           const GroupId input_id = bindings.at("input");
           if (input_id == group ||
-              memo.Get(input_id).tag.starts_with("outer_to_anti_base:")) {
+              (memo.Get(input_id).tag.starts_with("outer_to_anti_base:") ||
+               memo.Get(input_id).tag.starts_with(
+                   "outer_to_anti_base_thru:"))) {
             return;
           }
           if (std::ranges::any_of(memo.Get(input_id).expressions,
@@ -5897,17 +6249,21 @@ const RuleSet& RuleSet::Default() {
             AppendInteger(child_key, left_id);
             child_key.push_back(':');
             AppendInteger(child_key, right_id);
+            // The decomposition's target list decides the produced schema;
+            // without it two FULL OUTER JOINs with identical children/ON but
+            // different projections would share one derived group and leak
+            // each other's schema.
+            const std::string schema_key =
+                ":" + predicate_key + ":" +
+                TargetListFingerprint(expression.target_list);
             const std::vector<std::string> cur_relations =
                 memo.Get(group).relations;
             const GroupId left_outer_group = memo.EnsureDerivedGroup(
-                cur_relations,
-                "full_to_left_outer:" + child_key + ":" + predicate_key);
+                cur_relations, "full_to_left_outer:" + child_key + schema_key);
             const GroupId anti_join_group = memo.EnsureDerivedGroup(
-                cur_relations,
-                "full_to_anti_join:" + child_key + ":" + predicate_key);
+                cur_relations, "full_to_anti_join:" + child_key + schema_key);
             const GroupId padded_group = memo.EnsureDerivedGroup(
-                cur_relations,
-                "full_to_padded_anti:" + child_key + ":" + predicate_key);
+                cur_relations, "full_to_padded_anti:" + child_key + schema_key);
             if (left_outer_group == group || anti_join_group == group ||
                 padded_group == group) {
               return;
@@ -6216,10 +6572,12 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kSemiJoin));
 
     // push_down_limit_through_join is DISABLED (see the disabled-rules table
-    // in docs/cascades_optimizer.md): a uniqueness proof on the right join
-    // keys bounds the match count at one but does not prove every left row
-    // matches, so LIMIT pushed into the left side truncates the join's own
-    // output whenever an unmatched left row sits inside the limit prefix.
+    // in docs/cascades_optimizer.md). Even a uniqueness proof on the right
+    // join keys only bounds the match count at one; it does not prove every
+    // left row finds a match, so LIMIT pushed into the left side truncates the
+    // join's own output whenever an unmatched left row sits inside the limit
+    // prefix. That uniqueness proof is now a gate of the separate, ENABLED
+    // topn_push_through_proven_one_to_one_join rule below, not of this rule.
 
     // push_selection_through_window: Push Selection conjuncts that reference
     // only PARTITION BY columns below the Window operator.
@@ -6244,6 +6602,7 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
             std::vector<ColumnName> partition_cols;
+            partition_cols.reserve(win_expr.partition_by.size());
             for (const auto& p : win_expr.partition_by) {
               if (p && p->Type() == TypeTag::kColumnValue) {
                 partition_cols.push_back(p->AsColumnValue().GetColumnName());
@@ -6265,6 +6624,7 @@ const RuleSet& RuleSet::Default() {
               const auto& call =
                   target.expression->AsWindowFunctionCallExpression();
               std::vector<ColumnName> call_cols;
+              call_cols.reserve(call.partition_by.size());
               for (const Expression& kp : call.partition_by) {
                 if (kp && kp->Type() == TypeTag::kColumnValue) {
                   call_cols.push_back(kp->AsColumnValue().GetColumnName());
@@ -6286,9 +6646,12 @@ const RuleSet& RuleSet::Default() {
               window_outputs.insert(target.name);
             }
 
+            const auto push_conjuncts = SplitConjuncts(*expression.predicate);
             std::vector<Expression> pushable;
             std::vector<Expression> remaining;
-            for (const auto& conjunct : SplitConjuncts(*expression.predicate)) {
+            pushable.reserve(push_conjuncts.size());
+            remaining.reserve(push_conjuncts.size());
+            for (const auto& conjunct : push_conjuncts) {
               if (!conjunct) {
                 continue;
               }
@@ -6391,8 +6754,14 @@ const RuleSet& RuleSet::Default() {
           // merged class is equal on every row the inner joins emit, so
           // substituting the filter column by any member keeps the selection
           // semantically unchanged (NULL rows never satisfy a join equality).
+          size_t member_count = 0;
+          for (const auto& ec : eq_classes) {
+            member_count += ec.size();
+          }
           std::unordered_map<std::string, size_t> member_node;
           std::vector<size_t> class_parent;
+          member_node.reserve(member_count);
+          class_parent.reserve(member_count);
           const auto find_root = [&class_parent](size_t node) {
             while (class_parent[node] != node) {
               class_parent[node] = class_parent[class_parent[node]];
@@ -6488,6 +6857,7 @@ const RuleSet& RuleSet::Default() {
 
           if (!new_inferred.empty()) {
             std::vector<Expression> combined = existing_conjuncts;
+            combined.reserve(existing_conjuncts.size() + new_inferred.size());
             for (const auto& inf : new_inferred) {
               combined.push_back(inf);
             }
@@ -6620,7 +6990,8 @@ const RuleSet& RuleSet::Default() {
           // its position above the join so the restored order picks the same
           // rows; the rewrite below drops every ordering field.
           if (expression.with_ties || !expression.sort_ascending.empty() ||
-              !expression.sort_nulls_first.empty()) {
+              !expression.sort_nulls_first.empty() ||
+              !expression.target_list.empty()) {
             return;
           }
           const GroupId input_id = bindings.at("input");
@@ -6776,6 +7147,480 @@ const RuleSet& RuleSet::Default() {
         },
         LogicalOperator::kLimit));
 
+    // window_halo_topn: TopN over unpartitioned bounded-ROWS Window sharing the
+    // exact ORDER BY spec can restrict the Window input to the sorted halo
+    // `[offset - max_preceding, offset + limit + max_following)` via an inner
+    // TopN and slice off only `[offset - halo_lo, ...)` above the Window.
+    // Lean proof: lean/TinylambOpt/WindowHalo.lean (window_halo_sound)
+    built.Add(Rule(
+        "window_halo_topn", TopN(Window(Any(), "window")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const char* disable_halo =
+              std::getenv("TINYLAMB_DISABLE_WINDOW_HALO");
+          if (disable_halo != nullptr && disable_halo[0] != '\0' &&
+              disable_halo[0] != '0') {
+            return;
+          }
+          if (expression.operation != LogicalOperator::kTopN ||
+              expression.children.size() != 1 || expression.with_ties ||
+              expression.limit_count == 0 ||
+              expression.prior_limit_offset != 0 ||
+              expression.target_list.empty() ||
+              expression.target_list.size() !=
+                  expression.sort_ascending.size()) {
+            return;
+          }
+          size_t end_excl = 0;
+          if (__builtin_add_overflow(expression.limit_offset,
+                                     expression.limit_count, &end_excl)) {
+            return;
+          }
+          const GroupId window_group_id = bindings.at("window");
+          if (window_group_id == group ||
+              memo.Get(window_group_id)
+                  .tag.starts_with("window-halo-window:") ||
+              memo.Get(window_group_id)
+                  .tag.starts_with("window-prefix-window:")) {
+            return;
+          }
+          const std::vector<LogicalExpression> window_exprs =
+              memo.Get(window_group_id).expressions;
+          const std::vector<NamedExpression> topn_targets =
+              expression.target_list;
+          const std::vector<bool> topn_ascending = expression.sort_ascending;
+          const std::vector<std::optional<bool>> topn_nulls_first =
+              expression.sort_nulls_first;
+          const size_t topn_limit = expression.limit_count;
+          const size_t topn_offset = expression.limit_offset;
+          const Schema topn_schema = expression.output_schema;
+          for (const LogicalExpression& win : window_exprs) {
+            if (win.operation != LogicalOperator::kWindow ||
+                win.children.size() != 1 || !win.partition_by.empty() ||
+                win.target_list.empty()) {
+              continue;
+            }
+            const GroupId input_id = win.children[0];
+            if (input_id == group || input_id == window_group_id ||
+                memo.Get(input_id).tag.starts_with("window-halo-topn:") ||
+                ReachableChildHasWindow(memo, input_id)) {
+              continue;
+            }
+            const std::vector<std::string> relations =
+                memo.Get(input_id).relations;
+            auto columns_match = [&](const ColumnName& a, const ColumnName& b) {
+              if (SameColumnReference(a, b)) {
+                return true;
+              }
+              if (relations.size() == 1 &&
+                  (a.schema.empty() || b.schema.empty())) {
+                const std::string& rel = relations.front();
+                const bool a_ok =
+                    a.schema.empty() || IdentifierEquals(a.schema, rel);
+                const bool b_ok =
+                    b.schema.empty() || IdentifierEquals(b.schema, rel);
+                return a_ok && b_ok && IdentifierEquals(a.name, b.name);
+              }
+              return false;
+            };
+            auto is_supported_halo_agg = [](std::string_view fn) {
+              return IdentifierEquals(fn, "SUM") ||
+                     IdentifierEquals(fn, "COUNT") ||
+                     IdentifierEquals(fn, "AVG") ||
+                     IdentifierEquals(fn, "MIN") || IdentifierEquals(fn, "MAX");
+            };
+            size_t max_preceding = 0;
+            size_t max_following = 0;
+            auto parse_bound = [&](const WindowFrameBound& bound) -> bool {
+              if (bound.type == WindowFrameBoundType::kCurrentRow) {
+                return true;
+              }
+              if (bound.type != WindowFrameBoundType::kOffsetPreceding &&
+                  bound.type != WindowFrameBoundType::kOffsetFollowing) {
+                return false;
+              }
+              if (!bound.offset ||
+                  bound.offset->Type() != TypeTag::kConstantValue ||
+                  dynamic_cast<const ParameterSlot*>(bound.offset.get()) !=
+                      nullptr) {
+                return false;
+              }
+              const Value& val = bound.offset->AsConstantValue().GetValue();
+              if (val.IsNull() || val.type != ValueType::kInt64 ||
+                  val.IsUnsigned() || val.value.int_value < 0) {
+                return false;
+              }
+              const auto off = static_cast<size_t>(val.value.int_value);
+              if (bound.type == WindowFrameBoundType::kOffsetPreceding) {
+                max_preceding = std::max(max_preceding, off);
+              } else {
+                max_following = std::max(max_following, off);
+              }
+              return true;
+            };
+
+            bool ok = true;
+            for (const NamedExpression& target : win.target_list) {
+              if (!target.expression ||
+                  target.expression->Type() != TypeTag::kWindowFunctionExp) {
+                ok = false;
+                break;
+              }
+              const auto& call =
+                  target.expression->AsWindowFunctionCallExpression();
+              if (!call.partition_by.empty() || !call.has_frame ||
+                  call.frame_unit != WindowFrameUnit::kRows ||
+                  call.exclusion != WindowFrameExclusion::kNone ||
+                  call.where_filter || !call.inner_order_by.empty() ||
+                  call.inner_limit.has_value() ||
+                  !is_supported_halo_agg(call.function)) {
+                ok = false;
+                break;
+              }
+              for (const Expression& arg : call.args) {
+                if (!arg || !SafeToReduceEvaluationCount(arg) ||
+                    !ExpressionCannotThrowForPlanner(arg)) {
+                  ok = false;
+                  break;
+                }
+              }
+              if (!ok || !parse_bound(call.frame_start) ||
+                  !parse_bound(call.frame_end)) {
+                ok = false;
+                break;
+              }
+              if (call.order_by.size() != topn_targets.size()) {
+                ok = false;
+                break;
+              }
+              for (size_t j = 0; j < call.order_by.size(); ++j) {
+                const WindowOrderTerm& wt = call.order_by[j];
+                const Expression& topn_key = topn_targets[j].expression;
+                if (!wt.expression || !topn_key) {
+                  ok = false;
+                  break;
+                }
+                const bool expr_eq =
+                    (wt.expression->Type() == TypeTag::kColumnValue &&
+                     topn_key->Type() == TypeTag::kColumnValue)
+                        ? columns_match(
+                              wt.expression->AsColumnValue().GetColumnName(),
+                              topn_key->AsColumnValue().GetColumnName())
+                        : (wt.expression->ToString() == topn_key->ToString());
+                const std::optional<bool> topn_nulls =
+                    j < topn_nulls_first.size() ? topn_nulls_first[j]
+                                                : std::nullopt;
+                if (!expr_eq || wt.ascending != topn_ascending[j] ||
+                    wt.nulls_first.value_or(wt.ascending) !=
+                        topn_nulls.value_or(wt.ascending) ||
+                    CollationOfExpression(wt.expression) !=
+                        CollationOfExpression(topn_key)) {
+                  ok = false;
+                  break;
+                }
+              }
+              if (!ok) {
+                break;
+              }
+            }
+            if (!ok) {
+              continue;
+            }
+            const size_t halo_lo =
+                topn_offset > max_preceding ? topn_offset - max_preceding : 0;
+            size_t halo_hi = 0;
+            if (__builtin_add_overflow(end_excl, max_following, &halo_hi)) {
+              continue;
+            }
+            const size_t halo_count = halo_hi - halo_lo;
+            if (halo_count == 0) {
+              continue;
+            }
+            const size_t outer_offset = topn_offset - halo_lo;
+
+            std::string sig = GroupIdsTag({input_id}) + "|" +
+                              WindowNodeIdentity(win) + "|" + win.Fingerprint();
+            AppendInteger(sig, halo_lo);
+            sig.push_back(':');
+            AppendInteger(sig, halo_count);
+            sig.push_back('|');
+            for (size_t j = 0; j < topn_targets.size(); ++j) {
+              const std::string text = topn_targets[j].expression->ToString();
+              AppendInteger(sig, text.size());
+              sig.push_back(':');
+              sig.append(text);
+              sig.push_back(topn_ascending[j] ? '+' : '-');
+              const std::optional<bool> nf = j < topn_nulls_first.size()
+                                                 ? topn_nulls_first[j]
+                                                 : std::nullopt;
+              sig.push_back(nf ? (*nf ? '1' : '0') : '?');
+            }
+
+            const GroupId halo_topn_group =
+                memo.EnsureDerivedGroup(relations, "window-halo-topn:" + sig);
+            if (halo_topn_group == group ||
+                halo_topn_group == window_group_id ||
+                halo_topn_group == input_id) {
+              continue;
+            }
+            memo.AddExpression(
+                halo_topn_group,
+                LogicalExpression{.operation = LogicalOperator::kTopN,
+                                  .children = {input_id},
+                                  .target_list = topn_targets,
+                                  .sort_ascending = topn_ascending,
+                                  .sort_nulls_first = topn_nulls_first,
+                                  .limit_count = halo_count,
+                                  .limit_offset = halo_lo,
+                                  .with_ties = false});
+
+            const GroupId halo_win_group =
+                memo.EnsureDerivedGroup(relations, "window-halo-window:" + sig);
+            if (halo_win_group == group || halo_win_group == window_group_id ||
+                halo_win_group == input_id ||
+                halo_win_group == halo_topn_group) {
+              continue;
+            }
+            LogicalExpression new_win = win;
+            new_win.children = {halo_topn_group};
+            memo.AddExpression(halo_win_group, std::move(new_win));
+
+            memo.AddExpression(
+                group, LogicalExpression{.operation = LogicalOperator::kTopN,
+                                         .children = {halo_win_group},
+                                         .target_list = topn_targets,
+                                         .sort_ascending = topn_ascending,
+                                         .sort_nulls_first = topn_nulls_first,
+                                         .limit_count = topn_limit,
+                                         .limit_offset = outer_offset,
+                                         .prior_limit_offset = halo_lo,
+                                         .with_ties = false,
+                                         .output_schema = topn_schema});
+          }
+        },
+        LogicalOperator::kTopN));
+
+    // push_topn_with_ties_through_left_join: TopN ordered strictly on left
+    // columns over LeftOuterJoin can push `TopN(offset + limit WITH TIES)`
+    // into the preserved left branch because every left row emits >= 1 output
+    // row in LEFT JOIN and ties keep all peers of the boundary key.
+    // Lean proof: lean/TinylambOpt/OuterFetchTies.lean
+    //   (sql_outer_fetch_ties_sound)
+    built.Add(Rule(
+        "push_topn_with_ties_through_left_join", TopN(Any("input")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          const char* disable_ties =
+              std::getenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+          if (disable_ties != nullptr && disable_ties[0] != '\0' &&
+              disable_ties[0] != '0') {
+            return;
+          }
+          if (expression.operation != LogicalOperator::kTopN ||
+              expression.children.size() != 1 || expression.limit_count == 0 ||
+              expression.prior_limit_offset != 0 ||
+              expression.target_list.empty() ||
+              expression.target_list.size() !=
+                  expression.sort_ascending.size()) {
+            return;
+          }
+          size_t total_limit = 0;
+          if (__builtin_add_overflow(expression.limit_count,
+                                     expression.limit_offset, &total_limit) ||
+              total_limit == 0) {
+            return;
+          }
+          const GroupId input_id = bindings.at("input");
+          if (input_id == group ||
+              memo.Get(input_id).tag.starts_with("ojoin_topn_ties_join:")) {
+            return;
+          }
+          auto is_pure_join_side_expr = [](auto&& self,
+                                           const Expression& expr) -> bool {
+            if (!expr) {
+              return false;
+            }
+            switch (expr->Type()) {
+              case TypeTag::kColumnValue:
+                return true;
+              case TypeTag::kConstantValue:
+                return dynamic_cast<const ParameterSlot*>(expr.get()) ==
+                       nullptr;
+              case TypeTag::kBinaryExp: {
+                const auto& b = expr->AsBinaryExpression();
+                if (b.Op() == BinaryOperation::kDivide ||
+                    b.Op() == BinaryOperation::kModulo ||
+                    b.Op() == BinaryOperation::kShiftLeft ||
+                    b.Op() == BinaryOperation::kShiftRight) {
+                  return false;
+                }
+                return self(self, b.Left()) && self(self, b.Right());
+              }
+              case TypeTag::kUnaryExp: {
+                const auto& u = expr->AsUnaryExpression();
+                return u.Op() != UnaryOperation::kMinus &&
+                       self(self, u.Child());
+              }
+              case TypeTag::kInExp:
+              case TypeTag::kCaseExp: {
+                const auto children = ExpressionChildren(expr);
+                return !children.empty() &&
+                       std::ranges::all_of(children, [&](const Expression& ch) {
+                         return self(self, ch);
+                       });
+              }
+              case TypeTag::kFunctionCallExp: {
+                const auto& fn = expr->AsFunctionCallExpression();
+                if (IdentifierEquals(fn.FuncName(), "rand") ||
+                    IdentifierEquals(fn.FuncName(), "random") ||
+                    IdentifierEquals(fn.FuncName(), "now") ||
+                    IdentifierEquals(fn.FuncName(), "current_timestamp") ||
+                    IdentifierEquals(fn.FuncName(), "uuid") ||
+                    IdentifierEquals(fn.FuncName(), "generate_uuid")) {
+                  return false;
+                }
+                return std::ranges::all_of(
+                    fn.Args(),
+                    [&](const Expression& ch) { return self(self, ch); });
+              }
+              default:
+                return false;
+            }
+          };
+
+          const LogicalExpression& outer_template = expression;
+          const std::vector<LogicalExpression> input_exprs =
+              memo.Get(input_id).expressions;
+          const std::vector<std::string> join_rels =
+              memo.Get(input_id).relations;
+          for (const LogicalExpression& ojoin : input_exprs) {
+            if (ojoin.operation != LogicalOperator::kOuterJoin ||
+                ojoin.join_type != 0 || ojoin.children.size() != 2 ||
+                !ojoin.predicate.has_value() || !*ojoin.predicate ||
+                !is_pure_join_side_expr(is_pure_join_side_expr,
+                                        *ojoin.predicate)) {
+              continue;
+            }
+            const GroupId left_id = ojoin.children[0];
+            const GroupId right_id = ojoin.children[1];
+            if (memo.Get(left_id).tag.starts_with("ojoin_topn_ties_left:")) {
+              continue;
+            }
+            bool left_already_bounded = false;
+            for (const LogicalExpression& lexpr :
+                 memo.Get(left_id).expressions) {
+              if ((lexpr.operation == LogicalOperator::kTopN &&
+                   lexpr.with_ties && lexpr.limit_offset == 0 &&
+                   lexpr.limit_count <= total_limit) ||
+                  (lexpr.operation == LogicalOperator::kLimit &&
+                   lexpr.limit_offset == 0 &&
+                   lexpr.limit_count <= total_limit)) {
+                left_already_bounded = true;
+                break;
+              }
+            }
+            if (left_already_bounded) {
+              continue;
+            }
+
+            const std::vector<std::string> left_rels =
+                memo.Get(left_id).relations;
+            const std::vector<std::string> right_rels =
+                memo.Get(right_id).relations;
+            auto rel_contains = [](const std::vector<std::string>& rels,
+                                   const std::string& schema) {
+              return std::ranges::any_of(rels, [&](const std::string& rel) {
+                return IdentifierEquals(rel, schema);
+              });
+            };
+            bool all_left_only = true;
+            bool touched_any = false;
+            for (const NamedExpression& key : outer_template.target_list) {
+              if (!key.expression ||
+                  !is_pure_join_side_expr(is_pure_join_side_expr,
+                                          key.expression)) {
+                all_left_only = false;
+                break;
+              }
+              const auto touched = key.expression->TouchedColumns();
+              for (const ColumnName& col : touched) {
+                touched_any = true;
+                if (col.schema.empty() ||
+                    !rel_contains(left_rels, col.schema) ||
+                    rel_contains(right_rels, col.schema)) {
+                  all_left_only = false;
+                  break;
+                }
+              }
+              if (!all_left_only) {
+                break;
+              }
+            }
+            if (!all_left_only || !touched_any) {
+              continue;
+            }
+
+            std::string sig;
+            AppendInteger(sig, total_limit);
+            sig.push_back(':');
+            AppendInteger(sig, left_id);
+            sig.push_back(':');
+            AppendInteger(sig, right_id);
+            sig.push_back(':');
+            const std::string pred_str = (*ojoin.predicate)->ToString();
+            AppendInteger(sig, pred_str.size());
+            sig.push_back('/');
+            sig.append(pred_str);
+            sig.push_back('|');
+            for (size_t j = 0; j < outer_template.target_list.size(); ++j) {
+              const std::string key_str =
+                  outer_template.target_list[j].expression->ToString();
+              AppendInteger(sig, key_str.size());
+              sig.push_back(':');
+              sig.append(key_str);
+              sig.push_back(outer_template.sort_ascending[j] ? '+' : '-');
+              const std::optional<bool> nf =
+                  j < outer_template.sort_nulls_first.size()
+                      ? outer_template.sort_nulls_first[j]
+                      : std::nullopt;
+              sig.push_back(nf ? (*nf ? '1' : '0') : '?');
+            }
+
+            const GroupId topn_left_group = memo.EnsureDerivedGroup(
+                left_rels, "ojoin_topn_ties_left:" + sig);
+            if (topn_left_group == left_id || topn_left_group == group ||
+                topn_left_group == input_id) {
+              continue;
+            }
+            memo.AddExpression(
+                topn_left_group,
+                LogicalExpression{
+                    .operation = LogicalOperator::kTopN,
+                    .children = {left_id},
+                    .target_list = outer_template.target_list,
+                    .sort_ascending = outer_template.sort_ascending,
+                    .sort_nulls_first = outer_template.sort_nulls_first,
+                    .limit_count = total_limit,
+                    .limit_offset = 0,
+                    .with_ties = true});
+
+            const GroupId new_ojoin_group = memo.EnsureDerivedGroup(
+                join_rels, "ojoin_topn_ties_join:" + sig);
+            if (new_ojoin_group == group || new_ojoin_group == input_id ||
+                new_ojoin_group == topn_left_group) {
+              continue;
+            }
+            LogicalExpression new_ojoin = ojoin;
+            new_ojoin.children = {topn_left_group, right_id};
+            memo.AddExpression(new_ojoin_group, std::move(new_ojoin));
+
+            LogicalExpression outer_topn = outer_template;
+            outer_topn.children = {new_ojoin_group};
+            memo.AddExpression(group, std::move(outer_topn));
+          }
+        },
+        LogicalOperator::kTopN));
+
     // merge_adjacent_windows: Fuse Window_1(Window_2(X)) into a single
     // Window(X) when both windows have identical PARTITION BY and Window_1
     // does not reference Window_2's outputs. ORDER BY/frame specifications
@@ -6846,6 +7691,8 @@ const RuleSet& RuleSet::Default() {
             }
 
             std::vector<NamedExpression> merged_targets = inner_win.target_list;
+            merged_targets.reserve(inner_win.target_list.size() +
+                                   expression.target_list.size());
             for (const auto& target : expression.target_list) {
               merged_targets.push_back(target);
             }
@@ -6971,6 +7818,10 @@ const RuleSet& RuleSet::Default() {
                 const Group& child_group = memo.Get(child);
                 if (child_group.filter &&
                     memo.Get(group).relations.size() == 1) {
+                  // The child's filter can be branch-local; the copied
+                  // alternatives must keep that mark or a later rule will
+                  // push it into a scan shared by another set-op branch.
+                  InheritBranchLocal(memo, group, child);
                   memo.MergeScanFilter(group, child_group.filter);
                 }
                 for (const LogicalExpression& child_expr :
@@ -7011,6 +7862,9 @@ const RuleSet& RuleSet::Default() {
               const auto outer_uses_window = [](const LogicalExpression& outer,
                                                 const LogicalExpression& win) {
                 if (outer.target_list.empty()) {
+                  // Unbound target list (e.g. SELECT * before expansion):
+                  // it may expose the window outputs even though nothing is
+                  // named yet, so treat it as a reference conservatively.
                   return true;
                 }
                 std::unordered_set<std::string> outputs;
@@ -7145,16 +7999,25 @@ const RuleSet& RuleSet::Default() {
           // filter over makes the alternative predicate-equivalent to the
           // original probe child.
           const Expression probe_filter = memo.Get(probe_id).filter;
+          // Length-prefix each name: a quoted identifier may itself contain
+          // the separator, and two different key sets must never collapse to
+          // the same derived-group tag.
           std::string key_fingerprint;
           for (const ColumnName& key : bloom_keys) {
-            key_fingerprint += key.ToString();
-            key_fingerprint.push_back(',');
+            const std::string name = key.ToString();
+            key_fingerprint += std::to_string(name.size());
+            key_fingerprint.push_back(':');
+            key_fingerprint += name;
           }
           const GroupId filtered_probe = memo.EnsureDerivedGroup(
               probe_rels,
               "bloom_probe:" + GroupIdsTag({probe_id}) + key_fingerprint);
           if (filtered_probe != probe_id && filtered_probe != group) {
             memo.Get(filtered_probe).filter = probe_filter;
+            // A branch-local probe must stay branch-local: other derived rules
+            // inherit the mark, otherwise this shared group could leak the
+            // probe filter into another UNION branch.
+            InheritBranchLocal(memo, filtered_probe, group);
             // The logical half of the dynamic filter contract: these columns
             // hold the join key a build side publishes a sound membership /
             // range filter over. The executor picks the shape (exact set,
@@ -7222,9 +8085,11 @@ const RuleSet& RuleSet::Default() {
                   })) {
             return;
           }
+          const std::vector<Expression> probe_conjuncts =
+              SplitConjuncts(*expression.predicate);
           std::vector<ColumnName> probe_keys;
-          for (const Expression& conjunct :
-               SplitConjuncts(*expression.predicate)) {
+          probe_keys.reserve(probe_conjuncts.size());
+          for (const Expression& conjunct : probe_conjuncts) {
             if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
               continue;
             }
@@ -7254,16 +8119,22 @@ const RuleSet& RuleSet::Default() {
             return;
           }
           const Expression probe_filter = memo.Get(probe_id).filter;
-          std::string key_fingerprint;
+          // Length-prefix each key: a plain comma-separated concatenation
+          // collides for e.g. ["a", "b"] and ["a,b"], which would reuse a
+          // derived group annotated with the wrong probe key set.
+          std::string key_fingerprint = std::to_string(probe_keys.size()) + ":";
           for (const ColumnName& key : probe_keys) {
-            key_fingerprint += key.ToString();
-            key_fingerprint.push_back(',');
+            const std::string text = key.ToString();
+            key_fingerprint += std::to_string(text.size()) + "/" + text + ";";
           }
           const GroupId keyed_probe = memo.EnsureDerivedGroup(
               probe_rels,
               "semi_reduce_probe:" + GroupIdsTag({probe_id}) + key_fingerprint);
           if (keyed_probe != probe_id && keyed_probe != group) {
             memo.Get(keyed_probe).filter = probe_filter;
+            // Keep the probe's branch locality: without this the derived
+            // group may be shared by another UNION branch as well.
+            InheritBranchLocal(memo, keyed_probe, group);
             // The logical half of the semi-reduction contract: the executor
             // may build a distinct key domain over these columns and drop
             // build rows the probe side can never match.
@@ -7306,6 +8177,7 @@ const RuleSet& RuleSet::Default() {
           }
           const auto conjuncts = SplitConjuncts(*expression.predicate);
           std::vector<std::pair<ColumnName, ColumnName>> equalities;
+          equalities.reserve(conjuncts.size());
           for (const auto& conj : conjuncts) {
             if (conj && conj->Type() == TypeTag::kBinaryExp) {
               const auto& bin = conj->AsBinaryExpression();
@@ -7447,12 +8319,13 @@ const RuleSet& RuleSet::Default() {
           };
 
           std::vector<Expression> kept;
+          kept.reserve(conjuncts.size());
           bool removed = false;
           for (const auto& conj : conjuncts) {
             if (conj && conj->Type() == TypeTag::kBinaryExp) {
               const auto& bin = conj->AsBinaryExpression();
-              if (bin.Op() == BinaryOperation::kEquals &&
-                  bin.Left()->Type() == TypeTag::kColumnValue &&
+              if (bin.Op() == BinaryOperation::kEquals && bin.Left() &&
+                  bin.Right() && bin.Left()->Type() == TypeTag::kColumnValue &&
                   bin.Right()->Type() == TypeTag::kColumnValue) {
                 const ColumnName lhs_col =
                     bin.Left()->AsColumnValue().GetColumnName();
@@ -8073,19 +8946,48 @@ const RuleSet& RuleSet::Default() {
                   bin.Op() == BinaryOperation::kGreaterThanEquals ||
                   bin.Op() == BinaryOperation::kLessThan ||
                   bin.Op() == BinaryOperation::kGreaterThan) {
+                const Expression* column_expr = nullptr;
+                const Expression* bound_expr = nullptr;
+                BinaryOperation op = bin.Op();
                 if (bin.Left()->Type() == TypeTag::kColumnValue &&
                     bin.Right()->Type() == TypeTag::kConstantValue) {
-                  const std::string col_str =
-                      bin.Left()->AsColumnValue().GetColumnName().ToString();
+                  column_expr = &bin.Left();
+                  bound_expr = &bin.Right();
+                } else if (bin.Left()->Type() == TypeTag::kConstantValue &&
+                           bin.Right()->Type() == TypeTag::kColumnValue) {
+                  column_expr = &bin.Right();
+                  bound_expr = &bin.Left();
+                  switch (op) {
+                    case BinaryOperation::kLessThan:
+                      op = BinaryOperation::kGreaterThan;
+                      break;
+                    case BinaryOperation::kGreaterThan:
+                      op = BinaryOperation::kLessThan;
+                      break;
+                    case BinaryOperation::kLessThanEquals:
+                      op = BinaryOperation::kGreaterThanEquals;
+                      break;
+                    case BinaryOperation::kGreaterThanEquals:
+                      op = BinaryOperation::kLessThanEquals;
+                      break;
+                    default:
+                      break;
+                  }
+                }
+                if (column_expr != nullptr) {
+                  const std::string col_str = (*column_expr)
+                                                  ->AsColumnValue()
+                                                  .GetColumnName()
+                                                  .ToString();
                   auto it = eq_constants.find(col_str);
                   if (it != eq_constants.end()) {
                     const Value& k = it->second;
                     const Value& bound =
-                        bin.Right()->AsConstantValue().GetValue();
+                        (*bound_expr)->AsConstantValue().GetValue();
                     if (!k.IsNull() && !bound.IsNull() &&
                         k.type == bound.type) {
                       const StatusOr<Value> eval =
-                          TryEvaluateBinary(bin.Op(), k, bound);
+                          TryEvaluateBinary(op, k, bound);
                       if (eval.HasValue() && !eval.Value().IsNull() &&
                           eval.Value().Truthy()) {
                         reduced = true;
@@ -8154,6 +9056,7 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
             std::vector<NamedExpression> new_targets;
+            new_targets.reserve(expression.target_list.size());
             bool transformed = false;
             bool all_valid = true;
             for (const auto& target : expression.target_list) {
@@ -8162,7 +9065,7 @@ const RuleSet& RuleSet::Default() {
                 break;
               }
               if (target.expression->Type() == TypeTag::kAggregateExp) {
-                const auto& orig = static_cast<const AggregateExpression&>(
+                const auto& orig = dynamic_cast<const AggregateExpression&>(
                     *target
                          .expression);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                 if (orig.NeedsGroupContext() || !orig.InnerGroupBy().empty()) {
@@ -8263,7 +9166,7 @@ const RuleSet& RuleSet::Default() {
                 break;
               }
               if (target.expression->Type() == TypeTag::kAggregateExp) {
-                const auto& agg = static_cast<const AggregateExpression&>(
+                const auto& agg = dynamic_cast<const AggregateExpression&>(
                     *target
                          .expression);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                 if (target.name.empty() ||
@@ -8365,7 +9268,7 @@ const RuleSet& RuleSet::Default() {
               for (const auto& target : expression.target_list) {
                 if (target.expression &&
                     target.expression->Type() == TypeTag::kAggregateExp) {
-                  const auto& agg = static_cast<
+                  const auto& agg = dynamic_cast<
                       const AggregateExpression&>(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                       *target.expression);
                   if (agg.GetType() == AggregationType::kCount) {
@@ -8566,6 +9469,10 @@ const RuleSet& RuleSet::Default() {
           // preserves the relation set, so the destination is single too.
           if (survivor != group && survivor_group.filter &&
               memo.Get(group).relations.size() == 1) {
+            // Same contract as eliminate_true_selection: carry the survivor's
+            // branch-local mark with the filter so it is never later merged
+            // into a scan shared by another set-op branch.
+            InheritBranchLocal(memo, group, survivor);
             memo.MergeScanFilter(group, survivor_group.filter);
           }
           for (const LogicalExpression& alternative :
@@ -8656,10 +9563,11 @@ const RuleSet& RuleSet::Default() {
     // topn_push_through_inner_join is DISABLED (see the disabled-rules table
     // in docs/cascades_optimizer.md): pushing TopN below an inner join
     // requires proof that every left row finds a match, but uniqueness on
-    // the right join keys only bounds the match count at one. With an
-    // unmatched left row inside the top-(limit+offset) prefix, the rewritten
-    // plan drops rows the original plan keeps. Proving ">= 1 match" needs
-    // referential-integrity metadata the memo does not model.
+    // the right join keys only bounds the match count at one. The unmatched
+    // left row inside the top-(limit+offset) prefix is that DISABLED rule's
+    // counterexample, not a gate of the enabled rule below. Proving
+    // ">= 1 match" needs referential-integrity metadata the memo does not
+    // model.
 
     // topn_push_through_proven_one_to_one_join:
     // TopN(keys, limit, offset) over an inner Join(L, R) gains an alternative
@@ -8681,7 +9589,8 @@ const RuleSet& RuleSet::Default() {
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           if (expression.operation != LogicalOperator::kTopN ||
-              expression.children.size() != 1 || expression.with_ties) {
+              expression.children.size() != 1 || expression.with_ties ||
+              expression.prior_limit_offset != 0) {
             return;
           }
           if (expression.limit_offset >
@@ -9038,10 +9947,32 @@ const RuleSet& RuleSet::Default() {
                 default:
                   break;
               }
+              const auto& schemas = memo.GetTableSchemas();
               for (const ColumnName& column : current->TouchedColumns()) {
-                if (!column.schema.empty() &&
-                    std::ranges::find(input_relations, column.schema) ==
-                        input_relations.end()) {
+                if (!column.schema.empty()) {
+                  if (std::ranges::find(input_relations, column.schema) ==
+                      input_relations.end()) {
+                    return false;
+                  }
+                  continue;
+                }
+                // An unqualified column must also resolve to an input
+                // relation: an outer reference would be re-bound per UNION
+                // branch and could evaluate differently in each. Keep the
+                // permissive behaviour when schemas are unavailable (e.g.
+                // synthesized memos in unit tests).
+                if (schemas.empty()) {
+                  continue;
+                }
+                size_t matches = 0;
+                for (const auto& rel : input_relations) {
+                  const auto found = schemas.find(rel);
+                  if (found != schemas.end() &&
+                      found->second.Offset(ColumnName("", column.name)) >= 0) {
+                    ++matches;
+                  }
+                }
+                if (matches != 1) {
                   return false;
                 }
               }
@@ -9248,9 +10179,14 @@ const RuleSet& RuleSet::Default() {
               pushed_join.children =
                   side == 0 ? std::vector<GroupId>{pushed_distinct, other_id}
                             : std::vector<GroupId>{other_id, pushed_distinct};
+              // The tag must identify the CHILDREN as well: with only the
+              // relation names and predicate, two joins with different child
+              // groups (e.g. one carrying an extra filter) share one derived
+              // group and mix each other's alternatives.
               const GroupId pushed_join_group = memo.EnsureDerivedGroup(
                   input_relations, "distinct_eager_join:" + pushed_rel + ":" +
-                                       join_predicate->ToString());
+                                       join_predicate->ToString() + ":" +
+                                       GroupIdsTag(pushed_join.children));
               if (pushed_join_group == group || pushed_join_group == input_id) {
                 continue;
               }
@@ -9280,7 +10216,8 @@ const RuleSet& RuleSet::Default() {
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           if (expression.operation != LogicalOperator::kTopN ||
-              expression.children.size() != 1 || expression.with_ties) {
+              expression.children.size() != 1 || expression.with_ties ||
+              expression.prior_limit_offset != 0) {
             return;
           }
           if (expression.limit_offset >
@@ -9447,13 +10384,14 @@ const RuleSet& RuleSet::Default() {
             return;
           }
           std::vector<std::pair<std::string, std::vector<size_t>>> runs;
+          runs.reserve(expression.target_list.size());
           for (size_t i = 0; i < expression.target_list.size(); ++i) {
             const NamedExpression& target = expression.target_list[i];
             if (!target.expression ||
                 target.expression->Type() != TypeTag::kWindowFunctionExp) {
               return;
             }
-            const auto& call = static_cast<
+            const auto& call = dynamic_cast<
                 const WindowFunctionCallExpression&>(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                 *target.expression);
             std::string spec;
@@ -9483,11 +10421,12 @@ const RuleSet& RuleSet::Default() {
           for (size_t s = 0; s < runs.size(); ++s) {
             const bool outermost = (s + 1 == runs.size());
             std::vector<NamedExpression> level_targets;
+            level_targets.reserve(runs[s].second.size());
             std::vector<Expression> level_partition;
             for (size_t index : runs[s].second) {
               level_targets.push_back(expression.target_list[index]);
               if (level_partition.empty()) {
-                const auto& call = static_cast<
+                const auto& call = dynamic_cast<
                     const WindowFunctionCallExpression&>(  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
                     *expression.target_list[index].expression);
                 level_partition = call.partition_by;
@@ -9890,8 +10829,14 @@ const RuleSet& RuleSet::Default() {
               default:
                 continue;
             }
-            memo.MergeScanFilter(memo.EnsureGroup({column.schema}),
-                                 CombineConjuncts(bounds));
+            // Strengthen the group that owns this Selection, not the shared
+            // base scan group: with the gate above, a branch-local Selection
+            // must not remove rows another UNION/outer-join branch needs.
+            // push_selection_into_scan copies the scan alternative into this
+            // group, so the range still reaches the access path.
+            if (memo.Get(group).relations.size() == 1) {
+              memo.MergeScanFilter(group, CombineConjuncts(bounds));
+            }
           }
         },
         LogicalOperator::kSelection));
@@ -10633,10 +11578,11 @@ const RuleSet& RuleSet::Default() {
                                                             left_vec.end());
             const std::unordered_set<std::string> right_rels(right_vec.begin(),
                                                              right_vec.end());
+            const auto join_conjuncts = SplitConjuncts(*join_expr.predicate);
             std::vector<std::pair<ColumnName, ColumnName>> equi_pairs;
+            equi_pairs.reserve(join_conjuncts.size());
             bool all_equi = true;
-            for (const Expression& conj :
-                 SplitConjuncts(*join_expr.predicate)) {
+            for (const Expression& conj : join_conjuncts) {
               if (!conj || conj->Type() != TypeTag::kBinaryExp ||
                   conj->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
                 all_equi = false;
@@ -10684,6 +11630,12 @@ const RuleSet& RuleSet::Default() {
               // 0 touched columns and is valid on either side).
               bool aggs_on_side = true;
               for (const NamedExpression& target : orig_agg_expr.target_list) {
+                // The rule's entry guard rejects null target expressions;
+                // keep the check local so this loop is safe on its own.
+                if (!target.expression) {
+                  aggs_on_side = false;
+                  break;
+                }
                 if (target.expression->Type() != TypeTag::kAggregateExp) {
                   continue;
                 }
@@ -10708,15 +11660,25 @@ const RuleSet& RuleSet::Default() {
               // Build pre-aggregation keys: outer_keys in side ∪ join_keys in
               // side.
               std::vector<ColumnName> pre_key_cols;
+              pre_key_cols.reserve(outer_key_cols.size() + equi_pairs.size());
               auto add_pre_key = [&](const ColumnName& c) {
                 if (std::ranges::find(pre_key_cols, c) == pre_key_cols.end()) {
                   pre_key_cols.push_back(c);
                 }
               };
+              bool all_outer_keys_on_side = true;
               for (const ColumnName& c : outer_key_cols) {
-                if (side_rels.contains(c.schema)) {
-                  add_pre_key(c);
+                if (!side_rels.contains(c.schema)) {
+                  // A GROUP BY key spanning both sides cannot be represented
+                  // by a single side's pre-aggregation key: silently dropping
+                  // the other side would coarsen the GROUP BY granularity.
+                  all_outer_keys_on_side = false;
+                  break;
                 }
+                add_pre_key(c);
+              }
+              if (!all_outer_keys_on_side) {
+                continue;
               }
               for (const auto& [lc, rc] : equi_pairs) {
                 add_pre_key(side == 0 ? lc : rc);
@@ -10762,10 +11724,19 @@ const RuleSet& RuleSet::Default() {
                 pre_grouping_exprs.push_back(ColumnValueExp(c));
               }
               std::vector<NamedExpression> pre_targets;
+              pre_targets.reserve(orig_agg_expr.target_list.size());
               std::vector<NamedExpression> final_targets;
               final_targets.reserve(orig_agg_expr.target_list.size());
               size_t partial_idx = 0;
+              bool valid_targets = true;
               for (const NamedExpression& target : orig_agg_expr.target_list) {
+                if (!target.expression) {
+                  // Defensive: the entry guard rejects partially built
+                  // aggregation nodes, but never dereference an unverified
+                  // target expression here.
+                  valid_targets = false;
+                  break;
+                }
                 if (target.expression->Type() != TypeTag::kAggregateExp) {
                   final_targets.push_back(target);
                   continue;
@@ -10787,11 +11758,15 @@ const RuleSet& RuleSet::Default() {
                 }
                 final_targets.emplace_back(target.name, std::move(final_agg));
               }
+              if (!valid_targets) {
+                continue;
+              }
 
               // Filter NULL join keys before pre-aggregating when not already
               // proven NOT NULL (Lean: innerJoin_filter_left_isSome).
               GroupId pre_input_id = side_id;
               std::vector<Expression> nn_filters;
+              nn_filters.reserve(equi_pairs.size());
               for (const auto& [lc, rc] : equi_pairs) {
                 const ColumnName& side_join_col = side == 0 ? lc : rc;
                 if (!memo.Get(side_id).logical_properties.IsNotNull(
@@ -11047,7 +12022,9 @@ const RuleSet& RuleSet::Default() {
           }
           const GroupId input_id = bindings.at("input");
           if (input_id == group ||
-              memo.Get(input_id).tag.starts_with("outer_to_anti_base:")) {
+              (memo.Get(input_id).tag.starts_with("outer_to_anti_base:") ||
+               memo.Get(input_id).tag.starts_with(
+                   "outer_to_anti_base_thru:"))) {
             return;
           }
           const std::vector<LogicalExpression> join_c_candidates =
@@ -11163,6 +12140,7 @@ const RuleSet& RuleSet::Default() {
                 }
 
                 std::vector<std::string> ac_rels_vec = a_rels_vec;
+                ac_rels_vec.reserve(a_rels_vec.size() + c_rels_vec.size());
                 for (const std::string& r : c_rels_vec) {
                   if (std::ranges::find(ac_rels_vec, r) == ac_rels_vec.end()) {
                     ac_rels_vec.push_back(r);
@@ -11191,8 +12169,12 @@ const RuleSet& RuleSet::Default() {
                                         .target_list = sel_targets,
                                         .output_schema = sel_schema});
                 } else {
+                  // Distinct prefix from the plain outer_to_anti_join rule:
+                  // the child pair here is (Join(A,C), B) instead of (L, R),
+                  // so with the same prefix the two rules could collide on
+                  // equal group ids and mix different AntiJoin meanings.
                   const GroupId anti_group = memo.EnsureDerivedGroup(
-                      input_relations, "outer_to_anti_base:" +
+                      input_relations, "outer_to_anti_base_thru:" +
                                            GroupIdsTag({ac_join_group, b_id}) +
                                            PredicateTag(ojoin.predicate));
                   InheritBranchLocal(memo, anti_group, group);
@@ -11334,18 +12316,49 @@ const RuleSet& RuleSet::Default() {
                 }
                 const std::string s_rel = memo.Get(s_id).relations[0];
                 const std::string b_rel = memo.Get(agg_id).relations[0];
-                if (s_rel == b_rel || !IsSameTable(s_rel, b_rel)) {
+                if (s_rel == b_rel) {
                   continue;
                 }
-                std::string s_table;
-                for (const LogicalExpression& sc : memo.Get(s_id).expressions) {
-                  if (sc.operation == LogicalOperator::kScan &&
-                      !sc.table.empty()) {
-                    s_table = sc.table;
-                    break;
-                  }
+                // The same-table proof comes from the catalog-published
+                // schemas, never from alias spelling: IsSameTable's "_N"
+                // stripping conflates distinct real tables such as `orders`
+                // and `orders_1` (T224). Both aliases must resolve to the
+                // same physical table; relations without catalog schemas
+                // (CTEs, hand-built memos) cannot prove it and are skipped.
+                const auto& rel_schemas = memo.GetTableSchemas();
+                const auto s_schema = rel_schemas.find(s_rel);
+                const auto b_schema = rel_schemas.find(b_rel);
+                if (s_schema == rel_schemas.end() ||
+                    b_schema == rel_schemas.end() ||
+                    s_schema->second.Name() != b_schema->second.Name() ||
+                    s_schema->second.Name().empty()) {
+                  continue;
                 }
-                if (s_table.empty()) {
+                const std::string shared_table(s_schema->second.Name());
+                // kScan.table spells either the relation alias or the
+                // physical table name; AddExpression already proved each
+                // scan covers its group's relation, so resolving the table
+                // field through the catalog identifies a scan of the shared
+                // table under either spelling.
+                const auto scans_shared_table = [&](GroupId scan_group) {
+                  for (const LogicalExpression& e :
+                       memo.Get(scan_group).expressions) {
+                    if (e.operation != LogicalOperator::kScan ||
+                        e.table.empty()) {
+                      continue;
+                    }
+                    if (e.table == shared_table) {
+                      return true;
+                    }
+                    const auto owner = rel_schemas.find(e.table);
+                    if (owner != rel_schemas.end() &&
+                        owner->second.Name() == shared_table) {
+                      return true;
+                    }
+                  }
+                  return false;
+                };
+                if (!scans_shared_table(s_id)) {
                   continue;
                 }
                 const std::vector<LogicalExpression> agg_candidates =
@@ -11354,12 +12367,24 @@ const RuleSet& RuleSet::Default() {
                   if (agg_expr.operation != LogicalOperator::kAggregation ||
                       agg_expr.children.size() != 1 ||
                       (agg_expr.predicate && *agg_expr.predicate) ||
-                      agg_expr.grouping_sets.size() != 1 ||
-                      !agg_expr.partition_by.empty()) {
+                      agg_expr.grouping_sets.size() != 1) {
                     continue;
                   }
                   const Expression& gk = agg_expr.grouping_sets[0];
                   if (!gk || gk->Type() != TypeTag::kColumnValue) {
+                    continue;
+                  }
+                  // AddExpression now retains PARTITION BY as metadata. When
+                  // it agrees with the single grouping key the rewrite below
+                  // rebuilds the same partitioning as a window, so the
+                  // aggregate is still a valid candidate. A different
+                  // partition list would change the rebuilt values and stays
+                  // excluded.
+                  if (!agg_expr.partition_by.empty() &&
+                      (agg_expr.partition_by.size() != 1 ||
+                       !agg_expr.partition_by[0] ||
+                       ExpressionIdentity(agg_expr.partition_by[0]) !=
+                           ExpressionIdentity(gk))) {
                     continue;
                   }
                   const ColumnName& gk_col =
@@ -11373,17 +12398,7 @@ const RuleSet& RuleSet::Default() {
                       memo.Get(b_scan_id).sample_barrier) {
                     continue;
                   }
-                  bool same_base_table = false;
-                  for (const LogicalExpression& bsc :
-                       memo.Get(b_scan_id).expressions) {
-                    if (bsc.operation == LogicalOperator::kScan &&
-                        (bsc.table == s_table ||
-                         IsSameTable(bsc.table, s_table))) {
-                      same_base_table = true;
-                      break;
-                    }
-                  }
-                  if (!same_base_table) {
+                  if (!scans_shared_table(b_scan_id)) {
                     continue;
                   }
 
@@ -11445,22 +12460,27 @@ const RuleSet& RuleSet::Default() {
                     continue;
                   }
 
+                  const std::vector<Expression> join_conjuncts =
+                      join_expr.predicate && *join_expr.predicate
+                          ? SplitConjuncts(*join_expr.predicate)
+                          : std::vector<Expression>{};
+                  const std::vector<Expression> sel_conjuncts =
+                      SplitConjuncts(*sel_expr.predicate);
                   std::vector<Expression> all_conjuncts;
-                  if (join_expr.predicate && *join_expr.predicate) {
-                    for (const Expression& c :
-                         SplitConjuncts(*join_expr.predicate)) {
-                      all_conjuncts.push_back(c);
-                    }
-                  }
-                  for (const Expression& c :
-                       SplitConjuncts(*sel_expr.predicate)) {
-                    all_conjuncts.push_back(c);
-                  }
+                  all_conjuncts.reserve(join_conjuncts.size() +
+                                        sel_conjuncts.size());
+                  all_conjuncts.insert(all_conjuncts.end(),
+                                       join_conjuncts.begin(),
+                                       join_conjuncts.end());
+                  all_conjuncts.insert(all_conjuncts.end(),
+                                       sel_conjuncts.begin(),
+                                       sel_conjuncts.end());
 
                   const std::string win_col_name = "$self_win_" + agg_out_name;
                   bool found_key_eq = false;
                   bool conjuncts_ok = true;
                   std::vector<Expression> mapped_conjuncts;
+                  mapped_conjuncts.reserve(all_conjuncts.size() + 1);
                   mapped_conjuncts.push_back(UnaryExpressionExp(
                       ColumnValueExp(ColumnName(s_rel, gk_col.name)),
                       UnaryOperation::kIsNotNull));
@@ -11551,19 +12571,40 @@ const RuleSet& RuleSet::Default() {
                       std::move(fn_name), {std::move(rebound_arg)}, {part_key},
                       {});
 
-                  const std::vector<std::string> s_rels_vec{s_rel};
+                  // The rewritten chain must preserve the projection
+                  // group's relation set {s_rel, b_rel}: a lone {s_rel}
+                  // chain cannot be added to `group` (AddExpression rejects
+                  // a unary child whose relation set differs). Like
+                  // self_join_elimination, the shared base table is scanned
+                  // once under a group covering both aliases; the catalog
+                  // proof above is what lets that single scan stand for
+                  // both relations.
+                  const std::vector<std::string> out_rels =
+                      memo.Get(group).relations;
+                  const GroupId win_base = memo.EnsureDerivedGroup(
+                      out_rels, "self_join_win_base:" +
+                                    GroupIdsTag({s_id, agg_id}) + shared_table);
+                  InheritBranchLocal(memo, win_base, group);
+                  if (win_base == group || win_base == s_id ||
+                      win_base == agg_id) {
+                    continue;
+                  }
+                  memo.AddExpression(
+                      win_base,
+                      LogicalExpression{.operation = LogicalOperator::kScan,
+                                        .table = shared_table});
+
                   const GroupId win_group = memo.EnsureDerivedGroup(
-                      s_rels_vec, "self_join_win:" + GroupIdsTag({s_id}) +
-                                      win_col_name + "=" +
-                                      win_call->ToString());
+                      out_rels, "self_join_win:" + GroupIdsTag({win_base}) +
+                                    win_col_name + "=" + win_call->ToString());
                   InheritBranchLocal(memo, win_group, group);
-                  if (win_group == group || win_group == s_id) {
+                  if (win_group == group || win_group == win_base) {
                     continue;
                   }
                   memo.AddExpression(
                       win_group,
                       LogicalExpression{.operation = LogicalOperator::kWindow,
-                                        .children = {s_id},
+                                        .children = {win_base},
                                         .target_list = {NamedExpression(
                                             win_col_name, std::move(win_call))},
                                         .partition_by = {std::move(part_key)}});
@@ -11571,11 +12612,12 @@ const RuleSet& RuleSet::Default() {
                   const Expression new_sel_pred =
                       CanonicalizeConjuncts(CombineConjuncts(mapped_conjuncts));
                   const GroupId new_sel_group = memo.EnsureDerivedGroup(
-                      s_rels_vec,
+                      out_rels,
                       "self_join_win_sel:" + GroupIdsTag({win_group}) +
                           new_sel_pred->ToString());
                   InheritBranchLocal(memo, new_sel_group, group);
-                  if (new_sel_group == group || new_sel_group == win_group) {
+                  if (new_sel_group == group || new_sel_group == win_group ||
+                      new_sel_group == win_base) {
                     continue;
                   }
                   memo.AddExpression(
@@ -11706,6 +12748,10 @@ const RuleSet& RuleSet::Default() {
                     }
 
                     std::vector<ColumnName> fact_keys;
+                    // fact_keys.size() > 4 is rejected below, so the accepted
+                    // path needs at most that many entries; reserve to avoid
+                    // reallocating while collecting them from both predicates.
+                    fact_keys.reserve(8);
                     bool preds_ok = true;
                     for (const Expression* pred :
                          {&(*j1.predicate), &(*j2.predicate)}) {
@@ -11736,6 +12782,7 @@ const RuleSet& RuleSet::Default() {
                     });
 
                     std::vector<NamedExpression> fact_proj_targets;
+                    fact_proj_targets.reserve(fact_keys.size());
                     std::string fk_tag;
                     for (const ColumnName& fk : fact_keys) {
                       fact_proj_targets.emplace_back(fk);

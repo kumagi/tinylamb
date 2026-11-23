@@ -64,6 +64,9 @@ class DuckDBSupportTest(unittest.TestCase):
                 if time.monotonic() > deadline:
                     cls.server.close()
                     raise
+                # Bounded cross-process readiness poll: the server runs in a
+                # child interpreter, so there is no in-process condition
+                # variable; `deadline` caps the wait.
                 time.sleep(.1)
 
     @classmethod

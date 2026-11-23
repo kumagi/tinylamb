@@ -7,7 +7,7 @@
 
 排他的論理和 `a XOR b` を、論理和・論理積・否定の組み合わせ `(a OR b) AND NOT(a AND b)` へ展開（lowering）する式書き換え Rule です。
 
-エンジンが実行時バックエンドやスキャンフィルタにおいて専用の XOR 演算子を直接サポートしない場合、または標準的なブール論理積・論理和の正規化パイプラインへ式を還元したい場合に機能します。SQL の三値論理においてこの代数展開は真理値を厳密に保存しますが、被演算子 $a$ および $b$ の評価回数が最大 3 回まで増加するため、揮発性関数や相関サブクエリに対する安全制約（`SafeToReduceEvaluationCount`）を課しています。
+エンジンが実行時バックエンドやスキャンフィルタにおいて専用の XOR 演算子を直接サポートしない場合、または標準的なブール論理積・論理和の正規化パイプラインへ式を還元したい場合に機能します。SQL の三値論理においてこの代数展開は真理値を厳密に保存しますが、被演算子 $a$ および $b$ の評価回数が最大 2 回まで増加するため、揮発性関数や相関サブクエリに対する安全制約（`SafeToReduceEvaluationCount`）を課しています。
 
 ## 変換前後の関係
 
@@ -41,7 +41,7 @@ graph TD
         [](const Expression&, const ExpressionBindings& bindings) {
           const Expression a = bindings.at("left");
           const Expression b = bindings.at("right");
-          // The expansion evaluates a and b up to three times; a volatile
+          // The expansion evaluates a and b up to two times; a volatile
           // expression or a subquery would change meaning under the rewrite.
           if (!SafeToReduceEvaluationCount(a) ||
               !SafeToReduceEvaluationCount(b)) {
@@ -72,7 +72,7 @@ Kleene の三値論理において、展開式 $(a \lor b) \land \neg(a \land b)
 したがって、二値論理のみならず SQL の不確定値モデルにおいても意味論は完全に保存されます。
 
 ### 2. 評価回数増加に伴う副作用抑止
-展開後の木構造において、部分式 $a$ および $b$ はそれぞれ最大 3 回評価される可能性があります。式木内に非決定的な関数やサブクエリが含まれている場合、評価回数の変化はクエリ結果の非決定性やパフォーマンス劣化を引き起こします。
+展開後の木構造（`:104-111` のコード片を参照）では、部分式 $a$ は `(a OR b)` と `(a AND b)` の各 1 回、合計 2 回現れます。$b$ も同じく 2 回現れますが、短絡評価により $a$ が真の場合は `AND` 側の評価が省略され、0〜2 回になります。すなわち $a$ および $b$ の評価回数の上限はいずれも 2 回です。式木内に非決定的な関数やサブクエリが含まれている場合、評価回数の変化はクエリ結果の非決定性やパフォーマンス劣化を引き起こします。
 
 ```cpp
 bool SafeToReduceEvaluationCount(

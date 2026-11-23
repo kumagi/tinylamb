@@ -19,7 +19,7 @@ graph TD
   end
   subgraph after["変換後: プローブ側を bloom_probe タグの派生 Group に置換"]
     J2["Join(t1, t2): t1.id = t2.id"] --> B2["Scan t1 (Build)"]
-    J2 --> P2["Scan t2 (Derived Group, tag=bloom_probe:t2.id, filter引継ぎ)"]
+    J2 --> P2["Scan t2 (Derived Group, tag=bloom_probe:GroupIdsTag(probe_id) + key_fingerprint, filter引継ぎ)"]
   end
 ```
 
@@ -72,6 +72,7 @@ graph TD
   `memo.EnsureDerivedGroup` はデフォルトでフィルタを持たない空の Group を生成します。もし元のプローブ側 Group が既にスキャンフィルタ（例: `t2.val > 10`）を保持していた場合、フィルタを引き継がずに派生 Group へ置き換えると、元の選択条件が消失して出力多重度が増大します。したがって、派生 Group 生成直後に元のプローブ Group の `filter` を明示的にコピーし、述語的同値性を保証します。
 - **キー集合のフィンガープリント化**:
   派生 Group はリレーション名とタグ文字列の組で一意化されます。元のプローブ Group ID とキー列名一覧をタグに含め、異なる入力やキー集合が派生 Group を誤って共有しないようにします。
+- **branch-local 属性の継承**: 派生プローブ Group の生成では `InheritBranchLocal(memo, filtered_probe, group)` も呼び、元のプローブが UNION 等の分岐ローカルであればその属性を引き継ぎます。これを落とすと、後続 Rule が共有スキャンへフィルタを漏らし、別分岐の結果まで変えるおそれがあります。
 - **多重度と三値論理の保全**:
   動的フィルタは擬陽性（False Positive）を許容する Bloom フィルタ等として物理層で機能しますが、ハッシュ結合本体の等値評価が最終フィルタとして残存するため、タプルの過剰出力や欠落は生じず、多重集合意味論および NULL セマンティクスは厳密に保たれます。
 
@@ -90,6 +91,7 @@ graph TD
               probe_rels,
               "bloom_probe:" + GroupIdsTag({probe_id}) + key_fingerprint);
           if (filtered_probe != probe_id && filtered_probe != group) {
+            InheritBranchLocal(memo, filtered_probe, group);
             memo.Get(filtered_probe).filter = probe_filter;
             memo.Get(filtered_probe).dynamic_filter_keys = bloom_keys;
             memo.AddExpression(

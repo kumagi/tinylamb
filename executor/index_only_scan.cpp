@@ -20,6 +20,7 @@
 
 #include "index_only_scan.hpp"
 
+#include <algorithm>
 #include <ostream>
 #include <utility>
 #include <vector>
@@ -135,7 +136,9 @@ Schema IndexOnlyScan::OutputSchema(const Index& idx,
     cols.push_back(input_schema.GetColumn(key));
   }
   for (const auto& included : is.include_) {
-    cols.push_back(input_schema.GetColumn(included));
+    if (std::find(is.key_.begin(), is.key_.end(), included) == is.key_.end()) {
+      cols.push_back(input_schema.GetColumn(included));
+    }
   }
   return {"", std::move(cols)};
 }
@@ -154,6 +157,14 @@ bool IndexOnlyScan::TryEnableKeyDeduplication() {
 
 size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset(output_schema_, max_rows);
+  if (!ok() || max_rows == 0) {
+    return 0;
+  }
+  const auto fail_batch = [&](Status status) -> size_t {
+    FailWith(std::move(status));
+    destination->Reset();
+    return 0;
+  };
   Row dst;
   while (destination->Size() < max_rows && iter_.IsValid()) {
     // Advancing below can load the next key. Capture this entry's identity
@@ -161,6 +172,9 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
     const size_t key_generation = iter_.ValueListsDecoded();
     if (!iter_.TryReadIndexOnly(&dst)) {
       const Row& heap_row = *iter_;
+      if (const Status status = iter_.GetStatus(); !status.ok()) {
+        return fail_batch(status);
+      }
       if (!heap_row.IsValid()) {
         ++iter_;
         continue;
@@ -178,10 +192,9 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
         combined.insert(combined.end(), key.values_.begin(), key.values_.end());
         for (slot_t offset : include_offsets_) {
           if (offset >= heap_row.Count()) {
-            FailWith(
-                StatusError(StatusCode::kInvalidArgument,
-                            "index only scan INCLUDE offset out of range"));
-            return destination->Size();
+            return fail_batch(StatusError(
+                StatusCode::kInvalidArgument,
+                "index only scan INCLUDE offset out of range"));
           }
           combined.push_back(heap_row[offset]);
         }
@@ -214,8 +227,7 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
             return conjunct->TryEvaluate(dst, output_schema_);
           });
       if (!pass.HasValue()) {
-        FailWith(pass.GetStatus());
-        return destination->Size();
+        return fail_batch(pass.GetStatus());
       }
       if (key_only_condition_) {
         condition_key_generation_ = key_generation;
@@ -227,8 +239,8 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     destination->Append(std::move(dst));
   }
-  if (!iter_.IsValid() && iter_.GetStatus() != Status::kSuccess) {
-    FailWith(iter_.GetStatus());
+  if (const Status status = iter_.GetStatus(); !status.ok()) {
+    return fail_batch(status);
   }
   return destination->Size();
 }

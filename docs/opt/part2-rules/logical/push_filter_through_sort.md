@@ -22,9 +22,11 @@ graph TD
   end
 ```
 
-Memo 上では、`filter-before-sort:` タグの派生グループに `Selection(X, p)`
-を追加し、外側グループには元のソートキーを維持した `Sort(その派生
-グループ)` を追加します。
+Memo 上では、`filter-before-sort:<input-group-id><predicate>` タグの派生グループに
+`Selection(X, p)` を追加し、外側グループには元のソートキーを維持した
+`Sort(その派生グループ)` を追加します。タグにはソートの入力 Group ID
+(`GroupIdsTag({input_id})`)が含まれ、同じ述語を異なる Sort 入力に押し込む
+2 箇所が派生グループを衝突させないようにしています(D1)。
 
 ## 適用条件
 
@@ -45,7 +47,8 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
             const GroupId input_id = sort.children[0];
             const GroupId filtered = memo.EnsureDerivedGroup(
                 memo.Get(input_id).relations,
-                "filter-before-sort:" + (*expression.predicate)->ToString());
+                "filter-before-sort:" + GroupIdsTag({input_id}) +
+                    (*expression.predicate)->ToString());
             if (filtered == group || filtered == input_id) {
               continue;
             }
@@ -53,8 +56,8 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
 
 - Selection が述語を持つこと。
 - ソートグループに実際に `kSort`(子を持つ)の代替があること。
-- 述語を指紋に持つ派生グループが、外側グループ自身でもソートの子でも
-  ないこと(循環防止)。
+- 述語と入力 Group ID を指紋に持つ派生グループが、外側グループ自身でも
+  ソートの子でもないこと(循環防止)。
 
 なお、この Rule は「述語がソートキーの子の表に閉じる」ことを検査しません。
 次節のとおり、不要だからです。
@@ -120,8 +123,7 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
 
 適用後は `Sort(Selection(X, p))` が選べるようになり、ソートの入力行が
 「`p` を通った行」に減ります。ソートは行数に対するコストが高い演算子
-(O(n log n) 比較・ハッシュ/ソートバッファ)なので、選択率の高いフィルタの
-フィルタを下へ移すと、Sort に入力される行数を減らせます。順序という物理特性は Sort ノードが上に残ることで
+(O(n log n) 比較・ハッシュ/ソートバッファ)なので、選択率の高いフィルタを下へ移すと、Sort に入力される行数を減らせます。順序という物理特性は Sort ノードが上に残ることで
 完全に維持されます。LIMIT と違い、行数を減らしても「上位 k 件」の意味は
 変わらないため LIMIT 系のような特別な guard は不要です。
 
@@ -136,6 +138,10 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
 
 ## 検証テスト
 
-- `plan/cascades_test_part*.cpp` を含むテストファイルに、この Rule
-  (`push_filter_through_sort`)に対応する個別テストは確認できませんでした。
-  `filter-before-sort:` タグへの言及もテスト内にはありません。
+- `plan/cascades_test_part*.cpp` を含むテストファイルを対象に、Rule 名
+  (`PushFilterThroughSort` / `push_filter_through_sort`) と現在のタグ接頭辞
+  `filter-before-sort:` で検索しても、この Rule 専用のテストは見つかりません。
+  以前の本文が引用していた `"filter-before-sort:" + pred->ToString()` は
+  古い形で、現行コードは `GroupIdsTag({input_id})` を含むため、古いタグ文字列で
+  検索すると「テストが無い」理由と「古いタグで検索した」ことが混同されます。
+  上記の現在の形で検索した結果、個別テストは未整備です。

@@ -152,13 +152,17 @@ Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
   struct StagedRun {
     Run* borrowed{nullptr};
     std::optional<Run> owned;
-    const Run& Get() const { return owned ? *owned : *borrowed; }
-    bool HasValue() const { return borrowed != nullptr || owned.has_value(); }
+    [[nodiscard]] const Run& Get() const { return owned ? *owned : *borrowed; }
+    [[nodiscard]] bool HasValue() const { return borrowed != nullptr || owned.has_value(); }
   };
   // Each level holds either an original run or a newly merged temporary.
   // Original files are untouched until every merge has succeeded.
   const size_t max_levels = std::max(levels_.size(), other.levels_.size());
-  std::vector<StagedRun> staged(max_levels + 1);
+  std::vector<StagedRun> staged;
+  if (max_levels >= staged.max_size()) {
+    return StatusError(StatusCode::kTooBigData, "too many distinct run levels");
+  }
+  staged.resize(max_levels + 1);
   for (size_t i = 0; i < levels_.size(); ++i) {
     if (levels_[i]) {
       staged[i].borrowed = &*levels_[i];
@@ -190,7 +194,7 @@ Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
   for (size_t i = 0; i < staged.size(); ++i) {
     if (staged[i].owned) {
       result[i] = std::move(staged[i].owned);
-    } else if (staged[i].borrowed) {
+    } else if (staged[i].borrowed != nullptr) {
       result[i] = std::move(*staged[i].borrowed);
     }
   }
@@ -207,64 +211,70 @@ Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
 }
 
 Status SortedDistinctRuns::ForEach(
-    const std::function<void(uint64_t)>& consume) try {
-  // Keep every input owned by levels_ until all merges succeed. A failed
-  // merge then leaves the original runs intact for a retry.
-  std::optional<Run> merged_run;
-  size_t first_level = levels_.size();
-  for (size_t i = 0; i < levels_.size(); ++i) {
-    if (!levels_[i]) {
-      continue;
-    }
-    if (first_level == levels_.size()) {
-      first_level = i;
-      continue;
-    }
-    const Run& left = merged_run ? *merged_run : *levels_[first_level];
-    ASSIGN_OR_RETURN(Run, merged, Merge(left, *levels_[i]));
-    merged_run = std::move(merged);
-  }
+    const std::function<void(uint64_t)>& consume) {
+  // The merged run is the only copy once levels_ has been cleared. Keep it
+  // in a scope that survives the catch blocks so every failure path -- I/O
+  // error or an exception thrown by `consume` -- can hand it back. T4182
+  // fixed the Rewind/Next paths; a throwing callback used to be caught after
+  // `final` was destroyed, leaving an empty run set and losing the distinct
+  // values permanently on retry.
   std::optional<Run> final;
-  if (merged_run) {
-    final = std::move(merged_run);
-  } else if (first_level < levels_.size()) {
-    final = std::move(levels_[first_level]);
+  Status status = Status::kSuccess;
+  try {
+    // Keep every input owned by levels_ until all merges succeed. A failed
+    // merge then leaves the original runs intact for a retry.
+    std::optional<Run> merged_run;
+    size_t first_level = levels_.size();
+    for (size_t i = 0; i < levels_.size(); ++i) {
+      if (!levels_[i]) {
+        continue;
+      }
+      if (first_level == levels_.size()) {
+        first_level = i;
+        continue;
+      }
+      const Run& left = merged_run ? *merged_run : *levels_[first_level];
+      ASSIGN_OR_RETURN(Run, merged, Merge(left, *levels_[i]));
+      merged_run = std::move(merged);
+    }
+    if (merged_run) {
+      final = std::move(merged_run);
+    } else if (first_level < levels_.size()) {
+      final = std::move(levels_[first_level]);
+    }
+    levels_.clear();
+    if (!final) {
+      return Status::kSuccess;
+    }
+    status = Rewind(final->file.get());
+    if (status == Status::kSuccess) {
+      Reader reader{.file = final->file.get(), .remaining = final->count};
+      std::optional<uint64_t> previous;
+      for (;;) {
+        StatusOr<std::optional<uint64_t>> next = reader.Next();
+        if (!next.HasValue()) {
+          status = next.GetStatus();
+          break;
+        }
+        std::optional<uint64_t> value = next.MoveValue();
+        if (!value) {
+          break;
+        }
+        if (!previous || *previous != *value) {
+          consume(*value);
+          previous = value;
+        }
+      }
+    }
+  } catch (const std::exception& error) {
+    status = StatusError(StatusCode::kRuntimeError, error.what());
+  } catch (...) {
+    status =
+        StatusError(StatusCode::kRuntimeError, "distinct iteration failed");
   }
-  levels_.clear();
-  if (!final) {
-    return Status::kSuccess;
-  }
-  // T4182: a Rewind/Next failure used to return with levels_ already
-  // cleared and the merged `final` run destroyed on the way out -- a retry
-  // then saw an EMPTY run set and "succeeded" with zero values, so the
-  // distinct value set was permanently lost. Hand the merged run back to
-  // levels_ on every failure path so ForEach stays retryable.
-  const Status rewind_st = Rewind(final->file.get());
-  if (rewind_st != Status::kSuccess) {
+  if (status != Status::kSuccess && final) {
     levels_.push_back(std::move(final));
-    return rewind_st;  // NOLINT(performance-no-automatic-move)
   }
-  Reader reader{.file = final->file.get(), .remaining = final->count};
-  std::optional<uint64_t> previous;
-  for (;;) {
-    StatusOr<std::optional<uint64_t>> next = reader.Next();
-    if (!next.HasValue()) {
-      levels_.push_back(std::move(final));
-      return next.GetStatus();
-    }
-    std::optional<uint64_t> value = next.MoveValue();
-    if (!value) {
-      break;
-    }
-    if (!previous || *previous != *value) {
-      consume(*value);
-      previous = value;
-    }
-  }
-  return Status::kSuccess;
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError, "distinct iteration failed");
+  return status;
 }
 }  // namespace tinylamb

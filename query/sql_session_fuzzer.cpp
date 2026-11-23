@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <random>
@@ -837,13 +840,23 @@ std::optional<std::vector<Row>> RunSelect(Database& db, TransactionContext& ctx,
   }
   std::vector<Row> rows;
   Row row;
-  while (result.Value().Next(&row)) {
-    rows.push_back(row);
-  }
-  // Lazy result: a mid-stream error would silently truncate the dump used
-  // for state comparison — surface it as an error instead.
-  if (result.Value().GetStatus() != Status::kSuccess) {
-    *error = "stream-error: " + result.Value().GetStatus().GetMessage();
+  // Next()/Drain() can escape an exception through the transitional
+  // EXC-SHIM boundary; report it so the session diff is preserved.
+  try {
+    while (result.Value().Next(&row)) {
+      rows.push_back(row);
+    }
+    // Lazy result: a mid-stream error would silently truncate the dump used
+    // for state comparison — surface it as an error instead.
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      *error = "stream-error: " + result.Value().GetStatus().GetMessage();
+      return std::nullopt;
+    }
+  } catch (const std::exception& e) {
+    *error = "stream exception: " + std::string(e.what());
+    return std::nullopt;
+  } catch (...) {
+    *error = "stream exception: unknown";
     return std::nullopt;
   }
   return rows;
@@ -866,17 +879,27 @@ bool RunSql(Database& db, TransactionContext& ctx, const std::string& sql,
 // stream status) so an unexplained rejection names itself instead of
 // surfacing as an empty LastError.
 bool RunSqlWhy(Database& db, TransactionContext& ctx, const std::string& sql,
-               bool force_relational, std::string* why) {
+               bool force_relational, std::string* why,
+               StatusCode* failure_code = nullptr) {
+  if (failure_code != nullptr) {
+    *failure_code = StatusCode::kSuccess;
+  }
   SqlEngine engine(db);
   engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
+    if (failure_code != nullptr) {
+      *failure_code = result.GetStatus().GetCode();
+    }
     *why = "prepare: " + tinylamb::ToString(result.GetStatus()) + " " +
            engine.LastError();
     return false;
   }
   static_cast<void>(result.Value().Drain());
   if (result.Value().GetStatus() != Status::kSuccess) {
+    if (failure_code != nullptr) {
+      *failure_code = result.Value().GetStatus().GetCode();
+    }
     *why = "stream: " + tinylamb::ToString(result.Value().GetStatus());
     return false;
   }
@@ -891,14 +914,25 @@ bool RunSqlWhy(Database& db, TransactionContext& ctx, const std::string& sql,
 bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
               std::string* error, bool* rejected_as_duplicate = nullptr) {
   // "CREATE [UNIQUE] INDEX <name> ON <table> KEY(i,j) INCLUDE(k,l)"
-  auto parse_slots = [](const std::string& text) {
+  auto parse_slots =
+      [](const std::string& text) -> std::optional<std::vector<slot_t>> {
     std::vector<slot_t> slots;
     size_t pos = 0;
     while (pos < text.size()) {
       const size_t comma = text.find(',', pos);
       const std::string part = text.substr(
           pos, comma == std::string::npos ? std::string::npos : comma - pos);
-      slots.push_back(static_cast<slot_t>(std::stoi(part)));
+      // Replay inputs are arbitrary text: from_chars reports bad input
+      // instead of throwing across the fuzzer's Status boundary.
+      int parsed = 0;
+      const char* begin = part.data();
+      const char* end = begin + part.size();
+      const auto result = std::from_chars(begin, end, parsed);
+      if (result.ec != std::errc{} || result.ptr != end || parsed < 0 ||
+          std::cmp_greater(parsed , std::numeric_limits<slot_t>::max())) {
+        return std::nullopt;
+      }
+      slots.push_back(static_cast<slot_t>(parsed));
       if (comma == std::string::npos) {
         break;
       }
@@ -942,15 +976,20 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
   }
   const std::string table = ddl.substr(name_end + strlen(" ON "),
                                        key_pos - name_end - strlen(" ON "));
-  std::vector<slot_t> key = parse_slots(ddl.substr(
+  std::optional<std::vector<slot_t>> key = parse_slots(ddl.substr(
       key_pos + strlen(" KEY("), key_end - key_pos - strlen(" KEY(")));
-  std::vector<slot_t> include;
+  std::optional<std::vector<slot_t>> include;
   if (inc_pos != std::string::npos) {
     include = parse_slots(ddl.substr(inc_pos + strlen(" INCLUDE("),
                                      inc_end - inc_pos - strlen(" INCLUDE(")));
   }
+  if (!key.has_value() ||
+      (inc_pos != std::string::npos && !include.has_value())) {
+    *error = "malformed ddl (slots): " + ddl;
+    return false;
+  }
   const IndexSchema schema(
-      name, std::move(key), std::move(include),
+      name, std::move(*key), include.value_or(std::vector<slot_t>{}),
       is_unique ? IndexMode::kUnique : IndexMode::kNonUnique);
   const Status status = db.CreateIndex(ctx, table, schema);
   if (status != Status::kSuccess) {
@@ -1691,13 +1730,13 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     const Row old_row = target->rows[row_idx];
     const int64_t u = RowU(old_row);
     const auto owner_it = owner.find({target->name, u});
-    bool predicted_conflict = false;
-    for (const auto& [key, info] : owner) {
-      if (key.first == target->name && info.txn != x && !info.vacant) {
-        predicted_conflict = true;
-        break;
-      }
-    }
+    // The predicate peeks the target before retaining a write intent; intents
+    // on other rows are released by the scan and cannot make this statement
+    // conflict. Only a live write owned by the other transaction on this
+    // exact row predicts a conflict.
+    const bool predicted_conflict = owner_it != owner.end() &&
+                                    owner_it->second.txn != x &&
+                                    !owner_it->second.vacant;
     // The image the predicate sees for the target row: this txn's staged
     // image when it owns the row, else the committed head — and when the
     // committed table no longer has u (deleted or its slot reused), or the
@@ -2822,15 +2861,19 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
   return "";
 }
 
-std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
-  if (trace.steps.empty()) {
+namespace {
+
+std::string ExecuteSessionTrace(
+    SessionTrace* trace,
+    const std::vector<std::string>* refreshable_failure_sql, bool verbose) {
+  if (trace == nullptr || trace->steps.empty()) {
     return "malformed trace: no steps";
   }
   // Replay consumes checks in step order. Out-of-order after_step values (a
   // hand edit or a bad Cut) would leave every later check unexecuted and the
   // partial trace would replay green. Require the recorded order to be sane.
-  for (size_t i = 1; i < trace.checks.size(); ++i) {
-    if (trace.checks[i].after_step < trace.checks[i - 1].after_step) {
+  for (size_t i = 1; i < trace->checks.size(); ++i) {
+    if (trace->checks[i].after_step < trace->checks[i - 1].after_step) {
       return "malformed trace: checks are not ordered by after_step";
     }
   }
@@ -2850,8 +2893,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
   // only needs to compare against them.
   std::vector<std::string> report;
   size_t check_index = 0;
-  for (size_t i = 0; i < trace.steps.size(); ++i) {
-    const SessionStep& step = trace.steps[i];
+  for (size_t i = 0; i < trace->steps.size(); ++i) {
+    const SessionStep& step = trace->steps[i];
     std::string error;
     error.reserve(64);
     if (!step.is_crash && !step.is_checkpoint && !step.is_begin &&
@@ -2889,7 +2932,8 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
     } else if (step.is_checkpoint) {
       // Same fuzzy checkpoint as generation: no transaction boundary, no
       // state change — it only moves where a later crash replays from.
-      if (db->WriteCheckpoint().GetStatus() != Status::kSuccess) {
+      if (db->WriteCheckpoint(step.allow_checkpoint_compaction).GetStatus() !=
+          Status::kSuccess) {
         return "replay checkpoint failed at step " + std::to_string(i) + "\n";
       }
     } else if (step.is_ddl) {
@@ -2908,22 +2952,36 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
       }
     } else {
       std::string why;
+      StatusCode failure_code = StatusCode::kSuccess;
       const bool ok = RunSqlWhy(*db, *ctxs[static_cast<size_t>(step.txn)],
-                                step.sql, RouteFlipFor(i), &why);
+                                step.sql, RouteFlipFor(i), &why, &failure_code);
+      const bool refreshable =
+          refreshable_failure_sql != nullptr &&
+          std::find(refreshable_failure_sql->begin(),
+                    refreshable_failure_sql->end(),
+                    step.sql) != refreshable_failure_sql->end();
       if (step.must_fail) {
         if (ok) {
-          return "replay statement unexpectedly succeeded at step " +
-                 std::to_string(i) + ": " + step.sql +
-                 " (generation observed a conflict)\n";
+          if (refreshable) {
+            trace->steps[i].must_fail = false;
+          } else {
+            return "replay statement unexpectedly succeeded at step " +
+                   std::to_string(i) + ": " + step.sql +
+                   " (generation observed a conflict)\n";
+          }
         }
       } else if (!ok) {
-        return "replay statement failed at step " + std::to_string(i) + ": " +
-               step.sql + " :: " + why + "\n";
+        if (refreshable && failure_code == StatusCode::kConflicts) {
+          trace->steps[i].must_fail = true;
+        } else {
+          return "replay statement failed at step " + std::to_string(i) + ": " +
+                 step.sql + " :: " + why + "\n";
+        }
       }
     }
-    while (check_index < trace.checks.size() &&
-           trace.checks[check_index].after_step == i) {
-      const SessionCheck& check = trace.checks[check_index];
+    while (check_index < trace->checks.size() &&
+           trace->checks[check_index].after_step == i) {
+      SessionCheck& check = trace->checks[check_index];
       if (!ctxs[static_cast<size_t>(check.txn)].has_value()) {
         return "malformed trace: check on unbegun context\n";
       }
@@ -2942,16 +3000,20 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         actual.push_back(r.ToString());
       }
       std::sort(actual.begin(), actual.end());
-      std::vector<std::string> expected = check.expected;
-      std::sort(expected.begin(), expected.end());
-      if (expected != actual) {
-        std::string mismatch = "replay mismatch on " + check.table +
-                               " after step " + std::to_string(i) + "\n";
-        mismatch += "  expected:\n" + DumpLines(expected);
-        mismatch += "  actual:\n" + DumpLines(actual);
-        mismatch += DebugDumpTableChain(*ctxs[static_cast<size_t>(check.txn)],
-                                        check.table);
-        return mismatch;
+      if (refreshable_failure_sql != nullptr) {
+        check.expected = std::move(actual);
+      } else {
+        std::vector<std::string> expected = check.expected;
+        std::sort(expected.begin(), expected.end());
+        if (expected != actual) {
+          std::string mismatch = "replay mismatch on " + check.table +
+                                 " after step " + std::to_string(i) + "\n";
+          mismatch += "  expected:\n" + DumpLines(expected);
+          mismatch += "  actual:\n" + DumpLines(actual);
+          mismatch += DebugDumpTableChain(*ctxs[static_cast<size_t>(check.txn)],
+                                          check.table);
+          return mismatch;
+        }
       }
       if (verbose) {
         std::cerr << "[session][replay-check] " << check.table << " ok\n";
@@ -2959,15 +3021,29 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
       ++check_index;
     }
   }
-  if (check_index != trace.checks.size()) {
+  if (check_index != trace->checks.size()) {
     // A check with after_step >= steps.size() is never reached by the loop.
     // Confirm every recorded check actually ran; otherwise a trace whose
     // trailing steps were removed would still be reported as "fixed".
     return "malformed trace: " +
-           std::to_string(trace.checks.size() - check_index) +
+           std::to_string(trace->checks.size() - check_index) +
            " recorded check(s) were never reached (after_step >= steps.size())";
   }
   return "";
+}
+
+}  // namespace
+
+std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
+  SessionTrace copy = trace;
+  return ExecuteSessionTrace(&copy, /*refreshable_failure_sql=*/nullptr,
+                             verbose);
+}
+
+std::string RefreshSessionTrace(
+    SessionTrace* trace,
+    const std::vector<std::string>& refreshable_failure_sql, bool verbose) {
+  return ExecuteSessionTrace(trace, &refreshable_failure_sql, verbose);
 }
 
 std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
@@ -2989,7 +3065,8 @@ std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
     } else if (step.is_crash) {
       out += "-- crash\n";
     } else if (step.is_checkpoint) {
-      out += "-- checkpoint\n";
+      out += step.allow_checkpoint_compaction ? "-- checkpoint\n"
+                                              : "-- heap-checkpoint\n";
     } else if (step.must_fail && step.is_ddl) {
       out += "-- ddlfail" + sfx + ": " + step.sql + "\n";
     } else if (step.must_fail) {
@@ -3030,9 +3107,13 @@ std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,
   if (!failure_summary.empty()) {
     // The line-based format cannot carry the multi-line report body; the
     // first line names the failure and the rest stays in the fuzzer log.
-    out +=
-        "-- failure: " + failure_summary.substr(0, failure_summary.find('\n')) +
-        "\n";
+    const size_t first = failure_summary.find_first_not_of("\r\n");
+    const std::string headline =
+        first == std::string::npos
+            ? "unspecified failure"
+            : failure_summary.substr(
+                  first, failure_summary.find_first_of("\r\n", first) - first);
+    out += "-- failure: " + headline + "\n";
   }
   return out;
 }
@@ -3077,8 +3158,10 @@ bool ParseSessionTest(std::string_view text, uint64_t* seed,
           {.is_abort = true, .txn = line.back() == '2' ? 1 : 0});
     } else if (line == "-- crash") {
       trace->steps.push_back({.is_crash = true});
-    } else if (line == "-- checkpoint") {
-      trace->steps.push_back({.is_checkpoint = true});
+    } else if (line == "-- checkpoint" || line == "-- heap-checkpoint") {
+      trace->steps.push_back(
+          {.is_checkpoint = true,
+           .allow_checkpoint_compaction = line == "-- checkpoint"});
     } else if (line == "-- begin" || line == "-- begin2") {
       trace->steps.push_back(
           {.is_begin = true, .txn = line.back() == '2' ? 1 : 0});
@@ -3141,6 +3224,57 @@ bool ParseSessionTest(std::string_view text, uint64_t* seed,
   return saw_header && !trace->steps.empty();
 }
 
+std::string RefreshSessionRegressionFile(
+    const std::string& path,
+    const std::vector<std::string>& refreshable_failure_sql) {
+  std::ifstream input(path);
+  if (!input) {
+    return "could not open " + path;
+  }
+  std::string text((std::istreambuf_iterator<char>(input)),
+                   std::istreambuf_iterator<char>());
+  uint64_t seed = 0;
+  SessionTrace trace;
+  std::string failure_summary;
+  if (!ParseSessionTest(text, &seed, &trace, &failure_summary)) {
+    return "could not parse " + path;
+  }
+  if (std::string report = RefreshSessionTrace(&trace, refreshable_failure_sql);
+      !report.empty()) {
+    return path + ": refresh failed:\n" + report;
+  }
+  if (std::string report = ReplaySessionTrace(trace); !report.empty()) {
+    return path + ": refreshed trace did not replay cleanly:\n" + report;
+  }
+
+  const std::string refreshed = SerializeSessionTest(seed, trace, "");
+  const std::filesystem::path target(path);
+  std::filesystem::path temporary = target;
+  temporary += ".refresh-tmp";
+  {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      return "could not create " + temporary.string();
+    }
+    output.write(refreshed.data(),
+                 static_cast<std::streamsize>(refreshed.size()));
+    output.close();
+    if (!output) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+      return "could not write " + temporary.string();
+    }
+  }
+  std::error_code error;
+  std::filesystem::rename(temporary, target, error);
+  if (error) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    return "could not replace " + path + ": " + error.message();
+  }
+  return "";
+}
+
 void SessionFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   uint64_t seed = 0x51ed270b2f1f8d53ULL;
   for (size_t i = 0; i < size; ++i) {
@@ -3168,7 +3302,8 @@ void SessionFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   } else {
     verify = ReplaySessionTrace(parsed, false);
     if (verify.empty()) {
-      verify = "internal error: serialized session replay holds (flaky)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized session replay holds (flaky)");
     }
   }
 

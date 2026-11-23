@@ -65,8 +65,9 @@ guard の列挙は次のとおりです。
   **A と B の両方に触れる述語はどちらの分岐にも入らず不発**です。
   C の列だけに触れる述語(`touches_a` も `touches_b` も偽)も同様に
   どちらの分岐にも入らず不発します。
-- 派生グループ(`"semi_inner_push_ac"` または `"semi_inner_push_bc"`)が
-  自グループ・片側の入力グループと同一でないこと(`continue`)。
+- 派生グループ(`"semi_inner_push_ac:" + GroupIdsTag({a_id, c_id}) + PredicateTag(expression.predicate)` または
+  `"semi_inner_push_bc:" + GroupIdsTag({b_id, c_id}) + PredicateTag(expression.predicate)`)が
+  自グループ・片側の入力グループと同一でないこと(`continue`)。同じ (A, C) で semi 述語が異なる場合も子 ID と述語の指紋で隔離されます。
 
 ## 意味論的根拠と準結合の結合律
 
@@ -119,7 +120,10 @@ semi join の意味は「C にマッチする行だけを probe 側から残す�
 ```cpp
             if (touches_a && !touches_b) {
               const GroupId ac_group = memo.EnsureDerivedGroup(
-                  UnionRelations(a_rels, c_rels), "semi_inner_push_ac");
+                  UnionRelations(a_rels, c_rels),
+                  "semi_inner_push_ac:" + GroupIdsTag({a_id, c_id}) +
+                      PredicateTag(expression.predicate));
+              InheritBranchLocal(memo, ac_group, group);
               if (ac_group == group || ac_group == a_id || ac_group == c_id) {
                 continue;
               }
@@ -132,15 +136,17 @@ semi join の意味は「C にマッチする行だけを probe 側から残す�
                                     .output_schema = expression.output_schema});
 ```
 
-「B のみ」側は対称です(`"semi_inner_push_bc"` に `SemiJoin(B, C)`、
+「B のみ」側は対称です(`"semi_inner_push_bc:" + GroupIdsTag({b_id, c_id}) + PredicateTag(expression.predicate)` に `SemiJoin(B, C)`、
 自グループに `Join(A, bc_group)`)。
 
 - 自グループに追加されるのは `kJoin` で、述語は **内部結合の**
   `join_expr.predicate` です。semi 側の述語 `p_semi` は派生グループの
   semi join に移動するため、述語の適用回数が 2 重化・消失しません。
 - 派生グループのキーは `UnionRelations(a_rels, c_rels)`(関係集合の和) +
-  タグなので、同じ (A, C) への別の semi join 式も 1 つの派生グループに
-  集約されます。
+  タグ `"semi_inner_push_ac:" + GroupIdsTag({a_id, c_id}) + PredicateTag(expression.predicate)` です。
+  関係集合の和だけでは同じ (A, C) への別の semi join 式が混線するため、
+  子 ID と述語を指紋に含めて隔離します。生成後は `InheritBranchLocal` で
+  branch-local 属性が派生グループへ伝播されます(D5)。
 
 ## 最適化効果
 

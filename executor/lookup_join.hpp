@@ -45,9 +45,8 @@ class Transaction;
 //   * positions [0, range_position) are equality-pinned: they become the seek
 //     key prefix and are re-checked with `kEquals` on every candidate.
 //   * when `range_position` is set, that position carries the range bound.
-//     The probe opens the half-open index range
-//     `prefix <= key < prefix + bound` (or `prefix + bound <= key < prefix`
-//     for the mirrored operators) and re-checks the comparison
+//     The probe seeks through an inclusive key envelope around the bound
+//     (or its mirrored form) and re-checks the comparison
 //     `right_cols[range_position] <range_operation> left_cols[range_position]`
 //     per candidate, so inclusive/exclusive boundary rows are always
 //     resolved by the predicate, never by the seek.

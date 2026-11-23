@@ -5,9 +5,9 @@ framework into a production-grade query optimizer, replacing the remaining
 hand-written portions of `plan/optimizer.cpp`.
 
 > Revision 2026-08 (handover): audited against the working tree after the
-> previous implementer departed. Phases 1–7 are complete, with two correctness
-> defects found and fixed during the handover (see Handover Log). Remaining
-> work concentrates on Phase 8 coverage gaps and Phase 9 hardening.
+> previous implementer departed. Phases 1–9 are complete; four correctness
+> defects were found and fixed during the handover (see Handover Log). Remaining
+> routing limitations and capability follow-ups are noted in the sections below.
 
 ## Handover Log (2026-08)
 
@@ -22,7 +22,7 @@ Audit found the plan-level LIMIT work half-wired, producing wrong results:
   truncating `LimitPlan` even when the child did not deliver a required
   ordering; the engine would then sort the truncated stream (wrong top-N).
   The rule now passes the child through unchanged in that case, leaving
-  Sort+Limit to the engine (D6 soundness).
+  Sort+Limit to the engine (O6 soundness).
 - **DISTINCT interaction**: DISTINCT is applied by the engine *above* the
   plan output, so a plan-level limit would truncate before dedup. The engine
   therefore withholds LIMIT from `QueryData` when `select->Distinct()` is
@@ -134,9 +134,13 @@ that path.
   property with N·log N sort penalties for non-delivering alternatives,
   `access_method` hint, reserved `distribution` field, `limit_hint` enabling
   Top-K costing on order-delivering scans.
-- Cost model: selectivity from `TableStatistics::EstimateSelectivity`, join
-  cardinality `|L|·|R| / max NDV` capped by cross product, hybrid hash-spill
-  penalty, estimated rows threaded through `PlanAlternative`/`BestPlan`.
+- Cost model: selectivity from `TableStatistics::EstimateSelectivity`; join
+  cardinality starts from `ColumnStats::EstimateJoinMatches` per equality key,
+  normalized by each side's population (MCV, NULL mass, histogram/domain
+  overlap, and NDV fallback). Composite keys use independence backoff floored
+  at the most selective key, then cap at the cross product; missing stats fall
+  back to the cross product. Hybrid hash-spill penalty and estimated rows are
+  threaded through `PlanAlternative`/`BestPlan`.
 - Exploration: worklist-based (`DrainTouchedGroups`, expression cursors — no
   pass cap), per-rule operator hints (`Rule::MayApply`), disconnected-cut
   pruning in `join_enumeration` (`Memo::CutConnected`), graceful degradation
@@ -147,18 +151,18 @@ that path.
 `plan/optimizer.cpp` is now a thin QueryData→Memo translation plus options
 plumbing; the DP-era search logic is gone.
 
-## Design Decisions (implemented as specified)
+## Optimizer-local Design Decisions (O1–O6; separate from docs/design.md D1–D11)
 
-- **D1 Group identity**: Selection/Projection/Aggregation/Limit live as
+- **O1 Group identity**: Selection/Projection/Aggregation/Limit live as
   expressions inside groups sharing their child's relation set; derived
   root-layer groups disambiguate via tags. Fingerprints include payloads
   (canonicalized conjuncts).
-- **D2 Property derivation**: `SearchEngine::RequiredChildProperties`.
-- **D3 Cost units**: rows accessed; estimates as above.
-- **D4 Context plumbing**: `RuleContext` replaces the former thread-local.
-- **D5 Join-graph metadata**: conjunct masks on the Memo
+- **O2 Property derivation**: `SearchEngine::RequiredChildProperties`.
+- **O3 Cost units**: rows accessed; estimates as above.
+- **O4 Context plumbing**: `RuleContext` replaces the former thread-local.
+- **O5 Join-graph metadata**: conjunct masks on the Memo
   (`CutConnected`, `JoinGraphDisconnected`).
-- **D6 Ordering/LIMIT boundary**: optimizer folds LIMIT only over
+- **O6 Ordering/LIMIT boundary**: optimizer folds LIMIT only over
   order-delivering children (Top-K); the engine remains the safety net for
   sort and limit, skipping wrappers only when the plan already satisfies
   them (`EnforcesLimit`, `IsOrderedBy`).
@@ -272,17 +276,19 @@ relational executor; each needs its own design note):
 The four previously recorded direct-executor failures are resolved. Floating
 point aggregate assertions use numeric tolerance, and NULL has defined hash
 semantics so DISTINCT treats it as a value. The complete `executor_test` suite
-passes (144 tests as of 2026-08-26).
+passed in the 2026-08-26 validation; no current test count is asserted here.
 
 ---
 
 ## Notes for Other Agents
 
-- All logical operators and rules live in the `tinylamb::cascades` namespace:
-  small, pure data structures plus rule lambdas operating only on Memo groups
-  and expressions. Predicates are manipulated via expression utilities
-  (`TouchedColumns`, `SplitConjuncts`); storage/catalog/executor types are
-  confined to implementation rules behind the `RuleContext` object.
+- Cascades logical operators, Memo, and search machinery live in
+  `tinylamb::cascades`. Physical implementation rules are registered in
+  `plan/implementation_rules.cpp` under `tinylamb` and directly depend on plan,
+  executor, index, and value types. `RuleContext` carries explicit planning
+  inputs; it does not hide those dependencies. Keep predicate rewrites in
+  expression utilities (`TouchedColumns`, `SplitConjuncts`) and keep concrete
+  physical dependencies in the implementation-rule layer.
 - Soundness invariants that must not regress:
   1. Every WHERE conjunct is applied exactly once per root-to-leaf path
      (`Memo::NewJoin` canonicalization; never bypass it when synthesizing

@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@
 #include "expression/interval_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -39,20 +41,38 @@
 
 namespace tinylamb {
 
+inline size_t StructJsonFieldWidth(const FunctionCallExpression& call) {
+  if (call.FuncName() != "__struct_json__") {
+    return 0;
+  }
+  const auto& args = call.Args();
+  if (args.size() % 3 != 0) {
+    return 2;
+  }
+  for (size_t i = 2; i < args.size(); i += 3) {
+    if (!args[i] || args[i]->Type() != TypeTag::kConstantValue) {
+      return 2;
+    }
+    const Value& flag = args[i]->AsConstantValue().GetValue();
+    if (!flag.IsNull() && flag.type != ValueType::kInt64) {
+      return 2;
+    }
+  }
+  return 3;
+}
+
 // Arguments that are operator names, field paths or interval units rather
 // than bindable SQL literals. Shared by template binding and parameter-slot
 // assignment so the two paths cannot drift.
-// `arg_count` (0 when unavailable) decides the STRUCT field encoding: fields
-// are (name, value) pairs, or (name, value, null_flag) triples when the call
-// has a multiple-of-three arity. Only value positions are bindable.
+// STRUCT calls bind only their value arguments. The field width includes
+// an optional constant flag that distinguishes legacy deferred string values.
 inline bool IsStructuralCallArg(std::string_view func, size_t index,
-                                size_t arg_count = 0) {
+                                size_t struct_field_width) {
   if (func == "__quantified__") {
     return index >= 2;
   }
-  if (func == "__struct_json__") {
-    const bool triple_form = arg_count >= 3 && arg_count % 3 == 0;
-    return triple_form ? index % 3 != 1 : index % 2 == 0;
+  if (struct_field_width != 0) {
+    return index % struct_field_width != 1;
   }
   if (func == "make_interval" || func == "get_field") {
     return index == 1;
@@ -98,7 +118,10 @@ class ParameterSlot final : public ConstantValue {
     return use_prepared_values_;
   }
 
-  void Bind(const Value& value) { ResetValue(value); }
+  void Bind(const Value& value) {
+    ResetValue(value);
+    expected_ = value.type;
+  }
 
   [[nodiscard]] Expression Rebind(
       const std::shared_ptr<const PreparedValues>& values) const {
@@ -107,7 +130,7 @@ class ParameterSlot final : public ConstantValue {
 
   [[nodiscard]] Value Evaluate(const Row& row,
                                const Schema& schema) const override {
-    if (use_prepared_values_) {
+    if (use_prepared_values_ && values_) {
       return values_->at(slot_index_);
     }
     return ConstantValue::Evaluate(row, schema);
@@ -115,7 +138,7 @@ class ParameterSlot final : public ConstantValue {
   [[nodiscard]] Value Evaluate(const Row* left, const Schema& left_schema,
                                const Row* right,
                                const Schema& right_schema) const override {
-    if (use_prepared_values_) {
+    if (use_prepared_values_ && values_) {
       return values_->at(slot_index_);
     }
     return ConstantValue::Evaluate(left, left_schema, right, right_schema);
@@ -297,6 +320,14 @@ inline bool SamePrintedExpression(const Expression& left,
       return left_slot != nullptr && right_slot != nullptr &&
              left_slot->Index() == right_slot->Index();
     }
+    // ToString() deliberately omits the logical text domain, but a STRING
+    // literal and a TIMESTAMP literal can carry the identical VARCHAR value.
+    // Two such constants are not interchangeable to rewrite rules, so keep
+    // them distinct in the printed-equivalence key.
+    if (left->AsConstantValue().GetTextDomain() !=
+        right->AsConstantValue().GetTextDomain()) {
+      return false;
+    }
   }
   return left->ToString() == right->ToString() &&
          SameQuerySubtrees(left, right);
@@ -380,6 +411,37 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
       // hand-built or future-produced tree may carry one; SameQuerySubtrees
       // already descends here, so the readers must agree.
       return ContainsParameterSlot(expression->AsCastExpression().Child());
+    case TypeTag::kQueryExp:
+      return ContainsParameterSlot(expression->AsQueryExpression().Test());
+    case TypeTag::kWindowFunctionExp: {
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      if (ContainsParameterSlot(window.where_filter) ||
+          ContainsParameterSlot(window.frame_start.offset) ||
+          ContainsParameterSlot(window.frame_end.offset)) {
+        return true;
+      }
+      for (const Expression& arg : window.args) {
+        if (ContainsParameterSlot(arg)) {
+          return true;
+        }
+      }
+      for (const Expression& key : window.partition_by) {
+        if (ContainsParameterSlot(key)) {
+          return true;
+        }
+      }
+      for (const WindowOrderTerm& term : window.inner_order_by) {
+        if (ContainsParameterSlot(term.expression)) {
+          return true;
+        }
+      }
+      for (const WindowOrderTerm& term : window.order_by) {
+        if (ContainsParameterSlot(term.expression)) {
+          return true;
+        }
+      }
+      return false;
+    }
     default:
       return false;
   }
@@ -484,6 +546,8 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
     const Expression& expression, size_t* slot_cursor, bool* ok,
     const std::vector<Value>* expected = nullptr,
     std::vector<Expression>* slots = nullptr) {
+  // ok is optional: callers that pass nullptr only want the rebuilt tree.
+  const auto aborted = [ok] { return ok != nullptr && !*ok; };
   if (!expression) {
     return expression;
   }
@@ -493,6 +557,7 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
         if (slots != nullptr) {
           slots->push_back(expression);
         }
+        ++(*slot_cursor);
         return expression;
       }
       const Value current = expression->AsConstantValue().GetValue();
@@ -502,7 +567,9 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       if (expected != nullptr) {
         if (*slot_cursor >= expected->size() ||
             (*expected)[*slot_cursor] != current) {
-          *ok = false;
+          if (ok != nullptr) {
+            *ok = false;
+          }
           return expression;
         }
         auto slot = std::make_shared<ParameterSlot>(*slot_cursor, current);
@@ -526,12 +593,12 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       // silently swaps `d_w_id = 1 AND d_id = 2` bindings on replay).
       Expression left =
           SlotizeLiterals(binary.Left(), slot_cursor, ok, expected, slots);
-      if (!*ok) {
+      if (aborted()) {
         return expression;
       }
       Expression right =
           SlotizeLiterals(binary.Right(), slot_cursor, ok, expected, slots);
-      if (!*ok) {
+      if (aborted()) {
         return expression;
       }
       return BinaryExpressionExp(std::move(left), binary.Op(),
@@ -568,19 +635,19 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
         // order and scramble slot numbering).
         Expression condition =
             SlotizeLiterals(clause.first, slot_cursor, ok, expected, slots);
-        if (!*ok) {
+        if (aborted()) {
           return expression;
         }
         Expression result =
             SlotizeLiterals(clause.second, slot_cursor, ok, expected, slots);
-        if (!*ok) {
+        if (aborted()) {
           return expression;
         }
         clauses.emplace_back(std::move(condition), std::move(result));
       }
       Expression else_clause = SlotizeLiterals(
           searched.else_clause_, slot_cursor, ok, expected, slots);
-      if (!*ok) {
+      if (aborted()) {
         return expression;
       }
       return CaseExpressionExp(std::move(clauses), std::move(else_clause));
@@ -591,14 +658,14 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       const auto& in = expression->AsInExpression();
       Expression child =
           SlotizeLiterals(in.child_, slot_cursor, ok, expected, slots);
-      if (!*ok) {
+      if (aborted()) {
         return expression;
       }
       std::vector<Expression> list;
       list.reserve(in.list_.size());
       for (const Expression& item : in.list_) {
         list.push_back(SlotizeLiterals(item, slot_cursor, ok, expected, slots));
-        if (!*ok) {
+        if (aborted()) {
           return expression;
         }
       }
@@ -606,21 +673,20 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kFunctionCallExp: {
       const auto& call = expression->AsFunctionCallExpression();
+      const std::string& func = call.FuncName();
+      const size_t struct_width = StructJsonFieldWidth(call);
       std::vector<Expression> args;
       args.reserve(call.Args().size());
       for (size_t i = 0; i < call.Args().size(); ++i) {
         // Structural arguments (operator names, field paths, interval units)
         // are not SQL literals. Numbering them would shift every later slot.
-        const std::string& func = call.FuncName();
-        const bool structural =
-            IsStructuralCallArg(func, i, call.Args().size());
-        if (structural) {
+        if (IsStructuralCallArg(func, i, struct_width)) {
           args.push_back(call.Args()[i]);
           continue;
         }
         args.push_back(
             SlotizeLiterals(call.Args()[i], slot_cursor, ok, expected, slots));
-        if (!*ok) {
+        if (aborted()) {
           return expression;
         }
       }
@@ -633,7 +699,7 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       for (const Expression& element : array.Elements()) {
         elements.push_back(
             SlotizeLiterals(element, slot_cursor, ok, expected, slots));
-        if (!*ok) {
+        if (aborted()) {
           return expression;
         }
       }
@@ -645,7 +711,9 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       // literals: INTERVAL '1-2' YEAR TO MONTH became a zero interval.
       return expression;
     default:
-      *ok = false;
+      if (ok != nullptr) {
+        *ok = false;
+      }
       return expression;
   }
 }
@@ -720,6 +788,28 @@ inline void AppendParameterSlots(  // NOLINT(misc-no-recursion)
     case TypeTag::kCastExp:
       AppendParameterSlots(expression->AsCastExpression().Child(), slots);
       return;
+    case TypeTag::kQueryExp:
+      AppendParameterSlots(expression->AsQueryExpression().Test(), slots);
+      return;
+    case TypeTag::kWindowFunctionExp: {
+      const auto& window = expression->AsWindowFunctionCallExpression();
+      for (const Expression& arg : window.args) {
+        AppendParameterSlots(arg, slots);
+      }
+      AppendParameterSlots(window.where_filter, slots);
+      for (const WindowOrderTerm& term : window.inner_order_by) {
+        AppendParameterSlots(term.expression, slots);
+      }
+      for (const Expression& key : window.partition_by) {
+        AppendParameterSlots(key, slots);
+      }
+      for (const WindowOrderTerm& term : window.order_by) {
+        AppendParameterSlots(term.expression, slots);
+      }
+      AppendParameterSlots(window.frame_start.offset, slots);
+      AppendParameterSlots(window.frame_end.offset, slots);
+      return;
+    }
     default:
       return;
   }

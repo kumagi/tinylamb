@@ -57,7 +57,7 @@ bool LineIsSeparator(std::string_view line, std::string_view expected) {
 }
 
 // Byte offset of an " as " separator that sits outside parentheses, brackets,
-// angle brackets and quoted literals, or npos when none exists.
+// bracketed expressions and quoted literals, or npos when none exists.
 size_t TopLevelAsPosition(const std::string& lower) {
   const std::string needle = " as ";
   int depth = 0;
@@ -80,9 +80,9 @@ size_t TopLevelAsPosition(const std::string& lower) {
       quote = c;
       continue;
     }
-    if (c == '[' || c == '{' || c == '(' || c == '<') {
+    if (c == '[' || c == '{' || c == '(') {
       ++depth;
-    } else if (c == ']' || c == '}' || c == ')' || c == '>') {
+    } else if (c == ']' || c == '}' || c == ')') {
       if (depth > 0) {
         --depth;
       }
@@ -137,11 +137,13 @@ bool SplitTrailingIdentifier(const std::string& s, size_t* split) {
       quote = c;
       continue;
     }
-    if (c == '[' || c == '{' || c == '(' || c == '<') {
+    if (c == '[' || c == '{' || c == '(') {
       ++depth;
     }
-    if (c == ']' || c == '}' || c == ')' || c == '>') {
-      --depth;
+    if (c == ']' || c == '}' || c == ')') {
+      if (depth > 0) {
+        --depth;
+      }
     }
   }
   if (depth != 0 || in_string) {
@@ -192,7 +194,8 @@ constexpr auto kIgnoredOptionKeys = std::to_array<std::string_view>({
 
 bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
                        std::vector<std::string>* file_default_features,
-                       bool* file_default_time_zone) {
+                       bool* file_default_time_zone,
+                       bool* file_default_unknown_order) {
   const std::string trimmed = Trim(line);
   if (trimmed.size() < 2 || trimmed.front() != '[' || trimmed.back() != ']') {
     return false;
@@ -212,6 +215,8 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     return true;
   }
   if (key == "required_features" || key == "required_feature") {
+    out->required_features.reserve(out->required_features.size() +
+                                   std::ranges::count(value, ',') + 1);
     std::string feature;
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
@@ -225,6 +230,8 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
   if (key == "forbidden_features" || key == "forbidden_feature") {
     // The case is only valid while the engine LACKS every listed capability
     // (reference-driver contract); the runner gates on the parsed set.
+    out->forbidden_features.reserve(out->forbidden_features.size() +
+                                    std::ranges::count(value, ',') + 1);
     std::string feature;
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
@@ -237,6 +244,10 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
   }
   if (key == "default required_features" || key == "default required_feature") {
     file_default_features->clear();
+    const size_t feature_count = std::ranges::count(value, ',') + 1;
+    file_default_features->reserve(feature_count);
+    out->required_features.reserve(out->required_features.size() +
+                                   feature_count);
     std::string feature;
     std::istringstream features(value);
     while (std::getline(features, feature, ',')) {
@@ -270,6 +281,8 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     return true;
   }
   if (key == "parameters" || key == "parameter") {
+    out->unparseable_parameters.reserve(out->unparseable_parameters.size() +
+                                        std::ranges::count(value, ',') + 1);
     for (const auto& item : SplitTopLevel(value)) {
       const std::string s = Trim(item);
       const std::string lower = ToLower(s);
@@ -326,6 +339,9 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     const std::string lower_value = ToLower(Trim(value));
     out->unknown_order =
         value.empty() || lower_value == "true" || lower_value == "1";
+    if (key.starts_with("default ")) {
+      *file_default_unknown_order = out->unknown_order;
+    }
     return true;
   }
   return std::ranges::any_of(
@@ -344,7 +360,6 @@ bool ParseStructRow(std::string_view text, size_t* offset,
   }
   ++*offset;
   std::string token;
-  token.reserve(text.size());
   int depth = 1;
   int bracket_depth = 0;
   bool in_string = false;
@@ -516,6 +531,12 @@ void ParseResult(std::string_view result, GoogleSqlComplianceCase* out) {
 std::string NormalizeCommentEscapes(std::string sql) {
   size_t pos = 0;
   while ((pos = sql.find("\\--", pos)) != std::string::npos) {
+    // The corpus marker only escapes a comment at the beginning of a source
+    // line. Do not rewrite the same bytes inside a SQL string literal.
+    if (pos != 0 && sql[pos - 1] != '\n') {
+      pos += 3;
+      continue;
+    }
     sql.erase(pos, 1);
     pos += 2;
   }
@@ -607,7 +628,7 @@ std::string ApplyParameters(
 std::string ReadLogicalOptionLine(std::istringstream* stream,
                                   std::string first_line) {
   auto unbalanced = [](const std::string& text) {
-    int depth = 0;
+    std::vector<char> delimiters;
     bool in_string = false;
     char quote = '\0';
     for (size_t i = 0; i < text.size(); ++i) {
@@ -623,13 +644,16 @@ std::string ReadLogicalOptionLine(std::istringstream* stream,
       if (c == '"' || c == '\'') {
         in_string = true;
         quote = c;
-      } else if (c == '[' || c == '(' || c == '<') {
-        ++depth;
-      } else if (c == ']' || c == ')' || c == '>') {
-        --depth;
+      } else if (c == '[' || c == '(') {
+        delimiters.push_back(c);
+      } else if (c == ']' || c == ')') {
+        const char expected = c == ']' ? '[' : '(';
+        if (!delimiters.empty() && delimiters.back() == expected) {
+          delimiters.pop_back();
+        }
       }
     }
-    return depth > 0;
+    return !delimiters.empty();
   };
   std::string line = std::move(first_line);
   while (unbalanced(line)) {
@@ -645,11 +669,12 @@ std::string ReadLogicalOptionLine(std::istringstream* stream,
 
 GoogleSqlComplianceCase ParseSegment(
     std::string_view file, std::string_view segment,
-    std::string* current_default_tz,
+    std::string* current_default_tz, bool* default_unknown_order,
     std::vector<std::string>* default_features) {
   GoogleSqlComplianceCase test_case;
   test_case.file = std::string(file);
   test_case.default_time_zone = *current_default_tz;
+  test_case.unknown_order = *default_unknown_order;
   test_case.required_features = *default_features;
   std::istringstream stream{std::string(segment)};
   std::string line;
@@ -666,7 +691,7 @@ GoogleSqlComplianceCase ParseSegment(
       }
       bool file_default_time_zone = false;
       if (ConsumeOptionLine(line, &test_case, default_features,
-                            &file_default_time_zone)) {
+                            &file_default_time_zone, default_unknown_order)) {
         if (file_default_time_zone && !test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -702,7 +727,7 @@ GoogleSqlComplianceCase ParseSegment(
       }
       bool file_default_time_zone = false;
       if (ConsumeOptionLine(line, &test_case, default_features,
-                            &file_default_time_zone)) {
+                            &file_default_time_zone, default_unknown_order)) {
         if (file_default_time_zone && !test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
@@ -775,18 +800,21 @@ std::string Unquote(std::string_view token) {
 
 std::vector<std::string> SplitTopLevel(std::string_view text) {
   std::vector<std::string> parts;
-  parts.reserve(text.size());
-  std::string current;
-  current.reserve(text.size());
+  size_t start = 0;
+  const auto append_part = [&](size_t end) {
+    std::string part = Trim(text.substr(start, end - start));
+    if (!part.empty()) {
+      parts.push_back(std::move(part));
+    }
+  };
   int depth = 0;
   bool in_string = false;
   char quote = '\0';
   for (size_t i = 0; i < text.size(); ++i) {
     const char c = text[i];
     if (in_string) {
-      current.push_back(c);
       if (c == '\\' && i + 1 < text.size()) {
-        current.push_back(text[++i]);
+        ++i;
         continue;
       }
       if (c == quote) {
@@ -797,35 +825,24 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
     if (c == '"' || c == '\'') {
       in_string = true;
       quote = c;
-      current.push_back(c);
       continue;
     }
-    if (c == '[' || c == '{' || c == '(' || c == '<') {
+    if (c == '[' || c == '{' || c == '(') {
       ++depth;
-      current.push_back(c);
       continue;
     }
-    if (c == ']' || c == '}' || c == ')' || c == '>') {
+    if (c == ']' || c == '}' || c == ')') {
       if (depth > 0) {
         --depth;
       }
-      current.push_back(c);
       continue;
     }
     if (c == ',' && depth == 0) {
-      const std::string part = Trim(current);
-      if (!part.empty()) {
-        parts.push_back(part);
-      }
-      current.clear();
-      continue;
+      append_part(i);
+      start = i + 1;
     }
-    current.push_back(c);
   }
-  const std::string part = Trim(current);
-  if (!part.empty()) {
-    parts.push_back(part);
-  }
+  append_part(text.size());
   return parts;
 }
 
@@ -896,13 +913,15 @@ std::vector<GoogleSqlComplianceCase> ParseGoogleSqlComplianceFile(
   std::vector<GoogleSqlComplianceCase> cases;
   size_t unnamed = 0;
   std::string current_default_tz = "America/Los_Angeles";
+  bool default_unknown_order = false;
   std::vector<std::string> default_features;
   for (const std::string& segment : SplitCases(contents)) {
     if (Trim(segment).empty()) {
       continue;
     }
     GoogleSqlComplianceCase test_case =
-        ParseSegment(file, segment, &current_default_tz, &default_features);
+        ParseSegment(file, segment, &current_default_tz, &default_unknown_order,
+                     &default_features);
     if (test_case.name == "unnamed" ||
         test_case.name.starts_with("prepare_database")) {
       if (test_case.name.find('_') == std::string::npos ||
@@ -934,7 +953,8 @@ std::vector<std::string> ListGoogleSqlComplianceFiles(
   std::error_code error;
   for (const auto& entry :
        std::filesystem::directory_iterator(std::string(directory), error)) {
-    if (!entry.is_regular_file()) {
+    std::error_code entry_error;
+    if (!entry.is_regular_file(entry_error) || entry_error) {
       continue;
     }
     if (entry.path().extension() != ".test") {
@@ -1014,10 +1034,11 @@ std::string FormatComplianceValue(const Value& value) {
               element.type == ValueType::kInt64 && element.value.int_value != 0
                   ? "true"
                   : "false";
-        } else if (sql_type == "STRING") {
+        } else if (sql_type == "STRING" &&
+                   element.type == ValueType::kVarChar) {
           inner += QuoteComplianceString(
               std::string(element.value.varchar_value), false);
-        } else if (sql_type == "BYTES") {
+        } else if (sql_type == "BYTES" && element.type == ValueType::kVarChar) {
           inner += QuoteComplianceString(
               std::string(element.value.varchar_value), true);
         } else {
@@ -1352,7 +1373,9 @@ bool ComplianceErrorTextMatches(std::string_view expected,
   // differently-worded messages can still agree on.
   auto significant = [](const std::string& text) {
     std::vector<std::string> tokens;
-    tokens.reserve(text.size());
+    // Only space-separated tokens of length >= 4 are kept, so reserving one
+    // slot per (token + separator) is a sufficient upper bound.
+    tokens.reserve((text.size() / 5) + 1);
     size_t i = 0;
     while (i < text.size()) {
       while (i < text.size() && text[i] == ' ') {
@@ -1392,9 +1415,8 @@ bool ComplianceErrorTextMatches(std::string_view expected,
   // StatusCode names as spelled by common/constants.hpp ToString; used to
   // recover the engine's error category from "<Name>: message" reports.
   auto is_status_code_name = [](std::string_view name) {
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     static constexpr std::string_view kNames[] = {
-        // NOLINT(modernize-avoid-c-arrays)
-        // NOLINT(modernize-avoid-c-arrays)
         "Unknown",
         "Success",
         "NoSpace",
@@ -1412,6 +1434,7 @@ bool ComplianceErrorTextMatches(std::string_view expected,
         "InvalidArgument",
         "RuntimeError",
         "MemoryLimitExceeded",
+        "QueryCanceled",
     };
     for (const std::string_view n :  // NOLINT(readability-use-anyofallof)
          kNames) {                   // NOLINT(readability-use-anyofallof)
@@ -1704,7 +1727,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     try {
       const uint64_t parsed = std::stoull(want, &consumed);
       if (consumed == want.size()) {
-        return static_cast<uint64_t>(actual.value.int_value) == parsed;
+        return std::cmp_equal(actual.value.int_value, parsed);
       }
     } catch (...) {
       return false;
@@ -1739,7 +1762,7 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
       return got == parsed;
     }
     if (parsed == 0.0) {
-      return got == 0.0;
+      return got == 0.0 && std::signbit(got) == std::signbit(parsed);
     }
     const double scale =
         std::max(  // NOLINT(modernize-min-max-use-initializer-list)
@@ -1916,9 +1939,10 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
         actual_str.size() >= 2 && actual_str.front() == '{' &&
         actual_str.back() == '}') {
       auto split_object_values = [](std::string_view body) {
+        const auto members = SplitTopLevel(body);
         std::vector<std::string> values;
-        values.reserve(body.size());
-        for (const std::string& member : SplitTopLevel(body)) {
+        values.reserve(members.size());
+        for (const std::string& member : members) {
           int depth = 0;
           bool quoted = false;
           char quote = '\0';

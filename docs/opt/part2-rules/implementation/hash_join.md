@@ -85,12 +85,16 @@ NULL安全等値比較（`IS NOT DISTINCT FROM`）への対応は、SQL標準に
 - **インメモリ戦略（`kInMemory`）**: ビルド側の全タプルをメモリ上のハッシュテーブルに保持します。
 - **ハイブリッド戦略（`kHybrid`）**: メモリに収まらないパーティションを一時領域へスピルし、段階的に結合を処理します（DeWitt方式ハイブリッドハッシュ結合）。
 
-コスト計算では、入力の走査コスト（$|L| + |R|$）を基本コストとし、インメモリ戦略においてビルド側フットプリントがソフトメモリ予算を超過すると予測される場合は、スピルに伴うI/Oペナルティを加算します。
+コスト計算では左の probe 行数と右の build 行数を使います。build が probe の 4 倍を超える場合は build の重みを 2 倍にし、inner join で build が probe より大きい場合は差分の半分を追加します。インメモリ戦略の footprint がソフトメモリ予算を超える場合は、さらにスピル I/O ペナルティを加算します。
 
 ```cpp
-      double local_cost = l_rows + r_rows;
+      const double build_weight = r_rows > l_rows * 4.0 ? 2.0 : 1.0;
+      double local_cost = l_rows + (r_rows * build_weight);
+      if (kind == JoinAlternativeKind::kInner && r_rows > l_rows) {
+        local_cost += (r_rows - l_rows) * 0.5;
+      }
       const double build_bytes = r_rows * kHashJoinRowBytesEstimate;
-      if (mode == HashJoinMode::kInMemory &&
+      if (mode == HashJoinMode::kInMemory && std::isfinite(build_bytes) &&
           PreferHybridHashJoin(static_cast<size_t>(build_bytes))) {
         local_cost += r_rows * 3;
       }

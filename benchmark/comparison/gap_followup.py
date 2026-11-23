@@ -27,6 +27,11 @@ def main():
     p.add_argument('--warmup', type=float, default=10)
     p.add_argument('--only-workloads', nargs='+', choices=('nonkey_read','hot_update','update','transfer','insert_delete','htap'))
     p.add_argument('--history', choices=('fresh', 'continued'), default='fresh')
+    # Distinct ports let several follow-up campaigns run in parallel; Stack
+    # still reserves each port up front and fails fast on a real conflict.
+    p.add_argument('--tiny-port', type=int, default=55433)
+    p.add_argument('--pg-port', type=int, default=55432)
+    p.add_argument('--mysql-port', type=int, default=53306)
     a = p.parse_args()
     if min(a.seconds, a.trials) <= 0 or a.warmup < 0:
         p.error('positive duration/trials and nonnegative warmup required')
@@ -35,7 +40,6 @@ def main():
     a.scratch = '/var/tmp'
     a.server_cpus = (','.join(map(str, sorted(os.sched_getaffinity(0))[:8]))
                      if hasattr(os, 'sched_getaffinity') else '0-7')
-    a.tiny_port, a.pg_port, a.mysql_port = 55433, 55432, 53306
     a.postgres_image = 'postgres@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4'
     a.mysql_image = 'mysql@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7'
     a.tiny_query_memory_mib, a.read_workers = 64, 8

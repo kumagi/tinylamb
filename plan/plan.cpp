@@ -19,17 +19,26 @@
 #include <algorithm>
 #include <cstddef>
 #include <ostream>
+#include <sstream>
+#include <string>
 
 namespace tinylamb {
 
 void PlanBase::Explain(std::ostream& o, int indent) const {
-  Dump(o, indent);
   const PlanExplainInfo& info = ExplainInfo();
   if (info.rule_name.empty() && info.physical_operator.empty() &&
       info.required_properties.empty() && info.provided_properties.empty() &&
       info.applied_rules.empty()) {
+    Dump(o, indent);
     return;
   }
+  std::ostringstream rendered;
+  Dump(rendered, indent);
+  std::string plan = rendered.str();
+  while (!plan.empty() && plan.back() == '\n') {
+    plan.pop_back();
+  }
+  o << plan;
   const std::string pad(static_cast<size_t>(std::max(indent, 0)), ' ');
   o << "\n"
     << pad << "Rule: " << info.rule_name << "\n"

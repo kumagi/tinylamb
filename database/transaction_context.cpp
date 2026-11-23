@@ -66,6 +66,17 @@ bool TransactionContext::LookupThreadRuntimeOverride(
   return false;
 }
 
+StatusOr<bool> TransactionContext::TableExists(std::string_view name) {
+  {
+    std::scoped_lock lock(cache_mutex_);
+    if (tables_.contains(AsciiToLower(name))) { return true;
+}
+  }
+  if (catalog_ == nullptr) { return false;
+}
+  return catalog_->TableExists(*this, name);
+}
+
 StatusOr<std::shared_ptr<Table>> TransactionContext::GetTable(
     std::string_view table_name) {
   {
@@ -103,13 +114,19 @@ StatusOr<std::shared_ptr<TableStatistics>> TransactionContext::GetStats(
   struct ThreadStatsCache {
     CatalogReader* owner{nullptr};
     uint64_t epoch{0};
+    uint64_t snapshot{0};
     std::unordered_map<std::string, std::shared_ptr<TableStatistics>> entries;
   };
   thread_local ThreadStatsCache cache;
   const uint64_t epoch = catalog_->CatalogEpoch();
-  if (cache.owner != catalog_ || cache.epoch != epoch) {
+  const uint64_t snapshot = txn_.SnapshotTimestamp();
+  // The live epoch can advance while this transaction still sees older
+  // catalog rows. Cache each read under the snapshot that produced it.
+  if (cache.owner != catalog_ || cache.epoch != epoch ||
+      cache.snapshot != snapshot) {
     cache.owner = catalog_;
     cache.epoch = epoch;
+    cache.snapshot = snapshot;
     cache.entries.clear();
   }
   if (const auto cached = cache.entries.find(name);

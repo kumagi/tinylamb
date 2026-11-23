@@ -14,9 +14,144 @@
  * limitations under the License.
  */
 
+#include <cstdlib>
+
+#include "common/platform/process.hpp"
+#include "common/unwind_guard.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "query/query_test.hpp"
+#include "query/select_rewrites.hpp"
 
 namespace tinylamb {
+
+TEST_F(QueryTest, GroupedUnionRewriteKeepsCteUsedInClauseSubqueries) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE union_left (v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE union_right (v INT64);");
+
+  enum class Clause { kNone, kGroupBy, kOrderBy, kDistinctOn };
+  for (const Clause clause : {Clause::kNone, Clause::kGroupBy, Clause::kOrderBy,
+                              Clause::kDistinctOn}) {
+    SCOPED_TRACE(static_cast<int>(clause));
+    auto make_branch = [](const std::string& table) {
+      auto branch = std::make_shared<SelectStatement>();
+      branch->SetSources({SelectSource(table, "")});
+      branch->SetSelectList({NamedExpression("v", ColumnValueExp("v"))});
+      return branch;
+    };
+    auto union_cte = make_branch("union_left");
+    union_cte->AddUnionAll(make_branch("union_right"));
+
+    auto grouped = std::make_shared<SelectStatement>();
+    grouped->SetSources(
+        {SelectSource("union_cte", "u"), SelectSource("union_right", "r")});
+    const Expression group_key = ColumnValueExp(ColumnName("u", "v"));
+    grouped->SetGroupBy({group_key});
+    grouped->SetSelectList(
+        {NamedExpression("v", group_key),
+         NamedExpression("total", AggregateExpressionExp(AggregationType::kSum,
+                                                         group_key))});
+
+    SelectStatement root;
+    root.AddWithQuery("union_cte", std::move(union_cte));
+    root.SetSources({SelectSource("", "grouped", grouped)});
+    const Expression ref = QueryExpressionExp(make_branch("union_cte"));
+    switch (clause) {
+      case Clause::kNone:
+        break;
+      case Clause::kGroupBy:
+        root.SetGroupBy({ref});
+        break;
+      case Clause::kOrderBy:
+        root.SetOrderBy(
+            {SelectStatement::OrderByTerm{.expression=ref, .ascending=true, .nulls_first=std::nullopt}});
+        break;
+      case Clause::kDistinctOn:
+        root.SetDistinctOn({ref});
+        break;
+    }
+
+    ASSERT_TRUE(RewriteDistributeGroupedSumOverUnionAll(&root, ctx));
+    ASSERT_EQ(grouped->Sources().size(), 1U);
+    EXPECT_EQ(root.WithQueries().contains("union_cte"), clause != Clause::kNone);
+  }
+  ASSERT_SUCCESS(ctx.txn_.Abort());
+}
+
+TEST_F(QueryTest, LeftJoinKeyDomainRewriteValidatesNamesAndNullRejection) {
+  TransactionContext ctx = db_->BeginContext();
+  const Schema fact("domain_fact", {Column("k1", ValueType::kInt64),
+                                    Column("k2", ValueType::kInt64)});
+  ASSERT_SUCCESS(db_->CreateTable(ctx, fact).GetStatus());
+  TableStatistics stats(fact);
+  stats.Assign(100000, std::vector<ColumnStats>(fact.ColumnCount()));
+  ASSERT_SUCCESS(db_->UpdateStatistics(ctx, fact.Name(), stats));
+
+  auto make_grouped = [](bool duplicate_output) {
+    auto grouped = std::make_shared<SelectStatement>();
+    grouped->SetSources(
+        {SelectSource("domain_fact", "f"), SelectSource("domain_fact", "d")});
+    const Expression k1 = ColumnValueExp(ColumnName("f", "k1"));
+    const Expression k2 = ColumnValueExp(ColumnName("f", "k2"));
+    grouped->SetGroupBy({k1, k2});
+    std::vector<NamedExpression> output{{"k1", k1}, {"k2", k2}};
+    if (duplicate_output) {
+      output.emplace_back("K1", k2);
+    }
+    grouped->SetSelectList(std::move(output));
+    return grouped;
+  };
+  auto join_condition = [](std::string_view right) {
+    return BinaryExpressionExp(
+        BinaryExpressionExp(ColumnValueExp(ColumnName("l", "k1")),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp(ColumnName(right, "k1"))),
+        BinaryOperation::kAnd,
+        BinaryExpressionExp(ColumnValueExp(ColumnName("l", "k2")),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp(ColumnName(right, "k2"))));
+  };
+
+  enum class Case {
+    kAllowed,
+    kOutputCollision,
+    kCteCollision,
+    kUnsignedDefault
+  };
+  for (const Case test : {Case::kAllowed, Case::kOutputCollision,
+                          Case::kCteCollision, Case::kUnsignedDefault}) {
+    SCOPED_TRACE(static_cast<int>(test));
+    const std::string left =
+        test == Case::kCteCollision ? "__LJ_ACTIVE_KEYS" : "left_group";
+    SelectStatement root;
+    root.AddWithQuery(left, make_grouped(test == Case::kOutputCollision));
+    root.AddWithQuery("right_group1", make_grouped(false));
+    root.AddWithQuery("right_group2", make_grouped(false));
+    root.SetSources({SelectSource(left, "l"),
+                     SelectSource("right_group1", "r1", nullptr,
+                                  JoinType::kLeft, join_condition("r1")),
+                     SelectSource("right_group2", "r2", nullptr,
+                                  JoinType::kLeft, join_condition("r2"))});
+    const Value default_value =
+        test == Case::kUnsignedDefault
+            ? Value(std::numeric_limits<int64_t>::min()).WithUnsigned()
+            : Value(int64_t{0});
+    root.SetWhereClause(BinaryExpressionExp(
+        BinaryExpressionExp(
+            FunctionCallExp("coalesce", {ColumnValueExp(ColumnName("r1", "k1")),
+                                         ConstantValueExp(default_value)}),
+            BinaryOperation::kGreaterThan, ConstantValueExp(Value(1))),
+        BinaryOperation::kOr,
+        UnaryExpressionExp(ColumnValueExp(ColumnName("r2", "k1")),
+                           UnaryOperation::kIsNotNull)));
+    EXPECT_EQ(RewriteDisjunctiveLeftJoinCteKeyDomain(&root, ctx),
+              test == Case::kAllowed);
+    EXPECT_EQ(root.WithQueries().contains("__lj_active_keys"),
+              test == Case::kAllowed);
+    EXPECT_TRUE(root.WithQueries().contains(left));
+  }
+  ASSERT_SUCCESS(ctx.txn_.Abort());
+}
 
 // WITH DEPTH modifier: iteration count is bounded explicitly, every row
 // carries its depth, and the depth-0 anchor stays hidden below a non-zero
@@ -41,7 +176,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteDepthModifierBoundsIterations) {
       "SELECT n, depth FROM t ORDER BY depth, n;");
   ASSERT_EQ(anchored.size(), 3U);
   EXPECT_EQ(anchored[0], Row({Value(0), Value(0)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // WITH DEPTH metadata must survive the set-operation wrapper root: without
@@ -57,7 +192,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteDepthModifierSurvivesSetOpRoot) {
   for (const Row& row : rows) {
     EXPECT_EQ(row.Count(), 2U);
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // EXTRACT(YEAR FROM date_col) predicates rewrite into column ranges so scan
@@ -89,7 +224,7 @@ TEST_F(QueryTest, SqlEngineExtractYearPredicateUsesDateRange) {
       ctx, *db_, "SELECT v FROM events WHERE EXTRACT(YEAR FROM d) < 2024;");
   ASSERT_EQ(before_2024.size(), 1U);
   EXPECT_EQ(before_2024[0][0], Value(1));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
@@ -118,7 +253,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
         << status;
   }
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineMultiRelationGroupByUnqualifiedColumns) {
@@ -152,7 +287,7 @@ TEST_F(QueryTest, SqlEngineMultiRelationGroupByUnqualifiedColumns) {
   EXPECT_EQ(row[2], Value(200));
 
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SyntheticOrderByNameCannotCollideWithUserAlias) {
@@ -172,7 +307,7 @@ TEST_F(QueryTest, SyntheticOrderByNameCannotCollideWithUserAlias) {
   EXPECT_EQ(rows[0][1], Value(int64_t{2}));
   EXPECT_EQ(rows[1][0], Value("zzz"));
   EXPECT_EQ(rows[1][1], Value(int64_t{1}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineGroupedLeftJoinRoutesThroughCascadesBridge) {
@@ -209,7 +344,7 @@ TEST_F(QueryTest, SqlEngineGroupedLeftJoinRoutesThroughCascadesBridge) {
   EXPECT_TRUE(row[2].IsNull());
 
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineScalarAggregateOverLeftJoin) {
@@ -233,7 +368,7 @@ TEST_F(QueryTest, SqlEngineScalarAggregateOverLeftJoin) {
   ASSERT_TRUE(prepared.Value()->Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(2));  // one matched row + one null-padded row
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineGroupedLeftJoinChainRoutesThroughCascadesBridge) {
@@ -268,7 +403,7 @@ TEST_F(QueryTest, SqlEngineGroupedLeftJoinChainRoutesThroughCascadesBridge) {
   EXPECT_EQ(row[1], Value(1));
 
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelfJoinWithAliasesGroupBy) {
@@ -296,7 +431,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinWithAliasesGroupBy) {
   EXPECT_EQ(row[1], Value(1));
 
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineMultiRelationUnqualifiedSelectWithoutGrouping) {
@@ -320,7 +455,7 @@ TEST_F(QueryTest, SqlEngineMultiRelationUnqualifiedSelectWithoutGrouping) {
   EXPECT_EQ(row[1], Value(100));
 
   EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelectLimitZeroReturnsNoRows) {
@@ -353,7 +488,7 @@ TEST_F(QueryTest, SqlEngineSelectLimitZeroReturnsNoRows) {
   EXPECT_EQ(engine.Prepare(ctx, "SELECT missing FROM t LIMIT 0;").GetStatus(),
             Status::kNotExists);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineExplainDoesNotExecuteDdlOrDml) {
@@ -386,7 +521,7 @@ TEST_F(QueryTest, SqlEngineExplainDoesNotExecuteDdlOrDml) {
       engine.Prepare(ctx, "EXPLAIN SELECT a FROM t;");
   ASSERT_TRUE(explain_select.HasValue()) << engine.LastError();
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, OrToUnionPreservesBagMultiplicity) {
@@ -403,7 +538,7 @@ TEST_F(QueryTest, OrToUnionPreservesBagMultiplicity) {
                               Row({Value(int64_t{1}), Value()}),
                               Row({Value(int64_t{1}), Value(int64_t{2})}),
                               Row({Value(int64_t{1}), Value(int64_t{2})})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
@@ -412,6 +547,11 @@ TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   SqlEngine engine(*db_);
   RunSql(ctx, *db_, "CREATE TABLE pcache_hit (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_hit VALUES (7, 70), (8, 80);");
+  // Setup only: publish the DDL/DML before measuring anything.  This commit
+  // advances the schema epoch, so the fresh context below is a different
+  // snapshot from the setup transaction -- but BOTH measured executions use
+  // that same post-commit snapshot.  The hit assertion therefore measures
+  // plan/template reuse, not an epoch invalidation between the two runs.
   ASSERT_SUCCESS(ctx.PreCommit());
   ctx = db_->BeginContext();
 
@@ -428,7 +568,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   ASSERT_EQ(second.size(), 1U);
   EXPECT_EQ(second[0][0], Value(70));
   EXPECT_EQ(PlanCacheStats().hits.load(), hits_before + 1);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // The template cache replays a WITH body through `SqlTemplate::BindSelect`, so
@@ -482,7 +622,7 @@ TEST_F(QueryTest, TemplateCacheKeepsRecursiveCteMetadata) {
             (std::vector<Row>{Row({Value(0), Value(int64_t{0})}),
                               Row({Value(1), Value(int64_t{1})})}));
   EXPECT_EQ(template_hits(), depth_before + 1);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest,
@@ -505,7 +645,7 @@ TEST_F(QueryTest,
   EXPECT_EQ(PlanCacheStats().hits.load(), hits_before);
   RunSql(ctx, *db_, "UPDATE pcache_snap_child SET pid = 999 WHERE id = 1;");
   EXPECT_TRUE(RunPrepared(&engine, &ctx, sql).empty());
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheRevalidatesSnapshotDependentTopNProof) {
@@ -536,7 +676,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheRevalidatesSnapshotDependentTopNProof) {
   ASSERT_EQ(after.size(), 1U);
   EXPECT_EQ(after[0][0], Value(int64_t{1}));
   EXPECT_EQ(after[0][1], Value(int64_t{10}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, CompliancePrimaryKeyModeNeverReplaysUncheckedDml) {
@@ -592,6 +732,9 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   ASSERT_TRUE(engine.Prepare(ctx, "DROP TABLE pcache_ddl;").HasValue());
   RunSql(ctx, *db_, "CREATE TABLE pcache_ddl (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO pcache_ddl VALUES (5, 555);");
+  // Unlike the pure cache-hit tests, here the commit is deliberate: its epoch
+  // bump is what must invalidate the entry filled before the DROP.  Measure
+  // invalidations only in the new snapshot, after that bump.
   ASSERT_SUCCESS(ctx.PreCommit());
   ctx = db_->BeginContext();
   const uint64_t invalidations_before =
@@ -617,7 +760,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheInvalidatedByDdlAndAnalyze) {
   EXPECT_EQ(analyzed[0][0], Value(60));
   EXPECT_GT(PlanCacheStats().epoch_invalidations.load(), invalidations_mid);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheRejectsPreDdlSnapshotAtPostDdlEpoch) {
@@ -719,7 +862,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheParameterCorrectness) {
   EXPECT_EQ(contents[3][0], Value(14));
   EXPECT_EQ(contents[3][1], Value("w"));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheRebindsUpdateAndDelete) {
@@ -753,7 +896,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheRebindsUpdateAndDelete) {
   EXPECT_EQ(PlanCacheStats().replays.load(), delete_replays + 1);
   EXPECT_TRUE(RunPrepared(&engine, &ctx, "SELECT k FROM pcache_upd;").empty());
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // The optimizer sorts conjuncts by text, so `d_id` precedes `d_w_id`. The
@@ -805,7 +948,7 @@ TEST_F(QueryTest, SqlEnginePlanCacheRebindsDuplicateKeyLiterals) {
   EXPECT_EQ(updated[1][0], Value(2));
   EXPECT_EQ(updated[1][1], Value(21));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEnginePlanCacheRetainsSubqueryTablesAcrossDmlReplays) {
@@ -831,19 +974,38 @@ TEST_F(QueryTest, SqlEnginePlanCacheRetainsSubqueryTablesAcrossDmlReplays) {
       "SELECT 1 FROM pcache_del_sub WHERE pcache_del_sub.c1 = "
       "pcache_del_target.c3);";
 
-  // Fill the DML plan cache inside txn1 and then commit it so txn1's
-  // ctx.tables_ map is destroyed before txn2 replays the cached plan.
+  // Fill the DML plan cache inside txn1 and roll back its mutations before
+  // destroying its ctx.tables_ map.
   {
     TransactionContext txn1 = db_->BeginContext();
     RunSql(txn1, *db_, del_sql);
     RunSql(txn1, *db_, upd_sql);
-    txn1.txn_.Abort();
+    EXPECT_EQ(txn1.txn_.Abort(), Status::kSuccess);
   }
 
   // Replaying both statements across a fresh transaction must keep
   // FullScanPlan/IndexScanPlan Table references alive for subquery tables and
   // preserve correctness across checkpointing.
-  ASSERT_SUCCESS(db_->WriteCheckpoint().GetStatus());
+  {
+    // Auto-compaction advances the schema epoch and invalidates the plans.
+    // Keep this checkpoint focused on replaying the existing cached plans.
+    constexpr char kAutoTlcs[] = "TINYLAMB_AUTO_TLCS";
+    const char* configured = std::getenv(kAutoTlcs);
+    const auto previous = configured != nullptr
+                              ? std::optional<std::string>(configured)
+                              : std::nullopt;
+    ASSERT_EQ(platform::SetEnv(kAutoTlcs, "0"), 0);
+    const UnwindGuard restore_auto_tlcs([&] {
+      if (previous) {
+        (void)platform::SetEnv(kAutoTlcs, previous->c_str());
+      } else {
+        (void)platform::UnsetEnv(kAutoTlcs);
+      }
+    });
+    const uint64_t epoch = db_->SchemaEpoch();
+    ASSERT_SUCCESS(db_->WriteCheckpoint().GetStatus());
+    ASSERT_EQ(db_->SchemaEpoch(), epoch);
+  }
   {
     TransactionContext txn2 = db_->BeginContext();
     const uint64_t hits_before = PlanCacheStats().hits.load();
@@ -940,7 +1102,7 @@ TEST_F(QueryTest, LateralJoinExpansion) {
   EXPECT_EQ(left_result[3][0], Value("Charlie"));
   EXPECT_TRUE(left_result[3][1].IsNull());
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, LeftUsingBeforeLateralPreservesOuterRow) {
@@ -956,7 +1118,7 @@ TEST_F(QueryTest, LeftUsingBeforeLateralPreservesOuterRow) {
   ASSERT_EQ(result.size(), 1U);
   EXPECT_EQ(result[0][0], Value(1));
   EXPECT_EQ(result[0][1], Value(42));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, PreparedStatementGenericCustomPlan) {
@@ -979,7 +1141,7 @@ TEST_F(QueryTest, PreparedStatementGenericCustomPlan) {
   ASSERT_EQ(res2.size(), 1U);
   EXPECT_EQ(res2[0][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, BatchInsertChunking) {
@@ -1009,7 +1171,7 @@ TEST_F(QueryTest, BatchInsertChunking) {
   ASSERT_EQ(sample_res.size(), 1U);
   EXPECT_EQ(sample_res[0][0], Value(700));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SelectDistinctOnExecution) {
@@ -1032,7 +1194,23 @@ TEST_F(QueryTest, SelectDistinctOnExecution) {
   EXPECT_EQ(res[1][1], Value(200));
   EXPECT_EQ(res[1][2], Value("Charlie"));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
+}
+
+TEST_F(QueryTest, IntersectWithEmptyBranchKeepsExpandedHeadColumnNames) {
+  auto setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE intersect_head (a INT64, b INT64);");
+  RunSql(setup, *db_, "CREATE TABLE intersect_empty (x INT64, y INT64);");
+  RunSql(setup, *db_, "INSERT INTO intersect_head VALUES (1, 2), (3, 4);");
+  ASSERT_EQ(setup.PreCommit(), Status::kSuccess);
+  auto context = db_->BeginContext();
+  RunSql(context, *db_, "ANALYZE;");
+
+  EXPECT_TRUE(RunSql(
+                  context, *db_,
+                  "SELECT a, b FROM (SELECT * FROM intersect_head "
+                  "INTERSECT DISTINCT SELECT x, y FROM intersect_empty);")
+                  .empty());
 }
 
 TEST_F(QueryTest, FetchFirstWithTiesExecution) {
@@ -1062,7 +1240,7 @@ TEST_F(QueryTest, FetchFirstWithTiesExecution) {
   EXPECT_EQ(replay[1][1], Value(90));
   EXPECT_EQ(replay[2][1], Value(90));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // WITH TIES tie detection must resolve a collated SELECT-list ordinal
@@ -1088,7 +1266,7 @@ TEST_F(QueryTest, FetchFirstWithTiesCollatedOrdinal) {
   EXPECT_EQ(res[1][1], Value(90));
   EXPECT_EQ(res[2][1], Value(90));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A COLLATE-wrapped ORDER BY ordinal is still an ordinal: out-of-range
@@ -1111,7 +1289,14 @@ TEST_F(QueryTest, CollatedOrderByOrdinalRangeChecked) {
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
     }
-    EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
+    // Pin the *reason* for the failure, not merely that something failed:
+    // a syntax error or an unrelated runtime fault must not turn this
+    // range-check regression test green.
+    const Status status = prepared.Value()->GetStatus();
+    ASSERT_EQ(status.GetCode(), StatusCode::kInvalidArgument) << sql;
+    EXPECT_NE(status.GetMessage().find("ordinal out of range"),
+              std::string::npos)
+        << sql << ": " << status.GetMessage();
   }
 
   // The in-range collated ordinal still binds and sorts.
@@ -1121,7 +1306,7 @@ TEST_F(QueryTest, CollatedOrderByOrdinalRangeChecked) {
   EXPECT_EQ(res[0][0], Value(1));
   EXPECT_EQ(res[2][0], Value(3));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, GroupByAllAndDistinctExecution) {
@@ -1155,7 +1340,7 @@ TEST_F(QueryTest, GroupByAllAndDistinctExecution) {
   EXPECT_EQ(res_dist[1][0], Value("B"));
   EXPECT_EQ(res_dist[1][1], Value(30));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, QualifyExecution) {
@@ -1180,7 +1365,7 @@ TEST_F(QueryTest, QualifyExecution) {
   EXPECT_EQ(res[2][0], Value("IT"));
   EXPECT_EQ(res[2][1], Value("Dave"));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, PivotAndUnpivotExecution) {
@@ -1225,7 +1410,7 @@ TEST_F(QueryTest, PivotAndUnpivotExecution) {
   EXPECT_EQ(res_u[3][1], Value(40));
   EXPECT_EQ(res_u[3][2], Value("q2"));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
@@ -1257,7 +1442,7 @@ TEST_F(QueryTest, OrderByHonorsExplicitNullsFirstLast) {
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_EQ(topn_last[i], asc_last[i]);
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, DistinctIndexScanHonorsNullsLastBeforeLimit) {
@@ -1276,7 +1461,7 @@ TEST_F(QueryTest, DistinctIndexScanHonorsNullsLastBeforeLimit) {
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, DescendingIndexScanReturnsReversedRange) {
@@ -1311,7 +1496,7 @@ TEST_F(QueryTest, DescendingIndexScanReturnsReversedRange) {
   ASSERT_EQ(desc_limit.size(), 2U);
   EXPECT_EQ(desc_limit[0][0], Value(int64_t{100}));
   EXPECT_EQ(desc_limit[1][0], Value(int64_t{99}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnknownColumnOnSingleColumnTableIsAnError) {
@@ -1326,7 +1511,7 @@ TEST_F(QueryTest, UnknownColumnOnSingleColumnTableIsAnError) {
       engine.Prepare(ctx, "SELECT typo_name FROM sc;");
   EXPECT_FALSE(prepared.HasValue());
   EXPECT_EQ(prepared.GetStatus(), Status::kNotExists);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
@@ -1341,7 +1526,7 @@ TEST_F(QueryTest, StructConstantFoldingEscapesQuotesAndBackslashes) {
   // The quote and backslash must be escaped inside the JSON string value.
   EXPECT_NE(json.find(R"(a\"b\\c)"), std::string::npos) << json;
   EXPECT_NE(json.find(R"("n":3)"), std::string::npos) << json;
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, MixedDottedAndPlainSetTargetsAreRejected) {
@@ -1360,7 +1545,7 @@ TEST_F(QueryTest, MixedDottedAndPlainSetTargetsAreRejected) {
   EXPECT_EQ(prepared.GetStatus(), Status::kInvalidArgument);
   EXPECT_NE(prepared.GetStatus().GetMessage().find("cannot mix dotted"),
             std::string::npos);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, EighthScanNumericEdgeCases) {
@@ -1410,6 +1595,10 @@ TEST_F(QueryTest, EighthScanNumericEdgeCases) {
       RunScalar(ctx, *db_,
                 "SELECT DATE_BUCKET(DATE '2024-03-15', INTERVAL 0 MONTH);"),
       std::exception);
+  EXPECT_THROW(
+      RunScalar(ctx, *db_,
+                "SELECT DATE_BUCKET(DATE '0001-01-01', INTERVAL 3000 YEAR);"),
+      std::exception);
 
   // A4: AVG OVER a negative int64 sum (was uint64 misinterpretation).
   RunSql(ctx, *db_, "CREATE TABLE av (v INT64);");
@@ -1418,7 +1607,7 @@ TEST_F(QueryTest, EighthScanNumericEdgeCases) {
       RunScalar(ctx, *db_, "SELECT AVG(v) OVER () FROM av ORDER BY v;");
   ASSERT_GE(avg_over.size(), 1U);
   EXPECT_EQ(avg_over[0][0], Value(-1.0));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, EighthScanSingleColumnTypoRejected) {
@@ -1431,7 +1620,7 @@ TEST_F(QueryTest, EighthScanSingleColumnTypoRejected) {
   const StatusOr<Executor> prepared =
       engine.Prepare(ctx, "SELECT only FROM solo WHERE typo_col = 5;");
   EXPECT_FALSE(prepared.HasValue());
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineNonEqualityJoinCascades) {
@@ -1465,7 +1654,7 @@ TEST_F(QueryTest, SqlEngineNonEqualityJoinCascades) {
   EXPECT_EQ(rows[0], Row({Value("a1"), Value("b2")}));
   EXPECT_EQ(rows[1], Row({Value("a1"), Value("b4")}));
   EXPECT_EQ(rows[2], Row({Value("a3"), Value("b4")}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineJoinOnlySourceCascades) {
@@ -1496,7 +1685,7 @@ TEST_F(QueryTest, SqlEngineJoinOnlySourceCascades) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0][0], Value(100));
   EXPECT_EQ(rows[1][0], Value(300));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineCompoundJoinPredicateCascades) {
@@ -1529,7 +1718,7 @@ TEST_F(QueryTest, SqlEngineCompoundJoinPredicateCascades) {
       "SELECT p.num FROM p JOIN q ON p.k = q.k AND p.num > q.threshold;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(50));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
@@ -1557,7 +1746,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteCascadesPlan) {
              "FROM t WHERE n < 5) SELECT SUM(n) FROM t;");
   ASSERT_EQ(total.size(), 1U);
   EXPECT_EQ(total[0][0], Value(15));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
@@ -1576,7 +1765,7 @@ TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
   EXPECT_EQ(
       RunSql(ctx, *db_, "SELECT CASE WHEN s = s THEN 7 ELSE 0 END FROM wr s;"),
       (std::vector<Row>{Row({Value(7)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // Index nested-loop (lookup join) end to end through the SQL engine. The
@@ -1585,30 +1774,32 @@ TEST_F(QueryTest, SqlEngineWholeRowRefNestedInExpressionResolves) {
 // second range the single bound slot cannot take. Whatever the planner picks,
 // the answers must match the nested-loop semantics the mirror below spells out.
 TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
-  TransactionContext ctx = db_->BeginContext();
-  RunSql(ctx, *db_, "CREATE TABLE lk (x INT64, y INT64, z FLOAT64);");
-  RunSql(ctx, *db_,
+  TransactionContext setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE lk (x INT64, y INT64, z FLOAT64);");
+  RunSql(setup, *db_,
          "INSERT INTO lk VALUES (1, 5, 2.5), (1, 6, 3.5), (2, 1, 0.5), "
          "(3, 9, 1.5);");
-  RunSql(ctx, *db_, "CREATE TABLE rk (a INT64, b INT64, c INT64, d FLOAT64);");
+  RunSql(setup, *db_, "CREATE TABLE rk (a INT64, b INT64, c INT64, d FLOAT64);");
   {
     std::string values =
         "(1, 10, 1, 9.5), (1, 20, 7, 1.5), (1, 30, 1, 3.5), (1, 4, 5, 0.5), "
         "(2, 5, 2, 0.25), (2, 40, 9, 7.5), (2, 0, 3, 2.5), (3, 2, 3, 0.5), "
         "(4, 100, 4, 1.0)";
-    RunSql(ctx, *db_, "INSERT INTO rk VALUES " + values + ";");
+    RunSql(setup, *db_, "INSERT INTO rk VALUES " + values + ";");
   }
   ASSERT_EQ(
-      db_->CreateIndex(ctx, "rk",
+      db_->CreateIndex(setup, "rk",
                        IndexSchema("rk_ab", {0, 1}, {}, IndexMode::kNonUnique)),
       Status::kSuccess);
+  ASSERT_SUCCESS(setup.PreCommit());
   {
     TransactionContext stat_ctx = db_->BeginContext();
-    db_->RefreshStatistics(stat_ctx, "lk");
-    db_->RefreshStatistics(stat_ctx, "rk");
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_ctx, "lk"));
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_ctx, "rk"));
     ASSERT_EQ(stat_ctx.PreCommit(), Status::kSuccess);
   }
 
+  TransactionContext ctx = db_->BeginContext();
   // Equality prefix on (a) plus a range bound on (b). The mirror below lists
   // the pairs the predicate accepts, computed in plain C++.
   const std::vector<Row> probe_left{{Value(1), Value(5), Value(2.5)},
@@ -1729,7 +1920,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
                      "SELECT lk.x FROM lk JOIN rk_empty ON lk.x = "
                      "rk_empty.a AND rk_empty.b > lk.y;")
                   .empty());
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // The two-sided interval probe reached through SQL: `lo < b < hi` adopts BOTH
@@ -1737,25 +1928,27 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
 // over-fetching from one side.  The plan text pins the interval and the mirror
 // below lists the accepted pairs in plain C++.
 TEST_F(QueryTest, CompositeIndexLookupJoinIntervalProbe) {
-  TransactionContext ctx = db_->BeginContext();
-  RunSql(ctx, *db_, "CREATE TABLE il (x INT64, lo INT64, hi INT64);");
-  RunSql(ctx, *db_,
+  TransactionContext setup = db_->BeginContext();
+  RunSql(setup, *db_, "CREATE TABLE il (x INT64, lo INT64, hi INT64);");
+  RunSql(setup, *db_,
          "INSERT INTO il VALUES (1, 5, 15), (2, 9, 26), (3, 20, 31);");
-  RunSql(ctx, *db_, "CREATE TABLE ir (a INT64, b INT64);");
-  RunSql(ctx, *db_,
+  RunSql(setup, *db_, "CREATE TABLE ir (a INT64, b INT64);");
+  RunSql(setup, *db_,
          "INSERT INTO ir VALUES (1, 4), (1, 10), (1, 15), (1, 20), (2, 10), "
          "(2, 25), (3, 21), (3, 30);");
   ASSERT_EQ(
-      db_->CreateIndex(ctx, "ir",
+      db_->CreateIndex(setup, "ir",
                        IndexSchema("ir_ab", {0, 1}, {}, IndexMode::kNonUnique)),
       Status::kSuccess);
+  ASSERT_SUCCESS(setup.PreCommit());
   {
     TransactionContext stat_ctx = db_->BeginContext();
-    db_->RefreshStatistics(stat_ctx, "il");
-    db_->RefreshStatistics(stat_ctx, "ir");
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_ctx, "il"));
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_ctx, "ir"));
     ASSERT_EQ(stat_ctx.PreCommit(), Status::kSuccess);
   }
 
+  TransactionContext ctx = db_->BeginContext();
   const std::vector<Row> left{{Value(1), Value(5), Value(15)},
                               {Value(2), Value(9), Value(26)},
                               {Value(3), Value(20), Value(31)}};
@@ -1803,7 +1996,7 @@ TEST_F(QueryTest, CompositeIndexLookupJoinIntervalProbe) {
   EXPECT_EQ(collect("SELECT ir.a, ir.b FROM il JOIN ir ON il.x = ir.a AND "
                     "ir.b >= il.lo AND ir.b <= il.hi;"),
             mirror(true, true));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, ZigZagJoinSqlContracts) {
@@ -1825,7 +2018,7 @@ TEST_F(QueryTest, ZigZagJoinSqlContracts) {
   ASSERT_SUCCESS(setup.txn_.PreCommit());
 
   TransactionContext stats_context = db_->BeginContext();
-  db_->RefreshStatistics(stats_context, "zz_left");
+  ASSERT_SUCCESS(db_->RefreshStatistics(stats_context, "zz_left"));
   db_->RefreshStatistics(stats_context, "zz_right");
   ASSERT_SUCCESS(stats_context.txn_.PreCommit());
 
@@ -1917,7 +2110,7 @@ TEST_F(QueryTest, ZigZagJoinSqlContracts) {
   ASSERT_EQ(unique.size(), 1U);
   EXPECT_EQ(unique[0], (Row({Value(2), Value(2)})));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A unique inner side means a probe can name at most one row: the join must
@@ -1942,8 +2135,8 @@ TEST_F(QueryTest, UniqueInnerJoinEmitsOneRowPerOuterRow) {
   ASSERT_SUCCESS(setup.txn_.PreCommit());
 
   TransactionContext stats_context = db_->BeginContext();
-  db_->RefreshStatistics(stats_context, "ui_left");
-  db_->RefreshStatistics(stats_context, "ui_right");
+  ASSERT_SUCCESS(db_->RefreshStatistics(stats_context, "ui_left"));
+  ASSERT_SUCCESS(db_->RefreshStatistics(stats_context, "ui_right"));
   ASSERT_SUCCESS(stats_context.txn_.PreCommit());
 
   TransactionContext ctx = db_->BeginContext();
@@ -1965,7 +2158,7 @@ TEST_F(QueryTest, UniqueInnerJoinEmitsOneRowPerOuterRow) {
   ASSERT_EQ(counted.size(), 2U);
   EXPECT_EQ(counted[0], (Row({Value(1), Value(1)})));
   EXPECT_EQ(counted[1], (Row({Value(2), Value(2)})));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnsignedInt64_CreateInsertOrderAndIndex) {
@@ -2007,7 +2200,7 @@ TEST_F(QueryTest, UnsignedInt64_CreateInsertOrderAndIndex) {
   EXPECT_EQ(desc[1][0].AsString(), "10");
   EXPECT_EQ(desc[2][0].AsString(), "0");
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnsignedInt64_CastQuerySemantics) {
@@ -2041,7 +2234,7 @@ TEST_F(QueryTest, UnsignedInt64_CastQuerySemantics) {
   EXPECT_FALSE(in_range[0][0].IsUnsigned());
   EXPECT_EQ(in_range[0][0].value.int_value, 10LL);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnsignedInt64SumOverJoinGroupByDoesNotWrap) {
@@ -2060,7 +2253,7 @@ TEST_F(QueryTest, UnsignedInt64SumOverJoinGroupByDoesNotWrap) {
   EXPECT_TRUE(rows[0][1].IsUnsigned());
   EXPECT_EQ(rows[0][1].AsString(), "18446744073709551605");
   EXPECT_EQ(rows[1][1].AsString(), "100");
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnsignedInt64_AggregationSemantics) {
@@ -2114,7 +2307,7 @@ TEST_F(QueryTest, UnsignedInt64_AggregationSemantics) {
   EXPECT_EQ(group_rows[1][1].AsString(), "0");
   EXPECT_EQ(group_rows[1][2].AsString(), "18446744073709551615");
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, OuterJoinNullPadGolden) {
@@ -2252,7 +2445,7 @@ TEST_F(QueryTest, OuterJoinNullPadGolden) {
   EXPECT_TRUE(chain_res[2][1].IsNull());
   EXPECT_TRUE(chain_res[2][2].IsNull());
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, CancellationResourceLeakVerification) {
@@ -2267,7 +2460,10 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
     RunSql(ctx, *db_, sql);
   }
 
-  Table tbl = db_->GetTable(ctx, "cancel_t").Value();
+  StatusOr<Table> table = db_->GetTable(ctx, "cancel_t");
+  ASSERT_TRUE(table.HasValue())
+      << "CREATE/INSERT setup failed: " << table.GetStatus();
+  Table tbl = table.Value();
 
   // Part 1: ParallelScan early destruction and worker join.
   // 1a. ParallelScan destroyed after 0 rows read.
@@ -2402,7 +2598,7 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
   std::error_code cleanup_ec;
   std::filesystem::remove_all(spill_isolation_dir, cleanup_ec);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
@@ -2549,7 +2745,7 @@ TEST_F(QueryTest, DifferentialTestCascadesVsRelationalFallback) {
   run_differential("SELECT val, COUNT(*) FROM diff_t1 GROUP BY val;", false);
   run_differential("SELECT id, val FROM diff_t1 WHERE val = 5;", false);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // The optimizer canonicalizes conjunct order (lexicographic sort in
@@ -2624,7 +2820,7 @@ TEST_F(QueryTest, WhereConjunctReorderSuppressesSiblingError) {
     EXPECT_EQ(rows[1][0], Value(int64_t{2}));
   }
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // UPDATE/DELETE build a QueryData whose WHERE may hold an IN/EXISTS
@@ -2718,7 +2914,7 @@ TEST_F(QueryTest, UpdateWithInSubqueryDecorrelatesOnce) {
   EXPECT_EQ(rows[0][0], Value(int64_t{2}));
   EXPECT_EQ(rows[0][1], Value(int64_t{40}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 TEST_F(QueryTest, DmlDuplicateExistsConjunctDecorrelateOnce) {
   TransactionContext ctx = db_->BeginContext();
@@ -2743,7 +2939,7 @@ TEST_F(QueryTest, DmlDuplicateExistsConjunctDecorrelateOnce) {
   const std::vector<Row> rows = RunSql(ctx, *db_, "SELECT u, v FROM t0;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][1].value.int_value, 2);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 TEST_F(QueryTest, GroupedOrderBySpelledAggregate) {
   TransactionContext ctx = db_->BeginContext();
@@ -3378,7 +3574,7 @@ TEST_F(QueryTest, TemplateCacheDoesNotReplayStaleViewBody) {
   ctx = db_->BeginContext();
   EXPECT_EQ(RunPrepared(&engine, &ctx, "SELECT a FROM tpl_view_v WHERE b = 3"),
             (std::vector<Row>{Row({Value(int64_t{3})})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

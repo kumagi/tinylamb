@@ -49,7 +49,7 @@ class BoolSource final : public ExecutorBase {
     dst->Reset();
     size_t emitted = 0;
     while (offset_ < n_ && emitted < max_rows) {
-      dst->Append(Row({Value(int64_t{static_cast<int64_t>(offset_ % 2)})}));
+      dst->Append(Row({Value(static_cast<int64_t>(offset_ % 2))}));
       ++offset_;
       ++emitted;
     }
@@ -72,8 +72,14 @@ TEST(ExecutorCoverageTest, BareColumnPredicateJITGateDoesNotReadPastBytecode) {
   Selection sel(ColumnValueExp("flag"), schema, std::make_shared<BoolSource>(4),
                 /*jit_threshold_rows=*/1);
   DataChunk batch;
-  EXPECT_GT(sel.NextBatch(&batch, 4), 0U);
+  // BoolSource emits 0,1,0,1; a bare flag predicate keeps only the truthy
+  // rows. Checking just the row count/status would let a bad JIT promotion
+  // that passes every row (or drops every row) slip through.
+  ASSERT_EQ(sel.NextBatch(&batch, 4), 2U);
   EXPECT_EQ(sel.GetStatus(), Status::kSuccess);
+  ASSERT_EQ(batch.Size(), 2U);
+  EXPECT_EQ(batch.RowAt(0), Row({Value(int64_t{1})}));
+  EXPECT_EQ(batch.RowAt(1), Row({Value(int64_t{1})}));
 }
 
 std::vector<Value> ReadAll(ExecutorBase* exec) {
@@ -87,6 +93,31 @@ std::vector<Value> ReadAll(ExecutorBase* exec) {
 }
 
 }  // namespace
+
+TEST(ExecutorCoverageTest, ValuesPreserveMixedDomainsAcrossBatchBoundaries) {
+  const std::vector<Row> expected{
+      Row({Value(-2), Value("text")}),
+      Row({Value(-1).WithUnsigned(), Value("1-0 0 0:0:0").WithInterval()}),
+      Row({Value(), Value()}), Row({Value(-3), Value("text")}),
+  };
+  for (const size_t batch_size : {1U, 2U, 4U}) {
+    ValuesExecutor source(expected);
+    DataChunk chunk;
+    size_t next = 0;
+    while (source.NextBatch(&chunk, batch_size) != 0) {
+      for (size_t i = 0; i < chunk.Size(); ++i) {
+        ASSERT_LT(next, expected.size());
+        const Row row = chunk.RowAt(i);
+        EXPECT_EQ(row, expected[next]);
+        EXPECT_EQ(row[0].IsUnsigned(), expected[next][0].IsUnsigned());
+        EXPECT_EQ(row[1].IsInterval(), expected[next][1].IsInterval());
+        ++next;
+      }
+    }
+    EXPECT_EQ(next, expected.size());
+    EXPECT_EQ(source.GetStatus(), Status::kSuccess);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // TopNExecutor
@@ -537,6 +568,37 @@ TEST(ExecutorBaseCoverageTest,
     ASSERT_EQ(chunk.Size(), 1U);
     EXPECT_EQ(chunk.RowAt(0), Row({Value(i)}));
   }
+  // Once the Next() buffer is drained, small draining pulls must fall through
+  // to NextBatch() and keep returning the *next* row (not a stale prefix from
+  // the destination that Reset() failed to clear).
+  for (int64_t i = 8; i < 16; ++i) {
+    ASSERT_EQ(source.NextBatchDraining(&chunk, 1), 1U);
+    ASSERT_EQ(chunk.Size(), 1U);
+    EXPECT_EQ(chunk.RowAt(0), Row({Value(i)}));
+  }
+  // Exhaustion is reported as a short/zero batch with a healthy status.
+  EXPECT_EQ(source.NextBatchDraining(&chunk, 1), 0U);
+  EXPECT_EQ(source.GetStatus(), Status::kSuccess);
+}
+
+TEST(ExecutorBaseCoverageTest, DrainingKeepsBufferedColumnTypesForNullRows) {
+  const Row first({Value(-1).WithUnsigned(), Value("text")});
+  const Row nulls({Value(), Value()});
+  ValuesExecutor source({first, nulls, first});
+  Row row;
+  ASSERT_TRUE(source.Next(&row));
+  DataChunk batch;
+  EXPECT_EQ(source.NextBatchDraining(&batch, 0), 0U);
+  EXPECT_TRUE(batch.Empty());
+  ASSERT_EQ(source.NextBatchDraining(&batch, 1), 1U);
+  ASSERT_EQ(batch.ColumnCount(), 2U);
+  EXPECT_EQ(batch.ColumnAt(0).Type(), ValueType::kInt64);
+  EXPECT_TRUE(batch.ColumnAt(0).IsUnsigned());
+  EXPECT_EQ(batch.ColumnAt(1).Type(), ValueType::kVarChar);
+  EXPECT_EQ(batch.RowAt(0), nulls);
+  ASSERT_EQ(source.NextBatchDraining(&batch, 1), 1U);
+  EXPECT_EQ(batch.RowAt(0), first);
+  EXPECT_TRUE(batch.RowAt(0)[0].IsUnsigned());
 }
 
 }  // namespace tinylamb

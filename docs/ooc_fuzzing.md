@@ -49,9 +49,13 @@ differently: `mixed`, `query`, `bigtxn` (pool of one or two pages, statements
 touching every page, few commits), `skew`, `inject`, `wide`.
 
 A failed statement is only tolerated when the active pressure explains it:
-`kMemoryLimitExceeded` always, `kNoSpace` / `kIOError` under an injection or a
-temp-disk cap, `kTooBigData` when one value really is large against the
-budget.  Anything else is a finding.
+`kMemoryLimitExceeded` always; under injection or a temp-disk cap,
+`kNoSpace`, `kTooBigData`, and `kIOError`; and for `big_rows` operations,
+`kNoSpace` or `kTooBigData` even without injection or a temp-disk cap. An
+injected fault explicitly identified in the error is tolerated regardless of
+its status code. A deterministic capability gap — currently only the
+streaming window aggregate's `kNotImplemented` ("Unsupported streaming
+window aggregate") — is tolerated by message. Anything else is a finding.
 
 ## Running it
 
@@ -97,10 +101,10 @@ If these stay at zero the fuzzer is not testing what it claims to:
 - `spill_bytes`, `spilled_queries`, `max_partition_depth`, `skew_fallbacks`
 - `evicted_pages`, `uncommitted_spill_evictions`
 - `sweep_fired` (injected failures that really fired)
-- `executor routes: pipeline=N legacy=M` — only `pipeline` statements ran on
+- `executor routes (EXPLAIN ANALYZE): pipeline=N legacy=M` — only `pipeline` statements ran on
   the OOC sinks (ADR 0006: `legacy_source_ms = 0`); `legacy` ones went through
   `LegacySource` and their memory is still proportional to the input.
-- `pipeline operators seen` — which sinks and sources were reached.
+- `pipeline operators seen` — which pipeline operators were reached, including intermediate operators as well as sinks and sources.
 
 ## Signatures
 
@@ -221,12 +225,12 @@ snap open ro|rw | snap check t0 | snap close
 ```
 
 `profile` is applied before the database opens, so it also governs recovery.
-`SqlOocFuzzer.HandWrittenTraceHolds` exercises every op kind.
+`SqlOocFuzzer.HandWrittenTraceHolds` exercises representative operation kinds and trace combinations.
 
 ## ctest units
 
-`sql_ooc_fuzzer_test` keeps each case under the 60 s cap: eight seeded shards
-of three 7-second sessions, one case per flavour asserting that the flavour
+`sql_ooc_fuzzer_test` keeps each case under the 60 s cap: 24 seeded shards,
+each running one 7-second session, plus one case per flavour asserting that the flavour
 reaches what it is for (spilled pipeline queries, fired sweeps, uncommitted
 page spill), and unit tests of the trace format, the signatures and the
 in-process minimizer.  A failing seed writes `sql_ooc_fuzz-seed-N.test` into

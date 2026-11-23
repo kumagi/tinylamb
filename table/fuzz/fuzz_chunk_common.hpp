@@ -198,8 +198,10 @@ inline StatusOr<PaxChunk> MergeAllSortedRuns(
     if (!winner_deleted) {
       const auto key_off = static_cast<uint32_t>(merged_blob.size());
       const uint32_t be_len = htobe32(static_cast<uint32_t>(key_copy.size()));
-      const char* p = reinterpret_cast<const char*>(&be_len);
-      merged_blob.insert(merged_blob.end(), p, p + sizeof(uint32_t));
+      char be_len_bytes[sizeof(be_len)];
+      std::memcpy(be_len_bytes, &be_len, sizeof(be_len));
+      merged_blob.insert(merged_blob.end(), be_len_bytes,
+                         be_len_bytes + sizeof(be_len_bytes));
       merged_blob.insert(merged_blob.end(), key_copy.begin(), key_copy.end());
       const auto row_off = static_cast<uint32_t>(merged_blob.size());
       std::vector<char> rbuf(winner_row.Size());
@@ -307,8 +309,9 @@ inline SortedRun MakeRun(const std::vector<Row>& rows, const Schema& sc,
     const std::string key = r.EncodeKeyMemcomparableFormat(sc);
     const auto key_off = static_cast<uint32_t>(blob.size());
     const uint32_t be_len = htobe32(static_cast<uint32_t>(key.size()));
-    const char* p = reinterpret_cast<const char*>(&be_len);
-    blob.insert(blob.end(), p, p + sizeof(uint32_t));
+    char be_len_bytes[sizeof(be_len)];
+    std::memcpy(be_len_bytes, &be_len, sizeof(be_len));
+    blob.insert(blob.end(), be_len_bytes, be_len_bytes + sizeof(be_len_bytes));
     blob.insert(blob.end(), key.begin(), key.end());
     const auto row_off = static_cast<uint32_t>(blob.size());
     std::vector<char> buf(r.Size());
@@ -465,12 +468,12 @@ inline std::vector<Row> MakeStorageRowsForScheme(uint8_t shape,
   auto rows = MakeStorageRows(shape);
   if (scheme == PaxChunk::Scheme::kSfor) {
     for (size_t i = 0; i < rows.size(); ++i) {
-      rows[i][3] = Value(1.0 + shape + static_cast<double>(i) * 0.25);
+      rows[i][3] = Value(1.0 + shape + (static_cast<double>(i) * 0.25));
     }
   } else if (scheme == PaxChunk::Scheme::kExpFor) {
     for (size_t i = 0; i < rows.size(); ++i) {
       const double magnitude =
-          12.0 + static_cast<double>((i * (size_t{3} + shape)) % 97) / 32.0;
+          12.0 + (static_cast<double>((i * (size_t{3} + shape)) % 97) / 32.0);
       rows[i][3] = Value((i / 120) % 2 == 0 ? magnitude : -magnitude);
     }
   }
@@ -486,6 +489,8 @@ inline PaxChunk BuildStorageChunk(uint8_t shape = 0) {
 // Deserialize(chunk.Data()) must reproduce the in-memory chunk exactly --
 // same footer fields, same rows.
 inline bool DeserializeRoundTrips(const PaxChunk& src, const Schema& sc) {
+  // Deserialize is [[nodiscard]] and its StatusOr is checked right here: a
+  // corrupt image returns false, it never flows into the round-trip walk.
   auto rt = PaxChunk::Deserialize(src.Data());
   if (!rt.HasValue()) {
     return false;
@@ -688,6 +693,8 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
           g < f.row_counts.size() ? f.row_counts[g] : PaxChunk::kRowGroupSize;
       std::vector<int64_t> buf(rc > 0 ? rc : 1, 0);
       try {
+        // DecodeInt64ColumnRg returns void and signals a hostile footer by
+        // throwing std::out_of_range; both catch handlers below count it.
         chunk.DecodeInt64ColumnRg(c, g, buf.data());
       } catch (const std::out_of_range&) {
         ++throws;

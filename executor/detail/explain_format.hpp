@@ -15,6 +15,9 @@ class TransactionContext;
 namespace tinylamb::relational_detail {
 
 std::string IndentLines(std::string_view text, int spaces);
+// Formats a non-negative byte count as B, KiB, MiB, or GiB (one decimal
+// place for scaled units; zero is "0B"). Convert or clamp signed estimates
+// before calling this unsigned API.
 std::string FormatBytes(size_t bytes);
 
 void WriteEstimatedPhysicalPlan(TransactionContext& context,

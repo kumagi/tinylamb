@@ -84,6 +84,7 @@ class Logger final {
                                            uint64_t index);
   static std::filesystem::path SegmentMetadataPath(
       const std::filesystem::path& base);
+  // segment_size is validated by Logger::Create and RecoveryManager.
   static constexpr size_t SegmentIndex(lsn_t lsn, size_t segment_size) {
     return static_cast<size_t>(lsn / segment_size);
   }
@@ -115,6 +116,9 @@ class Logger final {
                                              uint64_t index,
                                              size_t segment_size,
                                              bool allow_torn_footer = false);
+  // Serializes validation with footer writes from this live logger.
+  [[nodiscard]] StatusOr<size_t> ReadSegmentLogicalSize(
+      uint64_t index, bool allow_torn_footer) const;
   Logger(const Logger&) = delete;
   Logger(Logger&&) = delete;
   Logger& operator=(const Logger&) = delete;
@@ -147,6 +151,7 @@ class Logger final {
     return ring_floor_lsn_.load(std::memory_order_acquire);
   }
   [[nodiscard]] size_t SegmentSize() const { return segment_size_; }
+  [[nodiscard]] Status CheckAppendSize(size_t size) const;
 
   // Appends payload to the write buffer and returns the LSN at which the
   // record STARTS. The record is only enqueued: nothing is flushed yet.
@@ -284,6 +289,9 @@ class Logger final {
   std::filesystem::path base_path_;
   size_t segment_size_ = kDefaultLogSegmentSize;
   mutable std::mutex segment_mu_;
+  // Leaf mutex. The writer holds segment_mu_ before taking it; a reader can
+  // take it without waiting on segment_mu_ or any durability condition.
+  mutable std::mutex footer_mu_;
   // Index of the segment dst_ currently appends to.
   uint64_t current_segment_ = 0;
   // Format is immutable after Create; generation is guarded by segment_mu_.

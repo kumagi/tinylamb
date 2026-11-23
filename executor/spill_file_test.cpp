@@ -2,6 +2,7 @@
 #include "executor/spill_file.hpp"
 
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -18,6 +19,7 @@
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <sys/resource.h>
 
+#include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
@@ -51,6 +53,41 @@ TEST(SpillFileTest, Append_MultipleRows_ReadsAllRowsCorrectly) {
   EXPECT_EQ(rows[1], Row({Value(2), Value("b")}));
 }
 
+TEST(SpillFileTest, AppendRejectsOversizedStringsWithoutChangingTheFile) {
+  constexpr size_t limit = std::numeric_limits<bin_size_t>::max();
+  constexpr size_t kMaxOversizedTestAllocation = 1U << 20;
+  if (limit >= kMaxOversizedTestAllocation) {
+    GTEST_SKIP() << "bin_size_t limit is too large for an oversized-string test";
+  }
+  const Value oversized(std::string(limit + 1, 'a'));
+  const Row invalid({oversized});
+  const Row nested_invalid({Value::Array({oversized}, "STRING")});
+  const Row supported({Value(std::string(limit, 'b'))});
+
+  SpillFile plain;
+  ASSERT_SUCCESS(plain.Append(supported));
+  const uint64_t plain_bytes_before_rejection = plain.FileBytes();
+  EXPECT_EQ(plain.Append(invalid).GetCode(), StatusCode::kTooBigData);
+  EXPECT_EQ(plain.FileBytes(), plain_bytes_before_rejection);
+  ASSERT_SUCCESS(plain.Append(supported));
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, rows, plain.ReadAllRows());
+  EXPECT_EQ(rows, (std::vector<Row>{supported, supported}));
+
+  SpillFile positioned;
+  const RowPosition location(1, 2);
+  ASSERT_SUCCESS(positioned.Append(supported, location));
+  const uint64_t positioned_bytes_before_rejection = positioned.FileBytes();
+  EXPECT_EQ(positioned.Append(nested_invalid, location).GetCode(),
+            StatusCode::kTooBigData);
+  EXPECT_EQ(positioned.FileBytes(), positioned_bytes_before_rejection);
+  ASSERT_SUCCESS(positioned.Append(supported, location));
+  const auto result = positioned.ReadAllPositioned();
+  ASSERT_TRUE(result.HasValue());
+  ASSERT_EQ(result.Value().size(), 2U);
+  EXPECT_EQ(result.Value()[0], std::make_pair(supported, location));
+  EXPECT_EQ(result.Value()[1], std::make_pair(supported, location));
+}
+
 TEST(SpillFileTest, RowReaderRejectsMissingOutputsWithoutConsumingRow) {
   SpillFile spill;
   const Row expected({Value(42)});
@@ -73,7 +110,8 @@ TEST(SpillFileTest, FinishWriting_OnEmptySpill_HasZeroRows) {
   ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_TRUE(spill.Empty());
   EXPECT_EQ(spill.Count(), 0U);
-  EXPECT_TRUE(spill.ReadAllRows().Value().empty());
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, rows, spill.ReadAllRows());
+  EXPECT_TRUE(rows.empty());
 }
 
 TEST(SpillFileTest, Append_PositionedRow_ReadsPositionedRowCorrectly) {
@@ -133,6 +171,32 @@ TEST(SpillFileTest, ForEachPositionedStopsAtCallbackFailure) {
   EXPECT_EQ(calls, 1);
 }
 
+TEST(SpillFileTest, StreamStopsAtStatusLikeCallbackFailure) {
+  SpillFile rows;
+  ASSERT_SUCCESS(rows.Append(Row({Value(7)})));
+  ASSERT_SUCCESS(rows.Append(Row({Value(8)})));
+  int row_calls = 0;
+  const Status row_status = rows.ForEachRow([&](const Row&) -> StatusOr<int> {
+    ++row_calls;
+    return StatusError(StatusCode::kInvalidArgument, "row callback");
+  });
+  EXPECT_EQ(row_status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(row_status.GetMessage(), "row callback");
+  EXPECT_EQ(row_calls, 1);
+
+  SpillFile positioned;
+  ASSERT_SUCCESS(positioned.Append(Row({Value(7)}), RowPosition(0, 0)));
+  ASSERT_SUCCESS(positioned.Append(Row({Value(8)}), RowPosition(0, 1)));
+  int positioned_calls = 0;
+  const Status positioned_status =
+      positioned.ForEachPositioned([&](const Row&, const RowPosition&) {
+        ++positioned_calls;
+        return StatusCode::kInvalidArgument;
+      });
+  EXPECT_EQ(positioned_status.GetCode(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(positioned_calls, 1);
+}
+
 TEST(SpillFileTest, ReadAllRows_WithoutFinishWriting_AutoFinishesAndReads) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(7), Value("x")})));
@@ -158,7 +222,7 @@ TEST(SpillFileTest,
   EXPECT_EQ(positioned[1].second, RowPosition(4, 8));
 }
 
-TEST(SpillFileTest, Append_AfterFinishWriting_ThrowsRuntimeError) {
+TEST(SpillFileTest, Append_AfterFinishWriting_ReturnsError) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
   ASSERT_SUCCESS(spill.FinishWriting());
@@ -180,14 +244,14 @@ TEST(SpillFileTest, Append_PlainAfterPositioned_ThrowsRuntimeError) {
   EXPECT_NE(spill.Append(Row({Value(2)})), Status::kSuccess);
 }
 
-TEST(SpillFileTest, ReadAllRows_OnPositionedSpill_ThrowsRuntimeError) {
+TEST(SpillFileTest, ReadAllRows_OnPositionedSpill_ReturnsError) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(1)}), RowPosition(1, 2)));
   ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_FALSE(spill.ReadAllRows().HasValue());
 }
 
-TEST(SpillFileTest, ReadAllPositioned_OnRowOnlySpill_ThrowsRuntimeError) {
+TEST(SpillFileTest, ReadAllPositioned_OnRowOnlySpill_ReturnsError) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
   ASSERT_SUCCESS(spill.FinishWriting());
@@ -207,8 +271,11 @@ TEST(SpillFileTest, ForEachRow_OnEmptySpill_IsNoOp) {
   int calls = 0;
   ASSERT_SUCCESS(spill.ForEachRow([&](const Row&) { ++calls; }));
   EXPECT_EQ(calls, 0);
-  EXPECT_TRUE(spill.ReadAllPositioned().Value().empty());
-  EXPECT_TRUE(spill.ReadAllRows().Value().empty());
+  auto positioned = spill.ReadAllPositioned();
+  ASSERT_TRUE(positioned.HasValue());
+  EXPECT_TRUE(positioned.Value().empty());
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, rows, spill.ReadAllRows());
+  EXPECT_TRUE(rows.empty());
 }
 
 TEST(SpillFileTest, FinishWriting_CalledMultipleTimes_IsIdempotent) {
@@ -273,7 +340,7 @@ TEST(SpillFileTest, MoveAssignment_ToExistingSpillFile_DeletesOldTargetFile) {
       // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
       a.Empty());
   EXPECT_EQ(b.Count(), 1U);
-  auto rows = b.ReadAllRows().Value();
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, rows, b.ReadAllRows());
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(10)}));
 }
@@ -307,37 +374,52 @@ TEST(SpillFileTest, Destructor_WhenSpillFileDestroyed_RemovesUnderlyingFile) {
 }
 
 TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
+  // A per-test random directory keeps ctest -j runs (and reruns) from
+  // colliding on the same path.  The guard restores TINYLAMB_TEMP and removes
+  // the directory even when an ASSERT below returns early: both are
+  // process-global state that must not leak into other tests.
   const std::filesystem::path tmp =
-      std::filesystem::temp_directory_path() / "tinylamb_spill_test_env";
-  const char* previous_temp = std::getenv("TINYLAMB_TEMP");
-  const std::string saved_temp = previous_temp != nullptr ? previous_temp : "";
-  std::error_code ec;
-  std::filesystem::remove_all(tmp, ec);
-  std::filesystem::create_directories(tmp, ec);
-  ASSERT_FALSE(ec) << ec.message();
-  setenv("TINYLAMB_TEMP", tmp.c_str(), 1);
-  EXPECT_EQ(SpillFile::TempDirectory(), tmp);
+      std::filesystem::temp_directory_path() /
+      ("tinylamb_spill_test_env_" + RandomString());
   {
-    SpillFile spill;
-    ASSERT_SUCCESS(spill.Append(Row({Value(42)})));
-    ASSERT_SUCCESS(spill.FinishWriting());
-    EXPECT_EQ(spill.Path().parent_path(), tmp);
-    EXPECT_TRUE(std::filesystem::exists(spill.Path()));
+    const char* previous_temp = std::getenv("TINYLAMB_TEMP");
+    const std::string saved_temp = previous_temp != nullptr ? previous_temp : "";
+    struct TempEnvGuard {
+      std::filesystem::path dir;
+      bool had_value;
+      std::string saved;
+      ~TempEnvGuard() {
+        if (had_value) {
+          setenv("TINYLAMB_TEMP", saved.c_str(), 1);
+        } else {
+          unsetenv("TINYLAMB_TEMP");
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+      }
+    } env_guard{.dir=tmp, .had_value=previous_temp != nullptr, .saved=saved_temp};
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::create_directories(tmp, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    setenv("TINYLAMB_TEMP", tmp.c_str(), 1);
+    EXPECT_EQ(SpillFile::TempDirectory(), tmp);
+    {
+      SpillFile spill;
+      ASSERT_SUCCESS(spill.Append(Row({Value(42)})));
+      ASSERT_SUCCESS(spill.FinishWriting());
+      EXPECT_EQ(spill.Path().parent_path(), tmp);
+      EXPECT_TRUE(std::filesystem::exists(spill.Path()));
+    }
   }
-  if (previous_temp != nullptr) {
-    setenv("TINYLAMB_TEMP", saved_temp.c_str(), 1);
-  } else {
-    unsetenv("TINYLAMB_TEMP");
-  }
-  std::filesystem::remove_all(tmp, ec);
   EXPECT_FALSE(std::filesystem::exists(tmp));
 }
 
-TEST(SpillFileTest, ReadAllRows_WhenFileDeleted_ThrowsRuntimeError) {
+TEST(SpillFileTest, ReadAllRows_WhenFileDeleted_ReturnsError) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(1)})));
   ASSERT_SUCCESS(spill.FinishWriting());
-  std::filesystem::remove(spill.Path());
+  EXPECT_TRUE(std::filesystem::remove(spill.Path()));
   EXPECT_FALSE(spill.ReadAllRows().HasValue());
 }
 
@@ -351,7 +433,14 @@ TEST(SpillFileTest, RowReaderStreamsRowsAndTracksFileBytes) {
   ASSERT_SUCCESS(spill.FinishWriting());
   EXPECT_GT(spill.FileBytes(), 0ULL);
 
+  ASSIGN_OR_ASSERT_FAIL(SpillFile::RowReader, original, spill.OpenRowReader());
+  SpillFile::RowReader moved(std::move(original));
+  EXPECT_FALSE(original.IsOpen());
+  EXPECT_EQ(original.Remaining(), 0U);
   ASSIGN_OR_ASSERT_FAIL(SpillFile::RowReader, reader, spill.OpenRowReader());
+  reader = std::move(moved);
+  EXPECT_FALSE(moved.IsOpen());
+  EXPECT_EQ(moved.Remaining(), 0U);
   EXPECT_TRUE(reader.IsOpen());
   EXPECT_EQ(reader.Remaining(), static_cast<uint64_t>(kRows));
   int64_t expected = 0;
@@ -376,42 +465,48 @@ TEST(SpillFileTest, RowReaderStreamsRowsAndTracksFileBytes) {
 // "spill write failed: <path>" text with no cause.  The status now embeds
 // errno and maps space exhaustion to kNoSpace with an actionable hint.
 TEST(SpillFileTest, WriteCapacityFailureReportsErrnoOrNoSpace) {
-  struct RlimitGuard {
-    rlimit old{};
-    RlimitGuard() = default;
-    RlimitGuard(const RlimitGuard&) = delete;
-    RlimitGuard& operator=(const RlimitGuard&) = delete;
-    RlimitGuard(RlimitGuard&&) = delete;
-    RlimitGuard& operator=(RlimitGuard&&) = delete;
-    ~RlimitGuard() { (void)setrlimit(RLIMIT_FSIZE, &old); }
-  } guard;
-  ASSERT_EQ(getrlimit(RLIMIT_FSIZE, &guard.old), 0);
-  rlimit lim = guard.old;
-  lim.rlim_cur = std::min<rlim_t>(1 << 20, lim.rlim_max);
-  ASSERT_EQ(setrlimit(RLIMIT_FSIZE, &lim), 0);
-  // Without this, the first write past the cap raises SIGXFSZ and the
-  // default disposition kills the process before errno can be observed;
-  // ignoring it makes write(2) fail with EFBIG, exactly like a full disk.
-  void (*previous_xfsz)(int) = std::signal(SIGXFSZ, SIG_IGN);
-  struct SignalGuard {
-    void (*previous)(int);
-    explicit SignalGuard(void (*handler)(int)) : previous(handler) {}
-    SignalGuard(const SignalGuard&) = delete;
-    SignalGuard& operator=(const SignalGuard&) = delete;
-    SignalGuard(SignalGuard&&) = delete;
-    SignalGuard& operator=(SignalGuard&&) = delete;
-    ~SignalGuard() { (void)std::signal(SIGXFSZ, previous); }
-  } signal_guard{previous_xfsz};
-
-  SpillFile spill;
-  const std::string blob(4096, 'x');
+  // RLIMIT_FSIZE and the SIGXFSZ disposition are process-global. gtest runs
+  // the cases of this binary sequentially; keep both changes inside a small
+  // scope so the guards restore them before the status assertions, and no
+  // other case observes the 1 MiB cap or the ignored signal.
   Status failure = Status::kSuccess;
   bool failed = false;
-  for (int i = 0; i < 4096 && !failed; ++i) {
-    failure = spill.Append(Row({Value(i), Value(std::string(blob))}));
-    failed = failure != Status::kSuccess;
-  }
-  ASSERT_TRUE(failed) << "RLIMIT_FSIZE cap never tripped";
+  {
+    struct RlimitGuard {
+      rlimit old{};
+      RlimitGuard() = default;
+      RlimitGuard(const RlimitGuard&) = delete;
+      RlimitGuard& operator=(const RlimitGuard&) = delete;
+      RlimitGuard(RlimitGuard&&) = delete;
+      RlimitGuard& operator=(RlimitGuard&&) = delete;
+      ~RlimitGuard() { (void)setrlimit(RLIMIT_FSIZE, &old); }
+    } guard;
+    ASSERT_EQ(getrlimit(RLIMIT_FSIZE, &guard.old), 0);
+    rlimit lim = guard.old;
+    lim.rlim_cur = std::min<rlim_t>(1 << 20, lim.rlim_max);
+    ASSERT_EQ(setrlimit(RLIMIT_FSIZE, &lim), 0);
+    // Without this, the first write past the cap raises SIGXFSZ and the
+    // default disposition kills the process before errno can be observed;
+    // ignoring it makes write(2) fail with EFBIG, exactly like a full disk.
+    void (*previous_xfsz)(int) = std::signal(SIGXFSZ, SIG_IGN);
+    struct SignalGuard {
+      void (*previous)(int);
+      explicit SignalGuard(void (*handler)(int)) : previous(handler) {}
+      SignalGuard(const SignalGuard&) = delete;
+      SignalGuard& operator=(const SignalGuard&) = delete;
+      SignalGuard(SignalGuard&&) = delete;
+      SignalGuard& operator=(SignalGuard&&) = delete;
+      ~SignalGuard() { (void)std::signal(SIGXFSZ, previous); }
+    } signal_guard{previous_xfsz};
+
+    SpillFile spill;
+    const std::string blob(4096, 'x');
+    for (int i = 0; i < 4096 && !failed; ++i) {
+      failure = spill.Append(Row({Value(i), Value(std::string(blob))}));
+      failed = failure != Status::kSuccess;
+    }
+    ASSERT_TRUE(failed) << "RLIMIT_FSIZE cap never tripped";
+  }  // rlimit and SIGXFSZ restored here
   const std::string text = ToString(failure);
   EXPECT_TRUE(failure.GetCode() == StatusCode::kNoSpace ||
               failure.GetCode() == StatusCode::kIOError)

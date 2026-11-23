@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 // P0 empirical footprint & baseline measurement tool (ooca-v2.md §6 P0).
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -29,6 +30,15 @@ using namespace tinylamb;
 double ToMiB(uint64_t bytes) {
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
+
+struct DatabaseCleanup {
+  Database* db;
+  ~DatabaseCleanup() {
+    if (db != nullptr) {
+      db->DeleteAll();
+    }
+  }
+};
 
 void PrintSizeRow(const char* name, size_t bytes_per_unit, uint64_t units_1tb,
                   const char* note) {
@@ -95,6 +105,7 @@ int main() {
       return 1;
     }
     std::unique_ptr<Database> db = db_or.MoveValue();
+    DatabaseCleanup cleanup{db.get()};
     std::cout << "After Database::Create: RSS="
               << ToMiB(platform::CurrentProcessRssBytes())
               << " MiB, tracked=" << ToMiB(mem.TotalUsed())
@@ -103,6 +114,13 @@ int main() {
     TransactionContext ctx = db->BeginContext();
     SqlEngine engine(*db);
 
+    auto commit = [&](std::string_view operation) {
+      const Status status = ctx.PreCommit();
+      if (!status.ok()) {
+        std::cerr << operation << " commit failed: " << status << '\n';
+      }
+      return status.ok();
+    };
     auto run_sql = [&](std::string_view sql) -> uint64_t {
       auto res = engine.Execute(ctx, sql);
       if (!res.HasValue()) {
@@ -112,13 +130,19 @@ int main() {
       }
       QueryResult qr = res.MoveValue();
       const size_t n = qr.Drain();
+      if (const Status status = qr.GetStatus(); !status.ok()) {
+        std::cerr << "SQL failed (" << sql << "): " << status << '\n';
+        std::exit(1);
+      }
       return n;
     };
 
     run_sql(
         "CREATE TABLE t(k INT64, g INT64, v1 INT64, v2 FLOAT64, s "
         "STRING(MAX))");
-    (void)ctx.PreCommit();
+    if (!commit("CREATE TABLE")) {
+      return 1;
+    }
     ctx = db->BeginContext();
     std::cout << "After CREATE TABLE: RSS="
               << ToMiB(platform::CurrentProcessRssBytes())
@@ -129,7 +153,7 @@ int main() {
     // Load 50,000 rows in batches to measure storage + query + RSS delta.
     for (int b = 0; b < 50; ++b) {
       std::string ins = "INSERT INTO t VALUES ";
-      ins.reserve(1000);
+      ins.reserve(static_cast<size_type>(1000 * 80));
       for (int i = 0; i < 1000; ++i) {
         const int64_t id = (static_cast<int64_t>(b) * 1000) + i;
         if (i > 0) {
@@ -142,7 +166,9 @@ int main() {
       }
       run_sql(ins);
     }
-    (void)ctx.PreCommit();
+    if (!commit("data load")) {
+      return 1;
+    }
     ctx = db->BeginContext();
 
     const uint64_t rss_after_load = platform::CurrentProcessRssBytes();
@@ -164,6 +190,10 @@ int main() {
       QueryResult qr = ea.MoveValue();
       Row row;
       while (qr.Next(&row)) {
+        if (row.Count() == 0) {
+          std::cerr << "WARNING: EXPLAIN ANALYZE returned a zero-column row\n";
+          continue;
+        }
         std::cout << row[0].AsString() << "\n";
       }
     } else {
@@ -190,7 +220,9 @@ int main() {
                 << ", RSS=" << ToMiB(rss_after_evict) << " MiB\n";
     }
 
-    (void)ctx.PreCommit();
+    if (!commit("measurement")) {
+      return 1;
+    }
     if (pm != nullptr) {
       const size_t before_res = pm->ResidentBytes();
       const Status evict_st = pm->EvictColdPagesForTest(0);
@@ -202,7 +234,6 @@ int main() {
                 << " MiB, EvictedPageCount=" << pm->EvictedPageCount()
                 << ", RSS=" << ToMiB(rss_after_evict) << " MiB\n";
     }
-    db->DeleteAll();
   }
   return 0;
 }

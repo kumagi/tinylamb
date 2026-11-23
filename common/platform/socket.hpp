@@ -73,23 +73,29 @@ namespace tinylamb::platform {
 //
 // On POSIX this is the usual small, non-negative `int` file descriptor (-1 on
 // error). On Windows a Winsock `SOCKET` is a `UINT_PTR` (64 bits on Win64), so
-// it cannot be narrowed to `int` without losing the upper bits. Use a *signed*
-// pointer-sized type there: it holds the full handle bit-for-bit, keeps the
-// `fd < 0` error checks working (INVALID_SOCKET is all-ones == -1), and avoids
-// collisions/truncation. Callers should store this type rather than `int`.
+// it must be stored without narrowing. The signed representation preserves
+// all bits, including the sign bit, which may be set on a valid socket.
 #ifdef TINYLAMB_OS_WINDOWS
 using SocketFd = std::intptr_t;
 #else
 using SocketFd = int;
 #endif
 
+inline constexpr SocketFd kInvalidSocketFd = -1;
+
+[[nodiscard]] constexpr bool IsValidSocketFd(SocketFd fd) noexcept {
+#ifdef TINYLAMB_OS_WINDOWS
+  return fd != kInvalidSocketFd;
+#else
+  return fd >= 0;
+#endif
+}
+
 // Descriptor flags applied at creation time. Linux sets them atomically
 // (SOCK_NONBLOCK/SOCK_CLOEXEC, accept4, pipe2). macOS has no such flags and
 // applies them with fcntl right after creation; the close-on-exec race this
-// opens against a concurrent fork/exec is closed only for children spawned
-// with InitSpawnAttributes (POSIX_SPAWN_CLOEXEC_DEFAULT) -- RunProcess does
-// not pass spawn attributes, so on macOS a descriptor created non-CLOEXEC
-// can still leak into a RunProcess child during the fcntl window.
+// opens against a concurrent fork/exec is closed for children spawned with
+// InitSpawnAttributes (POSIX_SPAWN_CLOEXEC_DEFAULT).
 struct FdFlags {
   bool nonblocking{false};
   bool close_on_exec{true};

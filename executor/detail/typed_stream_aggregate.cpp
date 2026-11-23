@@ -602,7 +602,7 @@ struct CompiledLSTableBlockFilter {
         Scratch::ActiveBranchSlice slice{
             // NOLINT(modernize-use-designated-initializers)
             // NOLINT(modernize-use-designated-initializers)
-            p_begin, p_end};  // NOLINT(modernize-use-designated-initializers)
+            .pred_begin=p_begin, .pred_end=p_end};  // NOLINT(modernize-use-designated-initializers)
         // BETWEEN branches otherwise dispatch two generic comparisons and
         // load the same cell/null flag twice for each surviving row.
         if (p_end == p_begin + 2) {
@@ -1205,7 +1205,7 @@ inline bool EvalDirectDoubleExpr(const TypedDoubleExprInput& expr,
 inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
                               const std::vector<slot_t>& proj_to_full,
                               const std::vector<DirectBlockCol>& cols,
-                              uint32_t r, int64_t* out, Status* err) noexcept {
+                              uint32_t r, int64_t* out, Status* err) {
   std::array<int64_t, 16> stack{};
   size_t sp = 0;
   // Producers cap ops at 16 entries so pushes can never exceed the stack;
@@ -4312,11 +4312,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       (direct_lstable_store != nullptr &&
        direct_lstable_store->total_rows > 16384) ||
       table.BackingColumnarRowCount() > 16384;
+  bool same_query_reuse = false;
   if (reusable && runtime != nullptr && stream_runtime_filter == nullptr) {
     fold_cache_key = BaseRelationCacheKey(
         table_name, projection.empty() ? nullptr : &projection);
     auto found = runtime->base_relations.find(fold_cache_key);
     if (found != runtime->base_relations.end()) {
+      same_query_reuse = true;
       cached_relation = found->second;
       ++runtime->base_scan_cache_hits;
       if (cached_relation != nullptr && cached_relation->rows.empty() &&
@@ -4333,6 +4335,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     fold_cache_key = BaseRelationCacheKey(
         table_name, projection.empty() ? nullptr : &projection);
     if (runtime->base_relations.contains(fold_cache_key)) {
+      same_query_reuse = true;
       ++runtime->base_scan_cache_hits;
     }
   }
@@ -4347,10 +4350,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // When no resident LSTableStore covers this projection yet, try streaming
   // compressed TlcsFile blocks directly first so large TLCS-backed tables do
   // not pay multi-GB lazy LSTableStore deserialization before reaching the
-  // zero-copy columnar kernel.
+  // zero-copy columnar kernel. If the same query re-scans the same table
+  // projection (e.g. TPC-DS Q09's 10 subqueries on store_sales), populate the
+  // per-column cache on the second pass so subsequent scans stay in RAM.
   bool tried_columnar_tlcs = false;
   if (direct_lstable_store == nullptr && cached_relation == nullptr &&
-      !fill_cache && stream_runtime_filter == nullptr &&
+      !fill_cache && !same_query_reuse && stream_runtime_filter == nullptr &&
       stream_prebuilt_membership == nullptr) {
     tried_columnar_tlcs = true;
     ASSIGN_OR_RETURN(
@@ -5499,6 +5504,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     size_t scanned{0};
     size_t emitted{0};
     size_t updates{0};
+    size_t dictionary_rows{0};
   };
   std::vector<WorkerCounters> counters(worker_count);
   std::vector<size_t> reclaimed_groups(worker_count, 0);
@@ -7048,6 +7054,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             counters[worker].scanned += nrows;
             counters[worker].emitted += nrows;
             counters[worker].updates += nrows;
+            if (use_val_dict) {
+              counters[worker].dictionary_rows += nrows;
+            }
             const bool can_fast_having =
                 having_expr != nullptr && positional_having.size() == 1 &&
                 positional_having[0].agg_index == 0 &&
@@ -9378,6 +9387,17 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   for (const Status& error : worker_errors) {
     if (error != Status::kSuccess) {
       return error;
+    }
+  }
+  if (runtime != nullptr) {
+    const size_t dictionary_rows =
+        std::accumulate(counters.begin(), counters.end(), size_t{0},
+                        [](size_t total, const WorkerCounters& worker) {
+                          return total + worker.dictionary_rows;
+                        });
+    if (dictionary_rows != 0) {
+      ++runtime->dictionary_aggregations;
+      runtime->dictionary_aggregate_rows += dictionary_rows;
     }
   }
 

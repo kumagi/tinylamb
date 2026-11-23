@@ -76,7 +76,7 @@ DSL パターンとしては `Is(TypeTag::kCastExp)` のみで広く捕捉し、
 
 ## 関連 Rule との相互作用
 
-- `numeric_widening_cast`: 数値型の暗黙の拡大キャストを整理するルール群と連携し、CAST 式の規準化を推進します。
+- `numeric_widening_cast`: 同一型・同一 SAFE_CAST 条件でのネスト解消を定数 CAST の畳み込みと組み合わせて扱います。暗黙の数値拡大とは連携しません。
 - `cast_pushdown_on_comparison`: 単一化された CAST 式を比較演算子の対向側へ押し込む論理 Rule です。
 - `fold_unary`: 被演算子が定数の場合、CAST 全体が事前にスカラー値へ畳み込まれるため、本 Rule は主に列参照や動的式を含む木に対して機能します。
 

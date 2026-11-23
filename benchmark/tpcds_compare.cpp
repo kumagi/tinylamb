@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/json_string.hpp"
 #include "common/query_parallelism.hpp"
 #include "database/database.hpp"
 #include "query/sql_engine.hpp"
@@ -29,23 +30,23 @@ namespace {
 using namespace tinylamb;
 
 std::string Json(std::string_view text) {
-  std::string out = "\"";
-  out.reserve(text.size() * 6 + 2);
-  constexpr std::string_view hex = "0123456789abcdef";
-  for (const char raw_c : text) {
-    const auto c = static_cast<unsigned char>(raw_c);
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += raw_c;
-    } else if (c < 32) {
-      out += "\\u00";
-      out += hex[static_cast<size_t>(c >> 4U)];
-      out += hex[static_cast<size_t>(c & 15U)];
-    } else {
-      out += raw_c;
-    }
-  }
-  return out + '"';
+  return json_text::EncodeJsonString(text);
+}
+
+bool DatabaseFilesExist(const std::filesystem::path& base) {
+  return std::filesystem::exists(base.string() + ".db") ||
+         std::filesystem::exists(base.string() + ".log") ||
+         std::filesystem::exists(base.string() + ".log.meta") ||
+         std::filesystem::exists(base.string() + ".last_checkpoint");
+}
+
+void RemoveDatabaseFiles(const std::filesystem::path& base) {
+  std::error_code ignored;
+  std::filesystem::remove(base.string() + ".db", ignored);
+  std::filesystem::remove(base.string() + ".log", ignored);
+  std::filesystem::remove(base.string() + ".log.meta", ignored);
+  std::filesystem::remove(base.string() + ".log.meta.tmp", ignored);
+  std::filesystem::remove(base.string() + ".last_checkpoint", ignored);
 }
 
 void SplitInto(std::string_view line, std::vector<std::string_view>& fields) {
@@ -261,11 +262,13 @@ void Query(Database& db, std::string_view sql, bool profile) {
   if (profile) {
     result.Value().Dump(std::cerr, 0);
   }
-  std::cout << "{\"ms\":" << std::setprecision(17) << ms << ",\"prepare_ms\":"
-            << static_cast<double>(SqlEngine::ThreadRuntimeStats().prepare_ns -
-                                   before.prepare_ns) /
-                   1e6
-            << ",\"rows\":[";
+  const uint64_t prepare_ns = SqlEngine::ThreadRuntimeStats().prepare_ns;
+  const double prepare_ms =
+      prepare_ns >= before.prepare_ns
+          ? static_cast<double>(prepare_ns - before.prepare_ns) / 1e6
+          : 0.0;
+  std::cout << "{\"ms\":" << std::setprecision(17) << ms
+            << ",\"prepare_ms\":" << prepare_ms << ",\"rows\":[";
   bool first_row = true;
   for (const auto& row : rows) {
     if (!first_row) {
@@ -307,10 +310,9 @@ int main(int argc, char** argv) {
     // engine's GoogleSQL-compatible default or the host's TZ environment.
     tinylamb::SetDefaultTimeZone("UTC");
     const bool loading = mode == "--load" || mode == "--load-compact";
-    const bool load_compact = loading;
     const bool compacting = mode == "--compact";
     const bool compacting_all = mode == "--compact-all";
-    const bool exists = std::filesystem::exists(std::string(argv[1]) + ".db");
+    const bool exists = DatabaseFilesExist(argv[1]);
     if (loading == exists) {
       throw std::runtime_error(loading ? "database already exists"
                                        : "database missing");
@@ -321,7 +323,13 @@ int main(int argc, char** argv) {
     }
     auto& db = *opened.Value();
     if (loading) {
-      Load(db, argv[3], load_compact);
+      try {
+        Load(db, argv[3], /*compact_after=*/mode == "--load-compact");
+      } catch (...) {
+        opened.Value().reset();
+        RemoveDatabaseFiles(argv[1]);
+        throw;
+      }
     } else if (compacting) {
       auto ctx = db.BeginContext();
       Check(db.CompactTableToTlcs(ctx, argv[3]));

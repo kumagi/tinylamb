@@ -40,7 +40,7 @@ graph TD
 
 2. **同一引数を持つ多引数関数経路**: `GetFunctionVolatility` が `kImmutable` であり、引数を 2 個以上持つ関数呼び出しを対象とします。
    - `coalesce` / `greatest` / `least`: 全引数が第 1 引数と `Same` かつ `SafeToReduceEvaluationCount`（揮発性関数やサブクエリを含まない）を満たす場合、第 1 引数そのものへ置き換えます。
-   - `ifnull(a, a)`: 2 つの引数が `Same` であれば `a` へ置き換えます。
+   - `ifnull(a, a)`: 2 つの引数が `Same` であり、`SafeToReduceEvaluationCount(a)` を満たす場合に `a` へ置き換えます。
    - `nullif(a, a)`: 第 1 引数が定数リテラルの場合は本 Rule では扱わず定数畳み込みに委ね、それ以外で以下の guard をすべて満たす場合にのみ NULL 定数へ畳み込みます。
 
    ```cpp

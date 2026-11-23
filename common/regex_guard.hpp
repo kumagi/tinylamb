@@ -18,9 +18,11 @@
 #define TINYLAMB_REGEX_GUARD_HPP
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
 #include <optional>
 #if defined(__GNUC__) && !defined(__clang__)
@@ -209,14 +211,14 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
   bool pending_ambiguous = false;
   bool elem_quantified = false;  // trailing '?' is a laziness modifier
 
-  bool fixed_length_overflow = false;
   const auto flush = [&] {
     if (!groups.empty()) {
       Frame& f = groups.back();
       if (f.cur_len == kVar || pending_len == kVar) {
         f.cur_len = kVar;
       } else if (__builtin_add_overflow(f.cur_len, pending_len, &f.cur_len)) {
-        fixed_length_overflow = true;
+        // An unrepresentable fixed length is just an unknown-length operand;
+        // it is not a nested-repetition (ReDoS) hazard on its own.
         f.cur_len = kVar;
       }
       if (!f.first_done) {
@@ -517,15 +519,18 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
     if (!exact || pending_len == kVar) {
       pending_len = kVar;
     } else if (__builtin_mul_overflow(pending_len, repeat, &pending_len)) {
-      // A fixed length that cannot be represented is unsafe to compile.
-      return true;
+      // Huge *bounded* repetitions are slow but not ReDoS. Treat the length
+      // as unknown instead of rejecting the pattern as "nested repetition";
+      // an actually unbounded quantifier around it is still caught by the
+      // pending_var check above.
+      pending_len = kVar;
     }
     pending_var = (pending_len == kVar);
     pending_nullable = can_be_empty || pending_nullable;
     elem_quantified = true;
     i += len;
   }
-  return fixed_length_overflow;
+  return false;
 }
 
 // Compile `pattern` after the nested-repetition check above; callers get a
@@ -549,6 +554,10 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
   try {
     for (const auto& entry : cache) {
       if (entry && entry->pattern == pattern) {
+        // std::regex is a handle type (libstdc++/libc++ store the NFA behind a
+        // shared_ptr), so this value return shares the cached program rather
+        // than recompiling or deep-copying it. The StatusOr-by-value API is
+        // intentional; keep it so callers own the compiled program.
         return entry->compiled;
       }
     }
@@ -583,9 +592,20 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
     // is a resource failure, not the user's regex being invalid.
     return StatusError(StatusCode::kMemoryLimitExceeded,
                        "regular expression compilation ran out of memory");
-  } catch (...) {
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kTooBigData,
+                       "regular expression is too large to compile");
+  } catch (const std::regex_error& error) {
+    if (error.code() == std::regex_constants::error_complexity ||
+        error.code() == std::regex_constants::error_stack) {
+      return StatusError(StatusCode::kRuntimeError,
+                         "regular expression compilation exceeded engine limits");
+    }
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid regular expression: " + pattern);
+  } catch (...) {
+    return StatusError(StatusCode::kRuntimeError,
+                       "regular expression compilation failed unexpectedly");
   }
 }
 }  // namespace regex_guard_detail
@@ -597,6 +617,35 @@ inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
                           // consumed immediately by std::regex
       }>(pattern);
 }
+
+// Runtime toggle for benchmarking / regression verification of fast regex
+// search. Lean proofs:
+//   - lean/TinylambOpt/RegexMandatoryLiteral.lean (mandatory_search_sound)
+//   - lean/TinylambOpt/RegexBitsetNfa.lean +
+//     lean/TinylambOpt/ThompsonSearch.lean (compiled_search_iff)
+inline std::atomic<bool>& FastRegexDisabledFlag() noexcept {
+  static std::atomic<bool> flag = [] {
+    const char* env = std::getenv("TINYLAMB_DISABLE_FAST_REGEX");
+    return env != nullptr && env[0] == '1';
+  }();
+  return flag;
+}
+
+inline void SetFastRegexDisabledForTest(bool disabled) noexcept {
+  FastRegexDisabledFlag().store(disabled, std::memory_order_relaxed);
+}
+
+inline void ReloadFastRegexDisabledFromEnv() noexcept {
+  const char* env = std::getenv("TINYLAMB_DISABLE_FAST_REGEX");
+  FastRegexDisabledFlag().store(env != nullptr && env[0] == '1',
+                                std::memory_order_relaxed);
+}
+
+// Existence regex search (`REGEXP_CONTAINS`), accelerating validated patterns
+// with conservative mandatory-literal prefiltering and <=64-state bitset
+// Thompson NFA search on pure-ASCII inputs before falling back to std::regex.
+StatusOr<bool> CheckedRegexContains(std::string_view input,
+                                    std::string_view pattern);
 
 // Find a non-overlapping occurrence and report its one-based position. With
 // one capturing group, the position refers to that group's span.

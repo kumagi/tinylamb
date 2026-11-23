@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -38,15 +40,35 @@ constexpr const SchemeCase* const kCases = kSchemeCases.data();
 constexpr size_t kCaseCount = kSchemeCaseCount;
 
 // RAII so a throwing build (e.g. bad_alloc) cannot leave a stale scheme name
-// in the process environment for later iterations or other harnesses.
+// in the process environment for later iterations or other harnesses. The
+// previous value is saved and restored on exit, matching ScopedForceScheme in
+// pax_storage_fuzzer_test.cpp: an externally set scheme must survive this
+// harness. The harness is single-threaded; the process environment is
+// deliberately global here, so the getenv/setenv/unsetenv calls carry
+// NOLINT(concurrency-mt-unsafe) annotations.
 class ScopedForcedScheme {
  public:
   explicit ScopedForcedScheme(const char* name) {
-    setenv("TINYLAMB_FORCE_SCHEME", name, 1);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    const char* prev = std::getenv("TINYLAMB_FORCE_SCHEME");
+    if (prev != nullptr) {
+      previous_ = prev;
+    }
+    setenv("TINYLAMB_FORCE_SCHEME", name, 1);  // NOLINT(concurrency-mt-unsafe)
   }
-  ~ScopedForcedScheme() { unsetenv("TINYLAMB_FORCE_SCHEME"); }
+  ~ScopedForcedScheme() {
+    if (previous_) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
+      setenv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
+    }
+  }
   ScopedForcedScheme(const ScopedForcedScheme&) = delete;
   ScopedForcedScheme& operator=(const ScopedForcedScheme&) = delete;
+
+ private:
+  std::optional<std::string> previous_;
 };
 
 PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
@@ -63,7 +85,8 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
             sc)
             .MoveValue();
     const auto& enc = chunk.GetFooter().encodings;
-    if (!enc.empty() && enc[c.col] == static_cast<uint8_t>(c.expected)) {
+    if (c.col < enc.size() &&
+        enc[c.col] == static_cast<uint8_t>(c.expected)) {
       *ok = true;
       return chunk;
     }

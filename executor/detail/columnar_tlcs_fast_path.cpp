@@ -496,6 +496,9 @@ bool CompilePredicatesFromExpressions(
     }
     if (dbg_pred) {
       std::string extra;
+      // The static_cast<int> values below are small enum tags (operator and
+      // type enums) used only in this debug string, not size/offset values;
+      // converting them to int cannot narrow away any information.
       if (predicate->Type() == TypeTag::kBinaryExp) {
         const auto& b = predicate->AsBinaryExpression();
         extra = " lop=" + std::to_string(static_cast<int>(b.Op())) +
@@ -1315,22 +1318,22 @@ void RunFastNumericPred(const FastNumericPred& p, uint32_t rc, bool is_first,
       const double hi = p.dbl_hi;
       if (p.lo_inclusive && p.hi_inclusive) {
         dispatch([cells, lo, hi](uint32_t r) noexcept {
-          const double v = std::bit_cast<double>(cells[r]);
+          const auto v = std::bit_cast<double>(cells[r]);
           return v >= lo && v <= hi;
         });
       } else if (p.lo_inclusive && !p.hi_inclusive) {
         dispatch([cells, lo, hi](uint32_t r) noexcept {
-          const double v = std::bit_cast<double>(cells[r]);
+          const auto v = std::bit_cast<double>(cells[r]);
           return v >= lo && v < hi;
         });
       } else if (!p.lo_inclusive && p.hi_inclusive) {
         dispatch([cells, lo, hi](uint32_t r) noexcept {
-          const double v = std::bit_cast<double>(cells[r]);
+          const auto v = std::bit_cast<double>(cells[r]);
           return v > lo && v <= hi;
         });
       } else {
         dispatch([cells, lo, hi](uint32_t r) noexcept {
-          const double v = std::bit_cast<double>(cells[r]);
+          const auto v = std::bit_cast<double>(cells[r]);
           return v > lo && v < hi;
         });
       }
@@ -1342,7 +1345,7 @@ void RunFastNumericPred(const FastNumericPred& p, uint32_t rc, bool is_first,
 bool TryFilterBlockNumericColumnAtATime(
     const ColumnarPredicateSet& preds,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
-    uint32_t rc, std::vector<uint32_t>* cand_rows) noexcept {
+    uint32_t rc, std::vector<uint32_t>* cand_rows) {
   if (!preds.nulls.empty() || !preds.inlists.empty() ||
       preds.compares.empty() || preds.compares.size() > 16) {
     return false;
@@ -1869,7 +1872,7 @@ bool TryFoldBlockDenseGroupsFastAggs(
     double* dst = g_sum[a].data();
     const int64_t* c0 = p0[a];
     if (paired >= 0) {
-      const size_t b = static_cast<size_t>(paired);
+      const auto b = static_cast<size_t>(paired);
       double* dst_b = g_sum[b].data();
       const int64_t* c1 = p1[a];
       const int64_t* c2 = p2[b];
@@ -1925,7 +1928,7 @@ bool TryFoldBlockDenseGroupsFastAggs(
           }
         }
         if (same_col_dup >= 0) {
-          const size_t b = static_cast<size_t>(same_col_dup);
+          const auto b = static_cast<size_t>(same_col_dup);
           std::copy(dst, dst + num_groups, g_sum[b].data());
           done[b] = true;
         }
@@ -2563,8 +2566,8 @@ Status WorkerGroupTable::ReserveGroupStorage(size_t groups) {
   size_t key_capacity = 0;
   size_t agg_capacity = 0;
   size_t bytes = 0;
-  const size_t bytes_per_group = nkeys * sizeof(RuntimeKeyCell) +
-                                 naggs * sizeof(RuntimeAggState) +
+  const size_t bytes_per_group = (nkeys * sizeof(RuntimeKeyCell)) +
+                                 (naggs * sizeof(RuntimeAggState)) +
                                  sizeof(uint64_t);
   const auto limit = [] {
     return StatusError(StatusCode::kMemoryLimitExceeded,
@@ -2594,9 +2597,9 @@ Status WorkerGroupTable::ReserveGroupStorage(size_t groups) {
   aggs_.swap(aggs);
   group_hashes_.swap(hashes);
   if (charge_ != nullptr) {
-    const size_t old_bytes = keys.capacity() * sizeof(RuntimeKeyCell) +
-                             aggs.capacity() * sizeof(RuntimeAggState) +
-                             hashes.capacity() * sizeof(uint64_t);
+    const size_t old_bytes = (keys.capacity() * sizeof(RuntimeKeyCell)) +
+                             (aggs.capacity() * sizeof(RuntimeAggState)) +
+                             (hashes.capacity() * sizeof(uint64_t));
     std::vector<RuntimeKeyCell>().swap(keys);
     std::vector<RuntimeAggState>().swap(aggs);
     std::vector<uint64_t>().swap(hashes);
@@ -3474,7 +3477,7 @@ StatusOr<Value> EvaluateBindingValue(
         }
       }
       if (b.post_agg->program.has_value()) {
-        return b.post_agg->program->EvaluateRow(arg_row);
+        return b.post_agg->program->TryEvaluateRow(arg_row);
       }
       return b.post_agg->expr->TryEvaluate(arg_row, b.post_agg->eval_schema);
     }
@@ -4208,6 +4211,8 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
   if (!extrema && !frequency) {
     return std::nullopt;
   }
+  // DecodeTlcsColumnStats' result is not discarded: a decode failure makes
+  // the optional empty and the fast path below is skipped immediately.
   auto stats =
       DecodeTlcsColumnStats(tlcs.SerializedColumnStats(), schema.ColumnCount());
   if (!stats) {
@@ -5314,12 +5319,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   const int64_t kv = kcells[r];
                   const int64_t vv = vcells[r];
                   if (kv == cur_k) {
-                    if (vv < rmin) {
-                      rmin = vv;
-                    }
-                    if (vv > rmax) {
-                      rmax = vv;
-                    }
+                    rmin = std::min(vv, rmin);
+                    rmax = std::max(vv, rmax);
                   } else if (kv > cur_k) {
                     flush_mm(cur_k, rmin, rmax);
                     cur_k = kv;
@@ -5336,12 +5337,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   const int64_t kv = kcells[r];
                   const int64_t vv = vcells[r];
                   if (kv == cur_k) {
-                    if (vv < rmin) {
-                      rmin = vv;
-                    }
-                    if (vv > rmax) {
-                      rmax = vv;
-                    }
+                    rmin = std::min(vv, rmin);
+                    rmax = std::max(vv, rmax);
                   } else if (kv > cur_k) {
                     flush_mm(cur_k, rmin, rmax);
                     cur_k = kv;
@@ -5385,12 +5382,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               int64_t hi = all_b[i].rmax;
               size_t j = i + 1;
               while (j < all_b.size() && all_b[j].key == all_b[i].key) {
-                if (all_b[j].rmin < lo) {
-                  lo = all_b[j].rmin;
-                }
-                if (all_b[j].rmax > hi) {
-                  hi = all_b[j].rmax;
-                }
+                lo = std::min(all_b[j].rmin, lo);
+                hi = std::max(all_b[j].rmax, hi);
                 ++j;
               }
               ++b_groups;
@@ -6496,7 +6489,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               case CompiledFastAgg::Kind::kSumDoubleCol:
                 for (size_t i = 0; i < n; ++i) {
                   const uint32_t r = rows[i];
-                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  const auto idx = static_cast<uint64_t>(kcells[r] - lo);
                   sums[idx] += std::bit_cast<double>(c0[r]);
                   seen[idx] = 1;
                 }
@@ -6505,7 +6498,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const int64_t* c1 = col_ptrs[op.c1]->int_cells.data();
                 for (size_t i = 0; i < n; ++i) {
                   const uint32_t r = rows[i];
-                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  const auto idx = static_cast<uint64_t>(kcells[r] - lo);
                   sums[idx] += std::bit_cast<double>(c0[r]) *
                                std::bit_cast<double>(c1[r]);
                   seen[idx] = 1;
@@ -6517,7 +6510,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const double k1 = op.k1;
                 for (size_t i = 0; i < n; ++i) {
                   const uint32_t r = rows[i];
-                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  const auto idx = static_cast<uint64_t>(kcells[r] - lo);
                   sums[idx] += std::bit_cast<double>(c0[r]) *
                                (k1 - std::bit_cast<double>(c1[r]));
                   seen[idx] = 1;
@@ -6531,7 +6524,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 const double k2 = op.k2;
                 for (size_t i = 0; i < n; ++i) {
                   const uint32_t r = rows[i];
-                  const size_t idx = static_cast<uint64_t>(kcells[r] - lo);
+                  const auto idx = static_cast<uint64_t>(kcells[r] - lo);
                   sums[idx] += std::bit_cast<double>(c0[r]) *
                                (k1 - std::bit_cast<double>(c1[r])) *
                                (k2 + std::bit_cast<double>(c2[r]));
@@ -7889,6 +7882,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                  agg.kind == ColAggKind::kAvgByteLen));
       });
   using BucketProfiles = std::unordered_map<std::string, std::vector<uint32_t>>;
+  // Process-wide capture profiles are intentional here; both reads and writes
+  // below are held under profiles_mu, so thread_local is not needed.
   static std::mutex profiles_mu;
   static BucketProfiles profiles;
   std::string profile_key;
@@ -8244,6 +8239,9 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                      .IsUnsigned() &&
                 (km.phys_specs[0].kind == ColKeyKind::kColInt64 ||
                  km.phys_specs[0].kind == ColKeyKind::kColDate);
+            if (p0_int_prunable) {
+              win_p0_values.reserve(n_win);
+            }
 
             for (uint32_t w = 0; w < n_win; ++w) {
               const RuntimeKeyCell* pk = &win_phys_keys[w * n_phys];

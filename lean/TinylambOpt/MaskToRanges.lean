@@ -152,4 +152,38 @@ theorem mask_to_ranges_merge_words (base : Nat) (m₁ m₂ : List Bool) :
   rw [mask_to_ranges_sound, mask_to_ranges_sound, mask_to_ranges_sound]
   exact (selectedRows_append base m₁ m₂).symm
 
+/-- LSB-first physical words; truncate before run detection so high padding
+    bits in the last word can never join a visible range. -/
+def wordMask (words : List (BitVec w)) (valid : Nat) : List Bool :=
+  (words.flatMap (fun word => (List.range w).map word.getLsbD)).take valid
+
+def SeparatedFrom (lower : Nat) : List Range → Prop
+  | [] => True
+  | (s,n) :: rs => lower ≤ s ∧ 0 < n ∧ SeparatedFrom (s+n+1) rs
+
+private theorem runs_separated (mask : List Bool) (s n : Nat) :
+    SeparatedFrom s (runsGo (s+n) s n mask) := by
+  induction mask generalizing s n with
+  | nil => cases n <;> simp [runsGo, SeparatedFrom]
+  | cons b bs ih =>
+    cases b with
+    | true => exact ih s (n+1)
+    | false =>
+      have h := ih (s+n+1) 0
+      cases n with
+      | succ n => simpa [runsGo, SeparatedFrom] using h
+      | zero =>
+        simp only [runsGo, Bool.false_eq_true, ↓reduceIte, List.nil_append, Nat.add_zero]
+        simp only [Nat.add_zero] at h
+        generalize runsGo (s+1) (s+1) 0 bs = rs at *
+        cases rs <;> simp_all [SeparatedFrom] <;> omega
+
+theorem physical_ranges_sound (words : List (BitVec w)) (valid base : Nat) :
+    let mask := wordMask words valid
+    decode (runs base mask) = selectedRows base mask ∧ SeparatedFrom base (runs base mask) :=
+  ⟨mask_to_ranges_sound .., runs_separated _ base 0⟩
+
+example : runs 0 (wordMask [0x8000000000000000#64, 0xffffffffffffffff#64] 65) =
+    [(63,2)] := by decide
+
 end TinylambOpt.MaskToRanges

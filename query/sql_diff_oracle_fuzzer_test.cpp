@@ -3,11 +3,16 @@
 #include "query/sql_diff_oracle_fuzzer.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <optional>
 #include <random>
 #include <string>
 
+#include "common/platform/process.hpp"
+#include "common/random_string.hpp"
 #include "common/unwind_guard.hpp"
 #include "gtest/gtest.h"
+#include "query/fuzz_scoped_db.hpp"
 
 namespace tinylamb {
 
@@ -90,11 +95,18 @@ TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
   // The report is "" there, so an arm that would bulk-add its whole query set
   // on an empty report has to be told it was skipped instead -- otherwise a
   // run that executed nothing looks like a fully-agreed sweep.
-  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  constexpr const char* kForceFailure =
+      "TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE";
+  const char* current = std::getenv(kForceFailure);
+  const std::optional<std::string> previous =
+      current != nullptr ? std::optional<std::string>(current) : std::nullopt;
+  ASSERT_EQ(platform::SetEnv(kForceFailure, "1"), 0);
   // An ASSERT or an exception below must not leak the hatch into the next
   // test in this process; restore it on every exit path.
-  tinylamb::UnwindGuard restore_env(
-      [] { unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"); });
+  tinylamb::UnwindGuard restore_env([&] {
+    EXPECT_EQ(previous ? platform::SetEnv(kForceFailure, previous->c_str())
+                       : platform::UnsetEnv(kForceFailure), 0);
+  });
   // Fixed seed: the trace must stay reproducible, only the database is gone.
   std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
   for (int arm = 0; arm < 4; ++arm) {
@@ -124,14 +136,41 @@ TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
         << "arm " << arm << " (" << trace.kind
         << ") counted queries that never ran";
   }
-  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
-  restore_env.Disarm();
+  ASSERT_EQ(platform::UnsetEnv(kForceFailure), 0);
   // The hatch is off again: the very next sweep must run and count normally.
   DiffOracleStats stats;
   DiffOracleTrace trace;
   EXPECT_EQ(RunTqsIteration(rng, false, &stats, &trace), "") << trace.kind;
   EXPECT_EQ(stats.skipped, 0);
   EXPECT_EQ(stats.tqs_queries, 4);
+}
+
+TEST(SqlDiffOracleFuzzer, SkippedVerificationPreservesTraceAndContinues) {
+  const std::filesystem::path base = std::filesystem::temp_directory_path() /
+                                     ("tinylamb_diff_unverified_" + RandomString());
+  const std::string regression = base.string() + ".test";
+  const std::string unverified = base.string() + ".unverified";
+  const std::string report = unverified + ".report.txt";
+  UnwindGuard cleanup([&] {
+    std::error_code error;
+    std::filesystem::remove(regression, error);
+    std::filesystem::remove(unverified, error);
+    std::filesystem::remove(report, error);
+  });
+
+  ASSERT_EXIT(
+      {
+        unsetenv("TINYLAMB_FUZZ_CONTINUE");
+        unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR");
+        EmitFuzzFinding("sql_diff_oracle_fuzz", 42, regression,
+                        "-- tinylamb-diff-oracle v1\n", "first run differed\n",
+                        "replay skipped", /*replay_skipped=*/true);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "unverified trace written");
+  EXPECT_FALSE(std::filesystem::exists(regression));
+  EXPECT_TRUE(std::filesystem::exists(unverified));
+  EXPECT_TRUE(std::filesystem::exists(report));
 }
 
 }  // namespace tinylamb

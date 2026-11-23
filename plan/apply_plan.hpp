@@ -2,7 +2,6 @@
 #ifndef TINYLAMB_PLAN_APPLY_PLAN_HPP
 #define TINYLAMB_PLAN_APPLY_PLAN_HPP
 
-#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -47,11 +46,10 @@ class ApplyPlan final : public PlanBase {
     return child_ ? child_->AccessRowCount() : 1;
   }
   [[nodiscard]] size_t EmitRowCount() const override {
-    constexpr size_t kMaxRows = std::numeric_limits<size_t>::max();
-    constexpr size_t kApplyEstimate = 10;
-    const size_t child_rows = child_ ? child_->EmitRowCount() : 1;
-    return child_rows > kMaxRows / kApplyEstimate ? kMaxRows
-                                                  : child_rows * kApplyEstimate;
+    return stats_.Rows();
+  }
+  [[nodiscard]] static constexpr size_t RowsPerOuterRowEstimate(JoinKind kind) {
+    return kind == JoinKind::kSemi || kind == JoinKind::kAnti ? 1 : 10;
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const Plan& InnerChild() const { return inner_child_; }

@@ -41,7 +41,7 @@ graph TD
 
 1. **二重半結合の合致**: 外側ノードが `kSemiJoin`（子ノード数 2）であり、左側子グループ内に別の `kSemiJoin` 式（$R \ltimes_{p_1} S$）が存在すること。
 2. **述語属性の局所性**: 外側の結合述語 $p_2$ が参照するすべての属性が、$R$ または $T$ の関係集合のみに閉じており、$S$ の属性を一切参照していないこと（`touches_only_rt` 検査）。
-3. **サイクル防止**: 派生グループ `memo.EnsureDerivedGroup(UnionRelations(r_rels, t_rels), "semi_comm_rt")` が現在のグループ自身や $R, T$ のグループと一致しないこと。
+3. **サイクル防止**: 派生グループ `memo.EnsureDerivedGroup(UnionRelations(r_rels, t_rels), "semi_comm_rt:" + GroupIdsTag({r_id, t_id}) + PredicateTag(expression.predicate))` が現在のグループ自身や $R, T$ のグループと一致しないこと。同じ $(R, T)$ 関係集合で述語が異なる半結合が混在しても、子 ID と述語を指紋に含むため互いに隔離されます（D1 契約）。
 
 ## 意味論的根拠と安全性制約
 
@@ -53,7 +53,7 @@ graph TD
 $$(R \ltimes_{p_1} S) \ltimes_{p_2} T \equiv (R \ltimes_{p_2} T) \ltimes_{p_1} S$$
 
 ### 2. 述語配置における属性到達可能性
-もし $p_2$ が $S$ の属性を参照している場合（例: $p_2 \equiv (s.id = t.id)$）、変換後の内部結合 $R \ltimes_{p_2} T$ の評価時点では関係 $S$ がスコープ外となり、述語が評価不能となります。そのため、`touches_only_rt` ガードによる属性の静的検証が不可欠です。
+もし $p_2$ が $S$ の属性を参照している場合（例: $p_2 \equiv (s.id = t.id)$）、変換後の半結合 $R \ltimes_{p_2} T$ の評価時点では関係 $S$ がスコープ外となり、述語が評価不能となります。そのため、`touches_only_rt` ガードによる属性の静的検証が不可欠です。
 
 ```cpp
             if (expression.predicate && *expression.predicate) {
@@ -72,11 +72,13 @@ $$(R \ltimes_{p_1} S) \ltimes_{p_2} T \equiv (R \ltimes_{p_2} T) \ltimes_{p_1} S
 
 ## 実装の詳細
 
-派生グループ `"semi_comm_rt"` を生成し、そこに先行する半結合式 $R \ltimes_{p_2} T$ を登録します。その後、現在のルートグループに対して外側半結合 $(R \ltimes T) \ltimes_{p_1} S$ を登録します。
+派生グループ `"semi_comm_rt:" + GroupIdsTag({r_id, t_id}) + PredicateTag(expression.predicate)` を生成し、そこに先行する半結合式 $R \ltimes_{p_2} T$ を登録します。タグに子 ID と述語の指紋を含めることで、同じ $(R, T)$ で異なる述語の半結合同士が 1 つの派生グループへ混線するのを防ぎます。その後、現在のルートグループに対して外側半結合 $(R \ltimes T) \ltimes_{p_1} S$ を登録します。
 
 ```cpp
             const GroupId rt_group = memo.EnsureDerivedGroup(
-                UnionRelations(r_rels, t_rels), "semi_comm_rt");
+                UnionRelations(r_rels, t_rels),
+                "semi_comm_rt:" + GroupIdsTag({r_id, t_id}) +
+                    PredicateTag(expression.predicate));
             if (rt_group == group || rt_group == r_id || rt_group == t_id) {
               continue;
             }

@@ -452,9 +452,29 @@ double JoinKeyDomainEstimate(const Plan& plan, const ColumnName& column) {
 
 double JoinKeyDomainEstimate(const Plan& plan,
                              const std::vector<ColumnName>& columns) {
-  double domain = 0.0;
+  if (plan == nullptr || columns.empty()) {
+    return 0.0;
+  }
+  const auto rows = static_cast<double>(plan->GetStats().Rows());
+  if (rows <= 0.0) {
+    return 0.0;
+  }
+  double domain = 1.0;
   for (const ColumnName& column : columns) {
-    domain = std::max(domain, JoinKeyDomainEstimate(plan, column));
+    const double component = JoinKeyDomainEstimate(plan, column);
+    // A zero component means statistics are unavailable (or the key has no
+    // non-NULL values). Preserve the caller's no-information fallback rather
+    // than claiming that the composite key domain is empty.
+    if (component < 1.0) {
+      return 0.0;
+    }
+    // Composite NDV is at most the product of component NDVs and the number
+    // of rows. Cap before multiplication to avoid overflowing double for
+    // wide keys with large per-column domains.
+    if (domain >= rows / component) {
+      return rows;
+    }
+    domain *= component;
   }
   return domain;
 }

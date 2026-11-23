@@ -82,8 +82,9 @@ std::string SerializeDiffOracleTest(uint64_t seed, const DiffOracleTrace& trace,
 bool ParseDiffOracleTest(std::string_view text, uint64_t* seed,
                          DiffOracleTrace* trace, std::string* failure_summary);
 
-// libFuzzer: the first byte selects the oracle. A mismatch writes
-// `sql_diff_oracle_fuzz-repro-<seed>.test` and aborts.
+// libFuzzer: the first byte selects the oracle. A mismatch emits a replay
+// finding; if replay cannot run under resource pressure, the file is marked
+// unverified rather than presented as a confirmed reproducer.
 void DiffOracleFuzzTry(const uint8_t* data, size_t size, bool verbose);
 
 }  // namespace tinylamb

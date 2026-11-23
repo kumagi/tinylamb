@@ -41,7 +41,7 @@ struct PhysicalProperties {
 - **`limit_hint`**: 必要な最大行数の上限値（OFFSET ＋ LIMIT）。要求されたソート順序を提供する走査において、Top-K 探索によるコスト削減を見積もるために用いられます。上限がない場合は `size_t` の最大値が設定されます。
 - **`access_method`**: 利用可能なアクセスパスに対する選好ヒント（全表走査かインデックス走査の優先か）を示します。
 - **`distribution`**: 分散実行環境におけるデータ配置（パーティショニング）の要求を表現するための予約フィールドです。
-- **その他の補助属性**: 重複排除（`distinct`）、パーティション分割列（`partition_by`）、一意性（`is_unique`）など、実装規則が演算子を選択する際の判定基準として使用されます。
+- **その他の属性**: `distinct`、`partition_by`、`is_unique`、`bloom_filter_keys`、`join_multiplicity` などはプラン探索の共通判定基準ではありません。個別の変換・物理化経路で参照される属性と、現在は予約・記録用途にとどまる属性があります。
 
 `Key()` メソッドは、これらの属性を結合した文字列を生成します（`plan/cascades.cpp`）。前章で説明した `(Group, 物理要求)` のキャッシュキーとして、要求を一意に識別するために使います。
 
@@ -111,7 +111,7 @@ struct PhysicalProperties {
       return {PhysicalProperties{}};
 ```
 集約は入力行をまとめ直すため、入力の順序と物理行位置を出力へ引き継ぎません。
-したがって、子ノードへの要求を初期化します。
+RequiredChildProperties は順序・行位置などの親要求を子へ渡さず、空の要求を返します。ただし探索側は別途、グルーピング列や window-style partition 列に沿った ordered child property も候補に加えて比較し、sort aggregate などで活用できます。
 
 **4. 単項のフィルタ・変形演算子**:
 ```cpp
@@ -184,7 +184,7 @@ Top-N 演算子は、自身の整列キーを子ノードに対する順序要�
             (!alternative.plan->IsOrderedBy(required_order, required_ascending,
                                             properties.sort_nulls_first) ||
              !SatisfiesOrderingCollation(alternative.plan, properties))) {
-          const double rows = std::max(alternative.estimated_rows, child_rows);
+          const double rows = std::max(0.0, alternative.estimated_rows);
           score += rows * std::log2(std::max(2.0, rows));
         }
 ```

@@ -183,7 +183,7 @@ TEST(ExprSimplifyOracle, CoalesceShortCircuitsLikeRelationalPath) {
       ConstantValueExp(Value(int64_t{0})));
   EXPECT_EQ(EvaluateGroundTruth(FunctionCallExp(
                 "coalesce", {ConstantValueExp(Value(int64_t{7})), throwing})),
-            Value(int64_t{7}));
+            Value(7.0));
   EXPECT_EQ(EvaluateGroundTruth(FunctionCallExp(
                 "ifnull", {ConstantValueExp(Value(int64_t{7})), throwing})),
             Value(int64_t{7}));

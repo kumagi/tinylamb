@@ -18,8 +18,8 @@ namespace tinylamb {
 // stay within TINYLAMB_MEMORY_LIMIT_BYTES (16 GiB default).
 //
 // Config: TINYLAMB_QUERY_MEMORY_BYTES
-//   - unset: default 8 GiB (clamped below TINYLAMB_MEMORY_LIMIT_BYTES)
-//   - "0": unlimited (legacy / debugging)
+//   - unset: default 8 GiB, clamped to the process-level memory limit
+//   - "0": disable the query-specific cap, still bounded by the process limit
 class QueryMemoryBudget {
  public:
   static QueryMemoryBudget& Global();
@@ -94,7 +94,7 @@ class QueryMemoryCharge {
   struct kAlreadyReserved {};
   QueryMemoryCharge() = default;
   explicit QueryMemoryCharge(size_t bytes);
-  QueryMemoryCharge(kAlreadyReserved, size_t bytes) noexcept
+  QueryMemoryCharge(kAlreadyReserved /*unused*/, size_t bytes) noexcept
       : bytes_(bytes) {}  // NOLINT(readability-named-parameter)
   QueryMemoryCharge(const QueryMemoryCharge&) = delete;
   QueryMemoryCharge& operator=(const QueryMemoryCharge&) = delete;
@@ -102,6 +102,7 @@ class QueryMemoryCharge {
   QueryMemoryCharge& operator=(QueryMemoryCharge&& other) noexcept;
   ~QueryMemoryCharge();
 
+  // Force-charge as many bytes as this owner can account for without overflow.
   void Add(size_t bytes);
   [[nodiscard]] bool TryAdd(size_t bytes);
   void Release(size_t bytes);
@@ -114,6 +115,9 @@ class QueryMemoryCharge {
     constexpr size_t kMax = std::numeric_limits<size_t>::max();
     bytes_ = bytes > kMax - bytes_ ? kMax : bytes_ + bytes;
   }
+  // Transfers responsibility for releasing the reservation to the caller.
+  // The global budget keeps the bytes reserved. Immediately adopt them into
+  // another QueryMemoryCharge or release them explicitly with the budget.
   [[nodiscard]] size_t DetachBytes() noexcept {
     const size_t detached = bytes_;
     bytes_ = 0;

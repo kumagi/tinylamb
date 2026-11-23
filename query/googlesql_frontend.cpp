@@ -17,6 +17,7 @@
 #include <spawn.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -38,6 +39,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -49,7 +51,10 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+
+#include "common/unwind_guard.hpp"
 
 namespace tinylamb {
 namespace {
@@ -59,35 +64,37 @@ namespace {
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
     (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
 
+GoogleSqlParseResult RetryableParserFailure(std::string error) {
+  return {.ok = false, .ast = {}, .error = std::move(error), .retryable = true};
+}
+
 // Child stdout and stderr share one pipe; a stderr warning can precede the
 // parser's "ERROR:" line, so a leading-only check would misclassify an error
 // as a successful AST. A successful dump, however, echoes literal contents
 // verbatim: a multi-line literal can hold a line starting with "ERROR:".
 // Treat only diagnostics before the AST dump begins as parse errors.
-bool ContainsParserError(std::string_view output) {
-  bool in_ast_dump = false;
+std::string_view ParserErrorLine(std::string_view output) {
   size_t line_start = 0;
   while (line_start < output.size()) {
     const size_t newline = output.find('\n', line_start);
     const size_t line_end =
         newline == std::string_view::npos ? output.size() : newline;
-    const std::string_view line =
-        output.substr(line_start, line_end - line_start);
+    std::string_view line = output.substr(line_start, line_end - line_start);
+    const size_t first = line.find_first_not_of(" \t\r");
+    line.remove_prefix(first == std::string_view::npos ? line.size() : first);
     if (line.starts_with("ERROR:")) {
-      if (!in_ast_dump) {
-        return true;
-      }
-    } else if (!line.empty() && !line.starts_with("WARNING:") &&
+      return line;
+    } if (!line.empty() && !line.starts_with("WARNING:") &&
                !line.starts_with("INFO:")) {
       // The first non-diagnostic line is the root node of the AST dump.
-      in_ast_dump = true;
+      break;
     }
     if (newline == std::string_view::npos) {
       break;
     }
     line_start = newline + 1;
   }
-  return false;
+  return {};
 }
 
 constexpr size_t kParseCacheShards = 16;
@@ -117,12 +124,12 @@ size_t MaxCachedStatementsPerShard() {
       if (errno != 0 || end == env || *end != '\0') {
         return kMaxCachedStatementsPerShard;
       }
-      // A value below one-per-shard is a misconfiguration; applying it would
-      // floor to zero. Keep the default instead of silently disabling cache.
-      if (val < kParseCacheShards) {
+      const auto per_shard = val / kParseCacheShards;
+      // Keep the default if the requested capacity cannot be represented.
+      if (per_shard == 0 || !std::in_range<size_t>(per_shard)) {
         return kMaxCachedStatementsPerShard;
       }
-      return static_cast<size_t>(val / kParseCacheShards);
+      return static_cast<size_t>(per_shard);
     }
     return kMaxCachedStatementsPerShard;
   }();
@@ -149,15 +156,14 @@ std::chrono::seconds NegativeCacheTtlSeconds() {
 // slowdown need a larger round-trip budget than the production default.
 std::chrono::seconds ParseTimeoutSeconds() {
   if (const char* env = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC")) {
-    const std::string owned(env);
     char* end = nullptr;
     errno = 0;
-    const long value = std::strtol(owned.c_str(), &end, 10);
+    const long value = std::strtol(env, &end, 10);
     // Cap well below the point where adding seconds to a nanosecond
     // steady_clock time_point would overflow its signed rep.
     constexpr long kMaxParseTimeoutSec = 30LL * 24 * 3600;  // 30 days
-    if (errno == 0 && value > 0 && value <= kMaxParseTimeoutSec &&
-        end != nullptr && end != owned.c_str() && *end == '\0') {
+    if (errno == 0 && value > 0 && value <= kMaxParseTimeoutSec && end != env &&
+        *end == '\0') {
       return std::chrono::seconds(value);
     }
   }
@@ -168,17 +174,49 @@ constexpr size_t kMaxChildOutputBytes = 64U << 20;
 
 struct ParseShard {
   std::mutex mutex;
+  std::condition_variable parse_finished;
+  std::unordered_set<std::string_view> pending;
   std::unordered_map<std::string, std::string> cache;
+  size_t cached_key_bytes{0};
   std::unordered_map<std::string, std::chrono::steady_clock::time_point>
       negative_cache;
+  size_t negative_key_bytes{0};
 };
 
 std::array<ParseShard, kParseCacheShards> parse_shards;
 
-// A zygote that accepts a connection but never returns the exit-status byte
-// would otherwise wedge every later parse until the timeout. Retire the
-// fast path process-wide on the first such failure and spawn the parser.
-std::atomic<bool> zygote_unresponsive{false};
+// Bound child concurrency independently of the cache shard a statement hashes
+// to. A slow parse leaves both cache hits and other keys free to proceed.
+class ParseProcessSlots {
+ public:
+  void lock() {
+    std::unique_lock lock(mutex_);
+    ready_.wait(lock, [this] { return running_ < kParseCacheShards; });
+    ++running_;
+  }
+
+  void unlock() {
+    {
+      std::scoped_lock lock(mutex_);
+      --running_;
+    }
+    ready_.notify_one();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  size_t running_{0};
+};
+
+ParseProcessSlots parse_process_slots;
+
+#ifdef TINYLAMB_OS_POSIX
+// Give an unresponsive zygote time to recover while new requests use spawn.
+constexpr std::chrono::seconds kZygoteRetryDelay{5};
+std::atomic<std::chrono::steady_clock::time_point> zygote_retry_after{
+    std::chrono::steady_clock::time_point::min()};
+#endif
 
 ParseShard& ShardFor(std::string_view sql) {
   return parse_shards[std::hash<std::string_view>{}(sql) % kParseCacheShards];
@@ -206,19 +244,6 @@ std::filesystem::path ResolveGoogleSqlExecutable() {
       return sibling;
     }
   }
-#ifndef TINYLAMB_OS_WINDOWS
-  // /tmp is writable by other users on multi-user hosts: silently executing
-  // whatever happens to live at a fixed path there would run arbitrary code
-  // with this process's privileges and leak every SQL statement on stdin.
-  // Keep the dev shim, but require an explicit opt-in instead of trusting it.
-  if (const char* allow = std::getenv("TINYLAMB_ALLOW_TMP_PARSER_SHIM");
-      allow != nullptr && std::strcmp(allow, "1") == 0) {
-    std::filesystem::path tmp_shim("/tmp/tinylamb-execute-query");
-    if (std::filesystem::exists(tmp_shim, ec)) {
-      return tmp_shim;
-    }
-  }
-#endif
   return configured;
 }
 
@@ -234,7 +259,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   HANDLE stdin_read = INVALID_HANDLE_VALUE;
   HANDLE stdin_write = INVALID_HANDLE_VALUE;
   if (!::CreatePipe(&stdin_read, &stdin_write, &sa, 0)) {
-    return {.ok = false, .ast = {}, .error = "cannot create GoogleSQL pipe"};
+    return RetryableParserFailure("cannot create GoogleSQL pipe");
   }
   (void)::SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
 
@@ -243,9 +268,16 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   if (!::CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
     ::CloseHandle(stdin_read);
     ::CloseHandle(stdin_write);
-    return {.ok = false, .ast = {}, .error = "cannot create GoogleSQL pipe"};
+    return RetryableParserFailure("cannot create GoogleSQL pipe");
   }
-  (void)::SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+  if (!::SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)) {
+    ::CloseHandle(stdin_read);
+    ::CloseHandle(stdin_write);
+    ::CloseHandle(stdout_read);
+    ::CloseHandle(stdout_write);
+    return RetryableParserFailure(
+        "cannot clear inherit flag on GoogleSQL stdout pipe");
+  }
 
   STARTUPINFOW si{};
   si.cb = sizeof(si);
@@ -264,7 +296,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   if (!started) {
     ::CloseHandle(stdin_write);
     ::CloseHandle(stdout_read);
-    return {.ok = false, .ast = {}, .error = "cannot start GoogleSQL"};
+    return RetryableParserFailure("cannot start GoogleSQL");
   }
 
   std::string output;
@@ -316,8 +348,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     ::CloseHandle(stdout_read);
     ::CloseHandle(pi.hThread);
     ::CloseHandle(pi.hProcess);
-    return {
-        .ok = false, .ast = {}, .error = "cannot start parser pipe workers"};
+    return RetryableParserFailure("cannot start parser pipe workers");
   }
 
   const auto timeout_ms =
@@ -340,19 +371,14 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   ::CloseHandle(pi.hProcess);
 
   if (timed_out) {
-    return {.ok = false, .ast = {}, .error = "GoogleSQL parser timed out"};
+    return RetryableParserFailure("GoogleSQL parser timed out");
   }
   if (output_truncated) {
     return {.ok = false,
             .ast = {},
             .error = "GoogleSQL parser output exceeds the size limit"};
   }
-  if (output_truncated) {
-    return {.ok = false,
-            .ast = {},
-            .error = "GoogleSQL parser output exceeds the size limit"};
-  }
-  if (exit_code != 0 || ContainsParserError(output)) {
+  if (exit_code != 0 || !ParserErrorLine(output).empty()) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
   }
   // T1811: exit 0 with zero bytes of output was accepted unconditionally,
@@ -399,17 +425,261 @@ class BlockedSigPipe {
   sigset_t old_{};
 };
 
+// Lazily spawns a per-process persistent GoogleSQL parser daemon on first
+// un-overridden parse when the configured binary supports `--zygote_sock=...`.
+// Fork-safe (`owner_pid_ != getpid()` resets child tracking without reaping
+// the parent's daemon) and gracefully falls back to per-query spawn if the
+// configured binary is stock upstream `execute_query`.
+class AutoZygoteManager {
+ public:
+  static AutoZygoteManager& Instance() {
+    static AutoZygoteManager instance;
+    return instance;
+  }
+
+  ~AutoZygoteManager() { Shutdown(/*permanent=*/true); }
+
+  std::string EnsureSocketPath() {
+    const auto retry_after = zygote_retry_after.load(std::memory_order_relaxed);
+    if (retry_after != std::chrono::steady_clock::time_point::min() &&
+        std::chrono::steady_clock::now() < retry_after) {
+      return {};
+    }
+    if (const char* env_sock = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+        env_sock != nullptr && *env_sock != '\0') {
+      return {};
+    }
+    if (const char* disable = std::getenv("TINYLAMB_DISABLE_AUTO_ZYGOTE");
+        disable != nullptr && std::strcmp(disable, "1") == 0) {
+      return {};
+    }
+    if (const char* bin = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+        bin != nullptr && *bin != '\0') {
+      return {};
+    }
+    std::scoped_lock lk(mu_);
+    const pid_t self = ::getpid();
+    if (owner_pid_ != 0 && owner_pid_ != self) {
+      pid_ = -1;
+      owner_pid_ = 0;
+      sock_path_.clear();
+      dir_path_.clear();
+      disabled_ = false;
+    }
+    if (disabled_) {
+      return {};
+    }
+    if (pid_ > 0 && !sock_path_.empty()) {
+      return sock_path_;
+    }
+
+    const std::string exe = ResolveGoogleSqlExecutable().string();
+    std::error_code ec;
+    if (exe.empty() || !std::filesystem::exists(exe, ec)) {
+      disabled_ = true;
+      return {};
+    }
+
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t id = seq.fetch_add(1, std::memory_order_relaxed);
+    std::string dir = "/tmp/tinylamb-gsql-" + std::to_string(::getuid()) + "-" +
+                      std::to_string(self) + "-" + std::to_string(id);
+    if (::mkdir(dir.c_str(), 0700) != 0) {
+      disabled_ = true;
+      return {};
+    }
+    std::string sock = dir + "/z.sock";
+    struct sockaddr_un probe_addr{};
+    if (sock.size() >= sizeof(probe_addr.sun_path)) {
+      ::rmdir(dir.c_str());
+      disabled_ = true;
+      return {};
+    }
+    probe_addr.sun_family = AF_UNIX;
+    std::strncpy(probe_addr.sun_path, sock.c_str(),
+                 sizeof(probe_addr.sun_path) - 1);
+
+    posix_spawn_file_actions_t actions{};
+    int spawn_err = posix_spawn_file_actions_init(&actions);
+    if (spawn_err == 0) {
+      spawn_err = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+                                                   "/dev/null", O_RDONLY, 0);
+      if (spawn_err == 0) {
+        spawn_err = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                                     "/dev/null", O_WRONLY, 0);
+      }
+      if (spawn_err == 0) {
+        spawn_err = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+                                                     "/dev/null", O_WRONLY, 0);
+      }
+      pid_t child = -1;
+      if (spawn_err == 0) {
+        std::string arg0 = exe;
+        std::string arg1 = "--zygote_sock=" + sock;
+        std::array<char*, 3> argv = {arg0.data(), arg1.data(), nullptr};
+        posix_spawnattr_t attributes{};
+        spawn_err = platform::InitSpawnAttributes(&attributes);
+        if (spawn_err == 0) {
+          spawn_err = posix_spawn(&child, exe.c_str(), &actions, &attributes,
+                                  argv.data(), platform::Environment());
+          posix_spawnattr_destroy(&attributes);
+        }
+      }
+      posix_spawn_file_actions_destroy(&actions);
+      if (spawn_err != 0 || child <= 0) {
+        ::rmdir(dir.c_str());
+        disabled_ = true;
+        return {};
+      }
+
+      for (int iter = 0; iter < 100; ++iter) {
+        int st = 0;
+        const pid_t w = ::waitpid(child, &st, WNOHANG);
+        if (w == child || (w < 0 && errno != EINTR)) {
+          ::unlink(sock.c_str());
+          ::rmdir(dir.c_str());
+          disabled_ = true;
+          return {};
+        }
+        const int probe_fd = platform::OpenSocket(AF_UNIX, SOCK_STREAM, 0, {});
+        if (probe_fd >= 0) {
+          if (::connect(probe_fd,
+                        reinterpret_cast<const struct sockaddr*>(&probe_addr),
+                        sizeof(probe_addr)) == 0) {
+            ::close(probe_fd);
+            pid_ = child;
+            owner_pid_ = self;
+            sock_path_ = std::move(sock);
+            dir_path_ = std::move(dir);
+            static std::once_flag atexit_once;
+            std::call_once(atexit_once, []() {
+              std::atexit(
+                  []() { AutoZygoteManager::Instance().Shutdown(true); });
+            });
+            return sock_path_;
+          }
+          ::close(probe_fd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+
+      ::kill(child, SIGTERM);
+      bool reaped = false;
+      for (int i = 0; i < 25; ++i) {
+        int st = 0;
+        const pid_t w = ::waitpid(child, &st, WNOHANG);
+        if (w == child || (w < 0 && errno == ECHILD)) {
+          reaped = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      if (!reaped) {
+        ::kill(child, SIGKILL);
+        int st = 0;
+        while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {
+        }
+      }
+      ::unlink(sock.c_str());
+      ::rmdir(dir.c_str());
+    }
+    disabled_ = true;
+    return {};
+  }
+
+  void Shutdown(bool permanent = true) {
+    std::scoped_lock lk(mu_);
+    if (permanent) {
+      disabled_ = true;
+    }
+    if (owner_pid_ != ::getpid() || pid_ <= 0) {
+      return;
+    }
+    const pid_t child = pid_;
+    pid_ = -1;
+    owner_pid_ = 0;
+    ::kill(child, SIGTERM);
+    bool reaped = false;
+    for (int i = 0; i < 25; ++i) {
+      int st = 0;
+      const pid_t w = ::waitpid(child, &st, WNOHANG);
+      if (w == child || (w < 0 && errno == ECHILD)) {
+        reaped = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!reaped) {
+      ::kill(child, SIGKILL);
+      int st = 0;
+      while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {
+      }
+    }
+    if (!sock_path_.empty()) {
+      ::unlink(sock_path_.c_str());
+      sock_path_.clear();
+    }
+    if (!dir_path_.empty()) {
+      ::rmdir(dir_path_.c_str());
+      dir_path_.clear();
+    }
+  }
+
+  void OnConnectFailure() {
+    std::scoped_lock lk(mu_);
+    if (owner_pid_ != ::getpid() || pid_ <= 0) {
+      return;
+    }
+    int st = 0;
+    const pid_t w = ::waitpid(pid_, &st, WNOHANG);
+    if (w == pid_ || (w < 0 && errno == ECHILD)) {
+      pid_ = -1;
+      owner_pid_ = 0;
+      disabled_ = false;
+      zygote_retry_after.store(
+          std::chrono::steady_clock::now() + kZygoteRetryDelay,
+          std::memory_order_relaxed);
+      if (!sock_path_.empty()) {
+        ::unlink(sock_path_.c_str());
+        sock_path_.clear();
+      }
+      if (!dir_path_.empty()) {
+        ::rmdir(dir_path_.c_str());
+        dir_path_.clear();
+      }
+    }
+  }
+
+ private:
+  std::mutex mu_;
+  pid_t pid_{-1};
+  pid_t owner_pid_{0};
+  std::string sock_path_;
+  std::string dir_path_;
+  bool disabled_{false};
+};
+
 // Optional Unix-domain socket fast-path for a pre-warmed GoogleSQL parser
-// zygote (TINYLAMB_GOOGLESQL_ZYGOTE_SOCK). Passes (stdin_fd, stdout_fd) via
-// SCM_RIGHTS and returns the connected socket fd (which will yield a 1-byte
-// exit status when the parse finishes), or -1 to fall back to posix_spawn.
+// zygote (TINYLAMB_GOOGLESQL_ZYGOTE_SOCK, or AutoZygoteManager). Passes
+// (stdin_fd, stdout_fd) via SCM_RIGHTS and returns the connected socket fd
+// (which will yield a 1-byte exit status when the parse finishes), or -1 to
+// fall back to posix_spawn.
 int TryConnectZygote(int stdin_fd, int stdout_fd) {
-  if (zygote_unresponsive.load(std::memory_order_relaxed)) {
+  const auto retry_after = zygote_retry_after.load(std::memory_order_relaxed);
+  if (retry_after != std::chrono::steady_clock::time_point::min() &&
+      std::chrono::steady_clock::now() < retry_after) {
     return -1;
   }
   const char* sock_path = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  std::string auto_sock;
+  bool using_auto = false;
   if (sock_path == nullptr || *sock_path == '\0') {
-    return -1;
+    auto_sock = AutoZygoteManager::Instance().EnsureSocketPath();
+    if (auto_sock.empty()) {
+      return -1;
+    }
+    sock_path = auto_sock.c_str();
+    using_auto = true;
   }
   const int sock = platform::OpenSocket(AF_UNIX, SOCK_STREAM, 0, {});
   if (sock < 0) {
@@ -425,6 +695,9 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
   if (::connect(sock, reinterpret_cast<const struct sockaddr*>(&addr),
                 sizeof(addr)) != 0) {
     ::close(sock);
+    if (using_auto) {
+      AutoZygoteManager::Instance().OnConnectFailure();
+    }
     return -1;
   }
   std::array<int, 2> pass_fds = {stdin_fd, stdout_fd};
@@ -450,32 +723,39 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
   } while (sent < 0 && errno == EINTR);
   if (sent <= 0) {
     ::close(sock);
+    if (using_auto) {
+      // The zygote accepted the connection but failed the fd hand-off; it is
+      // just as broken as a refused connect and must leave the pool, or every
+      // later parse waits on the same dead socket.
+      AutoZygoteManager::Instance().OnConnectFailure();
+    }
     return -1;
   }
   return sock;
 }
 
-GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
-                                        bool allow_zygote = true) {
+GoogleSqlParseResult ParseRawSubprocess(
+    std::string_view sql, bool allow_zygote = true,
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + ParseTimeoutSeconds()) {
+  if (std::chrono::steady_clock::now() >= deadline) {
+    return RetryableParserFailure("GoogleSQL parser timed out");
+  }
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
   // Close-on-exec (plus POSIX_SPAWN_CLOEXEC_DEFAULT where the platform cannot
   // set it atomically) keeps concurrent parses' descriptors out of the child;
   // only the dup2'd std{in,out,err} survive exec.
   if (platform::OpenPipe(input_pipe, {}) != 0) {
-    return {.ok = false,
-            .ast = {},
-            .error = std::string("cannot create GoogleSQL pipe: ") +
-                     std::strerror(errno)};
+    return RetryableParserFailure(
+        std::string("cannot create GoogleSQL pipe: ") + std::strerror(errno));
   }
   if (platform::OpenPipe(output_pipe, {}) != 0) {
     const std::string reason(errno == EMFILE || errno == ENFILE
                                  ? std::string("too many open files")
                                  : std::strerror(errno));
     CloseAll(input_pipe);
-    return {.ok = false,
-            .ast = {},
-            .error = "cannot create GoogleSQL pipe: " + reason};
+    return RetryableParserFailure("cannot create GoogleSQL pipe: " + reason);
   }
 
   BlockedSigPipe blocked_sigpipe;
@@ -517,9 +797,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
         const std::string reason(std::strerror(spawn_err));
         CloseAll(input_pipe);
         CloseAll(output_pipe);
-        return {.ok = false,
-                .ast = {},
-                .error = "cannot start GoogleSQL: " + reason};
+        return RetryableParserFailure("cannot start GoogleSQL: " + reason);
       }
     } else {
       // Resolve in the parent: a fork()ed child of a multi-threaded process
@@ -532,9 +810,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
         const std::string reason(std::strerror(errno));
         CloseAll(input_pipe);
         CloseAll(output_pipe);
-        return {.ok = false,
-                .ast = {},
-                .error = "cannot start GoogleSQL: " + reason};
+        return RetryableParserFailure("cannot start GoogleSQL: " + reason);
       }
       if (child == 0) {
         dup2(input_pipe[0], STDIN_FILENO);
@@ -554,8 +830,6 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
   close(output_pipe[1]);
   output_pipe[1] = -1;
 
-  const auto deadline =
-      std::chrono::steady_clock::now() + ParseTimeoutSeconds();
   bool input_open = true;
   bool output_open = true;
   size_t written = 0;
@@ -610,10 +884,6 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
         output_open = false;
       } else {
         std::array<char, 4096> buffer{};
-        // Blocking syscalls under the caller's parse-cache shard mutex are the
-        // documented per-shard miss serialization; every syscall here is
-        // poll-driven with a deadline, so the critical section stays bounded.
-        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
         const ssize_t count =
             read(output_pipe[0], buffer.data(), buffer.size());
         if (count > 0) {
@@ -697,11 +967,19 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
     }
     ::close(zygote_sock);
     if (!got_status) {
-      // The zygote accepted the descriptors but never answered; keep serving
-      // parses by retiring it and retrying this one via a fresh spawn. The
-      // recursive call skips the zygote, so it cannot recurse again.
-      zygote_unresponsive.store(true, std::memory_order_relaxed);
-      return ParseRawSubprocess(sql, /*allow_zygote=*/false);
+      // Retry this parse via spawn and let subsequent requests reconnect
+      // once the cooldown expires. The recursive call skips the zygote.
+      zygote_retry_after.store(
+          std::chrono::steady_clock::now() + kZygoteRetryDelay,
+          std::memory_order_relaxed);
+      AutoZygoteManager::Instance().Shutdown(/*permanent=*/false);
+      // The zygote consumed the original deadline while hanging. Passing it
+      // on would make the spawn branch fail its first "already expired"
+      // check, so the documented fallback never actually ran. Give spawn a
+      // fresh budget; allow_zygote=false keeps this a one-shot retry.
+      return ParseRawSubprocess(
+          sql, /*allow_zygote=*/false,
+          std::chrono::steady_clock::now() + ParseTimeoutSeconds());
     }
     if (output_truncated) {
       GoogleSqlParseResult truncated;
@@ -709,7 +987,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
       truncated.error = "GoogleSQL parser output exceeds the size limit";
       return truncated;
     }
-    if (exit_code != 0 || ContainsParserError(output)) {
+    if (exit_code != 0 || !ParserErrorLine(output).empty()) {
       return {.ok = false, .ast = {}, .error = std::move(output)};
     }
     if (output.empty() &&
@@ -744,10 +1022,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
     kill(child, SIGKILL);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
     }
-    GoogleSqlParseResult timed_out;
-    timed_out.ok = false;
-    timed_out.error = "GoogleSQL parser timed out";
-    return timed_out;
+    return RetryableParserFailure("GoogleSQL parser timed out");
   }
   if (!WIFEXITED(status) ||        // NOLINT(misc-include-cleaner) glibc macro
       WEXITSTATUS(status) != 0) {  // NOLINT(misc-include-cleaner) glibc macro
@@ -759,12 +1034,12 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql,
     truncated.error = "GoogleSQL parser output exceeds the size limit";
     return truncated;
   }
-  if (ContainsParserError(output)) {
+  if (!ParserErrorLine(output).empty()) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
   }
-  // T1811: see the Windows arm -- exit 0 with no output is only a valid
-  // "empty SQL" result for whitespace input; a broken binary that says
-  // nothing and succeeds must not masquerade as an empty AST.
+  // T1811: same guard as the Windows implementation above -- exit 0 with no
+  // output is only a valid "empty SQL" result for whitespace input; a broken
+  // binary that says nothing and succeeds must not masquerade as an empty AST.
   if (output.empty() &&
       std::any_of(sql.begin(), sql.end(),
                   [](unsigned char c) { return std::isspace(c) == 0; })) {
@@ -921,7 +1196,15 @@ bool ExtractDistinctOn(std::string_view sql, size_t* out_start, size_t* out_end,
     // alphanumeric quote-adjacent byte and would reject a valid rewrite.
     if (found > 0 &&
         ((std::isalnum(static_cast<unsigned char>(mask[found - 1])) != 0) ||
-         mask[found - 1] == '_')) {
+         mask[found - 1] == '_' || mask[found - 1] == '$')) {
+      pos = found + 8;
+      continue;
+    }
+    // Symmetric trailing boundary: "distinctx" is an identifier, not the
+    // DISTINCT keyword (FindOuterKeyword checks both sides already).
+    if (found + 8 < mask.size() &&
+        ((std::isalnum(static_cast<unsigned char>(mask[found + 8])) != 0) ||
+         mask[found + 8] == '_' || mask[found + 8] == '$')) {
       pos = found + 8;
       continue;
     }
@@ -1131,24 +1414,51 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
 std::string NormalizeGroupByDistinct(std::string_view sql) {
   std::string lower = ToLowerCopy(sql);
   // The mask keeps a "group by distinct" inside a literal/comment from
-  // being rewritten into invalid SQL.
+  // being rewritten into invalid SQL.  Comments are blanked to spaces, so
+  // the keyword sequence is matched with arbitrary whitespace between the
+  // words — a literal find() misses `GROUP /*c*/ BY DISTINCT`.
   const std::string mask = ToLowerCopy(MaskLiteralsAndComments(sql));
-  size_t pos = mask.find("group by distinct");
-  if (pos != std::string::npos) {
-    size_t after = pos + 17;
+  auto skip_ws = [&](size_t i) {
+    while (i < mask.size() &&
+           std::isspace(static_cast<unsigned char>(mask[i])) != 0) {
+      ++i;
+    }
+    return i;
+  };
+  auto ident_char = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+           c == '$';
+  };
+  for (size_t pos = mask.find("group"); pos != std::string::npos;
+       pos = mask.find("group", pos + 1)) {
+    if (pos > 0 && ident_char(mask[pos - 1])) {
+      continue;  // "mygroup": not the GROUP keyword.
+    }
+    size_t p = skip_ws(pos + 5);
+    if (p + 2 > mask.size() || mask.compare(p, 2, "by") != 0 ||
+        (p + 2 < mask.size() && ident_char(mask[p + 2]))) {
+      continue;
+    }
+    p = skip_ws(p + 2);
+    if (p + 8 > mask.size() || mask.compare(p, 8, "distinct") != 0) {
+      continue;
+    }
+    const size_t distinct_end = p + 8;
     // `distinct_1` is an ordinary identifier, not the GROUP BY DISTINCT
     // modifier.  Rewriting it would remove the identifier prefix and turn
     // the query into the invalid token `GROUP BY_1`.
-    if (after < lower.size() &&
-        (std::isalnum(static_cast<unsigned char>(lower[after])) != 0 ||
-         lower[after] == '_')) {
-      return std::string(sql);
+    if (distinct_end < lower.size() && ident_char(lower[distinct_end])) {
+      continue;
     }
+    size_t after = distinct_end;
     while (after < lower.size() &&
            (std::isspace(static_cast<unsigned char>(lower[after])) != 0)) {
       ++after;
     }
-    if (lower.compare(after, 3, "all") == 0) {
+    // `all` must be a whole word: `GROUP BY DISTINCT allocate` names a column,
+    // and matching its "all" prefix would rewrite it into `GROUP BY ALLOCATE`.
+    if (lower.compare(after, 3, "all") == 0 &&
+        (after + 3 >= lower.size() || !ident_char(lower[after + 3]))) {
       std::string result(sql.substr(0, pos));
       result += "GROUP BY ALL";
       result += sql.substr(after + 3);
@@ -1156,7 +1466,7 @@ std::string NormalizeGroupByDistinct(std::string_view sql) {
     }
     std::string result(sql.substr(0, pos));
     result += "GROUP BY";
-    result += sql.substr(pos + 17);
+    result += sql.substr(distinct_end);
     return result;
   }
   return std::string(sql);
@@ -1758,15 +2068,32 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
       return res;
     }
     if (with_ties) {
-      size_t limit_pos = res.ast.rfind("LimitOffset");
-      if (limit_pos != std::string::npos) {
-        size_t line_start = res.ast.rfind('\n', limit_pos);
-        line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
-        size_t limit_indent = 0;
-        while (line_start + limit_indent < res.ast.size() &&
-               res.ast[line_start + limit_indent] == ' ') {
-          ++limit_indent;
+      // The FETCH prepass rewrites only the outer clause. The AST dump is
+      // depth-first, so its last LimitOffset can belong to a nested query.
+      // Choose the shallowest LimitOffset node, which belongs to the outer
+      // query being rewritten.
+      size_t limit_pos = std::string::npos;
+      size_t limit_indent = std::numeric_limits<size_t>::max();
+      size_t line_start = 0;
+      while (line_start < res.ast.size()) {
+        const size_t line_end = res.ast.find('\n', line_start);
+        const size_t end =
+            line_end == std::string::npos ? res.ast.size() : line_end;
+        const size_t indent = res.ast.find_first_not_of(' ', line_start);
+        if (indent < end && res.ast.compare(indent, 11, "LimitOffset") == 0 &&
+            indent - line_start < limit_indent) {
+          limit_pos = indent;
+          limit_indent = indent - line_start;
         }
+        if (line_end == std::string::npos) {
+          break;
+        }
+        line_start = line_end + 1;
+      }
+      if (limit_pos != std::string::npos) {
+        size_t node_line_start = res.ast.rfind('\n', limit_pos);
+        node_line_start =
+            (node_line_start == std::string::npos) ? 0 : node_line_start + 1;
         size_t limit_line_end = res.ast.find('\n', limit_pos);
         if (limit_line_end != std::string::npos) {
           res.ast.insert(limit_line_end + 1,
@@ -1783,6 +2110,20 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
 #endif  // TINYLAMB_GOOGLESQL_EXECUTABLE
 
 }  // namespace
+
+size_t GoogleSqlFrontend::CachedStatementCountForTest() {
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
+    (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
+  size_t total = 0;
+  for (ParseShard& shard : parse_shards) {
+    std::scoped_lock lock(shard.mutex);
+    total += shard.cache.size();
+  }
+  return total;
+#else
+  return 0;
+#endif
+}
 
 bool frontend_detail::InjectDistinctOnKeys(
     std::string& ast, const std::string& keys_ast,
@@ -1898,14 +2239,11 @@ bool GoogleSqlFrontend::Available() {
 GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
     (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
-  // The parser is an external process. Sharded caches avoid a single global
-  // reader/writer lock on OLTP parse bursts; the shard lock is deliberately
-  // HELD across a cache-miss parse so a burst of distinct statements
-  // serializes per shard (at most kParseCacheShards concurrent parser
-  // processes) instead of forking one child per racing thread.
   const std::string cache_key(sql);
   ParseShard& shard = ShardFor(cache_key);
-  std::scoped_lock cache_lock(shard.mutex);
+  std::unique_lock cache_lock(shard.mutex);
+  shard.parse_finished.wait(cache_lock,
+                            [&] { return !shard.pending.contains(cache_key); });
   const size_t max_per_shard = MaxCachedStatementsPerShard();
   const auto neg_ttl = NegativeCacheTtlSeconds();
   const auto now = std::chrono::steady_clock::now();
@@ -1921,43 +2259,61 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
                 .ast = {},
                 .error = "GoogleSQL parse failed (recently cached)"};
       }
+      shard.negative_key_bytes -= failed->first.size();
       shard.negative_cache.erase(failed);
     }
   }
 
-  GoogleSqlParseResult parsed = ParseViaSubprocess(sql);
+  // The view in pending points into this call's key and is erased before the
+  // key goes out of scope, including when parsing or cache insertion throws.
+  shard.pending.insert(cache_key);
+  const UnwindGuard finish_parse([&] {
+    if (!cache_lock.owns_lock()) {
+      cache_lock.lock();
+    }
+    shard.pending.erase(cache_key);
+    cache_lock.unlock();
+    shard.parse_finished.notify_all();
+  });
+  cache_lock.unlock();
+  GoogleSqlParseResult parsed;
+  {
+    std::scoped_lock process_slot(parse_process_slots);
+    parsed = ParseViaSubprocess(sql);
+  }
+  if (cache_key.size() > kMaxParseCacheKeyBytesPerShard) {
+    return parsed;
+  }
+  cache_lock.lock();
   if (parsed.ok) {
     // unordered_map iteration order is unspecified, so evict an ARBITRARY
     // entry until both the count and key-byte bounds hold.
-    size_t cached_bytes = 0;
-    for (const auto& [key, ast] : shard.cache) {
-      cached_bytes += key.size();
-    }
+    const size_t spare = kMaxParseCacheKeyBytesPerShard - cache_key.size();
     while (shard.cache.size() >= max_per_shard ||
-           cached_bytes + cache_key.size() > kMaxParseCacheKeyBytesPerShard) {
-      if (shard.cache.empty()) {
-        break;
-      }
+           shard.cached_key_bytes > spare) {
       auto victim = shard.cache.begin();
-      cached_bytes -= std::min(cached_bytes, victim->first.size());
+      shard.cached_key_bytes -= victim->first.size();
       shard.cache.erase(victim);
     }
-    if (cache_key.size() <= kMaxParseCacheKeyBytesPerShard) {
-      shard.cache.emplace(cache_key, parsed.ast);
-    }
-    shard.negative_cache.erase(cache_key);
+    shard.cache.emplace(cache_key, parsed.ast);
+    shard.cached_key_bytes += cache_key.size();
   } else {
-    // Only deterministic parser verdicts ("ERROR: ...") belong in the
-    // negative cache. Spawn/pipe failures, timeouts and oversized-output
-    // errors are transient resource problems: caching them would turn a
-    // retryable failure into a sticky "(recently cached)" syntax error for
-    // the whole TTL.
-    if (parsed.error.starts_with("ERROR:")) {
-      if (shard.negative_cache.size() >= max_per_shard) {
-        shard.negative_cache.erase(shard.negative_cache.begin());
+    // Negative-cache the parser's explicit syntax verdict. A diagnostic about
+    // a resource failure may also start with "ERROR:" and need an immediate
+    // retry after the resource becomes available.
+    const std::string_view diagnostic = ParserErrorLine(parsed.error);
+    if (!parsed.retryable &&
+        (diagnostic.starts_with("ERROR: INVALID_ARGUMENT: Syntax error:") ||
+         diagnostic.starts_with("ERROR: Syntax error:"))) {
+      const size_t spare = kMaxParseCacheKeyBytesPerShard - cache_key.size();
+      while (shard.negative_cache.size() >= max_per_shard ||
+             shard.negative_key_bytes > spare) {
+        const auto victim = shard.negative_cache.begin();
+        shard.negative_key_bytes -= victim->first.size();
+        shard.negative_cache.erase(victim);
       }
-      shard.negative_cache.insert_or_assign(cache_key,
-                                            std::chrono::steady_clock::now());
+      shard.negative_cache.emplace(cache_key, std::chrono::steady_clock::now());
+      shard.negative_key_bytes += cache_key.size();
     }
   }
   return parsed;

@@ -18,7 +18,7 @@ graph TD
     U1 --> R1["Group R"]
   end
   subgraph after["変換後: Distinct(UnionAll(L, R))"]
-    D1["kDistinct"] --> UA["派生 Group union-all-for-distinct:<br>kUnionAll"]
+    D1["kDistinct"] --> UA["派生 Group union-all-for-distinct:+GroupIdsTag(children)<br>kUnionAll"]
     UA --> L2["Group L"]
     UA --> R2["Group R"]
   end
@@ -39,7 +39,8 @@ graph TD
         [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           const GroupId union_all = memo.EnsureDerivedGroup(
-              memo.Get(group).relations, "union-all-for-distinct");
+              memo.Get(group).relations,
+              "union-all-for-distinct:" + GroupIdsTag(expression.children));
           memo.AddExpression(
               union_all,
               LogicalExpression{.operation = LogicalOperator::kUnionAll,
@@ -57,15 +58,15 @@ graph TD
 
 SQL 規格および関係代数では、UNION（DISTINCT）を「UNION ALL の結果に対する DISTINCT 演算」と定義しており、両者は等価です。
 
-- **代数的恒等式**: 実行器（`executor/set_operation.cpp`）における `kUnion` の処理（`AppendDistinct`）は、`kUnionAll`（`AppendAll`）の出力タプルを順次ハッシュセット等の重複排除機構に通すことと完全に一致します。
-- **派生グループの隔離**: `"union-all-for-distinct"` という固有タグを付与した派生グループを生成することにより、生成された `UnionAll` 式が他の無関係なグループと不適切に混線することを防止します。
+- **代数的恒等式**: 実行器（`executor/set_operation.cpp`）の `kUnion` は、各入力の行を順にローカルな `SetOperationRowSet` へ挿入し、新規行だけを出力します(:537-548)。これは `kUnionAll` が各入力を `AppendAll` で連結した後に DISTINCT を適用することと意味的に等価ですが、現行コードは削除済みの `AppendDistinct` ヘルパーを呼ばず、重複排除をインラインで行います。
+- **派生グループの隔離**: `"union-all-for-distinct:" + GroupIdsTag(expression.children)` という、**子グループ ID を指紋に含む**タグを付与した派生グループを生成することにより、生成された `UnionAll` 式が他の無関係なグループと不適切に混線することを防止します。同じリレーション集合の UNION DISTINCT がクエリ内に 2 箇所あっても子 ID が異なれば別グループへ隔離されるため、タグ文字列だけでは混線を防げないという D1 契約の実例です。
 - **物理実装の直交性**: 本 Rule は重複排除の具体的アルゴリズム（Hash, Sort, Skip-Scan）を何ら規定しません。純粋な論理レベルでの演算子分解に徹することで、後続の Implementation Rule による柔軟な最適化の余地を最大化します。
 
 ## 実装の詳細
 
 `plan/cascades.cpp` における変換処理は、2 つの `AddExpression` で完結します。
 
-1. `memo.EnsureDerivedGroup(memo.Get(group).relations, "union-all-for-distinct")` により、同一関係集合を持つ派生グループ `union_all` を取得または作成します。
+1. `memo.EnsureDerivedGroup(memo.Get(group).relations, "union-all-for-distinct:" + GroupIdsTag(expression.children))` により、同一関係集合かつ同一の子グループ ID 集合を持つ派生グループ `union_all` を取得または作成します。子 ID をタグに含めることで、関係集合が同じでも入力が異なる UNION DISTINCT 同士の混線を防ぎます。
 2. 派生グループ `union_all` に、元の `kUnion` と同一の子リストを持つ `kUnionAll` 式を登録します。
 3. 元のグループに、派生グループ `union_all` を唯一の子とする `kDistinct` 式を登録します。
 

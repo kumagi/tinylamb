@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <barrier>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -20,10 +21,15 @@
 
 namespace {
 
+using tinylamb::platform::IsValidSocketFd;
+using tinylamb::platform::SocketFd;
+using tinylamb::platform::kInvalidSocketFd;
+
 // One thread plus one barrier slot per client; an unbounded value turns
 // clients.reserve() and the barrier into a multi-GiB allocation (or a
 // ptrdiff_t overflow) before the load generator can do any useful work.
 constexpr size_t kMaxClients = 65536;
+constexpr size_t kQueryMessageOverhead = 5;
 
 struct Options {
   std::string host{"127.0.0.1"};
@@ -52,7 +58,7 @@ uint32_t ReadUint32(std::string_view input, size_t offset) {
          static_cast<uint32_t>(data[offset + 3]);
 }
 
-bool SendAll(int fd, const std::string& bytes) {
+bool SendAll(SocketFd fd, const std::string& bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
     const ssize_t sent = tinylamb::platform::SendNoSignal(
@@ -69,13 +75,22 @@ bool SendAll(int fd, const std::string& bytes) {
   return true;
 }
 
-bool ReadUntilReady(int fd, bool* server_error) {
+bool ReadUntilReady(SocketFd fd, bool* server_error,
+                    const std::atomic<bool>* stopping = nullptr) {
   std::string input;
   while (true) {
     pollfd descriptor{.fd = static_cast<decltype(pollfd::fd)>(fd),
                       .events = POLLIN,
                       .revents = 0};
-    if (tinylamb::platform::PollSockets(&descriptor, 1, 30000) <= 0) {
+    const int poll_result =
+        tinylamb::platform::PollSockets(&descriptor, 1, 100);
+    if (poll_result == 0) {
+      if (stopping != nullptr && stopping->load()) {
+        return false;
+      }
+      continue;
+    }
+    if (poll_result < 0) {
       return false;
     }
     std::array<char, 8192> buffer{};
@@ -128,16 +143,17 @@ std::string StartupMessage(const Options& options) {
 
 std::string QueryMessage(std::string_view query) {
   std::string message(1, 'Q');
-  AppendUint32(&message, static_cast<uint32_t>(query.size() + 5));
+  AppendUint32(&message,
+               static_cast<uint32_t>(query.size() + kQueryMessageOverhead));
   message.append(query);
   message.push_back('\0');
   return message;
 }
 
-int Connect(const Options& options) {
-  const int fd = tinylamb::platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-  if (fd < 0) {
-    return -1;
+SocketFd Connect(const Options& options) {
+  const SocketFd fd = tinylamb::platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+  if (!IsValidSocketFd(fd)) {
+    return kInvalidSocketFd;
   }
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -147,18 +163,19 @@ int Connect(const Options& options) {
           0 ||
       !SendAll(fd, StartupMessage(options))) {
     tinylamb::platform::CloseSocket(fd);
-    return -1;
+    return kInvalidSocketFd;
   }
   bool server_error = false;
   if (!ReadUntilReady(fd, &server_error) || server_error) {
     tinylamb::platform::CloseSocket(fd);
-    return -1;
+    return kInvalidSocketFd;
   }
   return fd;
 }
 
 bool ParsePositive(std::string_view input, size_t* result) {
-  if (input.empty() || input.front() == '-' || input.front() == '+') {
+  if (input.empty() || input.front() == '-' || input.front() == '+' ||
+      std::isspace(static_cast<unsigned char>(input.front())) != 0) {
     return false;
   }
   char* end = nullptr;
@@ -214,6 +231,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     } else if (argument == "--database") {
       options->database = value;
     } else if (argument == "--query") {
+      if (value.size() >
+          std::numeric_limits<int32_t>::max() - kQueryMessageOverhead) {
+        return false;
+      }
       options->query = value;
     } else {
       return false;
@@ -251,18 +272,24 @@ int main(int argc, char** argv) {
   const std::string query_message = QueryMessage(options.query);
   std::vector<std::thread> clients;
   clients.reserve(options.clients);
-  for (size_t i = 0; i < options.clients; ++i) {
-    clients.emplace_back([&] {
-      const int fd = Connect(options);
-      if (fd < 0) {
+  try {
+    for (size_t i = 0; i < options.clients; ++i) {
+      clients.emplace_back([&] {
+      const SocketFd fd = Connect(options);
+      if (!IsValidSocketFd(fd)) {
         errors.fetch_add(1);
         ready.arrive_and_drop();
         return;
       }
       ready.arrive_and_wait();
+      if (stopping.load()) {
+        tinylamb::platform::CloseSocket(fd);
+        return;
+      }
       while (!stopping.load()) {
         bool server_error = false;
-        if (!SendAll(fd, query_message) || !ReadUntilReady(fd, &server_error) ||
+        if (!SendAll(fd, query_message) ||
+            !ReadUntilReady(fd, &server_error, &stopping) ||
             server_error) {
           errors.fetch_add(1);
           break;
@@ -271,9 +298,23 @@ int main(int argc, char** argv) {
           completed.fetch_add(1);
         }
       }
-      (void)SendAll(fd, std::string("X\0\0\0\4", 5));
+      if (!SendAll(fd, std::string("X\0\0\0\4", 5))) {
+        std::cerr << "warning: failed to send Terminate message\n";
+      }
       tinylamb::platform::CloseSocket(fd);
-    });
+      });
+    }
+  } catch (const std::system_error& error) {
+    stopping.store(true);
+    for (size_t missing = clients.size(); missing < options.clients; ++missing) {
+      ready.arrive_and_drop();
+    }
+    ready.arrive_and_wait();
+    for (std::thread& client : clients) {
+      client.join();
+    }
+    std::cerr << "failed to create client thread: " << error.what() << '\n';
+    return 1;
   }
 
   ready.arrive_and_wait();

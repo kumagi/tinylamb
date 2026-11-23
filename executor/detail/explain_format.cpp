@@ -773,8 +773,14 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       output << pad << "ComputeScalar CASE uses=" << cse_counts.at(*case_key)
              << '\n';
     } else {
+      // slots=N summarizes every CSE slot, so report the total uses across
+      // all of them, not the count of the lexicographically first key.
+      size_t uses = 0;
+      for (const std::string& key : cse_keys) {
+        uses += cse_counts.at(key);
+      }
       output << pad << "ComputeScalar slots=" << cse_keys.size()
-             << " uses=" << cse_counts.at(cse_keys.front()) << '\n';
+             << " uses=" << uses << '\n';
     }
   }
 
@@ -1137,62 +1143,11 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                              !source.using_columns.empty();
                     });
 
-    // Collect projected table aliases for join elimination detection.
-    // SELECT * has null expressions, so mark all aliases as projected.
-    std::unordered_set<std::string> projected_aliases;
-    projected_aliases.reserve(statement.SelectList().size());
-    bool select_all = false;
-    for (const NamedExpression& item : statement.SelectList()) {
-      if (!item.expression) {
-        select_all = true;
-        break;
-      }
-      for (const ColumnName& col : item.expression->TouchedColumns()) {
-        if (!col.schema.empty()) {
-          projected_aliases.insert(col.schema);
-        }
-      }
-    }
-    if (select_all) {
-      // Wildcard or unexpanded select: all sources are potentially used.
-      for (const SelectSource& source : statement.Sources()) {
-        const std::string& alias =
-            source.alias.empty() ? source.table : source.alias;
-        projected_aliases.insert(alias);
-      }
-    }
-    // Also check WHERE clause references.
-    if (statement.WhereClause()) {
-      for (const ColumnName& col : statement.WhereClause()->TouchedColumns()) {
-        if (!col.schema.empty()) {
-          projected_aliases.insert(col.schema);
-        }
-      }
-    }
-    // Only do join elimination when we have positive evidence of which
-    // sources are used.  An empty set with no star expansion could mean
-    // columns resolved to empty schemas (subqueries) or genuine
-    // aggregate-only queries like COUNT(*).  In both cases we must
-    // NOT eliminate inner joins because the result depends on the join
-    // producing the correct row set.
-    //
-    // Aggregate-only queries are deliberately not an exception here.  An
-    // inner join can filter rows or multiply them even when no joined column
-    // is projected (COUNT(*) is the simplest counterexample), so eliminating
-    // such a join without a proven key/foreign-key relationship changes the
-    // result.
-    [[maybe_unused]] const bool can_eliminate = !projected_aliases.empty();
-
     // The relational executor never removes an INNER join (that would need
     // a proven foreign-key / unique-key relationship: an unmatched or
-    // duplicated dimension row changes the result), so its estimate must not
-    // claim such an elimination either. Plans produced by the Cascades core
+    // duplicated dimension row changes the result), so this EXPLAIN path
+    // models no join elimination at all. Plans produced by the Cascades core
     // carry their own JoinElimination annotation (SqlEngine EXPLAIN).
-    const size_t eliminated_dimensions = 0;
-    if (eliminated_dimensions > 0) {
-      output << pad << "JoinElimination dimensions=" << eliminated_dimensions
-             << '\n';
-    }
 
     EstimatedPlanNode plan;
     bool any_join_remaining = false;
@@ -1238,23 +1193,6 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                                  : CombineConjuncts(all_predicates),
           schema_only);
 
-      // Filter out eliminated dimension tables from the greedy path.
-      if (eliminated_dimensions > 0) {
-        std::vector<EstimatedPlanNode> filtered;
-        filtered.reserve(nodes.size());
-        for (size_t i = 0; i < nodes.size(); ++i) {
-          const SelectSource& src = statement.Sources()[i];
-          if (src.join_type == JoinType::kInner) {
-            const std::string& alias =
-                src.alias.empty() ? src.table : src.alias;
-            if (!projected_aliases.contains(alias)) {
-              continue;  // skip eliminated dimension
-            }
-          }
-          filtered.push_back(std::move(nodes[i]));
-        }
-        nodes = std::move(filtered);
-      }
       size_t first = 0;
       for (size_t i = 1; i < nodes.size(); ++i) {
         if (nodes[i].rows < nodes[first].rows) {

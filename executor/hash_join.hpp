@@ -158,7 +158,8 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // NOT DISTINCT FROM equijoin matches NULL to NULL) and the residual
   // predicate retained by the plan.  When any key is null-safe the key
   // encoder folds NULL into a comparable sentinel so `NULL IS NOT DISTINCT
-  // FROM NULL` joins correctly.
+  // FROM NULL` joins correctly. Configure before starting the join; the
+  // execution state and worker key encoders borrow this configuration.
   void SetJoinAnnotations(std::vector<bool> key_null_safe,
                           Expression residual_note) {
     key_null_safe_ = std::move(key_null_safe);

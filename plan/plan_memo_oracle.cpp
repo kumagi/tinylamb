@@ -213,19 +213,31 @@ std::string CheckMemoInvariants(const cascades::Memo& memo,
           }
           const uint64_t left = memo.Get(expression.children[0]).relation_mask;
           const uint64_t right = memo.Get(expression.children[1]).relation_mask;
+          // Neither side may be empty: the left side is the rows the operator
+          // returns and the right side supplies existence. Check both even
+          // when they equal a (possibly empty) parent mask, otherwise the
+          // branch below could skip the check entirely.
+          if (left == 0) {
+            return "semi/anti join in group " + std::to_string(group_id) +
+                   " has an empty left relation set";
+          }
+          if (right == 0) {
+            return "semi/anti join in group " + std::to_string(group_id) +
+                   " has an empty right relation set";
+          }
           // A semi/anti join's right side only supplies existence, so its
           // relations are not necessarily part of the parent group's relation
           // set: e.g. semi_join_commutativity builds (R semi T) semi S where
           // the parent covers R|T and the right side S is outside it. Hence
           // MasksPartition cannot be required when `left` covers the whole
-          // parent. An empty right relation set, however, is never meaningful
-          // and must be reported even in that case.
-          if (right == 0) {
-            return "semi/anti join in group " + std::to_string(group_id) +
-                   " has an empty right relation set";
-          }
-          if (left != group.relation_mask &&
-              !MasksPartition(group.relation_mask, {left, right})) {
+          // parent. The two sides must still be disjoint, though: a bogus
+          // (R semi R) would otherwise bypass partition validation altogether.
+          if (left == group.relation_mask) {
+            if ((left & right) != 0) {
+              return "semi/anti join in group " + std::to_string(group_id) +
+                     " has overlapping left and right relation sets";
+            }
+          } else if (!MasksPartition(group.relation_mask, {left, right})) {
             return "semi/anti join in group " + std::to_string(group_id) +
                    " does not match parent relation set";
           }
@@ -311,17 +323,23 @@ std::string CheckExploreEquivalence(const GeneratedJoinGraph& graph) {
     }
   }
   // 4. Reduced-rule-set sanity: removing the two associativity rules must not
-  // break exploration. We deliberately do NOT assert that a subset enumerates
-  // fewer root alternatives than the full set: rule interactions can change
-  // derived-group tags/reachability, and the expression cap can trip during
-  // one exploration but not the other, so a subset may legitimately yield
-  // more alternatives. Comparing counts here would be a false positive.
+  // break exploration. We deliberately do NOT compare counts in general: rule
+  // interactions can change derived-group tags/reachability, and the expression
+  // cap can trip during one exploration but not the other, so a subset may
+  // legitimately yield more alternatives. A total collapse to a single root
+  // alternative while the full set enumerates many is not a benign count
+  // difference, though -- it means a rule lost reachability.
   {
     cascades::RuleSet reduced = cascades::RuleSet::Default();
     reduced.Remove("join_associativity_left");
     reduced.Remove("join_associativity_right");
-    if (ExploreRootCount(graph, reduced) == 0) {
+    const size_t reduced_count = ExploreRootCount(graph, reduced);
+    if (reduced_count == 0) {
       return "reduced rule set left root empty for " + where;
+    }
+    if (reduced_count == 1 && explored_root_count > 1) {
+      return "reduced rule set collapsed to one alternative for " + where +
+             ": reduced=1 full=" + std::to_string(explored_root_count);
     }
   }
   return "";

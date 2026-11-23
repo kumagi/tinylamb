@@ -46,6 +46,9 @@ int main(int argc, char** argv) {
     // binary and must be replayed verbatim.
     std::string file_content((std::istreambuf_iterator<char>(case_data)),
                              std::istreambuf_iterator<char>());
+    // Keep the current file in stderr: a batch replay aborting on one of many
+    // .test files must still say which input caused the failure.
+    LOG(INFO) << "test: " << file.path();
     TestCase(file_content);
   }
   return 0;

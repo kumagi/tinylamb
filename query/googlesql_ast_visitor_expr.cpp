@@ -251,7 +251,7 @@ StatusOr<uint64_t> ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
 // Window inner LIMIT is stored as size_t; a uint64 literal that does not
 // fit (32-bit targets) must clamp to "unlimited", never truncate to a
 // smaller limit.
-size_t WindowLimitFromUint64(uint64_t v) {
+static size_t WindowLimitFromUint64(uint64_t v) {
   return static_cast<size_t>(std::min<uint64_t>(
       v, static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
 }
@@ -261,7 +261,7 @@ size_t WindowLimitFromUint64(uint64_t v) {
 // check plus a trailing-whitespace allowance keeps '+3' and ' 3 ' working
 // while compound forms ('1-2') yield 0 — TryParse stays the validity
 // authority and every Amount() consumer rejects compound units anyway.
-int64_t ParseIntervalAmount(const std::string& raw) {
+static int64_t ParseIntervalAmount(const std::string& raw) {
   const char* s = raw.c_str();
   char* end = nullptr;
   errno = 0;
@@ -477,9 +477,15 @@ StatusOr<std::string> DecodeStringEscapesImpl(std::string_view value_view,
             oct_str.push_back(value[++i]);
           }
         }
+        if (oct_str.size() != 3) {
+          return AstError<std::string>("octal escape requires three digits");
+        }
         try {
-          auto raw_byte =
+          const auto raw_byte =
               static_cast<uint32_t>(std::stoul(oct_str, nullptr, 8));
+          if (is_bytes && raw_byte > 0xFF) {
+            return AstError<std::string>("octal byte escape exceeds 255");
+          }
           if (is_bytes || raw_byte <= 0x7F) {
             decoded.push_back(static_cast<char>(raw_byte));
           } else {
@@ -741,6 +747,9 @@ StatusOr<Expression> FoldBoolean(
                            // ExpressionDepthGuard in VisitExpression.
   Expression result;
   for (const auto& child : node.children) {
+    if (IsAstTrivia(child->kind)) {
+      continue;
+    }
     ASSIGN_OR_RETURN(Expression, hv38172_0, (VisitExpression(*child)));
     Expression next = std::move(hv38172_0);
     result = result
@@ -851,7 +860,7 @@ Expression SubstituteUdfParameter(const std::string& path_name) {
   return nullptr;
 }
 Expression WrapIfBoolean(Expression expr, const GoogleSqlAstNode& node) {
-  if (IsBooleanAstNode(node)) {
+  if (IsPredicateAstNode(node)) {
     return CaseExpressionExp(
         {{std::move(expr), ConstantValueExp(Value(std::string("true")))}},
         ConstantValueExp(Value(std::string("false"))));
@@ -859,11 +868,6 @@ Expression WrapIfBoolean(Expression expr, const GoogleSqlAstNode& node) {
   return expr;
 }
 
-// Strict UTF-8 validator: BYTES -> STRING casts must reject the sequences
-// GoogleSQL refuses (surrogates, overlong forms, truncated tails) instead of
-// passing mojibake through.
-// IsValidUtf8Text now lives in common/string_util.hpp (canonical validator
-// shared with the expression layer's proto-CAST gate).
 // Validate cast coercibility for literal struct sources. Anything not
 // statically checkable is left to the existing runtime behavior untouched.
 Status ValidateStructCastCoercibility(const GoogleSqlAstNode& node, bool safe) {
@@ -1176,6 +1180,10 @@ SelectSource MakeLambdaArrayBindingSource(Expression array_expr) {
   SelectSource source;
   source.query = std::move(arg_query);
   source.alias = "__lambda_array_binding";
+  // array_expr can reference columns of an enclosing row (e.g. t.arr in
+  // ARRAY_TRANSFORM(t.arr, ...)). Without LATERAL the derived table is
+  // evaluated in isolation and loses that correlation.
+  source.is_lateral = true;
   return source;
 }
 
@@ -1512,7 +1520,13 @@ StatusOr<Expression> VisitFunction(
     }
   }
   std::vector<Expression> arguments;
-  arguments.reserve(node.children.size());
+  const auto argument_count = std::count_if(
+      node.children.begin() + 1, node.children.end(), [](const auto& child) {
+        return child->kind != "Location" && child->kind != "WhereClause" &&
+               child->kind != "HavingModifier" && child->kind != "OrderBy" &&
+               child->kind != "LimitOffset";
+      });
+  arguments.reserve(static_cast<size_t>(argument_count) + static_cast<size_t>(median_alias));
   AggregateHavingModifier having = AggregateHavingModifier::kNone;
   Expression having_condition;
   Expression where_filter;
@@ -1599,6 +1613,12 @@ StatusOr<Expression> VisitFunction(
           }
         }
       }
+      if (child.Child("Offset") != nullptr) {
+        // There is no inner-offset slot: silently dropping OFFSET would
+        // return rows from the start instead of the requested offset, so
+        // fail loudly like the non-literal LIMIT case above.
+        return AstError<Expression>("aggregate OFFSET is not supported");
+      }
       continue;
     }
     ASSIGN_OR_RETURN(Expression, hv65853_0, (VisitExpression(child)));
@@ -1672,11 +1692,7 @@ StatusOr<Expression> VisitFunction(
     // number): the trailing arguments ride along as per-row extras.
     if (type == AggregationType::kApproxTopCount ||
         type == AggregationType::kApproxTopSum) {
-      std::vector<Expression> extras;
-      for (size_t i = 1; i < arguments.size(); ++i) {
-        extras.push_back(arguments[i]);
-      }
-      aggregate->SetExtraArgs(std::move(extras));
+      aggregate->SetExtraArgs({arguments.begin() + 1, arguments.end()});
     }
     // ARRAY_AGG keeps a statically inferred element type: runtime values
     // cannot distinguish BOOL from INT64 or INT32 from INT64.
@@ -1722,20 +1738,13 @@ StatusOr<Expression> VisitFunction(
       name == "array_agg" || name == "string_agg" || name == "countif" ||
       name == "bit_and" || name == "bit_or" || name == "bit_xor" ||
       name == "array_concat_agg" || name == "elementwise_sum" ||
-      name == "elementwise_avg" || name == "any_value" || name == "mode" ||
-      name == "approx_top_count" || name == "approx_top_sum") {
+      name == "elementwise_avg" || name == "any_value" || name == "mode") {
     const bool is_bit =
         name == "bit_and" || name == "bit_or" || name == "bit_xor";
-    const bool is_approx_top =
-        name == "approx_top_count" || name == "approx_top_sum";
-    const size_t approx_arity = name == "approx_top_count" ? 2 : 3;
     // STRING_AGG accepts 1 or 2 arguments and is exempt from the strict
     // single-argument aggregate arity check.
-    const bool arity_checked =
-        !is_bit && !is_approx_top && name != "string_agg";
-    const bool arity_ok = !arity_checked || arguments.size() == 1 ||
-                          (is_bit && arguments.size() == 2) ||
-                          (is_approx_top && arguments.size() == approx_arity);
+    const bool arity_ok =
+        is_bit || name == "string_agg" || arguments.size() == 1;
     if (!arity_ok) {
       return AstError<Expression>("GoogleSQL AST: aggregate arity");
     }
@@ -1767,10 +1776,9 @@ StatusOr<Expression> VisitFunction(
     if (name == "countif") {
       type = AggregationType::kCountIf;
     }
-    // ANY_VALUE may legally return any non-NULL group value; MIN provides
-    // that with deterministic streaming semantics.
+    // Preserve the SQL aggregate identity for EXPLAIN and plan dumps.
     if (name == "any_value") {
-      type = AggregationType::kMin;
+      type = AggregationType::kAnyValue;
     }
     if (name == "mode") {
       type = AggregationType::kMode;
@@ -1793,12 +1801,6 @@ StatusOr<Expression> VisitFunction(
     if (name == "elementwise_avg") {
       type = AggregationType::kElementwiseAvg;
     }
-    if (name == "approx_top_count") {
-      type = AggregationType::kApproxTopCount;
-    }
-    if (name == "approx_top_sum") {
-      type = AggregationType::kApproxTopSum;
-    }
     return finish_aggregate(type);
   }
 
@@ -1810,9 +1812,7 @@ StatusOr<Expression> VisitFunction(
     size_t min_arity = 1;
     size_t max_arity = 1;
     bool matched = true;
-    if (name == "any_value") {
-      extended = AggregationType::kAnyValue;
-    } else if (name == "var_samp" || name == "variance") {
+    if (name == "var_samp" || name == "variance") {
       extended = AggregationType::kVarSamp;
     } else if (name == "var_pop") {
       extended = AggregationType::kVarPop;
@@ -1928,6 +1928,16 @@ StatusOr<Expression> VisitFunction(
     if (base == "cast" || base == "extract" || base == "if") {
       return AstError<Expression>(
           "GoogleSQL AST: SAFE. prefix does not apply to " + name);
+    }
+    // SAFE.<udf> must expand the UDF body first: a raw
+    // FunctionCallExp("my_udf") is not a builtin, so it would always error
+    // into NULLIFERROR's NULL instead of computing the function.
+    if (FindUdf(base) != nullptr) {
+      auto expanded = ExpandUdfCall(base, std::move(arguments));
+      if (!expanded.HasValue()) {
+        return expanded.GetStatus();
+      }
+      return FunctionCallExp("nulliferror", {expanded.MoveValue()});
     }
     return FunctionCallExp("nulliferror",
                            {FunctionCallExp(base, std::move(arguments))});
@@ -2353,8 +2363,18 @@ StatusOr<std::string> InferAggregateArrayElementType(
 }
 
 StatusOr<std::string> DecodeBytes(const GoogleSqlAstNode& node) {
+  size_t component_bytes = 0;
+  size_t components = 0;
+  for (const auto& child : node.children) {
+    if (child->kind == "BytesLiteralComponent") {
+      component_bytes += child->detail.size();
+      ++components;
+    }
+  }
   std::string result;
-  result.reserve(node.children.size());
+  if (components > 1) {
+    result.reserve(component_bytes);
+  }
   bool found_component = false;
   for (const auto& child : node.children) {
     if (child->kind == "BytesLiteralComponent") {
@@ -2598,6 +2618,7 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
     }
   }
   if (const GoogleSqlAstNode* partition = spec.Child("PartitionBy")) {
+    parts.partition_by.reserve(partition->children.size());
     for (const auto& child : partition->children) {
       if (child->kind == "Location") {
         continue;
@@ -2691,7 +2712,14 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
   RecoverNullTreatment(*call, &window->respect_nulls, &window->ignore_nulls);
 
   std::vector<WindowOrderTerm> inner_order_by;
-  inner_order_by.reserve(call->children.size());
+  const auto argument_count = std::count_if(
+      call->children.begin() + static_cast<ptrdiff_t>(arg_start),
+      call->children.end(), [](const auto& child) {
+        return child->kind != "Location" && child->kind != "WhereClause" &&
+               child->kind != "OrderBy" && child->kind != "LimitOffset";
+      });
+  window->args.reserve(static_cast<size_t>(argument_count) +
+                       static_cast<size_t>(median_window_alias));
   for (size_t i = arg_start; i < call->children.size(); ++i) {
     const GoogleSqlAstNode& child = *call->children[i];
     if (child.kind == "Location") {
@@ -2711,8 +2739,12 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
     if (child.kind == "OrderBy") {
       ASSIGN_OR_RETURN(std::vector<WindowOrderTerm>, h_terms,
                        (ParseOrderingList(child)));
-      for (WindowOrderTerm& term : h_terms) {
-        inner_order_by.push_back(std::move(term));
+      if (inner_order_by.empty()) {
+        inner_order_by = std::move(h_terms);
+      } else {
+        for (WindowOrderTerm& term : h_terms) {
+          inner_order_by.push_back(std::move(term));
+        }
       }
       continue;
     }
@@ -2846,6 +2878,14 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
       }
       return true;
     };
+    // all_digits() plus the bounded field lengths below make every value at
+    // most four digits. Use from_chars so no parse exception can ever escape
+    // across a Status boundary (std::stoi throws on malformed input).
+    const auto to_int = [](std::string_view s) {
+      int out = 0;
+      const auto parsed = std::from_chars(s.data(), s.data() + s.size(), out);
+      return parsed.ec == std::errc() ? out : 0;
+    };
     int tz_hours = 0;
     int tz_mins = 0;
     bool valid_offset = false;
@@ -2855,17 +2895,17 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
       const std::string mins = tz_part.substr(colon + 1);
       if (hours.size() <= 2 && mins.size() == 2 && all_digits(hours) &&
           all_digits(mins)) {
-        tz_hours = std::stoi(hours);
-        tz_mins = std::stoi(mins);
+        tz_hours = to_int(hours);
+        tz_mins = to_int(mins);
         valid_offset = tz_hours <= 14 && tz_mins <= 59;
       }
     } else if (all_digits(tz_part)) {
       if (tz_part.size() == 4) {
-        tz_hours = std::stoi(tz_part.substr(0, 2));
-        tz_mins = std::stoi(tz_part.substr(2, 2));
+        tz_hours = to_int(tz_part.substr(0, 2));
+        tz_mins = to_int(tz_part.substr(2, 2));
         valid_offset = tz_hours <= 14 && tz_mins <= 59;
       } else if (tz_part.size() <= 2) {
-        tz_hours = std::stoi(tz_part);
+        tz_hours = to_int(tz_part);
         valid_offset = tz_hours <= 14;
       }
     }
@@ -2879,11 +2919,13 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
   if (base_time.size() > 10 && (base_time[10] == 'T' || base_time[10] == 't')) {
     base_time[10] = ' ';
   }
-  int Y = 0, M = 0, D = 0, h = 0, m = 0;
-  double s_val = 0;
+  int Y = 0, M = 0, D = 0, h = 0, m = 0, seconds = 0;
+  int seconds_end = 0;
+  // Keep fractional digits separate so rounding a double cannot change the
+  // whole second before we apply a time zone offset.
   // NOLINTNEXTLINE(cert-err34-c) `matched` is checked below
-  int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%lf", &Y, &M, &D, &h,
-                       &m, &s_val);
+  int matched = sscanf(base_time.c_str(), "%d-%d-%d %d:%d:%2d%n", &Y, &M, &D,
+                       &h, &m, &seconds, &seconds_end);
   if (matched < 3) {
     // NOLINTNEXTLINE(cert-err34-c) `matched` is checked below
     matched = sscanf(base_time.c_str(), "%d-%d-%d", &Y, &M, &D);
@@ -2894,12 +2936,16 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     // silently turn TIMESTAMP comparisons into string comparisons.
     return std::nullopt;
   }
+  if (matched == 6 && static_cast<size_t>(seconds_end) < base_time.size() &&
+      std::isdigit(static_cast<unsigned char>(base_time[seconds_end])) != 0) {
+    return std::nullopt;
+  }
   // Validate the calendar date and clock fields: TimeGm below normalizes
   // out-of-range fields like mktime, so 2026-02-29 used to roll silently to
   // March 1 and second=60 (leap second) used to advance a minute. BigQuery
   // rejects both.
   if (Y < 1 || Y > 9999 || M < 1 || M > 12 || h < 0 || h > 23 || m < 0 ||
-      m > 59 || s_val < 0 || s_val >= 60) {
+      m > 59 || seconds < 0 || seconds >= 60) {
     return std::nullopt;
   }
   {
@@ -2956,11 +3002,10 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     }
   }
   if (!has_explicit_tz) {
-    total_offset_secs = ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
-                                            static_cast<int>(s_val));
-  } else if (!named_zone.empty()) {
     total_offset_secs =
-        ParseTimeZoneOffset(named_zone, Y, M, D, h, m, static_cast<int>(s_val));
+        ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m, seconds);
+  } else if (!named_zone.empty()) {
+    total_offset_secs = ParseTimeZoneOffset(named_zone, Y, M, D, h, m, seconds);
   }
   struct tm t = {};
   t.tm_year = Y - 1900;
@@ -2970,13 +3015,13 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
   t.tm_min = m;
   // TimeGm/timegm normalize out-of-range fields, so subtracting the whole
   // offset (including sub-minute seconds) here is safe.
-  t.tm_sec = static_cast<int>(s_val) - total_offset_secs;
+  t.tm_sec = seconds - total_offset_secs;
   t.tm_isdst = 0;
   const int64_t epoch = platform::TimeGm(&t);
   struct tm utc = {};
   platform::GmTime(epoch, &utc);
-  std::array<char, 64> buf{};
-  size_t dot_pos = text.find('.');
+  std::string_view fraction;
+  const size_t dot_pos = text.find('.');
   if (dot_pos != std::string::npos) {
     size_t end_digit = dot_pos + 1;
     while (end_digit < text.size() && text[end_digit] >= '0' &&
@@ -2988,16 +3033,20 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
       // malformed "...:00.+00". GoogleSQL rejects that spelling.
       return std::nullopt;
     }
-    std::string frac_str = text.substr(dot_pos, end_digit - dot_pos);
-    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d%s+00",
-                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
-                   utc.tm_min, utc.tm_sec, frac_str.c_str());
-  } else {
-    (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d+00",
-                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
-                   utc.tm_min, utc.tm_sec);
+    fraction = std::string_view(text).substr(dot_pos, end_digit - dot_pos);
   }
-  return std::string{buf.data()};
+  std::array<char, 32> base{};
+  const int length =
+      snprintf(base.data(), base.size(), "%04d-%02d-%02d %02d:%02d:%02d",
+               utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour,
+               utc.tm_min, utc.tm_sec);
+  if (length < 0 || static_cast<size_t>(length) >= base.size()) {
+    return std::nullopt;
+  }
+  std::string normalized(base.data(), static_cast<size_t>(length));
+  normalized.append(fraction);
+  normalized += "+00";
+  return normalized;
 }
 
 // Validates the clock fields (H:M:S[.fraction]) of a DATETIME/TIME literal.
@@ -3420,6 +3469,12 @@ StatusOr<Expression> VisitExpression(
       }
       std::string dt_str = text;
       if (dt_str.find(":59:60") != std::string::npos) {
+        // IsValidCivilTimeLiteral accepts ' ', 'T' and 't' as the date/time
+        // separator, but the sscanf format below needs a literal space. An
+        // ISO 'T' would stop the scan at the hour, leaving second=60 intact.
+        if (dt_str.size() > 10 && (dt_str[10] == 'T' || dt_str[10] == 't')) {
+          dt_str[10] = ' ';
+        }
         int Y = 0, M = 0, D = 0, h = 0;
         // NOLINTNEXTLINE(cert-err34-c): outcome is checked via >= 4 below
         if (sscanf(dt_str.c_str(), "%d-%d-%d %d", &Y, &M, &D, &h) >= 4) {
@@ -3694,8 +3749,21 @@ StatusOr<Expression> VisitExpression(
     }
     if (node.detail == "-") {
       if (node.children[0]->kind == "IntLiteral" &&
-          node.children[0]->detail == "9223372036854775808") {
-        return ConstantValueExp(Value(std::numeric_limits<int64_t>::min()));
+          (node.children[0]->detail.size() <= 2 ||
+            node.children[0]->detail[0] != '0' ||
+            (node.children[0]->detail[1] != 'x' &&
+             node.children[0]->detail[1] != 'X'))) {
+        ASSIGN_OR_RETURN(uint64_t, magnitude,
+                         ParseUnsignedLiteral(*node.children[0]));
+        constexpr uint64_t kInt64MinMagnitude = uint64_t{1} << 63;
+        if (magnitude == kInt64MinMagnitude) {
+          return ConstantValueExp(Value(std::numeric_limits<int64_t>::min()));
+        }
+        if (magnitude > kInt64MinMagnitude) {
+          return AstError<Expression>(
+              "GoogleSQL AST: negative integer literal out of INT64 range " +
+              node.children[0]->detail);
+        }
       }
     }
     if (node.detail == "NOT") {
@@ -4150,6 +4218,8 @@ StatusOr<Expression> VisitExpression(
         }
         if (v.type == ValueType::kVarChar) {
           std::string str_val = std::string(v.value.varchar_value);
+          // ParseIntervalAmount returns a plain int64_t (0 on malformed text),
+          // not a StatusOr; TryParse below is the validity authority.
           const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(str_val.empty()
                                            ? std::string_view("0")
@@ -4168,6 +4238,11 @@ StatusOr<Expression> VisitExpression(
         std::string col_name = expr->AsColumnValue().GetColumnName().name;
         if (HasSessionConstant(col_name)) {
           std::string str_val = GetSessionConstant(col_name);
+          // Keep the numeric amount in sync with the string passed to the
+          // IntervalExpression. TryParse below validates the complete value;
+          // ParseIntervalAmount extracts the leading amount just like the
+          // direct STRING-literal path above.
+          const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(
                    (str_val.empty() ? std::string("0") : str_val), unit)
                    .HasValue()) {
@@ -4175,7 +4250,8 @@ StatusOr<Expression> VisitExpression(
                 StatusCode::kInvalidArgument,
                 "unsupported INTERVAL literal: session-constant interval");
           }
-          return IntervalExpressionExp(0, std::move(unit), std::move(str_val));
+          return IntervalExpressionExp(amount, std::move(unit),
+                                       std::move(str_val));
         }
         return FunctionCallExp(
             "make_interval",
@@ -4196,6 +4272,8 @@ StatusOr<Expression> VisitExpression(
         }
         if (v.Value().type == ValueType::kVarChar) {
           std::string str_val = std::string(v.Value().value.varchar_value);
+          // ParseIntervalAmount returns a plain int64_t (0 on malformed text),
+          // not a StatusOr; TryParse below is the validity authority.
           const int64_t amount = ParseIntervalAmount(str_val);
           if (!IntervalValue::TryParse(str_val.empty()
                                            ? std::string_view("0")
@@ -4214,6 +4292,7 @@ StatusOr<Expression> VisitExpression(
           "make_interval", {expr, ConstantValueExp(Value(std::string(unit)))});
     }
     if (!node.children.empty() && node.children[0]->kind == "StringLiteral") {
+      // DecodeString returns StatusOr; ASSIGN_OR_RETURN propagates any error.
       ASSIGN_OR_RETURN(std::string, hv131942_0,
                        (DecodeString(*node.children[0])));
       std::string res = std::move(hv131942_0);
@@ -4394,6 +4473,7 @@ StatusOr<Expression> VisitExpression(
       node.kind == "StructConstructorWithParens") {
     std::vector<std::string> field_names;
     if (const GoogleSqlAstNode* st = node.Child("StructType")) {
+      field_names.reserve(st->children.size());
       for (const auto& child : st->children) {
         if (child->kind == "StructField") {
           if (const GoogleSqlAstNode* id = child->Child("Identifier")) {
@@ -4584,7 +4664,7 @@ StatusOr<Expression> VisitExpression(
       struct_value.SetCollation(
           static_cast<uint8_t>(Collation::kCaseInsensitive));
     }
-    return ConstantValueExp(std::move(struct_value));
+    return ConstantValueExp(struct_value);
   }
 
   if (node.kind == "DotIdentifier") {
@@ -4701,14 +4781,15 @@ StatusOr<Expression> VisitExpression(
            ConstantValueExp(Value(std::move(node_detail))),
            ConstantValueExp(Value(std::move(quantifier_copy)))});
     }
-    // PRODUCTION FIX: a QuantifiedComparisonExpression with no query and no
-    // list dereferenced a null node here and crashed the process (the AST is
-    // fuzzer/untrusted input). Fail loudly instead.
+    // A quantified comparison must carry either a query or a list node; the
+    // AST is fuzzer/untrusted input, so one with neither is malformed. Fail
+    // loudly instead of dereferencing the null list below.
     if (list_node == nullptr) {
       return AstError<Expression>(
           "GoogleSQL AST: malformed quantified comparison (missing list)");
     }
     std::vector<Expression> items;
+    items.reserve(list_node->children.size());
     for (const auto& child : list_node->children) {
       if (child->kind != "Location") {
         ASSIGN_OR_RETURN(Expression, hv149841_0, (VisitExpression(*child)));
@@ -4786,12 +4867,21 @@ StatusOr<Expression> VisitExpression(
     const bool is_any = UpperCopy(any_op->detail) == "ANY" ||
                         UpperCopy(any_op->detail) == "SOME";
     std::vector<Expression> patterns;
+    patterns.reserve(list_node->children.size());
     for (const auto& child : list_node->children) {
       if (child->kind != "Location") {
         ASSIGN_OR_RETURN(Expression, hv152598_0, (VisitExpression(*child)));
         patterns.push_back(std::move(hv152598_0));
       }
     }
+    // NOT distributes over the quantified list by De Morgan: NOT(x LIKE ANY
+    // ps) is (x NOT LIKE p1) AND (x NOT LIKE p2), and NOT(x LIKE ALL ps) is
+    // (x NOT LIKE p1) OR (x NOT LIKE p2).  The subquery arm above applies the
+    // negation at the quantifier level; here the negation is pushed into each
+    // term, so the combining operator must be flipped as well.  Keeping ANY
+    // as OR when negated used to make `x NOT LIKE ANY (p1, p2)` true whenever
+    // either pattern failed to match -- nearly always the wrong answer.
+    const bool combine_with_or = negated ? !is_any : is_any;
     Expression chain;
     for (Expression& pattern : patterns) {
       Expression term =
@@ -4801,7 +4891,7 @@ StatusOr<Expression> VisitExpression(
       }
       if (chain == nullptr) {
         chain = std::move(term);
-      } else if (is_any) {
+      } else if (combine_with_or) {
         chain = BinaryExpressionExp(std::move(chain), BinaryOperation::kOr,
                                     std::move(term));
       } else {
@@ -4966,6 +5056,7 @@ bool NeedsRelationalEvaluation(
 }
 StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
                                           bool is_triple, char quote) {
+  // Forward the StatusOr unchanged; errors reach the caller untouched.
   return DecodeStringEscapesImpl(value, is_bytes, is_triple, quote);
 }
 std::optional<std::string> NormalizeTimestampText(const std::string& text) {

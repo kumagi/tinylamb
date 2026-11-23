@@ -196,6 +196,26 @@ TEST(SpillStoreTest, TempLimitEnforcesNoSpaceAndRecoversAfterDrop) {
             Status::kSuccess);
 }
 
+TEST(SpillStoreTest, WriterRejectsNullBufferWithNonzeroLength) {
+  TempDirGuard dir("spill_store_null_buffer");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  SpillSegmentWriter writer(&store, /*buffer_bytes=*/4096);
+  EXPECT_EQ(writer.Write(nullptr, 1), StatusCode::kInvalidArgument);
+  EXPECT_EQ(writer.Write(nullptr, 4096), StatusCode::kInvalidArgument);
+  EXPECT_EQ(store.Stats().live_segments, 0U);
+  EXPECT_EQ(writer.BytesWritten(), 0U);
+
+  ASSERT_EQ(writer.Write(nullptr, 0), Status::kSuccess);
+  const uint8_t value = 42;
+  ASSERT_EQ(writer.Write(&value, 1), Status::kSuccess);
+  auto id = writer.Finish();
+  ASSERT_TRUE(id.HasValue());
+  SpillSegmentReader reader(&store, id.Value());
+  uint8_t actual = 0;
+  ASSERT_EQ(reader.ReadExact(&actual, 1), Status::kSuccess);
+  EXPECT_EQ(actual, value);
+}
+
 TEST(SpillStoreTest, InjectedIoFailureRollsBackWithoutLeakingBlocks) {
   TempDirGuard dir("spill_store_fault");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
@@ -223,8 +243,14 @@ TEST(SpillStoreTest, InjectedIoFailureRollsBackWithoutLeakingBlocks) {
   const SpillStoreStats after_abort = store.Stats();
   EXPECT_EQ(after_abort.live_segments, 0U);
   EXPECT_EQ(after_abort.current_active_bytes, 0U);
+  EXPECT_EQ(after_abort.peak_physical_file_bytes, 0U);
 
   // Mid-multi-slice failure (2nd block fails): verify full rollback too.
+  auto live = store.AllocateSegment();
+  ASSERT_TRUE(live.HasValue());
+  const uint8_t sentinel = 7;
+  ASSERT_EQ(store.Append(live.Value(), &sentinel, 1), Status::kSuccess);
+  EXPECT_EQ(store.Stats().physical_file_bytes, 1U);
   {
     SpillSegmentWriter writer(&store, /*buffer_bytes=*/0);
     ASSERT_EQ(writer.EnsureOpen(), Status::kSuccess);
@@ -232,9 +258,14 @@ TEST(SpillStoreTest, InjectedIoFailureRollsBackWithoutLeakingBlocks) {
     std::vector<uint8_t> two_blocks(SpillStore::kBlockSize + 4096, 0x22);
     const Status st = writer.Write(two_blocks.data(), two_blocks.size());
     EXPECT_EQ(st.GetCode(), StatusCode::kIOError);
+    EXPECT_EQ(store.Stats().physical_file_bytes, 2 * SpillStore::kBlockSize);
+    EXPECT_EQ(store.Stats().peak_physical_file_bytes,
+              2 * SpillStore::kBlockSize);
   }
+  store.DropSegment(live.Value());
   EXPECT_EQ(store.Stats().live_segments, 0U);
   EXPECT_EQ(store.Stats().current_active_bytes, 0U);
+  EXPECT_EQ(store.Stats().physical_file_bytes, 0U);
 
   // Subsequent clean write succeeds normally.
   SpillSegmentWriter writer(&store, /*buffer_bytes=*/4096);
@@ -323,7 +354,7 @@ TEST(SpillStoreTest, ConcurrentDropAndClearDeferWhileAppendInFlight) {
     });
 
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
     // Wait for the writer to reach the contending state, not for it to finish:
     // waiting on a completion flag instead would let a fast writer make the
     // test pass vacuously before Drop/Clear ever overlaps with the append.
@@ -483,13 +514,13 @@ TEST(SpillStoreTest, ExplicitlyEmptyTempDirBeatsEnvironmentFallback) {
     std::string value;
     ~EnvRestore() {
       if (had) {
-        (void)platform::SetEnv("TINYLAMB_TEMP_DIR", value.c_str(), 1);
+        EXPECT_EQ(platform::SetEnv("TINYLAMB_TEMP_DIR", value.c_str(), 1), 0);
       } else {
-        (void)platform::UnsetEnv("TINYLAMB_TEMP_DIR");
+        EXPECT_EQ(platform::UnsetEnv("TINYLAMB_TEMP_DIR"), 0);
       }
     }
-  } restore{saved != nullptr,
-            saved_copy};  // NOLINT(modernize-use-designated-initializers)
+  } restore{.had=saved != nullptr,
+            .value=saved_copy};  // NOLINT(modernize-use-designated-initializers)
   ASSERT_EQ(platform::SetEnv("TINYLAMB_TEMP_DIR", "/nonexistent_t2066_dir", 1),
             0);
 

@@ -56,7 +56,11 @@ NextBatch(列指向バッチの出力先, 最大行数) -> 返した行数
 
 0 行も正常な末尾と失敗の両方を表すため、停止後の状態確認は `Next` と同じである。標準の最大バッチ幅は 1024 行である。
 
-各演算子は `NextBatch` を実装する。`ExecutorBase::Next` は `NextBatch(dst, 1)` を呼び、一行 API へ変換する非仮想の共通ラッパーである。行ベースの内部実装を持つ演算子は、自身の NextBatch でその処理を繰り返す。
+各演算子は `NextBatch` を実装する。`ExecutorBase::Next` は内部バッファへ
+最大 `kDefaultVectorSize`（1024）行をまとめて取り込み、バッファ位置を進めながら
+一行ずつ返す非仮想の共通ラッパーである。行 API とバッチ API を同じ executor で
+混在させる呼び出し側は、残りのバッファ行を保つ `NextBatchDraining()` を使う。
+行ベースの内部実装を持つ演算子は、自身の NextBatch でその処理を繰り返す。
 
 バッチ API は列配列や選択ベクトルを直接扱い、一行ずつの要求・変換費用を減らす。呼び出し側はどちらの API でも停止後の GetStatus を確認する。
 
@@ -168,13 +172,16 @@ SQL の結果順は `ORDER BY` がなければ保証されない。それでも�
 
 各演算子は計画木を表示する `Dump` / `Explain` を持つ。説明出力は結果計算とは独立しており、子の構造、結合種別、利用索引、整列キー、推定行数などを観察するためのものになる。
 
-実行時の診断には、推定行数と実測行数のずれを表す q-error（q 誤差）を利用できる。
+推定行数と実測行数のずれは q-error（q 誤差）で表せるが、現在の実行器は
+実測行数や経過時間を記録する probe をまだ提供していない。将来その計測が
+追加された場合は、次の式を物理アルゴリズム選択の検証に使える。
 
 ```text
-q-error = max(actual, estimated) / max(min(actual, estimated), 1)
+q-error = max(actual, estimated) / min(actual, estimated), when both are positive.
+If both are zero, q-error = 1; if exactly one is zero, q-error is unbounded.
 ```
 
-1 に近いほど推定が良く、大きいほど過大・過小推定が深刻である。行数プローブはデータを変えずにこの情報と経過時間を記録し、物理アルゴリズム選択の検証に使える。
+1 に近いほど推定が良く、大きいほど過大・過小推定が深刻である。
 
 ## 12. パイプライン実行と OOC シンク（現在の既定経路）
 

@@ -167,6 +167,8 @@ bool WindowExecutor::EnsureComputed() {
     std::vector<Row> input;
     DataChunk batch;
     while (child_->NextBatch(&batch) != 0) {
+      // No reserve: reserve(size()+batch) exhausts capacity every batch and
+      // copies all buffered rows; push_back growth is already amortized.
       for (size_t i = 0; i < batch.Size(); ++i) {
         input.push_back(batch.RowAt(i));
       }

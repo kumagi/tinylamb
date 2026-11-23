@@ -58,7 +58,13 @@ graph TD
 
 ```cpp
         [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression&) {
+           const LogicalExpression& expression) {
+          if (memo.JoinEnumerationClaimed(group) ||
+              !HasCanonicalStoredJoinPredicate(memo, expression.children[0],
+                                               expression.children[1],
+                                               expression)) {
+            return;
+          }
           const GroupId inner = memo.EnsureGroup(
               UnionRelations(memo.Get(bindings.at("lr")).relations,
                              memo.Get(bindings.at("right")).relations));
@@ -90,7 +96,7 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
 1. **結合述語の再導出**: 追加される `NewJoin(ll, inner)` の結合述語は、`JoinConditionFor` によって「$ll$ の関係集合」と「$inner$ の関係集合」を跨ぐ連接詞から自動導出されます（第20章 20-6節）。結合木の回転前後で参照される関係の総集合は不変であるため、各述語は過不足なく適切な結合ノードに再配置されます。単一関係に閉じたフィルタ述語はスキャン側に保持されるため影響を受けません。
 2. **中間 Group の自動初期化**: 新規に作成される中間 Group（$lr \cup right$）が未登録であった場合、`EnsureGroup` は関係グラフの連結性に基づいて初期の結合木を構築します（第20章 20-5.2節）。これにより、回転後の部分問題に対しても探索の入口が自動的に用意されます。
 
-結合則は `join_associativity_right` と探索領域が重複するため、同一の結合形状が複数回生成される可能性があります。tinylambでは、ガード条件を複雑にするのではなく、`Memo::AddExpression` における指紋照合（`Fingerprint`）によって重複式を登録直前に排除します。
+結合則は `join_associativity_right` と探索領域が重複するため、同一の結合形状が複数回生成される可能性があります。tinylambでは、ガード条件を複雑にするのではなく、`Memo::AddExpression` における重複チェックによって重複式を登録直前に排除します。チェックはまず operation / table / children の前方一致で候補を絞り、一致した場合にのみ `Fingerprint()` を遅延計算して完全一致を確認します（指紋を毎回計算するわけではありません）。
 
 ```cpp
     // Two complementary associativity rotations (§6.10). They look redundant,
@@ -107,7 +113,7 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
 
 - **入れ子パターンの照合**: `Pattern::Op(LogicalOperator::kJoin, {...}, "name")` を用いることで、左子 Group に結合ノードが存在するかをパターン評価エンジンが判定します（第30章）。ラムダ式側では `bindings.at("lr")` や `bindings.at("ll")` を直接参照できるため、手動での型検査が不要です。
 - **`EnsureGroup` による冪等な管理**: `EnsureGroup` は関係集合を一意キーとして管理するため、他の Rule（`join_enumeration` など）がすでに同一の部分結合 Group を生成していた場合は既存の `GroupId` を返却し、探索空間の合流を促します。
-- **指紋照合による重複排除**: `Memo::AddExpression` は登録対象の式と既存式の `Fingerprint()` を比較し、同一の構造を持つ式を破棄します。この棄却は探索上限（`expression_cap_`）のカウント対象外となるため、探索の質を損ないません。
+- **指紋照合による重複排除**: `Memo::AddExpression` はまず operation / table / children が一致する既存式だけを候補とし、その場合に限って登録対象と既存式の `Fingerprint()` を比較して同一構造の式を破棄します。指紋は必要になった時点で一度だけ計算されるため、毎回の計算コストはかかりません。この棄却は探索上限（`expression_cap_`）のカウント対象外となるため、探索の質を損ないません。
 
 ## 最適化効果
 

@@ -20,13 +20,21 @@
 #include "type/type.hpp"
 
 namespace tinylamb {
+namespace {
+
+Plan RequireChild(Plan child) {
+  CHECK_MSG(child != nullptr, "MergeJoinPlan requires non-null children");
+  return child;
+}
+
+}  // namespace
 
 MergeJoinPlan::MergeJoinPlan(Plan left, std::vector<ColumnName> left_keys,
                              Plan right, std::vector<ColumnName> right_keys,
                              JoinKind kind, Expression residual,
                              std::optional<size_t> estimated_rows)
-    : left_(std::move(left)),
-      right_(std::move(right)),
+    : left_(RequireChild(std::move(left))),
+      right_(RequireChild(std::move(right))),
       left_keys_(std::move(left_keys)),
       right_keys_(std::move(right_keys)),
       kind_(kind),

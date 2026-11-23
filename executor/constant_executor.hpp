@@ -24,6 +24,7 @@
 
 namespace tinylamb {
 
+// Single-pass source for constant rows. Explain only describes the source.
 class ConstantExecutor : public ExecutorBase {
  public:
   explicit ConstantExecutor(Row row) : rows_({std::move(row)}) {}

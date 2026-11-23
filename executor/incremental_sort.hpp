@@ -64,6 +64,9 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
   Schema schema_;
   std::vector<SortExecutor::Key> prefix_keys_;
   std::vector<SortExecutor::Key> suffix_keys_;
+  std::vector<SortKeyOrder> prefix_orders_;
+  std::shared_ptr<std::vector<SortKeyOrder>> suffix_orders_;
+  Status ObserveSingleton(const Row& row);
 
   std::vector<std::pair<Row, RowPosition>> output_;
   size_t output_offset_{0};

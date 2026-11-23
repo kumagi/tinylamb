@@ -43,10 +43,53 @@ struct IntegerPeekCompare {
   slot_t column{0};
   BinaryOperation op{BinaryOperation::kEquals};
   int64_t constant{0};
+  // Lets scan iterators compare their compiled residual predicates without
+  // opening a hand-written field-by-field loop.
+  bool operator==(const IntegerPeekCompare&) const = default;
 };
 
 [[nodiscard]] inline bool MatchIntegerCompare(int64_t left, BinaryOperation op,
-                                              int64_t right) {
+                                              int64_t right,
+                                              bool left_unsigned = false) {
+  if (left_unsigned) {
+    // The column stores the uint64 payload in an int64 cell. SQL comparison
+    // against a signed integer keeps negative constants below every unsigned
+    // value, then compares non-negative constants in the unsigned domain.
+    if (right < 0) {
+      switch (op) {
+        case BinaryOperation::kEquals:
+          return false;
+        case BinaryOperation::kNotEquals:
+          return true;
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+          return false;
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+          return true;
+        default:
+          return false;
+      }
+    }
+    const auto unsigned_left = static_cast<uint64_t>(left);
+    const auto unsigned_right = static_cast<uint64_t>(right);
+    switch (op) {
+      case BinaryOperation::kEquals:
+        return unsigned_left == unsigned_right;
+      case BinaryOperation::kNotEquals:
+        return unsigned_left != unsigned_right;
+      case BinaryOperation::kLessThan:
+        return unsigned_left < unsigned_right;
+      case BinaryOperation::kLessThanEquals:
+        return unsigned_left <= unsigned_right;
+      case BinaryOperation::kGreaterThan:
+        return unsigned_left > unsigned_right;
+      case BinaryOperation::kGreaterThanEquals:
+        return unsigned_left >= unsigned_right;
+      default:
+        return false;
+    }
+  }
   switch (op) {
     case BinaryOperation::kEquals:
       return left == right;
@@ -119,13 +162,24 @@ struct TypedCellBatch {
     }
   }
   // Varchar cell (row, varchar ordinal among VARCHAR slots). Callers hold the
-  // batch alive while consuming views.
+  // batch alive while consuming views. Unavailable cells return an empty view.
   [[nodiscard]] std::string_view Varchar(size_t row,
                                          size_t varchar_slot) const {
-    const uint32_t begin = row == 0 ? 0U : varchar_ends[varchar_slot][row - 1];
-    return {reinterpret_cast<const char*>(varchar_bytes[varchar_slot].data()) +
-                begin,
-            varchar_ends[varchar_slot][row] - begin};
+    if (row >= rows || varchar_slot >= varchar_ends.size() ||
+        varchar_slot >= varchar_bytes.size()) {
+      return {};
+    }
+    const auto& ends = varchar_ends[varchar_slot];
+    const auto& bytes = varchar_bytes[varchar_slot];
+    if (row >= ends.size()) {
+      return {};
+    }
+    const uint32_t begin = row == 0 ? 0U : ends[row - 1];
+    const uint32_t end = ends[row];
+    if (begin >= end || end > bytes.size()) {
+      return {};
+    }
+    return {reinterpret_cast<const char*>(bytes.data()) + begin, end - begin};
   }
 };
 
@@ -140,12 +194,15 @@ struct TypedCellBatch {
 // once no active snapshot needs anything older than the physical image.
 // Pages with chains fall back to ReadVersion as before.
 //
-// Lifetime contract: table_ and txn_ must outlive the iterator.  If
-// key_filter_ / runtime_filter_ / peek_compares_ are supplied, those objects
-// must also outlive the iterator -- they are held as raw pointers, so passing
-// the address of a temporary is a dangling-pointer bug.  Rows handed out via
+// Lifetime contract: table_ and txn_ must outlive the iterator. If
+// key_filter_ / runtime_filter_ / extra runtime filter groups /
+// peek_compares_ are supplied, those objects must also outlive the iterator --
+// they are held as raw pointers, so passing the address of a temporary is a
+// dangling-pointer bug. Rows handed out via
 // operator* own their data and stay valid after the iterator's page latch is
 // dropped.
+// Each worker has its own cursor. Dereferencing a cursor may materialize its
+// current row, so operations on the same cursor must be serialized.
 class FullScanIterator : public IteratorBase {
  public:
   // Non-copyable by design: instances are owned by smart pointers and
@@ -253,11 +310,13 @@ class FullScanIterator : public IteratorBase {
                                                       const char* row);
   [[nodiscard]] int64_t PeekCompareValue(const PlannedPeek& peek,
                                          const char* row) const;
-  [[nodiscard]] StatusOr<bool> PassesPeekFilters(std::string_view row) const;
+  [[nodiscard]] StatusOr<bool> PassesPeekFilters(std::string_view row);
+  [[nodiscard]] StatusOr<bool> PassesExtraRuntimeFilters(std::string_view row);
   // Resolves the next visible row image (the SeekVisibleRow ladder) and
   // advances pos_ past it; nullopt at exhaustion or on a latched failure.
   [[nodiscard]] std::optional<std::string_view> NextVisibleImage();
   void SeekVisibleRow();
+  void ReseekWithRuntimeFilters();
   [[nodiscard]] bool TryInitLSTableScan();
   [[nodiscard]] const LSTablePageBlock* CurrentLSTableBlock() const noexcept;
   [[nodiscard]] bool LSTableRowMatches(const LSTablePageBlock& blk,
@@ -271,7 +330,7 @@ class FullScanIterator : public IteratorBase {
   [[nodiscard]] const std::shared_ptr<const TlcsFile>& EnsureBackingTlcs()
       const;
   void ClearStubBlockState();
-  void ComputeStubBlockMatches() noexcept;
+  void ComputeStubBlockMatches();
   [[nodiscard]] bool TryEnterStubPage();
   [[nodiscard]] bool AdvanceFromStubPage();
   [[nodiscard]] bool StubBlockAllRowsMatch(const TlcsFile& tlcs,
@@ -335,10 +394,10 @@ class FullScanIterator : public IteratorBase {
   std::optional<RowDecodePlan> row_plan_;
   bool row_plan_failed_{false};
   // Planned peek column info, parallel to peek_compares_ (lazily built).
-  mutable std::vector<PlannedPeek> peek_plan_;
-  mutable bool peek_plan_built_{false};
-  mutable PlannedPeek key_peek_plan_{};
-  mutable bool key_peek_built_{false};
+  std::vector<PlannedPeek> peek_plan_;
+  bool peek_plan_built_{false};
+  PlannedPeek key_peek_plan_{};
+  bool key_peek_built_{false};
   // Per kept slot: VARCHAR ordinal among kept slots, or SIZE_MAX for
   // fixed-width slots. Precomputed so the decode loop never rescans the
   // plan per row to map a kept slot to its varchar arena.

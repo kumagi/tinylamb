@@ -65,16 +65,28 @@ std::string IndexSchema::GenerateKey(const Row& row) const {
       } else {
         const size_t length = value.AsStringView().size();
         const size_t groups =
-            std::max<size_t>(1, length / 8 + (length % 8 != 0));
-        if (groups > (key.max_size() - 1) / 9) {
-          throw std::length_error("index key too large");
+            std::max<size_t>(1, (length / 8) + static_cast<size_t>(length % 8 != 0));
+        bytes = 1 + (groups * 9);
+      }
+    } else if (value.type == ValueType::kArray) {
+      // An array encodes as tag + 4-byte count + element SQL type + NUL and
+      // one flag (plus a fixed-width payload) per element.  The old flat
+      // 9-byte guess underestimated every array, forcing a realloc per key
+      // part on the hot INSERT/LOOKUP path.
+      bytes = 1 + sizeof(uint32_t) + value.ArrayElementSqlType().size() + 1;
+      for (const Value& element : value.ArrayElements()) {
+        bytes += 1;  // null/present flag
+        if (!element.IsNull()) {
+          bytes += 9;
         }
-        bytes = 1 + groups * 9;
       }
     }
-    if (bytes > key.max_size() - estimate) {
-      throw std::length_error("index key too large");
-    }
+    // GenerateKey returns a plain std::string (not StatusOr) and is called
+    // from Status-returning DDL/DML paths, so it must not throw a
+    // length_error across that boundary.  Saturate the reserve estimate
+    // instead: the worst case is a reallocation, and the real key bytes are
+    // appended below regardless.
+    bytes = std::min(bytes, key.max_size() - estimate);
     estimate += bytes;
   }
   key.reserve(estimate);
@@ -106,6 +118,12 @@ Decoder& operator>>(Decoder& e, IndexSchema& idx) {
   uint8_t mode = 0;
   e >> idx.name_ >> idx.key_ >> idx.include_ >> mode;
   idx.mode_ = static_cast<IndexMode>(mode);
+  // Deliberate sanitisation on read (see IndexSchema::NormalizeInclude): a
+  // catalog written by an older version or an external tool can contain a
+  // duplicate/key-listed INCLUDE column, which would make an index-only scan
+  // emit the same column twice.  That outweighs byte-for-byte Encode/Decode/
+  // Encode idempotence for such legacy records; a well-formed catalog still
+  // round-trips exactly (DeduplicatesStoredIncludes pins this).
   idx.NormalizeInclude();
   return e;
 }

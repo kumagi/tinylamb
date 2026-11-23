@@ -11,7 +11,7 @@ INTERSECT 演算を「左入力の各行について、右入力に対応する�
 
 ## 変換前後の関係
 
-同一グループ内に、集合演算ノードと等価な半結合の論理式を追加します。
+半結合は `join_group` 派生グループに追加し、親グループにはその上に `kDistinct` を追加します。INTERSECT は DISTINCT 集合演算なので、単なる SemiJoin では左入力の重複度が残ってしまうためです。
 
 ```mermaid
 graph TD
@@ -19,13 +19,14 @@ graph TD
     I1["kIntersect"] --> L1["Group L (t1)"]
     I1 --> R1["Group R (t2)"]
   end
-  subgraph after["変換後: SemiJoin(L, R, 全列等値)"]
-    S1["SemiJoin t1.a = t2.a AND t1.b = t2.b"] --> L2["Group L"]
+  subgraph after["変換後: Distinct(SemiJoin(L, R, 全列等値))"]
+    D1["Distinct"] --> S1["SemiJoin t1.a = t2.a AND t1.b = t2.b"]
+    S1 --> L2["Group L"]
     S1 --> R2["Group R"]
   end
 ```
 
-元の `kIntersect` 式と並列して `kSemiJoin` 式が同一グループに保持され、物理計画生成時のコスト評価対象となります。
+元の `kIntersect` 式は親グループに残り、派生グループの `kSemiJoin` とその上の `kDistinct` が物理計画生成時のコスト評価対象となります（`except_to_antijoin.md` と同じ Distinct ラップです）。
 
 ## 適用条件
 
@@ -77,20 +78,35 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
   }
 ```
 
-なお、多重度保存に関する留意事項として、SQL の `INTERSECT`（DISTINCT 集合演算）は左入力内の重複行を1 行に集約しますが、`SemiJoin` はマッチした左行をそのまま通過させるため、左入力に重複行が含まれる場合は多重度が一致しません。tinylamb の現行実装では `kIntersect` のみを対象とし、bag 演算である `kIntersectAll` は除外されています。
+なお、多重度保存に関する留意事項として、SQL の `INTERSECT`（DISTINCT 集合演算）は左入力内の重複行を1 行に集約しますが、`SemiJoin` はマッチした左行をそのまま通過させます。本 Rule は SemiJoin の上に `kDistinct` を重ねることでこの差を解消しています。tinylamb の現行実装では `kIntersect` のみを対象とし、bag 演算である `kIntersectAll` は除外されています。
 
 ## 実装の詳細
 
-変換処理では、構築された全列等値述語を伴う `kSemiJoin` 論理式を親グループへ登録します。
+変換処理では、構築された全列等値述語を伴う `kSemiJoin` 論理式を `join_group`
+派生グループへ登録し、親 `group` にはそれを子に持つ `kDistinct` を登録します。
+派生グループのタグには `ChildGroupIdsFingerprint` が含まれ、同じリレーション集合の
+別 INTERSECT と派生グループが衝突するのを防ぎます。
 
 ```cpp
+          const std::string tag =
+              "intersect-semi:" +
+              ChildGroupIdsFingerprint(expression.children) +
+              TargetListFingerprint(expression.target_list) + ":" +
+              (expression.predicate && *expression.predicate
+                   ? (*expression.predicate)->ToString()
+                   : std::string("null"));
+          const GroupId join_group =
+              memo.EnsureDerivedGroup(memo.Get(group).relations, tag);
           memo.AddExpression(
-              group,
+              join_group,
               LogicalExpression{.operation = LogicalOperator::kSemiJoin,
                                 .children = {left, right},
                                 .predicate = equality_predicate,
                                 .target_list = expression.target_list,
                                 .output_schema = expression.output_schema});
+          memo.AddExpression(
+              group, LogicalExpression{.operation = LogicalOperator::kDistinct,
+                                       .children = {join_group}});
 ```
 
 - **述語の優先度**: `BuildEqualityOnAllColumns` は、元の式に述語が存在すればそれを採用し、存在しない場合は `output_schema` の各列から `left_rel.col = right_rel.col` を導出します。さらにそれが得られない場合は `target_list` または左右の子グループの出力スキーマから列情報を補完します。

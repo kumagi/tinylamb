@@ -50,8 +50,8 @@ def main():
     parser.add_argument('--clang', default='clang++')
     parser.add_argument('--simd', action='store_true', help='WASM SIMD128 vs native AVX2')
     args = parser.parse_args()
-    if not 0 < args.rows <= 100_000_000 or args.repeats < 1:
-        parser.error('rows must be 1..100000000 and repeats positive')
+    if not 0 < args.rows <= 100_000_000 or not 1 <= args.repeats <= 100:
+        parser.error('rows must be 1..100000000 and repeats must be 1..100')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     if hasattr(os, 'sched_setaffinity'):

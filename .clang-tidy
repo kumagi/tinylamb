@@ -41,4 +41,4 @@ Checks: '-*,
 '
 CheckOptions:
   # Keep the LLVM defaults and also diagnose discarded storage/query results.
-  bugprone-unused-return-value.CheckedReturnTypes: '^::std::error_code$;^::std::error_condition$;^::std::errc$;^::std::expected$;^::boost::system::error_code$;^::tinylamb::Status$;^::tinylamb::StatusOr<.*>$'
+  bugprone-unused-return-value.CheckedReturnTypes: '^::std::error_code$;^::std::error_condition$;^::std::errc$;^::std::expected(<|$);^::boost::system::error_code$;^::tinylamb::Status$;^::tinylamb::StatusOr<.*>$'

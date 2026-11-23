@@ -42,6 +42,7 @@ std::vector<size_t> SlotIndexes(const Expression& expression,
   Expression slotted =
       SlotizeLiterals(expression, &cursor, &ok, &parameters, nullptr);
   EXPECT_TRUE(ok);
+  EXPECT_EQ(cursor, parameters.size());
   std::vector<Expression> slots;
   AppendParameterSlots(slotted, &slots);
   std::vector<size_t> result;

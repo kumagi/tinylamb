@@ -107,7 +107,7 @@ TEST_F(MemTableSyncTest, FailedDurabilityHookKeepsDataForRetry) {
   // Sync can hand it to the hook again. Releasing the arenas first made the
   // failed run unrecoverable (the bytes existed only in the discarded blob).
   struct Thrower {
-    static void Boom(const char*, size_t, void*) {
+    static void Boom(const char* /*unused*/, size_t /*unused*/, void* /*unused*/) {
       throw std::runtime_error("disk on fire");
     }
   };

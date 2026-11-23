@@ -50,7 +50,7 @@ if (children.size() != 1) {
 
 第二に、重複排除の申告契約（`EnforcesDistinct`）です。`DistinctPlan` は、特定の列のみをキーとする `DISTINCT ON` が指定されていない通常の `DISTINCT` の場合、自らが重複排除を完了することをオプティマイザに申告します。
 
-第三に、行数見積もりの保守性です。重複排除により実際の出力タプル数は減少しますが、本 Rule はユニーク値数（NDV）の高度な統計情報を持たない場合、保守的に子の推定行数をそのまま引き継ぎます。行数を過大に見積もる方向の誤差は実行の正しさを損なわず、上位演算子のコスト評価において安全側の判断を促します。
+第三に、行数見積もりの保守性です。重複排除後の行数は `EstimateDistinctRows` が列統計の NDV を使って見積もります。統計がない場合の保守的な推定やクランプもこの共通関数に委ねられます。
 
 ## 実装の詳細
 
@@ -61,12 +61,12 @@ Plan distinct = std::make_shared<DistinctPlan>(children[0].plan);
 return std::vector<PlanAlternative>{
     PlanAlternative{.plan = std::move(distinct),
                     .local_cost = children[0].estimated_rows,
-                    .estimated_rows = children[0].estimated_rows}};
+                    .estimated_rows = EstimateDistinctRows(children[0].plan, columns)}};
 ```
 
 - `DistinctPlan`: 子プランを内包する物理プランノードであり、エグゼキュータ生成時には `DistinctExecutor` をインスタンス化します。
 - `local_cost`: 子プランの推定行数（$1$ 行あたり $1$ 回のハッシュテーブル参照・挿入コストを想定）。
-- `estimated_rows`: 子プランの推定行数をそのまま維持。
+- `estimated_rows`: `EstimateDistinctRows` による重複排除後の行数推定。
 
 ## 最適化効果
 

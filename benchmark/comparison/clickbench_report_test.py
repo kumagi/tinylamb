@@ -13,6 +13,7 @@ class ReportTest(unittest.TestCase):
         path.mkdir()
         manifest = {'reference': reference, 'binary_sha256': 'same', 'threads': 8,
                     'cpus': list(range(8)), 'warmups': 1, 'repeats': 3,
+                    'reverse': False, 'reference_session': {'timezone': 'UTC'},
                     'dataset': {'rows': 10_000_000, 'sources': [{'sha256': 'data'}],
                                 'query_sha256': {'q1': 'query'}, 'timezone': 'UTC',
                                 'upstream_commit': 'revision'}}
@@ -61,6 +62,22 @@ class ReportTest(unittest.TestCase):
                     manifest['dataset']['sources'][0]['sha256'] = 'different'
                 (click / 'run.json').write_text(json.dumps(manifest))
                 with self.subTest(change=change), self.assertRaises(ValueError):
+                    report(duck, click, root / 'report')
+                self.assertFalse((root / 'report').exists())
+
+    def test_rejects_runs_with_different_order_or_reference_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            duck = self.make_run(root, 'duckdb')
+            click = self.make_run(root, 'clickhouse')
+            original = json.loads((click / 'run.json').read_text())
+            for field, value in (('reverse', True),
+                                 ('reference_session', {'timezone': 'Asia/Tokyo'}),
+                                 ('reference_session_timezone', 'Asia/Tokyo')):
+                manifest = json.loads(json.dumps(original))
+                manifest[field] = value
+                (click / 'run.json').write_text(json.dumps(manifest))
+                with self.subTest(field=field), self.assertRaises(ValueError):
                     report(duck, click, root / 'report')
                 self.assertFalse((root / 'report').exists())
 

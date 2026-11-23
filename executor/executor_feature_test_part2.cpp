@@ -1,5 +1,9 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include <cstddef>
+#include <limits>
+
+#include "common/serdes.hpp"
 #include "executor/executor_feature_test.hpp"
 
 namespace tinylamb {
@@ -258,8 +262,12 @@ namespace {
 class ThrowingResidual final : public ExpressionBase {
  public:
   [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
-  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override {
+  [[nodiscard]] Value Evaluate(const Row& /*row*/, const Schema& /*schema*/) const override {
     throw std::runtime_error("residual exploded");
+  }
+  [[nodiscard]] StatusOr<Value> TryEvaluate(
+      const Row& row, const Schema& schema) const override {
+    return Evaluate(row, schema);
   }
   [[nodiscard]] std::string ToString() const override { return "THROWING()"; }
   void Dump(std::ostream& o) const override { o << ToString(); }
@@ -272,7 +280,9 @@ TEST(ParallelMergeJoinTest, SinglePartitionWorkerExceptionBecomesStatus) {
                          Expression(std::make_shared<ThrowingResidual>()),
                          Schema(), /*right_width=*/1);
   EXPECT_TRUE(Drain(&join).empty());
-  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(join.GetStatus().GetCode(), StatusCode::kRuntimeError);
+  EXPECT_NE(join.GetStatus().GetMessage().find("residual exploded"),
+            std::string::npos);
 }
 
 TEST(ParallelMergeJoinTest, FailedChildLatchesStatusWithoutPartialResult) {
@@ -848,6 +858,26 @@ TEST(SimdComparisonKernelTest, DoubleScalarCoversAllOperators) {
   EXPECT_EQ(cleared.CountTrue(), 0U);
 }
 
+// TryEvaluateBinary returns TRUE for `NaN != anything` (including NaN != NaN).
+// The AVX2 vector body used to use the ordered predicate, so its answer
+// depended on whether a NaN row landed in the vector body or the scalar tail.
+TEST(SimdComparisonKernelTest, DoubleNotEqualsMatchesEngineForNaN) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  // 9 rows: the 4-wide NEON body and the scalar tail both see NaNs.
+  const std::vector<double> data = {nan, 1.0, nan, 2.0, nan,
+                                    3.0, nan, 1.0, nan};
+  ValidityBitmap mask;
+  SimdComparisonKernel::CompareDouble(data.data(), data.size(),
+                                      BinaryOperation::kNotEquals, 1.0, &mask);
+  EXPECT_EQ(mask.CountTrue(), 7U);  // five NaNs plus 2.0 and 3.0
+  SimdComparisonKernel::CompareDouble(data.data(), data.size(),
+                                      BinaryOperation::kNotEquals, nan, &mask);
+  EXPECT_EQ(mask.CountTrue(), 9U);  // every row is "not equal" to NaN
+  SimdComparisonKernel::CompareDouble(data.data(), data.size(),
+                                      BinaryOperation::kEquals, nan, &mask);
+  EXPECT_EQ(mask.CountTrue(), 0U);
+}
+
 TEST(SimdComparisonKernelTest, StringPrefixCoversAllOperators) {
   const std::vector<std::string_view> data = {
       "apple",        "banana", "cherry",
@@ -961,7 +991,7 @@ TEST_F(SkipScanDistinctTest, DistinctOverIndexedColumnSkipsDuplicates) {
   const Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar)});
   std::vector<Row> rows;
-  rows.reserve(3 * 20);
+  rows.reserve(static_cast<size_type>(3 * 20));
   for (int64_t round = 0; round < 3; ++round) {
     for (int64_t k = 1; k <= 20; ++k) {
       rows.push_back(Row({Value(k), Value("v" + std::to_string(k))}));
@@ -1027,7 +1057,7 @@ TEST_F(SkipScanDistinctTest, PrefixDistinctJumpsCompoundIndexGroups) {
   const Schema schema(
       "pt", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
   std::vector<Row> rows;
-  rows.reserve(5 * 4);
+  rows.reserve(static_cast<size_type>(5 * 4));
   for (int64_t a = 1; a <= 5; ++a) {
     for (int64_t b = 1; b <= 4; ++b) {
       rows.push_back(Row({Value(a), Value(b)}));
@@ -1089,6 +1119,39 @@ TEST_F(SkipScanDistinctTest, UniqueIndexNullKeysDecodeAsMultiValue) {
   EXPECT_EQ(ones, 1U);
   EXPECT_EQ(twos, 1U);
   EXPECT_EQ(null_rows, 1U);
+}
+
+TEST_F(SkipScanDistinctTest, InvalidRowImageClearsTheWholeBatch) {
+  const Schema schema("distinct_images", {Column("k", ValueType::kInt64)});
+  const auto created = database_->CreateTable(*context_, schema);
+  ASSERT_TRUE(created.HasValue());
+  Table table = created.Value();
+  ASSERT_TRUE(table.Insert(context_->txn_, IRow(1)).HasValue());
+  const auto second = table.Insert(context_->txn_, IRow(2));
+  ASSERT_TRUE(second.HasValue());
+  ASSERT_EQ(database_->CreateIndex(*context_, schema.Name(),
+                                   IndexSchema("distinct_images_k", {0})),
+            Status::kSuccess);
+  ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+
+  std::string header_only(sizeof(slot_t), '\0');
+  SerializeSlot(header_only.data(), schema.ColumnCount());
+  const Row valid = IRow(2);
+  std::string original(valid.Size(), '\0');
+  ASSERT_EQ(valid.Serialize(original.data()), original.size());
+  ASSERT_TRUE(context_->txn_.AddWriteSet(second.Value()));
+  context_->txn_.RegisterVersionWrite(second.Value(), original, header_only);
+
+  table = database_->GetTable(*context_, schema.Name()).MoveValue();
+  SkipScanDistinct scan(context_->txn_, table, table.GetIndex(0), Value(),
+                        Value(), true, Expression{}, table.GetSchema(), 0);
+  DataChunk batch;
+  EXPECT_EQ(scan.NextBatch(&batch, 10), 0U);
+  EXPECT_TRUE(batch.Empty());
+  EXPECT_EQ(scan.GetStatus(), Status::kCorrupt);
+  EXPECT_EQ(scan.NextBatch(&batch, 10), 0U);
+  EXPECT_EQ(scan.GetStatus(), Status::kCorrupt);
 }
 
 TEST_F(SkipScanDistinctTest,

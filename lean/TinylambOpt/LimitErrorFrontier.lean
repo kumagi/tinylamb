@@ -249,4 +249,56 @@ theorem carried_demand_batches :
       [Lane.error (5 : Nat), Lane.pass (2 : Nat)]] = Result.failed 5 := by
   decide
 
+def emitted : Nat → List (Lane α ε) → List α
+  | 0, _ | _, [] => []
+  | _+1, .error _ :: _ => []
+  | k+1, .skip :: xs => emitted (k+1) xs
+  | k+1, .pass v :: xs => v :: emitted k xs
+
+def passing : Lane α ε → Option α
+  | .pass v => some v
+  | _ => none
+
+def beforeError : Lane α ε → Bool
+  | .error _ => false
+  | _ => true
+
+/-- Gather all passing lanes before the first error, capped by remaining
+    demand. The observation includes rows delivered before failure. -/
+theorem limit_rows_and_error (k : Nat) (xs : List (Lane α ε)) :
+    (emitted k xs, reference k xs) =
+      ((((xs.takeWhile beforeError).filterMap passing).take k), simdDecision k xs) := by
+  rw [limit_error_frontier_sound]
+  congr 1
+  induction xs generalizing k with
+  | nil => cases k <;> rfl
+  | cons x xs ih =>
+    cases k <;> cases x <;> simp [emitted, List.takeWhile, List.filterMap, passing, beforeError, ih]
+
+/-- Each batch contributes its delivered rows before the consumer either
+    stops (also on error) or requests the next batch with residual demand. -/
+def collectBatches (step : Nat → List (Lane α ε) → List α × Result α ε)
+    (k : Nat) : List (List (Lane α ε)) → List α × Result α ε
+  | [] => ([], .carry k)
+  | batch :: rest =>
+    let (out, status) := step k batch
+    match status with
+    | .carry (n+1) =>
+      let (more, last) := collectBatches step (n+1) rest
+      (out ++ more,last)
+    | _ => (out,status)
+
+theorem limit_batch_trace (k : Nat) (batches : List (List (Lane α ε))) :
+    collectBatches (fun n xs => (emitted n xs, reference n xs)) k batches =
+    collectBatches (fun n xs =>
+      (((xs.takeWhile beforeError).filterMap passing).take n, simdDecision n xs)) k batches := by
+  have eq (n : Nat) (xs : List (Lane α ε)) := limit_rows_and_error n xs
+  exact congrArg (fun step => collectBatches step k batches) (funext fun n => funext (eq n))
+
+example :
+    let batches : List (List (Lane Nat Nat)) := [[.pass 4,.skip],[.pass 8,.error 9,.pass 12]]
+    collectBatches (fun n xs => (emitted n xs,reference n xs)) 3 batches = ([4,8],.failed 9) ∧
+    collectBatches (fun n xs => (emitted n xs,reference n xs)) 2 batches = ([4,8],.done 8) := by
+  decide
+
 end TinylambOpt.LimitErrorFrontier

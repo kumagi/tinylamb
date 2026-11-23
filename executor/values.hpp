@@ -10,7 +10,8 @@
 
 namespace tinylamb {
 
-// A replayable constant row source used by ValuesPlan and DummyScanPlan.
+// A single-pass constant row source used by ValuesPlan and DummyScanPlan.
+// The plan constructs a fresh executor for each execution.
 // Unlike ConstantExecutor, the executor has an explicit name in EXPLAIN so
 // VALUES is distinguishable from diagnostic/status result rows.
 class ValuesExecutor final : public ExecutorBase {
@@ -23,10 +24,10 @@ class ValuesExecutor final : public ExecutorBase {
 
  private:
   std::vector<Row> rows_;
-  // Schema inferred from the first row (if any) so an empty batch still
-  // carries the relation's column types.
+  // Keeps the common column types available on empty batches.
   Schema schema_;
   size_t offset_{0};
+  bool schema_initialized_{false};
 };
 
 }  // namespace tinylamb

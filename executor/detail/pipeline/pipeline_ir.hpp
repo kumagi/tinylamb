@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -86,6 +87,8 @@ class PipelineSource {
     (void)ctx;
     return Status::kSuccess;
   }
+  // The executor passes a positive max_rows, where false signals EOF.
+  // A false result from a direct zero-row request does not imply EOF.
   [[nodiscard]] virtual StatusOr<bool> NextBatch(
       PipelineContext* ctx, DataChunk* out,
       size_t max_rows = kDefaultVectorSize) = 0;
@@ -108,7 +111,8 @@ class PipelineSource {
   [[nodiscard]] virtual std::string Describe() const = 0;
   // Optional compatibility Dump/Explain delegation for EXPLAIN/test guards.
   virtual void DumpExplain(std::ostream& out, int indent) const {
-    out << std::string(static_cast<size_t>(indent), ' ') << Describe() << "\n";
+    out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
+        << Describe() << "\n";
   }
   virtual void Explain(std::ostream& out, int indent) const {
     DumpExplain(out, indent);
@@ -294,7 +298,7 @@ struct PipelineGraph {
   std::vector<PipelineStage> stages;
   Schema output_schema;
   // Optional optimizer/plan dump text rendered in Dump() before Pipeline lines.
-  mutable std::string plan_explain_text;
+  std::string plan_explain_text;
   // Lazy producer for plan_explain_text: materialized on first Dump/Explain so
   // Prepare does not serialize the plan for every grouped query.
   std::function<std::string()> plan_explain_producer;
@@ -359,9 +363,12 @@ class PipelineExecutor final : public ExecutorBase {
       DataChunk* chunk, bool* exhausted);
   void RenderStageTree(size_t stage_idx, std::ostream& out, int indent,
                        bool is_dump) const;
+  [[nodiscard]] const std::string& PlanExplainText() const;
 
   TransactionContext* txn_{nullptr};
   PipelineGraph graph_;
+  mutable std::once_flag plan_explain_once_;
+  mutable std::string lazy_plan_explain_text_;
   std::optional<QueryMemoryGrant> pre_acquired_grant_;
   std::unique_ptr<PipelineContext> ctx_;
 

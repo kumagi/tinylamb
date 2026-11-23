@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 
 
 def window_metrics(points, start, duration):
@@ -48,11 +49,19 @@ def main():
     p.add_argument('directory', type=Path)
     a = p.parse_args()
     points = []
-    for line in (a.directory / 'tinylamb-server.log').read_text().splitlines():
-        if line.startswith('TINYLAMB_METRICS '):
-            points.append(json.loads(line.partition(' ')[2]))
+    metrics_path = a.directory / 'tinylamb-server.log'
+    if metrics_path.is_file():
+        for line in metrics_path.read_text().splitlines():
+            if line.startswith('TINYLAMB_METRICS '):
+                points.append(json.loads(line.partition(' ')[2]))
+    else:
+        print(f'No server metrics log at {metrics_path}; metrics will be null.',
+              file=sys.stderr)
+    results_path = a.directory / 'results.jsonl'
+    if not results_path.is_file():
+        p.error(f'missing required results file: {results_path}')
     records = []
-    for line in (a.directory / 'results.jsonl').read_text().splitlines():
+    for line in results_path.read_text().splitlines():
         r = json.loads(line)
         if r['kind'] != 'oltp' or r['engine'] != 'tinylamb':
             continue
@@ -63,8 +72,16 @@ def main():
         roles = r.get('role_tps', {})
         entry['roles'] = roles
         entry['role_latency'] = r.get('role_latency')
-        entry['crossing'] = {role:sum(w.get('crossing',0) for w in r['workers'] if w['role']==role)
-                             for role in roles}
+        # A fatal worker record has no 'role' key (oltp_child emits
+        # {"fatal": ..., "worker": ...} on connection/execution failure).
+        # Such a worker contributed no role traffic, so skip it instead of
+        # raising KeyError while other workers still make `roles` non-empty.
+        entry['crossing'] = {
+            role: sum(w.get('crossing', 0)
+                      for w in (r.get('workers') or [])
+                      if w.get('role') == role)
+            for role in roles
+        }
         records.append(entry)
     (a.directory / 'trial-metrics.json').write_text(json.dumps(records, indent=2))
     print(json.dumps(records, indent=2))

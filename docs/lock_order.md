@@ -5,6 +5,16 @@ waiting on an outer one.
 
 ```
 1. Database / catalog latch (schema changes)
+1a. Database `catalog_mu_` → `table_incarnations_mu_`: catalog-mutating paths
+   (CreateTable, RenameTable) hold `catalog_mu_` and take the per-database
+   incarnation registry below it; `GetTable` takes only the registry mutex.
+   No path takes `table_incarnations_mu_` before `catalog_mu_`. A
+   `TableIncarnation`'s own locks are leaf locks, taken only after both are
+   released (see the `CreateIndex`/`IsCurrentIncarnation` comments).
+1b. Database `catalog_mu_` → `tlcs_attach_mu_`: DDL (CreateTable/DropTable)
+   holds `catalog_mu_` and takes `tlcs_attach_mu_` in a short nested scope;
+   `MaybeAttachBackingTlcs` takes `tlcs_attach_mu_` alone. No path takes
+   `tlcs_attach_mu_` before `catalog_mu_`.
 2. PageManager `blocks_mu_` (short map lookup/insert) → `Page` content latch
    (`PageRef`)
 3. Index mutation gate(s) (`TransactionManager::AcquireIndexReadGuard` /
@@ -53,6 +63,14 @@ rule 6; the reverse acquisition remains forbidden.
   keeping the latch**, ordering enqueue latch → work mutex.  The flush worker
   never acquires the enqueue latch, so the wait can never form a cycle.  A
   record's byte stream is never fragmented by another producer.
+- **Logger internal mutex order**: `enqueue_latch_` → `segment_mu_` →
+  (`durable_mu_`, `work_mu_`).  `AddLog` / `TruncateTo` take the enqueue latch
+  first; segment rolls and the flush worker take `segment_mu_`; `SetFailed`
+  takes `durable_mu_` and then `work_mu_` in separate short scopes (even when
+  called with `segment_mu_` held), and `AdvanceDurable` / `NotifyWorker` take
+  one of those leaf mutexes alone.  Never acquire `segment_mu_` or the enqueue
+  latch while holding `durable_mu_` or `work_mu_`.  Keeping this order explicit
+  matters because `SetFailed` does volume-state logging outside those scopes.
 - **No page/tree lock while blocking on disk I/O**: `CheckpointManager` and
   `PageManager` avoid holding page latches or `blocks_mu_` across
   `WaitForDurable` and large sequential companion-file I/O (`<db>.blocks.*`,
@@ -77,6 +95,10 @@ rule 6; the reverse acquisition remains forbidden.
   page latch before waiting on `table_tails_cv_`. Never hold `table_tails_mu_`
   while taking a page, transaction, index, or catalog latch. A pending
   tail owner is resolved only after commit or complete runtime undo.
+- **WAL footer access**: The logger updates the fixed-segment footer while
+  holding `segment_mu_`, then `footer_mu_`. The recovery reader validates it
+  while holding `read_fd_mutex_`, then `footer_mu_`. `footer_mu_` is a leaf
+  lock and covers neither the durability barrier nor the recycle validator.
 - **Write-intent timeout**: waits use `GetWriteIntentWaitLimit()` (default 5 s,
   extended toward the 60 s durability floor during WAL stalls); on expiry the
   wait gives up and returns false / `Status::kConflicts` (see

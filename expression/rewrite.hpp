@@ -219,9 +219,9 @@ ExtractWindowCalls(const Expression& expression, size_t* counter,
                    std::unordered_map<std::string, size_t>* dedup);
 
 enum class Volatility : uint8_t {
-  kImmutable,
-  kStable,
-  kVolatile,
+  kImmutable,  // same result for the same inputs across calls and statements
+  kStable,     // fixed within one statement, may change between statements
+  kVolatile,   // may change between evaluations within a statement
 };
 
 [[nodiscard]] Volatility GetFunctionVolatility(std::string_view func_name);

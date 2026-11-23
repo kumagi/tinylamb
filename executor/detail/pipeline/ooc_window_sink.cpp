@@ -6,9 +6,11 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <ostream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,6 +53,27 @@ namespace {
 
 constexpr size_t kWindowBlockTargetBytes = 32768;
 constexpr size_t kMinWindowMemBudget = 16384;
+
+void RecordPeakRows(std::atomic<size_t>& peak, size_t rows) {
+  size_t previous = peak.load(std::memory_order_relaxed);
+  while (previous < rows && !peak.compare_exchange_weak(
+                                previous, rows, std::memory_order_relaxed)) {
+  }
+}
+
+// Frame offsets are int64_t while the running row counter is size_t. A very
+// large PRECEDING offset can underflow a plain integer addition (UB), so
+// clamp the sum to int64_t's bounds instead.
+int64_t SaturatingFrameIndex(size_t k, int64_t delta) noexcept {
+  const int64_t k_signed = std::cmp_greater(k, uint64_t{INT64_MAX})
+                               ? INT64_MAX
+                               : static_cast<int64_t>(k);
+  int64_t result = 0;
+  if (__builtin_add_overflow(k_signed, delta, &result)) {
+    return delta < 0 ? INT64_MIN : INT64_MAX;
+  }
+  return result;
+}
 
 StatusOr<Value> EvalWindowExpr(const Expression& expr, const Row& row,
                                const Schema& schema, TransactionContext* txn) {
@@ -328,6 +351,9 @@ class SegmentIndexedReader {
     const size_t bidx = static_cast<size_t>(it - blocks_.begin());
     RETURN_IF_FAIL(reader_.Seek(it->offset));
     cached_rows_.clear();
+    // Invalidate the cached block up front: a failed decode must not leave a
+    // stale index pointing at rows that are no longer held.
+    cached_block_idx_ = std::numeric_limits<size_t>::max();
     ASSIGN_OR_RETURN(bool, got_block,
                      ReadRowBlock(&reader_, &cached_rows_, &scratch_));
     if (!got_block) {
@@ -1439,8 +1465,11 @@ class StreamingWindowAggState {
       }
       return Status::kSuccess;
     }
-    return StatusError(StatusCode::kMemoryLimitExceeded,
-                       "Non-invertible remove on skewed frame: " + fn_);
+    // Same capability gap as AddRow's tail: a non-invertible aggregate has
+    // no streaming RemoveRow implementation. kMemoryLimitExceeded would make
+    // clients retry forever with more memory (T2131).
+    return StatusError(StatusCode::kNotImplemented,
+                       "Unsupported streaming window aggregate: " + fn_);
   }
 
   [[nodiscard]] Value Result() const {
@@ -2066,8 +2095,8 @@ class SkewCallStream {
         return Status::kSuccess;
       }
 
-      // Bounded deque sliding window capped at max(16 KiB, `budget_bytes_ /
-      // 2`):
+      // Bounded deque sliding window with a reader buffer sized at
+      // max(4 KiB, `budget_bytes_ / 4`):
       peer_reader_ = std::make_unique<SegmentRowReader>(
           store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(peer_reader_->Open());
@@ -2529,7 +2558,7 @@ class SkewCallStream {
           return false;
         }
         const int64_t target_lo_signed =
-            static_cast<int64_t>(k_) + sliding_start_delta_;
+            SaturatingFrameIndex(k_, sliding_start_delta_);
         const uint64_t target_lo =
             target_lo_signed <= 0
                 ? uint64_t{0}
@@ -2558,8 +2587,8 @@ class SkewCallStream {
         if (!got) {
           return false;
         }
-        const int64_t raw_lo = static_cast<int64_t>(k_) + sliding_start_delta_;
-        const int64_t raw_hi = static_cast<int64_t>(k_) + sliding_end_delta_;
+        const int64_t raw_lo = SaturatingFrameIndex(k_, sliding_start_delta_);
+        const int64_t raw_hi = SaturatingFrameIndex(k_, sliding_end_delta_);
         if (raw_hi < 0 || std::cmp_greater_equal(raw_lo, total_rows_) ||
             raw_lo > raw_hi) {
           *val_out = (call_.function == "COUNT" || call_.function == "COUNTIF")
@@ -2603,8 +2632,8 @@ class SkewCallStream {
         if (!got) {
           return false;
         }
-        const int64_t raw_lo = static_cast<int64_t>(k_) + sliding_start_delta_;
-        const int64_t raw_hi = static_cast<int64_t>(k_) + sliding_end_delta_;
+        const int64_t raw_lo = SaturatingFrameIndex(k_, sliding_start_delta_);
+        const int64_t raw_hi = SaturatingFrameIndex(k_, sliding_end_delta_);
         const bool empty_frame =
             (raw_hi < 0 || std::cmp_greater_equal(raw_lo, total_rows_) ||
              raw_lo > raw_hi);
@@ -3662,8 +3691,7 @@ class OocWindowStreamSource final : public PipelineSource {
           RETURN_IF_FAIL(skew_writer->Append(std::move(prev)));
           ++skew_rows;
         }
-        part_rows.clear();
-        part_rows.shrink_to_fit();
+        std::vector<Row>().swap(part_rows);
         part_bytes = 0;
         if (part_grant_cache_.has_value()) {
           part_grant_cache_->ReleaseAll();
@@ -3707,12 +3735,7 @@ class OocWindowStreamSource final : public PipelineSource {
     runtime_partitions_->fetch_add(1, std::memory_order_relaxed);
 
     if (skew_writer == nullptr) {
-      size_t cur_peak =
-          runtime_peak_resident_rows_->load(std::memory_order_relaxed);
-      while (part_rows.size() > cur_peak &&
-             !runtime_peak_resident_rows_->compare_exchange_weak(
-                 cur_peak, part_rows.size(), std::memory_order_relaxed)) {
-      }
+      RecordPeakRows(*runtime_peak_resident_rows_, part_rows.size());
       RETURN_IF_FAIL(EvalInMemoryPartitionGroup(
           ctx->txn, input_schema_, input_width_, group_, &part_rows));
       active_mem_rows_ = std::move(part_rows);
@@ -3860,7 +3883,7 @@ class WindowRestoredOrderSource final : public PipelineSource {
 // for partition splitting & skew handling) into a downstream ExternalSorter
 // (either group `g + 1` or the final `orig_seq` restore sorter).
 Status DrainSortedGroupIntoSorter(
-    PipelineContext* ctx, const Schema& input_schema, size_t input_width,
+    PipelineContext& ctx, const Schema& input_schema, size_t input_width,
     size_t base_width, std::unique_ptr<ExternalSorter> src_sorter,
     const OocWindowSink::SpecGroup& cur_group, size_t budget_bytes,
     std::shared_ptr<std::atomic<bool>> runtime_spilled,
@@ -3878,7 +3901,7 @@ Status DrainSortedGroupIntoSorter(
     const auto seq =
         static_cast<uint64_t>(full_row[base_width].value.int_value);
     if (next_group.has_value()) {
-      return EncodeRowForGroup(ctx->txn, input_schema, std::move(full_row),
+      return EncodeRowForGroup(ctx.txn, input_schema, std::move(full_row),
                                base_width, seq, *next_group, dst_sorter);
     }
     // Restoring original order by `base_width` (seq):
@@ -3906,26 +3929,27 @@ Status DrainSortedGroupIntoSorter(
     const size_t refill =
         std::min<size_t>(QueryMemoryGrant::LocalBatchCache::kDefaultRefillBytes,
                          std::max<size_t>(65536, budget_bytes / 4));
-    QueryMemoryGrant::LocalBatchCache part_cache(
-        ctx != nullptr ? &ctx->grant : nullptr, refill);
+    QueryMemoryGrant::LocalBatchCache part_cache(&ctx.grant, refill);
     std::unique_ptr<SegmentRowWriter> skew_writer;
     uint64_t skew_rows = 0;
 
     auto push = [&](Row&& r) -> Status {
       const size_t rb = EstimateRowMemoryBytes(r);
       if (skew_writer == nullptr &&
-          (part_bytes + rb > part_budget ||
+          (rb > part_budget - std::min(part_bytes, part_budget) ||
            ProcessMemoryBudget::Global().AlwaysSpillEnabled() ||
            (!part_rows.empty() && !part_cache.Reserve(rb)))) {
         runtime_spilled->store(true, std::memory_order_relaxed);
-        skew_writer = std::make_unique<SegmentRowWriter>(&ctx->spill_store);
+        skew_writer = std::make_unique<SegmentRowWriter>(&ctx.spill_store);
         for (Row& prev : part_rows) {
           RETURN_IF_FAIL(skew_writer->Append(std::move(prev)));
           ++skew_rows;
         }
-        part_rows.clear();
-        part_rows.shrink_to_fit();
+        std::vector<Row>().swap(part_rows);
         part_bytes = 0;
+        // Only the in-memory rows are charged to the grant. Releasing here
+        // pairs with the reservations above before rows move to the spill
+        // writer; later skew_writer appends are disk rows and stay uncharged.
         part_cache.ReleaseAll();
       }
       if (skew_writer != nullptr) {
@@ -3964,14 +3988,9 @@ Status DrainSortedGroupIntoSorter(
     runtime_partitions->fetch_add(1, std::memory_order_relaxed);
 
     if (skew_writer == nullptr) {
-      size_t cur_peak =
-          runtime_peak_resident_rows->load(std::memory_order_relaxed);
-      while (part_rows.size() > cur_peak &&
-             !runtime_peak_resident_rows->compare_exchange_weak(
-                 cur_peak, part_rows.size(), std::memory_order_relaxed)) {
-      }
+      RecordPeakRows(*runtime_peak_resident_rows, part_rows.size());
       RETURN_IF_FAIL(EvalInMemoryPartitionGroup(
-          ctx->txn, input_schema, input_width, cur_group, &part_rows));
+          ctx.txn, input_schema, input_width, cur_group, &part_rows));
       for (Row& r : part_rows) {
         RETURN_IF_FAIL(forward_row(std::move(r)));
       }
@@ -3983,26 +4002,26 @@ Status DrainSortedGroupIntoSorter(
     ASSIGN_OR_RETURN(SpillSegmentId, raw_seg, skew_writer->Finish());
     skew_writer.reset();
 
-    QueryMemoryGrant* grant_ptr = ctx != nullptr ? &ctx->grant : nullptr;
+    QueryMemoryGrant* grant_ptr = &ctx.grant;
     StatusOr<SpillSegmentId> eval_seg_or = EvalSpilledCallsMaterializingSegment(
-        &ctx->spill_store, raw_seg, skew_rows, input_schema, input_width,
-        cur_group, /*eval_all=*/false, ctx->txn, budget_bytes, grant_ptr);
+        &ctx.spill_store, raw_seg, skew_rows, input_schema, input_width,
+        cur_group, /*eval_all=*/false, ctx.txn, budget_bytes, grant_ptr);
     if (!eval_seg_or.HasValue()) {
-      ctx->spill_store.DropSegment(raw_seg);
+      ctx.spill_store.DropSegment(raw_seg);
       return eval_seg_or.GetStatus();
     }
     const SpillSegmentId active_seg = eval_seg_or.Value();
     if (active_seg != raw_seg) {
-      ctx->spill_store.DropSegment(raw_seg);
+      ctx.spill_store.DropSegment(raw_seg);
     }
 
     const auto& last_call = cur_group.calls.back();
-    SkewCallStream stream(&ctx->spill_store, active_seg, skew_rows,
+    SkewCallStream stream(&ctx.spill_store, active_seg, skew_rows,
                           *last_call.expr, input_schema, cur_group.order_slots,
-                          ctx->txn, budget_bytes, grant_ptr);
+                          ctx.txn, budget_bytes, grant_ptr);
     Status st = stream.Init();
     if (st != Status::kSuccess) {
-      ctx->spill_store.DropSegment(active_seg);
+      ctx.spill_store.DropSegment(active_seg);
       return st;
     }
     const size_t target_slot = input_width + last_call.output_idx;
@@ -4011,7 +4030,7 @@ Status DrainSortedGroupIntoSorter(
     while (true) {
       StatusOr<bool> next_or = stream.Next(&r, &v);
       if (!next_or.HasValue()) {
-        ctx->spill_store.DropSegment(active_seg);
+        ctx.spill_store.DropSegment(active_seg);
         return next_or.GetStatus();
       }
       if (!next_or.Value()) {
@@ -4022,11 +4041,11 @@ Status DrainSortedGroupIntoSorter(
       }
       Status fwd_st = forward_row(std::move(r));
       if (fwd_st != Status::kSuccess) {
-        ctx->spill_store.DropSegment(active_seg);
+        ctx.spill_store.DropSegment(active_seg);
         return fwd_st;
       }
     }
-    ctx->spill_store.DropSegment(active_seg);
+    ctx.spill_store.DropSegment(active_seg);
   }
   return Status::kSuccess;
 }
@@ -4201,14 +4220,26 @@ Status OocWindowSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
   const bool always_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
   const size_t chunk_bytes = EstimateChunkMemoryBytes(input);
   if (!ooc_mode_ &&
-      (always_spill || buffered_bytes_ + chunk_bytes > in_mem_budget_ ||
+      (always_spill ||
+       chunk_bytes > in_mem_budget_ - std::min(buffered_bytes_, in_mem_budget_) ||
        (grant_cache_.has_value() && !grant_cache_->Reserve(chunk_bytes)))) {
     RETURN_IF_FAIL(TransitionToOoc(ctx));
   }
 
   if (!ooc_mode_) {
-    for (size_t r = 0; r < input.Size(); ++r) {
-      in_mem_rows_.push_back(input.RowAt(r));
+    try {
+      if (in_mem_rows_.capacity() == 0) {
+        in_mem_rows_.reserve(input.Size());
+      }
+      for (size_t r = 0; r < input.Size(); ++r) {
+        in_mem_rows_.push_back(input.RowAt(r));
+      }
+    } catch (const std::bad_alloc&) {
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "window in-memory input allocation failed");
+    } catch (const std::length_error&) {
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "window in-memory input is too large");
     }
     buffered_bytes_ += chunk_bytes;
     return Status::kSuccess;
@@ -4258,8 +4289,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
         }
       }
     }
-    runtime_peak_resident_rows_->store(in_mem_rows_.size(),
-                                       std::memory_order_relaxed);
+    RecordPeakRows(*runtime_peak_resident_rows_, in_mem_rows_.size());
     if (!in_mem_rows_.empty()) {
       runtime_partitions_->store(1, std::memory_order_relaxed);
     }
@@ -4280,8 +4310,15 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
   }
 
   // OOC streaming multi-pass window execution.
+  if (ctx == nullptr || ctx->txn == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "OocWindowSink requires a TransactionContext");
+  }
+  if (!stage0_sorter_) {
+    return StatusError(StatusCode::kInvalidArgument, "window input sorter already consumed");
+  }
+  RETURN_IF_FAIL(stage0_sorter_->Finish());
   std::unique_ptr<ExternalSorter> cur_sorter = std::move(stage0_sorter_);
-  RETURN_IF_FAIL(cur_sorter->Finish());
   if (cur_sorter->Spilled()) {
     runtime_spilled_->store(true, std::memory_order_relaxed);
   }
@@ -4303,7 +4340,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
     auto next_sorter = std::make_unique<ExternalSorter>(std::move(next_opts));
 
     RETURN_IF_FAIL(DrainSortedGroupIntoSorter(
-        ctx, input_schema_, input_width, base_cols, std::move(cur_sorter),
+        *ctx, input_schema_, input_width, base_cols, std::move(cur_sorter),
         groups_[g], half_budget, runtime_spilled_, runtime_partitions_,
         runtime_peak_resident_rows_, groups_[g + 1], next_sorter.get()));
     cur_sorter.reset();
@@ -4342,7 +4379,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
         std::make_unique<ExternalSorter>(std::move(restore_opts));
 
     RETURN_IF_FAIL(DrainSortedGroupIntoSorter(
-        ctx, input_schema_, input_width, base_cols, std::move(cur_sorter),
+        *ctx, input_schema_, input_width, base_cols, std::move(cur_sorter),
         last_group, half_budget, runtime_spilled_, runtime_partitions_,
         runtime_peak_resident_rows_, std::nullopt, restore_sorter.get()));
     cur_sorter.reset();
@@ -4372,8 +4409,7 @@ std::string OocWindowSink::Describe() const {
 }
 
 void OocWindowSink::Explain(std::ostream& out, int indent) const {
-  out << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
-      << "WindowExecutor(outputs=" << outputs_.size() << ")\n";
+  DumpExplain(out, indent);
 }
 
 void OocWindowSink::DumpExplain(std::ostream& out, int indent) const {

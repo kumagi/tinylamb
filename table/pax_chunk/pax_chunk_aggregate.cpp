@@ -977,7 +977,7 @@ const uint8_t* PaxChunk::CellNullBits(uint32_t g, slot_t c) const {
     const size_t off = static_cast<size_t>(null_rg_offsets_[g]) +
                        // NOLINTNEXTLINE(readability-math-missing-parentheses)
                        // precedence is unambiguous
-                       static_cast<size_t>(c) * cell_bytes;
+                       (static_cast<size_t>(c) * cell_bytes);
     if (off + cell_bytes > footer_.null_bitmaps.size()) {
       return nullptr;
     }
@@ -1480,7 +1480,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // Checkpointed deltas with a running sum: read the checkpoint base once per
     // block and accumulate deltas in order (O(n) instead of O(n*C)).
     const char* reg_end = RegionEndAt(footer_, g, col, data_);
-    if (reg_end == nullptr || region + 2 > reg_end) {
+    if (reg_end == nullptr || reg_end - region < 2 || rc == 0) {
       std::fill(out, out + rc, 0);
       return;
     }
@@ -1492,7 +1492,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // stops a hostile ncp from walking the checkpoint reads ~512KB past
     // the region (the gate used to run only AFTER the first ReadBE64).
     if (ncp == 0 || (static_cast<uint32_t>(rc) - 1) / C >= ncp ||
-        region + 2 + (static_cast<size_t>(ncp) * sizeof(int64_t)) > reg_end) {
+        ncp > static_cast<size_t>(reg_end - region - 2) / sizeof(int64_t)) {
       std::fill(out, out + rc, 0);
       return;
     }
@@ -1501,12 +1501,13 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // Inner-payload extent for the FULL group must stay inside the region:
     // ForBp 8B base + rc*param bytes; BitWeave 9B header + ceil(rc*bw/8)
     // (bw validated below before the packed extent is used).
+    const auto inner_bytes = static_cast<size_t>(reg_end - ir);
     if (s == Scheme::kDeltaFor) {
-      if (prm > 8 || ir + 8 + (static_cast<size_t>(rc) * prm) > reg_end) {
+      if (prm > 8 || inner_bytes < 8 + (static_cast<size_t>(rc) * prm)) {
         std::fill(out, out + rc, 0);
         return;
       }
-    } else if (ir + 9 > reg_end) {
+    } else if (inner_bytes < 9) {
       std::fill(out, out + rc, 0);
       return;
     }
@@ -1520,8 +1521,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       }
       const char* packed = ir + 9;
       const size_t bit_len = static_cast<size_t>(rc) * static_cast<size_t>(bw);
-      const char* end = packed + ((bit_len + 7) / 8);
-      end = std::min(end, reg_end);
+      const char* end = packed + std::min((bit_len + 7) / 8, inner_bytes - 9);
       brb = WordBitReader(packed, end);
       // deltas[0] is unused (MakeDeltasInto sets it to 0); consume it to keep
       // the contiguous word-window reader aligned with rows 1..rc-1.
@@ -1535,21 +1535,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         d = static_cast<uint64_t>(inner_base) +
             brb.get(static_cast<int>(static_cast<uint8_t>(ir[8])));
       } else {
-        const auto* vp = reinterpret_cast<const unsigned char*>(
-            ir + 8 + (static_cast<size_t>(j) * prm));
-        uint64_t off = 0;
-        if (vp + 8 <= reinterpret_cast<const unsigned char*>(reg_end)) {
-          // Masked u64 load (window inside the region); the byte loop only
-          // runs for the last values whose window crosses the region end.
-          uint64_t raw{};
-          std::memcpy(&raw, vp, 8);
-          off = raw & (prm >= 8 ? ~0ULL : ((1ULL << (8U * prm)) - 1));
-        } else {
-          for (uint32_t b = 0; b < prm; ++b) {
-            off |= static_cast<uint64_t>(vp[b]) << (b * 8);
-          }
-        }
-        d = static_cast<uint64_t>(inner_base) + off;
+        const char* vp = ir + 8 + (static_cast<size_t>(j) * prm);
+        d = static_cast<uint64_t>(inner_base) +
+            ReadForByteOffset(vp, prm, reg_end - vp >= 8);
       }
       if (j % C == 0) {
         v = ReadBE64(ck + ((j / C) * sizeof(int64_t)));
@@ -2167,7 +2155,7 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kChimp128) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
         return false;
       }
@@ -2343,7 +2331,7 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kAlpRdTans) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
         return false;
       }
@@ -2516,7 +2504,7 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
     }
     const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kPatas) {
-      std::array<int64_t, PaxChunk::kRowGroupSize> decoded;
+      std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       if (!TryDecodeInt64ColumnRg(chunk, col, group, decoded.data())) {
         return false;
       }
@@ -2809,7 +2797,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       // Gated to a single predicate on the aggregate column, and only when
       // TryFastPredicateMask DECLINES: if a compressed kernel can answer the
       // mask without decoding, decoding it here would throw that win away.
-      std::array<int64_t, PaxChunk::kRowGroupSize> fused_stack;
+      std::array<int64_t, PaxChunk::kRowGroupSize> fused_stack{};
       const int64_t* fused_vals = nullptr;
       // A compressed-domain mask already computed for THIS cell by THIS
       // predicate. TryFastPredicateMask used to run here purely as a probe and
@@ -3746,7 +3734,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             }
             continue;
           }
-          // Unparseable region: fall through to the generic decode below,
+          // Unparsable region: fall through to the generic decode below,
           // which fail-closes the same way.
         }
         if (ts == Scheme::kTopk) {
@@ -4141,7 +4129,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       //
       // `vals_stack` must outlive this block: `vals` is read by the fold loop
       // below, so scoping the array to the `else` arm leaves it dangling.
-      std::array<int64_t, PaxChunk::kRowGroupSize> vals_stack;
+      std::array<int64_t, PaxChunk::kRowGroupSize> vals_stack{};
       std::vector<int64_t> vals_heap;
       const int64_t* vals = nullptr;
       if (fused_vals != nullptr) {
@@ -4870,7 +4858,7 @@ StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
       }
     }
 #endif
-    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf;
+    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf{};
     std::vector<int64_t> heap_buf;
     int64_t* buf = stack_buf.data();
     if (rc > PaxChunk::kRowGroupSize) {
@@ -5403,7 +5391,7 @@ StatusOr<ScanResult> VectorizedScanColumnInList(
     }
     // Generic: decode the group once, binary-search the literal set per
     // row. Null cells decode as raw 0, matching every other path.
-    std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf;
+    std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf{};
     std::vector<int64_t> heap_buf;
     int64_t* buf = stack_buf.data();
     if (rc > PaxChunk::kRowGroupSize) {

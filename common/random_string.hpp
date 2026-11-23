@@ -26,7 +26,10 @@ namespace tinylamb {
 
 // mt19937 is not thread safe, so every thread gets its own pair of engines.
 // `device_random` seeds from random_device; `seeded_random` uses a fixed seed
-// (see https://xkcd.com/221/) so tests and fuzzers can reproduce sequences.
+// (see https://xkcd.com/221/). Only the opt-in SeededRandom() path is
+// reproducible: RandomString() defaults to use_random=true (device entropy)
+// so parallel tests get unique artifact names. Pass use_random=false (or call
+// RandomStringInitialize()) when a caller needs a replayable sequence.
 // Function-local statics keep initialization lazy and thread-safe (a
 // throwing constructor at static-init time would otherwise be uncatchable).
 inline std::random_device& SeedGen() {  // Kept for existing callers seeding

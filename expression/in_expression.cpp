@@ -72,9 +72,15 @@ StatusOr<Value> TryMembership(const ExpressionBase& child,
 }  // namespace
 
 std::unordered_set<ColumnName> InExpression::TouchedColumns() const {
-  std::unordered_set<ColumnName> result = child_->TouchedColumns();
+  std::unordered_set<ColumnName> result;
+  // Guard against null children on hand-built or rewrite-damaged trees.
+  if (child_) {
+    result = child_->TouchedColumns();
+  }
   for (const auto& item : list_) {
-    result.merge(item->TouchedColumns());
+    if (item) {
+      result.merge(item->TouchedColumns());
+    }
   }
   return result;
 }
@@ -117,9 +123,10 @@ Value InExpression::Evaluate(const Row& row, const Schema& schema,
 }
 
 std::string InExpression::ToString() const {
-  std::string result = child_->ToString() + " IN (";
+  std::string result =
+      (child_ ? child_->ToString() : std::string("<null>")) + " IN (";
   for (size_t i = 0; i < list_.size(); ++i) {
-    result += list_[i]->ToString();
+    result += list_[i] ? list_[i]->ToString() : std::string("<null>");
     if (i < list_.size() - 1) {
       result += ", ";
     }

@@ -69,11 +69,17 @@ Expression Comparison(BinaryOperation operation) {
                              ColumnValueExp(ColumnName("r", "k")));
 }
 
-void InsertRows(TransactionContext& context, Table& table,
-                std::initializer_list<Row> rows) {
+Status InsertRows(TransactionContext& context, Table& table,
+                  std::initializer_list<Row> rows) {
+  // ASSERT_* in a void helper only returns from the helper, leaving the test
+  // body to run against a half-inserted table. Propagate the Status instead.
   for (const Row& row : rows) {
-    ASSERT_SUCCESS(table.Insert(context.txn_, row).GetStatus());
+    const Status status = table.Insert(context.txn_, row).GetStatus();
+    if (status != Status::kSuccess) {
+      return status;
+    }
   }
+  return Status::kSuccess;
 }
 
 class PositionedSource final : public ExecutorBase {
@@ -375,10 +381,10 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
                         context.GetTable("ZigLeft"));
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, indexed_right,
                         context.GetTable("ZigRight"));
-  InsertRows(context, *indexed_left,
-             {{Value()}, {Value(1)}, {Value(1)}, {Value(2)}});
-  InsertRows(context, *indexed_right,
-             {{Value()}, {Value(1)}, {Value(1)}, {Value(3)}});
+  ASSERT_SUCCESS(InsertRows(context, *indexed_left,
+                            {{Value()}, {Value(1)}, {Value(1)}, {Value(2)}}));
+  ASSERT_SUCCESS(InsertRows(context, *indexed_right,
+                            {{Value()}, {Value(1)}, {Value(1)}, {Value(3)}}));
   ASSERT_SUCCESS(context.txn_.PreCommit());
 
   TransactionContext read_context = database->BeginContext();

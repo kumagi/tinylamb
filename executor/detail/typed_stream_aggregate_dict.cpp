@@ -1498,7 +1498,8 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         }
       }
     }));
-    for (const auto& error : errors) RETURN_IF_FAIL(error);
+    for (const auto& error : errors) { RETURN_IF_FAIL(error);
+}
   }
   const auto dependent_value = [&](size_t code, size_t key) {
     return code == null_code
@@ -3127,7 +3128,8 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
         observe(i);
       }
     }));
-    for (const auto& error : errors) RETURN_IF_FAIL(error);
+    for (const auto& error : errors) { RETURN_IF_FAIL(error);
+}
     if (too_large.load(std::memory_order_relaxed)) {
       return false;
     }
@@ -3260,12 +3262,14 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
             state.total = static_cast<double>(group->length_sum);
             break;
           case AggregationType::kMin:
-            if (group->min != SIZE_MAX)
+            if (group->min != SIZE_MAX) {
               RETURN_IF_FAIL(state.Add(cell(group->min)));
+}
             break;
           case AggregationType::kMax:
-            if (group->max != SIZE_MAX)
+            if (group->max != SIZE_MAX) {
               RETURN_IF_FAIL(state.Add(cell(group->max)));
+}
             break;
           default:
             return Status::kRuntimeError;

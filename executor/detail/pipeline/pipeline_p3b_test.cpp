@@ -298,10 +298,12 @@ TEST(PipelineP3bTest, OocWindowSkewPartitionStreamingAndRejectsNonStreaming) {
                                                 /*preserve_input_order=*/false,
                                                 /*spill_capable_plan=*/true);
     Status st;
-    (void)ExecuteSink(arr_schema, input, sink, &st, nullptr, &txn);
+    std::vector<Row> out =
+        ExecuteSink(arr_schema, input, sink, &st, nullptr, &txn);
+    EXPECT_TRUE(out.empty());
     EXPECT_EQ(st.GetCode(), StatusCode::kMemoryLimitExceeded);
   }
-  txn.txn_.Abort();
+  EXPECT_EQ(Status::kSuccess, txn.txn_.Abort());
 }
 
 TEST(PipelineP3bTest, OocWindowSkewSlidingAggregatesStayIncremental) {
@@ -432,7 +434,108 @@ TEST(PipelineP3bTest, OocWindowSkewSlidingAggregatesStayIncremental) {
           << " actual=" << actual[i];
     }
   }
-  txn.txn_.Abort();
+  EXPECT_EQ(Status::kSuccess, txn.txn_.Abort());
+}
+
+TEST(PipelineP3bTest, SpillTransitionRetryKeepsResidentRows) {
+  TestKnobsGuard knobs(4ULL << 20);
+  PipelineContext ctx(nullptr, QueryMemoryGrant{});
+  Schema schema("input", {Column("k", ValueType::kInt64),
+                          Column("v", ValueType::kVarChar)});
+  auto aggregate = std::make_shared<AggregateExpression>(
+      AggregationType::kArrayAgg, ColumnValueExp("v"), false);
+  OocGroupAggSink grouped(schema, {ColumnValueExp("k")}, {aggregate.get()},
+                          Schema("out", {Column("k", ValueType::kInt64),
+                                         Column("a", ValueType::kArray)}));
+  OocDistinctSink distinct(schema, {0}, "Distinct", {}, true);
+  auto coordinator = std::make_shared<OocSetOpCoordinator>(
+      SetOperationKind::kUnion, schema, std::vector<Schema>{schema, schema});
+  OocSetOpInputSink set_op(coordinator, 0, true, nullptr);
+  for (PipelineSink* sink :
+       std::vector<PipelineSink*>{&grouped, &distinct, &set_op}) {
+    SCOPED_TRACE(sink->Describe());
+    ProcessMemoryBudget::Global().SetTestAlwaysSpill(false);
+    ASSERT_EQ(sink->Init(&ctx, 1), Status::kSuccess);
+    DataChunk resident, incoming;
+    for (int k = 0; k < 4; ++k) {
+      resident.Append(Row({Value(k), Value(std::string(65536, 'x'))}));
+    }
+    incoming.Append(Row({Value(4), Value("y")}));
+    ASSERT_EQ(sink->Consume(&ctx, 0, resident), Status::kSuccess);
+    auto& budget = ProcessMemoryBudget::Global();
+    budget.SetTestAlwaysSpill(true);
+    budget.SetTestSpillIoFailCountdown(2);
+    const Status failed = sink->Consume(&ctx, 0, incoming);
+    budget.SetTestSpillIoFailCountdown(0);
+    ASSERT_EQ(failed, Status::kIOError);
+    EXPECT_EQ(ctx.spill_store.Stats().live_segments, 0U);
+    ASSERT_EQ(sink->Consume(&ctx, 0, incoming), Status::kSuccess);
+    auto source = sink->Finalize(&ctx);
+    ASSERT_TRUE(source.HasValue()) << source.GetStatus();
+    ASSERT_EQ(source.Value()->Open(&ctx), Status::kSuccess);
+    std::vector<int64_t> keys;
+    DataChunk out;
+    for (;;) {
+      auto next = source.Value()->NextBatch(&ctx, &out);
+      ASSERT_TRUE(next.HasValue()) << next.GetStatus();
+      if (!next.Value()) {
+        break;
+      }
+      for (size_t i = 0; i < out.Size(); ++i) {
+        const auto row = out.RowAt(i);
+        ASSERT_GT(row.Count(), 0U);
+        ASSERT_EQ(row[0].type, ValueType::kInt64);
+        keys.push_back(row[0].AsInt64());
+      }
+    }
+    std::ranges::sort(keys);
+    EXPECT_EQ(keys, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+  }
+}
+
+TEST(PipelineP3bTest, WindowCanRetryFirstSorterFinishOnSameSink) {
+  TestKnobsGuard knobs(64ULL << 10, true);
+  auto db = Database::Create("window_retry_" + RandomString()).MoveValue();
+  {
+    auto txn = db->BeginContext();
+    PipelineContext ctx(&txn, QueryMemoryGrant{});
+    Schema schema("in", {Column("k", ValueType::kInt64),
+                         Column("v", ValueType::kVarChar)});
+    const auto rn = MakeWindowCall(
+        "ROW_NUMBER", {},
+        {{.expression = ColumnValueExp("k"), .ascending = true}});
+    OocWindowSink sink(
+        schema, schema + Schema("out", {Column("rn", ValueType::kInt64)}),
+        {NamedExpression("rn", rn)}, false, true);
+    ASSERT_EQ(sink.Init(&ctx, 1), Status::kSuccess);
+    DataChunk input;
+    for (int i = 4; i > 0; --i) {
+      input.Append(Row({Value(i), Value(std::string(12000, 'x'))}));
+    }
+    ASSERT_EQ(sink.Consume(&ctx, 0, input), Status::kSuccess);
+    auto& budget = ProcessMemoryBudget::Global();
+    budget.SetTestSpillIoFailCountdown(1);
+    const auto failed = sink.Finalize(&ctx);
+    budget.SetTestSpillIoFailCountdown(0);
+    ASSERT_EQ(failed.GetStatus(), Status::kIOError);
+    auto output = sink.Finalize(&ctx);
+    ASSERT_TRUE(output.HasValue()) << output.GetStatus();
+    ASSERT_EQ(output.Value()->Open(&ctx), Status::kSuccess);
+    DataChunk rows;
+    int64_t expected = 1;
+    for (;;) {
+      auto next = output.Value()->NextBatch(&ctx, &rows);
+      ASSERT_TRUE(next.HasValue()) << next.GetStatus();
+      if (!next.Value()) { break;
+}
+      for (size_t i = 0; i < rows.Size(); ++i, ++expected) {
+        EXPECT_EQ(rows.RowAt(i)[0], Value(expected));
+        EXPECT_EQ(rows.RowAt(i)[2], Value(expected));
+      }
+    }
+    EXPECT_EQ(expected, 5);
+  }
+  db->DeleteAll();
 }
 
 TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
@@ -481,7 +584,7 @@ TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
     EXPECT_EQ(retry_status, Status::kSuccess);
     EXPECT_FALSE(retry_out.empty());
   }
-  txn.txn_.Abort();
+  EXPECT_EQ(Status::kSuccess, txn.txn_.Abort());
   db->DeleteAll();
 }
 
@@ -514,7 +617,11 @@ TEST(PipelineP3bTest, OocGroupAggNonDecomposableSkewReturnsTooBigData) {
 TEST(PipelineP3bTest, OocGroupAggMixedDistinctSkewReturnsTooBigData) {
   // COUNT(DISTINCT) combined with other aggregates cannot take the sorted
   // single-distinct path, so its per-group distinct-value set must obey the
-  // operator memory budget instead of growing without bound.
+  // operator memory budget instead of growing without bound. The skew path
+  // charges DistinctRetainedBytes() -- each live set entry's real VARCHAR
+  // payload plus node overhead -- rather than a fixed per-entry estimate, so
+  // the 256-byte pad below (~300 KiB over 1200 entries) genuinely exercises
+  // the byte budget instead of merely tripping a nominal estimate.
   TestKnobsGuard guard(64ULL << 10);
   Schema schema(
       "gdm", {Column("grp", ValueType::kInt64), Column("k", ValueType::kInt64),
@@ -576,9 +683,9 @@ TEST(PipelineP3bTest, OocGroupAggSingleDistinctSkewStripsAndStaysExact) {
     AggregationType type;
     ValueType out_type;
   } cases[] = {
-      {AggregationType::kCount, ValueType::kInt64},
-      {AggregationType::kSum, ValueType::kInt64},
-      {AggregationType::kAvg, ValueType::kDouble},
+      {.type=AggregationType::kCount, .out_type=ValueType::kInt64},
+      {.type=AggregationType::kSum, .out_type=ValueType::kInt64},
+      {.type=AggregationType::kAvg, .out_type=ValueType::kDouble},
   };
   for (const auto& tc : cases) {
     auto agg =
@@ -730,7 +837,7 @@ TEST(PipelineP3bTest, SqlEngineP3bOperatorsZeroLegacyAndBudgetInvariant) {
       }
       results.push_back(std::move(rows));
     }
-    ctx.txn_.Abort();
+    EXPECT_EQ(Status::kSuccess, ctx.txn_.Abort());
     return results;
   };
 
@@ -755,6 +862,11 @@ TEST(PipelineP3bTest, OocRecursiveCteUnionDistinctSpillBoundaryKeepsRow) {
   // *before* it enters `reached_seg`; inserting it first wrote it into both
   // the spilled reached set and the candidate sorter, and the merge
   // anti-join then dropped it from the output and the next delta.
+  // The keys here are integers; the collation-peer variant of the same spill
+  // boundary relies on the comparator contract in ooc_join_cte_sources.cpp:
+  // the sorter keys carry the static Collation::kNone, but SortKeyOrder::
+  // Compare resolves the runtime collation from the operand tags, so the
+  // spilled anti-join peer rule matches WorkTableIndex's EqualUnderCollation.
   const std::string prefix = "p3b_rcte_" + RandomString();
   auto db_or = Database::Create(prefix);
   ASSERT_EQ(db_or.GetStatus(), Status::kSuccess);
@@ -771,13 +883,13 @@ TEST(PipelineP3bTest, OocRecursiveCteUnionDistinctSpillBoundaryKeepsRow) {
     StatusOr<Executor> exec_or = eng.Prepare(ctx, sql);
     EXPECT_TRUE(exec_or.HasValue()) << eng.LastError();
     if (!exec_or.HasValue()) {
-      ctx.txn_.Abort();
+      EXPECT_EQ(Status::kSuccess, ctx.txn_.Abort());
       return {};
     }
     Executor exec = exec_or.MoveValue();
     std::vector<Row> rows = DrainExecutor(exec.get());
     EXPECT_EQ(exec->GetStatus().GetCode(), StatusCode::kSuccess);
-    ctx.txn_.Abort();
+    EXPECT_EQ(Status::kSuccess, ctx.txn_.Abort());
     return rows;
   };
 
@@ -1127,7 +1239,9 @@ TEST(PipelineP3bTest,
                                                 /*preserve_input_order=*/false,
                                                 /*spill_capable_plan=*/true);
     Status st;
-    (void)ExecuteSink(grp_schema, input, sink, &st, nullptr, &txn);
+    std::vector<Row> out =
+        ExecuteSink(grp_schema, input, sink, &st, nullptr, &txn);
+    EXPECT_TRUE(out.empty());
     EXPECT_EQ(st.GetCode(), StatusCode::kNotImplemented);
   }
 
@@ -1157,7 +1271,45 @@ TEST(PipelineP3bTest,
           << "Input order not restored at row " << i;
     }
   }
-  txn.txn_.Abort();
+  EXPECT_EQ(Status::kSuccess, txn.txn_.Abort());
+}
+
+TEST(PipelineP3bTest, SetOperationsAcceptEntirelyNullColumns) {
+  const Schema schema("n", {Column("x", ValueType::kNull)});
+  auto input_stream = [&] {
+    return OocSetOpInputStream{
+        .source = std::make_shared<RowVectorSource>(
+            std::vector<Row>{Row({Value()})}),
+        .operators = {},
+        .schema = schema};
+  };
+  DataChunk output;
+  OocConcatSource concat({input_stream(), input_stream()}, schema);
+  ASSERT_EQ(concat.Open(nullptr), Status::kSuccess);
+  for (int i = 0; i < 2; ++i) {
+    auto next = concat.NextBatch(nullptr, &output, 1);
+    ASSERT_TRUE(next.HasValue() && next.Value());
+    ASSERT_EQ(output.Size(), 1U);
+    EXPECT_TRUE(output.RowAt(0)[0].IsNull());
+  }
+
+  for (bool always_spill : {false, true}) {
+    TestKnobsGuard guard(96ULL << 10, always_spill);
+    PipelineContext ctx(nullptr, QueryMemoryGrant{});
+    OocSetOpCoordinator coord(SetOperationKind::kIntersect, schema,
+                              {schema, schema});
+    DataChunk input;
+    input.Append(Row({Value()}));
+    ASSERT_EQ(coord.ConsumeFromSource(&ctx, 0, input), Status::kSuccess);
+    ASSERT_EQ(coord.ConsumeFromSource(&ctx, 1, input), Status::kSuccess);
+    auto source = coord.Finalize(&ctx);
+    ASSERT_TRUE(source.HasValue()) << source.GetStatus();
+    ASSERT_EQ(source.Value()->Open(&ctx), Status::kSuccess);
+    auto next = source.Value()->NextBatch(&ctx, &output, 2);
+    ASSERT_TRUE(next.HasValue() && next.Value());
+    ASSERT_EQ(output.Size(), 1U);
+    EXPECT_TRUE(output.RowAt(0)[0].IsNull());
+  }
 }
 
 TEST(PipelineP3bTest,
@@ -1260,7 +1412,9 @@ TEST(PipelineP3bTest,
     TransactionContext txn = db->BeginContext();
 
     QueryMemoryCoordinator qmc(&mb);
-    auto grant = qmc.AcquireGrant(4ULL << 20, 4ULL << 20).MoveValue();
+    auto grant_or = qmc.AcquireGrant(4ULL << 20, 4ULL << 20);
+    ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+    auto grant = grant_or.MoveValue();
     PipelineContext ctx(&txn, std::move(grant), 1);
 
     Schema s("w", {Column("k", ValueType::kInt64),

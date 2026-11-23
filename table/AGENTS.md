@@ -45,7 +45,7 @@ ops to accelerate consecutive ops inside one UPDATE.
 - `lstable_bridge.{hpp,cpp}`, `tlcs_file.{hpp,cpp}`, `memtable/`, `sorted_run/`,
   `pax_chunk/`, `fragment/`, `workload/`, `fuzz/` — native `tinylamb`
   LSM/PAX columnar storage components (`LSTableStore` reserved under
-  `MemoryPoolKind::kColumnar`, `TlcsFile` `kFormatVersion = 2` persistent
+  `MemoryPoolKind::kColumnar`, `TlcsFile` `kFormatVersion = 3` persistent
   columnar files with `DirGroupMeta` directory groups and mmap / paged `Pread`
   + bounded LRU cache, `MemTable`, `SkipList`, `SortedRun`, `PaxChunk`,
   `Fragment`, `WorkloadTracker`) and their 11 libFuzzer / GTest storage
@@ -55,6 +55,13 @@ ops to accelerate consecutive ops inside one UPDATE.
   `footer_sections_fuzzer`, `encode_agree_fuzzer`, replayed in
   `pax_storage_fuzzer_test`). All reside in `namespace tinylamb` and use
   `common/` and `type/` directly.
+  `TlcsFile`'s `cache_mu_`, `dir_cache_mu_`, `resident_mu_`,
+  `varchar_bounds_mu_` and `cache_reclaim_bridge_->mu` are independent leaf
+  mutexes: each `std::scoped_lock`/`std::unique_lock` is a separate, sequential
+  critical section (often an early-return fast path followed by a later
+  publish step), never a nested acquisition. Multiple lock sites within one
+  function are therefore not an ABBA hazard and need no combined
+  `std::scoped_lock(m1, m2)`.
 - **row-layout generation** — `TableIncarnation` (`common/incarnation.hpp`,
   the per-catalog-entry state every `Table` copy shares) carries
   `LayoutGeneration()` (bumped on entry to *and* exit from every row mutation,

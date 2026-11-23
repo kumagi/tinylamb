@@ -167,6 +167,8 @@ constexpr bool IsIdempotentDistinctInsensitive(AggregationType type) noexcept {
 AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
     const AggregateExpression* aggregate, const Schema* input_schema) {
   Shape shape;
+  if (aggregate == nullptr) { return shape;  // Placeholder for an empty aggregate slot.
+}
   // The DISTINCT hash set is allocated lazily (EnsureDistinctSet): INT64/DATE
   // distinct tracking never needs it, and per-group allocation dominated
   // multi-million-group COUNT(DISTINCT) builds.
@@ -219,7 +221,7 @@ AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
 AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
                                            const Shape& shape)
     : expression(aggregate),
-      core_type_(aggregate->GetType()),
+      core_type_((aggregate != nullptr) ? aggregate->GetType() : AggregationType::kCount),
       sum_is_uint64(shape.sum_is_uint64),
       distinct_mode_(shape.distinct_mode),
       resolved_element_type_(shape.resolved_element_type) {
@@ -830,6 +832,14 @@ StatusOr<platform::ExtendedFloat> TryToLongDouble(const Value& value) {
     return static_cast<platform::ExtendedFloat>(value.value.double_value);
   }
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
+    if (value.IsUnsigned()) {
+      // UINT64 shares the int64_t payload with INT64. Statistical sums must
+      // see the unsigned magnitude, otherwise UINT64_MAX becomes -1 and
+      // variance/covariance collapse whenever a set mixes small and large
+      // unsigned values.
+      return static_cast<platform::ExtendedFloat>(
+          static_cast<uint64_t>(value.value.int_value));
+    }
     return static_cast<platform::ExtendedFloat>(value.value.int_value);
   }
   return StatusError(StatusCode::kInvalidArgument, "numeric value required");
@@ -975,7 +985,11 @@ uint64_t ReadU64(std::string_view raw, size_t pos) {
 std::string EncodeSketch(int typecode, int64_t precision,
                          const std::vector<std::string>& entries) {
   std::string raw;
-  raw.reserve(entries.size());
+  size_t payload_bytes = 22;  // magic(5) + type(1) + precision(8) + count(8)
+  for (const std::string& entry : entries) {
+    payload_bytes += 4 + entry.size();
+  }
+  raw.reserve(payload_bytes);
   raw += kSketchMagic;
   raw.push_back(static_cast<char>(typecode));
   AppendU64(&raw, static_cast<uint64_t>(precision));
@@ -1372,6 +1386,39 @@ size_t AggregateAccumulator::DistinctValueCount() const {
   return distinct != nullptr ? distinct->size() : inline_distinct_value_count;
 }
 
+size_t AggregateAccumulator::DistinctRetainedBytes() const {
+  // Charge the live distinct keys only, not the raw input rows: duplicate-heavy
+  // groups keep one set entry per distinct value. EstimateValueMemoryBytes
+  // already includes VARCHAR/ARRAY heap payloads; add unordered_set node
+  // overhead for the promoted (overflow) sets.
+  constexpr size_t kSetNodeOverhead = 32;
+  size_t total = 0;
+  const size_t n_int = DistinctIntCount();
+  if (n_int > std::numeric_limits<size_t>::max() /
+                  (sizeof(int64_t) + kSetNodeOverhead)) {
+    return std::numeric_limits<size_t>::max();
+  }
+  total += n_int * (sizeof(int64_t) + kSetNodeOverhead);
+  if (distinct != nullptr) {
+    for (const Value& v : *distinct) {
+      const size_t vbytes = EstimateValueMemoryBytes(v) + kSetNodeOverhead;
+      if (vbytes > std::numeric_limits<size_t>::max() - total) {
+        return std::numeric_limits<size_t>::max();
+      }
+      total += vbytes;
+    }
+  } else {
+    for (size_t i = 0; i < inline_distinct_value_count; ++i) {
+      const size_t vbytes = EstimateValueMemoryBytes(inline_distinct_values[i]);
+      if (vbytes > std::numeric_limits<size_t>::max() - total) {
+        return std::numeric_limits<size_t>::max();
+      }
+      total += vbytes;
+    }
+  }
+  return total;
+}
+
 bool AggregateAccumulator::InsertDistinctValue(Value canonical) {
   if (distinct != nullptr) {
     return distinct->insert(std::move(canonical)).second;
@@ -1715,7 +1762,7 @@ Status AggregateAccumulator::Add(const Value& value) {
   return TryApplyCore(value);
 }
 
-StatusOr<Value> AggregateAccumulator::TryFinish() const {
+StatusOr<Value> AggregateAccumulator::TryFinish() {
   // Replay buffered rows: gate through the HAVING modifier, apply inner
   // ORDER BY / LIMIT, then feed the survivors into the streaming logic
   // (or build the ARRAY/STRING payload directly).
@@ -1804,11 +1851,17 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       if (limited && array_values_.size() >= limit) {
         break;
       }
-      // Finish() is const at the call site, but replaying buffered rows
-      // updates the accumulator result (count/total/extreme) as well as
-      // scratch state; the const_cast is deliberate, see expression_eval.hpp.
-      RETURN_IF_FAIL(const_cast<AggregateAccumulator*>(this)->TryApplyCore(
-          row.value, row.trailing_values, row.order_keys));
+      RETURN_IF_FAIL(
+          TryApplyCore(row.value, row.trailing_values, row.order_keys));
+      // kArrayConcatAgg expands one input row into many elements, so the
+      // per-row limit check above can overshoot; clamp to the element-stream
+      // limit the comment promises.
+      if (limited &&
+          expression->GetType() == AggregationType::kArrayConcatAgg &&
+          array_values_.size() > limit) {
+        array_values_.resize(limit);
+        break;
+      }
       // STRING_AGG delimiter comes from the first buffered row.
       if (expression->GetType() == AggregationType::kStringAgg &&
           !delimiter_.has_value()) {
@@ -1840,11 +1893,11 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       if (sum_is_uint64 && !total_is_double) {
-        return Value(static_cast<int64_t>(static_cast<uint64_t>(uint_total)))
+        return Value(static_cast<int64_t>(uint_total))
             .WithUnsigned();
       }
       if (!total_is_double && total == 0.0) {
-        return Value(static_cast<int64_t>(int_total));
+        return Value(int_total);
       }
       {
         const double sum_result =
@@ -1993,6 +2046,9 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       const platform::ExtendedFloat sdd = stat_.sxy - (count * mx * my);
       const platform::ExtendedFloat vx = stat_.sxx - (count * mx * mx);
       const platform::ExtendedFloat vy = stat_.syy - (count * my * my);
+      if (vx <= 0 || vy <= 0) {
+        return Value();
+      }
       return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }
     case AggregationType::kMode: {

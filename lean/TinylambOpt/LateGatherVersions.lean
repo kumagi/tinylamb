@@ -197,4 +197,18 @@ theorem unpinned_reprobe_can_change_value :
     (visibleVersion chain 6).map Version.value = some 99 := by
   native_decide
 
+/-- A pinned slot retains its old chain and appends only versions born after
+    the reader's snapshot. Derive snapshot stability from that update rule. -/
+theorem gather_after_append (heap updates : Nat → List (Version K V)) (slots : List Nat) (s : Nat)
+    (future : ∀ i ∈ slots, ∀ v ∈ updates i, s < v.born) :
+    gatherPinned (fun i => heap i ++ updates i) slots s = eagerValues heap slots s := by
+  apply late_gather_versions_sound
+  intro i hi
+  simp only [upTo, List.filter_append]
+  have hempty : (updates i).filter (fun v => decide (v.born ≤ s)) = [] := by
+    apply List.filter_eq_nil_iff.mpr
+    intro v hv
+    simp [Nat.not_le.mpr (future i hi v hv)]
+  simp [hempty]
+
 end TinylambOpt.LateGatherVersions

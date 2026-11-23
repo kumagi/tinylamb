@@ -4,18 +4,22 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/plan_cache.hpp"
 #include "query/sql_engine.hpp"
 #include "query/statement.hpp"
 #include "type/column.hpp"
@@ -37,12 +41,15 @@ std::unique_ptr<SelectStatement> ParseSelect(const std::string& sql) {
   if (!ast.HasValue()) {
     return nullptr;
   }
-  std::unique_ptr<Statement> statement =
-      GoogleSqlAstVisitor::Visit(*ast.Value(), sql).MoveValue();
+  auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  if (!visited.HasValue()) {
+    return nullptr;
+  }
+  std::unique_ptr<Statement> statement = std::move(visited).MoveValue();
   if (statement == nullptr || statement->Type() != StatementType::kSelect) {
     return nullptr;
   }
-  return std::unique_ptr<SelectStatement>(static_cast<SelectStatement*>(
+  return std::unique_ptr<SelectStatement>(dynamic_cast<SelectStatement*>(
       statement
           .release()));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
 }
@@ -83,6 +90,21 @@ class SelectRewritesTest : public ::testing::Test {
   std::unique_ptr<TransactionContext> ctx_;
   std::unique_ptr<SqlEngine> engine_;
 };
+
+TEST_F(SelectRewritesTest, RewrittenBranchesRetainDifferentLocalCteBodies) {
+  auto stmt = ParseSelect("SELECT x FROM helper WHERE NOT (x IS NULL) UNION ALL SELECT x FROM helper");
+  ASSERT_TRUE(stmt && stmt->GetSetOperationTree());
+  const auto& tree = stmt->GetSetOperationTree();
+  ASSERT_EQ(tree->branches.size(), 1U);
+  tree->first->AddWithQuery("helper", ParseSelect("SELECT 1 AS x"));
+  tree->branches[0]->AddWithQuery("helper", ParseSelect("SELECT 2 AS x"));
+  ASSERT_TRUE(CanonicalizeTwoValuedNegations(stmt.get()));
+  EXPECT_TRUE(stmt->GetSetOperationTree()->grouped);
+  auto result = relational_detail::ExecuteQuery(*ctx_, *stmt, nullptr, {});
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  ASSERT_SUCCESS(result.Value().EnsureRowsMaterialized());
+  EXPECT_EQ(result.Value().rows, (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+}
 
 TEST_F(SelectRewritesTest, InlineSingleUseCtesReplacesSingleReference) {
   auto stmt = ParseSelect(
@@ -606,6 +628,13 @@ TEST_F(SelectRewritesTest, TpcdsDisjointUnionGroupByBypassAndPlanCacheSafety) {
   ASSERT_NE(ast, nullptr);
   EXPECT_TRUE(BypassDisjointUnionGroupBy(ast.get()));
   EXPECT_NE(ast->GetSetOperationTree(), nullptr);
+
+  auto overflowing = ParseSelect(disjoint_sql);
+  ASSERT_NE(overflowing, nullptr);
+  overflowing->SetLimit(std::numeric_limits<size_t>::max());
+  overflowing->SetOffset(1);
+  EXPECT_FALSE(BypassDisjointUnionGroupBy(overflowing.get()));
+  EXPECT_EQ(overflowing->GetSetOperationTree(), nullptr);
 
   // Differential check against `force_relational_fallback_ = true`:
   auto run_rows = [&](bool fallback, const std::string& sql) {
@@ -1354,6 +1383,357 @@ TEST_F(SelectRewritesTest, ClickBenchRound2AffineLinearSumsAndTraps) {
   EXPECT_EQ(run_rows(false, q30_shape_sql), ref_q30);
   EXPECT_EQ(run_rows(false, empty_filter_sql), fast_empty);
   EXPECT_EQ(run_rows(false, all_null_grouped_sql), fast_grp);
+}
+
+TEST_F(SelectRewritesTest, QualifyPushdownPartitionIntersectionAndAliasGuard) {
+  ScopedEnvVar env_guard("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN", nullptr);
+
+  auto exec_stmt = [&](const std::string& sql) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+  };
+  auto collect_rows = [&](const std::string& sql) {
+    PreparedPlanCache::Instance().Clear();
+    CurrentCompiledPlans().clear();
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(std::move(row));
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+    }
+    return out;
+  };
+
+  exec_stmt(
+      "CREATE TABLE q_events (id INT64 PRIMARY KEY, dept INT64, "
+      "subdept INT64, score INT64);");
+  exec_stmt(
+      "INSERT INTO q_events VALUES "
+      "(1, 10, 1, 100), (2, 10, 2, 90), (3, 10, 1, 100), "
+      "(4, 20, 1, 80), (5, 20, 2, 70), (6, NULL, 1, 95), "
+      "(7, 30, NULL, 60), (8, 30, 1, 50);");
+
+  // 1. AST: partition-only conjunct pushes to WHERE; rank filter stays in
+  // QUALIFY.
+  {
+    auto parsed = ParseSelect(
+        "SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score "
+        "DESC, id) AS rn "
+        "FROM q_events QUALIFY dept >= 20 AND rn = 1");
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(PushPartitionOnlyQualifyToWhere(parsed.get()));
+    ASSERT_NE(parsed->WhereClause(), nullptr);
+    ASSERT_NE(parsed->Qualify(), nullptr);
+    EXPECT_NE(parsed->WhereClause()->ToString().find("dept"),
+              std::string::npos);
+    EXPECT_EQ(parsed->Qualify()->ToString().find("dept"), std::string::npos);
+  }
+
+  // 2. AST: multi-window intersection + unpartitioned rejection + shadowed
+  // alias guard.
+  {
+    auto multi = ParseSelect(
+        "SELECT id, dept, subdept, "
+        "ROW_NUMBER() OVER (PARTITION BY dept, subdept ORDER BY id) AS r1, "
+        "RANK() OVER (PARTITION BY dept ORDER BY score DESC) AS r2 "
+        "FROM q_events QUALIFY dept = 10 AND subdept = 1 AND r1 <= 2");
+    ASSERT_NE(multi, nullptr);
+    EXPECT_TRUE(PushPartitionOnlyQualifyToWhere(multi.get()));
+    ASSERT_NE(multi->WhereClause(), nullptr);
+    ASSERT_NE(multi->Qualify(), nullptr);
+    EXPECT_NE(multi->WhereClause()->ToString().find("dept"), std::string::npos);
+    EXPECT_NE(multi->Qualify()->ToString().find("subdept"), std::string::npos);
+
+    auto shadowed = ParseSelect(
+        "SELECT dept + 100 AS dept, "
+        "ROW_NUMBER() OVER (PARTITION BY q_events.dept ORDER BY id) AS rn "
+        "FROM q_events QUALIFY dept >= 110");
+    ASSERT_NE(shadowed, nullptr);
+    EXPECT_FALSE(PushPartitionOnlyQualifyToWhere(shadowed.get()));
+  }
+
+  // 3. AST: grouped QUALIFY intersects PARTITION BY with GROUP BY.
+  {
+    auto grouped = ParseSelect(
+        "SELECT dept, subdept, SUM(score) AS tot, "
+        "RANK() OVER (PARTITION BY dept ORDER BY SUM(score) DESC) AS rk "
+        "FROM q_events GROUP BY dept, subdept "
+        "QUALIFY dept IS NOT NULL AND subdept = 1 AND rk = 1");
+    ASSERT_NE(grouped, nullptr);
+    EXPECT_TRUE(PushPartitionOnlyQualifyToWhere(grouped.get()));
+    ASSERT_NE(grouped->WhereClause(), nullptr);
+    ASSERT_NE(grouped->Qualify(), nullptr);
+    EXPECT_NE(grouped->WhereClause()->ToString().find("dept"),
+              std::string::npos);
+    EXPECT_NE(grouped->Qualify()->ToString().find("subdept"),
+              std::string::npos);
+  }
+
+  // 4. End-to-end SQL parity: OFF vs ON across non-grouped and grouped QUALIFY.
+  auto run_sql = [&](bool disable, const std::string& sql) {
+    if (disable) {
+      ::setenv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN", "1", 1);
+    } else {
+      ::unsetenv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN");
+    }
+    return collect_rows(sql);
+  };
+
+  for (const std::string& sql :
+       {std::string("SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept "
+                    "ORDER BY score DESC, id) AS rn "
+                    "FROM q_events QUALIFY (dept >= 10 OR dept IS NULL) AND rn "
+                    "<= 2 ORDER BY id"),
+        std::string(
+            "SELECT dept, SUM(score) AS s, RANK() OVER (ORDER BY SUM(score) "
+            "DESC) AS rk "
+            "FROM q_events GROUP BY dept QUALIFY dept >= 20 ORDER BY dept"),
+        std::string(
+            "SELECT dept, subdept, SUM(score) AS s, "
+            "RANK() OVER (PARTITION BY dept ORDER BY SUM(score) DESC) AS rk "
+            "FROM q_events GROUP BY dept, subdept "
+            "QUALIFY dept IS NOT NULL AND dept >= 10 AND rk <= 2 ORDER BY "
+            "dept, subdept")}) {
+    const auto fast = run_sql(false, sql);
+    const auto ref = run_sql(true, sql);
+    EXPECT_EQ(fast, ref) << sql;
+  }
+}
+
+TEST_F(SelectRewritesTest, OuterJoinCountsFullLeftInnerNullsAndEmpties) {
+  ScopedEnvVar env_guard("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", nullptr);
+
+  auto exec_stmt = [&](const std::string& sql) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+  };
+  auto run_sql = [&](bool disable, const std::string& sql) {
+    if (disable) {
+      ::setenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", "1", 1);
+    } else {
+      ::unsetenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
+    }
+    PreparedPlanCache::Instance().Clear();
+    CurrentCompiledPlans().clear();
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(std::move(row));
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+    }
+    return out;
+  };
+
+  exec_stmt("CREATE TABLE ojc_l (k INT64, v INT64);");
+  exec_stmt("CREATE TABLE ojc_r (k INT64, w INT64);");
+  exec_stmt("CREATE TABLE ojc_empty (k INT64, v INT64);");
+  exec_stmt(
+      "INSERT INTO ojc_l VALUES "
+      "(1, 10), (1, 11), (1, 12), "
+      "(2, 20), (2, 21), "
+      "(4, 40), "
+      "(NULL, 90), (NULL, 91);");
+  exec_stmt(
+      "INSERT INTO ojc_r VALUES "
+      "(1, 100), (1, 101), "
+      "(3, 300), (3, 301), (3, 302), "
+      "(4, 400), "
+      "(NULL, 900);");
+
+  const std::vector<std::string> queries = {
+      // FULL OUTER with duplicates, unmatched left/right keys, NULLs on both
+      // sides.
+      "SELECT COALESCE(l.k, r.k) AS k, COUNT(*) AS cnt "
+      "FROM ojc_l l FULL OUTER JOIN ojc_r r ON l.k = r.k "
+      "GROUP BY COALESCE(l.k, r.k) ORDER BY k NULLS LAST",
+      // LEFT OUTER with duplicates, unmatched left (2, NULL), multi-match right
+      // (1).
+      "SELECT l.k AS k, COUNT(*) AS cnt "
+      "FROM ojc_l l LEFT JOIN ojc_r r ON l.k = r.k "
+      "GROUP BY l.k ORDER BY k NULLS LAST",
+      // INNER JOIN with duplicates + NULL exclusion.
+      "SELECT l.k AS k, COUNT(*) AS cnt "
+      "FROM ojc_l l INNER JOIN ojc_r r ON l.k = r.k "
+      "GROUP BY l.k ORDER BY k",
+      // Empty left / empty right / both empty.
+      "SELECT COALESCE(l.k, r.k) AS k, COUNT(*) AS cnt "
+      "FROM ojc_empty l FULL OUTER JOIN ojc_r r ON l.k = r.k "
+      "GROUP BY COALESCE(l.k, r.k) ORDER BY k NULLS LAST",
+      "SELECT COALESCE(l.k, r.k) AS k, COUNT(*) AS cnt "
+      "FROM ojc_l l FULL OUTER JOIN ojc_empty r ON l.k = r.k "
+      "GROUP BY COALESCE(l.k, r.k) ORDER BY k NULLS LAST",
+      "SELECT COALESCE(l.k, r.k) AS k, COUNT(*) AS cnt "
+      "FROM ojc_empty l FULL OUTER JOIN ojc_empty r ON l.k = r.k "
+      "GROUP BY COALESCE(l.k, r.k) ORDER BY k",
+      "SELECT l.k AS k, COUNT(*) AS cnt "
+      "FROM ojc_empty l LEFT JOIN ojc_r r ON l.k = r.k "
+      "GROUP BY l.k ORDER BY k",
+      "SELECT l.k AS k, COUNT(*) AS cnt "
+      "FROM ojc_l l LEFT JOIN ojc_empty r ON l.k = r.k "
+      "GROUP BY l.k ORDER BY k NULLS LAST",
+  };
+
+  for (const std::string& sql : queries) {
+    ::unsetenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
+    auto parsed = ParseSelect(sql);
+    ASSERT_NE(parsed, nullptr) << sql;
+    EXPECT_TRUE(RewriteOuterJoinGroupedCountToHistograms(parsed.get(), *ctx_))
+        << sql;
+    const auto fast = run_sql(false, sql);
+    const auto ref = run_sql(true, sql);
+    EXPECT_EQ(fast, ref) << sql;
+  }
+}
+
+TEST_F(SelectRewritesTest, WindowHaloAndOuterFetchTiesSqlParity) {
+  ScopedEnvVar g_halo("TINYLAMB_DISABLE_WINDOW_HALO", nullptr),
+      g_ties("TINYLAMB_DISABLE_OUTER_FETCH_TIES", nullptr);
+
+  auto exec_stmt = [&](const std::string& sql) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+  };
+  auto run_with_env = [&](const char* env_name, bool disable,
+                          const std::string& sql) {
+    if (disable) {
+      ::setenv(env_name, "1", 1);
+    } else {
+      ::unsetenv(env_name);
+    }
+    PreparedPlanCache::Instance().Clear();
+    CurrentCompiledPlans().clear();
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(std::move(row));
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+    }
+    return out;
+  };
+
+  exec_stmt("CREATE TABLE wh_t (id INT64, val INT64);");
+  for (int i = 0; i < 40; ++i) {
+    const int64_t k = i / 2;  // intentional ties on id!
+    const int64_t v = (i % 7 == 0) ? -100 : ((i * 3) + 1);
+    std::string sql = "INSERT INTO wh_t VALUES (" + std::to_string(k) + ", ";
+    sql += (i == 5 ? "NULL" : std::to_string(v)) + ");";
+    exec_stmt(sql);
+  }
+  exec_stmt("INSERT INTO wh_t VALUES (NULL, 500), (NULL, 600);");
+  exec_stmt("ANALYZE wh_t;");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  const std::vector<std::pair<std::string, size_t>> halo_cases = {
+      {"SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND "
+       "3 FOLLOWING) FROM wh_t ORDER BY id LIMIT 6 OFFSET 0",
+       6U},
+      {"SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND "
+       "2 FOLLOWING) FROM wh_t ORDER BY id LIMIT 6 OFFSET 1",
+       6U},
+      {"SELECT id, COUNT(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND "
+       "3 FOLLOWING) FROM wh_t ORDER BY id LIMIT 8 OFFSET 10",
+       8U}};
+  for (const auto& [sql, expected_rows] : halo_cases) {
+    const auto fast = run_with_env("TINYLAMB_DISABLE_WINDOW_HALO", false, sql);
+    const auto ref = run_with_env("TINYLAMB_DISABLE_WINDOW_HALO", true, sql);
+    EXPECT_EQ(fast.size(), expected_rows) << sql;
+    EXPECT_EQ(fast, ref) << sql;
+  }
+
+  {
+    const std::vector<Row> ordinary_plan = run_with_env(
+        "TINYLAMB_DISABLE_WINDOW_HALO", false,
+        "EXPLAIN SELECT id FROM wh_t ORDER BY id LIMIT 6 OFFSET 1");
+    std::string explain_text;
+    for (const Row& r : ordinary_plan) {
+      explain_text += r.ToString();
+      explain_text += '\n';
+    }
+    EXPECT_EQ(explain_text.find("window_halo_topn"), std::string::npos)
+        << explain_text;
+  }
+
+  {
+    const std::vector<Row> exp_rows =
+        run_with_env("TINYLAMB_DISABLE_WINDOW_HALO", false,
+                     "EXPLAIN SELECT id, AVG(val) OVER (ORDER BY id ROWS "
+                     "BETWEEN 2 PRECEDING AND 3 FOLLOWING) "
+                     "FROM wh_t ORDER BY id LIMIT 8 OFFSET 10");
+    std::string explain_text;
+    for (const Row& r : exp_rows) {
+      explain_text += r.ToString();
+      explain_text += '\n';
+    }
+    EXPECT_NE(explain_text.find("window_halo_topn"), std::string::npos)
+        << explain_text;
+    EXPECT_NE(explain_text.find("TopN (limit=13, offset=8)"), std::string::npos)
+        << explain_text;
+    EXPECT_NE(explain_text.find("Limit: 8 offset 2"), std::string::npos)
+        << explain_text;
+    EXPECT_EQ(explain_text.find("Limit: 8 offset 10"), std::string::npos)
+        << explain_text;
+  }
+
+  exec_stmt(
+      "CREATE TABLE oft_l (id INT64 PRIMARY KEY, score INT64, pad STRING);");
+  exec_stmt("CREATE TABLE oft_r (id INT64, tag STRING);");
+  exec_stmt(
+      "INSERT INTO oft_l VALUES "
+      "(1, 100, 'a'), (2, 100, 'b'), (3, 90, 'c'), "
+      "(4, 90, 'd'), (5, 90, 'e'), (6, 80, 'f'), "
+      "(7, NULL, 'g'), (8, 95, 'h'), (9, 95, 'i');");
+  exec_stmt(
+      "INSERT INTO oft_r VALUES "
+      "(1, 'r1a'), (1, 'r1b'), (3, 'r3'), (5, 'r5a'), "
+      "(5, 'r5b'), (8, 'r8');");
+  exec_stmt("ANALYZE oft_l;");
+  exec_stmt("ANALYZE oft_r;");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  for (const std::string& sql :
+       {std::string("SELECT l.id, l.score, r.tag FROM oft_l l "
+                    "LEFT JOIN oft_r r ON l.id = r.id "
+                    "ORDER BY l.score DESC, l.id ASC LIMIT 4 OFFSET 0"),
+        std::string("SELECT l.id, l.score, r.tag FROM oft_l l "
+                    "LEFT JOIN oft_r r ON l.id = r.id "
+                    "ORDER BY l.score DESC, l.id ASC LIMIT 3 OFFSET 2"),
+        std::string("SELECT l.id, l.score, r.tag FROM oft_l l "
+                    "LEFT JOIN oft_r r ON l.id = r.id "
+                    "ORDER BY l.score DESC LIMIT 3")}) {
+    auto fast = run_with_env("TINYLAMB_DISABLE_OUTER_FETCH_TIES", false, sql);
+    auto ref = run_with_env("TINYLAMB_DISABLE_OUTER_FETCH_TIES", true, sql);
+    if (sql.find("l.id ASC") == std::string::npos) {
+      auto row_less = [](const Row& a, const Row& b) {
+        return a.ToString() < b.ToString();
+      };
+      std::ranges::sort(fast, row_less);
+      std::ranges::sort(ref, row_less);
+    }
+    EXPECT_EQ(fast, ref) << sql;
+  }
 }
 
 }  // namespace

@@ -183,7 +183,9 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
   const bool engine_agrees =
       (reference.threw && engine.threw) ||
       (!reference.threw && !engine.threw &&
-       SimplifyValuesEqual(reference.value, engine.value));
+       SimplifyValuesEqual(reference.value, engine.value) &&
+       (reference.value.IsNull() ||
+        reference.value.type == engine.value.type));
   if (!engine_agrees) {
     t.failure = t.failure.empty() ? "engine mismatch vs AST reference"
                                   : t.failure + " + engine mismatch";
@@ -371,6 +373,15 @@ bool ParseExprOracleTest(std::string_view text, ExprOracleTrace* trace) {
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
+      // stoull accepts signs and whitespace ("-1" wraps to ULLONG_MAX and
+      // would pass the seed>>32 == seed&0xffffffff tamper check); require a
+      // plain decimal literal first.
+      if (value.empty() ||
+          !std::all_of(value.begin(), value.end(), [](char c) {
+            return c >= '0' && c <= '9';
+          })) {
+        return false;
+      }
       size_t used = 0;
       try {
         trace->seed = std::stoull(value, &used);
@@ -462,7 +473,8 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
         // empty verify as a real finding (writes the file and aborts).
         std::string row_verify = ReplayRowExprOracleTrace(row_trace, false);
         if (row_verify.empty()) {
-          row_verify = "internal error: replay holds (flaky row mismatch)";
+          row_verify = MakeFlakyVerify(
+              "internal error: replay holds (flaky row mismatch)");
         }
         EmitFuzzFinding("row_expr_oracle_fuzz", row_trace.seed, row_path,
                         row_text, row_report, row_verify);
@@ -482,7 +494,8 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   } else {
     verify = ReplayExprOracleTrace(parsed, false);
     if (verify.empty()) {
-      verify = "internal error: serialized test replay holds (flaky mismatch)";
+      verify = MakeFlakyVerify(
+          "internal error: serialized test replay holds (flaky mismatch)");
     }
   }
 
@@ -897,8 +910,12 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     if (cascades::ExpressionRejectsNullsOnColumn(pred.expr, col_name)) {
       t.null_reject_claimed = true;
       t.null_reject_col = col_name;
+      // verified means at least one actual NULL row was evaluated; a column
+      // with no NULLs leaves the claim unverifiable, not proven.
+      bool checked_null_row = false;
       for (const auto& r_idx : rows) {
         if (r_idx[col_idx].IsNull()) {
+          checked_null_row = true;
           StatusOr<Value> v = pred.expr->TryEvaluate(r_idx, schema);
           if (v.HasValue() && !v.Value().IsNull() && v.Value().Truthy()) {
             report += "[NULL-REJECT SOUNDNESS VIOLATION]\n";
@@ -918,7 +935,9 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
           }
         }
       }
-      t.null_reject_verified = true;
+      // verified means at least one actual NULL row was evaluated; a column
+      // with no NULLs leaves the claim unverifiable, not proven.
+      t.null_reject_verified = checked_null_row;
     }
   }
 
@@ -1033,6 +1052,13 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
       return "";
     }
     ddl_res.Value().Drain();
+    if (ddl_res.Value().GetStatus() != Status::kSuccess) {
+      if (verbose) {
+        std::cerr << "[row_expr_fuzz][skip] DDL stream failed: " << ddl
+                  << ": " << ddl_res.Value().GetStatus().GetMessage() << "\n";
+      }
+      return "";
+    }
 
     StatusOr<std::shared_ptr<Table>> tbl_or = ctx.GetTable(tab);
     if (!tbl_or.HasValue()) {
@@ -1080,12 +1106,23 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
   t.engine_ran = true;
   std::vector<int64_t> engine_ids;
   Row row;
-  while (qr.Value().Next(&row)) {
-    if (row.Size() >= 1 && !row[0].IsNull()) {
-      engine_ids.push_back(row[0].value.int_value);
+  Status engine_status = Status::kSuccess;
+  bool engine_threw = false;
+  try {
+    while (qr.Value().Next(&row)) {
+      if (row.Size() >= 1 && !row[0].IsNull()) {
+        engine_ids.push_back(row[0].value.int_value);
+      }
     }
+    engine_status = qr.Value().GetStatus();
+  } catch (const std::exception&) {
+    engine_threw = true;
+  } catch (...) {
+    engine_threw = true;
   }
-  Status engine_status = qr.Value().GetStatus();
+  if (engine_threw) {
+    engine_status = Status(StatusCode::kUnknown);
+  }
   if (ast_threw) {
     if (engine_status == Status::kSuccess) {
       report +=

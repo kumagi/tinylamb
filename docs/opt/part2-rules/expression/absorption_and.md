@@ -94,7 +94,7 @@ AST 評価器（意味論の正準参照実装）は、左辺の評価値によ�
 
 - `absorption_and_reversed`: 被演算子の順序が逆転した $(x \lor y) \land x$ を処理する対照 Rule です。
 - `absorption_or` / `absorption_or_reversed`: 論理和を外側、論理積を内側に配置した双対形 $x \lor (x \land y)$ を処理します。
-- `factor_or_common_and`: 選言から共通の連言項を括り出す Rule であり、一方の分岐が空になる場合の簡約と領域が接合します。
+- `factor_or_common_and`: 選言から共通の連言項を括り出す Rule です。片方の残余が空の場合は、双対の吸収則 $x \lor (x \land y) = x$ により共通項へ簡約します。
 
 ## 検証テスト
 

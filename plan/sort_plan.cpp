@@ -75,7 +75,8 @@ std::string SortPlan::KeysToString() const {
     if (i > 0) {
       output << ", ";
     }
-    output << keys_[i].expression->ToString()
+    output << (keys_[i].expression ? keys_[i].expression->ToString()
+                                   : "<missing expression>")
            << (keys_[i].ascending ? " ASC" : " DESC");
     // T2668: the 3-argument IsOrderedBy compares nulls placement, so the
     // render must not hide it either.  Explicit spellings print their NULLS

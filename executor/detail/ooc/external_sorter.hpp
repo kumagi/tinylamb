@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,11 @@ class ExternalSorter {
   [[nodiscard]] StatusOr<bool> NextChunk(DataChunk* chunk_out,
                                          size_t max_rows = kDefaultVectorSize);
 
+  // Clears accumulated rows/runs and statistics so the sorter can be reused
+  // for a new input. Construction-time `Options` are intentionally retained:
+  // in particular a `limit` cannot be cleared here, so a sorter built with a
+  // Top-N limit keeps applying it after Reset(). Rebuild the sorter for a
+  // limit-less pass.
   void Reset() noexcept;
 
   [[nodiscard]] bool Spilled() const noexcept { return spilled_; }
@@ -114,14 +120,15 @@ class ExternalSorter {
                                  const Row& rhs) const noexcept {
     return CompareRows(lhs, rhs) < 0;
   }
+  [[nodiscard]] bool TrySortRowsPackedTwoKey(std::vector<Row>* rows) const;
 
   [[nodiscard]] Status FlushCurrentRun();
   [[nodiscard]] int CompareKeyCells(const MergeStream& lhs,
                                     const MergeStream& rhs) const noexcept;
-  void RefreshStreamKey(MergeStream* stream) noexcept;
+  [[nodiscard]] Status RefreshStreamKey(MergeStream* stream) noexcept;
   [[nodiscard]] Status WriteSortedRun(std::vector<Row>* rows,
                                       SpillSegmentId* seg_out);
-  [[nodiscard]] Status MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
+  [[nodiscard]] Status MergeRunGroup(std::span<const SpillSegmentId> inputs,
                                      size_t reader_buf_bytes,
                                      size_t writer_buf_bytes,
                                      SpillSegmentId* merged_out);
@@ -135,6 +142,9 @@ class ExternalSorter {
   Options options_;
   std::weak_ptr<const bool> spill_store_alive_;
   std::vector<SortKeyOrder> key_orders_;
+  // Count this sorter as a live memory consumer for the query's grant, like
+  // SpillableStore does, so ComputeEffectiveDop sees the whole query (#12699).
+  std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
   std::optional<QueryMemoryGrant::LocalBatchCache> grant_cache_;
 
   std::vector<Row> run_rows_;

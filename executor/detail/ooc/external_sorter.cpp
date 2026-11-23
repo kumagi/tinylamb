@@ -2,7 +2,13 @@
 #include "executor/detail/ooc/external_sorter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <utility>
 
 #include "common/memory_budget.hpp"
@@ -111,6 +117,7 @@ ExternalSorter::ExternalSorter(Options options)
   for (const OocSortKey& k : options_.keys) {
     key_orders_.push_back(MakeSortKeyOrder(k));
   }
+  consumer_guard_.emplace(options_.grant);
   if (options_.grant != nullptr) {
     const size_t refill =
         options_.memory_budget_bytes > 0
@@ -141,10 +148,16 @@ int ExternalSorter::CompareRows(const Row& lhs, const Row& rhs) const noexcept {
     const bool lhs_ok = col_idx < lhs.Count();
     const bool rhs_ok = col_idx < rhs.Count();
     if (!lhs_ok || !rhs_ok) {
-      if (lhs_ok != rhs_ok) {
-        return lhs_ok ? 1 : -1;
+      if (lhs_ok == rhs_ok) {
+        continue;
       }
-      continue;
+      // A missing column is the NULL peer of a present one, so place it by
+      // the key's NULLS FIRST/LAST rule instead of unconditionally sorting
+      // "has column" after "missing column" (which can invert against a
+      // NULL-valued cell).  Upstream normally supplies one schema, but a
+      // spilled and a resident run can disagree after a projection change.
+      const bool nulls_first = key_orders_[i].NullsFirst();
+      return nulls_first ? (lhs_ok ? 1 : -1) : (lhs_ok ? -1 : 1);
     }
     const int cmp = key_orders_[i].Compare(lhs[col_idx], rhs[col_idx]);
     if (cmp != 0) {
@@ -152,6 +165,149 @@ int ExternalSorter::CompareRows(const Row& lhs, const Row& rhs) const noexcept {
     }
   }
   return 0;
+}
+
+// Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
+bool ExternalSorter::TrySortRowsPackedTwoKey(std::vector<Row>* rows) const {
+  const char* disable_env = std::getenv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
+  if (disable_env != nullptr && std::strcmp(disable_env, "1") == 0) {
+    return false;
+  }
+  const size_t n = rows->size();
+  if (n < 64 || n > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  if (options_.keys.size() < 2 || options_.keys.size() > 3 ||
+      key_orders_.size() != options_.keys.size()) {
+    return false;
+  }
+  const bool has_seq_col = (options_.keys.size() == 3);
+  if (has_seq_col && !key_orders_[2].Ascending()) {
+    return false;
+  }
+
+  const slot_t col0 = options_.keys[0].column_index;
+  const slot_t col1 = options_.keys[1].column_index;
+  const slot_t col2 = has_seq_col ? options_.keys[2].column_index : 0;
+  const bool asc0 = key_orders_[0].Ascending();
+  const bool nf0 = key_orders_[0].NullsFirst();
+  const bool asc1 = key_orders_[1].Ascending();
+  const bool nf1 = key_orders_[1].NullsFirst();
+
+  struct PackedEntry {
+    uint64_t key;
+    uint32_t idx;
+  };
+  std::vector<PackedEntry> entries;
+  std::vector<PackedEntry> scratch;
+  try {
+    entries.resize(n);
+    scratch.resize(n);
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
+
+  static constexpr int64_t kRangeLimit = int64_t{1} << 30;
+  std::array<std::optional<ValueType>, 2> seen_type{};
+  int64_t prev_seq = 0;
+
+  auto encode_half = [&](const Row& row, slot_t col, size_t k_idx, bool asc,
+                         bool nf, uint32_t* out) -> bool {
+    if (col >= row.Count() || row[col].IsNull()) {
+      *out = nf ? 0x00000000U : 0xFFFFFFFFU;
+      return true;
+    }
+    const Value& v = row[col];
+    if (v.type != ValueType::kDate &&
+        (v.type != ValueType::kInt64 || v.IsUnsigned())) {
+      return false;
+    }
+    if (!seen_type[k_idx].has_value()) {
+      seen_type[k_idx] = v.type;
+    } else if (*seen_type[k_idx] != v.type) {
+      return false;
+    }
+    const int64_t iv = v.value.int_value;
+    if (iv < -kRangeLimit || iv > kRangeLimit - 1) {
+      return false;
+    }
+    auto u = static_cast<uint32_t>(iv + kRangeLimit);
+    if (!asc) {
+      u = 0x7FFFFFFFU - u;
+    }
+    *out = nf ? (0x80000000U | u) : u;
+    return true;
+  };
+
+  for (size_t i = 0; i < n; ++i) {
+    const Row& row = (*rows)[i];
+    if (has_seq_col) {
+      if (col2 >= row.Count() || row[col2].IsNull() ||
+          row[col2].type != ValueType::kInt64 || row[col2].IsUnsigned()) {
+        return false;
+      }
+      const int64_t seq = row[col2].value.int_value;
+      if (i > 0 && seq <= prev_seq) {
+        return false;
+      }
+      prev_seq = seq;
+    }
+    uint32_t h0 = 0;
+    uint32_t h1 = 0;
+    if (!encode_half(row, col0, 0, asc0, nf0, &h0) ||
+        !encode_half(row, col1, 1, asc1, nf1, &h1)) {
+      return false;
+    }
+    entries[i] = PackedEntry{
+        .key = (static_cast<uint64_t>(h0) << 32) | static_cast<uint64_t>(h1),
+        .idx = static_cast<uint32_t>(i)};
+  }
+
+  for (unsigned shift = 0; shift < 64; shift += 8) {
+    std::array<uint32_t, 256> counts{};
+    const auto first_byte =
+        static_cast<uint8_t>((entries[0].key >> shift) & 0xFFU);
+    bool all_same = true;
+    for (const PackedEntry& e : entries) {
+      const auto b = static_cast<uint8_t>((e.key >> shift) & 0xFFU);
+      ++counts[b];
+      if (b != first_byte) {
+        all_same = false;
+      }
+    }
+    if (all_same) {
+      continue;
+    }
+    uint32_t offset = 0;
+    std::array<uint32_t, 256> pos{};
+    for (size_t b = 0; b < 256; ++b) {
+      pos[b] = offset;
+      offset += counts[b];
+    }
+    for (const PackedEntry& e : entries) {
+      const auto b = static_cast<uint8_t>((e.key >> shift) & 0xFFU);
+      scratch[pos[b]++] = e;
+    }
+    entries.swap(scratch);
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    if (entries[i].idx == i) {
+      continue;
+    }
+    Row tmp = std::move((*rows)[i]);
+    size_t cur = i;
+    while (entries[cur].idx != i) {
+      const size_t nxt = entries[cur].idx;
+      (*rows)[cur] = std::move((*rows)[nxt]);
+      entries[cur].idx = static_cast<uint32_t>(cur);
+      cur = nxt;
+    }
+    (*rows)[cur] = std::move(tmp);
+    entries[cur].idx = static_cast<uint32_t>(cur);
+  }
+  return true;
 }
 
 // P34/61: identical to CompareRows but over the per-stream cached key cells
@@ -162,10 +318,13 @@ int ExternalSorter::CompareKeyCells(const MergeStream& lhs,
     const bool lhs_ok = lhs.key_present[i] != 0;
     const bool rhs_ok = rhs.key_present[i] != 0;
     if (!lhs_ok || !rhs_ok) {
-      if (lhs_ok != rhs_ok) {
-        return lhs_ok ? 1 : -1;
+      if (lhs_ok == rhs_ok) {
+        continue;
       }
-      continue;
+      // Mirror CompareRows: a missing cache cell is the NULL peer of a
+      // present one and follows the key's NULLS FIRST/LAST placement.
+      const bool nulls_first = key_orders_[i].NullsFirst();
+      return nulls_first ? (lhs_ok ? 1 : -1) : (lhs_ok ? -1 : 1);
     }
     const int cmp = key_orders_[i].Compare(lhs.key_cells[i], rhs.key_cells[i]);
     if (cmp != 0) {
@@ -176,21 +335,36 @@ int ExternalSorter::CompareKeyCells(const MergeStream& lhs,
 }
 
 // P34/61: snapshot the stream's current row key columns into owned Values.
-void ExternalSorter::RefreshStreamKey(MergeStream* stream) noexcept {
-  const size_t nk = key_orders_.size();
-  stream->key_cells.resize(nk);
-  stream->key_present.assign(nk, 0);
-  if (stream->eof || stream->row_idx >= stream->block_rows.size()) {
-    return;
-  }
-  const Row& row = stream->block_rows[stream->row_idx];
-  for (size_t i = 0; i < nk; ++i) {
-    const size_t col_idx = options_.keys[i].column_index;
-    if (col_idx < row.Count()) {
-      stream->key_present[i] = 1;
-      stream->key_cells[i] = row[col_idx];
+// resize/assign and the deep Value copy can allocate, so translate allocation
+// failure into a Status instead of terminating inside this noexcept helper.
+Status ExternalSorter::RefreshStreamKey(MergeStream* stream) noexcept {
+  try {
+    const size_t nk = key_orders_.size();
+    // Build into locals and commit only on success: the loser tree compares
+    // stream->key_cells directly, so a partially written cache would corrupt
+    // ordering for every later comparison, not just this stream's.
+    std::vector<Value> cells(nk);
+    std::vector<uint8_t> present(nk, 0);
+    if (!stream->eof && stream->row_idx < stream->block_rows.size()) {
+      const Row& row = stream->block_rows[stream->row_idx];
+      for (size_t i = 0; i < nk; ++i) {
+        const size_t col_idx = options_.keys[i].column_index;
+        if (col_idx < row.Count()) {
+          present[i] = 1;
+          cells[i] = row[col_idx];
+        }
+      }
     }
+    stream->key_cells = std::move(cells);
+    stream->key_present = std::move(present);
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter key refresh out of memory");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter key refresh too large");
   }
+  return Status::kSuccess;
 }
 
 // Fast pre-check for the TopK heap. This duplicates SortKeyOrder::Compare
@@ -210,6 +384,15 @@ bool ExternalSorter::ShouldSkipTopKChunkRow(
   if (!key_orders_[sql_key_count].Ascending()) {
     return false;
   }
+  // Every text key must reach AddRow, including later sort terms on rows
+  // discarded by the first term.
+  for (size_t i = 0; i < sql_key_count; ++i) {
+    const size_t col = options_.keys[i].column_index;
+    if (col < chunk.ColumnCount() &&
+        (chunk.ColumnAt(col).Type() == ValueType::kVarChar ||
+         chunk.ColumnAt(col).IsHeterogeneous())) { return false;
+}
+  }
   const Row& heap_root = run_rows_.front();
   for (size_t i = 0; i < sql_key_count; ++i) {
     const size_t col_idx = options_.keys[i].column_index;
@@ -217,7 +400,21 @@ bool ExternalSorter::ShouldSkipTopKChunkRow(
     const bool rhs_ok = col_idx < heap_root.Count();
     if (!lhs_ok || !rhs_ok) {
       if (lhs_ok != rhs_ok) {
-        return lhs_ok;
+        // Mirror CompareRows/CompareKeyCells: a missing column is the NULL
+        // peer of a present one and follows the key's NULLS FIRST/LAST
+        // placement; a present-but-NULL value makes both sides NULL peers
+        // -> tie. Unconditionally treating "has column" as sorting after
+        // "missing column" can skip a row the real comparator would keep
+        // under NULLS FIRST.
+        const bool lhs_null =
+            !lhs_ok || chunk.ColumnAt(col_idx).IsNull(row_idx);
+        const bool rhs_null = !rhs_ok || heap_root[col_idx].IsNull();
+        if (lhs_null == rhs_null) {
+          continue;
+        }
+        const int cmp = key_orders_[i].NullsFirst() ? (lhs_null ? -1 : 1)
+                                                    : (lhs_null ? 1 : -1);
+        return cmp > 0;
       }
       continue;
     }
@@ -327,6 +524,9 @@ void ExternalSorter::DropRunSegments() noexcept {
 }
 
 void ExternalSorter::Reset() noexcept {
+  for (size_t i = 0; i < key_orders_.size(); ++i) {
+    key_orders_[i] = MakeSortKeyOrder(options_.keys[i]);
+  }
   final_merge_.reset();
   final_streams_.clear();
   DropRunSegments();
@@ -354,16 +554,30 @@ void ExternalSorter::Reset() noexcept {
 
 Status ExternalSorter::WriteSortedRun(std::vector<Row>* rows,
                                       SpillSegmentId* seg_out) {
+  if (options_.spill_store != nullptr && spill_store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
+  }
   if (options_.spill_store == nullptr) {
     return StatusError(
         StatusCode::kMemoryLimitExceeded,
         "ExternalSorter exceeded memory budget with no SpillStore");
   }
-  std::stable_sort(
-      rows->begin(), rows->end(),
-      [this](const Row& a, const Row& b) { return RowPrecedes(a, b); });
-  if (options_.limit.has_value() && rows->size() > *options_.limit) {
-    rows->resize(*options_.limit);
+  try {
+    if (!TrySortRowsPackedTwoKey(rows)) {
+      std::stable_sort(
+          rows->begin(), rows->end(),
+          [this](const Row& a, const Row& b) { return RowPrecedes(a, b); });
+    }
+    if (options_.limit.has_value() && rows->size() > *options_.limit) {
+      rows->resize(*options_.limit);
+    }
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter run sort out of memory");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter run resize too large");
   }
 
   const size_t budget = EffectiveBudgetBytes();
@@ -382,9 +596,15 @@ Status ExternalSorter::WriteSortedRun(std::vector<Row>* rows,
     // the first batch flush individually once the threshold is reached,
     // exhausting the temporary-space budget.
     size_t batch_bytes = 0;
-    while (batch_end < rows->size() && (batch_end - idx) < kWriteBatchRows &&
-           batch_bytes < kWriteBatchMaxBytes) {
-      batch_bytes += EstimateRowMemoryBytes((*rows)[batch_end]);
+    while (batch_end < rows->size() && (batch_end - idx) < kWriteBatchRows) {
+      const size_t row_bytes = EstimateRowMemoryBytes((*rows)[batch_end]);
+      // A wide row must still form its own batch so the merge can progress.
+      if (batch_end != idx &&
+          row_bytes > kWriteBatchMaxBytes -
+                          std::min(batch_bytes, kWriteBatchMaxBytes)) {
+        break;
+      }
+      batch_bytes += row_bytes;
       ++batch_end;
     }
     RETURN_IF_FAIL(WriteRowBlock(
@@ -419,8 +639,16 @@ Status ExternalSorter::FlushCurrentRun() {
 }
 
 Status ExternalSorter::AddRow(const Row& row) {
-  Row copy = row;
-  return AddRow(std::move(copy));
+  try {
+    Row copy = row;
+    return AddRow(std::move(copy));
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter row copy out of memory");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter row copy too large");
+  }
 }
 
 Status ExternalSorter::AddRow(Row&& row) {
@@ -428,8 +656,20 @@ Status ExternalSorter::AddRow(Row&& row) {
     return StatusError(StatusCode::kInvalidArgument,
                        "cannot AddRow to finished ExternalSorter");
   }
+  if (options_.spill_store != nullptr && spill_store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
+  }
   if (options_.limit.has_value() && *options_.limit == 0) {
+    // Every submitted row is dropped, but still contributes to TotalRows().
+    ++total_rows_;
     return Status::kSuccess;
+  }
+  for (size_t i = 0; i < key_orders_.size(); ++i) {
+    const size_t col = options_.keys[i].column_index;
+    if (col < row.Count()) {
+      RETURN_IF_FAIL(key_orders_[i].Observe(row[col]));
+    }
   }
   ++total_rows_;
 
@@ -484,15 +724,21 @@ Status ExternalSorter::AddRow(Row&& row) {
     }
   }
 
+  bool row_grant_reserved = false;
   const bool need_flush =
       (always_spill && !run_rows_.empty() && run_bytes_ >= 16384) ||
       (budget > 0 && run_bytes_ + row_bytes > budget) ||
-      (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes));
+      (grant_cache_.has_value() &&
+       !(row_grant_reserved = grant_cache_->Reserve(row_bytes)));
 
   if (need_flush) {
     RETURN_IF_FAIL(FlushCurrentRun());
-    if ((budget > 0 && row_bytes > budget) ||
-        (grant_cache_.has_value() && !grant_cache_->Reserve(row_bytes))) {
+    const bool row_exceeds_budget = budget > 0 && row_bytes > budget;
+    if (!row_exceeds_budget && grant_cache_.has_value()) {
+      row_grant_reserved = grant_cache_->Reserve(row_bytes);
+    }
+    if (row_exceeds_budget ||
+        (grant_cache_.has_value() && !row_grant_reserved)) {
       if (options_.spill_store == nullptr) {
         return StatusError(
             StatusCode::kMemoryLimitExceeded,
@@ -501,17 +747,47 @@ Status ExternalSorter::AddRow(Row&& row) {
       }
       ObservePeakMemory(row_bytes);
       std::vector<Row> single;
-      single.push_back(std::move(row));
+      try {
+        single.push_back(std::move(row));
+      } catch (const std::bad_alloc&) {
+        return StatusError(StatusCode::kMemoryLimitExceeded,
+                           "ExternalSorter single-row buffer out of memory");
+      } catch (const std::length_error&) {
+        return StatusError(StatusCode::kMemoryLimitExceeded,
+                           "ExternalSorter single-row buffer too large");
+      }
       SpillSegmentId seg = kInvalidSpillSegmentId;
       RETURN_IF_FAIL(WriteSortedRun(&single, &seg));
-      run_segments_.push_back(seg);
+      try {
+        run_segments_.push_back(seg);
+      } catch (const std::bad_alloc&) {
+        options_.spill_store->DropSegment(seg);
+        return StatusError(StatusCode::kMemoryLimitExceeded,
+                           "ExternalSorter run list out of memory");
+      } catch (const std::length_error&) {
+        options_.spill_store->DropSegment(seg);
+        return StatusError(StatusCode::kMemoryLimitExceeded,
+                           "ExternalSorter run list too large");
+      }
       ++run_count_;
       spilled_ = true;
       return Status::kSuccess;
     }
   }
 
-  run_rows_.push_back(std::move(row));
+  try {
+    run_rows_.push_back(std::move(row));
+  } catch (const std::bad_alloc&) {
+    if (row_grant_reserved) { grant_cache_->Release(row_bytes);
+}
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter row buffer out of memory");
+  } catch (const std::length_error&) {
+    if (row_grant_reserved) { grant_cache_->Release(row_bytes);
+}
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter row buffer too large");
+  }
   run_bytes_ += row_bytes;
   ObservePeakMemory(run_bytes_);
 
@@ -533,7 +809,11 @@ Status ExternalSorter::AdvanceMergeStream(MergeStream* stream) {
     return Status::kSuccess;
   }
   while (stream->row_idx >= stream->block_rows.size()) {
-    stream->block_rows.clear();
+    // Free the previous block's high-water capacity as well as its rows:
+    // keeping it would retain every stream's largest-ever 64 KiB block until
+    // the merge ends, exceeding the computed budget (#12823). swap-with-empty
+    // does not allocate, so it is safe on this Status path.
+    std::vector<Row>().swap(stream->block_rows);
     stream->row_idx = 0;
     ASSIGN_OR_RETURN(bool, has_more,
                      ReadRowBlock(stream->reader.get(), &stream->block_rows,
@@ -578,104 +858,129 @@ void ExternalSorter::ComputeMergeGeometry(
   *merge_fan_in_out = fan_in;
 }
 
-Status ExternalSorter::MergeRunGroup(const std::vector<SpillSegmentId>& inputs,
+Status ExternalSorter::MergeRunGroup(std::span<const SpillSegmentId> inputs,
                                      size_t reader_buf_bytes,
                                      size_t writer_buf_bytes,
                                      SpillSegmentId* merged_out) {
-  std::vector<MergeStream> streams(inputs.size());
-
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    streams[i].reader = std::make_unique<SpillSegmentReader>(
-        options_.spill_store, inputs[i], reader_buf_bytes);
-    RETURN_IF_FAIL(AdvanceMergeStream(&streams[i]));
-    RefreshStreamKey(&streams[i]);
+  if (options_.spill_store != nullptr && spill_store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
   }
-  // P34/61: loser tree on cached key cells; equal keys break by stream
-  // index (run order), keeping the merge deterministic.
-  const auto key_beats = [this, &streams](int a, int b) {
-    const int cmp = CompareKeyCells(streams[a], streams[b]);
-    return cmp < 0 || (cmp == 0 && a < b);
-  };
-  std::vector<uint8_t> initial_active(inputs.size(), 1);
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    initial_active[i] = streams[i].eof ? 0 : 1;
-  }
-  LoserMerge tree;
-  tree.Build(inputs.size(), initial_active, key_beats);
+  try {
+    std::vector<MergeStream> streams(inputs.size());
 
-  SpillSegmentWriter writer(options_.spill_store, writer_buf_bytes);
-  RETURN_IF_FAIL(writer.EnsureOpen());
-
-  std::vector<Row> batch;
-  batch.reserve(kWriteBatchRows);
-  size_t batch_bytes = 0;
-  std::string write_scratch;
-  size_t written = 0;
-
-  while (tree.Top() >= 0) {
-    if (options_.limit.has_value() && written >= *options_.limit) {
-      // Top-N pruning: only the first `limit` rows of a merge can hold the
-      // global top-N, so leaving the rest unread is intentional. The limit is
-      // fixed in Options at construction (Reset() cannot clear it), so a
-      // limit-less sorter never enters this branch and cannot lose runs.
-      break;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      streams[i].reader = std::make_unique<SpillSegmentReader>(
+          options_.spill_store, inputs[i], reader_buf_bytes);
+      RETURN_IF_FAIL(AdvanceMergeStream(&streams[i]));
+      RETURN_IF_FAIL(RefreshStreamKey(&streams[i]));
     }
-    const auto idx = static_cast<size_t>(tree.Top());
+    // P34/61: loser tree on cached key cells; equal keys break by stream
+    // index (run order), keeping the merge deterministic.
+    const auto key_beats = [this, &streams](int a, int b) {
+      const int cmp = CompareKeyCells(streams[a], streams[b]);
+      return cmp < 0 || (cmp == 0 && a < b);
+    };
+    std::vector<uint8_t> initial_active(inputs.size(), 1);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      initial_active[i] = streams[i].eof ? 0 : 1;
+    }
+    LoserMerge tree;
+    tree.Build(inputs.size(), initial_active, key_beats);
 
-    Row row = std::move(streams[idx].block_rows[streams[idx].row_idx]);
-    ++streams[idx].row_idx;
-    batch_bytes += EstimateRowMemoryBytes(row);
-    batch.push_back(std::move(row));
-    ++written;
+    SpillSegmentWriter writer(options_.spill_store, writer_buf_bytes);
+    RETURN_IF_FAIL(writer.EnsureOpen());
 
-    if (batch.size() >= kWriteBatchRows || batch_bytes >= kWriteBatchMaxBytes) {
+    std::vector<Row> batch;
+    batch.reserve(kWriteBatchRows);
+    size_t batch_bytes = 0;
+    std::string write_scratch;
+    size_t written = 0;
+
+    while (tree.Top() >= 0) {
+      if (options_.limit.has_value() && written >= *options_.limit) {
+        // Top-N pruning: only the first `limit` rows of a merge can hold the
+        // global top-N, so leaving the rest unread is intentional. The limit is
+        // fixed in Options at construction (Reset() cannot clear it), so a
+        // limit-less sorter never enters this branch and cannot lose runs.
+        break;
+      }
+      const auto idx = static_cast<size_t>(tree.Top());
+
+      Row row = std::move(streams[idx].block_rows[streams[idx].row_idx]);
+      ++streams[idx].row_idx;
+      batch_bytes += EstimateRowMemoryBytes(row);
+      batch.push_back(std::move(row));
+      ++written;
+
+      if (batch.size() >= kWriteBatchRows ||
+          batch_bytes >= kWriteBatchMaxBytes) {
+        RETURN_IF_FAIL(WriteRowBlock(&writer, batch, &write_scratch));
+        batch.clear();
+        batch_bytes = 0;
+      }
+
+      RETURN_IF_FAIL(AdvanceMergeStream(&streams[idx]));
+      RETURN_IF_FAIL(RefreshStreamKey(&streams[idx]));
+      tree.SetActive(idx, !streams[idx].eof);
+      tree.Replay(static_cast<int>(idx), key_beats);
+    }
+
+    if (!batch.empty()) {
       RETURN_IF_FAIL(WriteRowBlock(&writer, batch, &write_scratch));
       batch.clear();
-      batch_bytes = 0;
     }
-
-    RETURN_IF_FAIL(AdvanceMergeStream(&streams[idx]));
-    RefreshStreamKey(&streams[idx]);
-    tree.SetActive(idx, !streams[idx].eof);
-    tree.Replay(static_cast<int>(idx), key_beats);
+    ASSIGN_OR_RETURN(SpillSegmentId, out_id, writer.Finish(true));
+    spilled_bytes_ += writer.BytesWritten();
+    *merged_out = out_id;
+    return Status::kSuccess;
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter merge allocation out of memory");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter merge allocation too large");
   }
-
-  if (!batch.empty()) {
-    RETURN_IF_FAIL(WriteRowBlock(&writer, batch, &write_scratch));
-    batch.clear();
-  }
-  ASSIGN_OR_RETURN(SpillSegmentId, out_id, writer.Finish(true));
-  spilled_bytes_ += writer.BytesWritten();
-  *merged_out = out_id;
-  return Status::kSuccess;
 }
 
 Status ExternalSorter::OpenFinalMergeStreams(size_t reader_buf_bytes) {
-  final_streams_.clear();
-  final_merge_ = std::make_unique<LoserMerge>();
-  final_streams_.resize(run_segments_.size());
+  try {
+    final_streams_.clear();
+    final_merge_ = std::make_unique<LoserMerge>();
+    final_streams_.resize(run_segments_.size());
 
-  for (size_t i = 0; i < run_segments_.size(); ++i) {
-    final_streams_[i].reader = std::make_unique<SpillSegmentReader>(
-        options_.spill_store, run_segments_[i], reader_buf_bytes);
-    RETURN_IF_FAIL(AdvanceMergeStream(&final_streams_[i]));
-    RefreshStreamKey(&final_streams_[i]);
+    for (size_t i = 0; i < run_segments_.size(); ++i) {
+      final_streams_[i].reader = std::make_unique<SpillSegmentReader>(
+          options_.spill_store, run_segments_[i], reader_buf_bytes);
+      RETURN_IF_FAIL(AdvanceMergeStream(&final_streams_[i]));
+      RETURN_IF_FAIL(RefreshStreamKey(&final_streams_[i]));
+    }
+    const auto key_beats = [this](int a, int b) {
+      const int cmp = CompareKeyCells(final_streams_[a], final_streams_[b]);
+      return cmp < 0 || (cmp == 0 && a < b);
+    };
+    std::vector<uint8_t> initial_active(run_segments_.size(), 1);
+    for (size_t i = 0; i < run_segments_.size(); ++i) {
+      initial_active[i] = final_streams_[i].eof ? 0 : 1;
+    }
+    final_merge_->Build(run_segments_.size(), initial_active, key_beats);
+    return Status::kSuccess;
+  } catch (const std::bad_alloc&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter final merge allocation out of memory");
+  } catch (const std::length_error&) {
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "ExternalSorter final merge allocation too large");
   }
-  const auto key_beats = [this](int a, int b) {
-    const int cmp = CompareKeyCells(final_streams_[a], final_streams_[b]);
-    return cmp < 0 || (cmp == 0 && a < b);
-  };
-  std::vector<uint8_t> initial_active(run_segments_.size(), 1);
-  for (size_t i = 0; i < run_segments_.size(); ++i) {
-    initial_active[i] = final_streams_[i].eof ? 0 : 1;
-  }
-  final_merge_->Build(run_segments_.size(), initial_active, key_beats);
-  return Status::kSuccess;
 }
 
 Status ExternalSorter::Finish() {
   if (finished_) {
     return Status::kSuccess;
+  }
+  if (options_.spill_store != nullptr && spill_store_alive_.expired()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "spill store is no longer alive");
   }
   if (!spilled_) {
     if (in_limit_heap_) {
@@ -684,7 +989,7 @@ Status ExternalSorter::Finish() {
       };
       std::sort_heap(run_rows_.begin(), run_rows_.end(), less_fn);
       in_limit_heap_ = false;
-    } else {
+    } else if (!TrySortRowsPackedTwoKey(&run_rows_)) {
       std::stable_sort(
           run_rows_.begin(), run_rows_.end(),
           [this](const Row& a, const Row& b) { return RowPrecedes(a, b); });
@@ -708,41 +1013,44 @@ Status ExternalSorter::Finish() {
   ComputeMergeGeometry(&merge_fan_in, &reader_buf, &writer_buf);
 
   while (run_segments_.size() > merge_fan_in) {
-    std::vector<SpillSegmentId> next_round;
-    next_round.reserve((run_segments_.size() + merge_fan_in - 1) /
-                       merge_fan_in);
-    for (size_t i = 0; i < run_segments_.size(); i += merge_fan_in) {
-      const size_t end = std::min(i + merge_fan_in, run_segments_.size());
-      std::vector<SpillSegmentId> group(
-          run_segments_.begin() + static_cast<ptrdiff_t>(i),
-          run_segments_.begin() + static_cast<ptrdiff_t>(end));
-      if (group.size() == 1) {
-        next_round.push_back(group.front());
-        continue;
+    // Compact completed groups into the front of the ownership list. On
+    // failure the remaining suffix still owns the original, unmerged runs.
+    size_t completed = 0;
+    for (size_t i = 0; i < run_segments_.size();) {
+      const auto group =
+          std::span<const SpillSegmentId>(run_segments_)
+              .subspan(i, std::min(merge_fan_in, run_segments_.size() - i));
+      SpillSegmentId output = group.front();
+      if (group.size() > 1) {
+        const Status merged =
+            MergeRunGroup(group, reader_buf, writer_buf, &output);
+        if (merged != Status::kSuccess) {
+          run_segments_.erase(
+              run_segments_.begin() + static_cast<ptrdiff_t>(completed),
+              run_segments_.begin() + static_cast<ptrdiff_t>(i));
+          return merged;
+        }
+        for (const auto input : group) {
+          SpillStore::DropSegmentIfAlive(options_.spill_store,
+                                         spill_store_alive_, input);
+        }
       }
-      SpillSegmentId merged = kInvalidSpillSegmentId;
-      RETURN_IF_FAIL(MergeRunGroup(group, reader_buf, writer_buf, &merged));
-      // Immediately release merged input runs so SpillStore recycles blocks.
-      // Use the shared liveness token: the store may already have been
-      // dropped by a sibling consumer, and a raw DropSegment would reuse a
-      // recycled id.
-      for (const SpillSegmentId consumed : group) {
-        SpillStore::DropSegmentIfAlive(options_.spill_store, spill_store_alive_,
-                                       consumed);
-      }
-      next_round.push_back(merged);
+      i += group.size();
+      run_segments_[completed++] = output;
     }
-    run_segments_ = std::move(next_round);
+    run_segments_.resize(completed);
     ++merge_passes_;
   }
 
   if (!run_segments_.empty()) {
     // A lone remaining run is only wrapped in a cursor, not merged; counting
-    // it here would inflate EXPLAIN's MergePasses by one.
+    // it here would inflate EXPLAIN's MergePasses by one. Count only after the
+    // streams open successfully so a retried Finish() cannot double-count
+    // (#12624).
+    RETURN_IF_FAIL(OpenFinalMergeStreams(reader_buf));
     if (run_segments_.size() > 1) {
       ++merge_passes_;
     }
-    RETURN_IF_FAIL(OpenFinalMergeStreams(reader_buf));
   }
   emitted_rows_ = 0;
   finished_ = true;
@@ -758,6 +1066,8 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     RETURN_IF_FAIL(Finish());
   }
   if (options_.limit.has_value() && emitted_rows_ >= *options_.limit) {
+    final_streams_.clear();
+    final_merge_.reset();
     DropRunSegments();  // no further rows will be read
     return false;
   }
@@ -792,15 +1102,45 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     return cmp < 0 || (cmp == 0 && a < b);
   };
   const auto idx = static_cast<size_t>(final_merge_->Top());
+  MergeStream& stream = final_streams_[idx];
 
-  *row_out =
-      std::move(final_streams_[idx].block_rows[final_streams_[idx].row_idx]);
-  ++final_streams_[idx].row_idx;
+  // Pull the winner into a local first. The source advance (and its block
+  // refill) happens before the pop is published to `row_out`/the loser tree,
+  // so a failed read leaves the tree and cached key describing the row a
+  // retry must emit again (#12636).
+  Row emitted = std::move(stream.block_rows[stream.row_idx]);
+  ++stream.row_idx;
+  Status advance = AdvanceMergeStream(&stream);
+  if (advance != Status::kSuccess) {
+    // AdvanceMergeStream may already have cleared and partially refilled the
+    // block; prepend the consumed row and point the cursor back at it. The
+    // tree/key cells were left untouched, so the stream is consistent again.
+    try {
+      stream.block_rows.insert(stream.block_rows.begin(), std::move(emitted));
+      stream.row_idx = 0;
+    } catch (const std::bad_alloc&) {
+      // Best effort: even if the row cannot be restored, report the real
+      // failure instead of leaking an exception across this Status path.
+    }
+    return advance;
+  }
+  // Refresh the loser key before publishing the emitted row. On failure the
+  // tree still describes `emitted` (the key cache was left untouched), so
+  // roll the stream cursor back and let a retry emit it again — the same
+  // contract the advance-failure path above maintains.
+  if (const Status key_status = RefreshStreamKey(&stream); !key_status.ok()) {
+    try {
+      stream.block_rows.insert(stream.block_rows.begin(), std::move(emitted));
+      stream.row_idx = 0;
+    } catch (const std::bad_alloc&) {
+      // Best effort, as above: report the real failure either way.
+    }
+    return key_status;
+  }
+  *row_out = std::move(emitted);
   ++emitted_rows_;
 
-  RETURN_IF_FAIL(AdvanceMergeStream(&final_streams_[idx]));
-  RefreshStreamKey(&final_streams_[idx]);
-  final_merge_->SetActive(idx, !final_streams_[idx].eof);
+  final_merge_->SetActive(idx, !stream.eof);
   final_merge_->Replay(static_cast<int>(idx), key_beats);
   if (final_merge_->Top() < 0) {
     final_streams_.clear();

@@ -570,7 +570,8 @@ StatusOr<bool> HasCollatedJoinColumn(const Relation& relation, size_t column) {
       const auto& values = chunk.columns[column];
       for (size_t row = 0; row < chunk.rows; ++row) {
         values.WriteValueInto(row, &cell);
-        if (!cell.IsNull() && cell.IsCaseInsensitive()) {
+        if (!cell.IsNull() &&
+            (cell.IsCaseInsensitive() || cell.IsInterval())) {
           return true;
         }
       }
@@ -579,7 +580,7 @@ StatusOr<bool> HasCollatedJoinColumn(const Relation& relation, size_t column) {
   }
   const auto collated = [column](const Row& row) {
     return column < row.Count() && !row[column].IsNull() &&
-           row[column].IsCaseInsensitive();
+           (row[column].IsCaseInsensitive() || row[column].IsInterval());
   };
   if (!relation.HasSpill()) {
     return std::ranges::any_of(relation.rows, collated);
@@ -714,9 +715,14 @@ bool HasMixedKeySignednessOrType(const Relation& left, const Relation& right,
   return check_side(left, true, keys) || check_side(right, false, keys);
 }
 
+// Lean proof: lean/TinylambOpt/ResearchProofs/BinaryCollationStringEquiJoinElision.lean (sound)
 std::vector<Expression> ResidualJoinPredicates(
     const Schema& left, const Schema& right,
-    const std::vector<Expression>& predicates) {
+    const std::vector<Expression>& predicates, bool allow_binary_varchar) {
+  static const bool varchar_elision_disabled =
+      std::getenv("TINYLAMB_DISABLE_VARCHAR_KEY_ELISION") != nullptr;
+  const bool elide_binary_varchar =
+      allow_binary_varchar && !varchar_elision_disabled;
   const std::vector<EqualityKey> keys = EqualityKeys(left, right, predicates);
   const bool can_elide_exact =
       !keys.empty() && keys.size() <= 4 &&
@@ -728,9 +734,15 @@ std::vector<Expression> ResidualJoinPredicates(
         }
         const Column& lc = left.GetColumn(key.left);
         const Column& rc = right.GetColumn(key.right);
-        return lc.Type() == rc.Type() && !lc.IsUnsigned() && !rc.IsUnsigned() &&
-               (lc.Type() == ValueType::kInt64 ||
-                lc.Type() == ValueType::kDate);
+        if (lc.Type() != rc.Type() || lc.IsUnsigned() || rc.IsUnsigned()) {
+          return false;
+        }
+        if (lc.Type() == ValueType::kInt64 || lc.Type() == ValueType::kDate) {
+          return true;
+        }
+        return elide_binary_varchar && lc.Type() == ValueType::kVarChar &&
+               !lc.IsInterval() && !rc.IsInterval() &&
+               lc.GetTextDomain() == rc.GetTextDomain();
       });
   std::vector<Expression> residual;
   residual.reserve(predicates.size());
@@ -833,7 +845,11 @@ bool SingleIntegerJoinKey(const Schema& schema,
   if (columns.size() != 1) {
     return false;
   }
-  const ValueType type = schema.GetColumn(columns[0]).Type();
+  const Column& column = schema.GetColumn(columns[0]);
+  if (column.IsUnsigned()) {
+    return false;
+  }
+  const ValueType type = column.Type();
   return type == ValueType::kInt64 || type == ValueType::kDate;
 }
 
@@ -863,7 +879,9 @@ bool CompositeIntJoinKey(const Schema& left_schema,
     const ValueType left_type = left_schema.GetColumn(left_columns[i]).Type();
     const ValueType right_type =
         right_schema.GetColumn(right_columns[i]).Type();
-    if (left_type != right_type ||
+    if (left_schema.GetColumn(left_columns[i]).IsUnsigned() ||
+        right_schema.GetColumn(right_columns[i]).IsUnsigned() ||
+        left_type != right_type ||
         (left_type != ValueType::kInt64 && left_type != ValueType::kDate)) {
       return false;
     }
@@ -873,36 +891,43 @@ bool CompositeIntJoinKey(const Schema& left_schema,
 
 namespace {
 
+bool LegacyJoinEstimateEnabled() {
+  static const bool enabled = [] {
+    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+    if (legacy == nullptr) {
+      return false;
+    }
+    const std::string_view value(legacy);
+    return !value.empty() && value != "0" && value != "false";
+  }();
+  return enabled;
+}
+
+size_t JoinEstimateSampleTarget() {
+  return LegacyJoinEstimateEnabled() ? size_t{2'000'000} : size_t{2'048};
+}
+
 void BuildJoinKeyFrequencyMaps(const Relation& right,
                                const std::vector<slot_t>& right_columns,
                                bool single_int, bool composite_int,
                                bool allow_hashed, JoinKeyFrequencyMaps* maps) {
-  static const bool legacy_estimate =
-      std::getenv("TINYLAMB_LEGACY_ESTIMATE") != nullptr;
   maps->single_int = single_int;
-  maps->hashed_key = !single_int && allow_hashed && !legacy_estimate;
+  maps->hashed_key =
+      !single_int && allow_hashed && !LegacyJoinEstimateEnabled();
   maps->hashed_fallback = false;
   maps->composite_int = composite_int && !maps->hashed_key;
   maps->right_columns = right_columns;
   maps->single_int_frequencies = FlatIntKeyMap<size_t>{};
   maps->frequencies.clear();
   maps->int_frequencies.clear();
-  static const size_t kBuildSampleTarget = [] {
-    // A/B hatch: a truthy TINYLAMB_LEGACY_ESTIMATE enables the 2M-row
-    // sampling targets; an explicit "0" must keep the small default.
-    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
-    const bool enabled = legacy != nullptr && legacy[0] != '\0' &&
-                         std::string_view(legacy) != "0" &&
-                         std::string_view(legacy) != "false";
-    return enabled ? size_t{2'000'000} : size_t{2'048};
-  }();
+  const size_t sample_target = JoinEstimateSampleTarget();
   static const bool build_sampling_disabled =
       std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
   const size_t total = right.TotalRows();
   maps->build_stride =
-      build_sampling_disabled || total <= kBuildSampleTarget
+      build_sampling_disabled || total <= sample_target
           ? 1
-          : (total + kBuildSampleTarget - 1) / kBuildSampleTarget;
+          : (total + sample_target - 1) / sample_target;
   const size_t sample_rows =
       maps->build_stride == 1
           ? total
@@ -1016,17 +1041,14 @@ size_t ProbeJoinEstimate(const Relation& left,
   // candidate).  Above a threshold, probe a deterministic stride sample and
   // scale the matched-key sum back up; near-tie estimates may flip ranking,
   // which is acceptable for a heuristic planner.
-  static const size_t kEstimateSampleTarget = [] {
-    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
-    return legacy != nullptr ? size_t{2'000'000} : size_t{2'048};
-  }();
+  const size_t sample_target = JoinEstimateSampleTarget();
   static const bool probe_sampling_disabled =
       std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
   const size_t left_rows = left.TotalRows();
   const size_t stride =
-      probe_sampling_disabled || left_rows <= kEstimateSampleTarget
+      probe_sampling_disabled || left_rows <= sample_target
           ? 1
-          : (left_rows + kEstimateSampleTarget - 1) / kEstimateSampleTarget;
+          : (left_rows + sample_target - 1) / sample_target;
   const auto probe_row = [&](const Row& row) {
     if (HasNullKey(row, left_columns)) {
       return;
@@ -1274,6 +1296,9 @@ size_t SpillPartitionOfSalted(int64_t key, size_t partitions, uint64_t salt) {
   // depend on the standard library's std::hash.  Encode big-endian so the
   // byte string (and therefore the hash) is identical on every endianness.
   const uint64_t be = htobe64(static_cast<uint64_t>(key));
+  // Examining an object's bytes through char* is allowed by the aliasing
+  // rules; &be is suitably aligned and htobe64 fixes the byte order, so the
+  // hash is identical on every endianness.
   const uint64_t h = platform::StableHashBytes(
       std::string_view(reinterpret_cast<const char*>(&be), sizeof(be)));
   return static_cast<size_t>((salt == 0 ? h : MixPartitionHash(h, salt)) %
@@ -3596,7 +3621,8 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           bop == BinaryOperation::kLessThanEquals ||
           bop == BinaryOperation::kGreaterThan ||
           bop == BinaryOperation::kGreaterThanEquals) {
-        auto unwrap_double_cast = [](const Expression& e) -> const Expression& {
+        auto unwrap_double_cast = [](const Expressio {n& e) -> Expre
+}ssion {
           if (e && e->Type() == TypeTag::kCastExp &&
               e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
               e->AsCastExpression().Child() != nullptr) {
@@ -3615,14 +3641,17 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           const auto off = LocalColumnOffset(
               result_schema, e->AsColumnValue().GetColumnName());
           if (!off.has_value() || *off >= result_schema.ColumnCount()) {
-            return false;
+          {   return fals
+}e;
           }
           const Column& c = result_schema.GetColumn(*off);
-          if (c.IsUnsigned() || c.Type() != ValueType::kDouble) {
+          if { (c.IsUnsigned
+}() || c.Type() != ValueType::kDouble) {
             return false;
           }
-          if (*off < left_width) {
-            out->on_probe = !flip;
+          if (*off < l {eft_width) {
+ 
+}           out->on_probe = !flip;
             out->col = *off;
           } else {
             out->on_probe = flip;
@@ -3858,8 +3887,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           const uint64_t packed =
               (static_cast<uint64_t>(
                    static_cast<uint32_t>(static_cast<int32_t>(v0)))
-               << 32) |
-              static_cast<uint64_t>(
+               << worker_items.data()    static_cast<uint64_t>(
                   static_cast<uint32_t>(static_cast<int32_t>(v1)));
           out->push_back({packed, base + p + i});
         }
@@ -3989,7 +4017,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                 for (const PartItem& it : bucket) {
                   if (packed_has_bloom) {
                     const auto w0 = static_cast<size_t>((it.h >> 6U) &
-                                                        packed_bloom_word_mask);
+                                      auto            packed_bloom_word_mask);
                     const auto w1 = static_cast<size_t>((it.h >> 30U) &
                                                         packed_bloom_word_mask);
                     const uint64_t m0 = uint64_t{1} << (it.h & 63U);
@@ -5087,7 +5115,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           *out_n = any_null ? dst_n : nullptr;
           return any_null;
         };
-        for (uint32_t r0 = task.row_begin; r0 < task.row_end; r0 += 4096) {
+        for (uint32_t r0 = task.rautoin; r0 < task.row_end; r0 += 4096) {
           const uint32_t cnt = std::min<uint32_t>(4096, task.row_end - r0);
           const int64_t* in_k0 = nullptr;
           const uint8_t* in_n0 = nullptr;
@@ -5121,7 +5149,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                                        ? AddJoinKeyBias(in_k0[i], pb0)
                                        : in_k0[i];
                 const int64_t v1 = has_bias && pb1 != 0
-                                       ? AddJoinKeyBias(in_k1[i], pb1)
+                                       ? AddautoyBias(in_k1[i], pb1)
                                        : in_k1[i];
                 if (static_cast<int64_t>(static_cast<int32_t>(v0)) == v0 &&
                     static_cast<int64_t>(static_cast<int32_t>(v1)) == v1) {
@@ -5582,7 +5610,9 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   }
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, ordinary_predicates);
+  const size_t raw_key_count = equality_keys.size();
   RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
+  const bool allow_varchar_elision = equality_keys.size() == raw_key_count;
   struct UsingJoinKey {
     std::vector<size_t> left_columns;
     std::vector<size_t> right_columns;
@@ -5606,9 +5636,9 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
         (right.using_columns == nullptr ||
          !ContainsIdentifier(*right.using_columns, name))) {
       return StatusError(StatusCode::kAmbiguousQuery,
-                         "ambiguous USING column: " + name);
+                         "am.left=biguous USING column: .right=" + name);
     }
-    // USING columns with the same ValueType but different unsigned tags do
+    //.null_safe= USING columns with the same ValueType but different unsigned tags do
     // NOT compare equal under the canonical `=` (-1 INT64 vs UINT64_MAX).
     // Only fold into a raw equality key when both sides share the tag;
     // otherwise keep a residual that rechecks with TryEvaluateBinary.
@@ -5634,7 +5664,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       HasMixedKeySignednessOrType(left, right, equality_keys)
           ? ordinary_predicates
           : ResidualJoinPredicates(left.schema, right.schema,
-                                   ordinary_predicates);
+                                   ordinary_predicates, allow_varchar_elision);
   const auto compiled_residuals =
       outer == nullptr && using_residuals.empty()
           ? CompileProbeResiduals(residual, result.schema)
@@ -6334,11 +6364,14 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, predicates);
+  const size_t raw_key_count = equality_keys.size();
   RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
+  const bool allow_varchar_elision = equality_keys.size() == raw_key_count;
   const std::vector<Expression> residual =
       HasMixedKeySignednessOrType(left, right, equality_keys)
           ? predicates
-          : ResidualJoinPredicates(left.schema, right.schema, predicates);
+          : ResidualJoinPredicates(left.schema, right.schema, predicates,
+                                   allow_varchar_elision);
 
   const auto compiled_residuals =
       outer == nullptr ? CompileProbeResiduals(residual, result.schema)

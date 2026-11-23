@@ -11,8 +11,15 @@
 
 namespace tinylamb {
 
+namespace {
+Plan RequireChild(Plan child) {
+  CHECK_MSG(child != nullptr, "EmptyPlan requires a non-null child");
+  return child;
+}
+}  // namespace
+
 EmptyPlan::EmptyPlan(Plan child)
-    : child_(std::move(child)), stats_(child_->GetSchema()) {}
+    : child_(RequireChild(std::move(child))), stats_(child_->GetSchema()) {}
 
 // EmitExecutor lives in the relational factory
 // (executor/relational_factory.cpp).

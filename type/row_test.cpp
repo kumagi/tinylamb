@@ -244,7 +244,7 @@ TEST(RowTest, Extract_WithOutOfBoundsIndices_ReportsError) {
   EXPECT_EQ(reordered.Value(), Row({Value(2), Value(1), Value(2)}));
 }
 
-TEST(RowTest, TryDeserializeProjected_RejectsOutOfRangeColumn) {
+TEST(RowTest, TryDeserializeProjected_RejectsInvalidSlots) {
   // The ascending fast path used to check only monotonicity, so a {100}
   // projection on a 2-column schema decoded to a resized all-NULL row while
   // TryExtract rejected the same index. Out-of-range is now an error on every
@@ -256,7 +256,8 @@ TEST(RowTest, TryDeserializeProjected_RejectsOutOfRangeColumn) {
   source.Serialize(image.data());
   for (const std::vector<slot_t>& projection :
        {std::vector<slot_t>{100}, std::vector<slot_t>{6, 5},
-        std::vector<slot_t>{0, 2}}) {
+        std::vector<slot_t>{0, 2}, std::vector<slot_t>{1, 0},
+        std::vector<slot_t>{1, 1}}) {
     std::string trace;
     for (slot_t slot : projection) {
       if (!trace.empty()) {

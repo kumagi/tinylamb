@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/log_message.hpp"
 #include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
@@ -37,7 +38,7 @@
 namespace tinylamb {
 
 MemTable::MemTable(const Schema& sc)
-    : schema_(sc), shards_(static_cast<size_t>(kNumShards)), fixed_key_(false) {
+    : schema_(sc), shards_(static_cast<size_t>(kNumShards)) {
   key_idx_ = sc.KeyColumnIndex();
   key_type_ = key_idx_ < sc.ColumnCount() ? sc.GetColumn(key_idx_).Type()
                                           : ValueType::kNull;
@@ -116,11 +117,14 @@ void PushPriorVersions(SkipList& list, std::string_view key, RowEntry& fresh) {
   if (prev == nullptr) {
     return;
   }
+  std::vector<RowEntry> chain;
+  // Reserve before taking ownership of the live entry. Upsert the same key
+  // without allocating once the old entry has been moved into the chain.
+  chain.reserve(1 + std::min(prev->older_versions.size(),
+                             kMaxKeptVersionsPerKey - 1));
   std::vector<RowEntry> history = std::move(prev->older_versions);
   RowEntry stolen = std::move(*prev);
-  stolen.older_versions.clear();  // moved-from; keep the node entry tidy
-  std::vector<RowEntry> chain;
-  chain.reserve(1 + history.size());
+  stolen.older_versions.clear();
   chain.push_back(std::move(stolen));
   for (auto& old : history) {
     if (chain.size() >= kMaxKeptVersionsPerKey) {
@@ -300,7 +304,7 @@ size_t MemTable::Size() const {
   return n;
 }
 
-Status MemTable::Put(const Row& r, bool sync) {
+Status MemTable::Put(const Row& r, bool sync) try {
   // The row-blob wire format length-prefixes varchars with bin_size_t
   // (uint16). A longer value passes through Put, only to have Row::Serialize
   // THROW from deep inside Sync() -- after the shard swap, with the entry
@@ -417,9 +421,11 @@ Status MemTable::Put(const Row& r, bool sync) {
     }
   }
   return Status::kSuccess;
+} catch (...) {
+  return StatusFromCurrentException("memtable put failed");
 }
 
-Status MemTable::Delete(std::string_view key, bool sync) {
+Status MemTable::Delete(std::string_view key, bool sync) try {
   Shard& s = ShardFor(key);
   {
     std::scoped_lock lk(s.lock);
@@ -441,6 +447,8 @@ Status MemTable::Delete(std::string_view key, bool sync) {
     }
   }
   return Status::kSuccess;
+} catch (...) {
+  return StatusFromCurrentException("memtable delete failed");
 }
 
 Status MemTable::Sync(std::vector<char>* blob_out,
@@ -618,17 +626,36 @@ Status MemTable::Sync(std::vector<char>* blob_out,
   // fails, the sealed lists have to stay intact so a retry can re-drain and
   // re-persist the same entries. Clearing them first made a failed hook
   // unrecoverable -- the data existed only in the returned blob.
+  // `draining` staying true is intentional on that path: it is only a read
+  // hint (Lookup/Contains also consult `sealed`), not a write gate -- Put and
+  // Delete always write to `active`. Clearing it while `sealed` still holds
+  // the entries would hide them from reads.
+  // On failure the partial run in the output vectors is not a valid SortedRun;
+  // clear it just like the empty and kNoSpace paths so a caller that retries
+  // with the same vectors cannot persist a duplicated prefix.
+  const auto clear_outputs = [&]() {
+    blob_out->clear();
+    key_run_out->clear();
+    row_run_out->clear();
+    if (deleted_out != nullptr) {
+      deleted_out->clear();
+    }
+  };
   // flush_mutex_ is held, so this read is ordered against
   // SetDurabilityCallback's store; (fn, ctx) are always a matched pair.
   if (durability_fn_ != nullptr) {
     try {
+      // blob_out is std::vector<char>: data() is already char*, so the cast
+      // only adds const. No type punning, alignment or endian assumption.
       durability_fn_(reinterpret_cast<const char*>(blob_out->data()),
                      blob_out->size(), durability_ctx_);
     } catch (const std::exception& e) {
+      clear_outputs();
       return StatusError(
           StatusCode::kIOError,
           std::string("WAL durability hook failed: ") + e.what());
     } catch (...) {
+      clear_outputs();
       return StatusError(StatusCode::kIOError, "WAL durability hook failed");
     }
   }

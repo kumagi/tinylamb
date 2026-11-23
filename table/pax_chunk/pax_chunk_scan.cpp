@@ -3806,7 +3806,7 @@ bool DecodableIntCacheScheme(Scheme scheme) {
 
 std::span<const int64_t> PaxChunk::DecodedIntCell(slot_t col,
                                                   uint32_t group) const {
-  const size_t index = static_cast<size_t>(group) * footer_.column_count + col;
+  const size_t index = (static_cast<size_t>(group) * footer_.column_count) + col;
   if (group >= footer_.row_counts.size() || index >= footer_.encodings.size() ||
       !DecodableIntCacheScheme(static_cast<Scheme>(footer_.encodings[index]))) {
     return {};
@@ -4225,15 +4225,13 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       Value tv = VarcharRegionAt(cur.region, cur.scheme, cur.prm, cache->seq_rc,
                                  loc, cur.region_end, &cur.fsst);
       if (tv.IsNull()) {
-        // VarcharRegionAt's default arm returns a null Value for an unknown
-        // scheme (e.g. an int64-encoded cell declared varchar). Reset the
-        // slot instead of leaving a stale string from a previous row: the
-        // caller may reuse the same Row across ReadRowInto calls. This
-        // matches the FrontCode decode-failure arm above.
-        slot = Value();
-      } else {
-        slot.SetString(tv.MoveString());
+        // VarcharRegionAt's default arm returns a null Value only for an
+        // unknown scheme (e.g. an int64-encoded cell declared varchar);
+        // legitimate NULLs were already filtered by the null bitmap above.
+        // Surface the corruption instead of emitting a silent NULL.
+        return Status::kCorruption;
       }
+      slot.SetString(tv.MoveString());
     }
     return Status::kSuccess;
   }
@@ -4432,12 +4430,12 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       Value tv =
           VarcharRegionAt(region, s, prm, rc, local, region_end, &fsst_view);
       if (tv.IsNull()) {
-        // Unknown scheme: clear a reused Row's previous string instead of
-        // leaving a stale value (same contract as the sequential path).
-        slot = Value();
-      } else {
-        slot.SetString(tv.MoveString());
+        // Unknown scheme: same contract as the sequential path — a null
+        // Value here means VarcharRegionAt's default arm fired (legitimate
+        // NULLs were filtered by the null bitmap above), i.e. corrupt footer.
+        return Status::kCorruption;
       }
+      slot.SetString(tv.MoveString());
     }
   }
   return Status::kSuccess;

@@ -41,13 +41,13 @@ graph TD
           }
 ```
 
-発火条件および非発火条件は以下の通りです。
+発火条件および非発火条件は以下の通りです。`WITH TIES` が指定されている Limit は、枝ごとの offset+count cap では同順位の境界行を保存できないため対象外です.
 
 1. `limit_count > 0` であること（0 は tinylamb において無制限を意味するため押し込み不能）。
 2. `limit_offset + limit_count` の計算が `size_t` の範囲内でオーバーフローしないこと。
 3. 入力グループのタグが `"union-limit-setop:"` で始まらないこと（自己適用のループ防止）。
 4. 入力グループ内に子ノード数 2 以上の `LogicalOperator::kUnionAll` 式が存在すること。
-5. 枝ごとの派生グループ（`union-limit:<cap>`）が枝自身やルートグループと一致しないこと。
+5. 枝ごとの派生グループ（`union-limit:<child>:<cap>`。子 Group ID を含む）が枝自身やルートグループと一致しないこと。子 ID がタグに入ることで、同じ `cap` 値を異なる 2 分岐に押し込むとき派生グループが衝突しません(D1)。
 
 UNION DISTINCT に対しては、重複排除が分岐をまたいで行われるため本 Rule は発火しません。
 
@@ -68,9 +68,10 @@ UNION DISTINCT に対しては、重複排除が分岐をまたいで行われ�
             limited_children.reserve(setop.children.size());
             bool cycle = false;
             for (const GroupId child : setop.children) {
-              const GroupId limited =
-                  memo.EnsureDerivedGroup(memo.Get(child).relations,
-                                          "union-limit:" + std::to_string(cap));
+              const GroupId limited = memo.EnsureDerivedGroup(
+                  memo.Get(child).relations,
+                  "union-limit:" + std::to_string(child) + ":" +
+                      std::to_string(cap));
               if (limited == child || limited == group) {
                 cycle = true;
                 break;
@@ -86,7 +87,7 @@ UNION DISTINCT に対しては、重複排除が分岐をまたいで行われ�
 ```
 
 1. 全枝に対して `limit_count = cap`, `limit_offset = 0` の `kLimit` 式を配置した派生グループを生成します。
-2. 派生グループ `union-limit-setop:<cap>` に新しい子リストを持つ `kUnionAll` 式を配置します。
+2. 派生グループ `union-limit-setop:<input-group>:<cap>` に新しい子リストを持つ `kUnionAll` 式を配置します。
 3. ルートグループにその派生グループを子とする元の `kLimit` 式を配置します。
 
 ## 最適化効果

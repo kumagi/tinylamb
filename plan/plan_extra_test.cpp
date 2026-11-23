@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -19,6 +20,7 @@
 #include "expression/named_expression.hpp"
 #include "gtest/gtest.h"
 #include "index/index.hpp"
+#include "plan/apply_plan.hpp"
 #include "plan/distinct_plan.hpp"
 #include "plan/group_by_plan.hpp"
 #include "plan/incremental_sort_plan.hpp"
@@ -26,6 +28,7 @@
 #include "plan/plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
+#include "plan/sample_plan.hpp"
 #include "plan/set_operation_plan.hpp"
 #include "plan/skip_scan_distinct_plan.hpp"
 #include "plan/sort_distinct_plan.hpp"
@@ -59,7 +62,52 @@ std::string DumpToString(const PlanBase& plan, int indent = 0) {
   return oss.str();
 }
 
+// Leaf plan reporting the saturated SIZE_MAX row estimate that
+// RecursiveCte/Product-style plans produce, to pin SamplePlan's narrowing.
+class SaturatedRowsPlan final : public PlanBase {
+ public:
+  Executor EmitExecutor(TransactionContext& /*ctx*/) const override {
+    return nullptr;
+  }
+  [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
+  [[nodiscard]] const TableStatistics& GetStats() const override {
+    return Stats();
+  }
+  [[nodiscard]] const Schema& GetSchema() const override { return LeafSchema(); }
+  [[nodiscard]] size_t AccessRowCount() const override {
+    return std::numeric_limits<size_t>::max();
+  }
+  [[nodiscard]] size_t EmitRowCount() const override {
+    return std::numeric_limits<size_t>::max();
+  }
+  void Dump(std::ostream& out, int indent) const override {
+    out << Indent(static_cast<size_t>(indent)) << "Saturated\n";
+  }
+  [[nodiscard]] std::string ToString() const override { return "Saturated"; }
+
+ private:
+  static const Schema& LeafSchema() {
+    static const Schema schema;
+    return schema;
+  }
+  static const TableStatistics& Stats() {
+    static const TableStatistics stats{LeafSchema()};
+    return stats;
+  }
+};
+
 }  // namespace
+
+TEST(PlanAuditTest, SemiAndAntiApplyCannotExpandOuterCardinality) {
+  const Plan outer = MakeValuesChild(3);
+  const Plan inner = MakeValuesChild(2);
+  for (JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kInner}) {
+    const ApplyPlan plan(outer, inner, Expression{}, kind);
+    const size_t expected = kind == JoinKind::kInner ? 30 : 3;
+    EXPECT_EQ(plan.EmitRowCount(), expected);
+    EXPECT_EQ(plan.GetStats().Rows(), expected);
+  }
+}
 
 TEST(PlanAuditTest, SetCardinalityUsesEveryBranch) {
   const auto empty = MakeValuesChild(0);
@@ -386,6 +434,13 @@ TEST_F(SkipScanDistinctPlanExtraTest, StatsDrivenRowCountsAndOrdering) {
                             {NamedExpression("a", ColumnValueExp("a"))}, out);
   EXPECT_EQ(none.EmitRowCount(), 0U);
   EXPECT_EQ(none.AccessRowCount(), 0U);
+
+  const size_t max_rows = std::numeric_limits<size_t>::max();
+  stats.Assign(max_rows, {ColumnStats(ValueType::kInt64)});
+  SkipScanDistinctPlan max_count(*table_, *index_, stats, true,
+                                {NamedExpression("a", ColumnValueExp("a"))},
+                                out);
+  EXPECT_EQ(max_count.EmitRowCount(), max_rows);
 }
 
 TEST(PlanExtraTest, RelationRenamePreservesColumnTypeAndConstraint) {
@@ -413,6 +468,36 @@ TEST(PlanExtraTest, RelationRenamePreservesColumnTypeAndConstraint) {
   EXPECT_FALSE(rcol2.IsUnsigned());
 
   EXPECT_EQ(rename.ToString(), "Rename: orig_table AS renamed_alias");
+}
+
+TEST(PlanExtraTest, SamplePlanSaturatedChildRowCountStaysInRange) {
+  const Plan child = std::make_shared<SaturatedRowsPlan>();
+  const size_t saturated = std::numeric_limits<size_t>::max();
+
+  TableSampleSpec percent_spec;
+  percent_spec.method = TableSampleMethod::kBernoulli;
+  percent_spec.unit = TableSampleUnit::kPercent;
+  percent_spec.size = ConstantValueExp(Value(100));
+  EXPECT_EQ(
+      std::make_shared<SamplePlan>(child, percent_spec)->EmitRowCount(),
+      saturated);
+
+  // 50% of the saturated estimate lands on 2^63 -- the double input already
+  // rounded SIZE_MAX up to 2^64, so the estimate stays approximate.
+  TableSampleSpec half_spec = percent_spec;
+  half_spec.size = ConstantValueExp(Value(50));
+  EXPECT_EQ(std::make_shared<SamplePlan>(child, half_spec)->EmitRowCount(),
+            size_t{1} << 63);
+
+  // A UINT64 row limit at SIZE_MAX must not round up to 2^64 either.
+  TableSampleSpec reservoir_spec;
+  reservoir_spec.method = TableSampleMethod::kReservoir;
+  reservoir_spec.unit = TableSampleUnit::kRows;
+  reservoir_spec.size =
+      ConstantValueExp(Value(static_cast<int64_t>(-1)).WithUnsigned());
+  EXPECT_EQ(
+      std::make_shared<SamplePlan>(child, reservoir_spec)->EmitRowCount(),
+      saturated);
 }
 
 }  // namespace tinylamb

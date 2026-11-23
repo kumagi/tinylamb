@@ -366,6 +366,15 @@ TEST(IntervalTest, ParseRejectsTrailingGarbage) {
   EXPECT_EQ(
       IntervalValue::TryParse("15:14", "MINUTE TO SECOND").MoveValue().nanos,
       (15LL * 60 + 14) * 1000000000LL);
+  // RangeUnitIndex accepts the plural spelling too, so M:S must be selected
+  // by the resolved range, not by an exact "minute to second" string match
+  // (which parsed 1:2 as 1h2m = 3720s).
+  EXPECT_EQ(
+      IntervalValue::TryParse("1:2", "minutes to seconds").MoveValue().nanos,
+      62LL * 1000000000LL);
+  EXPECT_EQ(
+      IntervalValue::TryParse("15:14", "MINUTES TO SECONDS").MoveValue().nanos,
+      (15LL * 60 + 14) * 1000000000LL);
   EXPECT_FALSE(IntervalValue::TryParse("1:2", "hour to second").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1:2:").HasValue());
   EXPECT_FALSE(IntervalValue::TryParse("1:2:3junk").HasValue());

@@ -94,6 +94,25 @@ TEST_F(IndexTest, Insert_DuplicateRowsOnNonUniqueIndex_Succeeds) {
   ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
   ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
   ASSERT_SUCCESS(tbl->Insert(ctx.txn_, r).GetStatus());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  // The name promises that all three duplicate keys survive in the index;
+  // assert it on both indexes from a fresh reader transaction (the writer's
+  // transaction is finished by PreCommit).
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, rtbl,
+                              reader.GetTable(kTableName));
+  for (const auto& [index, key] : {std::pair{rtbl->GetIndex(0), Value(1)},
+                                   std::pair{rtbl->GetIndex(1), Value(3)}}) {
+    auto scan = rtbl->BeginIndexScan(reader.txn_, index, key, key);
+    size_t found = 0;
+    while (scan.IsValid()) {
+      EXPECT_EQ(*scan, r);
+      ++found;
+      ++scan;
+    }
+    EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    EXPECT_EQ(found, 3U);
+  }
 }
 
 TEST_F(IndexTest, Read_AfterInsert_ReturnsInsertedRow) {
@@ -162,10 +181,9 @@ TEST_F(IndexTest, Insert_MultipleRowsWithIndex_Succeeds) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                               ctx.GetTable(kTableName));
-  const std::vector<Row> expected{
-      Row({Value(1), Value("string"), Value(3)}),
-      Row({Value(2), Value("hoge"), Value(8)}),
-      Row({Value(3), Value("foo"), Value(5)})};
+  const std::vector<Row> expected{Row({Value(1), Value("string"), Value(3)}),
+                                  Row({Value(2), Value("hoge"), Value(8)}),
+                                  Row({Value(3), Value("foo"), Value(5)})};
   for (const Row& row : expected) {
     ASSIGN_OR_ASSERT_FAIL_CONST(RowPosition, pos, tbl->Insert(ctx.txn_, row));
     ASSIGN_OR_ASSERT_FAIL_CONST(Row, restored, tbl->Read(ctx.txn_, pos));
@@ -173,13 +191,15 @@ TEST_F(IndexTest, Insert_MultipleRowsWithIndex_Succeeds) {
   }
   ASSERT_EQ(tbl->IndexCount(), 2U);
   for (const Row& row : expected) {
-    auto first = tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(0), row[0], row[0]);
+    auto first =
+        tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(0), row[0], row[0]);
     ASSERT_TRUE(first.IsValid());
     EXPECT_EQ(*first, row);
     ++first;
     EXPECT_FALSE(first.IsValid());
     EXPECT_EQ(first.GetStatus(), Status::kSuccess);
-    auto second = tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(1), row[2], row[2]);
+    auto second =
+        tbl->BeginIndexScan(ctx.txn_, tbl->GetIndex(1), row[2], row[2]);
     ASSERT_TRUE(second.IsValid());
     EXPECT_EQ(*second, row);
     ++second;

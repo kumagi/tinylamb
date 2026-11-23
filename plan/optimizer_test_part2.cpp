@@ -2767,6 +2767,12 @@ TEST_F(OptimizerTest, ClusteringPenaltySteersSelectiveRangeScanChoice) {
     EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
     auto plan_or = Optimizer::Optimize(query, context);
     EXPECT_EQ(plan_or.GetStatus(), Status::kSuccess);
+    // EXPECT is non-fatal: Value() on an empty StatusOr aborts the process, so
+    // bail out of this lambda instead of letting that happen.
+    if (!plan_or.HasValue()) {
+      ADD_FAILURE() << "Optimize() returned no plan";
+      return std::make_pair(std::string{}, size_t{0});
+    }
     std::ostringstream dump;
     dump << plan_or.Value();
     size_t rows = 0;
@@ -3161,6 +3167,12 @@ TEST_F(OptimizerTest, OrderedOuterDiscountsTheIndexProbeIntoAWin) {
     EXPECT_SUCCESS(query.Rewrite(context));
     StatusOr<Plan> optimized = Optimizer::Optimize(query, context);
     EXPECT_TRUE(optimized.HasValue());
+    // EXPECT is non-fatal: Value() on an empty StatusOr aborts the process, so
+    // bail out of this lambda instead of letting that happen.
+    if (!optimized.HasValue()) {
+      ADD_FAILURE() << "Optimize() returned no plan";
+      return std::pair<std::string, std::vector<std::pair<int64_t, int64_t>>>{};
+    }
     const Plan& plan = optimized.Value();
     std::ostringstream dump;
     plan->Dump(dump, 0);

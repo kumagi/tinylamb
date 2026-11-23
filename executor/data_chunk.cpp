@@ -134,8 +134,12 @@ void ColumnVector::PromoteToHeterogeneous() {
 
 void ColumnVector::Append(const Value& value) {
   const bool is_null = value.IsNull();
-  if (value.IsInterval() && !heterogeneous_) {
+  const bool mixed_text = value.type == ValueType::kVarChar &&
+                          type_ == ValueType::kVarChar && observed_collation_ &&
+                          CollationOf(value) != collation_;
+  if ((value.IsInterval() || mixed_text) && !heterogeneous_) {
     PromoteToHeterogeneous();
+    mixed_collation_ = mixed_text;
   }
   if (heterogeneous_) {
     EnsureNullBit(size_, is_null);
@@ -194,8 +198,12 @@ void ColumnVector::Append(const Value& value) {
 
 void ColumnVector::Append(Value&& value) {
   const bool is_null = value.IsNull();
-  if (value.IsInterval() && !heterogeneous_) {
+  const bool mixed_text = value.type == ValueType::kVarChar &&
+                          type_ == ValueType::kVarChar && observed_collation_ &&
+                          CollationOf(value) != collation_;
+  if ((value.IsInterval() || mixed_text) && !heterogeneous_) {
     PromoteToHeterogeneous();
+    mixed_collation_ = mixed_text;
   }
   if (heterogeneous_) {
     EnsureNullBit(size_, is_null);
@@ -283,7 +291,11 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
     }
     CHECK_MSG(false, "column vector type mismatch");
   }
-  if (type_ == ValueType::kVarChar && source.type_ == ValueType::kVarChar) {
+  if (!is_null && type_ == ValueType::kVarChar && source.type_ == ValueType::kVarChar) {
+    if (observed_collation_ && collation_ != source.ColumnCollation()) {
+      Append(source.ValueAt(index));
+      return;
+    }
     ObserveSourceCollation(source);
   }
   EnsureNullBit(size_, is_null);
@@ -335,6 +347,12 @@ void ColumnVector::AppendRange(const ColumnVector& source) {
     CHECK_MSG(false, "column vector type mismatch");
   }
   if (source.type_ == ValueType::kVarChar) {
+    if (source.observed_collation_ && observed_collation_ &&
+        collation_ != source.ColumnCollation()) {
+      for (size_t i = 0; i < source.Size(); ++i) { AppendFrom(source, i);
+}
+      return;
+    }
     ObserveSourceCollation(source);
   }
   const size_t old_size = size_;
@@ -391,13 +409,13 @@ void ColumnVector::AppendBoolBatch(const uint8_t* bits, size_t count) {
     type_ = ValueType::kInt64;
     MaterializeInferredStorage();
   }
+  if (type_ != ValueType::kInt64 && type_ != ValueType::kDate) {
+    CHECK_MSG(false, "bool batch append on non-integer column vector");
+  }
   const size_t old_size = size_;
   size_ = old_size + count;
   null_bitmap_.resize((size_ + 63) / 64, 0);
   // Every appended cell is non-null: the new bitmap words stay zero.
-  if (type_ != ValueType::kInt64 && type_ != ValueType::kDate) {
-    CHECK_MSG(false, "bool batch append on non-integer column vector");
-  }
   integers_.resize(size_);
   int64_t* out = integers_.data() + old_size;
   for (size_t i = 0; i < count; ++i) {
@@ -1190,7 +1208,7 @@ void DataChunk::CommitBatchAppend(size_t appended_rows) {
 }
 
 Row DataChunk::RowAt(size_t row_index) const {
-  assert(row_index < size_ && "DataChunk::RowAt out of range");
+  CHECK_MSG(row_index < size_, "DataChunk::RowAt out of range");
   std::vector<Value> values;
   values.reserve(columns_.size());
   for (const ColumnVector& column : columns_) {

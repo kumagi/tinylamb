@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -24,14 +26,52 @@ def main() -> None:
 
     cmd = [str(binary), f"--gtest_filter={args.filter}"]
     print(f"Running: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    stdout, _ = proc.communicate()
+    # Popen has no check= parameter. The child's exit status is validated
+    # explicitly below: gtest returns 0 on success and 1 when tests fail, so
+    # only those two codes are accepted; a crash, signal or other non-zero
+    # code is reported and aborts. `check=True` is therefore not applicable
+    # here (it would also reject gtest's legitimate exit code 1).
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        stdout, _ = proc.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            # Kill grandchildren too; they may have inherited stdout and keep
+            # communicate() waiting for EOF after only the direct child dies.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.kill()
+        try:
+            stdout, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Keep timeout handling bounded even if an inherited pipe remains
+            # open outside the process group.
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.kill()
+            proc.wait()
+            stdout = ""
+        print(f"Error: {binary} timed out after 600 s", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        sys.exit(1)
     if proc.returncode not in (0, 1):
         if proc.returncode < 0:
             import signal
 
             sig = -proc.returncode
-            name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else str(sig)
+            try:
+                name = signal.Signals(sig).name
+            except ValueError:
+                name = str(sig)
             print(f"Error: {binary} terminated by signal {name}", file=sys.stderr)
         else:
             print(f"Error: {binary} exited with {proc.returncode}", file=sys.stderr)

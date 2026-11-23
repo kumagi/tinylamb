@@ -90,7 +90,7 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
       predicate_(std::move(predicate)),
       identity_(LateMaterializationIdentity::kRowId),
       rowid_(rowid),
-      right_row_count_(0),
+      
       schema_(declared_output.ColumnCount() == 0
                   ? left_->GetSchema() + right_table.GetSchema()
                   : std::move(declared_output)),

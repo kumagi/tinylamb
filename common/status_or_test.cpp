@@ -19,6 +19,16 @@ TEST(StatusOrTest, NullOptionalIsAValueRatherThanMissingStorage) {
   ASSERT_TRUE(present.HasValue());
   EXPECT_EQ(present.Value(), 42);
 }
+TEST(StatusOrTest, CopyOfConsumedStatusOrStaysConsumed) {
+  StatusOr<int> original = 42;
+  (void)original.MoveValue();
+  ASSERT_FALSE(original.HasValue());
+  StatusOr<int> copied = original;
+  EXPECT_FALSE(copied.HasValue());
+  StatusOr<int> assigned = Status::kSuccess;
+  assigned = original;
+  EXPECT_FALSE(assigned.HasValue());
+}
 TEST(StatusOrTest, ConvertingValuesAndErrorsRemainDistinct) {
   const StatusOr<std::string> text = "value";
   ASSERT_TRUE(text.HasValue());
@@ -61,6 +71,16 @@ TEST(StatusOrTest, ConvertingValuesAndErrorsRemainDistinct) {
     EXPECT_NE(ToString(static_cast<StatusCode>(v)), "INVALID STATUS")
         << "StatusCode value " << v << " has no ToString case";
   }
+  // The range walk cannot see an alias (it shares kCorrupt's value) or a
+  // gap/hidden enumerator, so pin the enum's shape explicitly: aliases must
+  // keep their spelling and kStatusCodeCount must stay the last value,
+  // otherwise a new code inserted after the sentinel escapes the walk above.
+  EXPECT_EQ(ToString(StatusCode::kCorruption), "Corrupt");
+  EXPECT_EQ(static_cast<uint32_t>(StatusCode::kCorruption),
+            static_cast<uint32_t>(StatusCode::kCorrupt));
+  EXPECT_EQ(static_cast<uint32_t>(StatusCode::kStatusCodeCount),
+            static_cast<uint32_t>(StatusCode::kQueryCanceled) + 1);
+  EXPECT_EQ(ToString(StatusCode::kStatusCodeCount), "INVALID STATUS");
   EXPECT_EQ(SqlStateForStatus(Status::kQueryCanceled), "57014");
   EXPECT_EQ(SqlStateForStatus(Status::kQueryCanceled, "XX000"), "57014");
   // P2839: kNotImplemented is feature_not_supported, never a syntax error.

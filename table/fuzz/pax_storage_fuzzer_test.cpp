@@ -37,23 +37,30 @@ namespace tinylamb::fuzz {
 
 namespace {
 
+// This replay harness is single-threaded; the process environment is global
+// here by design. Mirror region_scheme_fuzzer.cpp's ScopedForcedScheme: the
+// getenv/setenv/unsetenv calls are annotated for that deliberate choice.
 class ScopedForceScheme {
  public:
   explicit ScopedForceScheme(const char* value) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     if (const char* old = std::getenv("TINYLAMB_FORCE_SCHEME")) {
       previous_ = old;
     }
-    setenv("TINYLAMB_FORCE_SCHEME", value, 1);
+    setenv("TINYLAMB_FORCE_SCHEME", value, 1);  // NOLINT(concurrency-mt-unsafe)
   }
   ~ScopedForceScheme() {
     if (previous_) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       setenv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");
+      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ScopedForceScheme(const ScopedForceScheme&) = delete;
   ScopedForceScheme& operator=(const ScopedForceScheme&) = delete;
+  ScopedForceScheme(ScopedForceScheme&&) = delete;
+  ScopedForceScheme& operator=(ScopedForceScheme&&) = delete;
 
  private:
   std::optional<std::string> previous_;
@@ -170,7 +177,7 @@ TEST(PaxStorageFuzzerTest, LsmMergeSeeds) {
       // variant (the reverse of one run is a no-op, keep those plain).
       seed.push_back(static_cast<uint8_t>(
           (nruns - 1) |
-          ((variant & 1)
+          (((variant & 1) != 0)
                ? 0x10
                : 0)));  // NOLINT(readability-implicit-bool-conversion)
       seed.push_back(static_cast<uint8_t>(variant));
@@ -443,7 +450,7 @@ TEST(PaxStorageFuzzerTest, FooterSectionsSeeds) {
         seed[3] = static_cast<uint8_t>((sec * 3) % 64);
         seed[4] = static_cast<uint8_t>(mode);
         for (size_t k = 5; k < 8; ++k) {
-          seed[k] = static_cast<uint8_t>(static_cast<size_t>(sec) + k);
+          seed[k] = static_cast<uint8_t>(sec + k);
         }
         const uint64_t probe = (static_cast<uint64_t>(sec) * 1000003ULL) +
                                (static_cast<uint64_t>(mode) * 7919ULL);

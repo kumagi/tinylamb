@@ -99,6 +99,11 @@ AggregationExecutor::AggregationExecutor(
   for (const NamedExpression& named : aggregates_) {
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
+    if (!IsCountStar(agg) && !agg.Child()) {
+      FailWith(StatusError(StatusCode::kInvalidArgument,
+                           "aggregate argument is missing"));
+      return;
+    }
     // BIT_* only accept INT64; the typed column kernels CHECK-abort on a
     // DOUBLE column, so keep such inputs on the generic loop, which reports
     // the type error as a Status like every other route.

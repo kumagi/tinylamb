@@ -56,6 +56,14 @@ class PageRef final {
   }
 
   void PageUnlock();
+  // Drop the content latch but keep the owning shared_ptr and the page
+  // pointer alive. Use when a callee must receive the raw Page* after the
+  // latch is released (e.g. DestroyPage takes blocks_mu_ and must not run
+  // under a page latch): PageUnlock() drops the owner and would leave the
+  // pointer dangling. IsNull() and get() still report the page after this
+  // call; they do not indicate whether its content latch is held. Use
+  // PageUnlock() when the PageRef should also stop retaining the page.
+  void PageReleaseLatch();
   RowPage& GetRowPage();
   [[nodiscard]] bool IsNull() const { return page_ == nullptr; }
   Page* get() { return page_; }

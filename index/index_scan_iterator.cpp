@@ -80,7 +80,7 @@ TableLease AcquireTableLease(const Table& table, Transaction& txn,
     // Preserve the real cause (kNoSpace/kIOError/...) instead of letting the
     // caller flatten every lease failure into kConflicts.
     *failure = lease.GetStatus();
-    return TableLease();
+    return {};
   }
   return lease.MoveValue();
 }
@@ -249,7 +249,12 @@ StatusOr<std::vector<Row>> IndexScanIterator::PartitionBoundaries(
   boundaries.reserve(encoded.size());
   for (std::string& key : encoded) {
     Row row;
-    row.DecodeMemcomparableFormat(key);
+    // Partition boundaries come from the index, so a malformed key must be
+    // reported as a corrupt scan rather than escaping as a shim exception.
+    if (const Status decoded = row.TryDecodeMemcomparableFormat(key);
+        decoded != Status::kSuccess) {
+      return decoded;
+    }
     boundaries.push_back(std::move(row));
   }
   return boundaries;
@@ -326,21 +331,30 @@ void IndexScanIterator::UpdateIteratorState() {
     return;
   }
   if (!entry_loaded_ || resolve_head_) {
-    std::string key_copy;
-    const std::string_view encoded_key =
-        iter_.stable_leaf_cache_
-            ? (iter_.EnsureLeafCache() ? iter_.CachedKey(iter_.idx_)
-                                       : std::string_view{})
-            : std::string_view(key_copy = iter_.Key());
-    if (iter_.GetStatus() != Status::kSuccess) {
-      status_ = iter_.GetStatus();
-      Clear();
-      return;
-    }
-    const Status decoded = keys_.TryDecodeMemcomparableFormat(encoded_key);
-    if (decoded != Status::kSuccess) {
-      status_ = decoded;
-      Clear();
+    // Every cursor step must refresh keys_: single-value scans skip vanished
+    // entries below, and keys_ is copied straight into TryReadIndexOnly's
+    // result. Keep the load in one place so both paths agree on the key.
+    const auto reload_current_key = [this]() -> bool {
+      std::string key_copy;
+      const std::string_view encoded_key =
+          iter_.stable_leaf_cache_
+              ? (iter_.EnsureLeafCache() ? iter_.CachedKey(iter_.idx_)
+                                         : std::string_view{})
+              : std::string_view(key_copy = iter_.Key());
+      if (iter_.GetStatus() != Status::kSuccess) {
+        status_ = iter_.GetStatus();
+        Clear();
+        return false;
+      }
+      const Status decoded = keys_.TryDecodeMemcomparableFormat(encoded_key);
+      if (decoded != Status::kSuccess) {
+        status_ = decoded;
+        Clear();
+        return false;
+      }
+      return true;
+    };
+    if (!reload_current_key()) {
       return;
     }
     std::string value_copy;
@@ -365,6 +379,11 @@ void IndexScanIterator::UpdateIteratorState() {
              encoded_value == std::string_view(kEmptyList, sizeof(uint64_t))) {
         ++iter_;
         if (!iter_.IsValid()) {
+          // A lazy cursor can become invalid because of an I/O error, not
+          // only at end-of-range: never turn that into a clean empty scan.
+          if (iter_.GetStatus() != Status::kSuccess) {
+            status_ = iter_.GetStatus();
+          }
           Clear();
           return;
         }
@@ -375,7 +394,13 @@ void IndexScanIterator::UpdateIteratorState() {
           Clear();
           return;
         }
+        // The skipped entry's key is still in keys_; refresh it before
+        // deciding whether the replacement is also a vanished entry.
+        if (!reload_current_key()) {
+          return;
+        }
       }
+      // DecodeIndexValue returns StatusOr: the failure is propagated below.
       auto value = DecodeIndexValue(encoded_value);
       if (!value.HasValue()) {
         status_ = value.GetStatus();
@@ -418,6 +443,7 @@ void IndexScanIterator::UpdateIteratorState() {
           }
         }
       }
+      // DecodeIndexValues returns StatusOr: the failure is propagated below.
       auto values = DecodeIndexValues(encoded_value);
       if (!values.HasValue()) {
         status_ = values.GetStatus();
@@ -663,6 +689,7 @@ IteratorBase& IndexScanIterator::operator++() {
       // A streaming DML consumer may have removed the current entry. Read
       // its new length before stepping, without rejecting the old offset:
       // an emptied list must advance to the next key rather than end the scan.
+      // DecodeIndexValues returns StatusOr; failure is propagated below.
       auto values = DecodeIndexValues(iter_.Value());
       if (!values.HasValue()) {
         status_ = values.GetStatus();

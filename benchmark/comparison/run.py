@@ -139,6 +139,8 @@ class Stack:
         it. Keep the probe socket open and release it only when the matching
         server is launched (close() drops any leftovers).
         """
+        if name in self.port_reservations:
+            return
         port = self.ports[name]
         probe = socket.socket()
         try:
@@ -186,12 +188,16 @@ class Stack:
                 del env[key]
         if getattr(a, "server_metrics", False):
             env["TINYLAMB_SERVER_METRICS"] = "1"
-        env.update(TINYLAMB_PAGE_POOL_BYTES=str(cache_mib * 1024 * 1024), TINYLAMB_QUERY_MEMORY_BYTES=str(a.tiny_query_memory_mib * 1024 * 1024))
+        env.update(TINYLAMB_BUFFER_POOL_BYTES=str(cache_mib * 1024 * 1024), TINYLAMB_QUERY_MEMORY_BYTES=str(a.tiny_query_memory_mib * 1024 * 1024))
         invocation = ["taskset", "-c", a.server_cpus, str(Path(a.server).resolve()), str(self.work / "database"),
                       "--port", str(a.tiny_port), "--read-workers", str(a.read_workers)]
         self.release_port('tinylamb')
         self.log = (self.output / "tinylamb-server.log").open("w")
         append_json(self.output / "commands.jsonl", {"argv": invocation, "env": {k: v for k, v in env.items() if k.startswith("TINYLAMB_")}})
+        # Popen has no check= argument: the tinylamb server is long-lived. Its
+        # startup is verified by the SELECT 1 probe below, and one-shot helper
+        # commands go through command()/subprocess.check_output() which checks
+        # their exit status.
         self.process = subprocess.Popen(invocation, env=env, cwd=ROOT, stdout=self.log, stderr=subprocess.STDOUT)
         if getattr(a, "include_oracle", False):
             from oracle_support import Container
@@ -219,6 +225,9 @@ class Stack:
                         first_failure = False
                     if time.monotonic() >= deadline:
                         raise RuntimeError(f"{engine} did not start: {error}") from error
+                    # Bounded poll of a TCP port in another process: there is
+                    # no in-process condition variable to wait on; `deadline`
+                    # caps the wait at 120 seconds.
                     time.sleep(.3)
 
     def metadata(self):
@@ -520,10 +529,15 @@ def oltp_child(engine, ports, name, worker, clients, account_rows, sales_rows, s
         client = Client(engine, ports, timeout)
         rng = random.Random(seed + worker)
         ready.put(True)
+        # Bounded busy-wait on the shared start timestamp set by the parent.
+        # The 1 ms sleep keeps the spawned workers from saturating the CPUs
+        # they will benchmark; there is no cross-process condition variable
+        # wired to this Value.
         while start_time.value == 0:
             time.sleep(.001)
         start = start_time.value
         measure_start, end = start + warmup, start + warmup + seconds
+        # Short, bounded wait until the synchronized start instant.
         while time.perf_counter() < start:
             time.sleep(.001)
         samples, errors, boundary_samples = [], [], []
@@ -604,7 +618,8 @@ def run_oltp(stack, args, output, rows):
                     collected = []
                     failure = None
                     try:
-                        if not all([ready.get(timeout=args.timeout + 10) for _ in workers]):
+                        if not all(ready.get(timeout=args.timeout + 10)
+                                   for _ in workers):
                             raise RuntimeError("worker could not connect")
                         start.value = time.perf_counter() + .1
                         deadline = start.value + args.warmup + args.seconds + args.timeout + 10

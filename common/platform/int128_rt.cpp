@@ -83,7 +83,47 @@ double U128ToF64(tu128 u) {
   return d;
 }
 
-float U128ToF32(tu128 u) { return static_cast<float>(U128ToF64(u)); }
+float U128ToF32(tu128 u) {
+  if (u == 0) {
+    return 0.0F;
+  }
+  int exponent = 127 - Clz128(u);
+  tu128 mantissa;
+  if (exponent > 23) {
+    const int drop = exponent - 23;
+    const tu128 dropped = u & ((static_cast<tu128>(1) << drop) - 1);
+    mantissa = u >> drop;
+    const tu128 half = static_cast<tu128>(1) << (drop - 1);
+    if (dropped > half || (dropped == half && (mantissa & 1))) {
+      ++mantissa;
+      if (mantissa >> 24) {
+        mantissa >>= 1;
+        ++exponent;
+      }
+    }
+  } else {
+    mantissa = u << (23 - exponent);
+  }
+  const uint32_t bits =
+      (static_cast<uint32_t>(exponent + 127) << 23) |
+      (static_cast<uint32_t>(mantissa) & ((1U << 23) - 1));
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+float I128ToF32(ti128 value) {
+  if (value >= 0) {
+    return U128ToF32(static_cast<tu128>(value));
+  }
+  const tu128 magnitude = -static_cast<tu128>(value);
+  float result = U128ToF32(magnitude);
+  uint32_t bits;
+  std::memcpy(&bits, &result, sizeof(bits));
+  bits |= uint32_t{1} << 31;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
 
 }  // namespace
 
@@ -100,7 +140,7 @@ double __floattidf(ti128 v) {
 
 double __floatuntidf(tu128 v) { return U128ToF64(v); }
 
-float __floattisf(ti128 v) { return static_cast<float>(__floattidf(v)); }
+float __floattisf(ti128 v) { return I128ToF32(v); }
 
 float __floatuntisf(tu128 v) { return U128ToF32(v); }
 

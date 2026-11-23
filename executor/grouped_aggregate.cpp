@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/status_or.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
@@ -240,18 +241,49 @@ bool SameGroup(const std::vector<SortKeyOrder>& orders, const Row& left,
 
 // ===================================================== AggregateGroupTable ===
 
-relational_detail::AggregateAccumulator& AggregateGroupTable::StateAt(
-    size_t flat) {
-  return (*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+StatusOr<size_t> AggregateGroupTable::StateIndex(size_t group, size_t index) const {
+  const size_t count = AggregateCount();
+  if (group >= keys_.size() || index >= count || index >= aggregates_->size() ||
+      group > (std::numeric_limits<size_t>::max() - index) / count) {
+    return StatusError(StatusCode::kInvalidArgument, "aggregate state index out of range");
+  }
+  if ((*aggregates_)[index] == nullptr) { return StatusError(StatusCode::kInvalidArgument, "empty aggregate slot");
+}
+  const size_t flat = (group * count) + index;
+  const size_t block = flat / kStateBlockElements;
+  if (block >= states_.size() || flat % kStateBlockElements >= states_[block]->size()) {
+    return StatusError(StatusCode::kCorrupt, "aggregate state block is incomplete");
+  }
+  return flat;
 }
 
-const relational_detail::AggregateAccumulator& AggregateGroupTable::StateAt(
-    size_t flat) const {
-  return (*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+StatusOr<relational_detail::AggregateAccumulator*> AggregateGroupTable::StateFor(size_t group, size_t index) {
+  ASSIGN_OR_RETURN(size_t, flat, StateIndex(group, index));
+  return &(*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+}
+
+StatusOr<const relational_detail::AggregateAccumulator*> AggregateGroupTable::StateFor(size_t group, size_t index) const {
+  ASSIGN_OR_RETURN(size_t, flat, StateIndex(group, index));
+  return &(*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
+}
+
+Status AggregateGroupTable::CheckAggregateList() {
+  const size_t count = aggregates_->size();
+  if (keys_.empty()) {
+    aggregate_count_ = count;
+    return Status::kSuccess;
+  }
+  if (aggregate_count_ != count) {
+    return StatusError(
+        StatusCode::kRuntimeError,
+        "aggregate list resized after the group table started");
+  }
+  return Status::kSuccess;
 }
 
 void AggregateGroupTable::AppendGroupStates() {
-  for (const AggregateExpression* aggregate : *aggregates_) {
+  for (size_t i = 0; i < AggregateCount(); ++i) {
+    const AggregateExpression* aggregate = (*aggregates_)[i];
     // nullptr aggregates keep a state slot so StateFor's flat
     // (group * count + index) mapping holds for every index.
     EmplaceState(aggregate, input_schema_);
@@ -260,6 +292,7 @@ void AggregateGroupTable::AppendGroupStates() {
 
 StatusOr<size_t> AggregateGroupTable::FindOrCreate(
     const std::vector<Value>& canonical_key) {
+  RETURN_IF_FAIL(CheckAggregateList());
   // The transparent lookup probes the scratch key vector directly, so a row
   // landing in an existing group costs no Row at all; only a new group pays
   // for one.
@@ -277,6 +310,7 @@ StatusOr<size_t> AggregateGroupTable::FindOrCreate(
 }
 
 StatusOr<size_t> AggregateGroupTable::FindOrCreate(Row key) {
+  RETURN_IF_FAIL(CheckAggregateList());
   auto [iterator, inserted] = index_.emplace(std::move(key), keys_.size());
   if (inserted) {
     keys_.push_back(&iterator->first);
@@ -286,13 +320,16 @@ StatusOr<size_t> AggregateGroupTable::FindOrCreate(Row key) {
 }
 
 Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
-  for (size_t i = 0; i < aggregates_->size(); ++i) {
+  RETURN_IF_FAIL(CheckAggregateList());
+  if (group >= keys_.size()) { return StatusError(StatusCode::kInvalidArgument, "aggregate group index out of range");
+}
+  for (size_t i = 0; i < AggregateCount(); ++i) {
     const AggregateExpression* aggregate = (*aggregates_)[i];
     if (aggregate == nullptr) {
       continue;
     }
-    relational_detail::AggregateAccumulator& state = StateFor(group, i);
-    if (state.IsDone()) {
+    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, StateFor(group, i));
+    if (state->IsDone()) {
       continue;
     }
     if (aggregate->WhereFilter()) {
@@ -337,46 +374,53 @@ Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
                        (extra->TryEvaluate(row, *input_schema_)));
       input.trailing_values.push_back(std::move(trailing));
     }
-    RETURN_IF_FAIL(state.Add(std::move(input)));
+    RETURN_IF_FAIL(state->Add(std::move(input)));
   }
   return Status::kSuccess;
 }
 
-StatusOr<Row> AggregateGroupTable::Finish(size_t group) const {
-  const Row& key = *keys_[group];
+StatusOr<Row> AggregateGroupTable::Finish(size_t group) {
+  RETURN_IF_FAIL(CheckAggregateList());
+  if (group >= keys_.size()) { return StatusError(StatusCode::kInvalidArgument, "aggregate group index out of range");
+}
+  const Row& key = Key(group);
   std::vector<Value> values;
-  values.reserve(key.values_.size() + aggregates_->size());
+  values.reserve(key.values_.size() + AggregateCount());
   for (const Value& value : key.values_) {
     values.push_back(value);
   }
-  for (size_t i = 0; i < aggregates_->size(); ++i) {
+  for (size_t i = 0; i < AggregateCount(); ++i) {
     if ((*aggregates_)[i] == nullptr) {
       values.emplace_back();
       continue;
     }
-    const relational_detail::AggregateAccumulator& state =
-        StateAt((group * aggregates_->size()) + i);
-    ASSIGN_OR_RETURN(Value, finished, state.TryFinish());
+    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, StateFor(group, i));
+    ASSIGN_OR_RETURN(Value, finished, state->TryFinish());
     values.push_back(std::move(finished));
   }
   return Row(std::move(values));
 }
 
 Status AggregateGroupTable::Merge(const AggregateGroupTable& other) {
+  RETURN_IF_FAIL(CheckAggregateList());
+  if (AggregateCount() != other.AggregateCount() || other.AggregateCount() != other.aggregates_->size()) {
+    return StatusError(StatusCode::kInvalidArgument, "aggregate shapes differ during merge");
+  }
   for (size_t group = 0; group < other.keys_.size(); ++group) {
-    const Row& other_key = *other.keys_[group];
+    const Row& other_key = other.Key(group);
     auto [iterator, inserted] = index_.emplace(other_key, keys_.size());
     if (inserted) {
       keys_.push_back(&iterator->first);
       AppendGroupStates();
     }
     const size_t target = iterator->second;
-    for (size_t i = 0; i < aggregates_->size(); ++i) {
+    for (size_t i = 0; i < AggregateCount(); ++i) {
       if ((*aggregates_)[i] == nullptr) {
         continue;
       }
-      RETURN_IF_FAIL(StateFor(target, i).Merge(
-          other.StateAt((group * other.aggregates_->size()) + i)));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, target_state, StateFor(target, i));
+      ASSIGN_OR_RETURN(const relational_detail::AggregateAccumulator*, source_state, other.StateFor(group, i));
+      RETURN_IF_FAIL(target_state->Merge(*source_state));
     }
   }
   return Status::kSuccess;
@@ -541,7 +585,8 @@ Status HashAggregateExecutor::EmitTable(AggregateGroupTable* table) {
 
 void HashAggregateExecutor::NoteResidentGroups(
     const AggregateGroupTable& table) {
-  peak_groups_ = std::max(peak_groups_, table.size());
+  peak_groups_.store(std::max(PeakResidentGroups(), table.size()),
+                     std::memory_order_relaxed);
 }
 
 Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
@@ -575,7 +620,8 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
               // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
               // harness assumes success
               : image[*value_offset];
-      RETURN_IF_FAIL(table->StateFor(group, i).Add(value));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, table->StateFor(group, i));
+      RETURN_IF_FAIL(state->Add(value));
     }
   }
   return Status::kSuccess;
@@ -738,8 +784,9 @@ Status HashAggregateExecutor::BuildParallel() {
             }
             worker_peaks[w] = std::max(worker_peaks[w], locals[w]->size());
           }
-        } catch (const std::exception& ex) {
-          stop_under_lock(StatusError(StatusCode::kRuntimeError, ex.what()));
+        } catch (...) {
+          stop_under_lock(
+              StatusFromCurrentException("grouped aggregation worker failed"));
         }
       });
     } catch (...) {
@@ -750,9 +797,8 @@ Status HashAggregateExecutor::BuildParallel() {
     }
   }
   threads.clear();
-  for (size_t peak : worker_peaks) {
-    peak_groups_ = std::max(peak_groups_, peak);
-  }
+  peak_groups_.store(*std::max_element(worker_peaks.begin(), worker_peaks.end()),
+                     std::memory_order_relaxed);
   if (error == Status::kSuccess && child_->GetStatus() != Status::kSuccess) {
     error = child_->GetStatus();
   }

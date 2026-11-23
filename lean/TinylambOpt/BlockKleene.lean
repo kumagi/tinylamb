@@ -91,15 +91,22 @@ def isNull : Scalar → K4
     leading CAST, NOT, AND, OR.  `col` is a column index. -/
 inductive Expr where
   | cmp : Nat → Int → Expr
+  | compareValue : Nat → (Int → Bool) → Expr
   | isNullExpr : Nat → Expr
   | castErr : Expr
   | notExpr : Expr → Expr
   | andExpr : Expr → Expr → Expr
   | orExpr : Expr → Expr → Expr
 
+def compareScalar (p : Int → Bool) : Scalar → K4
+  | .err => .e
+  | .ok none => .u
+  | .ok (some v) => if p v then .t else .f
+
 /-- Concrete evaluator, following the evaluator's (strict) order. -/
 def ceval (row : Nat → Scalar) : Expr → K4
   | .cmp col c => cmpEq c (row col)
+  | .compareValue col p => compareScalar p (row col)
   | .isNullExpr col => isNull (row col)
   | .castErr => .e
   | .notExpr e => kNot (ceval row e)
@@ -113,6 +120,7 @@ abbrev Summary := Nat → List Scalar
     combination admitted by the summaries. -/
 def aeval (s : Summary) : Expr → List K4
   | .cmp col c => (s col).map (cmpEq c)
+  | .compareValue col p => (s col).map (compareScalar p)
   | .isNullExpr col => (s col).map isNull
   | .castErr => [.e]
   | .notExpr e => (aeval s e).map kNot
@@ -126,6 +134,7 @@ theorem aeval_contains_ceval (s : Summary) (row : Nat → Scalar)
     (hrow : ∀ col, row col ∈ s col) (e : Expr) :
     ceval row e ∈ aeval s e := by
   induction e with
+  | compareValue col p => exact List.mem_map_of_mem (hrow col)
   | cmp col c =>
       simpa [ceval, aeval] using List.mem_map.mpr ⟨row col, hrow col, rfl⟩
   | isNullExpr col =>
@@ -199,5 +208,18 @@ theorem no_true_but_error_is_observable :
 theorem all_ones_block_all_pass :
     ∀ v ∈ aeval (fun _ => [Scalar.ok (some 1)]) (Expr.cmp 0 1), v = K4.t := by
   decide
+
+/-- Construct the finite column summary from encoded dictionary values.
+    Decoding (including a failed cast) happens before abstract comparison. -/
+theorem dictionary_block_skip (rows : List (Nat → Nat)) (decode : Nat → Nat → Scalar)
+    (e : Expr)
+    (skip : ∀ v ∈ aeval (fun col => (rows.map (fun row => decode col (row col))).eraseDups) e,
+      v ≠ .t ∧ v ≠ .e) :
+    ∀ row ∈ rows, let result := ceval (fun col => decode col (row col)) e
+                  result ≠ .t ∧ result ≠ .e := by
+  intro row hr
+  apply block_kleene_sound _ e skip
+  intro col
+  simpa using List.mem_map_of_mem (f := fun row => decode col (row col)) hr
 
 end TinylambOpt.BlockKleene

@@ -48,9 +48,8 @@ class ConcurrentJoinHashTable {
   explicit ConcurrentJoinHashTable(size_t expected_entries = 1024);
 
   // Switch the table to fixed-width integer keys (uniform signed-INT64 or
-  // DATE key columns only).  Must be called before the first insert; inserts
-  // then carry raw key parts instead of allocating a memcomparable string
-  // per row.
+  // DATE key columns only). Configure before starting the build workers.
+  // Once a row has been inserted, the encoding and key width are fixed.
   void EnableIntKeys(size_t key_parts);
   [[nodiscard]] bool IntKeyMode() const { return int_key_parts_ != 0; }
   [[nodiscard]] size_t IntKeyParts() const { return int_key_parts_; }
@@ -77,6 +76,9 @@ class ConcurrentJoinHashTable {
 
   template <typename Fn>
   void FindIntMatches(uint64_t hash, const int64_t* key_parts, Fn&& fn) const {
+    if (!IntKeyMode()) {
+      return;
+    }
     const Shard& shard = shards_[hash % kShardCount];
     const size_t slot = (hash >> 8) & shard.mask;
     for (size_t curr = shard.head_slots[slot]; curr != kNil;) {
@@ -106,7 +108,7 @@ class ConcurrentJoinHashTable {
   // Called under the shard mutex during build (probes run only after the
   // build barrier). Doubles a shard's bucket array and rethreads its chains
   // so probe cost stays O(1) per bucket as the build side grows.
-  void GrowShard(Shard& shard);
+  static void GrowShard(Shard& shard);
 
   std::array<Shard, kShardCount> shards_;
   size_t int_key_parts_{0};  // 0 = byte-key mode

@@ -42,10 +42,16 @@ int main(int argc, char** argv) {
   // are not AST dumps, and directory_iterator order is filesystem-dependent.
   std::vector<std::filesystem::path> inputs;
   std::error_code iter_ec;
-  for (const auto& file : dir) {
-    const auto& path = file.path();
+  std::error_code increment_ec;
+  const std::filesystem::directory_iterator end;
+  // A range-based for has no error_code overload for increment(), so an I/O
+  // failure midway through the enumeration would quietly truncate the replay
+  // set. Drive the iterator explicitly and fail loudly on every increment.
+  while (dir != end) {
+    const auto& path = dir->path();
     const std::string name = path.filename().string();
-    if (!file.is_regular_file(iter_ec)) {
+    bool keep = true;
+    if (!dir->is_regular_file(iter_ec)) {
       if (iter_ec) {
         // A failed stat() would silently shrink the replay set and make
         // "all regressions replayed" a false claim -- fail loudly instead.
@@ -53,20 +59,30 @@ int main(int argc, char** argv) {
                    << iter_ec.message();
         return 1;
       }
-      continue;
+      keep = false;
     }
     if (name.ends_with(".report.txt") || name.ends_with(".test") ||
         name.ends_with(".sql") || name.ends_with(".log")) {
-      continue;
+      keep = false;
     }
-    inputs.push_back(path);
+    if (keep) {
+      inputs.push_back(path);
+    }
+    dir.increment(increment_ec);
+    if (increment_ec) {
+      LOG(ERROR) << "cannot enumerate directory " << target_dir << ": "
+                 << increment_ec.message();
+      return 1;
+    }
   }
   std::sort(inputs.begin(), inputs.end());
   for (const auto& file : inputs) {
     std::ifstream case_data(file, std::ios::in | std::ios::binary);
     if (!case_data) {
+      // Skipping an unreadable regression would still let main() return 0 and
+      // report a false green, so treat a truncated replay set as a failure.
       LOG(ERROR) << "cannot open: " << file;
-      continue;
+      return 1;
     }
     // Formatted extraction stops at the first whitespace; fuzz inputs are
     // binary and must be replayed verbatim.

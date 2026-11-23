@@ -931,6 +931,9 @@ TEST(SqlTemplateTest, BindsRecursiveWithDepthBounds) {
 }
 
 TEST(SqlTemplateTest, BindPreservesUpdateAndDeleteAliases) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
   // "UPDATE tbl AS alias" / "DELETE FROM tbl AS alias" make bare alias
   // references denote the whole row; a rebind must not drop the alias.
   auto update = ParseSql("UPDATE t1 AS v SET c1 = 5 WHERE v.c2 = 3;");
@@ -1002,14 +1005,14 @@ TEST(SqlTemplateTest, BindsCachedMergeTree) {
     GTEST_SKIP() << "skipped";
   }
   auto original = ParseSql(
-      "MERGE INTO tgt USING src ON tgt.k = src.k AND tgt.v = 7 "
-      "WHEN MATCHED AND src.nv = 'hit' THEN UPDATE SET v = 8 "
+      "MERGE INTO tgt AS t USING src AS s ON t.k = s.k AND t.v = 7 "
+      "WHEN MATCHED AND s.nv = 'hit' THEN UPDATE SET v = 8 "
       "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (9, 'ins');");
   ASSERT_TRUE(original);
   ASSERT_EQ(original->Type(), StatementType::kMerge);
   const SqlTemplate templated = ExtractSqlTemplate(
-      "MERGE INTO tgt USING src ON tgt.k = src.k AND tgt.v = 7 "
-      "WHEN MATCHED AND src.nv = 'hit' THEN UPDATE SET v = 8 "
+      "MERGE INTO tgt AS t USING src AS s ON t.k = s.k AND t.v = 7 "
+      "WHEN MATCHED AND s.nv = 'hit' THEN UPDATE SET v = 8 "
       "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (9, 'ins');");
   ASSERT_EQ(templated.parameters.size(), 5U);
   std::vector<Value> rebound;
@@ -1029,6 +1032,9 @@ TEST(SqlTemplateTest, BindsCachedMergeTree) {
   auto bound = bound_or.MoveValue();
   ASSERT_EQ(bound->Type(), StatementType::kMerge);
   const auto& merge = dynamic_cast<const MergeStatement&>(*bound);
+  EXPECT_EQ(merge.TargetTable(), "tgt");
+  EXPECT_EQ(merge.TargetAlias(), "t");
+  EXPECT_EQ(merge.SourceAlias(), "s");
   // ON conjunct: the int literal moved 7 -> 107.
   EXPECT_NE(merge.OnCondition()->ToString().find("107"), std::string::npos)
       << merge.OnCondition()->ToString();

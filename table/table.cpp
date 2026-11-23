@@ -157,8 +157,8 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
     undo();
     // NOLINTNEXTLINE(modernize-return-braced-init-list) intentional pattern in
     // this code
-    return Status(StatusCode::kConflicts,
-                  "table was modified while CREATE INDEX was scanning; retry");
+    return {StatusCode::kConflicts,
+                  "table was modified while CREATE INDEX was scanning; retry"};
   }
   return Status::kSuccess;
 }
@@ -366,7 +366,14 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       }
       rp.page_id = new_page->PageID();
       rp.slot = new_pos.Value();
-      RETURN_IF_FAIL(LinkReservedTableTail(txn, ref, new_page));
+      const Status link_status = LinkReservedTableTail(txn, ref, new_page);
+      if (link_status != Status::kSuccess) {
+        // The reservation is still ours when the link was refused; dropping
+        // it here keeps other appenders from parking on a tail that will
+        // never be published by this failed transaction.
+        page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
+        return link_status;
+      }
       new_page.PageUnlock();
       break;
     }
@@ -404,7 +411,13 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
         return successor_result.GetStatus();
       }
       PageRef successor = successor_result.MoveValue();
-      RETURN_IF_FAIL(LinkReservedTableTail(txn, ref, successor));
+      const Status link_status = LinkReservedTableTail(txn, ref, successor);
+      if (link_status != Status::kSuccess) {
+        // Same cleanup as the grow-from-scratch path: a failed link must not
+        // strand the preallocated tail reservation until abort.
+        page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
+        return link_status;
+      }
       successor.PageUnlock();
     }
   }
@@ -1065,10 +1078,14 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   ASSIGN_OR_RETURN(std::string_view, read_row, page->Read(txn, pos.slot));
   Row result;
   // Length-prefixed row image from a checksummed page: consumed by offsets,
-  // never as a C string.
-  result.Deserialize(
-      read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-      schema_);
+  // never as a C string. Use the Status-returning decoder so a corrupt image
+  // becomes kCorrupt instead of throwing across this StatusOr boundary.
+  ASSIGN_OR_RETURN(
+      size_t, consumed,
+      result.TryDeserialize(
+          read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+          schema_));
+  (void)consumed;
   return result;
 }
 
@@ -1112,9 +1129,15 @@ StatusOr<Row> Table::ReadLatest(Transaction& txn, RowPosition pos) const {
     return Status::kNotExists;
   }
   Row result;
-  result.Deserialize(
-      read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-      schema_);
+  // MVCC version payloads come from WAL/spill replay and may be corrupt;
+  // report kCorrupt through StatusOr instead of letting the throwing decoder
+  // escape this boundary.
+  ASSIGN_OR_RETURN(
+      size_t, consumed,
+      result.TryDeserialize(
+          read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+          schema_));
+  (void)consumed;
   return result;
 }
 
@@ -1153,7 +1176,12 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
     // releasing RMWs past unrelated reservations wedged waiters of waiters
     // into write-intent escape-hatch timeouts.
     if (txn.HasForeignIndexReservations()) {
-      (void)txn.WaitAllIndexReservationsDrain(std::chrono::milliseconds(250));
+      const Status drained =
+          txn.WaitAllIndexReservationsDrain(std::chrono::milliseconds(250));
+      if (!drained.ok() &&
+          (drained.GetCode() != StatusCode::kConflicts || txn.IsWounded())) {
+        return drained;
+      }
     }
     RowPosition wait_pos;
     auto index_write_guard = txn.AcquireIndexWriteGuard(idx.Root());
@@ -1332,7 +1360,12 @@ Status Table::IndexDelete(Transaction& txn, const Index& idx,
   // kNoSpace for what is a contention artifact.
   for (int escalation = 0;; ++escalation) {
     if (txn.HasForeignIndexReservations()) {
-      (void)txn.WaitAllIndexReservationsDrain(std::chrono::milliseconds(250));
+      const Status drained =
+          txn.WaitAllIndexReservationsDrain(std::chrono::milliseconds(250));
+      if (!drained.ok() &&
+          (drained.GetCode() != StatusCode::kConflicts || txn.IsWounded())) {
+        return drained;
+      }
     }
     auto index_write_guard = txn.AcquireIndexWriteGuard(idx.Root());
     Status status = IndexDeleteGuarded(txn, idx, pos, original_row, hint_leaf);
@@ -1429,7 +1462,7 @@ std::shared_ptr<const LSTableStore> Table::GetLSTableStore() const {
 
 void Table::SetLSTableStore(
     std::shared_ptr<const LSTableStore>
-        store) {  // NOLINT(readability-make-member-function-const):
+        store) const {  // NOLINT(readability-make-member-function-const):
                   // explicit mutation API
   RefillLSTableStore(std::move(store));
 }
@@ -1472,10 +1505,11 @@ std::shared_ptr<const LSTableColumnCacheEntry> Table::GetCachedLSTableColumn(
 
 void Table::RefillCachedLSTableColumn(
     slot_t col, uint64_t generation, size_t bytes,
-    std::shared_ptr<const LSTableColumnCacheEntry> entry) const {
+    std::shared_ptr<const LSTableColumnCacheEntry> entry,
+    std::shared_ptr<const std::atomic<size_t>> dynamic_bytes) const {
   if (incarnation_state_ != nullptr) {
-    incarnation_state_->PutCachedColumnRaw(col, generation, bytes,
-                                           std::move(entry));
+    incarnation_state_->PutCachedColumnRaw(
+        col, generation, bytes, std::move(entry), std::move(dynamic_bytes));
   }
 }
 
@@ -1561,7 +1595,7 @@ void Table::SetCleanPageDirectory(
 
 void Table::SetBackingTLCSStore(
     std::shared_ptr<const TlcsFile>
-        store) {  // NOLINT(readability-make-member-function-const):
+        store) const {  // NOLINT(readability-make-member-function-const):
                   // explicit mutation API
   RefillBackingTLCSStore(std::move(store));
 }

@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -158,7 +159,7 @@ TEST_F(SqlEngineExtraTest, SqlCreateIndexFailureAndAbortKeepCatalogAtomic) {
   ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
   context_ = std::make_unique<TransactionContext>(database_->BeginContext());
   RunSql(engine_.get(), context_.get(), "CREATE INDEX aborted ON t(s)");
-  context_->Abort();
+  EXPECT_EQ(context_->Abort(), Status::kSuccess);
   context_ = std::make_unique<TransactionContext>(database_->BeginContext());
   table = context_->GetTable("t");
   ASSERT_TRUE(table.HasValue());
@@ -225,7 +226,7 @@ TEST_F(SqlEngineExtraTest, CteNarrowingVersusMaterialization) {
                 "WHERE a.k > 1 ORDER BY a.k"),
             std::vector<Row>(
                 {Row({Value(2), Value("b")}), Row({Value(3), Value("a")})}));
-  cte_ctx.Abort();
+  EXPECT_EQ(cte_ctx.Abort(), Status::kSuccess);
 }
 
 TEST_F(SqlEngineExtraTest, LateralDecorrelation) {
@@ -782,5 +783,68 @@ TEST_F(SqlEngineExtraTest, StructProtoTemplateGateIsWordAndQuoteAware) {
       "SELECT a FROM gate_t WHERE a = 2 AND "
       "CAST(NULL AS STRUCT<x INT64>) IS NULL;",
       false);
+}
+
+TEST_F(SqlEngineExtraTest, TemplateCacheRetainsARecentlyUsedLocalEntry) {
+  ASSERT_SUCCESS(context_->PreCommit());
+  context_ =
+      std::make_unique<TransactionContext>(database_->BeginReadOnlyContext());
+  const std::string hot = "SELECT k AS hot_alias FROM t WHERE k = 1";
+  const auto shard = [](const std::string& sql) {
+    return std::hash<std::string>{}(ExtractSqlTemplate(sql).fingerprint) % 16;
+  };
+  const size_t hot_shard = shard(hot);
+  const uint64_t fills_before = PlanCacheStats().template_fills.load();
+  const auto prepare_only = [&](const std::string& sql) {
+    auto prepared = engine_->Prepare(*context_, sql);
+    ASSERT_TRUE(prepared.HasValue()) << engine_->LastError() << ": " << sql;
+    Executor executor = prepared.MoveValue();
+    executor.reset();
+  };
+  prepare_only(hot);
+  for (size_t cold = 0, candidate = 0; cold < 1024; ++candidate) {
+    const std::string sql = "SELECT k AS cold_alias_" +
+                            std::to_string(candidate) + " FROM t WHERE k = 1";
+    if (shard(sql) != hot_shard) {
+      continue;
+    }
+    if (cold == 1023) {
+      // Force the template lookup even if the compiled-plan cache can serve
+      // an identical execution. The shared template has already been evicted.
+      engine_->SetForceRelationalFallback(true);
+      const uint64_t hits = PlanCacheStats().template_hits.load();
+      ExpectQuery(hot, {Row({Value(1)})});
+      EXPECT_EQ(PlanCacheStats().template_hits.load(), hits + 1);
+      engine_->SetForceRelationalFallback(false);
+    }
+    prepare_only(sql);
+    ++cold;
+  }
+  ASSERT_EQ(PlanCacheStats().template_fills.load(), fills_before + 1025);
+  engine_->SetForceRelationalFallback(true);
+  const uint64_t hits = PlanCacheStats().template_hits.load();
+  ExpectQuery(hot, {Row({Value(1)})});
+  EXPECT_EQ(PlanCacheStats().template_hits.load(), hits + 1);
+}
+
+TEST_F(SqlEngineExtraTest, InsertPlansDeclineClockAndRandomExpressions) {
+  ASSERT_SUCCESS(context_->PreCommit());
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+  const std::string sql = "INSERT INTO t (k, s, f) VALUES (10, 'r', RAND())";
+  for (int i = 0; i < 3; ++i) {
+    ExpectQuery(sql, {Row({Value("Insert Rows"), Value(1)})});
+  }
+  const auto fp = ExtractSqlTemplate(sql).fingerprint;
+  EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, database_.get(),
+                                               database_->SchemaEpoch()),
+            nullptr);
+  ExpectScalar("SELECT COUNT(DISTINCT f) FROM t WHERE k = 10", Value(3));
+  const std::string select = "SELECT RAND() AS r FROM t LIMIT 1";
+  const auto first = RunSql(engine_.get(), context_.get(), select);
+  ASSERT_EQ(first.size(), 1U);
+  EXPECT_NE(first, RunSql(engine_.get(), context_.get(), select));
+  EXPECT_TRUE(ContainsNonDeterministicCall(FunctionCallExp("CURRENT_DATE", {})));
+  EXPECT_TRUE(ContainsNonDeterministicCall(FunctionCallExp("GENERATE_UUID", {})));
+  EXPECT_FALSE(ContainsNonDeterministicCall(FunctionCallExp("abs", {})));
 }
 }  // namespace tinylamb

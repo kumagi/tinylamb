@@ -21,7 +21,7 @@ graph TD
 
 次のすべてを満たす場合のみ発火します（`plan/cascades.cpp`）。
 
-1. **有限・タイなし Top-N**: `expression.operation == kTopN`、`children.size() == 1`、`!with_ties`、`limit_count + limit_offset` がオーバーフローせず `> 0`、`!target_list.empty()` かつ `target_list.size() == sort_ascending.size()`。
+1. **有限・タイなし Top-N**: `expression.operation == kTopN`、`children.size() == 1`、`!with_ties`、`prior_limit_offset == 0`、`limit_count + limit_offset` がオーバーフローせず `> 0`、`!target_list.empty()` かつ `target_list.size() == sort_ascending.size()`。
 2. **二表等値内部結合**: `input` グループ内の `kJoin` 式で、左右の子がそれぞれ 1 リレーション（`left_relations.size() == 1 && right_relations.size() == 1`）であり、全結合連言が `col_l = col_r` の等値比較であること。
 3. **Top-N キーの局所性**: `topn_keys` が参照するすべての列が修飾済みかつ押し込み側リレーション `pushed_rel` のみに属すること。
 4. **対向側の一意・NOT NULL 性（高々 1 件の証明）**: `other_id` の `LogicalProperties::IsUniqueOn(other_join_cols)` と全結合キーの `IsNotNull` が成り立つこと（NULL 同士は一致せず、nullable UNIQUE は複数行になり得るため一意性だけでは不足）。

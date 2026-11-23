@@ -36,7 +36,8 @@ size_t LimitPlan::EmitRowCount() const {
 }
 
 void LimitPlan::Dump(std::ostream& o, int indent) const {
-  o << "Limit: " << limit_count_ << " offset " << limit_offset_ << "\n"
+  o << Indent(static_cast<size_t>(std::max(indent, 0))) << "Limit: "
+    << limit_count_ << " offset " << limit_offset_ << "\n"
     << Indent(static_cast<size_t>(indent) + 2);
   DumpChild(o, *src_, indent + 2);
 }

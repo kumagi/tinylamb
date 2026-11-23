@@ -18,8 +18,10 @@
 
 #include <sys/types.h>
 
+#include <cstdint>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 #include "column_name.hpp"
@@ -86,6 +88,19 @@ TEST(SchemaTest, LookupIdentityChangesWhenDecodingIntoExistingSchema) {
   EXPECT_EQ(schema, replacement);
   EXPECT_EQ(schema.Offset(ColumnName("a")), 1);
   EXPECT_NE(schema.LookupIdentity(), previous_identity);
+}
+
+TEST(SchemaTest, DecodeRejectsUnrepresentableColumnCount) {
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << std::string_view("wide")
+          << (static_cast<uint64_t>(Schema::kMaxColumns) + 1);
+  Decoder decoder(stream);
+  Schema schema;
+  decoder >> schema;
+
+  EXPECT_TRUE(decoder.Failed());
+  EXPECT_EQ(schema.ColumnCount(), 0U);
 }
 
 TEST(SchemaTest, WithName_RenamesSchemaAndQualifiesEveryColumn) {

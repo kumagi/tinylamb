@@ -3,6 +3,7 @@
 #include "query/googlesql_frontend.hpp"
 
 #include <gtest/gtest.h>
+#include <poll.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/SIGALRM
 #include <signal.h>
 #include <sys/resource.h>
@@ -10,14 +11,21 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "common/random_string.hpp"
+#include "common/unwind_guard.hpp"
 
 namespace tinylamb {
 
@@ -61,6 +69,109 @@ TEST(GoogleSqlFrontendTest, RejectsInvalidSqlWhenAvailable) {
   GoogleSqlParseResult result = GoogleSqlFrontend::Parse("SELECT 1 + ;");
   EXPECT_FALSE(result.ok);
   EXPECT_FALSE(result.error.empty());
+  EXPECT_FALSE(result.retryable);
+}
+
+TEST(GoogleSqlFrontendTest, NegativeCacheSkipsOversizedKeys) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser unavailable";
+  }
+  std::string sql = "/*";
+  sql.append(4U << 20, 'x');
+  sql += "*/ SELECT 1 + ;";
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const auto result = GoogleSqlFrontend::Parse(sql);
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(result.error.starts_with("ERROR:"))
+        << result.error.substr(0, 160);
+  }
+}
+
+TEST(GoogleSqlFrontendTest, NegativeCacheKeepsSyntaxVerdicts) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "GoogleSQL parser unavailable";
+  }
+  const std::string sql = "SELECT 637351 + ;";
+  const auto first = GoogleSqlFrontend::Parse(sql);
+  ASSERT_FALSE(first.ok);
+  ASSERT_NE(first.error.find("Syntax error:"), std::string::npos);
+  const auto cached = GoogleSqlFrontend::Parse(sql);
+  EXPECT_FALSE(cached.ok);
+  EXPECT_EQ(cached.error, "GoogleSQL parse failed (recently cached)");
+}
+
+TEST(GoogleSqlFrontendTest, DistinctCacheMissesCanParseOnOneShard) {
+  using namespace std::chrono_literals;
+  const auto dir =
+      std::filesystem::absolute("parser_concurrency_" + RandomString());
+  ASSERT_TRUE(std::filesystem::create_directory(dir));
+  const UnwindGuard remove_files([&] {
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+  });
+  const auto stub = dir / "parse";
+  const auto started = dir / "started";
+  const auto release = dir / "release";
+  {
+    std::ofstream script(stub);
+    script << "#!/bin/sh\nread -r line\n"
+              "if [ \"$line\" = 'SELECT /* slow */ 1;' ]; then\n"
+              "  : > \"${0%/*}/started\"\n"
+              "  while [ ! -f \"${0%/*}/release\" ]; do sleep 0.01; done\n"
+              "fi\nprintf 'QueryStatement\\n'\n";
+    ASSERT_TRUE(script.good());
+  }
+  std::filesystem::permissions(stub, std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::add);
+  const char* old_bin = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+  const std::optional<std::string> previous_bin =
+      (old_bin != nullptr) ? std::optional<std::string>(old_bin) : std::nullopt;
+  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", stub.c_str(), 1), 0);
+  const UnwindGuard restore_bin([&] {
+    if (previous_bin) {
+      setenv("TINYLAMB_GOOGLESQL_BIN", previous_bin->c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_GOOGLESQL_BIN");
+    }
+  });
+  const char* old_socket = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const std::optional<std::string> previous_socket =
+      (old_socket != nullptr) ? std::optional<std::string>(old_socket) : std::nullopt;
+  const UnwindGuard restore_socket([&] {
+    if (previous_socket) {
+      setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous_socket->c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+    }
+  });
+  ASSERT_EQ(unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK"), 0);
+  constexpr size_t shards = 16;
+  const std::string slow_sql = "SELECT /* slow */ 1;\n";
+  const auto shard = [](std::string_view sql) {
+    return std::hash<std::string_view>{}(sql) % shards;
+  };
+  std::string fast_sql;
+  for (int i = 0; i < 1024; ++i) {
+    fast_sql = "SELECT /* fast */ " + std::to_string(i) + ";\n";
+    if (shard(fast_sql) == shard(slow_sql)) {
+      break;
+    }
+  }
+  ASSERT_EQ(shard(fast_sql), shard(slow_sql));
+  auto slow = std::async(std::launch::async,
+                         [&] { return GoogleSqlFrontend::Parse(slow_sql); });
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!std::filesystem::exists(started) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_TRUE(std::filesystem::exists(started));
+  auto fast = std::async(std::launch::async,
+                         [&] { return GoogleSqlFrontend::Parse(fast_sql); });
+  EXPECT_EQ(fast.wait_for(1s), std::future_status::ready);
+  std::ofstream(release).close();
+  EXPECT_TRUE(fast.get().ok);
+  EXPECT_TRUE(slow.get().ok);
 }
 
 TEST(GoogleSqlFrontendTest, ParsesAndCachesCommonStatementKinds) {
@@ -89,13 +200,20 @@ TEST(GoogleSqlFrontendTest, CacheEvictsSomeStatementPastLimit) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
   }
-  // The parse cache holds kMaxCachedStatements entries; feed it well beyond
-  // that so an arbitrary-entry eviction path runs for every statement
-  for (int i = 0; i < 1030; ++i) {
+  // The parse cache holds kMaxCachedStatements (1024) entries; feed it well
+  // beyond that and assert the cache actually evicted instead of growing
+  // without bound.
+  const size_t before = GoogleSqlFrontend::CachedStatementCountForTest();
+  constexpr int kStatements = 1030;
+  for (int i = 0; i < kStatements; ++i) {
     GoogleSqlParseResult result =
         GoogleSqlFrontend::Parse("SELECT " + std::to_string(i) + ";");
     ASSERT_TRUE(result.ok) << result.error;
   }
+  const size_t after = GoogleSqlFrontend::CachedStatementCountForTest();
+  EXPECT_LT(after - before, static_cast<size_t>(kStatements))
+      << "parse cache did not evict (before=" << before << ", after=" << after
+      << ")";
   // A brand-new statement must still parse after all the churn.
   GoogleSqlParseResult fresh = GoogleSqlFrontend::Parse("SELECT 123456;");
   ASSERT_TRUE(fresh.ok) << fresh.error;
@@ -447,6 +565,7 @@ TEST(GoogleSqlFrontendTest, PipeCreationFailureReportsError) {
   const GoogleSqlParseResult result =
       GoogleSqlFrontend::Parse("SELECT 271828;");
   EXPECT_FALSE(result.ok);
+  EXPECT_TRUE(result.retryable);
   EXPECT_NE(result.error.find("cannot create GoogleSQL pipe"),
             std::string::npos);
 
@@ -476,7 +595,7 @@ TEST(GoogleSqlFrontendTest, ForkFailureReportsError) {
         const GoogleSqlParseResult result =
             GoogleSqlFrontend::Parse("SELECT 1618033;");
         const bool reported =
-            !result.ok &&
+            !result.ok && result.retryable &&
             result.error.find("cannot start GoogleSQL") != std::string::npos;
         std::_Exit(reported ? 0 : 1);
       },
@@ -503,7 +622,10 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   }
   // The 2 MB input parses far slower under sanitizer builds on a loaded
   // machine; this test targets EINTR retry, not the parse-round-trip budget,
-  // so lift the production timeout for the process under test.
+  // so lift the production timeout for the process under test. Keep the
+  // ceiling well under the 60-second ctest timeout: if SIGALRM fires before
+  // Parse() enters its blocking I/O the alarm is disarmed by alarm(0), and a
+  // 300-second budget would let a hung parse blow the test timeout.
   struct RestoreParseTimeoutEnv {
     std::optional<std::string> previous;
     ~RestoreParseTimeoutEnv() {
@@ -518,13 +640,15 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   const RestoreParseTimeoutEnv restore_parse_timeout_env{
       previous == nullptr ? std::nullopt
                           : std::optional<std::string>(previous)};
-  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "300",
+  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "30",
                1);  // NOLINT(clang-diagnostic-error)
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.
   struct sigaction saved = {};
   struct sigaction handler = {};
-  handler.sa_handler = [](int) {};
+  static volatile sig_atomic_t signal_count = 0;
+  signal_count = 0;
+  handler.sa_handler = [](int) { ++signal_count; };
   ASSERT_EQ(sigaction(SIGALRM, &handler, &saved), 0);
 
   std::string big = "SELECT ";
@@ -538,6 +662,8 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   const GoogleSqlParseResult result = GoogleSqlFrontend::Parse(big);
   alarm(0);
   ASSERT_EQ(sigaction(SIGALRM, &saved, nullptr), 0);
+  EXPECT_GT(signal_count, 0)
+      << "the test passed without delivering SIGALRM during Parse()";
   ASSERT_TRUE(result.ok) << result.error;
   EXPECT_NE(result.ast.find("QueryStatement"), std::string::npos);
 }
@@ -547,7 +673,9 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
 // --mode, stub) turned every statement into an "ok, empty AST" no-op.
 // Only whitespace input legitimately parses to nothing.
 TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
-  const std::string path = "/tmp/tlcs-zygote-" + RandomString();
+  const std::string path = (std::filesystem::temp_directory_path() /
+                            ("tlcs-zygote-" + RandomString()))
+                               .string();
   const int server = socket(AF_UNIX, SOCK_STREAM, 0);
   ASSERT_GE(server, 0);
   sockaddr_un address{};
@@ -558,7 +686,8 @@ TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
   ASSERT_EQ(listen(server, 1), 0);
   std::thread worker([&] {
     const int client = accept(server, nullptr, nullptr);
-    if (client < 0) return;
+    if (client < 0) { return;
+}
     char byte = 0;
     iovec io{.iov_base = &byte, .iov_len = 1};
     alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
@@ -585,18 +714,119 @@ TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
   });
   const char* old = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   const std::optional<std::string> previous =
-      old ? std::optional<std::string>(old) : std::nullopt;
-  setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1);
+      (old != nullptr) ? std::optional<std::string>(old) : std::nullopt;
+  UnwindGuard cleanup([&] {
+    if (previous) {
+      (void)setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+    } else {
+      (void)unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+    }
+    (void)shutdown(server, SHUT_RDWR);
+    close(server);
+    if (worker.joinable()) { worker.join();
+}
+    unlink(path.c_str());
+  });
+  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1), 0);
   const auto parsed = GoogleSqlFrontend::Parse("SELECT 1054610546");
-  if (previous)
-    setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
-  else
-    unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   worker.join();
   close(server);
   unlink(path.c_str());
+  if (previous) {
+    (void)setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+  } else {
+    (void)unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  }
+  cleanup.Disarm();
   EXPECT_FALSE(parsed.ok);
   EXPECT_NE(parsed.error.find("without output"), std::string::npos);
+}
+
+TEST(GoogleSqlFrontendTest, RetriesZygoteAfterMissingExitStatus) {
+  const std::string path = (std::filesystem::temp_directory_path() /
+                            ("tlcs-zygote-" + RandomString()))
+                               .string();
+  const int server = socket(AF_UNIX, SOCK_STREAM, 0);
+  ASSERT_GE(server, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1);
+  ASSERT_EQ(
+      bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  ASSERT_EQ(listen(server, 1), 0);
+
+  constexpr std::string_view kZygoteAst = "QueryStatement from zygote\n";
+  std::jthread worker([&] {
+    // First request drops its exit status. Return a recognizable AST on the
+    // next request to distinguish zygote recovery from the spawn fallback.
+    for (const bool reply : {false, true}) {
+      pollfd ready{.fd = server, .events = POLLIN, .revents = 0};
+      if (poll(&ready, 1, 8000) != 1) {
+        return;
+      }
+      const int client = accept(server, nullptr, nullptr);
+      if (client < 0) {
+        return;
+      }
+      char byte = 0;
+      iovec io{.iov_base = &byte, .iov_len = 1};
+      alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
+      msghdr message{};
+      message.msg_iov = &io;
+      message.msg_iovlen = 1;
+      message.msg_control = control;
+      message.msg_controllen = sizeof(control);
+      if (recvmsg(client, &message, 0) > 0) {
+        if (const auto* header = CMSG_FIRSTHDR(&message); header != nullptr) {
+          int fds[2];
+          std::memcpy(fds, CMSG_DATA(header), sizeof(fds));
+          char input[128];
+          while (read(fds[0], input, sizeof(input)) > 0) {
+          }
+          close(fds[0]);
+          if (reply) {
+            EXPECT_EQ(write(fds[1], kZygoteAst.data(), kZygoteAst.size()),
+                      static_cast<ssize_t>(kZygoteAst.size()));
+          }
+          close(fds[1]);
+          if (reply) {
+            const char success = 0;
+            EXPECT_EQ(write(client, &success, 1), 1);
+          }
+        }
+      }
+      close(client);
+    }
+  });
+
+  const char* old = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const std::optional<std::string> previous =
+      (old != nullptr) ? std::optional<std::string>(old) : std::nullopt;
+  setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1);
+  const auto first = GoogleSqlFrontend::Parse("SELECT 122650001");
+  const auto cooldown = GoogleSqlFrontend::Parse("SELECT 122650002");
+  auto recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
+  const auto recovery_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  while (recovered.ast != kZygoteAst &&
+         std::chrono::steady_clock::now() < recovery_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
+  }
+  if (previous) {
+    setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  }
+  worker.join();
+  close(server);
+  unlink(path.c_str());
+
+  EXPECT_TRUE(first.ok) << first.error;
+  EXPECT_TRUE(cooldown.ok) << cooldown.error;
+  EXPECT_NE(cooldown.ast, kZygoteAst);
+  EXPECT_TRUE(recovered.ok) << recovered.error;
+  EXPECT_EQ(recovered.ast, kZygoteAst);
 }
 
 TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
@@ -604,8 +834,16 @@ TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
     GTEST_SKIP() << "skipped";
   }
   const char* previous = std::getenv("TINYLAMB_GOOGLESQL_BIN");
-  const std::string restore = previous == nullptr ? std::string() : previous;
+  const std::optional<std::string> restore =
+      previous == nullptr ? std::nullopt : std::optional<std::string>(previous);
   ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", "/bin/true", 1), 0);
+  const UnwindGuard restore_bin([&] {
+    if (restore) {
+      setenv("TINYLAMB_GOOGLESQL_BIN", restore->c_str(), 1);
+    } else {
+      unsetenv("TINYLAMB_GOOGLESQL_BIN");
+    }
+  });
   // Unique literal: the parse cache is keyed by text, and other tests in
   // this binary may already have cached ordinary statements.
   const GoogleSqlParseResult silent =
@@ -618,11 +856,6 @@ TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
   const GoogleSqlParseResult blank = GoogleSqlFrontend::Parse("   \n");
   EXPECT_TRUE(blank.ok) << blank.error;
   EXPECT_TRUE(blank.ast.empty());
-  if (previous == nullptr) {
-    unsetenv("TINYLAMB_GOOGLESQL_BIN");
-  } else {
-    ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", restore.c_str(), 1), 0);
-  }
 }
 
 }  // namespace tinylamb

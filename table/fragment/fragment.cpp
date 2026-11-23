@@ -654,6 +654,11 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
         break;
       }
       column_values[ci].resize(rc);
+      // DecodeInt64ColumnRg returns void and throws std::out_of_range on a
+      // hostile footer/offset. The catch below is the error check: a failed
+      // decode leaves the whole group to the residual path (rows_unknown)
+      // instead of propagating a corrupt value, so no return value is being
+      // discarded here.
       try {
         chunk.DecodeInt64ColumnRg(col, g, column_values[ci].data());
       } catch (const std::exception&) {
@@ -700,16 +705,24 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       // prunes the row groups that cannot hold a key in the range, so the
       // surviving groups still have to be filtered row by row.
       if (frag.access == AccessMode::kKeyRange && key_idx >= 0) {
+        // key_idx comes from NeededIndex(needed, key_col): it is either -1 or
+        // a valid index into `needed`, and both column_values and
+        // column_nulls are sized to `needed`. Keep the bound explicit so a
+        // malformed fragment can never turn into an out-of-bounds read.
+        const auto ki = static_cast<size_t>(key_idx);
+        if (ki >= column_nulls.size() || r >= column_nulls[ki].size()) {
+          state->rows_unknown += 1;
+          continue;
+        }
         // NULL key cells decode as raw 0, but a NULL key never satisfies a
         // range: PointLookup skips NULL cells and the run/memtable paths
         // exclude the kNull-tagged key blob from the range window. Reject
         // it on the null bitmap before comparing the decoded value.
-        if (column_nulls[static_cast<size_t>(key_idx)][r] != 0) {
+        if (column_nulls[ki][r] != 0) {
           state->rows_proved_fail += 1;
           continue;
         }
-        const int64_t key_value =
-            column_values[static_cast<size_t>(key_idx)][r];
+        const int64_t key_value = column_values[ki][r];
         if (frag.range_lo.has_value() && key_value < *frag.range_lo) {
           state->rows_proved_fail += 1;
           continue;
@@ -1664,6 +1677,10 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
     return report;
   }
   const Schema& sc = *schema;
+  // This is the shared gate with Execute(): ValidateFragment rejects the
+  // fragments the int64 kernels cannot run (e.g. SUM/COUNT_COL over a
+  // non-int64 column), and a rejected fragment must keep coverage kNone
+  // instead of being priced as a full-coverage scan with limit_rows applied.
   if (ValidateFragment(sc, fragment) != Status::kSuccess) {
     report.coverage = Coverage::kNone;
     return report;

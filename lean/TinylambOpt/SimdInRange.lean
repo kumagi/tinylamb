@@ -13,25 +13,9 @@ where `U(z) = z mod 2^W` is taken in `[0, 2^W)`.  Reference and optimized
 computations are modelled on mathematical `Int`; the wrapping subtraction is
 `Int.emod` by `M = 2^W`.
 
-## Sufficient hypotheses (checked in the C++ lowering)
-
-* `W >= 2`, and `lo`, `hi`, `x` are representable `W`-bit signed values, i.e.
-  `-2^(W-1) <= v <= 2^(W-1) - 1`;
-* `lo <= hi` (signed), and the *width* satisfies `hi - lo < 2^(W-1)`: the
-  interval fits in a half-open `W`-bit range, so `U(hi - lo) = hi - lo > 0`.
-
-The width guard is essential for the one-comparison form: it prevents a
-wrapped negative `x - lo` from landing below `U(hi - lo)`.  NULL lanes and
-empty intervals are peeled off before the comparison.  When the guard cannot
-be proven the full two-comparison form must be kept.
-
-## C++ realization
-
-`expression/jit.cpp`: emit a wrapping `sub` (never `sub nsw`, which is poison
-at `lo = INT64_MIN`) followed by an unsigned `icmp ule`.  The guard above is
-checked from the ZoneMap / constant interval of `lo` and `hi` at lowering
-time; for `W = 64` the theorem is the general `W` instance and needs no
-enumeration.
+The endpoints and input must fit the signed lane, with lo ≤ hi. Even the
+full signed interval works: if x < lo, x + 2^W is strictly greater than hi.
+The intended LLVM subtractions use wrapping arithmetic with no nsw/nuw.
 -/
 
 /-- Unsigned view of a two's-complement `W`-bit value: `z mod 2^W`. -/
@@ -71,8 +55,7 @@ theorem simd_in_range_sound (W : Nat) (hW : 2 ≤ W)
     (hiHigh : hi ≤ (2 : Int) ^ (W - 1) - 1)
     (xLow : -((2 : Int) ^ (W - 1)) ≤ x)
     (xHigh : x ≤ (2 : Int) ^ (W - 1) - 1)
-    (order : lo ≤ hi)
-    (width : hi - lo < (2 : Int) ^ (W - 1)) :
+    (order : lo ≤ hi) :
     (lo ≤ x ∧ x ≤ hi) ↔
       unsigned ((2 : Int) ^ W) (x - lo) ≤ unsigned ((2 : Int) ^ W) (hi - lo) := by
   let M : Int := (2 : Int) ^ W
@@ -112,5 +95,19 @@ theorem simd_in_range_sound (W : Nat) (hW : 2 ≤ W)
       constructor <;> omega
     · rw [hwrap] at hcmp'
       constructor <;> omega
+
+/-- Concrete INT64 JIT operation, including MIN..MAX. Both subtractions
+    are the ordinary wrapping BitVec instructions. -/
+theorem int64_range_lowering (lo hi x : BitVec 64) (ordered : lo.sle hi = true) :
+    (lo.sle x && x.sle hi) = (x - lo).ule (hi - lo) := by
+  have wrap (a b : BitVec 64) : unsigned (2^64) (a.toInt-b.toInt) = ((a-b).toNat : Int) := by
+    rw [← BitVec.toInt_emod_two_pow, BitVec.toInt_sub]
+    exact (Int.bmod_emod ..).symm
+  have spec := simd_in_range_sound 64 (by decide) lo.toInt hi.toInt x.toInt
+    lo.le_toInt BitVec.toInt_le hi.le_toInt BitVec.toInt_le x.le_toInt BitVec.toInt_le
+    (BitVec.sle_iff_toInt_le.mp ordered)
+  rw [wrap,wrap] at spec
+  apply Bool.eq_iff_iff.mpr
+  simpa only [Bool.and_eq_true, BitVec.sle_iff_toInt_le,BitVec.ule_iff_toNat_le,Int.ofNat_le] using spec
 
 end TinylambOpt.SimdInRange

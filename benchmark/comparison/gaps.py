@@ -9,7 +9,7 @@ import statistics
 
 
 def loss_factor(tiny, postgres, higher_is_better=False):
-    """Always >=10 for a tenfold disadvantage, independent of metric direction."""
+    """Return the multiplicative disadvantage, with 1.0 indicating parity."""
     if tiny < 0 or postgres < 0 or not all(math.isfinite(v) for v in (tiny, postgres)):
         raise ValueError('performance values must be finite and nonnegative')
     numerator, denominator = (postgres, tiny) if higher_is_better else (tiny, postgres)
@@ -91,8 +91,10 @@ def collect(records, profile, threshold=10, reference_engine="postgresql"):
             for role in ('reader','transaction'):
                 if clients == 1 and role == 'transaction':
                     continue
-                emit('htap',name,role+'_tps',[r['role_tps'][role] for r in t],
-                     [r['role_tps'][role] for r in p],clients=clients)
+                if all(all(role in r.get('role_tps', {}) for r in trials)
+                       for trials in (t, p)):
+                    emit('htap',name,role+'_tps',[r['role_tps'][role] for r in t],
+                         [r['role_tps'][role] for r in p],clients=clients)
                 # Mixed-request latency can hide a slow reader behind many
                 # short writer requests. Older saved runs may lack this field;
                 # only compare a metric when BOTH sides actually recorded it,

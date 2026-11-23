@@ -19,10 +19,23 @@
 
 #include <utility>
 
+#include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "type/column.hpp"
 
 namespace tinylamb {
+
+// A rebound parameter carries only a Value, so its logical text domain has to
+// be recovered from the value itself. Only VARCHAR can be TIMESTAMP/STRING;
+// every other type is domain-free. Mirrors the shape check used by the string
+// comparison fast path.
+[[nodiscard]] inline TextDomain TextDomainForBoundValue(const Value& value) {
+  if (value.type != ValueType::kVarChar) {
+    return TextDomain::kUnspecified;
+  }
+  return LooksLikeTimestampText(value.AsString()) ? TextDomain::kTimestamp
+                                                  : TextDomain::kString;
+}
 
 class ConstantValue : public ExpressionBase {
  public:
@@ -46,11 +59,11 @@ class ConstantValue : public ExpressionBase {
   [[nodiscard]] TextDomain GetTextDomain() const { return text_domain_; }
   [[nodiscard]] tinylamb::Type ResultType(
       const Schema& /*unused*/) const override {
-    return TypeForValue();
+    return TypeForValue(val_.type);
   }
   [[nodiscard]] tinylamb::Type ResultType(
       const Schema& /*unused*/, const Schema& /*unused*/) const override {
-    return TypeForValue();
+    return TypeForValue(val_.type);
   }
 
   friend std::ostream& operator<<(std::ostream& o, const ConstantValue& c) {
@@ -64,18 +77,29 @@ class ConstantValue : public ExpressionBase {
   }
 
   [[nodiscard]] std::string ToString() const override {
+    // Intentionally renders the value only: text_domain_ is *not* part of the
+    // printed SQL literal. Expression identity must distinguish domains, and
+    // that is done by SamePrintedExpression (rewrite) and EncodeCompileTree
+    // (bytecode cache key), not by this human-readable form.
     return val_.IsInterval() ? "INTERVAL " + val_.AsString() : val_.AsString();
   }
   void Dump(std::ostream& o) const override { o << ToString(); }
 
  protected:
   // ParameterSlot rebinds the sniffed literal in place. The stored value is
-  // what AsConstantValue().GetValue() and constant-folding observe.
-  void ResetValue(Value value) { val_ = std::move(value); }
+  // what AsConstantValue().GetValue() and constant-folding observe. Keep the
+  // domain in sync with the new value: a slot sniffed as TIMESTAMP and later
+  // bound to a plain STRING (or a non-VARCHAR) must not keep the stale domain,
+  // otherwise CTAS column inference and DML write conversion take the wrong
+  // type-interpretation path.
+  void ResetValue(Value value) {
+    text_domain_ = TextDomainForBoundValue(value);
+    val_ = std::move(value);
+  }
 
- private:
-  [[nodiscard]] tinylamb::Type TypeForValue() const {
-    switch (val_.type) {
+ public:
+  [[nodiscard]] static tinylamb::Type TypeForValue(ValueType type) {
+    switch (type) {
       case ValueType::kInt64:
         return {TypeTag::kBigInt};
       case ValueType::kDouble:
@@ -91,6 +115,8 @@ class ConstantValue : public ExpressionBase {
     }
     return {TypeTag::kInvalid};
   }
+
+ private:
   Value val_;
   TextDomain text_domain_;
 };

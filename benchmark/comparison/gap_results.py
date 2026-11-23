@@ -28,10 +28,17 @@ def compare(baseline, following, max_loss=10, inclusive=False):
             reference = before.get('reference_engine', 'postgresql')
             original_ratio = loss_factor(after['tinylamb'], before[reference],
                                          after['metric'] in ('tps', 'reader_tps', 'transaction_tps'))
-            entry['loss_against_original_reference'] = original_ratio
+            # JSON forbids Infinity (allow_nan=False). Preserve its meaning as
+            # null in the machine-readable report; the markdown renders it as
+            # the explicit infinity symbol and the threshold check fails it.
+            finite_original_ratio = (original_ratio
+                                     if math.isfinite(original_ratio) else None)
+            entry['loss_against_original_reference'] = finite_original_ratio
             if reference == 'postgresql':
-                entry['loss_against_original_pg'] = original_ratio
-            entry['passed'] = (passes(original_ratio) and after['loss_factor'] is not None
+                entry['loss_against_original_pg'] = finite_original_ratio
+            entry['passed'] = (finite_original_ratio is not None
+                               and passes(finite_original_ratio)
+                               and after['loss_factor'] is not None
                                and passes(after['loss_factor']))
         rows.append(entry)
     return rows
@@ -50,8 +57,12 @@ def main():
     a = p.parse_args()
     if not math.isfinite(a.max_loss) or a.max_loss <= 1:
         p.error('max-loss must be finite and > 1')
+    if a.baseline is None:
+        p.error('--baseline is required (there is no default; results/ is gitignored)')
     subsequent = {}
     for spec in a.run:
+        if '=' not in spec:
+            p.error(f'--run expects PROFILE=DIR, got: {spec}')
         profile, directory = spec.split('=', 1)
         source = Path(directory)
         records = [json.loads(s) for s in (source / 'results.jsonl').read_text().splitlines()]
@@ -71,9 +82,11 @@ def main():
         b, n = row['before'], row['after']
         prefix = [b['profile'], b['workload'], str(b.get('rows', b.get('clients'))), b['metric'], f"{b['tinylamb']:.6f}", f"{b[a.reference_engine]:.6f}"]
         if n:
+            original = row['loss_against_original_reference']
             prefix += [f"{n['tinylamb']:.6f}", f"{n[a.reference_engine]:.6f}",
                        f"{n['loss_factor']:.2f}×" if n['loss_factor'] is not None else '∞',
-                       f"{row['loss_against_original_reference']:.2f}×", '通過' if row['passed'] else '未達']
+                       f"{original:.2f}×" if original is not None else '∞',
+                       '通過' if row['passed'] else '未達']
         else:
             prefix += ['—', '—', '—', '—', '未測定']
         lines.append('| ' + ' | '.join(prefix) + ' |')

@@ -114,6 +114,9 @@ if (agg.GetType() == AggregationType::kCount) {
 
 ## 関連 Rule との相互作用
 
+- `union_all_merge`: 入力に隣接する `UnionAll` を平坦化し、各枝へ部分集約を配置できる形を整えます。
+- `or_to_union`: OR 条件の選択から `UnionAll` を含む論理代替が生じた場合、その上位に集約があれば本 Rule の適用候補になります。分配後は各枝の集約がそれぞれの入力をまとめます。
+- `eager_aggregation_over_join`: Join を含む入力に対する集約押し下げの候補です。本 Rule は入力が `UnionAll` のときに枝ごとへ分配し、Join 入力を扱う相手 Rule とは対象形が異なります。
 
 ## 検証テスト
 

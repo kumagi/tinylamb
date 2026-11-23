@@ -124,8 +124,7 @@ class OocDistinctSink final : public PipelineSink {
  private:
   [[nodiscard]] Status TransitionToSpill(PipelineContext* ctx);
   [[nodiscard]] StatusOr<Row> ExtractKey(const Row& row) const;
-  [[nodiscard]] Row BuildTaggedRow(Row&& row, const Row& key,
-                                   uint64_t seq) const;
+  Status SpillRow(RecursivePartitioner& partitioner, Row row, uint64_t seq);
 
   Schema input_schema_;
   std::vector<slot_t> key_cols_;
@@ -273,11 +272,11 @@ struct OocHashJoinContext {
 
   // Dynamic-filter runtime state.
   size_t dynamic_filter_keys{0};
-  mutable size_t actual_probe_rows{0};
-  mutable size_t join_matches{0};
-  mutable size_t dynamic_filter_probe_rows{0};
-  mutable size_t dynamic_filter_rejected{0};
-  mutable size_t dynamic_filter_null_rejected{0};
+  size_t actual_probe_rows{0};
+  size_t join_matches{0};
+  size_t dynamic_filter_probe_rows{0};
+  size_t dynamic_filter_rejected{0};
+  size_t dynamic_filter_null_rejected{0};
 
   // Spilled Grace Hash build buckets (`spilled`):
   size_t io_buf_bytes{16384};
@@ -309,7 +308,6 @@ struct OocHashJoinContext {
   bool build_has_null_key{false};
   bool semi_intake_completed{false};
   bool semi_reduction_active{false};
-  bool semi_domain_capped{false};
   bool dynamic_filter_published{false};
   bool small_build_runtime_filter{false};
   mutable bool probe_opened{false};
@@ -657,6 +655,7 @@ class OocConcatSource final : public PipelineSource {
   std::vector<OocSetOpInputStream> inputs_;
   Schema output_schema_;
   std::vector<ValueType> common_types_;
+  Status common_type_status_{Status::kSuccess};
   size_t active_idx_{0};
   bool opened_{false};
 };
@@ -692,6 +691,7 @@ class OocMergeAppendSource final : public PipelineSource {
   std::vector<SortKeyOrder> key_orders_;
   Schema output_schema_;
   std::vector<ValueType> common_types_;
+  Status common_type_status_{Status::kSuccess};
 };
 
 // Shared coordinator for OOC set operations (`UNION`, `INTERSECT [ALL]`,
@@ -724,6 +724,7 @@ class OocSetOpCoordinator {
   Schema output_schema_;
   size_t num_sources_{0};
   std::vector<ValueType> common_types_;
+  Status common_type_status_{Status::kSuccess};
   std::optional<size_t> width_;
 
   bool initialized_{false};
@@ -762,7 +763,8 @@ class OocSetOpInputSink final : public PipelineSink {
 
 // Streaming IncrementalSort (`IncrementalSortPlan`): groups runs sharing equal
 // `prefix_keys`, sorts each run by `suffix_keys` in bounded `ExternalSorter`
-// (`<= B_op`), preserving LIMIT early-stop without full-input buffering.
+// (`<= B_op`) and emits it before reading the next. There is no LIMIT
+// early-stop here: a retained LimitOp downstream applies the cutoff.
 class IncrementalSortSource final : public PipelineSource {
  public:
   IncrementalSortSource(std::shared_ptr<PipelineSource> upstream_source,
@@ -781,7 +783,7 @@ class IncrementalSortSource final : public PipelineSource {
   void DumpExplain(std::ostream& out, int indent) const override;
 
  private:
-  [[nodiscard]] StatusOr<Row> ExtractPrefix(const Row& row) const;
+  [[nodiscard]] StatusOr<Row> ExtractPrefix(const Row& row);
   Status FillNextGroup(PipelineContext* ctx);
 
   std::shared_ptr<PipelineSource> upstream_source_;
@@ -789,6 +791,7 @@ class IncrementalSortSource final : public PipelineSource {
   Schema schema_;
   std::vector<OocSortSink::KeySpec> prefix_keys_;
   std::vector<OocSortSink::KeySpec> suffix_keys_;
+  std::vector<SortKeyOrder> prefix_orders_, suffix_orders_;
 
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
   size_t budget_bytes_{0};
@@ -1018,7 +1021,10 @@ class OocMergeJoinSource final : public PipelineSource {
 
 // Streaming/spilling BandJoin (`BandJoinPlan`): drains right into
 // `SpillableStore`, validates ordering, and evaluates left blocks against
-// sorted right window strictly within `B_op`.
+// sorted right window using a working budget floored at 16 KiB
+// (`max(16 KiB, budget_bytes)`). Left blocks target at most
+// `max(16 KiB, budget_bytes_ / 2)`; for tiny grants this floor can exceed the
+// operator's requested budget.
 class OocBandJoinSource final : public PipelineSource {
  public:
   OocBandJoinSource(OocSetOpInputStream left, OocSetOpInputStream right,
@@ -1140,6 +1146,7 @@ class OocCrossJoinProbeSource final : public PipelineSource {
  public:
   OocCrossJoinProbeSource(std::shared_ptr<OocCrossJoinContext> cross_ctx,
                           OocSetOpInputStream left_stream);
+  ~OocCrossJoinProbeSource() override;
 
   Status Open(PipelineContext* ctx) override;
   StatusOr<bool> NextBatch(PipelineContext* ctx, DataChunk* out,
@@ -1155,12 +1162,18 @@ class OocCrossJoinProbeSource final : public PipelineSource {
     uint64_t matches{0};
   };
 
+  struct DisjunctiveJoinIndex;
+
   [[nodiscard]] StatusOr<bool> PairPasses(const Row& left_row,
                                           const Row& right_row) const;
   Status FillNextLeftBlock(PipelineContext* ctx);
+  [[nodiscard]] StatusOr<bool> NextDisjunctiveBatch(PipelineContext* ctx,
+                                                    DataChunk* out,
+                                                    size_t max_rows);
 
   std::shared_ptr<OocCrossJoinContext> cross_ctx_;
   OocSetOpInputStream left_;
+  std::unique_ptr<DisjunctiveJoinIndex> disj_index_;
   bool left_eof_{false};
   DataChunk in_left_chunk_;
   size_t in_left_idx_{0};

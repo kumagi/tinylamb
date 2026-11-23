@@ -6,6 +6,7 @@
 #include <iostream>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -375,6 +376,10 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--hash-probe") {
     return BenchmarkHashProbe();
   }
+  if (argc > 1) {
+    std::cerr << "usage: " << argv[0] << " [--fusion|--hash-probe]\n";
+    return 2;
+  }
   using tinylamb::JitInt64Kernels;
   auto filter =
       JitInt64Kernels::CompileFilter(tinylamb::BinaryOperation::kGreaterThan);
@@ -636,6 +641,11 @@ int main(int argc, char** argv) {
 
     const ColumnVector ref_filter = bc_filter->EvaluateBatch(chunk);
     const ColumnVector ref_case = bc_case->EvaluateBatch(chunk);
+    if (ref_filter.IntegerData().size() != kBatch ||
+        ref_case.IntegerData().size() != kBatch) {
+      std::cerr << "bytecode benchmark expected a full integer batch\n";
+      return 5;
+    }
     if (!jit_filter_prog->Filter(filter_inputs, kBatch, keep_out.data()) ||
         !jit_case_prog->Evaluate(case_inputs_zonemap, kBatch, val_out.data(),
                                  nul_out.data(), &any_null, &used_unchecked) ||

@@ -130,7 +130,7 @@ TEST_F(TableStatisticsTest, Update_FromTable_ComputesStatistics) {
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
 
-  ts.Update(ctx.txn_, tbl);
+  ASSERT_SUCCESS(ts.Update(ctx.txn_, tbl));
   LOG(TRACE) << ts;
 }
 
@@ -154,9 +154,9 @@ TEST_F(TableStatisticsTest, UpdateStatistics_WhenCalled_StoresStatistics) {
   ASSIGN_OR_ASSERT_FAIL_CONST(Table, tbl, db_->GetTable(ctx, "Sc1"));
   ASSIGN_OR_ASSERT_FAIL(TableStatistics, ts, db_->GetStatistics(ctx, "Sc1"));
 
-  ts.Update(ctx.txn_, tbl);
+  ASSERT_SUCCESS(ts.Update(ctx.txn_, tbl));
   LOG(TRACE) << ts;
-  db_->UpdateStatistics(ctx, "Sc2", ts);
+  ASSERT_SUCCESS(db_->UpdateStatistics(ctx, "Sc2", ts));
 }
 
 TEST_F(TableStatisticsTest,
@@ -1183,7 +1183,7 @@ TEST_F(TableStatisticsTest, EstimateCount_InvalidColumnIndex_Aborts) {
   EXPECT_DEATH(std::ignore = statistics.EstimateCount(-1, Value(0), Value(1)),
                "statistics column index");
   testing::FLAGS_gtest_death_test_style = "fast";
-  std::ignore = context.PreCommit();
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 TEST_F(TableStatisticsTest,
@@ -1359,7 +1359,7 @@ TEST_F(TableStatisticsTest,
       tbl.Insert(ctx.txn_, Row({Value(std::move(long_str_2))})).GetStatus());
 
   TableStatistics stats(tbl.GetSchema());
-  stats.Update(ctx.txn_, tbl);
+  ASSERT_SUCCESS(stats.Update(ctx.txn_, tbl));
   const ColumnStats& cs = stats.Column(0);
   EXPECT_EQ(cs.NonNullCount(), 2U);
   ASSERT_FALSE(cs.LowestValues().empty());

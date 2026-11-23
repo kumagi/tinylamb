@@ -51,7 +51,9 @@ class CascadesPredicateCoverageTest : public ::testing::Test {
  protected:
   void SetUp() override {
     if (!GoogleSqlFrontend::Available()) {
-      GTEST_SKIP() << "skipped";
+      GTEST_SKIP() << "GoogleSQL frontend unavailable (external execute_query "
+                      "--mode=parse child process missing); predicate coverage "
+                      "not verified";
     }
     database_ =
         Database::Create("cascades_predicate_coverage_test-" + RandomString())

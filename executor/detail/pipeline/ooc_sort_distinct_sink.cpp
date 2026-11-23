@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -130,6 +131,10 @@ class DistinctOutputSource final : public PipelineSource {
     if (!has_seq_suffix_) {
       return Status::kSuccess;
     }
+    if (payload_width_ > std::numeric_limits<slot_t>::max()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "distinct spill sequence column index out of range");
+    }
     // Preserve input order across partitions by deduplicating all leaves into a
     // single ExternalSorter sorted by the original sequence tag.
     ExternalSorter::Options opts;
@@ -154,6 +159,7 @@ class DistinctOutputSource final : public PipelineSource {
           if (!has) {
             break;
           }
+          RETURN_IF_FAIL(CheckOrderSequence(row));
           ASSIGN_OR_RETURN(Row, key, ExtractKey(row));
           if (!have_prev ||
               !relational_detail::GroupKeyEqual{}(prev_key, key)) {
@@ -167,6 +173,7 @@ class DistinctOutputSource final : public PipelineSource {
         relational_detail::GroupKeyMap seen;
         RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
             store_, leaf, [&](Row&& r) -> Status {
+              RETURN_IF_FAIL(CheckOrderSequence(r));
               ASSIGN_OR_RETURN(Row, key, ExtractKey(r));
               if (seen.emplace(std::move(key), 0).second) {
                 r.values_.resize(payload_width_ + 1);
@@ -185,6 +192,9 @@ class DistinctOutputSource final : public PipelineSource {
   StatusOr<bool> NextBatch(PipelineContext* /*ctx*/, DataChunk* out,
                            size_t max_rows) override {
     out->Reset();
+    if (max_rows == 0) {
+      return false;
+    }
     if (restored_order_sorter_ != nullptr) {
       Row row;
       while (out->Size() < max_rows) {
@@ -193,9 +203,8 @@ class DistinctOutputSource final : public PipelineSource {
           restored_order_sorter_.reset();
           break;
         }
-        if (row.Count() > payload_width_) {
-          row.values_.resize(payload_width_);
-        }
+        RETURN_IF_FAIL(CheckOrderSequence(row));
+        row.values_.resize(payload_width_);
         out->Append(std::move(row));
       }
       if (out->Empty()) {
@@ -206,7 +215,7 @@ class DistinctOutputSource final : public PipelineSource {
     while (out->Empty()) {
       if (emit_cursor_ < active_rows_.size()) {
         const size_t end =
-            std::min(active_rows_.size(), emit_cursor_ + max_rows);
+            emit_cursor_ + std::min(active_rows_.size() - emit_cursor_, max_rows);
         out->Reserve(end - emit_cursor_);
         for (size_t i = emit_cursor_; i < end; ++i) {
           out->Append(std::move(active_rows_[i]));
@@ -261,10 +270,30 @@ class DistinctOutputSource final : public PipelineSource {
   [[nodiscard]] std::string Describe() const override { return label_; }
 
  private:
+  [[nodiscard]] Status CheckOrderSequence(const Row& row) const {
+    if (row.Count() <= payload_width_ ||
+        row[payload_width_].type != ValueType::kInt64 ||
+        row[payload_width_].value.int_value < 0) {
+      return StatusError(StatusCode::kCorrupt,
+                         "distinct spill row has an invalid order sequence");
+    }
+    return Status::kSuccess;
+  }
+
   StatusOr<std::unique_ptr<ExternalSorter>> BuildSkewSorter(
       const PartitionLeaf& leaf) {
     if (!distinct_on_exprs_.empty()) {
+      const size_t max_slot = std::numeric_limits<slot_t>::max();
+      if (payload_width_ > max_slot) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "distinct spill key column index out of range");
+      }
       const size_t key_base = payload_width_ + (has_seq_suffix_ ? 1U : 0U);
+      if (key_base > max_slot ||
+          distinct_on_exprs_.size() - 1 > max_slot - key_base) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "distinct spill key column index out of range");
+      }
       std::vector<OocSortKey> keys;
       keys.reserve(distinct_on_exprs_.size() + (has_seq_suffix_ ? 1U : 0U));
       for (size_t i = 0; i < distinct_on_exprs_.size(); ++i) {
@@ -283,6 +312,9 @@ class DistinctOutputSource final : public PipelineSource {
       auto sorter = std::make_unique<ExternalSorter>(std::move(opts));
       RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
           store_, leaf, [&](Row&& r) -> Status {
+            if (has_seq_suffix_) {
+              RETURN_IF_FAIL(CheckOrderSequence(r));
+            }
             ASSIGN_OR_RETURN(Row, k, ExtractKey(r));
             if (has_seq_suffix_) {
               r.values_.resize(payload_width_ + 1);
@@ -313,9 +345,16 @@ class DistinctOutputSource final : public PipelineSource {
     bool rebuilt_keys = sort_keys.empty();
     RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
         store_, leaf, [&](Row&& r) -> Status {
+          if (has_seq_suffix_) {
+            RETURN_IF_FAIL(CheckOrderSequence(r));
+          }
           if (rebuilt_keys) {
             rebuilt_keys = false;
             const size_t arity = has_seq_suffix_ ? payload_width_ : r.Count();
+            if (arity != 0 && arity - 1 > std::numeric_limits<slot_t>::max()) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "distinct spill row is too wide to sort");
+            }
             std::vector<OocSortKey> keys;
             keys.reserve(arity + (has_seq_suffix_ ? 1U : 0U));
             for (size_t c = 0; c < arity; ++c) {
@@ -417,13 +456,21 @@ Status OocSortSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
 
   for (size_t i = 0; i < keys_.size(); ++i) {
     const auto column_slot = keys_[i].column_slot;
-    if (column_slot.has_value() && *column_slot < input_schema_.ColumnCount()) {
+    if (column_slot.has_value()) {
+      if (*column_slot > std::numeric_limits<slot_t>::max()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column slot is out of range");
+      }
       direct_slots_[i] = static_cast<slot_t>(*column_slot);
     } else if (keys_[i].expression &&
                keys_[i].expression->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           keys_[i].expression->AsColumnValue().GetColumnName());
       if (offset >= 0) {
+        if (std::cmp_greater(offset , std::numeric_limits<slot_t>::max())) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "sort key column slot is out of range");
+        }
         direct_slots_[i] = static_cast<slot_t>(offset);
       } else {
         computed_key_indices_.push_back(i);
@@ -441,14 +488,37 @@ Status OocSortSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
 
 Status OocSortSink::EnsureSorter(PipelineContext* ctx, size_t payload_cols) {
   if (sorter_ != nullptr) {
+    if (payload_cols != payload_cols_) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "sort input column count changed between batches");
+    }
     return Status::kSuccess;
   }
   payload_cols_ = payload_cols;
+  // Computed-key and seq columns are appended after the payload; every
+  // sorter index must fit slot_t or it aliases a real column.
+  constexpr size_t kSlotCount =
+      static_cast<size_t>(std::numeric_limits<slot_t>::max()) + 1;
+  const size_t sequence_columns = limit_.has_value() ? 1 : 0;
+  if (computed_key_indices_.size() > kSlotCount - sequence_columns) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "sort key column slot is out of range");
+  }
+  const size_t appended_cols = computed_key_indices_.size() + sequence_columns;
+  if (appended_cols > 0 &&
+      payload_cols_ > kSlotCount - appended_cols) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "sort key column slot is out of range");
+  }
   std::vector<OocSortKey> sorter_keys;
   sorter_keys.reserve(keys_.size() + (limit_.has_value() ? 1U : 0U));
 
   size_t extra_idx = 0;
   for (size_t i = 0; i < keys_.size(); ++i) {
+    if (direct_slots_[i].has_value() && *direct_slots_[i] >= payload_cols_) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "sort key column slot is out of range");
+    }
     const slot_t sort_slot =
         direct_slots_[i].has_value()
             ? *direct_slots_[i]
@@ -623,21 +693,26 @@ StatusOr<Row> OocDistinctSink::ExtractKey(const Row& row) const {
   } else {
     vals.reserve(key_cols_.size());
     for (slot_t c : key_cols_) {
-      vals.push_back(c < row.Count()
-                         ? relational_detail::CanonicalDistinctValue(row[c])
-                         : Value());
+      if (c >= row.Count()) {
+        return StatusError(StatusCode::kCorrupt,
+                           "distinct key column slot is out of range");
+      }
+      vals.push_back(relational_detail::CanonicalDistinctValue(row[c]));
     }
   }
   return Row(std::move(vals));
 }
 
-Row OocDistinctSink::BuildTaggedRow(Row&& row, const Row& /*key*/,
-                                    uint64_t seq) const {
+Status OocDistinctSink::SpillRow(RecursivePartitioner& partitioner, Row row, uint64_t seq) {
   if (preserve_input_order_) {
+    if (seq > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return StatusError(StatusCode::kTooBigData,
+                         "distinct spill order sequence exceeds INT64");
+    }
     row.values_.resize(input_schema_.ColumnCount());
     row.values_.emplace_back(static_cast<int64_t>(seq));
   }
-  return std::move(row);
+  return partitioner.AddRow(std::move(row));
 }
 
 Status OocDistinctSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
@@ -668,7 +743,7 @@ Status OocDistinctSink::TransitionToSpill(PipelineContext* ctx) {
   opts.spill_store = &ctx->spill_store;
   opts.memory_budget_bytes = budget_bytes_;
   opts.grant = &ctx->grant;
-  partitioner_ = std::make_unique<RecursivePartitioner>(
+  auto candidate = std::make_unique<RecursivePartitioner>(
       opts, [this](const Row& r) -> uint64_t {
         StatusOr<Row> k = ExtractKey(r);
         if (!k.HasValue()) {
@@ -683,16 +758,12 @@ Status OocDistinctSink::TransitionToSpill(PipelineContext* ctx) {
       });
 
   for (size_t i = 0; i < unique_rows_.size(); ++i) {
-    Row& r = unique_rows_[i];
-    if (preserve_input_order_) {
-      r.values_.resize(input_schema_.ColumnCount());
-      r.values_.emplace_back(static_cast<int64_t>(i));
-    }
-    RETURN_IF_FAIL(partitioner_->AddRow(std::move(r)));
+    RETURN_IF_FAIL(SpillRow(*candidate, unique_rows_[i], i));
   }
+  RETURN_IF_FAIL(partition_key_status_);
+  partitioner_ = std::move(candidate);
   next_seq_ = std::max<uint64_t>(next_seq_, unique_rows_.size());
-  unique_rows_.clear();
-  unique_rows_.shrink_to_fit();
+  std::vector<Row>().swap(unique_rows_);
   index_map_.clear();
   mem_bytes_ = 0;
   if (grant_cache_.has_value()) {
@@ -711,11 +782,8 @@ Status OocDistinctSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
   for (size_t r = 0; r < input.Size(); ++r) {
     Row row = input.RowAt(r);
     if (spilled_) {
-      if (preserve_input_order_) {
-        row.values_.resize(input_schema_.ColumnCount());
-        row.values_.emplace_back(static_cast<int64_t>(next_seq_++));
-      }
-      RETURN_IF_FAIL(partitioner_->AddRow(std::move(row)));
+      RETURN_IF_FAIL(SpillRow(*partitioner_, std::move(row), next_seq_));
+      next_seq_ += static_cast<uint64_t>(preserve_input_order_);
       continue;
     }
     ASSIGN_OR_RETURN(Row, key, ExtractKey(row));
@@ -727,11 +795,8 @@ Status OocDistinctSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
     if ((budget_bytes_ > 0 && mem_bytes_ + add_bytes > budget_bytes_) ||
         (grant_cache_.has_value() && !grant_cache_->Reserve(add_bytes))) {
       RETURN_IF_FAIL(TransitionToSpill(ctx));
-      if (preserve_input_order_) {
-        row.values_.resize(input_schema_.ColumnCount());
-        row.values_.emplace_back(static_cast<int64_t>(next_seq_++));
-      }
-      RETURN_IF_FAIL(partitioner_->AddRow(std::move(row)));
+      RETURN_IF_FAIL(SpillRow(*partitioner_, std::move(row), next_seq_));
+      next_seq_ += static_cast<uint64_t>(preserve_input_order_);
       continue;
     }
     index_map_.emplace(std::move(key), unique_rows_.size());
@@ -758,8 +823,8 @@ StatusOr<std::shared_ptr<PipelineSource>> OocDistinctSink::Finalize(
                                              label_ + "Output");
   }
   PartitionLeafSet leaves;
-  RETURN_IF_FAIL(partitioner_->Finalize(&leaves));
   RETURN_IF_FAIL(partition_key_status_);
+  RETURN_IF_FAIL(partitioner_->Finalize(&leaves));
   partitioner_.reset();
   consumer_guard_.reset();
   return std::make_shared<DistinctOutputSource>(

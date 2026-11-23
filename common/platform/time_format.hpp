@@ -23,9 +23,9 @@
 
 namespace tinylamb::platform {
 
-// timegm(3)/gmtime_r(3) over the full proleptic Gregorian range, computed
-// arithmetically. This handles years outside the libc timegm range on every
-// platform and never consults the host zone.
+// timegm(3)/gmtime_r(3) computed arithmetically without consulting the host
+// zone. GmTime accepts int64 epoch seconds, but zeroes `out` when the civil
+// year cannot fit struct tm's int tm_year field.
 //
 // TimeGm normalizes out-of-range fields and rewrites `tm` exactly like glibc
 // timegm (tm_wday, tm_yday, tm_isdst = 0, tm_gmtoff = 0, tm_zone = "GMT") and
@@ -34,8 +34,9 @@ int64_t TimeGm(struct tm* tm);
 // Fills `out` with the UTC calendar time of `seconds` since the epoch.
 void GmTime(int64_t seconds, struct tm* out);
 // Fills `out` with the local calendar time of `seconds` since the epoch
-// (localtime_r on POSIX, localtime_s on Windows).
-void LocalTime(std::time_t seconds, struct tm* out);
+// (localtime_r on POSIX, localtime_s on Windows).  Returns false when the
+// value cannot be represented as a civil time; `out` is then left zeroed.
+bool LocalTime(std::time_t seconds, struct tm* out);
 
 // strptime(3)/strftime(3) with glibc's time-zone semantics on every platform.
 // The engine works on UTC-normalized `struct tm` values, so the process's

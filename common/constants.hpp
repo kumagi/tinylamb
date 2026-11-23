@@ -18,10 +18,8 @@
 #define TINYLAMB_CONSTANTS_HPP
 
 #include <bit>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <ostream>
@@ -44,25 +42,17 @@ static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 #define TINYLAMB_DETAIL_CONCAT_IMPL(a, b) a##b
 #define TINYLAMB_DETAIL_CONCAT(a, b) TINYLAMB_DETAIL_CONCAT_IMPL(a, b)
 
-#define RETURN_IF_FAIL(expr)                                                \
-  {                                                                         \
-    Status TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) = (expr); \
-    if (TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) !=           \
-        Status::kSuccess)                                                   \
-      return TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__);        \
-  }
-
-#ifndef CRASH_IF_FAIL
-#define CRASH_IF_FAIL(expr)                                                 \
-  {                                                                         \
-    Status TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) = (expr); \
-    if (TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) !=           \
-        Status::kSuccess) {                                                 \
-      assert(false && #expr);                                               \
-      abort();                                                              \
-    }                                                                       \
-  }
-#endif
+// Unlike ASSIGN_OR_* (which deliberately declares `value` in the caller's
+// scope), these macros introduce no caller-visible name, so they are proper
+// single statements: safe as a braceless if/else body.
+#define RETURN_IF_FAIL(expr)                                                 \
+  do {                                                                       \
+    ::tinylamb::Status TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) = (expr);  \
+    if (TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) !=            \
+        ::tinylamb::Status::kSuccess) {                                     \
+      return TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__);         \
+    }                                                                        \
+  } while (false)
 
 enum class StatusCode : uint8_t {
   kUnknown = 0,
@@ -89,14 +79,19 @@ enum class StatusCode : uint8_t {
   kQueryCanceled = 17,
   // Iteration bound, not a real status: every code above must precede this
   // sentinel so status_or_test can walk the whole declared range and fail
-  // when a new enumerator forgets its ToString case.
-  kStatusCodeCount,
+  // when a new enumerator forgets its ToString case. Untrusted 1-byte status
+  // values must be validated by the decoder (ToString returns
+  // "INVALID STATUS" for the sentinel); it is never produced by the engine.
+  kStatusCodeCount = 18,
 };
 
 // A status code plus an optional human-readable message. Equality (and every
 // `== Status::kXxx` style check) compares the code only; the message is
 // diagnostic payload propagated to user-facing error reporting instead of
-// C++ exceptions.
+// C++ exceptions. Comparing the message too would make every
+// `status == Status::kSuccess`-style check fail for statuses carrying a
+// diagnostic, so the message is deliberately compared with GetMessage()
+// explicitly where that distinction matters.
 class Status {
  public:
   Status() = default;
@@ -246,6 +241,7 @@ using txn_id_t = uint64_t;
 using page_id_t = uint64_t;
 using slot_t = uint16_t;
 using bin_size_t = uint16_t;
+constexpr uint64_t kMaxSerializedVectorElements = uint64_t{1} << 20;
 
 // Page id reserved for the MetaPage (allocator state). Currently unused; the
 // allocator state lives in PageManager itself.

@@ -44,7 +44,7 @@ std::atomic<bool> g_interrupted{false};
 std::atomic<int> g_interrupt_signal{SIGINT};
 
 void HandleInterrupt(int signo) {
-  g_interrupt_signal.store(signo, std::memory_order_relaxed);
+  g_interrupt_signal.store(signo, std::memory_order_seq_cst);
   if (g_interrupted.exchange(true)) {
     std::signal(SIGINT, SIG_DFL);   // NOLINT(cert-err33-c)
     std::signal(SIGTERM, SIG_DFL);  // NOLINT(cert-err33-c)
@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
       args.push_back(arg);
     }
   }
-  if (args.size() != 1) {
+  if (args.size() != 1 || args[0].empty()) {
     std::cerr << "usage: tinylamb [--force] <database-file> < input.sql\n";
     return 2;
   }
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
       std::cerr << "rollback after interrupt failed: " << abort_status << '\n';
     }
     // Shell convention: 128 + the signal that interrupted the run.
-    return 128 + g_interrupt_signal.load(std::memory_order_relaxed);
+    return 128 + g_interrupt_signal.load(std::memory_order_seq_cst);
   };
   for (const std::string& statement : statements) {
     if (g_interrupted.load()) {
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
   if (g_interrupted.load()) {
     std::cerr << "interrupted during commit/output (transaction was "
                  "committed)\n";
-    return 128 + g_interrupt_signal.load(std::memory_order_relaxed);
+    return 128 + g_interrupt_signal.load(std::memory_order_seq_cst);
   }
   return 0;
 }

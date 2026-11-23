@@ -47,12 +47,18 @@ class Decoder {
 
   template <typename T>
   Decoder& operator>>(std::vector<T>& vec) {
+    return ReadVector(vec, kMaxSerializedVectorElements);
+  }
+
+  // max_elements is a per-call tighter bound; serialized vectors also obey
+  // the global format limit, which callers cannot raise.
+  template <typename T>
+  Decoder& ReadVector(std::vector<T>& vec, uint64_t max_elements) {
     uint64_t size = 0;
     *this >> size;
     vec.clear();
-    constexpr uint64_t kMaxDecodedElements = 1 << 20;
-    if (size > kMaxDecodedElements) {
-      is_->setstate(std::ios::failbit);
+    if (size > kMaxSerializedVectorElements || size > max_elements) {
+      Fail();
       return *this;
     }
     try {
@@ -83,6 +89,12 @@ class Decoder {
   // fields written by newer encoders without tripping failbit on old
   // payloads (e.g. ColumnStats::correlation_).
   [[nodiscard]] bool AtEnd() {
+    // A failed stream makes peek() return EOF via the sentry too. Reporting
+    // that as "clean end" would let a truncated record be accepted as an old
+    // payload with fewer optional trailing fields.
+    if (is_->fail()) {
+      return false;
+    }
     return is_->peek() == std::char_traits<char>::eof();
   }
 

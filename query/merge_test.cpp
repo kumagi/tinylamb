@@ -94,7 +94,7 @@ TEST_F(MergeTest, UpdatesMatchedAndInsertsUnmatchedSourceRows) {
              "MERGE INTO tgt USING src ON tgt.k = src.k "
              "WHEN MATCHED THEN UPDATE SET v = src.nv "
              "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.nv);");
-  ASSERT_EQ(affected.size(), 1u);
+  ASSERT_EQ(affected.size(), 1U);
   EXPECT_EQ(CellText(affected[0], 1), "3");
   EXPECT_EQ((TargetRows()),
             (std::vector<std::string>{"1:\"new1\"", "2:\"new2\"", "3:\"old3\"",
@@ -210,6 +210,31 @@ TEST_F(MergeTest, NullJoinKeysNeverMatch) {
             (std::vector<std::string>{"NULL:\"nulltgt\"", "NULL:\"nullsrc\"",
                                       "1:\"new1\"", "2:\"new2\"", "3:\"old3\"",
                                       "4:\"new4\""}));
+}
+
+TEST_F(MergeTest, ForeignKeyFailureAfterDeletePreventsPartialCommit) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE parent (k INT64 PRIMARY KEY)");
+  RunSql(
+      engine_.get(), context_.get(),
+      "CREATE TABLE child (fk INT64, FOREIGN KEY (fk) REFERENCES parent (k))");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO parent VALUES (1)");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO child VALUES (1)");
+  ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
+
+  auto writer = database_->BeginContext();
+  const auto result = engine_->Prepare(
+      writer,
+      "MERGE INTO child USING (SELECT 1 AS k UNION ALL SELECT 2 AS k) "
+      "AS s ON child.fk = s.k WHEN MATCHED THEN DELETE "
+      "WHEN NOT MATCHED THEN INSERT (fk) VALUES (s.k)");
+  ASSERT_EQ(result.GetStatus(), Status::kConflicts);
+  ASSERT_GT(writer.txn_.WriteEpoch(), 0U);
+  EXPECT_TRUE(writer.txn_.IsFailed());
+  EXPECT_NE(writer.PreCommit(), Status::kSuccess);
+
+  auto reader = database_->BeginReadOnlyContext();
+  EXPECT_EQ(RunSql(engine_.get(), &reader, "SELECT fk FROM child"),
+            (std::vector<Row>{Row({Value(1)})}));
 }
 
 TEST_F(MergeTest, ForeignKeyEnforcedOnInsertAndUpdate) {
@@ -433,7 +458,7 @@ TEST_F(MergeTest, SelfReferencingDeleteIgnoresRowsThisStatementRemoves) {
 TEST_F(MergeTest, TruncateTableDropsRowsAndKeepsSchema) {
   const std::vector<Row> affected =
       RunSql(engine_.get(), context_.get(), "TRUNCATE TABLE tgt;");
-  ASSERT_EQ(affected.size(), 1u);
+  ASSERT_EQ(affected.size(), 1U);
   EXPECT_EQ(CellText(affected[0], 1), "3");
   EXPECT_TRUE(
       RunSql(engine_.get(), context_.get(), "SELECT k FROM tgt;").empty());
@@ -496,7 +521,7 @@ TEST_F(MergeTest, UpdateFromReportsUpdateCommand) {
              "UPDATE tgt SET v = src.nv FROM src WHERE tgt.k = src.k;");
   // The statement ran on the MERGE machinery, but the user statement is an
   // UPDATE: the diagnostic and server tags report UPDATE with the count.
-  ASSERT_EQ(affected.size(), 1u);
+  ASSERT_EQ(affected.size(), 1U);
   EXPECT_EQ(CellText(affected[0], 0), "\"Update Rows\"");
   EXPECT_EQ(CellText(affected[0], 1), "2");
   EXPECT_EQ(engine_->LastStatementType(), StatementType::kUpdate);

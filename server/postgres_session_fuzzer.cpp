@@ -15,6 +15,8 @@
 //     sanity query ("SELECT 1") must still return exactly one row.
 #include "server/postgres_session_fuzzer.hpp"
 
+#include "common/platform/socket.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -24,6 +26,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -62,7 +67,13 @@ class Conn {
   [[nodiscard]] bool Send(std::string_view bytes) const {
     size_t sent = 0;
     while (sent < bytes.size()) {
-      const ssize_t n = write(fd_, bytes.data() + sent, bytes.size() - sent);
+      // send()+MSG_NOSIGNAL (via the platform wrapper): a bare write() on a
+      // socket delivers EPIPE as SIGPIPE and kills the fuzzer on peer close.
+      const ssize_t n = platform::SendNoSignal(
+          fd_, bytes.data() + sent, bytes.size() - sent);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
       if (n <= 0) {
         return false;
       }
@@ -70,6 +81,8 @@ class Conn {
     }
     return true;
   }
+
+  [[nodiscard]] bool IsPeerClosed() const noexcept { return peer_closed_; }
 
   // Read backend messages until the deadline. `stop_on_ready` returns after
   // the first ReadyForQuery. Returns false on EOF/protocol violation; on a
@@ -83,7 +96,7 @@ class Conn {
       while (buf.size() >= 5) {
         const StatusOr<uint32_t> len = pgwire::ReadUint32(buf, 1);
         if (!len.HasValue()) {
-          return false;  // unframmable buffer: protocol violation by server
+          return false;  // Cannot read the message length: protocol violation.
         }
         if (len.Value() < 4) {
           return false;
@@ -107,15 +120,23 @@ class Conn {
       }
       struct pollfd pfd{.fd = fd_, .events = POLLIN, .revents = 0};
       const int pr = poll(&pfd, 1, static_cast<int>(left));
+      if (pr < 0 && errno == EINTR) {
+        continue;
+      }
       if (pr <= 0) {
         return !out->empty();
       }
       std::array<char, 16384> chunk{};
       const ssize_t n = read(fd_, chunk.data(), chunk.size());
       if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        peer_closed_ = true;
         return !out->empty();
       }
       if (n == 0) {
+        peer_closed_ = true;
         return false;  // EOF
       }
       buf.append(chunk.data(), static_cast<size_t>(n));
@@ -131,6 +152,7 @@ class Conn {
 
  private:
   int fd_;
+  bool peer_closed_{false};
 };
 
 std::string Frame(char type, std::string_view body) {
@@ -179,8 +201,21 @@ int Connect(uint16_t port) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) !=
-      0) {
+  int connected = connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                          sizeof(addr));
+  if (connected != 0 && errno == EINTR) {
+    struct pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
+    if (poll(&pfd, 1, -1) > 0) {
+      int socket_error = 0;
+      socklen_t socket_error_size = sizeof(socket_error);
+      if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                     &socket_error_size) == 0 &&
+          socket_error == 0) {
+        connected = 0;
+      }
+    }
+  }
+  if (connected != 0) {
     close(fd);
     return -1;
   }
@@ -196,10 +231,14 @@ struct ServerEnv {
   std::unique_ptr<PostgresServer> server;
   std::thread runner;
   uint16_t port{0};
+  std::mutex race_mutex;
+  bool race_table_ready{false};
   // Run() writes poller errors into this string from the runner thread,
   // which lives until the destructor's join -- it must be a member, not a
   // constructor local captured by reference (dangling-stack UAF).
   std::string run_error;
+  std::atomic<int> run_status{0};
+  std::atomic<bool> run_exited{false};
 
   ServerEnv() : db("pgwire_session_fuzz") {
     if (!db) {
@@ -217,7 +256,8 @@ struct ServerEnv {
     port = server->BoundPort();
     runner = std::thread([this] {
       const int rc = server->Run(&run_error);
-      (void)rc;
+      run_status.store(rc, std::memory_order_relaxed);
+      run_exited.store(true, std::memory_order_release);
     });
     // Wait until the sanity query answers on a real connection.
     for (int attempt = 0; attempt < 200; ++attempt) {
@@ -225,6 +265,11 @@ struct ServerEnv {
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (run_exited.load(std::memory_order_acquire)) {
+      const int rc = run_status.load(std::memory_order_relaxed);
+      (void)fprintf(stderr, "PostgresServer::Run exited (%d): %s\n", rc,
+                    run_error.c_str());
     }
   }
 
@@ -254,6 +299,9 @@ struct ServerEnv {
   }
 
   [[nodiscard]] bool SanityCheck() const {
+    if (run_exited.load(std::memory_order_acquire)) {
+      return false;
+    }
     const int fd = Connect(port);
     if (fd < 0) {
       return false;
@@ -564,6 +612,9 @@ void TryPipelining(ByteStream& stream) {
 // one of the writers' legal values.
 void TryWriteRace(ByteStream& stream) {
   ServerEnv* env = Env();
+  // Serialize independent runs that reset the same fixture. The two sessions
+  // inside each run still race each other on the hot row.
+  const std::scoped_lock race_lock(env->race_mutex);
   const int reset_fd = Connect(env->port);
   if (reset_fd < 0) {
     abort();
@@ -581,11 +632,8 @@ void TryWriteRace(ByteStream& stream) {
   (void)CheckExchange(reply, &err, &ready);
   static const std::string race_table =
       "pgw_race_" + std::to_string(static_cast<long>(::getpid()));
-  static bool table_ready = false;
-  const bool fresh = !table_ready;
-  table_ready = true;
   std::vector<std::string> setup;
-  if (fresh) {
+  if (!env->race_table_ready) {
     setup.push_back("CREATE TABLE " + race_table + " (u INT64, v INT64);");
   }
   setup.push_back("DELETE FROM " + race_table + ";");
@@ -604,6 +652,7 @@ void TryWriteRace(ByteStream& stream) {
       __builtin_trap();
     }
   }
+  env->race_table_ready = true;
   reset.Close();
 
   const int rounds = 3 + static_cast<int>(stream.Pick(10));
@@ -726,29 +775,21 @@ void TryWriteRace(ByteStream& stream) {
   for (const auto& [t, b] : reply) {
     if (t == 'D') {
       ++rows;
-      // Text format: "<col_count>\0<len>digits"
-      const size_t first_nl = b.find('\0');
-      if (first_nl == std::string::npos || b.size() < first_nl + 5) {
+      // A one-column DataRow starts with a two-byte count and a four-byte
+      // length, followed by the column's text bytes.
+      const auto count = pgwire::ReadUint16(b, 0);
+      constexpr size_t kDataOffset = sizeof(uint16_t) + sizeof(uint32_t);
+      const auto length = pgwire::ReadUint32(b, sizeof(uint16_t));
+      if (b.size() < kDataOffset || !count.HasValue() || count.Value() != 1 ||
+          !length.HasValue() || length.Value() != b.size() - kDataOffset) {
         __builtin_trap();
       }
-      const size_t len =
-          (static_cast<size_t>(static_cast<unsigned char>(b[first_nl + 1]))
-           << 24) |
-          (static_cast<size_t>(static_cast<unsigned char>(b[first_nl + 2]))
-           << 16) |
-          (static_cast<size_t>(static_cast<unsigned char>(b[first_nl + 3]))
-           << 8) |
-          static_cast<size_t>(static_cast<unsigned char>(b[first_nl + 4]));
-      const std::string num = b.substr(static_cast<size_t>(first_nl) + 5, len);
-      char* end = nullptr;
-      errno = 0;
-      const long long parsed = std::strtoll(num.c_str(), &end, 10);
-      if (errno != 0 || end == num.c_str() || *end != '\0') {
-        (void)fprintf(stderr, "post-race row value not numeric: '%s'\n",
-                      num.c_str());
+      const auto [end, error] = std::from_chars(b.data() + kDataOffset,
+                                                b.data() + b.size(), value);
+      if (error != std::errc{} || end != b.data() + b.size()) {
+        (void)fprintf(stderr, "post-race DataRow value is not an integer\n");
         __builtin_trap();
       }
-      value = parsed;
     }
   }
   const int64_t writer_id = value / 1000;
@@ -812,7 +853,17 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       return false;
     }
     char reply = 0;
-    if (read(fd, &reply, 1) != 1 || (reply != 'N' && reply != 'S')) {
+    while (true) {
+      const ssize_t n = read(fd, &reply, 1);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n != 1) {
+        return false;
+      }
+      break;
+    }
+    if (reply != 'N' && reply != 'S') {
       return false;
     }
   }
@@ -881,7 +932,7 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       }
       std::vector<std::pair<char, std::string>> exchange;
       (void)conn.ReadMessages(150, false, &exchange);
-      if (!exchange.empty()) {
+      if (!exchange.empty() || conn.IsPeerClosed()) {
         return false;  // Flush answered
       }
     } else if (kind == 8) {
@@ -928,7 +979,7 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       }
     } else {
       // Malformed frame: bogus length (<4 or > limit).  The server must
-      // answer 08P01 and close; either way the connection may die.
+      // answer 08P01 and close.
       std::string junk;
       junk.push_back('Q');
       const uint32_t extra = stream.U8();
@@ -936,11 +987,46 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
           extra % 2 == 0 ? 1U + (extra % 3U) : 0xFFFF0000U + extra;
       pgwire::AppendUint32(&junk, bad_len);
       junk += "junk";
-      (void)conn.Send(junk);
+      if (!conn.Send(junk)) {
+        return false;
+      }
       std::vector<std::pair<char, std::string>> exchange;
-      (void)conn.ReadMessages(500, false, &exchange);
+      (void)conn.ReadMessages(2000, false, &exchange);
+      bool error_seen = false;
+      size_t malformed_ready_count = 0;
+      (void)CheckExchange(exchange, &error_seen, &malformed_ready_count);
+      bool saw_protocol_error = false;
+      for (const auto& [type, body] : exchange) {
+        if (type != 'E') {
+          continue;
+        }
+        size_t pos = 0;
+        while (pos < body.size()) {
+          const char field = body[pos++];
+          if (field == '\0') {
+            break;
+          }
+          const size_t end = body.find('\0', pos);
+          if (end == std::string::npos) {
+            break;  // CheckExchange already reports malformed fields.
+          }
+          if (field == 'C' && body.compare(pos, end - pos, "08P01") == 0) {
+            saw_protocol_error = true;
+          }
+          pos = end + 1;
+        }
+      }
+      if (!error_seen || !saw_protocol_error || malformed_ready_count != 0 ||
+          !conn.IsPeerClosed()) {
+        (void)fprintf(stderr,
+                      "malformed frame contract failed (error=%d, 08P01=%d, "
+                      "ready=%zu, closed=%d)\n",
+                      error_seen, saw_protocol_error, malformed_ready_count,
+                      conn.IsPeerClosed());
+        return false;
+      }
       conn.Close();
-      return true;  // connection is expected to be gone
+      return true;
     }
   }
   conn.Close();

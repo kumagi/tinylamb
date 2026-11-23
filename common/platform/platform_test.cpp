@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -51,6 +52,7 @@
 #include "common/platform/synced_stream.hpp"
 #include "common/platform/time_format.hpp"
 #include "common/platform/time_zone.hpp"
+#include "common/random_string.hpp"
 #include "gtest/gtest.h"
 
 #ifndef TINYLAMB_OS_WINDOWS
@@ -68,6 +70,8 @@ static_assert(static_cast<SocketFd>(-1) < 0,
 #ifdef TINYLAMB_OS_WINDOWS
 static_assert(sizeof(SocketFd) >= sizeof(SOCKET),
               "SocketFd must hold a full Winsock SOCKET without truncation");
+static_assert(IsValidSocketFd(std::numeric_limits<SocketFd>::min()));
+static_assert(!IsValidSocketFd(kInvalidSocketFd));
 #endif
 
 TEST(PlatformTimeTest, TwoDigitYearUsesPosixPivot) {
@@ -78,6 +82,17 @@ TEST(PlatformTimeTest, TwoDigitYearUsesPosixPivot) {
     ASSERT_NE(end, nullptr);
     EXPECT_EQ(*end, '\0');
     EXPECT_EQ(parsed.tm_year, year) << text;
+  }
+}
+
+TEST(PlatformTimeTest, LocalTimeReportsUnrepresentableEpoch) {
+  std::tm tm{};
+  EXPECT_TRUE(platform::LocalTime(0, &tm));
+  EXPECT_FALSE(
+      platform::LocalTime(std::numeric_limits<std::time_t>::max(), &tm));
+  if constexpr (std::numeric_limits<std::time_t>::is_signed) {
+    EXPECT_FALSE(
+        platform::LocalTime(std::numeric_limits<std::time_t>::min(), &tm));
   }
 }
 
@@ -157,7 +172,42 @@ TEST(SoftExtendedAuditTest, ArithmeticRetainsLowBitsAndRoundsEven) {
   EXPECT_EQ(static_cast<double>(SoftExtended(9.0) / SoftExtended(4.0)), 2.25);
 }
 
-#ifndef TINYLAMB_OS_WINDOWS
+TEST(ProcessAuditTest, InvalidOverrideLeavesEnvironmentUnchanged) {
+  constexpr char kEnv[] = "TINYLAMB_AUDIT_INVALID_OVERRIDE";
+  ASSERT_EQ(SetEnv(kEnv, "parent", 1), 0);
+  std::string error;
+  EXPECT_EQ(RunProcess("unused_program", {},
+                       {{kEnv, "child"}, {"bad=key", "value"}}, &error),
+            -1);
+  EXPECT_EQ(error, "invalid environment override");
+  EXPECT_STREQ(std::getenv(kEnv), "parent");
+  EXPECT_EQ(UnsetEnv(kEnv), 0);
+}
+
+#ifdef TINYLAMB_OS_WINDOWS
+TEST(ProcessAuditTest, ConcurrentChildrenReceiveIndependentEnvironmentBlocks) {
+  constexpr char kEnv[] = "TINYLAMB_AUDIT_CHILD_ENV";
+  const char* shell = std::getenv("ComSpec");
+  ASSERT_NE(shell, nullptr);
+  const std::filesystem::path executable(shell);
+  ASSERT_EQ(SetEnv(kEnv, "parent", 1), 0);
+  const auto launch = [&](std::string value) {
+    std::string error;
+    const std::string command = std::string("if %") + kEnv + "%==" + value +
+                                " (exit /b 23) else (exit /b 1)";
+    const int code = RunProcess(executable, {"/d", "/s", "/c", command},
+                                {{"tinylamb_audit_child_env", value}}, &error);
+    EXPECT_EQ(code, 23) << error;
+  };
+  auto first = std::async(std::launch::async, launch, "first");
+  auto second = std::async(std::launch::async, launch, "second");
+  first.get();
+  second.get();
+  EXPECT_STREQ(std::getenv(kEnv), "parent");
+  EXPECT_EQ(UnsetEnv(kEnv), 0);
+  EXPECT_EQ(std::getenv(kEnv), nullptr);
+}
+#else
 TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
   ASSERT_EQ(SetEnv("TINYLAMB_AUDIT_SPAWN_ENV", "parent", 1), 0);
   // A failed EXPECT below still unwinds this guard: the variable is
@@ -179,6 +229,28 @@ TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
   EXPECT_EQ(RunProcess("/path/that/does/not/exist", {}, {}, &error), -1);
   EXPECT_FALSE(error.empty());
 }
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+TEST(ProcessAuditTest, SpawnInheritsStandardStreamsAndClosesOtherDescriptors) {
+  const int fd = ::fcntl(STDOUT_FILENO, F_DUPFD, 50);
+  ASSERT_GE(fd, 50);
+  struct FdGuard {
+    int fd;
+    ~FdGuard() {
+      if (fd >= 0) {
+        (void)::close(fd);
+      }
+    }
+  } fd_guard{fd};
+  std::string error;
+  const int result = RunProcess(
+      "/bin/sh",
+      {"-c",
+       "test -e /dev/fd/1 && test -e /dev/fd/2 && test ! -e \"/dev/fd/$1\"",
+       "audit", std::to_string(fd)},
+      {}, &error);
+  EXPECT_EQ(result, 0) << error;
+}
+#endif
 #endif
 
 namespace {
@@ -199,26 +271,53 @@ uint32_t WaitFor(EventPoller& poller, SocketFd fd, int timeout_ms = 1000) {
 }
 
 // A connected loopback TCP pair: {client, server-side accepted}.
-std::array<SocketFd, 2> TcpPair() {
+std::optional<std::array<SocketFd, 2>> TcpPair() {
   const SocketFd listener = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-  EXPECT_GE(listener, 0);
+  if (!IsValidSocketFd(listener)) {
+    ADD_FAILURE() << "could not open loopback listener";
+    return std::nullopt;
+  }
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  EXPECT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
-            0);
-  EXPECT_EQ(::listen(listener, 1), 0);
+  if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ADD_FAILURE() << "could not bind loopback listener";
+    CloseSocket(listener);
+    return std::nullopt;
+  }
+  if (::listen(listener, 1) != 0) {
+    ADD_FAILURE() << "could not listen on loopback socket";
+    CloseSocket(listener);
+    return std::nullopt;
+  }
   socklen_t size = sizeof(addr);
-  EXPECT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &size),
-            0);
+  if (::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &size) != 0) {
+    ADD_FAILURE() << "could not read loopback listener address";
+    CloseSocket(listener);
+    return std::nullopt;
+  }
   const SocketFd client = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-  EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
-            0);
+  if (!IsValidSocketFd(client)) {
+    ADD_FAILURE() << "could not open loopback client";
+    CloseSocket(listener);
+    return std::nullopt;
+  }
+  if (::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ADD_FAILURE() << "could not connect loopback client";
+    CloseSocket(client);
+    CloseSocket(listener);
+    return std::nullopt;
+  }
   const SocketFd server =
       AcceptSocket(listener, {.nonblocking = true, .close_on_exec = true});
-  EXPECT_GE(server, 0);
+  if (!IsValidSocketFd(server)) {
+    ADD_FAILURE() << "could not accept loopback client";
+    CloseSocket(client);
+    CloseSocket(listener);
+    return std::nullopt;
+  }
   CloseSocket(listener);
-  return {client, server};
+  return std::array<SocketFd, 2>{client, server};
 }
 
 TEST(PlatformHashTest, StableHashBytesPinsWireByteOrder) {
@@ -244,7 +343,7 @@ TEST(PlatformEndianTest, BigEndianRoundTrip) {
   EXPECT_EQ(le64toh(htole64(value)), value);
 }
 
-#if defined(__GLIBCXX__)
+#ifdef __GLIBCXX__
 // random.hpp's contract is bit-for-bit libstdc++ (GCC >= 11) reproduction so
 // seeded fuzzers and pinned regression traces replay identically everywhere.
 // Compare every draw against the real std:: facilities on identically-seeded
@@ -284,21 +383,60 @@ TEST(PlatformRandomTest, MatchesLibstdcxxDraws) {
 #endif
 
 TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
+  // PID alone is not unique across PID namespaces: ctest may run the same
+  // binary in separate containers with the same PID, so add random entropy.
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() /
-      ("platform_file_io_" + std::to_string(GetPid()));
+      ("platform_file_io_" + std::to_string(GetPid()) + "_" + RandomString());
+  const std::filesystem::path empty_path =
+      std::filesystem::temp_directory_path() /
+      ("platform_empty_map_" + std::to_string(GetPid()) + "_" + RandomString());
+  struct Cleanup {
+    std::array<std::filesystem::path, 2> paths;
+    std::array<int, 4> fds{-1, -1, -1, -1};
+    ~Cleanup() {
+      for (int& fd : fds) {
+        if (fd >= 0) {
+          CloseFile(fd);
+        }
+      }
+      std::error_code ec;
+      for (const auto& path : paths) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+      }
+    }
+  } cleanup{.paths={path, empty_path}};
   const int fd = OpenFile(
       path, {.mode = OpenMode::kReadWrite, .create = true, .truncate = true},
       0644);
+  cleanup.fds[0] = fd;
   ASSERT_GE(fd, 0);
   EXPECT_EQ(Preallocate(fd, 8192), 0);
   ASSERT_EQ(Write(fd, "abc", 3), 3);
   EXPECT_EQ(DataSync(fd), 0);
   AdviseDontNeed(fd, 0, 3);  // best effort; must not crash
   CloseFile(fd);
+  cleanup.fds[0] = -1;
+  const int readonly_fd = OpenFile(path, {});
+  cleanup.fds[1] = readonly_fd;
+  ASSERT_GE(readonly_fd, 0);
+  EXPECT_EQ(DataSync(readonly_fd), 0);
+  EXPECT_EQ(CloseFile(readonly_fd), 0);
+  cleanup.fds[1] = -1;
   // -1 is never a valid descriptor; reusing the just-closed integer would
   // make this check depend on fd allocation and flake if it got reopened.
   EXPECT_EQ(DataSync(-1), -1);  // invalid descriptor reports failure
+  // Also cover a closed-but-nonnegative descriptor: on Windows this drives
+  // the _get_osfhandle() == -1 / EBADF conversion in DataSync(), which the
+  // -1 case alone does not exercise. Open and close immediately so no other
+  // operation in this single-threaded test can reuse the number in between.
+  const int closed_fd = OpenFile(path, {.mode = OpenMode::kReadWrite}, 0644);
+  cleanup.fds[2] = closed_fd;
+  ASSERT_GE(closed_fd, 0);
+  CloseFile(closed_fd);
+  cleanup.fds[2] = -1;
+  EXPECT_EQ(DataSync(closed_fd), -1);
 
   MemoryMap mapped;
   ASSERT_EQ(mapped.Open(path), 0);
@@ -322,46 +460,47 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   moved.Close();
   EXPECT_FALSE(moved.IsValid());
 
-  const std::filesystem::path empty_path =
-      std::filesystem::temp_directory_path() /
-      ("platform_empty_map_" + std::to_string(GetPid()));
   const int empty_fd = OpenFile(
       empty_path,
       {.mode = OpenMode::kReadWrite, .create = true, .truncate = true}, 0644);
+  cleanup.fds[3] = empty_fd;
   ASSERT_GE(empty_fd, 0);
   CloseFile(empty_fd);
+  cleanup.fds[3] = -1;
   MemoryMap empty_map;
   ASSERT_EQ(empty_map.Open(empty_path), 0);
   EXPECT_TRUE(empty_map.IsValid());
   EXPECT_EQ(empty_map.Size(), 0U);
   EXPECT_NE(empty_map.Data(), nullptr);
   empty_map.Close();
-  std::filesystem::remove(empty_path);
+  EXPECT_TRUE(std::filesystem::remove(empty_path));
 
   MemoryMap missing;
   EXPECT_EQ(missing.Open(path.string() + ".nonexistent"), -1);
   EXPECT_FALSE(missing.IsValid());
 
-  std::filesystem::remove(path);
+  EXPECT_TRUE(std::filesystem::remove(path));
 }
 
 TEST(PlatformSocketTest, FlagsAreApplied) {
   const SocketFd blocking = OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-  ASSERT_GE(blocking, 0);
+  ASSERT_TRUE(IsValidSocketFd(blocking));
   EXPECT_TRUE(IsCloseOnExec(blocking));
   EXPECT_FALSE(IsNonBlocking(blocking));
   CloseSocket(blocking);
 
   const SocketFd nonblocking = OpenSocket(
       AF_INET, SOCK_STREAM, 0, {.nonblocking = true, .close_on_exec = false});
-  ASSERT_GE(nonblocking, 0);
+  ASSERT_TRUE(IsValidSocketFd(nonblocking));
   EXPECT_FALSE(IsCloseOnExec(nonblocking));
   EXPECT_TRUE(IsNonBlocking(nonblocking));
   CloseSocket(nonblocking);
 
   std::array<SocketFd, 2> fds{-1, -1};
   ASSERT_EQ(OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}), 0);
-  for (int fd : fds) {
+  // SocketFd is intptr_t on Win64 (a full SOCKET); narrowing it to int here
+  // would close an unrelated handle when the descriptor exceeds INT_MAX.
+  for (const SocketFd fd : fds) {
     EXPECT_TRUE(IsCloseOnExec(fd));
     EXPECT_TRUE(IsNonBlocking(fd));
     CloseSocket(fd);
@@ -369,7 +508,10 @@ TEST(PlatformSocketTest, FlagsAreApplied) {
 }
 
 TEST(PlatformSocketTest, AcceptAppliesFlagsAndSendSkipsSigPipe) {
-  auto [client, server] = TcpPair();
+  const auto pair = TcpPair();
+  ASSERT_TRUE(pair.has_value());
+  auto [client, server] = *pair;
+  ASSERT_TRUE(IsValidSocketFd(client) && IsValidSocketFd(server));
   EXPECT_TRUE(IsCloseOnExec(server));
   EXPECT_TRUE(IsNonBlocking(server));
   CloseSocket(server);
@@ -405,7 +547,10 @@ TEST(PlatformEventPollerTest, EmptyPollerWaitsForRegistrationAndReadiness) {
 TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
   EventPoller poller;
   ASSERT_TRUE(poller.Open());
-  auto [client, server] = TcpPair();
+  const auto pair = TcpPair();
+  ASSERT_TRUE(pair.has_value());
+  auto [client, server] = *pair;
+  ASSERT_TRUE(IsValidSocketFd(client) && IsValidSocketFd(server));
 
   ASSERT_TRUE(poller.Add(server, kPollReadable | kPollPeerClosed));
   EXPECT_EQ(WaitFor(poller, server, 50), 0U);  // nothing to read yet
@@ -475,9 +620,10 @@ TEST(PlatformEventPollerTest, WakerWakesWaitFromAnotherThread) {
 
 // T3719: Close() used to race an unsynchronized write_fd_ read in Wake()
 // (any-thread contract). The fd slot is an atomic now and Close publishes
-// -1 before the close, so racing Wake() calls must be crash-free — and a
-// Wake() after Close must be a no-op.
-TEST(PlatformEventPollerTest, WakeDuringCloseIsRaceFree) {
+// -1 before the close, so a Wake() after Close must be a no-op. The Waker
+// contract still requires joining every Wake() source before Close/destroy,
+// so the workers below are stopped first; a late Wake() is then checked.
+TEST(PlatformEventPollerTest, WakeAfterCloseIsNoOp) {
   Waker waker;
   ASSERT_TRUE(waker.Open());
   std::atomic<bool> stop{false};
@@ -493,12 +639,15 @@ TEST(PlatformEventPollerTest, WakeDuringCloseIsRaceFree) {
   for (int i = 0; i < 1000; ++i) {
     waker.Drain();
   }
-  waker.Close();
+  // Contract: every Wake() source must be joined before the Waker is closed
+  // or destroyed (Close on Windows may otherwise reuse a stale SOCKET and
+  // write into an unrelated connection).
   stop.store(true);
   for (std::thread& waker_thread : wakers) {
     waker_thread.join();
   }
-  waker.Wake();
+  waker.Close();
+  waker.Wake();  // no-op after Close
 }
 
 TEST(PlatformCpuAffinityTest, EqualityComparesBitmaskContents) {
@@ -643,6 +792,18 @@ TEST(PlatformSyncedStreamTest, FlushesOnDestruction) {
   EXPECT_EQ(target.str(), "a=1\nb=2\n");
 }
 
+TEST(PlatformSyncedStreamTest, EmitsOnDemandWithoutRepeatingOutput) {
+  std::ostringstream target;
+  {
+    SyncedOStream stream(target);
+    stream << "first";
+    stream.emit();
+    EXPECT_EQ(target.str(), "first");
+    stream << " second";
+  }
+  EXPECT_EQ(target.str(), "first second");
+}
+
 TEST(PlatformUnlinkedTempFileTest, ReadsWritesAndLeavesNoDirectoryEntries) {
   std::error_code ec;
   const std::filesystem::path dir =
@@ -741,11 +902,14 @@ TEST(PlatformHeapPurgeTest, ReleaseFreeHeapToOsIsRateLimited) {
 TEST(ProcessAuditTest, EmbeddedNulInArgumentsIsRejected) {
   std::string error;
   EXPECT_EQ(
-      RunProcess("/bin/sh", {std::string("-c\0trailing", 12), "x"}, {}, &error),
+      RunProcess("/bin/sh",
+                 {std::string("-c\0trailing", sizeof("-c\0trailing") - 1), "x"},
+                 {}, &error),
       -1);  // NOLINT(readability-uppercase-literal-suffix)
   EXPECT_NE(error.find("embedded NUL"), std::string::npos) << error;
   // A NUL in the executable path is rejected the same way.
-  EXPECT_EQ(RunProcess(std::filesystem::path(std::string("/bin/sh\0junk", 10)),
+  EXPECT_EQ(RunProcess(std::filesystem::path(std::string(
+                           "/bin/sh\0junk", sizeof("/bin/sh\0junk") - 1)),
                        {}, {}, &error),
             -1);
   EXPECT_NE(error.find("embedded NUL"), std::string::npos) << error;
@@ -783,8 +947,10 @@ TEST(ProcessMemoryAuditTest, PhysicalMemoryRespectsCgroupLimit) {
       return 0;
     }
     char* end = nullptr;
+    errno = 0;
     const unsigned long long v = std::strtoull(text.c_str(), &end, 10);
-    if (end == text.c_str() || v >= (1ULL << 60)) {
+    if (errno == ERANGE || end == text.c_str() ||
+        end != text.c_str() + text.size() || v >= (1ULL << 60)) {
       return 0;
     }
     return static_cast<uint64_t>(v);
@@ -818,6 +984,7 @@ TEST(PlatformFileIoTest, UnlinkedTempFdIsCloseOnExec) {
   (void)::close(fd);
   std::error_code clean_ec;
   std::filesystem::remove_all(dir, clean_ec);
+  EXPECT_FALSE(clean_ec) << clean_ec.message();
 }
 #endif
 

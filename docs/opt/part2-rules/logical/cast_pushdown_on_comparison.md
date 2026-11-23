@@ -93,4 +93,4 @@ changed = true;
 
 ## 検証テスト
 
-- `plan/cascades_test_part*.cpp` 等における SARG 化テストスイートにより、許可された型変換におけるインデックス走査の導出と、不正な型ペアに対する変換抑止が検証されています。
+- `CascadesRulesCoverageTest.CastInPredicateStaysResidual` は CAST 述語を残差として扱うケースを検証します。許可された型変換からインデックス走査を導出するテストは確認できていません。

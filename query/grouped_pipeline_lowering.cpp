@@ -2,7 +2,9 @@
 #include "query/grouped_pipeline_lowering.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -12,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/log_message.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/pipeline/ooc_sinks.hpp"
 #include "executor/detail/pipeline/pipeline_ops.hpp"
@@ -27,6 +30,7 @@
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/column.hpp"
 #include "type/type.hpp"
@@ -55,10 +59,20 @@ ValueType InferExprValueType(const Expression& expr, const Schema& schema) {
         return ValueType::kDate;
       case TypeTag::kArray:
         return ValueType::kArray;
+      // BOOL/TIMESTAMP/INTERVAL are not separate ValueTypes: they are stored
+      // as kInt64/kVarChar, so their ResultType never needs another mapping.
+      // The remaining tags are expression *node* kinds (or kInvalid), not
+      // value types, and kVarChar is the conservative schema fallback.
       default:
         return ValueType::kVarChar;
     }
+  } catch (const std::exception& e) {
+    // Keep the conservative VARCHAR fallback, but never hide the reason: a
+    // schema/type bug would otherwise surface only as a wrong sort order.
+    LOG(WARN) << "InferExprValueType: ResultType threw for " << e.what();
+    return ValueType::kVarChar;
   } catch (...) {
+    LOG(WARN) << "InferExprValueType: ResultType threw an unknown exception";
     return ValueType::kVarChar;
   }
 }
@@ -338,7 +352,9 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
       .agg_by_str = {},
       .valid = true,
   };
+  rewriter.agg_exprs.reserve(select.SelectList().size());
   if (!select.IsGroupAll()) {
+    rewriter.group_keys.reserve(select.GroupBy().size());
     for (const Expression& g : select.GroupBy()) {
       rewriter.RegisterGroupKey(sub_alias(g));
       if (!rewriter.valid) {
@@ -349,29 +365,66 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
 
   // Expand SELECT-list output aliases in HAVING / ORDER BY before rewriting,
   // unless an alias name shadows a grouped column already registered.
+  auto lower_name = [](const std::string& name) {
+    std::string lowered = name;
+    for (char& c : lowered) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return lowered;
+  };
   std::unordered_map<std::string, Expression> select_aliases;
   for (const NamedExpression& item : select.SelectList()) {
     if (!item.name.empty() && item.expression) {
-      // Duplicate aliases are invalid SQL; the general path reports the
-      // error. try_emplace's first-wins behavior here would silently pick
-      // one of the two expressions for HAVING/ORDER BY.
-      if (!select_aliases.emplace(item.name, item.expression).second) {
+      // Aliases are case-insensitive, just like identifier resolution in the
+      // legacy lane. Duplicate aliases are invalid SQL; the general path
+      // reports the error, so decline the pipeline rather than silently
+      // picking one of the two expressions for HAVING/ORDER BY.
+      if (!select_aliases.emplace(lower_name(item.name), item.expression)
+               .second) {
         return std::optional<PipelineGraph>(std::nullopt);
       }
     }
   }
-  auto expand_alias_root = [&](const Expression& e) -> Expression {
-    if (e && e->Type() == TypeTag::kColumnValue) {
+  // Expand aliases everywhere, not just at the root: HAVING s + 1 > 5 and
+  // ORDER BY f(s) reference the alias inside a larger expression. The depth
+  // cap counts alias hops only (expression nesting does not consume it), so
+  // a cyclic or over-deep alias chain sets alias_expand_overflow and the
+  // caller bails — a partially expanded expression would silently bind
+  // leftover aliases as columns.
+  bool alias_expand_overflow = false;
+  auto expand_aliases = [&](const auto& self, const Expression& e,
+                            int alias_depth) -> Expression {
+    if (!e) {
+      return e;
+    }
+    if (e->Type() == TypeTag::kColumnValue) {
       const ColumnName& col = e->AsColumnValue().GetColumnName();
       if (col.schema.empty() && !rewriter.group_by_str.contains(col.name) &&
           core_schema.Offset(col) < 0) {
-        if (const auto it = select_aliases.find(col.name);
-            it != select_aliases.end()) {
-          return it->second;
+        if (const auto it = select_aliases.find(lower_name(col.name));
+            it != select_aliases.end() && it->second != e) {
+          if (alias_depth >= 8) {
+            alias_expand_overflow = true;
+            return e;
+          }
+          return self(self, it->second, alias_depth + 1);
         }
       }
+      return e;
     }
-    return e;
+    std::vector<Expression> children = ExpressionChildren(e);
+    if (children.empty()) {
+      return e;
+    }
+    bool changed = false;
+    for (Expression& child : children) {
+      Expression next = self(self, child, alias_depth);
+      if (next != child) {
+        changed = true;
+        child = std::move(next);
+      }
+    }
+    return changed ? WithExpressionChildren(e, std::move(children)) : e;
   };
 
   std::vector<NamedExpression> proj_items;
@@ -389,17 +442,18 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
 
   Expression having_rewritten;
   if (select.Having()) {
-    having_rewritten =
-        rewriter.Rewrite(expand_alias_root(sub_alias(select.Having())));
-    if (!rewriter.valid) {
+    having_rewritten = rewriter.Rewrite(
+        expand_aliases(expand_aliases, sub_alias(select.Having()), 0));
+    if (alias_expand_overflow || !rewriter.valid) {
       return std::optional<PipelineGraph>(std::nullopt);
     }
   }
 
   // Reserve synthetic ORDER BY names against every user-visible projection
-  // name. A collision would make the name-based KeySpec resolve to the user's
-  // column instead of the synthesized sort value, silently sorting by the
-  // wrong key (the legacy slot-based route cannot collide).
+  // name and GROUP BY expression text. A collision would make the name-based
+  // KeySpec resolve to a grouped value instead of the synthesized sort value,
+  // silently sorting by the wrong key (the legacy slot-based route cannot
+  // collide).
   std::unordered_set<std::string> reserved_names;
   for (const auto& item : proj_items) {
     reserved_names.insert(item.name);
@@ -411,10 +465,17 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   order_keys.reserve(select.OrderBy().size());
   for (size_t i = 0; i < select.OrderBy().size(); ++i) {
     const auto& term = select.OrderBy()[i];
-    Expression ord_rewritten =
-        rewriter.Rewrite(expand_alias_root(sub_alias(term.expression)));
-    if (!rewriter.valid) {
+    Expression ord_rewritten = rewriter.Rewrite(
+        expand_aliases(expand_aliases, sub_alias(term.expression), 0));
+    if (alias_expand_overflow || !rewriter.valid) {
       return std::optional<PipelineGraph>(std::nullopt);
+    }
+    // The ORDER BY term may be a bare alias whose COLLATE wrapper only becomes
+    // visible after alias expansion, so read the collation from the rewritten
+    // expression first (keeping the original as a fallback).
+    Collation ord_collation = CollationOfExpression(ord_rewritten);
+    if (ord_collation == Collation::kNone) {
+      ord_collation = CollationOfExpression(term.expression);
     }
     std::string col_name = "__tinylamb_ord_" + std::to_string(i);
     while (reserved_names.contains(col_name)) {
@@ -426,7 +487,7 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
         .expression = MakeSynthCol(col_name),
         .ascending = term.ascending,
         .nulls_first = term.nulls_first,  // NOLINT(clang-diagnostic-error)
-        .collation = CollationOfExpression(term.expression),
+        .collation = ord_collation,
     });
   }
 
@@ -529,33 +590,18 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
         std::make_shared<FilterOp>(having_rewritten, agg_schema));
   }
 
-  if (select.Distinct() && !order_keys.empty()) {
-    // DISTINCT applies to the visible SELECT columns only; ORDER BY keys are
-    // carried as hidden __ord_i columns after them. The distinct key list
-    // below is therefore limited to the visible prefix, while the hidden keys
-    // remain available to the following ORDER BY stage.
-    stream.operators.push_back(
-        std::make_shared<ProjectOp>(std::move(proj_items), agg_schema));
-    std::vector<slot_t> distinct_cols;
-    distinct_cols.reserve(select.SelectList().size());
-    for (size_t i = 0; i < select.SelectList().size(); ++i) {
-      distinct_cols.push_back(static_cast<slot_t>(i));
-    }
-    auto visible_distinct_sink = std::make_shared<OocDistinctSink>(
-        effective_proj_schema, std::move(distinct_cols), "Distinct");
+  // DISTINCT together with ORDER BY falls back to the relational lane at the
+  // top of this function, so order_keys is empty whenever Distinct() is set.
+  // There is no "visible-columns-only" OocDistinctSink shape here: projecting
+  // every produced column is exactly the DISTINCT semantics we need.
+  stream.operators.push_back(
+      std::make_shared<ProjectOp>(std::move(proj_items), agg_schema));
+  if (select.Distinct()) {
+    auto all_columns_distinct_sink = std::make_shared<OocDistinctSink>(
+        effective_proj_schema, std::vector<slot_t>{}, "Distinct");
     RETURN_IF_FAIL(PipelineLowering::BreakWithSink(
-        &graph, &stream, std::move(visible_distinct_sink), "Distinct",
+        &graph, &stream, std::move(all_columns_distinct_sink), "Distinct",
         effective_proj_schema));
-  } else {
-    stream.operators.push_back(
-        std::make_shared<ProjectOp>(std::move(proj_items), agg_schema));
-    if (select.Distinct()) {
-      auto all_columns_distinct_sink = std::make_shared<OocDistinctSink>(
-          effective_proj_schema, std::vector<slot_t>{}, "Distinct");
-      RETURN_IF_FAIL(PipelineLowering::BreakWithSink(
-          &graph, &stream, std::move(all_columns_distinct_sink), "Distinct",
-          effective_proj_schema));
-    }
   }
   stream.schema = effective_proj_schema;
 
@@ -587,17 +633,24 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   });
   graph.output_schema = std::move(stream.schema);
 
-  const size_t core_rows = core_plan->EmitRowCount();
+  // EmitRowCount()==0 also means "cardinality unknown" (no statistics,
+  // subqueries), not necessarily an empty input. Keep a modest floor so the
+  // request does not collapse to the 256 KiB clamp and spill prematurely.
+  const size_t core_rows = std::max<size_t>(core_plan->EmitRowCount(), 1024);
   const size_t core_cols = std::max<size_t>(1, core_schema.ColumnCount());
+  constexpr size_t kEstimatedBytesPerCell = 24;
   const size_t est_bytes =
       // ~24 bytes per Value slot is an optimistic fixed-size estimate;
       // VARCHAR/PAX cells can be much larger. This guards size_t overflow,
       // not a real memory bound.
-      core_rows > std::numeric_limits<size_t>::max() / (core_cols * 24)
+      core_rows > std::numeric_limits<size_t>::max() /
+                      kEstimatedBytesPerCell / core_cols
           ? std::numeric_limits<size_t>::max()
-          : core_rows * core_cols * 24;
+          : core_rows * core_cols * kEstimatedBytesPerCell;
   graph.estimated_grant_bytes = PipelineGrantRequestBytes(est_bytes);
-  graph.min_grant_bytes = size_t{64} << 10;
+  // A wide GROUP BY key needs a larger floor than the historical flat 64 KiB;
+  // keep it below the request clamp so the coordinator can still shrink it.
+  graph.min_grant_bytes = std::clamp<size_t>(core_cols, 64, 256) << 10;
   return std::optional<PipelineGraph>(std::move(graph));
 }
 

@@ -39,8 +39,11 @@ class WorkerTest(unittest.TestCase):
             worker.close()
 
     def test_timeout_kills_worker_and_allows_restart(self):
-        script = ('import sys,time; print(\'{"ready":true}\',flush=True); '
-                  'sys.stdin.readline(); time.sleep(10)')
+        # Block on stdin after the ready line: the worker keeps the pipe open,
+        # so the child hangs until Worker's own timeout kills it. No arbitrary
+        # sleep duration is involved (and no timing-dependent wait in the test).
+        script = ('import sys; print(\'{"ready":true}\',flush=True); '
+                  'sys.stdin.readline(); sys.stdin.read()')
         with tempfile.TemporaryFile(mode='w+') as log:
             worker = tpcds.Worker([sys.executable, '-c', script], log, .1)
             try:

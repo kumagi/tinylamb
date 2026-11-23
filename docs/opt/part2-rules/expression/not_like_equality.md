@@ -96,4 +96,4 @@ $x \text{ NOT LIKE } p$ は $x \text{ LIKE } p$ の Kleene 否定として定義
 - `ExpressionRewriteTest.WildcardFreeLikeBecomesEquality`:
   `name NOT LIKE 'abc'` が `kNotEquals` 二項式ノードへと正規化されることを確認します。
 - `ExpressionRewriteTest.LikeEqualityRefusesTimestampShapedPattern`:
-  日時形状文字列に対する抑止挙動が肯定形とともに保証されています。
+  肯定形の LIKE が日時形状文字列に対する変換を抑止することを確認します。NOT LIKE の同じ形状はこのテストでは検証していません。

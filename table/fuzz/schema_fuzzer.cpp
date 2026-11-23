@@ -456,7 +456,9 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
       MemTable mt(sc);
       std::unordered_set<std::string> unique;
       for (auto& [k, r] : pairs) {
-        mt.Put(r);
+        if (mt.Put(r) != Status::kSuccess) {
+          FAIL("memtable insert failed on generated row");
+        }
         unique.insert(k);
       }
       std::vector<char> blob;

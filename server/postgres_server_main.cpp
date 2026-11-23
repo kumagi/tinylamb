@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -33,8 +34,9 @@ void Usage(std::ostream& output) {
             "[--port PORT] [--read-workers COUNT] "
             "[--max-connections COUNT] [--force]\n"
          << "  --host ADDRESS          listen address (default 127.0.0.1)\n"
-         << "  --port PORT             TCP port (1..65535)\n"
-         << "  --read-workers COUNT    reader threads (1..1024)\n"
+         << "  --port PORT             TCP port (0..65535; 0 = OS-assigned "
+            "ephemeral)\n"
+         << "  --read-workers COUNT    reader threads (1..1024; capped at 16)\n"
          << "  --max-connections COUNT max clients (1..65536; env "
             "TINYLAMB_MAX_CONNECTIONS)\n"
          << "  --force                 truncate a torn WAL tail before opening "
@@ -92,7 +94,10 @@ int main(int argc, char** argv) {
       options.listen_address = argv[++i];
     } else if (argument == "--port" && i + 1 < argc) {
       unsigned long port = 0;
-      if (!ParseUnsigned(argv[++i], &port) || port == 0 ||
+      // Like PostgresServerOptions::port, 0 asks the OS for an ephemeral
+      // port; bound_port_ reports the actual one after Listen(). Only the
+      // uint16 range needs validating here.
+      if (!ParseUnsigned(argv[++i], &port) ||
           port > std::numeric_limits<uint16_t>::max()) {
         std::cerr << "invalid port\n";
         return 2;

@@ -16,6 +16,18 @@ from tpcc_pg import clone
 from workloads import ROOT
 
 
+def measure_reads(client, name, sql, repeats):
+    first = client.execute(sql)
+    times = []
+    for iteration in range(repeats):
+        start = time.perf_counter()
+        result = client.execute(sql)
+        times.append((time.perf_counter() - start) * 1000)
+        if first != result:
+            raise ValueError(f'{name}, repeat {iteration + 1}: returned different rows')
+    return first, times
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
@@ -37,17 +49,20 @@ def main():
     work = ROOT / 'build/benchmarks' / out.name
     work.mkdir(parents=True, exist_ok=False)
     clone(a.fixture, work / 'database')
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
+    port_reservation = socket.socket()
+    port_reservation.bind(('127.0.0.1', 0))
+    port = port_reservation.getsockname()[1]
     env = {k: v for k, v in os.environ.items() if not k.startswith('TINYLAMB_')}
-    env.update(TINYLAMB_PAGE_POOL_BYTES=str(512 << 20), TINYLAMB_QUERY_MEMORY_BYTES=str(256 << 20))
+    env.update(TINYLAMB_BUFFER_POOL_BYTES=str(512 << 20), TINYLAMB_QUERY_MEMORY_BYTES=str(256 << 20))
     if a.disable_index_prefetch:
         env['TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH'] = '1'
     argv = ['taskset', '-c', '0-15', str(a.server.resolve()), str(work / 'database'),
             '--port', str(port), '--read-workers', '8']
+    with a.server.open('rb') as server_binary:
+        server_sha256 = hashlib.file_digest(server_binary, 'sha256').hexdigest()
     (out / 'environment.json').write_text(json.dumps(dict(argv=argv, fixture=str(a.fixture),
         environment={k: v for k, v in env.items() if k.startswith('TINYLAMB_')},
-        server_sha256=hashlib.file_digest(a.server.open('rb'), 'sha256').hexdigest(),
+        server_sha256=server_sha256,
         plans_only=a.plans_only,
         load_start=os.getloadavg()), indent=2))
     client = None
@@ -59,6 +74,10 @@ def main():
                            '--callgrind-out-file=' + str(out / 'callgrind.out'), *argv[3:]]
             # taskset must wrap valgrind, not become the instrumented program.
             server_argv = argv[:3] + server_argv
+        # Popen has no check= argument: this server is long-lived. Readiness is
+        # verified by the SELECT 1 probe below, which also fails fast when
+        # poll() reports an early exit, and the child is reaped in finally.
+        port_reservation.close()
         process = subprocess.Popen(server_argv, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
         (out / 'server-command.json').write_text(json.dumps(server_argv, indent=2))
         try:
@@ -69,6 +88,9 @@ def main():
                 except Exception:
                     if time.monotonic() > deadline or process.poll() is not None:
                         raise
+                    # Cross-process readiness poll; the 120s deadline and the
+                    # poll() check above bound the wait, so a condition
+                    # variable does not apply here.
                     time.sleep(.1)
             last = client.execute('SELECT c_last FROM customer WHERE c_w_id=1 AND c_d_id=1 AND c_id=1')[0][0]
             order = client.execute('SELECT o_id FROM orders WHERE o_w_id=1 AND o_d_id=1 AND o_c_id=1 ORDER BY o_id DESC LIMIT 1')[0][0]
@@ -102,12 +124,7 @@ def main():
             cases = [] if a.callgrind else [(sample, name, sql) for sample in range(8 if mixed else 1) for name, sql in queries.items()]
             for sample, name, sql in cases:
                 client.execute('BEGIN')
-                first = client.execute(sql)
-                times = []
-                for _ in range(0 if a.plans_only else 9):
-                    start = time.perf_counter(); result = client.execute(sql)
-                    times.append((time.perf_counter() - start) * 1000)
-                    assert first == result
+                first, times = measure_reads(client, name, sql, 0 if a.plans_only else 9)
                 plan = client.execute('EXPLAIN ANALYZE ' + sql)
                 client.execute('COMMIT')
                 record = dict(name=name, sample=sample, sql=sql, rows=len(first), samples_ms=times,

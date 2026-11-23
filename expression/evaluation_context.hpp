@@ -17,8 +17,9 @@ struct Row;
 class SelectStatement;
 
 // Prepared aggregation results keyed by the aggregate expression node that
-// produced them.  relational_detail aliases the same specialization, so both
-// spellings are interchangeable.
+// produced them. `tinylamb::relational_detail` declares the corresponding alias
+// in executor/detail/expression_eval.hpp; both names resolve to the same map
+// type, so keep their declarations in sync.
 using AggregateResultMap =
     std::unordered_map<const AggregateExpression*, Value>;
 
@@ -61,11 +62,12 @@ class EvaluationContext {
   };
   // Declared element type of `statement`'s first output column, when the
   // context can supply one.  RunSubquery alone returns only values, so the
-  // generic context has no schema to consult; fake contexts can override this
-  // hook to exercise ARRAY(SELECT ...) typing (notably the all-NULL case,
-  // where the declared type cannot be recovered from the values).  Production
-  // contexts override RunSubqueryDetailed and fill the hint from the result
-  // schema instead.
+  // generic context has no schema to consult; contexts with schema access
+  // (fake in tests, production in query/evaluation_context_impl.hpp) override
+  // this hook to exercise ARRAY(SELECT ...) typing, notably the all-NULL case
+  // where the declared type cannot be recovered from the values.  Every
+  // context goes through the default RunSubqueryDetailed below, so the hook
+  // is the single source of the hint.
   [[nodiscard]] virtual std::string SubqueryElementTypeHint(
       const SelectStatement& /*statement*/) {
     return {};

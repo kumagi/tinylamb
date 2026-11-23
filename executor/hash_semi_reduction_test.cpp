@@ -262,13 +262,13 @@ class HashSemiReductionSqlTest : public ::testing::Test {
     SqlEngine engine(*database_);
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return prepared.GetStatus();
     }
     *rows = Drain(prepared.Value().get());
     if (prepared.Value()->GetStatus() != Status::kSuccess) {
       const Status status = prepared.Value()->GetStatus();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return status;
     }
     return context.PreCommit();
@@ -281,13 +281,13 @@ class HashSemiReductionSqlTest : public ::testing::Test {
         engine.Prepare(context, "EXPLAIN ANALYZE " + std::string(sql));
     std::ostringstream text;
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return "ERROR: " + engine.LastError();
     }
     for (const Row& row : Drain(prepared.Value().get())) {
       text << row[0] << "\n";
     }
-    context.Abort();
+    EXPECT_SUCCESS(context.Abort());
     return text.str();
   }
 
@@ -769,7 +769,7 @@ TEST_F(HashSemiReductionExecutorTest, DuplicateAndUnmatchedBuildKeysArePruned) {
   // domain is {1, 2, 7}, so 197 keys are out of domain and the 3 surviving keys
   // keep one row each (six duplicates dropped).
   std::vector<Row> build;
-  build.reserve(200 * 3);
+  build.reserve(static_cast<size_type>(200 * 3));
   for (int64_t key = 0; key < 200; ++key) {
     for (int64_t copy = 0; copy < 3; ++copy) {
       build.push_back(Row({Value(key)}));

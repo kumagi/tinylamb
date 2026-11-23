@@ -106,26 +106,43 @@ class CompactTxnBitmap {
             MemoryPoolKind::kStorage, kChunkBytes);
         if (reserved) {
           emergency_bytes_ += kChunkBytes;
-        } else if (!emergency_warned_) {
+        } else {
           // The committed bit is still recorded (chunk is always installed
-          // below), but the memory escapes the budget ledger.  Surface that
-          // explicitly instead of silently swallowing the rejection so an
-          // operator can spot a pathologically small memory budget.
-          emergency_warned_ = true;
-          LOG(WARN) << "Recovery committed bitmap emergency reserve rejected; "
-                    << "using untracked chunk (" << kChunkBytes << " bytes)";
+          // below), but the memory escapes the budget ledger entirely — it
+          // is not covered by emergency_bytes_ (never reserved, never
+          // released).  Track it separately so warnings report the real
+          // escaping total, and re-warn whenever the untracked total doubles
+          // so a chronically exhausted budget cannot go silent after the
+          // first chunk.
+          untracked_bytes_ =
+              untracked_bytes_ > std::numeric_limits<size_t>::max() - kChunkBytes
+                  ? std::numeric_limits<size_t>::max()
+                  : untracked_bytes_ + kChunkBytes;
+          if (!emergency_warned_ ||
+              (untracked_bytes_ >= emergency_warned_bytes_ &&
+               untracked_bytes_ - emergency_warned_bytes_ >=
+                   emergency_warned_bytes_)) {
+            emergency_warned_ = true;
+            emergency_warned_bytes_ = untracked_bytes_;
+            LOG(WARN) << "Recovery committed bitmap emergency reserve rejected; "
+                      << "using untracked chunk (" << kChunkBytes
+                      << " bytes, " << untracked_bytes_
+                      << " bytes untracked so far)";
+          }
         }
       }
       // The array was value-initialized by make_unique; no second memset.
       chunk = std::move(fresh);
-      if (!warned_ && charge_.Bytes() + emergency_bytes_ > kWarnBytes) {
+      if (!warned_ &&
+          charge_.Bytes() + emergency_bytes_ + untracked_bytes_ > kWarnBytes) {
         warned_ = true;
         // The warning threshold includes the emergency reserve, so report
         // the same total; showing only charge_.Bytes() would hide the bulk
         // of a bitmap that lives on the emergency budget.
         LOG(WARN) << "Recovery committed TXN bitmap exceeded "
                   << (kWarnBytes >> 20)
-                  << " MiB (bytes=" << (charge_.Bytes() + emergency_bytes_)
+                  << " MiB (bytes="
+                  << (charge_.Bytes() + emergency_bytes_ + untracked_bytes_)
                   << "); WAL replay window may need more frequent checkpoints";
       }
     }
@@ -149,6 +166,12 @@ class CompactTxnBitmap {
       chunks_;
   ProcessMemoryCharge charge_{MemoryPoolKind::kStorage, 0, /*forced=*/false};
   size_t emergency_bytes_{0};
+  // Bytes in chunks whose emergency reserve was rejected: real memory that
+  // escapes the budget ledger entirely (never reserved, so never released).
+  size_t untracked_bytes_{0};
+  // Untracked total at the last emitted reserve-rejection warning; the next
+  // warning fires when untracked_bytes_ doubles past it.
+  size_t emergency_warned_bytes_{0};
   bool warned_{false};
   bool emergency_warned_{false};
 };
@@ -205,6 +228,11 @@ RecoveryManager::RecoveryManager(std::string_view log_path, PageManager* pm,
                                  size_t segment_size)
     : log_name_(log_path), segment_size_(segment_size), pm_(pm) {
   torn_tail_truncation_allowed_ = TornTailTruncationAllowed();
+  if (segment_size_ == 0) {
+    format_status_ = StatusError(StatusCode::kInvalidArgument,
+                                 "WAL segment size must be > 0");
+    return;
+  }
   auto format = Logger::FixedSizeSegmentFormat(log_name_);
   if (format.HasValue()) {
     fixed_size_segments_ = format.Value();
@@ -248,17 +276,14 @@ std::shared_ptr<RecoveryManager::ReadFd> RecoveryManager::SegmentFdFor(
     return {};
   }
   if (fixed_size_segments_) {
-    // Validate the footer of every segment we hand out a read fd for,
-    // including the one the live logger is currently appending to. The old
-    // exemption for the current segment let a corrupted logical-end slot go
-    // unnoticed: ReadAtDetailed derives its read range from the WAL end, so
-    // it would compute record boundaries from a damaged end and read garbage
-    // (or past the real record prefix) after a crash reopen. A healthy live
-    // footer always passes SegmentLogicalSize, so the check is safe for the
-    // normal append path too.
+    const bool allow_torn = TornTailTruncationAllowedForInstance();
+    // Skip the live writer's update window while keeping the same strict
+    // validation for idle live segments and segments read during recovery.
     const auto logical =
-        Logger::SegmentLogicalSize(log_name_, index, segment_size_,
-                                   TornTailTruncationAllowedForInstance());
+        logger_ != nullptr
+            ? logger_->ReadSegmentLogicalSize(index, allow_torn)
+            : Logger::SegmentLogicalSize(log_name_, index, segment_size_,
+                                         allow_torn);
     if (!logical.HasValue()) {
       platform::CloseFile(raw_fd);
       return {};
@@ -290,6 +315,7 @@ lsn_t RecoveryManager::LogStart() const {
 }
 
 StatusOr<lsn_t> RecoveryManager::LogStartStatus() const {
+  RETURN_IF_FAIL(format_status_);
   bool any = false;
   auto scanned = Logger::FindLowestSegment(log_name_, &any);
   if (!scanned.HasValue()) {
@@ -311,6 +337,7 @@ StatusOr<lsn_t> RecoveryManager::LogStartStatus() const {
 StatusOr<lsn_t> RecoveryManager::LogEnd() const { return LogEndStatus(); }
 
 StatusOr<lsn_t> RecoveryManager::LogEndStatus() const {
+  RETURN_IF_FAIL(format_status_);
   if (fixed_size_segments_ && logger_ != nullptr) {
     return logger_->CommittedLSN();
   }
@@ -337,6 +364,9 @@ StatusOr<lsn_t> RecoveryManager::LogEndStatus() const {
 
 RecoveryManager::ReadAtResult RecoveryManager::ReadAtDetailed(
     lsn_t lsn, char* dst, size_t len) const {
+  if (format_status_ != Status::kSuccess) {
+    return {.bytes = 0, .status = ReadAtStatus::kUnavailable};
+  }
   if (len == 0) {
     return {.bytes = 0, .status = ReadAtStatus::kComplete};
   }
@@ -348,7 +378,12 @@ RecoveryManager::ReadAtResult RecoveryManager::ReadAtDetailed(
   // request beyond BufferedLSN must continue to report EOF/truncation.
   if (logger_ != nullptr && len <= std::numeric_limits<lsn_t>::max() - lsn) {
     const lsn_t end = lsn + static_cast<lsn_t>(len);
+    // WaitForDurable() never takes the logger's enqueue_latch_, and this
+    // recovery read path holds no logger lock, so there is no recursive
+    // acquisition here. Skip the wait outright once the flush worker has
+    // failed: the barrier can never be satisfied and would stall recovery.
     if (end <= logger_->BufferedLSN() && end > logger_->CommittedLSN() &&
+        !logger_->Failed() &&
         logger_->WaitForDurable(end) != Status::kSuccess) {
       return {.bytes = 0, .status = ReadAtStatus::kUnavailable};
     }
@@ -545,6 +580,8 @@ RecoveryManager::LogReadResult RecoveryManager::ReadLogDetailed(
                           ? LogReadStatus::kShort
                           : LogReadStatus::kCorrupt};
   }
+  // Deserialize returns 0 for a corrupt body; a short or overlong decode must
+  // not leave a partially populated LogRecord for the replay passes.
   const size_t consumed = dst->Deserialize(buffer.data(), buffer.size());
   if (consumed == 0 || consumed != total_len) {
     return {.status = LogReadStatus::kCorrupt};
@@ -631,6 +668,9 @@ RecoveryManager::TailDamage RecoveryManager::ClassifyTailDamage(
     return TailDamage::kNone;
   }
   if (fixed_size_segments_) {
+    // The validated segment footer defines the logical end. A damaged
+    // record inside that advertised prefix may contain committed data, even
+    // when a corrupt length makes it look like a short physical write.
     return TailDamage::kSuspect;
   }
   bool any = false;
@@ -685,8 +725,22 @@ RecoveryManager::TailDamage RecoveryManager::ClassifyTailDamage(
   // In the latter case committed records can follow valid_end, so silently
   // truncating there would discard them. Accept the torn-tail explanation
   // only when no complete, valid record begins in (valid_end, on_disk).
-  const size_t tail_bytes = static_cast<size_t>(on_disk - valid_end);
-  std::string tail(tail_bytes, '\0');
+  // A torn record can never be larger than kMaxRecordSize; a bigger unparsed
+  // suffix means the logical end (on_disk) disagrees with the real file, so
+  // refuse to size an allocation from that metadata. This keeps a corrupt
+  // footer from turning into bad_alloc / OOM across RecoverFrom's Status
+  // boundary. Returning kSuspect is conservative (callers fail closed unless
+  // --force is set).
+  if (std::cmp_greater(on_disk - valid_end, Logger::kMaxRecordSize)) {
+    return TailDamage::kSuspect;
+  }
+  const auto tail_bytes = static_cast<size_t>(on_disk - valid_end);
+  std::string tail;
+  try {
+    tail.assign(tail_bytes, '\0');
+  } catch (...) {
+    return TailDamage::kSuspect;
+  }
   const ReadAtResult tail_read =
       ReadAtDetailed(valid_end, tail.data(), tail_bytes);
   if (tail_read.status != ReadAtStatus::kComplete ||
@@ -763,12 +817,19 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
                                                    std::to_string(valid_end) +
                                                    " of " + log_name_);
     }
-    if (tm != nullptr && tm->logger_ != nullptr) {
+    Logger* truncation_logger =
+        tm != nullptr && tm->logger_ != nullptr ? tm->logger_ : logger_;
+    if (truncation_logger != nullptr) {
       LOG(WARN) << "Truncating torn WAL tail: " << on_disk << " -> "
                 << valid_end;
-      RETURN_IF_FAIL(tm->logger_->TruncateTo(valid_end));
+      RETURN_IF_FAIL(truncation_logger->TruncateTo(valid_end));
       recovery_torn_tail_truncated_ = true;
     } else {
+      // --force permits truncation of a *suspect* tail, but it cannot repair
+      // the WAL without a writer: no logger means no TruncateTo(). This is
+      // deliberate (recovery_manager_test's forced/no-logger case asserts
+      // kCorrupt); "force" relaxes the damage classification, not the need
+      // for someone to actually rewrite the segment.
       return StatusError(
           StatusCode::kCorrupt,
           "WAL tail requires truncation but no logger is available: " +
@@ -802,8 +863,12 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
         }
         break;
       }
+      // owner==0 is the default of a LogRecord whose decode failed; it is not
+      // a real transaction id (TransactionManager starts at 1). Ignoring it
+      // prevents a corrupt record from seeding id 1, which could alias an old
+      // committed transaction after a crash.
       if (log.type != LogType::kBeginCheckpoint &&
-          log.type != LogType::kEndCheckpoint) {
+          log.type != LogType::kEndCheckpoint && log.owner != 0) {
         max_seen_txn = std::max(max_seen_txn, log.owner);
       }
       if (log.type == LogType::kCommit) {
@@ -825,13 +890,14 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
   }
 
+  // max_seen_txn + 1 would wrap to 0 at UINT64_MAX, so the exhaustion check
+  // must run unconditionally -- not only when a TransactionManager was passed
+  // in. A caller that creates the manager after recovery must never inherit
+  // a seed of 0 (id 0 would alias an old commit).
+  if (max_seen_txn == std::numeric_limits<txn_id_t>::max()) {
+    return StatusError(StatusCode::kCorrupt, "WAL transaction id exhausted");
+  }
   if (tm != nullptr) {
-    // max_seen_txn + 1 would wrap to 0 at UINT64_MAX, so the exhaustion
-    // check must run before the outer "seed when below max" condition;
-    // otherwise it is unreachable and the seed is silently skipped.
-    if (max_seen_txn == std::numeric_limits<txn_id_t>::max()) {
-      return StatusError(StatusCode::kCorrupt, "WAL transaction id exhausted");
-    }
     tm->SeedNextTransactionId(max_seen_txn + 1);
   }
 

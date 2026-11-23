@@ -150,11 +150,20 @@ Type UnaryResultType(UnaryOperation operation, const Type& child) {
 }  // namespace
 
 std::unordered_set<ColumnName> UnaryExpression::TouchedColumns() const {
+  // Hand-built or rewrite-damaged trees can carry a null child; touching
+  // nothing is safer than dereferencing it.
+  if (!child_) {
+    return {};
+  }
   return child_->TouchedColumns();
 }
 
 StatusOr<Value> UnaryExpression::TryEvaluate(const Row& row,
                                              const Schema& schema) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unary expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, child, child_->TryEvaluate(row, schema));
   return TryEvaluateUnary(operation_, child);
 }
@@ -167,6 +176,10 @@ StatusOr<Value> UnaryExpression::TryEvaluate(const Row* left,
                                              const Schema& left_schema,
                                              const Row* right,
                                              const Schema& right_schema) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unary expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, child,
                    child_->TryEvaluate(left, left_schema, right, right_schema));
   return TryEvaluateUnary(operation_, child);
@@ -187,6 +200,10 @@ Value UnaryExpression::Evaluate(const Row* left, const Schema& left_schema,
 StatusOr<Value> UnaryExpression::TryEvaluate(const Row& row,
                                              const Schema& schema,
                                              EvaluationContext& context) const {
+  if (!child_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unary expression with missing child");
+  }
   ASSIGN_OR_RETURN(Value, child, child_->TryEvaluate(row, schema, context));
   return TryEvaluateUnary(operation_, child);
 }
@@ -198,29 +215,43 @@ Value UnaryExpression::Evaluate(const Row& row, const Schema& schema,
 }
 
 Type UnaryExpression::ResultType(const Schema& schema) const {
+  if (!child_) {
+    return {TypeTag::kInvalid};
+  }
   return UnaryResultType(operation_, child_->ResultType(schema));
 }
 
 Type UnaryExpression::ResultType(const Schema& left,
                                  const Schema& right) const {
+  if (!child_) {
+    return {TypeTag::kInvalid};
+  }
   return UnaryResultType(operation_, child_->ResultType(left, right));
 }
 
 std::string UnaryExpression::ToString() const {
+  const std::string op = ::tinylamb::ToString(operation_);
+  if (!child_) {
+    return "(" + op + " ?)";
+  }
   if (operation_ == UnaryOperation::kMinus ||
       operation_ == UnaryOperation::kBitwiseNot) {
-    return "(" + ::tinylamb::ToString(operation_) + child_->ToString() + ")";
+    return "(" + op + child_->ToString() + ")";
   }
-  return "(" + ::tinylamb::ToString(operation_) + " " + child_->ToString() +
-         ")";
+  return "(" + op + " " + child_->ToString() + ")";
 }
 
 void UnaryExpression::Dump(std::ostream& o) const {
+  const std::string op = ::tinylamb::ToString(operation_);
+  if (!child_) {
+    o << "(" << op << " ?)";
+    return;
+  }
   if (operation_ == UnaryOperation::kMinus ||
       operation_ == UnaryOperation::kBitwiseNot) {
-    o << "(" << ::tinylamb::ToString(operation_) << *child_ << ")";
+    o << "(" << op << *child_ << ")";
   } else {
-    o << "(" << ::tinylamb::ToString(operation_) << " " << *child_ << ")";
+    o << "(" << op << " " << *child_ << ")";
   }
 }
 

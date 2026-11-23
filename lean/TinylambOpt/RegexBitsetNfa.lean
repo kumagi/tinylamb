@@ -1,4 +1,4 @@
-import Std.Tactic
+import TinylambOpt.ThompsonFragment
 
 /-
   TinylambOpt/RegexBitsetNfa.lean
@@ -30,7 +30,6 @@ import Std.Tactic
 
 namespace TinylambOpt.RegexBitsetNfa
 
-abbrev Byte := Nat
 
 /-- Packing a boolean function into a BitVec, with bit-level readback. -/
 def packNat (f : Nat → Bool) : Nat → Nat
@@ -721,97 +720,96 @@ theorem regex_bitset_nfa_accepts (N : NFA) (W : Nat) (hNW : N.states ≤ W)
 
 /-- Small byte regex: literal, byte class, concatenation, alternation, star.
     No captures, no flags, no anchors; matching is ASCII/byte based. -/
-inductive Regex where
-  | empty : Regex
-  | lit : Byte → Regex
-  | class : List Byte → Regex
-  | concat : Regex → Regex → Regex
-  | alt : Regex → Regex → Regex
-  | star : Regex → Regex
-
-def rsize : Regex → Nat
-  | .empty => 2
-  | .lit _ => 2
-  | .class _ => 2
-  | .concat a b => rsize a + rsize b
-  | .alt a b => rsize a + rsize b + 2
-  | .star a => rsize a + 2
-
 def shiftList (k : Nat) (l : List Nat) : List Nat := l.map (fun x => x + k)
 
 def shiftNFA (N : NFA) (k : Nat) : NFA where
   states := N.states + k
   start := N.start + k
-  eps i := if h : k ≤ i then shiftList k (N.eps (i - k)) else []
-  trans i b := if h : k ≤ i then shiftList k (N.trans (i - k) b) else []
-  accept i := if h : k ≤ i then N.accept (i - k) else false
+  eps i := if k ≤ i then shiftList k (N.eps (i - k)) else []
+  trans i b := if k ≤ i then shiftList k (N.trans (i - k) b) else []
+  accept i := if k ≤ i then N.accept (i - k) else false
 
-/-- Thompson-style translation into the reference NFA. -/
-def compile : Regex → NFA
-  | .empty =>
-      { states := 2, start := 0,
-        eps := fun q => if q = 0 then [1] else [],
-        trans := fun _ _ => [], accept := fun q => q = 1 }
-  | .lit b =>
-      { states := 2, start := 0,
-        eps := fun _ => [],
-        trans := fun q c => if q = 0 && decide (c = b) then [1] else [],
-        accept := fun q => q = 1 }
-  | .class bs =>
-      { states := 2, start := 0,
-        eps := fun _ => [],
-        trans := fun q c => if q = 0 && decide (c ∈ bs) then [1] else [],
-        accept := fun q => q = 1 }
-  | .concat a b =>
-      let A := compile a
-      let B := shiftNFA (compile b) (rsize a)
-      { states := rsize a + rsize b, start := 0,
-        eps := fun q =>
-          if hq : q < rsize a then
-            A.eps q ++ (if A.accept q then [B.start] else [])
-          else B.eps q,
-        trans := fun q c => if hq : q < rsize a then A.trans q c else B.trans q c,
-        accept := fun q => B.accept q }
-  | .alt a b =>
-      let A := shiftNFA (compile a) 2
-      let B := shiftNFA (compile b) (rsize a + 2)
-      { states := rsize a + rsize b + 2, start := 0,
-        eps := fun q =>
-          if q = 0 then [2, rsize a + 2]
-          else if q < 2 then []
-          else if hq : q < rsize a + 2 then
-            A.eps q ++ (if A.accept q then [1] else [])
-          else
-            B.eps q ++ (if B.accept q then [1] else []),
-        trans := fun q c =>
-          if q < 2 then []
-          else if hq : q < rsize a + 2 then A.trans q c
-          else B.trans q c,
-        accept := fun q => q = 1 }
-  | .star a =>
-      let A := shiftNFA (compile a) 2
-      { states := rsize a + 2, start := 0,
-        eps := fun q =>
-          if q = 0 then [2, 1]
-          else if q = 1 then []
-          else A.eps q ++ (if A.accept q then [1, 2] else []),
-        trans := fun q c => if q < 2 then [] else A.trans q c,
-        accept := fun q => q = 1 }
+namespace Thompson.Program
+
+def node (p : Program l) (i : Nat) : p.Q := p.nodes[i]?.getD p.graph.entry
+
+def index (p : Program l) (q : p.Q) : Nat :=
+  letI := p.eqQ
+  p.nodes.idxOf q
+
+theorem index_lt (p : Program l) (q : p.Q) : p.index q < p.nodes.length := by
+  letI := p.eqQ
+  exact List.idxOf_lt_length_of_mem (p.cover q)
+
+@[simp] theorem node_index (p : Program l) (q : p.Q) : p.node (p.index q) = q := by
+  letI := p.eqQ
+  have h := p.index_lt q
+  unfold node
+  rw [List.getElem?_eq_getElem h]
+  exact List.getElem_idxOf _
+
+def targets (p : Program l) (i : Nat) (c : Option Byte) : List Nat :=
+  (List.range p.nodes.length).filter fun j => p.graph.edge (p.node i) c (p.node j)
+
+def machine (p : Program l) : NFA :=
+  letI := p.eqQ
+  { states := p.nodes.length, start := p.index p.graph.entry,
+    eps := fun i => p.targets i none, trans := fun i b => p.targets i (some b),
+    accept := fun i => p.node i == p.graph.exit }
+
+end Thompson.Program
+
+/-- Flatten the tagged Thompson graph into the numeric transition table. -/
+def compile (r : Regex) : NFA := (Thompson.assemble r).machine
+
+private def acceptedBits (N : NFA) (bits : BitVec W) : Bool :=
+  (List.range N.states).any fun q => bits.getLsbD q && N.accept q
+
+private def searchBoundaries (N : NFA) (W : Nat) (st : BitVec W) : List Byte → Bool
+  | [] => acceptedBits N st
+  | b :: bs => acceptedBits N st || searchBoundaries N W (searchStepBits N W st b) bs
 
 /-- Observe acceptance at every input boundary, including the empty prefix. -/
 def containsMatch (N : NFA) (W : Nat) (input : List Byte) : Bool :=
-  let accepted := fun (bits : BitVec W) =>
-    (List.range N.states).any fun q => bits.getLsbD q && N.accept q
-  let init := initBits N W
-  (input.foldl (fun (st : Bool × BitVec W) b =>
-    let next := searchStepBits N W st.2 b
-    (st.1 || accepted next, next)) (accepted init, init)).1
+  searchBoundaries N W (initBits N W) input
+
+private theorem searchBoundaries_spec (N : NFA) (W : Nat) (st : BitVec W) (input : List Byte) :
+    searchBoundaries N W st input = true ↔ ∃ pre rest, input = pre ++ rest ∧
+      acceptedBits N (bitsSearchRun N W st pre) = true := by
+  induction input generalizing st with
+  | nil => simp [searchBoundaries, bitsSearchRun]
+  | cons b bs ih =>
+    rw [searchBoundaries, Bool.or_eq_true, ih]
+    constructor
+    · rintro (h | ⟨pre, rest, rfl, h⟩)
+      · exact ⟨[], b :: bs, rfl, h⟩
+      · exact ⟨b :: pre, rest, rfl, h⟩
+    · rintro ⟨pre, rest, eq, h⟩
+      cases pre with
+      | nil => exact Or.inl h
+      | cons c ps =>
+        obtain ⟨rfl, ht⟩ := List.cons.inj eq
+        exact Or.inr ⟨ps, rest, ht, h⟩
+
+/-- Unanchored bit search succeeds exactly when the independent reachable-set
+    evaluator has an accepting state at some boundary of the input. -/
+theorem containsMatch_iff_reference (N : NFA) (W : Nat) (hNW : N.states ≤ W)
+    (input : List Byte) : containsMatch N W input = true ↔
+    ∃ pre rest, input = pre ++ rest ∧
+      (List.range N.states).any (fun q => setSearchRun N (initSet N) pre q && N.accept q) = true := by
+  simp only [containsMatch, searchBoundaries_spec, acceptedBits, regex_bitset_nfa_accepts N W hNW]
 
 set_option maxRecDepth 100000 in
 theorem alternation_does_not_accept_left_prefix :
     let n := compile (.alt (.concat (.lit 97) (.lit 98)) (.lit 99))
-    containsMatch n 8 [97] = false ∧ containsMatch n 8 [97,98,120] = true ∧
+    containsMatch n 8 [97] = false ∧ containsMatch n 8 [98] = false ∧
+      containsMatch n 8 [97,98,120] = true ∧
       containsMatch n 8 [99] = true := by decide
+
+theorem alternation_keeps_both_singletons :
+    let n := compile (.alt (.lit 97) (.lit 98))
+    containsMatch n 6 [97] = true ∧ containsMatch n 6 [98] = true ∧
+      containsMatch n 6 [] = false := by decide
 
 theorem star_eps_cycle_closure_stabilizes :
     let N := compile (Regex.star (Regex.lit 97))

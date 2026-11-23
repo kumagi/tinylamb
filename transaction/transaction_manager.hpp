@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
@@ -226,6 +227,8 @@ class TransactionManager {
         try {
           deadlock_detector_ = std::thread([this] { DeadlockDetectorLoop(); });
         } catch (...) {
+          LOG(WARN) << "Deadlock detector thread failed to start; falling "
+                       "back to kWoundWait";
           deadlock_policy_.store(
               static_cast<uint8_t>(DeadlockPolicy::kWoundWait),
               std::memory_order_release);
@@ -418,7 +421,10 @@ class TransactionManager {
   // is released when the transaction leaves the active table. A transaction
   // never discounts its OWN reservation: the reverse-chain undo frees the
   // later ops' bytes before the earlier ops' undo re-claims them.
-  void ReserveIndexUndoBytes(Transaction& txn, page_id_t pid, size_t bytes);
+  // Returns kMemoryLimitExceeded when the per-transaction claim list cannot
+  // grow; the shared shard reservation is left untouched in that case so the
+  // failure cannot strand an unrecorded claim at finish time.
+  Status ReserveIndexUndoBytes(Transaction& txn, page_id_t pid, size_t bytes);
   // Diagnostic bisect for the reservation machinery (env
   // TINYLAMB_DISABLE_INDEX_RESERVATION): 0=on, 1=off, 2=no shared map,
   // 3=no per-transaction vector.
@@ -753,7 +759,9 @@ class TransactionManager {
   // Byte-sized state flags share one aligned block.
   std::atomic<bool> index_key_tracking_complete_{true};
   std::atomic<bool> synchronous_commit_{true};
-  std::atomic<bool> fail_stop_{false};
+  // mutable: const observers (e.g. ForEachPendingLsmWriteViaWal) may detect
+  // an unrecoverable state and must be able to request process fail-stop.
+  mutable std::atomic<bool> fail_stop_{false};
   std::atomic<bool> metrics_enabled_{false};
   std::atomic<bool> gc_stop_{false};
   std::atomic<uint8_t> deadlock_policy_{
@@ -805,10 +813,7 @@ class TransactionManager {
     // keys being dropped are at most that old.
     void Disable(uint64_t forget_through_ts) noexcept {
       precise = false;
-      if (forget_through_ts >
-          forgotten_through_ts) {  // NOLINT(readability-use-std-min-max)
-        forgotten_through_ts = forget_through_ts;
-      }
+      forgotten_through_ts = std::max(forget_through_ts, forgotten_through_ts);
       pending.clear();
       committed.clear();
       pending_bytes = pending_keys = history_bytes = 0;

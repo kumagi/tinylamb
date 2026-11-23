@@ -57,11 +57,15 @@ TEST(JsonStructHelpersTest, JsonTextToValueParsesScalars) {
   EXPECT_FALSE(JsonTextToValue("  \t\n", &parsed));
   // Rejection needs more than one unrelated token: truncated JSON, trailing
   // garbage after an otherwise valid number, and a bad numeric spelling are
-  // the cases that actually break struct-JSON round trips.
+  // the cases that actually break struct-JSON round trips. A failed parse
+  // must leave `parsed` untouched so callers never observe a half-written
+  // value.
+  const Value before_invalid = parsed;
   for (const char* invalid :
        {"{\"a\": 1", "[1, 2", "42abc", "1.2.3", "\"unterminated"}) {
     SCOPED_TRACE(invalid);
     EXPECT_FALSE(JsonTextToValue(invalid, &parsed));
+    EXPECT_EQ(parsed, before_invalid);
   }
 }
 
@@ -145,7 +149,7 @@ TEST(JsonStructHelpersTest, TryStructSetFieldCreatesAndUpdates) {
   // A NULL base stays NULL.
   Value null_base;
   auto created = TryStructSetField(null_base, "x.y", Value(int64_t{1}));
-  EXPECT_TRUE(created.HasValue());
+  ASSERT_TRUE(created.HasValue());
   EXPECT_TRUE(created.MoveValue().IsNull());
 }
 

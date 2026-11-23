@@ -10,14 +10,14 @@
 - 区分: 実態との乖離
 - 対象: docs/distributed_raft.md:1-6、全文
 - 問題: 「実装できる粒度」と書かれているが distributed/ ディレクトリもコードも 0。文書単独では既存仕様か設計提案か判別不可。
-- 根拠: find . -type d -not -path "./build*" に distributed/ なし。`grep -rilE "raft|membership|migration" --include="*.cpp" .` のヒットは部分文字列のみで、現行で残る実体は executor/detail/subquery_runtime.hpp:577-600 の UncorrelatedMembership だけ(旧レビューが挙げた planning_heuristics.cpp / postgres_server_test.cpp / lsm_tree_test.cpp の行は現行ファイルでは一致しない)。distributed.md:22「ネットワーク関連のコードは現在ワイヤサーバしか存在しない」と一致。
+- 根拠: find . -type d -not -path "./build*" に distributed/ なし。`grep -rilE "raft|membership|migration" --include="*.cpp" .` のヒットは部分文字列のみで、現行で残る実体は executor/detail/subquery_runtime.hpp:674-691 の UncorrelatedMembership だけ(旧レビューが挙げた planning_heuristics.cpp / postgres_server_test.cpp / lsm_tree_test.cpp の行は現行ファイルでは一致しない)。distributed.md:22「ネットワーク関連のコードは現在ワイヤサーバしか存在しない」と一致。
 - 提案: 冒頭に「設計仕様、Phase 1 未着手」と注記。
 
 ### R-2: 既存資産と新設物の区別が現在形で混在
 - 区分: 実態との乖離
 - 対象: docs/distributed_raft.md:38(nodeid_t)、:72(--control-port)、:76(crc32c)
-- 問題: nodeid_t は constants.hpp:238-242 に未追加、--control-port は server/postgres_server_main.cpp:21-68 に存在せず、crc32c.hpp のみ実在。現在形の記述が読者を混同させる。
-- 根拠: common/constants.hpp:238-242 は lsn_t/txn_id_t/page_id_t/slot_t/bin_size_t のみ。postgres_server_main.cpp は --host/--port/--read-workers に加え --max-connections/--force/--help も解析。crc32c.hpp は実在(CMakeLists.txt:1015 でテスト登録)。
+- 問題: nodeid_t は constants.hpp:253-257 の alias 群に未追加、--control-port は server/postgres_server_main.cpp:21-68 に存在せず、crc32c.hpp のみ実在。現在形の記述が読者を混同させる。
+- 根拠: common/constants.hpp:253-257 は lsn_t/txn_id_t/page_id_t/slot_t/bin_size_t のみ。postgres_server_main.cpp は --host/--port/--read-workers に加え --max-connections/--force/--help も解析。crc32c.hpp は実在(CMakeLists.txt:1064 でテスト登録)。
 - 提案: 既存は「既存」ラベル、新設は「WP-0b 追加予定」にラベル付け。
 
 ### R-3: RequestVoteReply / InstallSnapshotReply / TimeoutNow の wire 形式が未定義

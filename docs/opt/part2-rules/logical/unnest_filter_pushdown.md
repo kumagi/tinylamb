@@ -35,10 +35,15 @@ if (!expression.predicate || !*expression.predicate ||
 パターンは `Selection(Unnest(Any(), "unnest"))` であり、対象演算子は `LogicalOperator::kSelection` です。変換ラムダ内で以下のガード条件を検証します。
 
 ```cpp
+              const std::string eff_alias =
+                  unnest.unnest_alias.empty() ? "unnest" : unnest.unnest_alias;
+              const std::unordered_set<ColumnName> touched =
+                  (*expression.predicate)->TouchedColumns();
               bool touches_unnest = false;
               for (const auto& col : touched) {
-                if ((!unnest.unnest_alias.empty() &&
-                     IdentifierEquals(col.name, unnest.unnest_alias)) ||
+                if (col.name == "*" || IdentifierEquals(col.name, eff_alias) ||
+                    (!col.schema.empty() &&
+                     IdentifierEquals(col.schema, eff_alias)) ||
                     (!unnest.offset_alias.empty() &&
                      IdentifierEquals(col.name, unnest.offset_alias))) {
                   touches_unnest = true;
@@ -55,8 +60,13 @@ if (!expression.predicate || !*expression.predicate ||
 1. 選択述語が存在すること。
 2. `unnest` グループが現在のグループ自身でないこと。
 3. `unnest` グループ内に、子ノード数 1 の `LogicalOperator::kUnnest` 式が存在すること。
-4. 述語が参照するすべての列名が、UNNEST の展開値別名（`unnest_alias`）および位置序数列別名（`offset_alias`）のいずれとも一致しないこと（大文字小文字を無視して照合）。
-5. 新規派生グループ（`"sel_unnest_child"`）が入力グループまたは現在のグループと一致しないこと。
+4. 述語が参照する列が以下いずれにも一致しないこと（識別子照合は大文字小文字を無視）。
+   - 実効展開別名 `eff_alias`（`unnest_alias` が空なら既定値 `"unnest"`）。`col.name` との一致に加え、`col.schema`（修飾名側）との一致も拒否します。
+   - 位置序数列別名 `offset_alias`（指定がある場合のみ、`col.name` と照合）。
+   - ワイルドカード `col.name == "*"`（生成列全体を指すため）。
+
+   旧形のように `unnest_alias` が空のときにチェックを外すと、既定名 `"unnest"` の生成列参照や修飾名側に alias が現れるケースを見逃し、UNNEST 前に存在しない列を参照する誤ったプランが生成されます。
+5. 新規派生グループ（`"sel_unnest_child:" + GroupIdsTag({unnest_child}) + PredicateTag(expression.predicate)`）が入力グループまたは現在のグループと一致しないこと。子 ID と述語を指紋に含めることで、branch_local な Selection 同士の分岐間混線を防ぎます。生成後は `InheritBranchLocal` が branch-local 属性を派生グループへ伝播します(D5)。
 
 述語が UNNEST の生成列を参照している場合は発火しません。
 
@@ -64,7 +74,7 @@ if (!expression.predicate || !*expression.predicate ||
 
 UNNEST 演算子をまたぐ述語プッシュダウンの健全性は、属性の依存関係とタプルの生存条件の一致に基づいています。
 
-- **生成列の未定義性**: `unnest_alias` や `offset_alias` は UNNEST による配列展開の結果として初めて生成される属性です。展開前の入力タプルにおいてこれらの属性は存在しないため、物理的・代数的に下位へ押し込むことは不可能です。
+- **生成列の未定義性**: 実効展開別名 `eff_alias`（`unnest_alias` が空なら `"unnest"`）や `offset_alias` は UNNEST による配列展開の結果として初めて生成される属性です。展開前の入力タプルにおいてこれらの属性は存在しないため、物理的・代数的に下位へ押し込むことは不可能です。
 - **入力行と展開行の真偽値の一致**: UNNEST は 1 つの入力行から 0 個以上の展開行を生成するが、生成されたすべての行は親となる入力行の属性値をそのまま引き継ぐ。したがって、入力属性のみに依存する述語 $p(X)$ の真偽値は、同一の入力行から生成されるすべての展開行において常に一定（すべて真、またはすべて偽）です。したがって、展開前に入力行を除外することと、展開後に生成された全行を除外することは結果として完全に等価です。
 - **多重度への影響**: 不合格な入力行を先行除外しても、合格した入力行の展開多重度（配列の要素数）には何ら影響を与えないため、多重集合の意味論は完全に維持されます。
 
@@ -75,7 +85,10 @@ UNNEST 演算子をまたぐ述語プッシュダウンの健全性は、属性�
 ```cpp
             const GroupId unnest_child = unnest.children[0];
             const GroupId sel_below = memo.EnsureDerivedGroup(
-                memo.Get(unnest_child).relations, "sel_unnest_child");
+                memo.Get(unnest_child).relations,
+                "sel_unnest_child:" + GroupIdsTag({unnest_child}) +
+                    PredicateTag(expression.predicate));
+            InheritBranchLocal(memo, sel_below, group);
             if (sel_below != unnest_child && sel_below != group) {
               memo.AddExpression(
                   sel_below, LogicalExpression{

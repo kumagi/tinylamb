@@ -50,6 +50,38 @@ TEST(RowBlockCodecTest, RoundTripsAllValueVariantsIncludingLargeStrings) {
   EXPECT_EQ(decoded[1][3].ArrayElementSqlType(), "INT64");
 }
 
+// CheckSerializable (row-page/persist path) and the spill codec must accept
+// exactly the same maximum array nesting depth; otherwise a value that passes
+// validation can still fail when it is spilled.
+TEST(RowBlockCodecTest, ArrayNestingDepthBoundaryAgreesWithPersistenceLimit) {
+  auto nested = [](int levels) {
+    Value v(int64_t{7});
+    for (int i = 0; i < levels; ++i) {
+      v = Value::Array({v}, "INT64");
+    }
+    return v;
+  };
+
+  const int limit = static_cast<int>(Value::kMaxArrayNestingDepth);
+  for (int levels : {limit - 1, limit}) {
+    const Value v = nested(levels);
+    ASSERT_EQ(v.CheckSerializable(), Status::kSuccess) << levels;
+    std::string encoded;
+    ASSERT_EQ(EncodeSpillValue(v, &encoded), Status::kSuccess) << levels;
+    std::string_view sv(encoded);
+    auto decoded = DecodeSpillValue(&sv);
+    ASSERT_TRUE(decoded.HasValue()) << decoded.GetStatus() << " at " << levels;
+    EXPECT_TRUE(sv.empty()) << levels;
+    EXPECT_EQ(decoded.Value(), v) << levels;
+  }
+
+  const Value too_deep = nested(limit + 1);
+  EXPECT_EQ(too_deep.CheckSerializable().GetCode(), StatusCode::kTooBigData);
+  std::string encoded;
+  EXPECT_EQ(EncodeSpillValue(too_deep, &encoded).GetCode(),
+            StatusCode::kTooBigData);
+}
+
 TEST(RowBlockCodecTest, SpillStoreRoundTripsMultipleBlocksCleanly) {
   std::error_code ec;
   const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) /
@@ -64,6 +96,10 @@ TEST(RowBlockCodecTest, SpillStoreRoundTripsMultipleBlocksCleanly) {
     ~Guard() {
       std::error_code e;
       std::filesystem::remove_all(d, e);
+      if (e) {
+        ADD_FAILURE() << "Failed to remove spill dir " << d << ": "
+                      << e.message();
+      }
     }
     std::filesystem::path d;
   } g{dir};
@@ -169,6 +205,10 @@ TEST(RowBlockCodecTest, RejectsHugeRowCountAndOversizedPayloadWithoutOom) {
       ~Guard() {
         std::error_code e;
         std::filesystem::remove_all(d, e);
+        if (e) {
+          ADD_FAILURE() << "Failed to remove spill dir " << d << ": "
+                        << e.message();
+        }
       }
     } g{dir};
 

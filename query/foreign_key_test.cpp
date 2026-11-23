@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/memory_budget.hpp"
+#include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
@@ -78,13 +79,14 @@ class ForeignKeyTest : public ::testing::Test {
     if (!GoogleSqlFrontend::Available()) {
       GTEST_SKIP() << "skipped";
     }
-    // ctest runs each case as its own process in the same directory and may
-    // run them in parallel: the database file name must be unique per test,
-    // otherwise concurrent cases stomp on each other's files.
+    // Test binaries can run in parallel in the same directory, and a prior
+    // crash can leave database files behind. Give each fixture instance a
+    // unique database name so neither case can reuse another's files.
     const ::testing::TestInfo* info =
         ::testing::UnitTest::GetInstance()->current_test_info();
     db_name_ = std::string("sql_foreign_key_test_") +
-               (info != nullptr ? info->name() : "unknown");
+               (info != nullptr ? info->name() : "unknown") + "_" +
+               RandomString(8);
     database_ = Database::Create(db_name_).MoveValue();
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
     engine_ = std::make_unique<SqlEngine>(*database_);

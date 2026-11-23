@@ -10607,7 +10607,7 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
     const uint32_t checkpoints =
         (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery;
     const size_t checkpoint_bytes = static_cast<size_t>(checkpoints) * 8;
-    const size_t avail = static_cast<size_t>(region_end - region);
+    const auto avail = static_cast<size_t>(region_end - region);
     if (checkpoints == 0 || 8 + checkpoint_bytes > avail) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
@@ -10635,7 +10635,7 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
 
   if (block.scheme == Scheme::kDeltaFor ||
       block.scheme == Scheme::kDeltaBitweave) {
-    const size_t avail = static_cast<size_t>(region_end - region);
+    const auto avail = static_cast<size_t>(region_end - region);
     if (avail < 2) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;
@@ -10667,7 +10667,7 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
         return;
       }
       inner_need =
-          8 + static_cast<size_t>(n) * static_cast<size_t>(block.param);
+          8 + (static_cast<size_t>(n) * static_cast<size_t>(block.param));
     } else {
       if (inner_avail < 9) {
         std::fill(output.begin(), output.begin() + n, 0);
@@ -10844,7 +10844,7 @@ void DecodeInt64All(const EncodedBlock& block, std::span<int64_t> output) {
   }
 
   if (block.scheme == Scheme::kPfor) {
-    const size_t avail = static_cast<size_t>(region_end - region);
+    const auto avail = static_cast<size_t>(region_end - region);
     if (avail < 11) {
       std::fill(output.begin(), output.begin() + n, 0);
       return;

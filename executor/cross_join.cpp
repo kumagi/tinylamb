@@ -82,7 +82,11 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 
 void CrossJoin::TableConstruct() {
   DataChunk batch;
-  while (right_->NextBatch(&batch) != 0) {
+  while (true) {
+    batch.Reset();
+    if (right_->NextBatch(&batch) == 0) {
+      break;
+    }
     if (const Status ts = Transaction::CheckThreadStatementTimeout();
         ts != Status::kSuccess) {
       FailWith(ts);
@@ -90,6 +94,10 @@ void CrossJoin::TableConstruct() {
       table_constructed_ = true;
       return;
     }
+    // No reserve here: reserve(size()+batch) allocates exactly the requested
+    // size, so capacity is exhausted every batch and the whole vector is
+    // reallocated+copied each iteration. push_back's geometric growth is
+    // already amortized O(1).
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_table_.push_back(batch.RowAt(i));
     }

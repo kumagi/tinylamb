@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <ranges>
 #include <sstream>
@@ -66,6 +67,45 @@ inline void RemoveLogAndSegments(const std::string& log_path) {
     }
   }
 }
+
+// RAII guard for process environment variables in tests: saves the value `key`
+// held on construction (or its absence), applies `value` (`nullptr` unsets),
+// and restores the saved state on destruction — including on ASSERT failures.
+// `Set` changes the live value mid-scope without touching the saved prior
+// state, for tests that toggle a variable on and off.
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* key, const char* value) : key_(key) {
+    if (const char* prev = std::getenv(key)) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    Set(value);
+  }
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+  ScopedEnvVar(ScopedEnvVar&&) = delete;
+  ScopedEnvVar& operator=(ScopedEnvVar&&) = delete;
+  ~ScopedEnvVar() {
+    if (had_prev_) {
+      ::setenv(key_.c_str(), prev_.c_str(), 1);
+    } else {
+      ::unsetenv(key_.c_str());
+    }
+  }
+  void Set(const char* value) {
+    if (value != nullptr) {
+      ::setenv(key_.c_str(), value, 1);
+    } else {
+      ::unsetenv(key_.c_str());
+    }
+  }
+
+ private:
+  std::string key_;
+  bool had_prev_{false};
+  std::string prev_;
+};
 }  // namespace tinylamb
 
 #define ASSERT_SUCCESS(x) ASSERT_EQ(Status::kSuccess, x)

@@ -8,8 +8,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -60,6 +62,23 @@ TEST(VolatileFingerprintTest, SaturationIsBoundedAndCannotReviveStalePlans) {
   EXPECT_TRUE(MarkFingerprintVolatile("temporary"));
   DemoteVolatileFingerprint("temporary", true);
   EXPECT_FALSE(IsVolatileSpecializedPlan("temporary"));
+}
+
+TEST(VolatileFingerprintTest, FailedCompileKeepsOnlyAppliedFoldsVolatile) {
+  PreparedPlanSessionCache session;
+  ScopedPreparedPlanSession scope(&session);
+  const std::string key = "failed-statement";
+  for (const bool apply_fold : {false, true}) {
+    bool folded = false;
+    const auto compile = [&] {
+      ScopedFoldFingerprint guard(key, folded);
+      EXPECT_TRUE(IsVolatileSpecializedPlan(key));
+      folded = apply_fold;
+      throw std::runtime_error("compile failed");
+    };
+    EXPECT_THROW(compile(), std::runtime_error);
+    EXPECT_EQ(IsVolatileSpecializedPlan(key), apply_fold);
+  }
 }
 
 TEST(PlanCacheParameterSlotTest, EvaluateReturnsSlotValue) {
@@ -137,6 +156,41 @@ TEST(PlanCacheParameterSlotTest, IsBindableLiteralClassifiesValueTypes) {
   EXPECT_TRUE(IsBindableLiteral(Value::Date("2026-01-02")));
   EXPECT_FALSE(IsBindableLiteral(Value()));
   EXPECT_FALSE(IsBindableLiteral(Value::Array({Value(int64_t{1})}, "INT64")));
+}
+
+TEST(PlanCacheParameterSlotTest, StructSlotsFollowFieldLayout) {
+  for (bool has_flags : {false, true}) {
+    SCOPED_TRACE(has_flags);
+    const size_t width = has_flags ? 3 : 2;
+    const std::vector<Value> parameters{Value(11), Value(22), Value(33)};
+    std::vector<Expression> args;
+    for (size_t field = 0; field < parameters.size(); ++field) {
+      args.push_back(ConstantValueExp(Value("field" + std::to_string(field))));
+      args.push_back(ConstantValueExp(parameters[field]));
+      if (has_flags) {
+        args.push_back(ConstantValueExp(Value(0)));
+      }
+    }
+    const auto expression = FunctionCallExp("__struct_json__", args);
+    size_t cursor = 0;
+    bool ok = true;
+    const auto numbered =
+        SlotizeLiterals(expression, &cursor, &ok, &parameters);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(cursor, parameters.size());
+    const auto& numbered_args = numbered->AsFunctionCallExpression().Args();
+    for (size_t field = 0; field < parameters.size(); ++field) {
+      const size_t index = field * width;
+      EXPECT_EQ(numbered_args[index], args[index]);
+      const auto* slot =
+          dynamic_cast<const ParameterSlot*>(numbered_args[index + 1].get());
+      ASSERT_NE(slot, nullptr);
+      EXPECT_EQ(slot->Index(), field);
+      if (has_flags) {
+        EXPECT_EQ(numbered_args[index + 2], args[index + 2]);
+      }
+    }
+  }
 }
 
 TEST(PlanCacheParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
@@ -268,6 +322,100 @@ TEST(PlanCacheParameterSlotTest,
   EXPECT_EQ(out.InnerOrderBy().size(), 1U);
   EXPECT_TRUE(out.InnerOrderBy()[0].expression != nullptr);
   EXPECT_EQ(out.InnerGroupBy().size(), 1U);
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/PlanCacheToggleInvalidation.lean
+// (sound)
+TEST(PlanCacheToggleInvalidationTest, BothCachesCheckAllMemorySettings) {
+  PreparedPlanSessionCache session;
+  ScopedPreparedPlanSession scope(&session);
+  const auto settings = PlanMemorySettings::Current();
+  auto expect_miss = [&](PlanMemorySettings old) {
+    auto plan = std::make_shared<CompiledPlan>();
+    plan->memory_settings = old;
+    plan->opt_bits = CurrentPlanOptToggleBits();
+    const std::string sql = "memory-settings-test";
+    StoreThreadCompiledPlan(sql, plan);
+    PreparedPlanCache::Instance().Store(sql, plan);
+    EXPECT_EQ(FindThreadCompiledPlan(sql, nullptr, 0), nullptr);
+    EXPECT_EQ(PreparedPlanCache::Instance().Find(sql, nullptr, 0), nullptr);
+  };
+  expect_miss({.process_limit=settings.process_limit ^ 1U, .operator_limit=settings.operator_limit,
+               .always_spill=settings.always_spill});
+  expect_miss({.process_limit=settings.process_limit, .operator_limit=settings.operator_limit ^ 1U,
+               .always_spill=settings.always_spill});
+  expect_miss({.process_limit=settings.process_limit, .operator_limit=settings.operator_limit,
+               .always_spill=!settings.always_spill});
+}
+
+TEST(PlanCacheToggleInvalidationTest, OptBitsIsolateCachedPlansPerToggle) {
+  struct ScopedUnset {
+    const char* name;
+    std::string prev;
+    bool had_prev{false};
+    explicit ScopedUnset(const char* n) : name(n) {
+      if (const char* cur = std::getenv(name)) {
+        prev = cur;
+        had_prev = true;
+      }
+      ::unsetenv(name);
+    }
+    ~ScopedUnset() {
+      if (had_prev) {
+        ::setenv(name, prev.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+
+  ScopedUnset guard("TINYLAMB_DISABLE_ROW_IN_MASK");
+  PreparedPlanSessionCache session;
+  ScopedPreparedPlanSession session_scope(&session);
+
+  const auto* dummy_db = reinterpret_cast<const Database*>(0x123456);
+  const uint64_t epoch = 42;
+  const std::string fp = "SELECT * FROM t WHERE (a, b) IN ((1, 2))";
+
+  const uint64_t bits_on = CurrentPlanOptToggleBits();
+  auto plan_on = std::make_shared<CompiledPlan>();
+  plan_on->database = dummy_db;
+  plan_on->epoch = epoch;
+  plan_on->opt_bits = bits_on;
+  StoreThreadCompiledPlan(fp, plan_on);
+  PreparedPlanCache::Instance().Store(fp, plan_on);
+
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch, bits_on), plan_on);
+  EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, dummy_db, epoch, bits_on),
+            plan_on);
+
+  ::setenv("TINYLAMB_DISABLE_ROW_IN_MASK", "1", 1);
+  const uint64_t bits_off = CurrentPlanOptToggleBits();
+  EXPECT_NE(bits_off, bits_on);
+  EXPECT_NE(PlanCacheKeyWithOptBits(fp, bits_off),
+            PlanCacheKeyWithOptBits(fp, bits_on));
+
+  // Changing the toggle must NOT hit the stale ON-mode plan.
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch), nullptr);
+  EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, dummy_db, epoch), nullptr);
+
+  auto plan_off = std::make_shared<CompiledPlan>();
+  plan_off->database = dummy_db;
+  plan_off->epoch = epoch;
+  plan_off->opt_bits = bits_off;
+  StoreThreadCompiledPlan(fp, plan_off);
+  PreparedPlanCache::Instance().Store(fp, plan_off);
+
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch), plan_off);
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch, bits_on), plan_on);
+  EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, dummy_db, epoch), plan_off);
+  EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, dummy_db, epoch, bits_on),
+            plan_on);
+
+  ForgetThreadCompiledPlan(fp, bits_on);
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch, bits_on), nullptr);
+  EXPECT_EQ(FindThreadCompiledPlan(fp, dummy_db, epoch, bits_off), plan_off);
+  ForgetThreadCompiledPlan(fp, bits_off);
 }
 
 }  // namespace tinylamb

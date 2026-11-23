@@ -18,6 +18,7 @@
 #define TINYLAMB_LSTABLE_BRIDGE_HPP
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,7 @@
 namespace tinylamb {
 
 class Table;
+class TlcsFile;
 class Transaction;
 
 struct LSTableColumnDictionary {
@@ -115,11 +117,14 @@ struct LSTableColumnDictionary {
 
   [[nodiscard]] std::string_view StringEntryAt(size_t code) const noexcept {
     if (!flat_str_offsets.empty()) {
-      if (code + 1 >= flat_str_offsets.size()) {
+      if (code >= StringEntryCount()) {
         return {};
       }
       const uint64_t b = flat_str_offsets[code];
       const uint64_t e = flat_str_offsets[code + 1];
+      if (b >= e || e > flat_str_bytes.size()) {
+        return {};
+      }
       return {flat_str_bytes.data() + b, static_cast<size_t>(e - b)};
     }
     return code < entries.size() ? std::string_view(entries[code])
@@ -136,7 +141,9 @@ struct LSTableColumnDictionary {
   }
 
   [[nodiscard]] int64_t IntEntryAt(size_t code) const noexcept {
-    return IntEntries()[code];
+    const auto values = IntEntries();
+    // Match the numeric block decoder's fallback for absent codes.
+    return code < values.size() ? values[code] : 0;
   }
 
   [[nodiscard]] std::span<const double> DoubleEntries() const noexcept {
@@ -168,11 +175,23 @@ struct LSTableColumnDictionary {
     }
     const auto wc = WideCodes();
     if (packed_code_bits != 0) {
-      const size_t bit = row * packed_code_bits;
+      size_t bit = 0;
+      if (packed_code_bits > 32 ||
+          __builtin_mul_overflow(row, static_cast<size_t>(packed_code_bits),
+                                 &bit)) {
+        return UINT32_MAX;
+      }
+      const size_t offset = bit / 8;
       uint64_t word = 0;
-      std::memcpy(&word, wc.data() + (bit / 8), sizeof(word));
+      if (offset > wc.size() || sizeof(word) > wc.size() - offset) {
+        return UINT32_MAX;
+      }
+      std::memcpy(&word, wc.data() + offset, sizeof(word));
       return static_cast<uint32_t>((le64toh(word) >> (bit % 8)) &
                                    ((uint64_t{1} << packed_code_bits) - 1));
+    }
+    if (wide_code_bytes != 2 && wide_code_bytes != 4) {
+      return UINT32_MAX;
     }
     const auto* data = wc.data() + (row * wide_code_bytes);
     if (wide_code_bytes == 2) {
@@ -300,18 +319,20 @@ struct LSTableColumnBlock {
         return;
       }
       case 2: {
-        const auto* __restrict src =
-            reinterpret_cast<const uint16_t*>(for_bytes.data()) + r0;
+        const auto* __restrict src = for_bytes.data() + (r0 * sizeof(uint16_t));
         for (size_t i = 0; i < count; ++i) {
-          dst[i] = static_cast<int64_t>(base_u + src[i]);
+          uint16_t offset = 0;
+          std::memcpy(&offset, src + (i * sizeof(offset)), sizeof(offset));
+          dst[i] = static_cast<int64_t>(base_u + offset);
         }
         return;
       }
       case 4: {
-        const auto* __restrict src =
-            reinterpret_cast<const uint32_t*>(for_bytes.data()) + r0;
+        const auto* __restrict src = for_bytes.data() + (r0 * sizeof(uint32_t));
         for (size_t i = 0; i < count; ++i) {
-          dst[i] = static_cast<int64_t>(base_u + src[i]);
+          uint32_t offset = 0;
+          std::memcpy(&offset, src + (i * sizeof(offset)), sizeof(offset));
+          dst[i] = static_cast<int64_t>(base_u + offset);
         }
         return;
       }
@@ -337,11 +358,6 @@ struct LSTableColumnBlock {
   }
 
   [[nodiscard]] std::string_view VarcharAt(size_t row) const noexcept {
-    if (dict != nullptr && dict->wide_code_bytes != 0) {
-      const uint32_t code = is_const_code ? const_code : DictionaryCodeAt(row);
-      return code < dict->StringEntryCount() ? dict->StringEntryAt(code)
-                                             : std::string_view{};
-    }
     if (dict != nullptr && dict->active) {
       if (is_const_code) {
         return const_code < dict->StringEntryCount()
@@ -356,6 +372,12 @@ struct LSTableColumnBlock {
         return dict->StringEntryAt(code);
       }
       return {};
+    }
+    if (dict != nullptr &&
+        (dict->packed_code_bits != 0 || dict->wide_code_bytes != 0)) {
+      const uint32_t code = is_const_code ? const_code : DictionaryCodeAt(row);
+      return code < dict->StringEntryCount() ? dict->StringEntryAt(code)
+                                             : std::string_view{};
     }
     const std::span<const uint32_t> ends = VarcharEnds();
     const std::span<const uint8_t> bytes = VarcharBytes();
@@ -373,6 +395,9 @@ struct LSTableColumnBlock {
   [[nodiscard]] uint32_t DictionaryCodeAt(size_t row) const noexcept {
     if (is_const_code) {
       return const_code;
+    }
+    if (row < dict_codes.size()) {
+      return dict_codes[row];
     }
     if (dict == nullptr || row >= wide_code_count) {
       return UINT32_MAX;
@@ -396,6 +421,11 @@ class LSTableBlockColumns {
   }
   [[nodiscard]] size_t size() const {
     return offsets_.empty() ? values_.size() : offsets_.size();
+  }
+  [[nodiscard]] bool Contains(size_t column) const noexcept {
+    return offsets_.empty() ? column < values_.size()
+                            : (column < offsets_.size() &&
+                               offsets_[column] < values_.size());
   }
   LSTableColumnBlock& operator[](size_t column) {
     return offsets_.empty() ? values_[column] : values_.at(offsets_[column]);
@@ -548,6 +578,43 @@ struct LSTableBlockLayout {
   std::shared_ptr<ProcessMemoryCharge> memory_charge;
 };
 
+struct LSTableLazyDecodedBlock {
+  LSTableColumnBlock block;
+  std::unique_ptr<int64_t[]> owned_ints;
+  std::unique_ptr<uint8_t[]> owned_nulls;
+  std::unique_ptr<uint8_t[]> owned_dict_codes;
+  std::vector<uint8_t> owned_varchar_bytes;
+  std::vector<uint32_t> owned_varchar_ends;
+  std::shared_ptr<const platform::MemoryMap> backing_mmap;
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
+  size_t charged_bytes{0};
+};
+
+struct LSTableLazyBlockMeta {
+  uint64_t data_offset{0};
+  uint64_t aux_offset{0};
+  uint64_t nulls_offset{0};
+  uint32_t data_size{0};
+  uint32_t aux_size{0};
+  uint32_t nulls_size{0};
+  uint32_t row_count{0};
+  int64_t for_base{0};
+  uint8_t encoding{0};
+  uint8_t for_width{0};
+  bool has_null{false};
+};
+
+struct LSTableLazyColumnState {
+  static constexpr size_t kLazyStripeCount = 64;
+  std::shared_ptr<const TlcsFile> backing_tlcs;
+  std::unique_ptr<std::atomic<const LSTableColumnBlock*>[]> lazy_blocks;
+  mutable std::vector<std::shared_ptr<const LSTableLazyDecodedBlock>>
+      lazy_owners;
+  mutable std::array<std::mutex, kLazyStripeCount> lazy_stripes;
+  std::vector<LSTableLazyBlockMeta> block_meta;
+  std::shared_ptr<std::atomic<size_t>> lazy_bytes_used;
+};
+
 struct LSTableColumnCacheEntry {
   uint64_t generation{0};
   slot_t col_index{0};
@@ -558,14 +625,42 @@ struct LSTableColumnCacheEntry {
   bool is_monotonic{false};
   bool is_unique_nonnull{false};
   bool is_identity_1_to_n{false};
+  bool is_block_lazy{false};
   int64_t min_int{std::numeric_limits<int64_t>::max()};
   int64_t max_int{std::numeric_limits<int64_t>::min()};
   std::vector<int64_t> integer_column;
+  std::unique_ptr<int64_t[]> integer_column_raw;
+  size_t integer_column_raw_size{0};
+  std::unique_ptr<uint8_t[]> narrow_codes_raw;
+  size_t narrow_codes_raw_size{0};
   LSTableColumnDictionary dictionary;
   std::shared_ptr<const BloomRuntimeFilter> integer_membership;
   std::vector<LSTableColumnBlock> blocks;
   std::shared_ptr<const platform::MemoryMap> backing_mmap;
+  std::shared_ptr<const LSTableLazyColumnState> lazy_state;
   std::shared_ptr<ProcessMemoryCharge> memory_charge;
+
+  [[nodiscard]] std::span<const int64_t> IntegerColumnSpan() const noexcept {
+    if (integer_column_raw != nullptr) {
+      return {integer_column_raw.get(), integer_column_raw_size};
+    }
+    return integer_column;
+  }
+
+  [[nodiscard]] size_t LazyDecodedBlockCount() const noexcept {
+    if (!lazy_state || !lazy_state->lazy_blocks) {
+      return 0;
+    }
+    size_t count = 0;
+    const size_t n = blocks.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (lazy_state->lazy_blocks[i].load(std::memory_order_acquire) !=
+          nullptr) {
+        ++count;
+      }
+    }
+    return count;
+  }
 };
 
 struct LSTableStore {
@@ -631,6 +726,26 @@ struct LSTableStore {
   std::shared_ptr<const platform::MemoryMap> backing_mmap;
   std::shared_ptr<ProcessMemoryCharge> memory_charge;
   std::string_view serialized_column_stats;
+  bool is_block_lazy{false};
+
+  [[nodiscard]] bool ColumnIsLazy(slot_t col) const noexcept {
+    return is_block_lazy && col < column_owners.size() &&
+           column_owners[col] != nullptr && column_owners[col]->is_block_lazy;
+  }
+
+  struct LazyBlockScratch {
+    LSTablePageBlock block;
+    std::vector<std::unique_ptr<LSTableLazyDecodedBlock>> transient;
+  };
+
+  [[nodiscard]] const LSTableColumnBlock* ResolveBlockColumn(
+      size_t bi, slot_t col,
+      std::vector<std::unique_ptr<LSTableLazyDecodedBlock>>* transient_out)
+      const;
+
+  [[nodiscard]] const LSTablePageBlock* MaterializeBlockView(
+      size_t bi, LazyBlockScratch* scratch,
+      std::span<const slot_t> needed_cols = {}) const;
 
   // One lazily built, budgeted index per store. Replacing the store after a
   // layout/snapshot change also replaces this index; outstanding readers
@@ -679,7 +794,8 @@ struct LSTableStore {
 
 [[nodiscard]] std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     Transaction& txn, const Table& table, bool allow_lazy_build,
-    const std::vector<slot_t>* projection = nullptr);
+    const std::vector<slot_t>* projection = nullptr,
+    bool allow_block_lazy = false);
 
 [[nodiscard]] std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
     uint64_t generation, size_t col_count,

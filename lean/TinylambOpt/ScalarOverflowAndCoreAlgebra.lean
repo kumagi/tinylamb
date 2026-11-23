@@ -567,7 +567,9 @@ theorem int64_identities_negation_and_abs_sound
 - `canonicalize_comparison`, `canonicalize_boolean`
 - `not_like`, `not_not_like`, `not_is_null`, `not_is_not_null`, `is_null_of_null_check`, `is_not_null_of_null_check`, `like_equality`, `not_like_equality`
 - `singleton_in`, `dedupe_in_list`, `or_of_ranges_to_in`, `inner_join_not_null_inference`, `boolean_filter_pullup`
-- `simplify_case`, `uniform_case_result`, `if_to_case`, `predicate_pushdown_case`
+- `simplify_case`, `uniform_case_result`, `predicate_pushdown_case`
+  (`if_to_case` はスキーマ依存の分岐型昇格を CASE では保てないため C++ 側から削除済み;
+  下の IF→CASE 同値補題は参考として残す)
 - `greatest_least_fold`, `concat_flatten`, `array_flatten_optimization`, `collapse_nested_identical_cast`, `numeric_widening_cast`, `deterministic_function_cse`, `regexp_prefix_extraction`
 -/
 
@@ -730,7 +732,8 @@ def evalCase {α : Type} : List (SqlBool × SqlVal α) → SqlVal α → SqlVal 
   | (cond, res) :: rest, elseVal =>
     if cond.inWhere then res else evalCase rest elseVal
 
-/-- ✅ **完全正当性 (`simplify_case`, `uniform_case_result`, `if_to_case`, `predicate_pushdown_case`)** -/
+/-- ✅ **完全正当性 (`simplify_case`, `uniform_case_result`, `predicate_pushdown_case`)** —
+    IF→CASE の同値性は削除済みルール `if_to_case` の補題として残す -/
 theorem case_and_if_pushdown_rules_sound {α β : Type}
     (clauses : List (SqlBool × SqlVal α)) (elseVal v : SqlVal α)
     (c : SqlBool) (t e : SqlVal α) (f : SqlVal α → β) :

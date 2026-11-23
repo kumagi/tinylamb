@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cstdint>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -51,7 +53,7 @@ TEST(RegexGuardNestedRepetitionTest, AllowsDeterministicOrBoundedShapes) {
       "a{2,4}",           // bounded repeat
       "(a+){3}",          // exact-count repeat of a variable operand
       "(cat|dog|bird)+",  // distinct fixed-length branches
-      "(a|bc)*",          // disjoint fixed-length branches stay allowed
+      "(a|bc)*",          // different-length branches with disjoint first sets
       "[0-9]+",           // character class
       "[^a-z]*",          // negated class
       "\\d{4}-\\d{2}",    // escapes with bounded repeat
@@ -111,6 +113,8 @@ TEST(RegexGuardCompileTest, CachedPatternsKeepIndependentPrograms) {
 
 TEST(RegexGuardCompileTest, OneCacheMissPreservesOtherPrograms) {
   static thread_local int compiles = 0;
+  static std::atomic<std::uint64_t> invocation{0};
+  const std::uint64_t run = invocation.fetch_add(1, std::memory_order_relaxed);
   constexpr auto transform = [](const std::string& pattern) {
     ++compiles;
     return pattern;
@@ -118,13 +122,15 @@ TEST(RegexGuardCompileTest, OneCacheMissPreservesOtherPrograms) {
   const int before = compiles;
   for (int i = 0; i < 9; ++i) {
     ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
-                    "cache-capacity-" + std::to_string(i))
+                    "cache-capacity-" + std::to_string(run) + "-" +
+                    std::to_string(i))
                     .HasValue());
   }
   ASSERT_EQ(compiles, before + 9);
-  ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
-                  "cache-capacity-1")
-                  .HasValue());
+  ASSERT_TRUE(
+      regex_guard_detail::CompileCheckedPattern<transform>(
+          "cache-capacity-" + std::to_string(run) + "-1")
+          .HasValue());
   EXPECT_EQ(compiles, before + 9);
 }
 
@@ -312,6 +318,80 @@ TEST(RegexGuardTest, LargeReplacementTemplateCachedUnderBudget) {
     EXPECT_EQ(ReplacementProgramFullCompilesForTest(),
               before + 2 + static_cast<size_t>(i));
   }
+}
+
+TEST(RegexGuardTest, CheckedRegexContainsMatchesReferenceAcrossPatterns) {
+  struct FastRegexGuard {
+    ~FastRegexGuard() { SetFastRegexDisabledForTest(false); }
+  } guard;
+
+  const std::vector<std::string> patterns{
+      "",
+      "a",
+      "checkout-[0-9]+-vip",
+      "(ab|cd)[0-9]+(xy|zw)",
+      "(ab|b)c",  // ThompsonSearch start-injection-at-every-pos trap on "xbc"
+      "(abc)+",
+      "abc+",
+      "a*",
+      "a+b?",
+      "foo|bar",
+      "(foo.*1|foo.*2)",
+      "[0-9]{2}-[a-z]{3}",
+      "[^0-9]+",
+      R"(\d+\s+\w+)",
+      "a.b",
+      R"(^prefix_[0-9]+$)",
+      "(?:ab|cd)*ef",
+  };
+  const std::vector<std::string> inputs{
+      "",
+      "a",
+      "b",
+      "xbc",
+      "ab",
+      "abc",
+      "abcc",
+      "abcabc",
+      "zzzcheckout-42-vip_ok",
+      "checkout-vip",
+      "xxcd99zw_tail",
+      "xxcdzw",
+      "12-abc",
+      "1-abc",
+      "123\tword_9",
+      "a\nb",
+      "a\rb",
+      "aXb",
+      "prefix_123",
+      "prefix_123_extra",
+      "foo_mid_2",
+      "ef",
+      "\xE6\x97\xA5"
+      "abc\xE6\x9C\xAC",
+      std::string("p:a\0b:q", 7),
+  };
+
+  for (const std::string& pat : patterns) {
+    const std::regex re(pat);
+    for (const std::string& in : inputs) {
+      SCOPED_TRACE(pat);
+      SCOPED_TRACE(in);
+      const bool expected = std::regex_search(in.begin(), in.end(), re);
+      SetFastRegexDisabledForTest(true);
+      auto off = CheckedRegexContains(in, pat);
+      ASSERT_TRUE(off.HasValue());
+      EXPECT_EQ(off.Value(), expected);
+      SetFastRegexDisabledForTest(false);
+      auto on = CheckedRegexContains(in, pat);
+      ASSERT_TRUE(on.HasValue());
+      EXPECT_EQ(on.Value(), expected);
+    }
+  }
+
+  // Invalid and nested-repetition patterns must still error cleanly.
+  EXPECT_FALSE(CheckedRegexContains("aaa", "(a+)+").HasValue());
+  EXPECT_FALSE(CheckedRegexContains("abc", "([unclosed").HasValue());
 }
 
 }  // namespace tinylamb

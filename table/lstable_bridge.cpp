@@ -110,6 +110,9 @@ bool DecodeRowImageIntoBlock(std::string_view image, slot_t slot_id,
                              const std::vector<uint8_t>& loaded_columns,
                              LSTablePageBlock* block) {
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  // Every DeserializeSlot below (the header count and both VARCHAR lengths)
+  // is preceded by an explicit end-of-image bounds check; a short/forged
+  // image returns false here rather than feeding decoded junk downstream.
   if (image.size() < sizeof(slot_t)) {
     return false;
   }
@@ -634,6 +637,10 @@ size_t TransferColumnarCharge(const std::shared_ptr<ProcessMemoryCharge>& from,
   if (requested_bytes == 0 || !from || !to) {
     return 0;
   }
+  // TransferTo moves the charge in one noexcept step: it cannot throw or fail
+  // after the source has been debited (a pool mismatch is rejected up front),
+  // so the accounting can never lose the bytes between a Release and a
+  // ReserveForced.
   return from->TransferTo(*to, requested_bytes);
 }
 
@@ -644,8 +651,13 @@ void ExtractColumnsFromStore(
     std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>* cols_io) {
   const Schema& schema = table.GetSchema();
   const size_t nblocks = src.blocks.size();
+  // first_pid/owner alone do not identify a layout: a rebuild at the same
+  // generation can change the row count, and a stale generation would pair
+  // old row counts / page LSNs with the freshly extracted columns.
   if (!*layout_io || (*layout_io)->first_pid != src.first_pid ||
-      (*layout_io)->uncommitted_owner_txn != src.uncommitted_owner_txn) {
+      (*layout_io)->uncommitted_owner_txn != src.uncommitted_owner_txn ||
+      (*layout_io)->generation != generation ||
+      (*layout_io)->total_rows != src.total_rows) {
     auto layout = std::make_shared<LSTableBlockLayout>();
     layout->generation = generation;
     layout->first_pid = src.first_pid;
@@ -756,6 +768,10 @@ void ExtractColumnsFromStore(
                             .subspan(row_base, rc);
       }
       if (!col.for16_codes.empty()) {
+        // Reinterpreting object bytes as unsigned char is explicitly allowed
+        // by the aliasing rules, and the byte length is scaled from uint16_t
+        // to uint8_t, so no alignment/endian assumption is made here (the
+        // same pattern is used for the other for16_codes views in this file).
         col.for_bytes = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(col.for16_codes.data()),
             col.for16_codes.size() * sizeof(uint16_t));
@@ -794,6 +810,11 @@ bool LSTablePageBlock::MatchesZoneMaps(
       const LSTableColumnBlock& col = columns[cmp.column];
       if (col.type != ValueType::kInt64 && col.type != ValueType::kDate) {
         return false;
+      }
+      // Signed min/max and bloom comparisons cannot prune an unsigned
+      // column. Let the row-level predicate evaluate it in the right domain.
+      if (col.is_unsigned) {
+        continue;
       }
       if (!col.has_min_max) {
         return false;
@@ -934,6 +955,9 @@ std::shared_ptr<const LSTableIntegerRunBounds> LSTableStore::IntegerRunBounds(
         (column_has_null[value_column] != 0U)) {
       return nullptr;
     }
+    // IntegerRuns() took and released this same latch before returning; no
+    // second mutex is held here, so there is no nested acquisition/ordering
+    // hazard with the lock in IntegerRuns().
     std::scoped_lock lock(integer_runs_mutex_);
     if (integer_run_bounds_ && integer_run_bounds_->key_column == key_column &&
         integer_run_bounds_->value_column == value_column) {
@@ -1072,7 +1096,7 @@ StatusOr<ExecResult> LSTableStore::ExecuteFragment(const Fragment& fragment,
   return Execute(runtime, artifacts, fragment, *lstable_schema);
 }
 
-std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
+static std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
     Transaction& txn, const Table& table, const std::vector<slot_t>* projection,
     uint64_t max_bytes, bool cache_in_table,
     std::shared_ptr<LSTableStore>* mutable_out) {
@@ -2205,6 +2229,189 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(
                                /*mutable_out=*/nullptr);
 }
 
+namespace {
+
+void CopyColumnBlockView(const LSTableColumnBlock& src,
+                         const LSTableColumnDictionary* dst_dict,
+                         LSTableColumnBlock* dst) noexcept {
+  dst->type = src.type;
+  dst->is_unsigned = src.is_unsigned;
+  dst->has_null = src.has_null;
+  dst->has_min_max = src.has_min_max;
+  dst->has_double_min_max = src.has_double_min_max;
+  dst->has_nan = src.has_nan;
+  dst->all_single_byte_varchar = src.all_single_byte_varchar;
+  dst->for_width = src.for_width;
+  dst->for_base = src.for_base;
+  dst->min_int = src.min_int;
+  dst->max_int = src.max_int;
+  dst->min_double = src.min_double;
+  dst->max_double = src.max_double;
+  dst->dict = dst_dict;
+  dst->wide_code_begin = src.wide_code_begin;
+  dst->wide_code_count = src.wide_code_count;
+  dst->dict_mask = src.dict_mask;
+  dst->dict_codes = src.dict_codes;
+  dst->int_cells = src.int_cells;
+  dst->is_const_code = src.is_const_code;
+  dst->has_code_min_max = src.has_code_min_max;
+  dst->const_code = src.const_code;
+  dst->min_code = src.min_code;
+  dst->max_code = src.max_code;
+  dst->min_nonzero_code = src.min_nonzero_code;
+  if (!src.for_bytes.empty()) {
+    dst->for_bytes = src.for_bytes;
+  } else if (!src.for16_codes.empty()) {
+    dst->for_bytes = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(src.for16_codes.data()),
+        src.for16_codes.size() * sizeof(uint16_t));
+  } else {
+    dst->for_bytes = {};
+  }
+  dst->nulls_view = src.Nulls();
+  dst->varchar_bytes_view = src.VarcharBytes();
+  dst->varchar_ends_view = src.VarcharEnds();
+  dst->block_bloom = src.block_bloom;
+}
+
+}  // namespace
+
+const LSTableColumnBlock* LSTableStore::ResolveBlockColumn(
+    size_t bi, slot_t col,
+    std::vector<std::unique_ptr<LSTableLazyDecodedBlock>>* transient_out)
+    const {
+  if (bi >= blocks.size() || !HasColumn(col)) {
+    return nullptr;
+  }
+  if (!ColumnIsLazy(col)) {
+    return &blocks[bi].columns[col];
+  }
+  const std::shared_ptr<const LSTableColumnCacheEntry>& entry =
+      column_owners[col];
+  if (!entry || !entry->lazy_state || !entry->lazy_state->lazy_blocks ||
+      bi >= entry->blocks.size()) {
+    return nullptr;
+  }
+  const LSTableLazyColumnState& lazy = *entry->lazy_state;
+  if (const LSTableColumnBlock* cached =
+          lazy.lazy_blocks[bi].load(std::memory_order_acquire);
+      cached != nullptr) {
+    return cached;
+  }
+  if (!lazy.backing_tlcs) {
+    return nullptr;
+  }
+  std::unique_ptr<LSTableLazyDecodedBlock> decoded;
+  if (!lazy.backing_tlcs->DecodeSingleColumnBlockForCache(
+          static_cast<uint32_t>(bi), col, *entry, &decoded) ||
+      decoded == nullptr) {
+    return nullptr;
+  }
+  auto charge =
+      std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+  const bool budgeted = decoded->charged_bytes == 0 ||
+                        charge->TryAddWithReclaim(decoded->charged_bytes);
+  if (budgeted) {
+    decoded->memory_charge = std::move(charge);
+    std::scoped_lock lk(
+        lazy.lazy_stripes[bi & (LSTableLazyColumnState::kLazyStripeCount - 1)]);
+    if (const LSTableColumnBlock* winner =
+            lazy.lazy_blocks[bi].load(std::memory_order_relaxed);
+        winner != nullptr) {
+      return winner;
+    }
+    std::shared_ptr<const LSTableLazyDecodedBlock> owned = std::move(decoded);
+    const size_t charged = owned->charged_bytes;
+    const LSTableColumnBlock* ptr = &owned->block;
+    lazy.lazy_owners[bi] = std::move(owned);
+    if (lazy.lazy_bytes_used && charged > 0) {
+      lazy.lazy_bytes_used->fetch_add(charged, std::memory_order_relaxed);
+    }
+    lazy.lazy_blocks[bi].store(ptr, std::memory_order_release);
+    return ptr;
+  }
+  if (transient_out == nullptr) {
+    return nullptr;
+  }
+  transient_out->push_back(std::move(decoded));
+  return &transient_out->back()->block;
+}
+
+const LSTablePageBlock* LSTableStore::MaterializeBlockView(
+    size_t bi, LazyBlockScratch* scratch,
+    std::span<const slot_t> needed_cols) const {
+  if (bi >= blocks.size()) {
+    return nullptr;
+  }
+  if (!is_block_lazy) {
+    return &blocks[bi];
+  }
+  if (scratch == nullptr) {
+    return nullptr;
+  }
+  const LSTablePageBlock& src_b = blocks[bi];
+  LSTablePageBlock& dst_b = scratch->block;
+  dst_b.page_id = src_b.page_id;
+  dst_b.page_lsn = src_b.page_lsn;
+  dst_b.row_count = src_b.row_count;
+  dst_b.has_any_null = src_b.has_any_null;
+  dst_b.identity_slots = src_b.identity_slots;
+  if (!src_b.identity_slots) {
+    dst_b.slots = src_b.slots;
+  }
+  if (dst_b.columns.size() != src_b.columns.size() ||
+      dst_b.columns.Stored().size() != src_b.columns.Stored().size()) {
+    if (loaded_columns.empty()) {
+      dst_b.columns.resize(src_b.columns.size());
+    } else {
+      size_t kept = 0;
+      for (const uint8_t b : loaded_columns) {
+        kept += (b != 0) ? 1 : 0;
+      }
+      dst_b.columns.Project(column_offsets, kept);
+    }
+  }
+  auto materialize_col = [&](slot_t c) -> bool {
+    // dst_b.columns may be projected: Contains() maps the original column
+    // number through the offset table, so an unloaded column must be skipped
+    // here instead of letting operator[]'s .at() throw across the Status
+    // boundary.
+    if (!HasColumn(c) || c >= src_b.columns.size() ||
+        !dst_b.columns.Contains(c)) {
+      return true;
+    }
+    if (ColumnIsLazy(c)) {
+      const LSTableColumnBlock* resolved =
+          ResolveBlockColumn(bi, c, &scratch->transient);
+      if (resolved == nullptr) {
+        return false;
+      }
+      CopyColumnBlockView(
+          *resolved, resolved->dict != nullptr ? &dictionaries[c] : nullptr,
+          &dst_b.columns[c]);
+    } else {
+      const LSTableColumnBlock& dense = src_b.columns[c];
+      CopyColumnBlockView(dense, dense.dict, &dst_b.columns[c]);
+    }
+    return true;
+  };
+  if (needed_cols.empty()) {
+    const size_t col_count = src_b.columns.size();
+    for (size_t c = 0; c < col_count; ++c) {
+      if (!materialize_col(static_cast<slot_t>(c))) {
+        return nullptr;
+      }
+    }
+  } else {
+    for (const slot_t c : needed_cols) {
+      if (!materialize_col(c)) {
+        return nullptr;
+      }
+    }
+  }
+  return &dst_b;
+}
+
 std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
     uint64_t generation, size_t col_count,
     const std::shared_ptr<const LSTableBlockLayout>& layout,
@@ -2286,8 +2493,11 @@ std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
     store->column_min_int[c] = entry->min_int;
     store->column_max_int[c] = entry->max_int;
     store->dictionaries[c] = MakeDictionaryView(entry->dictionary);
-    store->integer_columns_view[c] = entry->integer_column;
+    store->integer_columns_view[c] = entry->IntegerColumnSpan();
     store->integer_membership[c] = entry->integer_membership;
+    if (entry->is_block_lazy) {
+      store->is_block_lazy = true;
+    }
   }
 
   store->blocks.resize(nblocks);
@@ -2318,42 +2528,8 @@ std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
       }
       const LSTableColumnBlock& src = entry->blocks[bi];
       LSTableColumnBlock& dst = dst_b.columns[c];
-      dst.type = src.type;
-      dst.is_unsigned = src.is_unsigned;
-      dst.has_null = src.has_null;
-      dst.has_min_max = src.has_min_max;
-      dst.has_double_min_max = src.has_double_min_max;
-      dst.has_nan = src.has_nan;
-      dst.all_single_byte_varchar = src.all_single_byte_varchar;
-      dst.for_width = src.for_width;
-      dst.for_base = src.for_base;
-      dst.min_int = src.min_int;
-      dst.max_int = src.max_int;
-      dst.min_double = src.min_double;
-      dst.max_double = src.max_double;
-      dst.dict = (src.dict != nullptr) ? &store->dictionaries[c] : nullptr;
-      dst.wide_code_begin = src.wide_code_begin;
-      dst.wide_code_count = src.wide_code_count;
-      dst.dict_mask = src.dict_mask;
-      dst.dict_codes = src.dict_codes;
-      dst.int_cells = src.int_cells;
-      dst.is_const_code = src.is_const_code;
-      dst.has_code_min_max = src.has_code_min_max;
-      dst.const_code = src.const_code;
-      dst.min_code = src.min_code;
-      dst.max_code = src.max_code;
-      dst.min_nonzero_code = src.min_nonzero_code;
-      if (!src.for_bytes.empty()) {
-        dst.for_bytes = src.for_bytes;
-      } else if (!src.for16_codes.empty()) {
-        dst.for_bytes = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(src.for16_codes.data()),
-            src.for16_codes.size() * sizeof(uint16_t));
-      }
-      dst.nulls_view = src.Nulls();
-      dst.varchar_bytes_view = src.VarcharBytes();
-      dst.varchar_ends_view = src.VarcharEnds();
-      dst.block_bloom = src.block_bloom;
+      CopyColumnBlockView(
+          src, (src.dict != nullptr) ? &store->dictionaries[c] : nullptr, &dst);
       if (dst.has_null) {
         dst_b.has_any_null = true;
       }
@@ -2364,7 +2540,7 @@ std::shared_ptr<const LSTableStore> AssembleLSTableStoreView(
 
 std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     Transaction& txn, const Table& table, bool allow_lazy_build,
-    const std::vector<slot_t>* projection) {
+    const std::vector<slot_t>* projection, bool allow_block_lazy) {
   if (txn.IsFailed() || table.RowsRewrittenInPlace()) {
     return nullptr;
   }
@@ -2374,7 +2550,8 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
   }
   std::shared_ptr<const LSTableStore> current = table.GetLSTableStore();
   if (current != nullptr && current->layout_generation == generation &&
-      current->first_pid == table.FirstPageId()) {
+      current->first_pid == table.FirstPageId() &&
+      (allow_block_lazy || !current->is_block_lazy)) {
     if (current->uncommitted_owner_txn == 0 ||
         current->uncommitted_owner_txn == txn.ID()) {
       return current;
@@ -2382,10 +2559,23 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     txn.SweepCommittedVersionChains();
     if (!txn.HasAnyPageVersionChains() &&
         (txn.IsReadOnly() || txn.WriteSetEmpty())) {
-      return BuildLSTableStore(txn, table);
+      if (auto rebuilt = BuildLSTableStore(txn, table);
+          rebuilt != nullptr &&
+          rebuilt->layout_generation == table.LayoutGeneration()) {
+        return rebuilt;
+      }
     }
     return nullptr;
   }
+  // A cached physical image is only safe when this snapshot can do a physical
+  // read: with registered MVCC version chains the txn's logical view differs
+  // from any physical store, so every cached-store return below must pass
+  // this gate (fresh builds are exempt — they are built under this txn).
+  const auto physical_snapshot_safe = [&]() {
+    txn.SweepCommittedVersionChains();
+    return !txn.HasAnyPageVersionChains() &&
+           (txn.IsReadOnly() || txn.WriteSetEmpty());
+  };
   const Schema& schema = table.GetSchema();
   const slot_t col_count = schema.ColumnCount();
   std::vector<uint32_t> req_cols;
@@ -2393,23 +2583,76 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     if (!CanonicalizeProjection(*projection, col_count, &req_cols)) {
       return nullptr;
     }
+  } else {
+    req_cols.resize(col_count);
+    for (slot_t c = 0; c < col_count; ++c) {
+      req_cols[c] = c;
+    }
+  }
+  if (!req_cols.empty()) {
     if (auto cached_view = table.GetCachedLSTableView(generation, req_cols);
         cached_view != nullptr &&
         cached_view->layout_generation == generation &&
         cached_view->first_pid == table.FirstPageId() &&
+        (allow_block_lazy || !cached_view->is_block_lazy) &&
         (cached_view->uncommitted_owner_txn == 0 ||
          cached_view->uncommitted_owner_txn == txn.ID())) {
-      return cached_view;
+      if (physical_snapshot_safe()) {
+        return cached_view;
+      }
     }
+  }
+  if (projection != nullptr) {
     const auto partial = table.GetProjectedLSTableStore();
     if (partial != nullptr && partial->layout_generation == generation &&
         partial->first_pid == table.FirstPageId() &&
+        (allow_block_lazy || !partial->is_block_lazy) &&
         (partial->uncommitted_owner_txn == 0 ||
          partial->uncommitted_owner_txn == txn.ID()) &&
         std::ranges::all_of(req_cols, [&](uint32_t c) {
           return c < col_count && partial->HasColumn(static_cast<slot_t>(c));
         })) {
-      return partial;
+      if (physical_snapshot_safe()) {
+        return partial;
+      }
+    }
+  }
+  if (!req_cols.empty() && LSTableStore::SupportsSchema(schema)) {
+    auto cached_layout = table.GetLSTableBlockLayout(generation);
+    if (cached_layout != nullptr &&
+        cached_layout->first_pid == table.FirstPageId() &&
+        (cached_layout->uncommitted_owner_txn == 0 ||
+         cached_layout->uncommitted_owner_txn == txn.ID())) {
+      std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
+          cached_entries(col_count);
+      bool all_cached = true;
+      for (const uint32_t c32 : req_cols) {
+        const auto c = static_cast<slot_t>(c32);
+        auto entry = table.GetCachedLSTableColumn(c, generation);
+        if (!entry || (!allow_block_lazy && entry->is_block_lazy)) {
+          all_cached = false;
+          break;
+        }
+        cached_entries[c] = std::move(entry);
+      }
+      if (all_cached && physical_snapshot_safe()) {
+        if (auto view =
+                AssembleLSTableStoreView(generation, col_count, cached_layout,
+                                         cached_entries, projection)) {
+          bool covers_request = true;
+          for (const uint32_t c32 : req_cols) {
+            if (!view->HasColumn(static_cast<slot_t>(c32))) {
+              covers_request = false;
+              break;
+            }
+          }
+          if (covers_request) {
+            table.RefillCachedLSTableView(
+                generation, std::vector<uint32_t>(req_cols), view);
+            return view;
+          }
+        }
+      }
     }
   }
   // Reaching here means the cached store is stale (different generation or
@@ -2433,28 +2676,66 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
   const bool valid_tlcs = backing_tlcs != nullptr &&
                           backing_tlcs->LayoutGeneration() == generation &&
                           backing_tlcs->FirstPageId() == table.FirstPageId();
-  if (valid_tlcs && projection != nullptr) {
+  if (valid_tlcs) {
     if (auto resident = backing_tlcs->ResidentStore();
         resident != nullptr && resident->layout_generation == generation &&
         resident->first_pid == table.FirstPageId()) {
       table.RefillLSTableStore(resident);
       return resident;
     }
+    const bool use_block_lazy = allow_block_lazy &&
+                                backing_tlcs->TotalRows() >= 65536 &&
+                                backing_tlcs->HasColumnSynopses();
+    if (!use_block_lazy && projection == nullptr &&
+        table.LSTableCapacityRejected(generation)) {
+      return nullptr;
+    }
     if (!LSTableStore::SupportsSchema(schema)) {
       return nullptr;
+    }
+    if (!use_block_lazy && projection == nullptr) {
+      std::vector<slot_t> all_slots;
+      all_slots.reserve(req_cols.size());
+      for (const uint32_t c32 : req_cols) {
+        all_slots.push_back(static_cast<slot_t>(c32));
+      }
+      const uint64_t est_all =
+          backing_tlcs->EstimateColumnsCacheBytes(schema, all_slots);
+      const uint64_t eff_limit =
+          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit);
+      const auto& budget = ProcessMemoryBudget::Global();
+      const size_t col_limit =
+          std::min(budget.ColumnarPoolLimit(),
+                   budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
+      if (est_all > eff_limit || (col_limit > 0 && est_all > col_limit)) {
+        table.NoteLSTableCapacityRejected(generation);
+        return nullptr;
+      }
     }
     std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> col_entries(
         col_count);
     std::vector<slot_t> missing_cols;
+    std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> existing_lazy;
+    bool has_existing_lazy = false;
     for (const uint32_t c32 : req_cols) {
       const auto c = static_cast<slot_t>(c32);
       if (auto cached = table.GetCachedLSTableColumn(c, generation)) {
-        col_entries[c] = std::move(cached);
-      } else {
+        if (use_block_lazy || !cached->is_block_lazy) {
+          col_entries[c] = std::move(cached);
+          continue;
+        }
         if (table.LSTableColumnRejected(c, generation)) {
           return nullptr;
         }
         missing_cols.push_back(c);
+        existing_lazy.push_back(std::move(cached));
+        has_existing_lazy = true;
+      } else {
+        if (!use_block_lazy && table.LSTableColumnRejected(c, generation)) {
+          return nullptr;
+        }
+        missing_cols.push_back(c);
+        existing_lazy.push_back(nullptr);
       }
     }
     auto layout = table.GetLSTableBlockLayout(generation);
@@ -2466,37 +2747,54 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
       table.RefillLSTableBlockLayout(generation, layout);
     }
     if (!missing_cols.empty()) {
-      const size_t est_missing =
-          backing_tlcs->EstimateColumnsCacheBytes(schema, missing_cols);
-      const auto& budget = ProcessMemoryBudget::Global();
-      const size_t col_limit =
-          std::min(budget.ColumnarPoolLimit(),
-                   budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
-      if (col_limit > 0 && budget.ColumnarUsed() + est_missing > col_limit) {
-        table.EvictIdleColumnarHeadroom((budget.ColumnarUsed() + est_missing) -
-                                        col_limit);
-      }
-      const uint64_t eff_limit =
-          EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit);
-      std::vector<slot_t> rejected_cols;
-      auto built = backing_tlcs->BuildColumnCacheEntries(
-          schema, generation, missing_cols, eff_limit, &rejected_cols);
-      for (const slot_t rc : rejected_cols) {
-        table.NoteLSTableColumnRejected(rc, generation);
-      }
-      bool all_built = built.size() == missing_cols.size();
-      for (size_t i = 0; i < missing_cols.size(); ++i) {
-        if (i < built.size() && built[i] != nullptr) {
-          const slot_t c = missing_cols[i];
-          table.RefillCachedLSTableColumn(c, generation,
-                                          built[i]->estimated_bytes, built[i]);
-          col_entries[c] = std::move(built[i]);
-        } else {
-          all_built = false;
+      if (use_block_lazy) {
+        auto built = backing_tlcs->BuildLazyColumnCacheEntries(
+            schema, generation, missing_cols);
+        bool all_built = built.size() == missing_cols.size();
+        for (size_t i = 0; i < missing_cols.size(); ++i) {
+          if (i < built.size() && built[i] != nullptr) {
+            const slot_t c = missing_cols[i];
+            table.RefillCachedLSTableColumn(
+                c, generation, built[i]->estimated_bytes, built[i],
+                built[i]->lazy_state ? built[i]->lazy_state->lazy_bytes_used
+                                     : nullptr);
+            col_entries[c] = std::move(built[i]);
+          } else {
+            all_built = false;
+          }
         }
-      }
-      if (!all_built) {
-        return nullptr;
+        if (!all_built) {
+          return nullptr;
+        }
+      } else {
+        const uint64_t eff_limit =
+            EffectiveBuildByteLimit(LSTableStore::kBuildByteLimit);
+        std::vector<slot_t> rejected_cols;
+        auto built = backing_tlcs->BuildColumnCacheEntries(
+            schema, generation, missing_cols, eff_limit, &rejected_cols,
+            has_existing_lazy ? &existing_lazy : nullptr);
+        for (const slot_t rc : rejected_cols) {
+          // Only a column this caller actually requested may be marked as
+          // rejected for the generation; an implementation change in the
+          // builder must not permanently ban an unrelated column.
+          if (std::ranges::find(missing_cols, rc) != missing_cols.end()) {
+            table.NoteLSTableColumnRejected(rc, generation);
+          }
+        }
+        bool all_built = built.size() == missing_cols.size();
+        for (size_t i = 0; i < missing_cols.size(); ++i) {
+          if (i < built.size() && built[i] != nullptr) {
+            const slot_t c = missing_cols[i];
+            table.RefillCachedLSTableColumn(
+                c, generation, built[i]->estimated_bytes, built[i]);
+            col_entries[c] = std::move(built[i]);
+          } else {
+            all_built = false;
+          }
+        }
+        if (!all_built) {
+          return nullptr;
+        }
       }
     }
     auto view = AssembleLSTableStoreView(generation, col_count, layout,
@@ -2517,12 +2815,24 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
       full_limit =
           std::min(eff, std::max<uint64_t>(uint64_t{64} << 20, eff / 4));
     }
-    if (auto full = BuildLSTableStore(txn, table, nullptr, full_limit)) {
+    if (auto full = BuildLSTableStore(txn, table, nullptr, full_limit);
+        full != nullptr &&
+        full->layout_generation == table.LayoutGeneration()) {
       return full;
     }
     if (full_limit != LSTableStore::kBuildByteLimit &&
         table.LayoutGeneration() == generation) {
-      table.NoteLSTableCapacityRejected(generation);
+      // A failure under the narrowed limit says nothing about its cause: an
+      // I/O error, snapshot mismatch or transient memory shortage looks the
+      // same as a genuine capacity failure here.  Retry at the full limit and
+      // let BuildLSTableStore record a capacity rejection only when the full
+      // build itself really runs out of budget.
+      if (auto full = BuildLSTableStore(txn, table, nullptr,
+                                        LSTableStore::kBuildByteLimit);
+          full != nullptr &&
+          full->layout_generation == table.LayoutGeneration()) {
+        return full;
+      }
     }
   }
   if (projection == nullptr || !table.LSTableCapacityRejected(generation)) {
@@ -2576,6 +2886,9 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
           std::min(budget.ColumnarPoolLimit(),
                    budget.EffectivePoolMaxBytes(MemoryPoolKind::kColumnar));
       if (col_limit > 0 && budget.ColumnarUsed() + est_missing > col_limit) {
+        // The global pool usage only decides *whether* to reclaim; the
+        // eviction itself walks this table's own incarnation columnar cache,
+        // so it cannot drop another table's hot column entries.
         table.EvictIdleColumnarHeadroom((budget.ColumnarUsed() + est_missing) -
                                         col_limit);
       }
@@ -2605,6 +2918,14 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
     }
     ExtractColumnsFromStore(*mutable_built, table, generation, missing_cols,
                             &layout, &col_entries);
+    // ExtractColumnsFromStore skips requested columns the built store does not
+    // carry.  Assembling that partial view would still succeed and cache it as
+    // satisfying the whole projection, so refuse it here instead.
+    for (const slot_t mc : missing_cols) {
+      if (col_entries[mc] == nullptr) {
+        return nullptr;
+      }
+    }
   }
   auto view = AssembleLSTableStoreView(generation, col_count, layout,
                                        col_entries, projection);

@@ -107,17 +107,22 @@ class FlatJoinValueBuckets {
 
   template <typename KeyLike>
   bool emplace(KeyLike&& key, Mapped value) {
+    EnsureBuckets();
     return emplace_bucket(std::forward<KeyLike>(key), value, BucketIndex(key));
   }
 
   template <typename KeyLike>
   bool emplace_hashed(KeyLike&& key, Mapped value, uint64_t hash) {
+    EnsureBuckets();
     return emplace_bucket(std::forward<KeyLike>(key), value,
                           static_cast<size_t>(hash) & (buckets_.size() - 1));
   }
 
   [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range(
       const Key& key) const {
+    if (buckets_.empty()) {
+      return {const_iterator(this, kNoEntry), const_iterator(this, kNoEntry)};
+    }
     const size_t bucket = BucketIndex(key);
     return {const_iterator(this, FindHead(key, bucket)),
             const_iterator(this, kNoEntry)};
@@ -125,6 +130,9 @@ class FlatJoinValueBuckets {
 
   [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range_hashed(
       const Key& key, uint64_t hash) const {
+    if (buckets_.empty()) {
+      return {const_iterator(this, kNoEntry), const_iterator(this, kNoEntry)};
+    }
     const size_t bucket = static_cast<size_t>(hash) & (buckets_.size() - 1);
     return {const_iterator(this, FindHead(key, bucket)),
             const_iterator(this, kNoEntry)};
@@ -154,6 +162,12 @@ class FlatJoinValueBuckets {
     uint32_t collision_next;
   };
 
+  void EnsureBuckets() {
+    if (buckets_.empty()) {
+      buckets_.assign(8, kNoEntry);
+    }
+  }
+
   template <typename KeyLike>
   bool emplace_bucket(KeyLike&& key, Mapped value, size_t bucket) {
     const uint32_t head = FindHead(key, bucket);
@@ -165,6 +179,9 @@ class FlatJoinValueBuckets {
   }
 
   [[nodiscard]] size_t BucketIndex(const Key& key) const {
+    if (buckets_.empty()) {
+      return 0;  // callers guard empty tables before dereferencing
+    }
     if constexpr (std::is_same_v<Key, int64_t>) {
       uint64_t x = static_cast<uint64_t>(key) * 0x9e3779b97f4a7c15ULL;
       x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;

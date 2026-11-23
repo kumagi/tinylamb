@@ -1037,10 +1037,10 @@ Status HashJoin::MaterializeSingle() {
   // partition-by-partition, so reload any spilled input rather than dropping
   // the spilled rows and returning a wrong (missing) result.
   s.left.LoadAll();
-  s.right.LoadAll();
   if (s.left.spill_error != Status::kSuccess) {
     return s.left.spill_error;
   }
+  s.right.LoadAll();
   if (s.right.spill_error != Status::kSuccess) {
     return s.right.spill_error;
   }
@@ -2094,6 +2094,10 @@ Status HashJoin::SetupBothSpilled() {
   const size_t workers = std::min(worker_count_, kReactiveSpillPartitions);
   std::atomic<size_t> next_partition{0};
   Status error{Status::kSuccess};
+  // Leaf mutex: every acquisition below guards only `error` inside a single
+  // disjoint scope (a catch block or an error branch), and is released before
+  // the next one. It is never held while taking another mutex, so the repeated
+  // scoped_locks in this function cannot form an ABBA cycle.
   std::mutex error_mutex;
   std::vector<std::jthread> threads;
   threads.reserve(workers);
@@ -2166,6 +2170,9 @@ Status HashJoin::RunStripedProbe() {
   const size_t chunk = (n + workers - 1) / workers;
   std::vector<std::vector<PositionedRow>> outs(workers);
   Status error{Status::kSuccess};
+  // Leaf mutex: the two scoped_locks below live in disjoint catch blocks and
+  // guard only `error`. They are never nested and no other mutex is taken while
+  // this one is held, so there is no lock-order inversion here.
   std::mutex error_mutex;
   std::vector<std::jthread> threads;
   threads.reserve(workers);
@@ -2535,8 +2542,11 @@ Status HashJoin::MaterializeHybrid() {
     if (!resident_reserved && batch.Size() > 0) {
       // Reserve from the first real batch: batch.Size() is 0 right after
       // default construction, so reserving before the first NextBatch was a
-      // no-op and every later batch forced a reallocation.
-      resident_right.reserve(batch.Size());
+      // no-op and every later batch forced a reallocation. Use the batch's
+      // upper bound, not this batch's (possibly selectivity-shrunk) size:
+      // the first batch may hold a single row while later ones hold a full
+      // vector, and reserving only 1 would reallocate/copy on each of them.
+      resident_right.reserve(std::max(batch.Size(), kDefaultVectorSize));
       resident_reserved = true;
     }
     for (size_t i = 0; i < batch.Size(); ++i) {
@@ -2604,7 +2614,7 @@ Status HashJoin::MaterializeHybrid() {
   resident_right.shrink_to_fit();
   resident_charge.ReleaseAll();
 
-  for (size_t i = 0; i < HashJoin::kDefaultHybridPartitions; ++i) {
+  for (size_t i = 0; i < partitions; ++i) {
     if (Status st_sp = left_spill[i].FinishWriting();
         st_sp != Status::kSuccess) {
       return st_sp;
@@ -2615,7 +2625,7 @@ Status HashJoin::MaterializeHybrid() {
     }
   }
 
-  for (size_t i = 0; i < HashJoin::kDefaultHybridPartitions; ++i) {
+  for (size_t i = 0; i < partitions; ++i) {
     if (left_spill[i].Empty() && right_spill[i].Empty()) {
       continue;
     }

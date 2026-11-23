@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -27,10 +28,18 @@ namespace {
 // TINYLAMB_LOG_LEVEL may raise the process threshold above TRACE and filter
 // severities these tests assert are emitted. Pin the level for the test's
 // duration and restore it afterwards so the ambient environment cannot turn
-// the assertions red.
+// the assertions red. The threshold is process-global, so two overlapping
+// scopes must not interleave their writes: hold a process-wide lock for the
+// whole scope (not just the constructor) to serialize them.
+std::mutex& TraceLogLevelMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 class ScopedTraceLogLevel {
  public:
-  ScopedTraceLogLevel() : previous_(::tinylamb::detail::MinLogLevel()) {
+  ScopedTraceLogLevel()
+      : lock_(TraceLogLevelMutex()), previous_(::tinylamb::detail::MinLogLevel()) {
     ::tinylamb::detail::SetMinLogLevel(TRACE);
   }
   ~ScopedTraceLogLevel() { ::tinylamb::detail::SetMinLogLevel(previous_); }
@@ -39,6 +48,7 @@ class ScopedTraceLogLevel {
   ScopedTraceLogLevel& operator=(const ScopedTraceLogLevel&) = delete;
 
  private:
+  std::lock_guard<std::mutex> lock_;
   ::LogLevel previous_;
 };
 }  // namespace
@@ -64,6 +74,17 @@ TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
 
 TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
   ASSERT_DEATH({ LOG(FATAL) << "FATAL"; }, "FATAL");
+}
+
+TEST(LogMessageTest, UnknownSeverityReportsTheMessageWithoutAborting) {
+  const ScopedTraceLogLevel trace_level;
+  ::testing::internal::CaptureStderr();
+  LogMessage(static_cast<LogLevel>(65535), __FILE__, __LINE__, __func__, true)
+          .stream()
+      << "unrecognized-severity-message";
+  const std::string output = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(output.find("UNKNOWN LOG LEVEL"), std::string::npos);
+  EXPECT_NE(output.find("unrecognized-severity-message"), std::string::npos);
 }
 
 TEST(LogMessageTest, AuditConcurrentMessagesStayOnOneLine) {

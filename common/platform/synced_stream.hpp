@@ -57,10 +57,8 @@ class SyncedOStream : public std::ostream {
     }
   }
 
- private:
-  // Internal only: emit() mutates the stringbuf, so exposing it lets a caller
-  // race the destructor's emit() on another thread (and the std::osyncstream
-  // path has no such API). Public users should just let the destructor flush.
+  // Like std::osyncstream, submit the current buffer on demand. Each
+  // SyncedOStream instance belongs to the thread that writes to it.
   void emit() {
     const std::string pending = buffer_.str();
     if (pending.empty()) {
@@ -75,6 +73,7 @@ class SyncedOStream : public std::ostream {
     }
   }
 
+ private:
   static std::mutex& Mutex() {
     static std::mutex mu;
     return mu;

@@ -16,8 +16,9 @@
 
 namespace tinylamb {
 
-// In-memory fast path pattern-defeating quicksort for in-memory row
-// collections.
+// Historical name for the materialized-key sorting adapter. The current
+// implementation delegates ordering to std::sort; it does not promise a
+// particular standard-library sorting algorithm.
 class PdqSort {
  public:
   // `error` receives the first key-evaluation failure (comparators cannot

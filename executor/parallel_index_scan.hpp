@@ -87,9 +87,13 @@ class ParallelIndexScan final : public ExecutorBase {
   std::vector<slot_t> key_slots_;
   TransactionManager::IndexReadGuard index_read_guard_;
   std::vector<Morsel> morsels_;
-  size_t worker_count_;
+  size_t worker_count_{1};
 
   std::vector<std::jthread> workers_;
+  // The only mutex this operator takes. Every acquisition is a single scoped
+  // lock (the condition variables wait on it via unique_lock); no second
+  // mutex is ever held while acquiring it, and the base class's sticky-status
+  // mutex is a leaf with no reverse path, so there is no lock order to invert.
   std::mutex mutex_;
   std::condition_variable ready_cv_;
   std::condition_variable space_cv_;

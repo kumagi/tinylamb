@@ -35,6 +35,10 @@
 
 namespace tinylamb {
 
+// Up-front capacity for the lazy ascending scan's append-only buffer. Avoids a
+// geometric series of reallocations/copies for scans that read a large range.
+constexpr size_t kLazyScanInitialCapacity = 64;
+
 void LsmIndexIterator::Clear() {
   valid_ = false;
   entries_.clear();
@@ -69,6 +73,7 @@ LsmIndexIterator::LsmIndexIterator(LsmIndex* tree, Transaction* txn,
     // Lazy path: the cursor snapshots the tree once, then resolves and
     // yields entries one at a time, so consumers that stop early (LIMIT
     // pushdown) never pay to materialize the whole range.
+    emitted_.reserve(kLazyScanInitialCapacity);
     scan_cursor_ = pm->OpenLsmScanCursor(tree_->Root(), begin, end, txn_);
     if (PullNext()) {
       valid_ = true;
@@ -81,6 +86,10 @@ LsmIndexIterator::LsmIndexIterator(LsmIndex* tree, Transaction* txn,
   // Descending scans start at the last entry, which requires knowing the
   // whole range anyway; keep the eager materialization for them.
   entries_ = pm->LsmScanRange(tree_->Root(), begin, end, true, txn_, &status_);
+  // The range reader already resolved every value against this transaction's
+  // snapshot. Re-reading the live tree from Value() would repeat an LSM lookup
+  // for every materialized entry without improving visibility.
+  stable_leaf_cache_ = true;
   if (entries_.empty()) {
     valid_ = false;
     return;
@@ -126,6 +135,13 @@ std::string LsmIndexIterator::Key() const {
 }
 
 std::string LsmIndexIterator::Value() const {
+  // Mirror Key(): a lazy cursor may have failed while older entries are still
+  // buffered. Returning one of those while Key() reports no key would hand
+  // callers an inconsistent (empty key, non-empty value) entry and hide the
+  // error, so once status_ is set both accessors report no data.
+  if (status_ != Status::kSuccess) {
+    return {};
+  }
   const auto* e = valid_ ? EntryAt(idx_) : nullptr;
   if (e == nullptr) {
     return {};
@@ -146,12 +162,18 @@ std::string LsmIndexIterator::Value() const {
       // skip the stale entry instead of decoding it as a RowPosition.
       return {sizeof(uint64_t), '\0'};
     }
+    // A real read failure (I/O error, corruption, ...) must reach GetStatus()
+    // instead of silently falling through to the stale snapshot value.
+    status_ = live.GetStatus();
+    return {};
   }
   return e->second;
 }
 
 LsmIndexIterator& LsmIndexIterator::operator++() {
-  if (!valid_) {
+  // IsValid() also checks the sticky cursor status; do not advance past an
+  // entry once an error has been recorded.
+  if (!IsValid()) {
     return *this;
   }
   ++idx_;
@@ -178,7 +200,7 @@ LsmIndexIterator& LsmIndexIterator::operator++() {
 }
 
 LsmIndexIterator& LsmIndexIterator::operator--() {
-  if (!valid_) {
+  if (!IsValid()) {
     return *this;
   }
   if (idx_ == 0) {
@@ -187,6 +209,25 @@ LsmIndexIterator& LsmIndexIterator::operator--() {
     --idx_;
   }
   return *this;
+}
+
+bool LsmIndexIterator::SeekBefore(std::string_view key) {
+  if (scan_cursor_ != nullptr || status_ != Status::kSuccess) {
+    return false;
+  }
+  const auto it = std::lower_bound(
+      entries_.begin(), entries_.end(), key,
+      [](const auto& entry, std::string_view bound) {
+        return entry.first < bound;
+      });
+  if (it == entries_.begin()) {
+    valid_ = false;
+    idx_ = 0;
+    return false;
+  }
+  idx_ = static_cast<size_t>(it - entries_.begin() - 1);
+  valid_ = true;
+  return true;
 }
 
 std::ostream& operator<<(std::ostream& o, const LsmIndexIterator& it) {
@@ -265,7 +306,9 @@ StatusOr<std::vector<std::string>> LsmIndex::ScanPartitionBoundaries(
   const size_t step =
       std::max<size_t>(1, leaves_per_partition) * kKeysPerVirtualLeaf;
   std::vector<std::string> boundaries;
-  boundaries.reserve(entries.size() / step);
+  // The loop visits every step-th entry and emits at most one boundary per
+  // visited entry, so the tight bound is entries.size()/step (step >= 1).
+  boundaries.reserve((entries.size() / step) + 1);
   for (size_t i = step; i < entries.size(); i += step) {
     if (begin.empty() || entries[i].first > begin) {
       if (boundaries.empty() || entries[i].first > boundaries.back()) {

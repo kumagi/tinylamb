@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -103,6 +104,18 @@ class SqlBugfixRegressionTest : public ::testing::Test {
   std::unique_ptr<TransactionContext> context_;
   std::unique_ptr<SqlEngine> engine_;
 };
+
+TEST_F(SqlBugfixRegressionTest, CoalesceRejectsIncompatibleTypesInEitherOrder) {
+  EXPECT_TRUE(ErrorOf("SELECT COALESCE(NULL, 1, 'a')").has_value());
+  EXPECT_TRUE(ErrorOf("SELECT COALESCE(NULL, 'b', 1)").has_value());
+}
+
+TEST_F(SqlBugfixRegressionTest, ProjectionDoesNotHoistGuardedDivision) {
+  Exec("CREATE TABLE cse_rows (x INT64)");
+  Exec("INSERT INTO cse_rows VALUES (0), (2)");
+  EXPECT_EQ(Query("SELECT IF(x = 0, 0, 6 / x), IF(x = 0, 1, 6 / x) FROM cse_rows ORDER BY x"),
+            (std::vector<std::string>{"0,1", "3,3"}));
+}
 
 TEST_F(SqlBugfixRegressionTest, JoinDiscardsOverflowingSumGroup) {
   Exec("CREATE TABLE fact (k INT64, v INT64)");
@@ -398,7 +411,7 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   for (int base = 0; base < 4100; base += 820) {
     std::string insert = "INSERT INTO m17 VALUES ";
     // Each tuple contains a UINT64 literal plus punctuation and spacing.
-    insert.reserve(insert.size() + 24 * 820);
+    insert.reserve(insert.size() + (static_cast<size_type>(24 * 820)));
     for (int k = 0; k < 820; ++k) {
       const uint64_t value =
           18446744073709551615ULL - static_cast<uint64_t>(base + k);
@@ -807,10 +820,17 @@ TEST_F(SqlBugfixRegressionTest, ProtoSetPathDepthIsCapped) {
       *context_, "SELECT __proto_set('int64_key_1: 1', '" + deep_65 + "', 9)");
   ASSERT_TRUE(over.HasValue());
   over.Value().Drain();
-  EXPECT_NE(over.Value().GetStatus().GetMessage().find(
-                "proto field path exceeds 64 segments"),
+  // Like the StructSet sibling above, the diagnostic may ride either the
+  // result status or the engine's last_error_ depending on where the fold
+  // boundary lands.
+  const std::string detail =
+      over.Value().GetStatus().GetMessage().find("exceeds 64 segments") !=
+              std::string::npos
+          ? over.Value().GetStatus().GetMessage()
+          : engine_->LastError();
+  EXPECT_NE(detail.find("proto field path exceeds 64 segments"),
             std::string::npos)
-      << over.Value().GetStatus().GetMessage();
+      << detail << " / " << engine_->LastError();
   EXPECT_EQ(Query("SELECT __proto_set('f0 { f1 { f2: 1 } }', 'f0.f1.f2', 9)"),
             (std::vector<std::string>{"\"f0 { f1 { f2: 9 } }\""}));
 }
@@ -979,15 +999,9 @@ TEST_F(RouteNameResolutionTest, DuplicateSelectAliasInOrderBy) {
   // Distinct aliases, or ordering by an unambiguous key, stay legal.
   ExpectAcceptedOnBothRoutes("SELECT u, u AS u2 FROM ix ORDER BY u");
   ExpectAcceptedOnBothRoutes("SELECT u, u FROM ix ORDER BY v");
-  // Ordinals are never ambiguous.  (The relational fallback still rejects
-  // `ORDER BY 1` over duplicated output names; only the default route is
-  // asserted until that is fixed.)
-  {
-    const RouteOutcome o =
-        RunOnRoute(db_.get(), ctx_.get(), "SELECT u, u FROM ix ORDER BY 1",
-                   /*relational=*/false);
-    EXPECT_TRUE(o.ran) << o.error;
-  }
+  // Ordinals address the select-list position, even when output labels
+  // repeat.
+  ExpectAcceptedOnBothRoutes("SELECT u, u FROM ix ORDER BY 1");
 }
 
 // sql_aggregate_fuzz: GoogleSQL rejects DISTINCT aggregates whose inner

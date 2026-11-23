@@ -52,6 +52,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,17 +90,19 @@ namespace tinylamb {
 
 namespace {
 
-// ResultType must not infer ARRAY from a name suffix: a future scalar UDF
-// ending in `_array` would otherwise get a bogus static type and break schema
-// inference / UNION coercion. Keep the array-producing builtins explicit.
+// ARRAY inference must use an explicit builtin list, never a name suffix:
+// a scalar UDF named `foo_array` is not array-returning and would get a bogus
+// static type. Builtin names here (e.g. `split`) take precedence during
+// execution, so a same-named UDF cannot shadow a builtin. ResultType uses its
+// own static builtin mapping and falls back to VARCHAR for unknown functions.
 bool IsArrayReturningFunction(std::string_view name) {
   return name == "split" || name == "regexp_extract_all" ||
-         name == "regexp_extract_groups" || name == "json_keys" ||
-         name == "to_code_points" || name == "generate_series" ||
-         name == "generate_array" || name == "generate_date_array" ||
-         name == "generate_timestamp_array" || name == "json_extract_array" ||
-         name == "json_extract_string_array" || name == "json_query_array" ||
-         name == "json_value_array";
+         name == "byte_regexp_extract_all" || name == "regexp_extract_groups" ||
+         name == "json_keys" || name == "to_code_points" ||
+         name == "generate_series" || name == "generate_array" ||
+         name == "generate_date_array" || name == "generate_timestamp_array" ||
+         name == "json_extract_array" || name == "json_extract_string_array" ||
+         name == "json_query_array" || name == "json_value_array";
 }
 
 struct CivilTime {
@@ -157,7 +160,17 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (frac_str.size() > 9) {
         frac_str = frac_str.substr(0, 9);
       }
-      ct->subsecond_nanos = std::stoll(frac_str);
+      // from_chars cannot throw; stoll would turn a malformed fraction into
+      // an exception crossing the Status boundary of ParseCivilTime.
+      int64_t nanos = 0;
+      const char* frac_begin = frac_str.data();
+      const char* frac_end = frac_begin + frac_str.size();
+      const auto [parsed_end, parse_ec] =
+          std::from_chars(frac_begin, frac_end, nanos);
+      if (parse_ec != std::errc{} || parsed_end != frac_end) {
+        return false;
+      }
+      ct->subsecond_nanos = nanos;
     }
     matched = true;
   }
@@ -187,7 +200,17 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       if (frac_str.size() > 9) {
         frac_str = frac_str.substr(0, 9);
       }
-      ct->subsecond_nanos = std::stoll(frac_str);
+      // from_chars cannot throw; stoll would turn a malformed fraction into
+      // an exception crossing the Status boundary of ParseCivilTime.
+      int64_t nanos = 0;
+      const char* frac_begin = frac_str.data();
+      const char* frac_end = frac_begin + frac_str.size();
+      const auto [parsed_end, parse_ec] =
+          std::from_chars(frac_begin, frac_end, nanos);
+      if (parse_ec != std::errc{} || parsed_end != frac_end) {
+        return false;
+      }
+      ct->subsecond_nanos = nanos;
     }
     matched = true;
   }
@@ -207,8 +230,10 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
       return false;
     }
     if (ct->second == 60) {
+      // Keep the fractional part: CAST and the comparison path fold ":60.5"
+      // into the next minute with the .5 intact. Dropping it here made the
+      // same literal denote a different instant in function evaluation.
       ct->second = 0;
-      ct->subsecond_nanos = 0;
       ct->minute += 1;
       ct->hour += ct->minute / 60;
       ct->minute %= 60;
@@ -290,7 +315,7 @@ CivilTime ShiftCivilTimeSeconds(const CivilTime& ct, int64_t delta_seconds) {
     --out_days;
   }
   const std::chrono::year_month_day out_ymd{
-      std::chrono::sys_days{std::chrono::days{static_cast<int>(out_days)}}};
+      std::chrono::sys_days{std::chrono::days{out_days}}};
   CivilTime out = ct;
   out.year = int(out_ymd.year());
   out.month = static_cast<int>(static_cast<unsigned>(out_ymd.month()));
@@ -367,12 +392,14 @@ std::string FormatCivilTime(const CivilTime& ct) {
 
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
   std::array<char, 16> buf{};
-  int abs_sec = std::abs(tz_offset_sec);
-  int h = abs_sec / 3600;
-  int m = (abs_sec % 3600) / 60;
+  // Widen before negating: std::abs(INT_MIN) is undefined behaviour.
+  const int64_t wide_sec = tz_offset_sec;
+  const int64_t abs_sec = wide_sec < 0 ? -wide_sec : wide_sec;
+  const int h = static_cast<int>(abs_sec / 3600);
+  const int m = static_cast<int>((abs_sec % 3600) / 60);
   // Historical (LMT) offsets carry a non-zero second component; dropping it
   // would mislabel the rendered instant (e.g. -07:52:58 became -07:52).
-  int s = abs_sec % 60;
+  const int s = static_cast<int>(abs_sec % 60);
   char sign = tz_offset_sec < 0 ? '-' : '+';
   if (m == 0 && s == 0) {
     // NOLINTNEXTLINE(cert-err33-c)
@@ -812,8 +839,8 @@ std::string FormatFloatingForPrintfImpl(double value, char specifier,
   if (precision < 0) {
     // printf/GoogleSQL default precision is 6: fractional decimal places for
     // %f (matching the old std::to_string shortcut), significant digits for
-    // %e/%g.
-    // (scientific / shortest-of-fixed-scientific) instead of fixed notation.
+    // %e/%g. Uppercase variants use the same scientific/general formats,
+    // not fixed notation.
     precision = 6;
   }
   // P945: C-locale snprintf instead of a per-call ostringstream + imbue.
@@ -1148,7 +1175,8 @@ StatusOr<Value> FormatFunction(const std::string& name,
               StatusCode::kInvalidArgument,
               "FORMAT: invalid argument type for integer specifier");
         }
-      } else if (spec == 'f' || spec == 'g' || spec == 'e' || spec == 'E') {
+      } else if (spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G' ||
+                 spec == 'e' || spec == 'E') {
         if (arg.IsNull()) {
           formatted_item = "NULL";
         } else if (arg.type == ValueType::kDouble) {
@@ -1233,8 +1261,9 @@ StatusOr<Value> FormatFunction(const std::string& name,
       const int64_t magnitude = width < 0 ? -width : width;
       const size_t field_width =
           magnitude > 0 ? static_cast<size_t>(magnitude) : 0;
-      if (formatted_item.size() < field_width) {
-        const size_t pad_len = field_width - formatted_item.size();
+      const size_t field_characters = CodePointsOf(formatted_item).size();
+      if (field_characters < field_width) {
+        const size_t pad_len = field_width - field_characters;
         if (left_justify) {
           formatted_item.append(pad_len, ' ');
         } else {
@@ -1267,6 +1296,36 @@ StatusOr<Value> FormatFunction(const std::string& name,
   return Value(std::move(result));
 }
 
+Value NormalizeIfBranch(Value value, const bool to_double) {
+  if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
+    if (value.IsUnsigned()) {
+      return Value(
+          static_cast<double>(static_cast<uint64_t>(value.value.int_value)));
+    }
+    return Value(static_cast<double>(value.value.int_value));
+  }
+  return value;
+}
+
+Status MergeCoalesceType(TypeTag candidate, TypeTag* common) {
+  if (candidate == TypeTag::kInteger) { candidate = TypeTag::kBigInt;
+}
+  if (candidate == TypeTag::kInvalid || candidate == *common) {
+    return Status::kSuccess;
+  }
+  if (*common == TypeTag::kInvalid) {
+    *common = candidate;
+    return Status::kSuccess;
+  }
+  if ((*common == TypeTag::kBigInt && candidate == TypeTag::kDouble) ||
+      (*common == TypeTag::kDouble && candidate == TypeTag::kBigInt)) {
+    *common = TypeTag::kDouble;
+    return Status::kSuccess;
+  }
+  return StatusError(StatusCode::kInvalidArgument,
+                     "COALESCE arguments have no common supertype");
+}
+
 StatusOr<Value> ExecuteBuiltin(const std::string& name,
                                const std::vector<Value>& values) {
   // A length-bearing view keeps builtin dispatch from repeatedly measuring
@@ -1286,8 +1345,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            "ROUND digits must be an integer");
       }
-      digits = values[1].IsUnsigned() && values[1].value.int_value < 0
-                   ? std::numeric_limits<int64_t>::max()
+      // Use the shared saturating conversion (same as to_i64 / the batch
+      // evaluator) instead of a private ternary. An unsigned digit count
+      // beyond INT64_MAX deliberately saturates: it only means "no fractional
+      // digits to round away", which is the same result for the value path.
+      digits = values[1].IsUnsigned()
+                   ? SaturatingUnsignedToInt64(
+                         static_cast<uint64_t>(values[1].value.int_value))
                    : values[1].value.int_value;
     }
     if (values[0].type == ValueType::kInt64) {
@@ -1370,6 +1434,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "ROUND requires numeric argument");
   }
+  // Owning conversion for callers that need to keep the text. Returning a
+  // prvalue costs no extra copy at the call site in C++17 (guaranteed copy
+  // elision), even for `const std::string s = raw_str(v)`. Hot paths that
+  // only need a transient view should use raw_view below: it borrows VARCHAR
+  // payloads directly and reuses caller-owned storage for scalar values.
   auto raw_str = [](const Value& val) -> std::string {
     if (val.type == ValueType::kVarChar) {
       return std::string(val.value.varchar_value);
@@ -1685,9 +1754,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // degenerate zero-argument COALESCE is NULL, not an error. SQL syntax
     // requires at least one argument, so only direct API/constant-fold
     // callers can reach this form; all evaluation paths must agree.
+    TypeTag common = TypeTag::kInvalid;
+    for (const Value& argument : values) {
+      RETURN_IF_FAIL(MergeCoalesceType(
+          ConstantValue::TypeForValue(argument.type).GetType(), &common));
+    }
     for (const auto& val : values) {
       if (!val.IsNull()) {
-        return val;
+        return NormalizeIfBranch(val, common == TypeTag::kDouble);
       }
     }
     return Value();
@@ -1742,7 +1816,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return Value(std::numeric_limits<double>::quiet_NaN());
       }
     }
-    Value best = values[0];
+    // Track the winner by pointer: Value may own heap storage (VARCHAR /
+    // ARRAY), so copying it on every new maximum/minimum is wasteful.
+    const Value* best = values.data();
     const auto numeric = [](const Value& val) {
       return val.type == ValueType::kInt64 || val.type == ValueType::kDouble;
     };
@@ -1756,29 +1832,29 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return static_cast<double>(val.value.int_value);
     };
     for (size_t i = 1; i < values.size(); ++i) {
-      if (best.type == ValueType::kInt64 &&
+      if (best->type == ValueType::kInt64 &&
           values[i].type == ValueType::kInt64) {
         const bool takes =
-            name_view == "greatest" ? values[i] > best : values[i] < best;
+            name_view == "greatest" ? values[i] > *best : values[i] < *best;
         if (takes) {
-          best = values[i];
+          best = &values[i];
         }
-      } else if (numeric(best) && numeric(values[i])) {
+      } else if (numeric(*best) && numeric(values[i])) {
         const bool takes = name_view == "greatest"
-                               ? as_double(values[i]) > as_double(best)
-                               : as_double(values[i]) < as_double(best);
+                               ? as_double(values[i]) > as_double(*best)
+                               : as_double(values[i]) < as_double(*best);
         if (takes) {
-          best = values[i];
+          best = &values[i];
         }
       } else if (name_view == "greatest") {
-        ASSIGN_OR_RETURN(bool, takes, values[i].TryGreater(best));
+        ASSIGN_OR_RETURN(bool, takes, values[i].TryGreater(*best));
         if (takes) {
-          best = values[i];
+          best = &values[i];
         }
       } else {
-        ASSIGN_OR_RETURN(bool, takes, values[i].TryLess(best));
+        ASSIGN_OR_RETURN(bool, takes, values[i].TryLess(*best));
         if (takes) {
-          best = values[i];
+          best = &values[i];
         }
       }
     }
@@ -1789,39 +1865,48 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         break;
       }
     }
-    if (has_double && best.type == ValueType::kInt64) {
-      best = Value(as_double(best));
+    if (has_double && best->type == ValueType::kInt64) {
+      return Value(as_double(*best));
     }
-    return best;
+    return *best;
   }
   if (name_view == "concat") {
     if (values.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CONCAT requires at least one argument");
     }
+    // Materialize non-VARCHAR arguments once: the earlier size pass used to
+    // call AsString() a second time for every scalar argument. Own the
+    // converted strings up front (reserve keeps the views valid even for
+    // short/small-string-optimized payloads), then do a checked size sum and
+    // a single append pass.
+    std::vector<std::string> owned;
+    std::vector<std::string_view> parts;
+    owned.reserve(values.size());
+    parts.reserve(values.size());
     size_t total_bytes = 0;
     for (const auto& value : values) {
       if (value.IsNull()) {
         return Value();
       }
-      total_bytes += value.type == ValueType::kVarChar
-                         ? value.value.varchar_value.size()
-                         : value.AsString().size();
+      if (value.type == ValueType::kVarChar) {
+        parts.push_back(value.value.varchar_value);
+      } else {
+        // GoogleSQL implicitly casts scalar arguments to STRING. This mirrors
+        // the batch evaluator (executor/detail/function_eval.cpp) so the same
+        // expression succeeds in a projection and in INSERT ... VALUES.
+        owned.push_back(value.AsString());
+        parts.push_back(owned.back());
+      }
+      if (__builtin_add_overflow(total_bytes, parts.back().size(),
+                                 &total_bytes)) {
+        return StatusError(StatusCode::kTooBigData, "CONCAT result too large");
+      }
     }
     std::string result;
     result.reserve(total_bytes);
-    for (const auto& value : values) {
-      if (value.IsNull()) {
-        return Value();
-      }
-      // GoogleSQL implicitly casts scalar arguments to STRING. This mirrors
-      // the batch evaluator (executor/detail/function_eval.cpp) so the same
-      // expression succeeds in a projection and in INSERT ... VALUES.
-      if (value.type != ValueType::kVarChar) {
-        result.append(value.AsString());
-      } else {
-        result.append(value.value.varchar_value);
-      }
+    for (const auto& part : parts) {
+      result.append(part);
     }
     return Value(std::move(result));
   }
@@ -2016,8 +2101,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            name + " digits must be an integer");
       }
-      digits = values[1].IsUnsigned() && values[1].value.int_value < 0
-                   ? std::numeric_limits<int64_t>::max()
+      // Same saturating conversion as ROUND / to_i64: huge unsigned digit
+      // counts just mean "no fractional digits to truncate".
+      digits = values[1].IsUnsigned()
+                   ? SaturatingUnsignedToInt64(
+                         static_cast<uint64_t>(values[1].value.int_value))
                    : values[1].value.int_value;
     }
     if (values[0].type == ValueType::kInt64) {
@@ -2614,9 +2702,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "SUBSTR argument type mismatch");
     }
     const std::string input = raw_str(values[0]);
-    const int64_t start = to_i64(values[1], 1);
+    // The argument is kInt64 (unsigned values share that tag): keep the raw
+    // bit pattern so a UINT64 start near 2^64 remains a negative
+    // end-relative offset instead of saturating to INT64_MAX / empty string.
+    const int64_t start = values[1].value.int_value;
+    int64_t len = 0;
     if (values.size() == 3) {
-      const int64_t len = to_i64(values[2], 0);
+      len = to_i64(values[2], 0);
       if (len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
@@ -2640,9 +2732,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(std::string());
     }
 
-    const size_t length = values.size() == 3
-                              ? static_cast<size_t>(to_i64(values[2], 0))
-                              : total_cps;
+    // Reuse the already-validated length; parsing a VARCHAR length twice is
+    // pure overhead on a per-row hot path.
+    const size_t length =
+        values.size() == 3 ? static_cast<size_t>(len) : total_cps;
     return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
 
@@ -2662,9 +2755,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "BYTE_SUBSTR argument type mismatch");
     }
     const std::string input = raw_str(values[0]);
-    const int64_t start = to_i64(values[1], 1);
+    // Same raw INT64-bit-pattern start as SUBSTR: UINT64 end-relative offsets
+    // must not be turned into an out-of-range positive position.
+    const int64_t start = values[1].value.int_value;
+    int64_t len = 0;
     if (values.size() == 3) {
-      const int64_t len = to_i64(values[2], 0);
+      len = to_i64(values[2], 0);
       if (len < 0) {
         return StatusError(StatusCode::kInvalidArgument,
                            "SUBSTR length cannot be negative");
@@ -2688,10 +2784,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(std::string());
     }
 
-    const size_t length =
-        values.size() == 3
-            ? static_cast<size_t>(std::max(int64_t{0}, to_i64(values[2], 0)))
-            : total_bytes;
+    // Reuse the validated length instead of converting it a second time.
+    const size_t length = values.size() == 3
+                              ? static_cast<size_t>(std::max(int64_t{0}, len))
+                              : total_bytes;
     return Value(input.substr(static_cast<size_t>(actual_start), length));
   }
   if (name_view == "length" || name_view == "char_length" ||
@@ -2704,7 +2800,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    const std::string input = raw_str(values[0]);
+    std::string input;
+    if (values[0].type == ValueType::kDate) {
+      ASSIGN_OR_RETURN(std::string, formatted,
+                       TryFormatDateDays(values[0].DateDays()));
+      input = std::move(formatted);
+    } else {
+      input = raw_str(values[0]);
+    }
     if (name_view == "octet_length" || name_view == "byte_length") {
       // BYTE_LENGTH/OCTET_LENGTH count raw bytes.
       return Value(static_cast<int64_t>(input.size()));
@@ -2780,12 +2883,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const auto t_offsets = utf8_offsets(target);
     const size_t t_cps = t_offsets.size() > 1 ? t_offsets.size() - 1 : 0;
     if (t_cps == 0) {
-      // An empty target matches once at `position`; later occurrences do not
-      // exist. The old code ignored `occurrence` here.
-      if (occurrence == 1 && static_cast<size_t>(position) <= s_cps + 1) {
-        return Value(position);
-      }
-      return Value(int64_t{0});
+      return Value(InstrEmptyTargetPosition(s_cps, position, occurrence));
     }
     std::vector<size_t> matches;
     matches.reserve(s_cps + 1);
@@ -3356,7 +3454,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsUnsigned()) {
       // UINT64 keeps the kInt64 tag; the bit pattern is the true value and
       // >= 2^63 would otherwise read back as a negative int64.
-      const uint64_t u = static_cast<uint64_t>(code);
+      const auto u = static_cast<uint64_t>(code);
       if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
         return StatusError(StatusCode::kIsInfinity,
                            "CHR argument out of range");
@@ -3401,8 +3499,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     std::vector<Value> elements;
     elements.reserve(values[0].value.varchar_value.size());
     for (const uint32_t cp : CodePointsOf(values[0].value.varchar_value)) {
-      elements.push_back(
-          Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+      elements.emplace_back(static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -3424,22 +3521,26 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "EDIT_DISTANCE requires STRING arguments");
     }
-    int64_t max_distance = -1;
+    uint64_t max_distance = std::numeric_limits<uint64_t>::max();
     if (values.size() == 3) {
       if (values[2].type != ValueType::kInt64) {
         return StatusError(StatusCode::kInvalidArgument,
                            "EDIT_DISTANCE max_distance must be an integer");
       }
-      max_distance = values[2].value.int_value;
-      if (max_distance < 0) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "EDIT_DISTANCE max_distance cannot be negative");
+      if (values[2].IsUnsigned()) {
+        max_distance = static_cast<uint64_t>(values[2].value.int_value);
+      } else {
+        if (values[2].value.int_value < 0) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "EDIT_DISTANCE max_distance cannot be negative");
+        }
+        max_distance = static_cast<uint64_t>(values[2].value.int_value);
       }
     }
     const int64_t distance = LevenshteinCodePoints(
         values[0].value.varchar_value, values[1].value.varchar_value);
-    if (max_distance >= 0 && distance > max_distance) {
-      return Value(max_distance + 1);
+    if (std::cmp_greater(distance, max_distance)) {
+      return Value(static_cast<int64_t>(max_distance + 1));
     }
     return Value(distance);
   }
@@ -3470,7 +3571,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (elem.IsUnsigned()) {
         // UINT64 elements keep the kInt64 tag; diagnose by the true value
         // instead of letting >= 2^63 surface as a negative code point.
-        const uint64_t u = static_cast<uint64_t>(cp);
+        const auto u = static_cast<uint64_t>(cp);
         if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
           return StatusError(StatusCode::kInvalidArgument,
                              "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -3529,7 +3630,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (elem.IsUnsigned()) {
         // UINT64 elements keep the kInt64 tag; diagnose by the true value
         // instead of letting >= 2^63 surface as a negative byte.
-        const uint64_t u = static_cast<uint64_t>(b);
+        const auto u = static_cast<uint64_t>(b);
         if (u > 255) {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -3811,15 +3912,24 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || values[1].IsNull()) {
       return Value();
     }
-    const std::string s = raw_str(values[0]);
-    const std::string pat = raw_str(values[1]);
-    try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      return Value(std::regex_search(s, re));
-    } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
-    }
+    const std::string_view s = values[0].type == ValueType::kVarChar
+                                   ? values[0].value.varchar_value
+                                   : std::string_view{};
+    const std::string_view pat = values[1].type == ValueType::kVarChar
+                                     ? values[1].value.varchar_value
+                                     : std::string_view{};
+    std::string s_owned;
+    std::string pat_owned;
+    const std::string_view s_view =
+        values[0].type == ValueType::kVarChar
+            ? s
+            : std::string_view(s_owned = raw_str(values[0]));
+    const std::string_view pat_view =
+        values[1].type == ValueType::kVarChar
+            ? pat
+            : std::string_view(pat_owned = raw_str(values[1]));
+    ASSIGN_OR_RETURN(bool, found, CheckedRegexContains(s_view, pat_view));
+    return Value(found);
   }
 
   if (name_view == "regexp_match") {
@@ -4061,8 +4171,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         entry.reserve(named_index.size());
         for (const size_t gi : named_index) {
           if (gi < it->size() && (*it)[gi].matched) {
-            entry.push_back(
-                Value(it->str(gi)));  // NOLINT(modernize-use-emplace)
+            entry.emplace_back(it->str(gi));  // NOLINT(modernize-use-emplace)
           } else {
             entry.push_back(Value());  // NOLINT(modernize-use-emplace)
           }
@@ -4125,7 +4234,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     const int64_t lhs = values[0].value.int_value;
     const int64_t rhs = values[1].value.int_value;
-    const bool is_u = values[0].IsUnsigned() || values[1].IsUnsigned();
+    const bool is_u = values[0].IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     if (name_view == "__bit_and") {
       return with_u(Value(lhs & rhs));
@@ -4409,8 +4518,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (os_user == nullptr || *os_user == '\0') {
         os_user = std::getenv("LOGNAME");
       }
-      return os_user != nullptr ? std::string(os_user)
-                                : std::string("tinylamb");
+      return os_user != nullptr && *os_user != '\0' ? std::string(os_user)
+                                                    : std::string("tinylamb");
     }();
     return Value(std::string(kUser));
   }
@@ -4524,7 +4633,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(FormatCivilTime(ct) + FormatTimeZoneOffset(tz_offset_sec));
     }
     if (values[0].type == ValueType::kDate) {
-      return Value(FormatDateDays(values[0].DateDays()));
+      ASSIGN_OR_RETURN(std::string, text,
+                       TryFormatDateDays(values[0].DateDays()));
+      return Value(std::move(text));
     }
     return Value(raw_str(values[0]));
   }
@@ -4645,15 +4756,15 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // T3929) records the input's own offset in tm_gmtoff; use it instead
     // of the default/third-argument zone, matching the TIMESTAMP literal
     // route and GoogleSQL.
-    auto has_unescaped = [&](std::string_view spec) {
-      for (size_t i = 0; i + spec.size() <= fmt.size(); ++i) {
-        if (fmt.compare(i, spec.size(), spec) == 0 &&
-            (i == 0 || fmt[i - 1] != '%')) {
-          return true;
+    bool has_zone_directive = false;
+    for (size_t i = 0; i + 1 < fmt.size(); ++i) {
+      if (fmt[i] == '%') {
+        if (fmt[++i] == 'z') {
+          has_zone_directive = true;
+          break;
         }
       }
-      return false;
-    };
+    }
     CivilTime ct;
     ct.year = tm.tm_year + 1900;
     ct.month = tm.tm_mon + 1;
@@ -4665,7 +4776,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // ParseTimeZoneOffset assume 2000-01-01, so a DST-observing zone applied
     // standard time to a summer date and UTC conversion was off by an hour.
     int tz_offset_sec = 0;
-    if (has_unescaped("%z")) {
+    if (has_zone_directive) {
       tz_offset_sec = static_cast<int>(platform::TmGmtoff(&tm));
     } else if (values.size() == 3) {
       ASSIGN_OR_RETURN(int, parsed_zone_offset,
@@ -5015,7 +5126,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   if (name_view == "farm_fingerprint") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "FARM_FINGERPRINT requires 1 argument");
+                         name + " requires 1 argument");
     }
     if (values[0].IsNull()) {
       return Value();
@@ -5269,9 +5380,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
 
   // GENERATE_SERIES (PostgreSQL spelling) is the element-wise twin of
   // GENERATE_ARRAY with integer-exact stepping and its own error surface.
-  // The body mirrors the executor's detail evaluator one-to-one; all three
-  // (this evaluator, the detail evaluator, and the plan-layer folds) share
-  // this exact code, so the engines cannot diverge element-wise.
+  // The executor's detail evaluator keeps a separate copy of the builtin
+  // table (SAFE_ADD, FormatTimeZoneOffset, __struct_set and the timezone
+  // shifts have already diverged), so parity is a manual obligation: any
+  // change here must be mirrored there. Do not rely on this comment as a
+  // guarantee that the engines share code.
   if (name_view == "generate_series") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -5574,9 +5687,19 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     constexpr int64_t kDayMicros = int64_t{86400} * 1000000;
-    auto to_micros = [](const Value& v) -> StatusOr<int64_t> {
+    // A DATE payload is an arbitrary int64; multiplying it unchecked would be
+    // signed-overflow UB and could smuggle a value past day_guard.
+    auto days_to_micros = [&](int64_t days) -> StatusOr<int64_t> {
+      int64_t micros = 0;
+      if (__builtin_mul_overflow(days, kDayMicros, &micros)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "TIMESTAMP value out of range");
+      }
+      return micros;
+    };
+    auto to_micros = [&](const Value& v) -> StatusOr<int64_t> {
       if (v.type == ValueType::kDate) {
-        return v.DateDays() * kDayMicros;
+        return days_to_micros(v.DateDays());
       }
       if (v.type != ValueType::kVarChar) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -5586,7 +5709,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (raw.size() == 10) {
         auto days = TryParseDateDays(raw);
         if (days.HasValue()) {
-          return days.Value() * kDayMicros;
+          return days_to_micros(days.Value());
         }
       }
       const std::optional<platform::Int128> nanos =
@@ -5603,9 +5726,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(int64_t, start_us, to_micros(values[0]));
     ASSIGN_OR_RETURN(int64_t, end_us, to_micros(values[1]));
     const auto day_guard = [](int64_t us) {
-      const int64_t days =
-          us >= 0 ? us / kDayMicros : -((-us + kDayMicros - 1) / kDayMicros);
-      return days < -11000000 || days > 11000000;
+      // Compare in microseconds instead of computing floor(us / kDayMicros):
+      // negating us overflows for INT64_MIN (UB), and the direct bounds are
+      // exact — days > 11000000 iff us >= 11000001*kDayMicros, days <
+      // -11000000 iff us < -11000000*kDayMicros.
+      return us >= int64_t{11000001} * kDayMicros ||
+             us < -int64_t{11000000} * kDayMicros;
     };
     if (day_guard(start_us) || day_guard(end_us)) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -5615,8 +5741,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 3) {
       const Value& step = values[2];
       if (step.type == ValueType::kInt64) {
-        step_us =
-            static_cast<platform::Int128>(step.value.int_value) * kDayMicros;
+        // kInt64 also carries UINT64 values: sign-extending the int64 bit
+        // pattern would turn a huge unsigned step into a negative one.
+        step_us = step.IsUnsigned()
+                      ? static_cast<platform::Int128>(
+                            static_cast<uint64_t>(step.value.int_value)) *
+                            kDayMicros
+                      : static_cast<platform::Int128>(step.value.int_value) *
+                            kDayMicros;
       } else {
         const std::string text = raw_str(step);
         ASSIGN_OR_RETURN(IntervalValue, parsed,
@@ -5628,9 +5760,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
               "unsupported GENERATE_TIMESTAMP_ARRAY step unit: the step must "
               "be DAY or smaller");
         }
-        step_us = static_cast<platform::Int128>(parsed.days) * kDayMicros +
-                  parsed.nanos /
-                      1000;  // NOLINT(readability-math-missing-parentheses)
+        step_us = (static_cast<platform::Int128>(parsed.days) * kDayMicros) +
+                  (parsed.nanos /
+                      1000);  // NOLINT(readability-math-missing-parentheses)
       }
     }
     if (step_us == 0) {
@@ -5669,8 +5801,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           text += digits.data();
         }
         text += "+00";
-        elements.push_back(
-            Value(std::move(text)));  // NOLINT(modernize-use-emplace)
+        elements.emplace_back(std::move(text));  // NOLINT(modernize-use-emplace)
         const platform::Int128 next =
             static_cast<platform::Int128>(t) + step_us;
         if (next < std::numeric_limits<int64_t>::min() ||
@@ -5721,9 +5852,7 @@ std::string UnicodeCaseFold(std::string_view value) {
   // "ss" via the kFullFolding entry below.
   static const std::unordered_map<uint32_t, std::string> kFullFolding = {
       {0x00DF, "ss"},  // ß
-      {
-          0x03C2, "\xCF\x82" /* σ (final sigma folds to sigma) */
-      },
+      {0x03C2, "\xCF\x83" /* ς final sigma -> σ U+03C3 */},
       {0x00B5, "\xCE\xBC" /* µ MICRO SIGN → μ GREEK SMALL MU */},
       {0x0130, "i\xCC\x87" /* İ → i + COMBINING DOT ABOVE */},
       {0xFB00, "ff"},
@@ -6030,7 +6159,7 @@ bool JsonTextToValue(std::string_view text, Value* parsed) {
             if (date_element.HasValue()) {
               elements.push_back(date_element.MoveValue());
             } else {
-              // Unparseable DATE element: mirror the sibling fallback that
+              // Unparsable DATE element: mirror the sibling fallback that
               // keeps the raw text instead of throwing through a bool API.
               elements.emplace_back(std::string(item));
             }
@@ -6322,7 +6451,7 @@ bool IfBranchesPromoteToDouble(const std::vector<Expression>& args,
       if (args[i]->ResultType(schema).GetType() == TypeTag::kDouble) {
         return true;
       }
-    } catch (const std::exception&) {
+    } catch (const std::runtime_error&) {
       continue;
     }
   }
@@ -6337,56 +6466,73 @@ bool IfBranchesPromoteToDouble(const std::vector<Expression>& args,
       if (args[i]->ResultType(left, right).GetType() == TypeTag::kDouble) {
         return true;
       }
-    } catch (const std::exception&) {
+    } catch (const std::runtime_error&) {
       continue;
     }
   }
   return false;
 }
 
-Value NormalizeIfBranch(Value value, const bool to_double) {
-  if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
-    if (value.IsUnsigned()) {
-      return Value(
-          static_cast<double>(static_cast<uint64_t>(value.value.int_value)));
-    }
-    return Value(static_cast<double>(value.value.int_value));
-  }
-  return value;
-}
-
 // Bare alias row reference ("SELECT s FROM t s"): encodes the columns
 // qualified by the given alias as a struct JSON object. Shared by all three
 // TryEvaluate overloads so the same AST cannot diverge by evaluation path.
-StatusOr<Value> EvaluateRowStruct(const std::vector<Expression>& args,
-                                  const Row& row, const Schema& schema) {
-  if (args.size() != 1 || args[0]->Type() != TypeTag::kConstantValue) {
+StatusOr<Value> EvaluateRowStruct(const Value& alias_value, const Row& row,
+                                  const Schema& schema) {
+  // Every overload (plain, join and context) funnels through here. A partial
+  // row -- e.g. a schema-only type-resolution call, or a join where only one
+  // side has values -- must not make row.values_[i] index past the end.
+  if (row.values_.size() < schema.ColumnCount()) {
     return StatusError(StatusCode::kInvalidArgument,
-                       "__row_struct requires an alias literal");
+                       "__row_struct row has fewer values than schema columns");
   }
   std::string alias;
-  const Value& alias_value = args[0]->AsConstantValue().GetValue();
   if (!alias_value.IsNull()) {
     alias = alias_value.type == ValueType::kVarChar
                 ? std::string(alias_value.value.varchar_value)
                 : alias_value.AsString();
   }
   std::vector<std::pair<std::string, Value>> fields;
+  std::unordered_set<std::string> used_names;
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     const ColumnName& column = schema.GetColumn(i).Name();
     if (!alias.empty() && !IdentifierEquals(column.schema, alias)) {
       continue;
     }
-    fields.emplace_back(column.name, row.values_[i]);
+    std::string key = column.name;
+    if (!used_names.insert(key).second) {
+      // A join schema can expose the same unqualified name from both sides.
+      // Emitting two JSON members with that name would silently discard one
+      // value, so qualify the later one (and add a numeric suffix if the
+      // qualifiers collide too, e.g. a self-join).
+      const std::string qualified =
+          column.schema.empty() ? key : column.schema + "." + key;
+      key = qualified;
+      for (uint64_t suffix = 2; !used_names.insert(key).second; ++suffix) {
+        key = qualified + "#" + std::to_string(suffix);
+      }
+    }
+    fields.emplace_back(std::move(key), row.values_[i]);
   }
   return Value(EncodeStructJson(fields));
+}
+
+// The two non-context overloads keep the original literal-only contract: the
+// alias is part of the AST, so it must be a constant there.
+StatusOr<Value> EvaluateRowStructLiteral(const std::vector<Expression>& args,
+                                         const Row& row, const Schema& schema) {
+  if (args.size() != 1 || args[0] == nullptr ||
+      args[0]->Type() != TypeTag::kConstantValue) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "__row_struct requires an alias literal");
+  }
+  return EvaluateRowStruct(args[0]->AsConstantValue().GetValue(), row, schema);
 }
 }  // namespace
 
 StatusOr<Value> FunctionCallExpression::TryEvaluate(
     const Row& row, const Schema& schema) const {
   if (func_name_ == "__row_struct") {
-    return EvaluateRowStruct(args_, row, schema);
+    return EvaluateRowStructLiteral(args_, row, schema);
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
@@ -6450,10 +6596,11 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
   // every argument eagerly here turned working queries (e.g. a throwing
   // third branch after a non-NULL first) into spurious failures.
   if (func_name_ == "coalesce") {
+    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(schema)));
     for (const auto& arg : args_) {
       ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema));
       if (!value.IsNull()) {
-        return value;
+        return NormalizeIfBranch(std::move(value), common == TypeTag::kDouble);
       }
     }
     return Value();
@@ -6482,7 +6629,13 @@ std::string FunctionCallExpression::ToString() const {
   std::stringstream ss;
   ss << func_name_ << "(";
   for (size_t i = 0; i < args_.size(); ++i) {
-    ss << *args_[i];
+    // A malformed node with a null argument must not crash Dump/ToString via
+    // the recursive operator<< path.
+    if (args_[i] != nullptr) {
+      ss << *args_[i];
+    } else {
+      ss << "<null>";
+    }
     if (i < args_.size() - 1) {
       ss << ", ";
     }
@@ -6499,7 +6652,8 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
   if (func_name_ == "__row_struct") {
     const Row combined =
         (left != nullptr ? *left : Row()) + (right != nullptr ? *right : Row());
-    return EvaluateRowStruct(args_, combined, left_schema + right_schema);
+    return EvaluateRowStructLiteral(args_, combined,
+                                    left_schema + right_schema);
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
@@ -6571,12 +6725,13 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
   // evaluator (see the plain overload): errors inside unevaluated branches
   // never surface.
   if (func_name_ == "coalesce") {
+    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(left_schema, &right_schema)));
     for (const auto& arg : args_) {
       ASSIGN_OR_RETURN(
           Value, value,
           arg->TryEvaluate(left, left_schema, right, right_schema));
       if (!value.IsNull()) {
-        return value;
+        return NormalizeIfBranch(std::move(value), common == TypeTag::kDouble);
       }
     }
     return Value();
@@ -6609,9 +6764,15 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
 StatusOr<Value> FunctionCallExpression::TryEvaluate(
     const Row& row, const Schema& schema, EvaluationContext& context) const {
   if (func_name_ == "__row_struct") {
-    // The row struct is built from the current row/schema; the context is
-    // threaded only into argument evaluation, which __row_struct never uses.
-    return EvaluateRowStruct(args_, row, schema);
+    // The struct is built from the current row/schema, but evaluate the alias
+    // through the context so a prepared-statement parameter is usable here.
+    if (args_.size() != 1 || args_[0] == nullptr) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__row_struct requires an alias argument");
+    }
+    ASSIGN_OR_RETURN(Value, alias_value,
+                     args_[0]->TryEvaluate(row, schema, context));
+    return EvaluateRowStruct(alias_value, row, schema);
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
     if (args_.size() != 2 || args_[1]->Type() != TypeTag::kIntervalExp) {
@@ -6676,10 +6837,11 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
   // evaluator (see the plain overload): errors inside unevaluated branches
   // never surface.
   if (func_name_ == "coalesce") {
+    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(schema)));
     for (const auto& arg : args_) {
       ASSIGN_OR_RETURN(Value, value, arg->TryEvaluate(row, schema, context));
       if (!value.IsNull()) {
-        return value;
+        return NormalizeIfBranch(std::move(value), common == TypeTag::kDouble);
       }
     }
     return Value();
@@ -6754,21 +6916,40 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     }
     return args_[0]->ResultType(schema);
   }
-  if (func_name_ == "coalesce" || func_name_ == "nullif" ||
-      func_name_ == "ifnull") {
+  if (func_name_ == "coalesce") {
+    const auto common = CoalesceType(schema);
+    return common.HasValue() ? common.Value() : TypeTag::kInvalid;
+  }
+  if (func_name_ == "nullif" || func_name_ == "ifnull") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
-    if (func_name_ == "coalesce" || func_name_ == "ifnull") {
-      // These return the first non-NULL argument. A NULL literal constant
-      // declares kInvalid, so COALESCE(NULL, double_col) must report DOUBLE
-      // rather than the first argument's NULL type.
+    if (func_name_ == "ifnull") {
+      // These return the first non-NULL argument. Skip statically-NULL
+      // constants (including typed ones such as CAST(NULL AS INT64)) and
+      // arguments whose type cannot be resolved here: ColumnValue::ResultType
+      // throws for an unbound/correlated column in schema-free Cascades
+      // rewrites, and that exception must not escape a Type query.
+      // For non-constant nullable arguments this remains a best-effort static
+      // type -- the runtime value's type is only knowable per row.
       for (const auto& arg : args_) {
-        const tinylamb::Type candidate = arg->ResultType(schema);
-        if (candidate.GetType() != TypeTag::kInvalid) {
-          return candidate;
+        if (!arg || (arg->Type() == TypeTag::kConstantValue &&
+                     arg->AsConstantValue().GetValue().IsNull())) {
+          continue;
+        }
+        try {
+          const tinylamb::Type candidate = arg->ResultType(schema);
+          if (candidate.GetType() != TypeTag::kInvalid) {
+            return candidate;
+          }
+        } catch (const std::runtime_error&) {
+          continue;
         }
       }
+      return {TypeTag::kInvalid};
+    }
+    if (!args_[0]) {
+      return {TypeTag::kInvalid};
     }
     return args_[0]->ResultType(schema);
   }
@@ -6781,7 +6962,24 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     if (IfBranchesPromoteToDouble(args_, schema, 1)) {
       return {TypeTag::kDouble};
     }
-    return args_[1]->ResultType(schema);
+    // A NULL literal declares kInvalid; anchor the declared type on the
+    // first branch that actually has one (IF(cond, NULL, int_col) is INT64).
+    for (size_t i = 1; i < args_.size(); ++i) {
+      if (!args_[i]) {
+        continue;
+      }
+      try {
+        const tinylamb::Type candidate = args_[i]->ResultType(schema);
+        if (candidate.GetType() != TypeTag::kInvalid) {
+          return candidate;
+        }
+      } catch (const std::runtime_error&) {
+        // An unresolved branch in schema-free rewrites does not make IF's
+        // result type query fail; another branch may still provide a type.
+        continue;
+      }
+    }
+    return {TypeTag::kInvalid};
   }
   if (func_name_ == "iferror") {
     if (args_.empty()) {
@@ -6897,7 +7095,7 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
                          : args_[0]->ResultType(schema);
   }
   // Match the runtime value types of these builtins.
-  if (func_name_ == "rand" || func_name_ == "pi") {
+  if (func_name_ == "rand") {
     return {TypeTag::kDouble};
   }
   if (func_name_ == "current_date") {
@@ -6906,9 +7104,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
   if (func_name_.starts_with("unix_")) {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "generate_series") {
-    return {TypeTag::kArray};
-  }
+  // generate_series is already covered by IsArrayReturningFunction above.
+  // Keep the array-function table as the single source of ARRAY static types;
+  // a second special case here would let the two overloads drift apart.
   return {TypeTag::kVarChar};
 }
 
@@ -6942,18 +7140,36 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     }
     return args_[0]->ResultType(left, right);
   }
-  if (func_name_ == "coalesce" || func_name_ == "nullif" ||
-      func_name_ == "ifnull") {
+  if (func_name_ == "coalesce") {
+    const auto common = CoalesceType(left, &right);
+    return common.HasValue() ? common.Value() : TypeTag::kInvalid;
+  }
+  if (func_name_ == "nullif" || func_name_ == "ifnull") {
     if (args_.empty()) {
       return {TypeTag::kInvalid};
     }
-    if (func_name_ == "coalesce" || func_name_ == "ifnull") {
+    if (func_name_ == "ifnull") {
+      // Mirror of the single-schema arm: skip statically-NULL arguments and
+      // swallow ResultType's exception for an unbound/correlated column, and
+      // prefer the first resolvable non-NULL type over args_[0].
       for (const auto& arg : args_) {
-        const tinylamb::Type candidate = arg->ResultType(left, right);
-        if (candidate.GetType() != TypeTag::kInvalid) {
-          return candidate;
+        if (!arg || (arg->Type() == TypeTag::kConstantValue &&
+                     arg->AsConstantValue().GetValue().IsNull())) {
+          continue;
+        }
+        try {
+          const tinylamb::Type candidate = arg->ResultType(left, right);
+          if (candidate.GetType() != TypeTag::kInvalid) {
+            return candidate;
+          }
+        } catch (const std::exception&) {
+          continue;
         }
       }
+      return {TypeTag::kInvalid};
+    }
+    if (!args_[0]) {
+      return {TypeTag::kInvalid};
     }
     return args_[0]->ResultType(left, right);
   }
@@ -6966,7 +7182,17 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     if (IfBranchesPromoteToDouble(args_, left, right, 1)) {
       return {TypeTag::kDouble};
     }
-    return args_[1]->ResultType(left, right);
+    // Same NULL-literal anchoring as the single-schema overload.
+    for (size_t i = 1; i < args_.size(); ++i) {
+      if (!args_[i]) {
+        continue;
+      }
+      const tinylamb::Type candidate = args_[i]->ResultType(left, right);
+      if (candidate.GetType() != TypeTag::kInvalid) {
+        return candidate;
+      }
+    }
+    return {TypeTag::kInvalid};
   }
   if (func_name_ == "iferror") {
     if (args_.empty()) {
@@ -7078,7 +7304,7 @@ Type FunctionCallExpression::ResultType(const Schema& left,
                          : args_[0]->ResultType(left, right);
   }
   // Keep both ResultType overloads in sync.
-  if (func_name_ == "rand" || func_name_ == "pi") {
+  if (func_name_ == "rand") {
     return {TypeTag::kDouble};
   }
   if (func_name_ == "current_date") {
@@ -7087,24 +7313,54 @@ Type FunctionCallExpression::ResultType(const Schema& left,
   if (func_name_.starts_with("unix_")) {
     return {TypeTag::kBigInt};
   }
-  if (func_name_ == "generate_series") {
-    return {TypeTag::kArray};
-  }
+  // generate_series is already covered by IsArrayReturningFunction above.
+  // Keep the array-function table as the single source of ARRAY static types;
+  // a second special case here would let the two overloads drift apart.
   return {TypeTag::kVarChar};
+}
+
+StatusOr<TypeTag> FunctionCallExpression::CoalesceType(
+    const Schema& schema, const Schema* right) const {
+  TypeTag common = TypeTag::kInvalid;
+  for (const Expression& argument : args_) {
+    if (!argument) { return Status::kInvalidArgument;
+}
+    TypeTag candidate;
+    try {
+      candidate = ((right != nullptr) ? argument->ResultType(schema, *right)
+                         : argument->ResultType(schema)).GetType();
+    } catch (const std::runtime_error&) {
+      // Correlated references may only be bound by the execution scope.
+      continue;
+    }
+    RETURN_IF_FAIL(MergeCoalesceType(candidate, &common));
+  }
+  return common;
 }
 
 Status FunctionCallExpression::Validate(EvaluationContext& context,
                                         const Schema& schema) const {
   for (const auto& arg : args_) {
+    if (arg == nullptr) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "FUNCTION_CALL has a null argument");
+    }
     Status s = arg->Validate(context, schema);
     if (s != Status::kSuccess) {
       return s;
     }
   }
   // Function registration goes through the abstract context; the production
-  // implementation forwards to Database::GetOrAddFunction. The static result
-  // type is already resolved by ResultType; argument-type checking still
-  // happens at evaluation time.
+  // implementation forwards to Database::GetOrAddFunction, whose arity is an
+  // `int`. Reject an arity that cannot be represented instead of letting the
+  // narrowing cast wrap to a negative number (which could register the wrong
+  // overload / alias an unrelated function).
+  if (args_.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "FUNCTION_CALL has too many arguments");
+  }
+  // The static result type is already resolved by ResultType; argument-type
+  // checking still happens at evaluation time.
   return context.GetOrAddFunction(func_name_, static_cast<int>(args_.size()));
 }
 

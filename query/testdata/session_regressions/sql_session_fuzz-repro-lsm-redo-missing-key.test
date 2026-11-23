@@ -1,5 +1,5 @@
 -- tinylamb-session-test v1
--- seed: 1042
+-- seed: 1
 -- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64);
 -- stmt: INSERT INTO tbl0 VALUES (0, -1, -2);
 -- ddl: CREATE INDEX idx_dual_tbl0 ON tbl0 KEY(1)

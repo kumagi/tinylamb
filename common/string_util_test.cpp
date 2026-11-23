@@ -139,6 +139,8 @@ TEST(StringUtilTest,
   // pattern rather than an interior wildcard.
   const auto all = LiteralLikePattern::Compile("%%%");
   ASSERT_TRUE(all.has_value());
+  EXPECT_EQ(all->kind, LiteralLikePattern::Kind::kContains);
+  EXPECT_TRUE(all->literal.empty());
   for (const auto* const value : {"", "abc", "%"}) {
     EXPECT_TRUE(all->Matches(value)) << value;
   }
@@ -302,6 +304,95 @@ TEST(StringUtilTest, Utf8SequenceLengthMatchesValidatorWindow) {
       TrimCodePoints(std::string_view("\xC0x", 2), std::string_view("\xC0", 1),
                      /*leading=*/true, /*trailing=*/false),
       "x");
+}
+
+TEST(StringUtilTest, CompiledLikeSegmentChainUnderscoreAndShiftAndParity) {
+  struct FastLikeGuard {
+    ~FastLikeGuard() { SetFastLikeDisabledForTest(false); }
+  } guard;
+
+  const std::string seg63(63, 'a');
+  const std::string seg64(64, 'a');
+  const std::string seg65(65, 'a');
+
+  const std::vector<std::string> patterns = {
+      "",
+      "%",
+      "%%%",
+      "a",
+      "a%a",
+      "a%%b%%c",
+      "%promo%spring%sale%",
+      "head%mid1%mid2%tail",
+      "_",
+      "__",
+      "2026-__-__-___%",
+      "%ab_cd_ef%",
+      "%aab%",
+      "a_%_b",
+      "_%_",
+      R"(\%\_\\)",
+      "a\\",
+      "%" + seg63 + "%",
+      "%" + seg64 + "%",
+      "%" + seg65 + "%",
+      "%" + seg63 + "_%",
+      "%" + seg64 + "_%",
+      "a_\xC3\xA9%",
+  };
+
+  const std::vector<std::string> values = {
+      "",
+      "%",
+      "%_\\",
+      "a",
+      "aa",
+      "aba",
+      "a\\",
+      "abbc",
+      "a_mid1_x_mid2_tail",
+      "head_mid1_mid2_tail",
+      "headmid1mid2tail",
+      "head_mid1_mid2_t",
+      "aaab",
+      "aab",
+      "xx_ab_cd_ef_yy",
+      "xx_abXcdYef_yy",
+      "2026-03-15-999-extra",
+      "2026-03-15-99",
+      "spring_promo_sale",
+      "promo_spring_sale",
+      "my/promo/for/spring/big/sale/today",
+      "axyb",
+      "ab",
+      "\xC3\xA9",
+      "a_\xC3\xA9",
+      "aX\xC3\xA9tail",
+      "prefix_\xE6\x97\xA5\xE6\x9C\xAC_suffix",
+      "a\xF0\x9F\x98\x80",
+      "ab\xC3"
+      "a",  // malformed lead before 'a'
+      seg63,
+      "z" + seg63 + "z",
+      seg64,
+      "z" + seg64 + "z",
+      seg65,
+      "z" + seg65 + "z",
+      "z" + seg63 + "Xz",
+      "z" + seg64 + "Xz",
+  };
+
+  for (const std::string& pat : patterns) {
+    for (const std::string& val : values) {
+      SCOPED_TRACE(pat);
+      SCOPED_TRACE(val);
+      const bool ref = EscapedLikeMatchUtf8(val, pat);
+      SetFastLikeDisabledForTest(true);
+      EXPECT_EQ(EscapedLikeMatch(val, pat), ref);
+      SetFastLikeDisabledForTest(false);
+      EXPECT_EQ(EscapedLikeMatch(val, pat), ref);
+    }
+  }
 }
 
 }  // namespace

@@ -36,6 +36,7 @@
 #include "common/platform/int128_conversion.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -58,6 +59,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
@@ -109,7 +111,7 @@ using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
 
 const WindowFunctionCallExpression* AsWindow(const Expression& expression) {
   if (expression && expression->Type() == TypeTag::kWindowFunctionExp) {
-    return static_cast<const WindowFunctionCallExpression*>(
+    return dynamic_cast<const WindowFunctionCallExpression*>(
         expression
             .get());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   }
@@ -1523,7 +1525,7 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           static_cast<platform::Int128>(i) *
           static_cast<platform::Int128>(sorted.size() - 1) /
           static_cast<platform::Int128>(num);
-      const int64_t idx =
+      const auto idx =
           static_cast<int64_t>(idx128);  // NOLINT(modernize-use-auto)
       quantiles.push_back(sorted[static_cast<size_t>(idx)]);
     }
@@ -2140,14 +2142,14 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
         continue;
       }
       if (is_avg) {
-        out.emplace_back(Value(
+        out.emplace_back(
             (double_sum +
              static_cast<double>(int_sum)) /  // NOLINT(modernize-use-emplace)
-            static_cast<double>(seen)));
+            static_cast<double>(seen));
       } else if (any_double) {
-        out.emplace_back(Value(
+        out.emplace_back(
             double_sum +
-            static_cast<double>(int_sum)));  // NOLINT(modernize-use-emplace)
+            static_cast<double>(int_sum));  // NOLINT(modernize-use-emplace)
       } else {
         out.emplace_back(Value(int_sum));  // NOLINT(modernize-use-emplace)
       }
@@ -3206,6 +3208,12 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     }
     return layout;
   }
+  std::vector<SortKeyOrder> order_domains;
+  order_domains.reserve(window.order_by.size());
+for (const auto& term : window.order_by) {
+    order_domains.emplace_back(term.ascending, std::nullopt,
+                               CollationOfExpression(term.expression));
+  }
   for (WindowPartitionLayout& partition : layout.partitions) {
     std::span<size_t> ordered = layout.MutableOrdered(partition);
     const bool build_order_values =
@@ -3227,6 +3235,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
                              runtime.EvalAt(term.expression, rows, ordered[k]));
             key = std::move(evaluated);
           }
+          RETURN_IF_FAIL(order_domains[t].Observe(key));
           // COLLATE-wrapped keys sort case-insensitively ('und:ci'); folding
           // the hidden sort key is sufficient because ValueLess then only
           // sees the folded text. The collation comes from the value's tag
@@ -3764,6 +3773,515 @@ StatusOr<bool> TryComputeColumnPrefixWithSummary(
                                     });
 }
 
+static StatusOr<bool> TryComputeSlidingDistinctRows(
+    const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+    std::span<const size_t> ordered, const WindowRuntime& runtime,
+    std::vector<Value>* out) {
+  const char* disable_env =
+      std::getenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+  if (disable_env != nullptr && disable_env[0] == '1') {
+    return false;
+  }
+  if (!window.distinct || window.args.size() != 1 || window.where_filter ||
+      !window.inner_order_by.empty() || window.inner_limit.has_value() ||
+      !window.has_frame || window.frame_unit != WindowFrameUnit::kRows ||
+      (window.exclusion != WindowFrameExclusion::kNone &&
+       window.exclusion != WindowFrameExclusion::kCurrentRow)) {
+    return false;
+  }
+  if (window.function != "COUNT" && window.function != "SUM") {
+    return false;
+  }
+  const Expression& arg = window.args[0];
+  if (!arg) {
+    return false;
+  }
+  const bool arg_is_col = arg->Type() == TypeTag::kColumnValue;
+  const bool arg_is_const =
+      arg->Type() == TypeTag::kConstantValue &&
+      dynamic_cast<const ParameterSlot*>(arg.get()) == nullptr;
+  if (!arg_is_col && !arg_is_const) {
+    return false;
+  }
+  if (arg_is_col) {
+    const auto& cname = arg->AsColumnValue().GetColumnName();
+    if (cname.name == "*" ||
+        !LocalColumnOffset(*runtime.schema, cname).has_value()) {
+      return false;
+    }
+  }
+
+  auto parse_const_offset = [](const WindowFrameBound& bound,
+                               bool* ok) -> int64_t {
+    if (bound.type == WindowFrameBoundType::kUnboundedPreceding ||
+        bound.type == WindowFrameBoundType::kUnboundedFollowing ||
+        bound.type == WindowFrameBoundType::kCurrentRow) {
+      return 0;
+    }
+    if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
+      *ok = false;
+      return 0;
+    }
+    const Value& val = bound.offset->AsConstantValue().GetValue();
+    if (val.IsNull() || val.type != ValueType::kInt64 || val.IsUnsigned() ||
+        val.value.int_value < 0) {
+      *ok = false;
+      return 0;
+    }
+    return val.value.int_value;
+  };
+  bool bounds_ok = true;
+  const int64_t start_off = parse_const_offset(window.frame_start, &bounds_ok);
+  const int64_t end_off = parse_const_offset(window.frame_end, &bounds_ok);
+  if (!bounds_ok) {
+    return false;
+  }
+
+  const size_t m = ordered.size();
+  if (m == 0) {
+    return true;
+  }
+
+  // Lean proof: lean/TinylambOpt/Research/WindowDistinctInverse.lean
+  //   (window_distinct_inverse_sound, update_count_bound)
+  const bool is_sum = window.function == "SUM";
+  // COUNT(DISTINCT) accepts general Value types, so normalize peer equality
+  // with CanonicalDistinctValue. SUM(DISTINCT) takes the arithmetic path only
+  // for signed INT64 values (checked below); their raw values are already the
+  // canonical keys used by the set and by the exact sum accumulator.
+  std::vector<Value> vals;
+  vals.reserve(m);
+  for (size_t k = 0; k < m; ++k) {
+    ASSIGN_OR_RETURN(Value, v, (runtime.EvalAt(arg, rows, ordered[k])));
+    if (is_sum && !v.IsNull() &&
+        (v.type != ValueType::kInt64 || v.IsUnsigned())) {
+      return false;
+    }
+    vals.push_back(is_sum ? v : CanonicalDistinctValue(v));
+  }
+
+  auto compute_bounds = [&](size_t pos) -> std::pair<size_t, size_t> {
+    std::optional<size_t> lo;
+    switch (window.frame_start.type) {
+      case WindowFrameBoundType::kUnboundedPreceding:
+        lo = size_t{0};
+        break;
+      case WindowFrameBoundType::kCurrentRow:
+        lo = pos;
+        break;
+      case WindowFrameBoundType::kOffsetPreceding: {
+        const auto off = static_cast<uint64_t>(start_off);
+        lo = (off <= pos) ? (pos - static_cast<size_t>(off)) : size_t{0};
+        break;
+      }
+      case WindowFrameBoundType::kOffsetFollowing: {
+        const auto off = static_cast<uint64_t>(start_off);
+        if (off <= m - 1 - pos) {
+          lo = pos + static_cast<size_t>(off);
+        }
+        break;
+      }
+      case WindowFrameBoundType::kUnboundedFollowing:
+        lo = m - 1;
+        break;
+    }
+    std::optional<size_t> hi;
+    switch (window.frame_end.type) {
+      case WindowFrameBoundType::kUnboundedFollowing:
+        hi = m - 1;
+        break;
+      case WindowFrameBoundType::kCurrentRow:
+        hi = pos;
+        break;
+      case WindowFrameBoundType::kOffsetFollowing: {
+        const auto off = static_cast<uint64_t>(end_off);
+        hi = (off <= m - 1 - pos) ? (pos + static_cast<size_t>(off)) : (m - 1);
+        break;
+      }
+      case WindowFrameBoundType::kOffsetPreceding: {
+        const auto off = static_cast<uint64_t>(end_off);
+        if (off <= pos) {
+          hi = pos - static_cast<size_t>(off);
+        }
+        break;
+      }
+      case WindowFrameBoundType::kUnboundedPreceding:
+        hi = size_t{0};
+        break;
+    }
+    if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
+      return {1, 0};
+    }
+    return {*lo, *hi};
+  };
+
+  std::unordered_map<Value, size_t, DistinctValueHash, DistinctValueEqual> mult;
+  mult.reserve(std::min<size_t>(m, 256));
+  size_t distinct_non_null = 0;
+  platform::Int128 distinct_sum = 0;
+  platform::Int128 abs_distinct_sum = 0;
+  constexpr platform::Int128 kMaxInt64 = std::numeric_limits<int64_t>::max();
+  constexpr platform::Int128 kMinInt64 = std::numeric_limits<int64_t>::min();
+
+  auto add_pos = [&](size_t pos) {
+    const Value& v = vals[pos];
+    if (v.IsNull()) {
+      return;
+    }
+    auto [it, inserted] = mult.emplace(v, 0);
+    if (inserted || it->second == 0) {
+      it->second = 1;
+      ++distinct_non_null;
+      if (is_sum) {
+        const auto x = static_cast<platform::Int128>(v.value.int_value);
+        distinct_sum += x;
+        abs_distinct_sum += (x < 0 ? -x : x);
+      }
+    } else {
+      ++(it->second);
+    }
+  };
+  auto rem_pos = [&](size_t pos) -> bool {
+    const Value& v = vals[pos];
+    if (v.IsNull()) {
+      return true;
+    }
+    auto it = mult.find(v);
+    if (it == mult.end()) {
+      // The slide/rebuild logic keeps mult == the frame multiset, so this is
+      // unreachable; bail to the generic path rather than dereference end().
+      return false;
+    }
+    if (--(it->second) == 0) {
+      if (is_sum) {
+        const auto x = static_cast<platform::Int128>(v.value.int_value);
+        distinct_sum -= x;
+        abs_distinct_sum -= (x < 0 ? -x : x);
+      }
+      mult.erase(it);
+      --distinct_non_null;
+    }
+    return true;
+  };
+
+  bool cur_valid = false;
+  size_t cur_lo = 1;
+  size_t cur_hi = 0;
+  for (size_t k = 0; k < m; ++k) {
+    const auto [lo, hi] = compute_bounds(k);
+    if (lo > hi) {
+      if (cur_valid) {
+        mult.clear();
+        distinct_non_null = 0;
+        distinct_sum = 0;
+        abs_distinct_sum = 0;
+        cur_valid = false;
+      }
+    } else if (!cur_valid || lo > cur_hi || lo < cur_lo || hi < cur_hi) {
+      if (cur_valid) {
+        mult.clear();
+        distinct_non_null = 0;
+        distinct_sum = 0;
+        abs_distinct_sum = 0;
+      }
+      for (size_t p = lo; p <= hi; ++p) {
+        add_pos(p);
+      }
+      cur_lo = lo;
+      cur_hi = hi;
+      cur_valid = true;
+    } else {
+      while (cur_lo < lo) {
+        if (!rem_pos(cur_lo++)) {
+          return false;
+        }
+      }
+      while (cur_hi < hi) {
+        add_pos(++cur_hi);
+      }
+    }
+
+    // EXCLUDE CURRENT ROW removes the current row only when it belongs to
+    // this frame. If an offset frame excludes k, there is nothing to remove
+    // or restore in the frame multiset.
+    const bool exclude_k =
+        (window.exclusion == WindowFrameExclusion::kCurrentRow) && cur_valid &&
+        lo <= k && k <= hi;
+    if (exclude_k) {
+      if (!rem_pos(k)) {
+        return false;
+      }
+    }
+
+    if (!is_sum) {
+      (*out)[ordered[k]] = Value(static_cast<int64_t>(distinct_non_null));
+    } else if (distinct_non_null == 0) {
+      (*out)[ordered[k]] = Value();
+    } else if (abs_distinct_sum > kMaxInt64 || distinct_sum < kMinInt64 ||
+               distinct_sum > kMaxInt64) {
+      return false;
+    } else {
+      (*out)[ordered[k]] = Value(static_cast<int64_t>(distinct_sum));
+    }
+
+    if (exclude_k) {
+      add_pos(k);
+    }
+  }
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/NthNonNullFrame.lean (sound)
+static StatusOr<bool> TryComputeNthNonNullFrame(
+    const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+    std::span<const size_t> ordered, const WindowOrderValues& order_values,
+    const std::vector<size_t>& peer_end, const std::vector<size_t>& group_ends,
+    const WindowRuntime& runtime, std::vector<Value>* out) {
+  const char* disable_env = std::getenv("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME");
+  if (disable_env != nullptr && disable_env[0] == '1') {
+    return false;
+  }
+  if (!window.ignore_nulls || window.where_filter ||
+      (window.exclusion != WindowFrameExclusion::kNone &&
+       window.exclusion != WindowFrameExclusion::kCurrentRow) ||
+      window.args.empty()) {
+    return false;
+  }
+  if (window.function != "FIRST_VALUE" && window.function != "LAST_VALUE" &&
+      window.function != "NTH_VALUE") {
+    return false;
+  }
+  if (window.function == "NTH_VALUE" && window.args.size() < 2) {
+    return false;
+  }
+  const Expression& arg = window.args[0];
+  if (!arg) {
+    return false;
+  }
+  const bool arg_is_col = arg->Type() == TypeTag::kColumnValue;
+  const bool arg_is_const =
+      arg->Type() == TypeTag::kConstantValue &&
+      dynamic_cast<const ParameterSlot*>(arg.get()) == nullptr;
+  if (!arg_is_col && !arg_is_const) {
+    return false;
+  }
+  if (arg_is_col) {
+    const auto& cname = arg->AsColumnValue().GetColumnName();
+    if (cname.name == "*" ||
+        !LocalColumnOffset(*runtime.schema, cname).has_value()) {
+      return false;
+    }
+  }
+  const size_t m = ordered.size();
+  if (m == 0) {
+    return true;
+  }
+
+  std::vector<size_t> ranks(m + 1, 0);
+  std::vector<Value> non_null_values;
+  non_null_values.reserve(m);
+  for (size_t i = 0; i < m; ++i) {
+    ASSIGN_OR_RETURN(Value, v, (runtime.EvalAt(arg, rows, ordered[i])));
+    if (!v.IsNull()) {
+      non_null_values.push_back(std::move(v));
+    }
+    ranks[i + 1] = non_null_values.size();
+  }
+
+  for (size_t k = 0; k < m; ++k) {
+    ASSIGN_OR_RETURN(
+        FrameBounds, frame_bounds,
+        (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
+                                     peer_end, group_ends)));
+    const size_t lo = frame_bounds.first;
+    const size_t hi = frame_bounds.second;
+    if (hi < lo || lo >= m) {
+      continue;
+    }
+    const size_t hi_excl = std::min(hi + 1, m);
+    const size_t a = ranks[lo];
+    const size_t b = ranks[hi_excl];
+    const size_t cut = ranks[k];
+    const bool remove =
+        (window.exclusion == WindowFrameExclusion::kCurrentRow) && lo <= k &&
+        k < hi_excl && cut < ranks[k + 1];
+    const size_t avail = (b - a) - (remove ? size_t{1} : size_t{0});
+    uint64_t nth_u64 = 1;
+    if (window.function == "LAST_VALUE") {
+      if (avail == 0) {
+        continue;
+      }
+      nth_u64 = avail;
+    } else if (window.function == "NTH_VALUE") {
+      ASSIGN_OR_RETURN(Value, nth_value,
+                       (runtime.EvalAt(window.args[1], rows, ordered[k])));
+      if (nth_value.IsNull()) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "The N value for the NthValue function must not be NULL");
+      }
+      if (nth_value.type != ValueType::kInt64) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "The N value for the NthValue function must be an integer");
+      }
+      const int64_t nth = nth_value.value.int_value;
+      if (nth <= 0) {
+        return StatusError(
+            StatusCode::kInvalidArgument,
+            "The N value for the NthValue function must be positive");
+      }
+      nth_u64 = static_cast<uint64_t>(nth);
+    }
+    if (nth_u64 > avail) {
+      continue;
+    }
+    const size_t pos = a + static_cast<size_t>(nth_u64 - 1);
+    const size_t target = (remove && cut <= pos) ? (pos + 1) : pos;
+    if (target < b) {
+      (*out)[ordered[k]] = non_null_values[target];
+    }
+  }
+  return true;
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/RangeDistinctIndex.lean (sound)
+static StatusOr<bool> TryComputeRangeDistinctIndex(
+    const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+    std::span<const size_t> ordered, const WindowOrderValues& order_values,
+    const std::vector<size_t>& peer_end, const std::vector<size_t>& group_ends,
+    const WindowRuntime& runtime, std::vector<Value>* out) {
+  const char* disable_env =
+      std::getenv("TINYLAMB_DISABLE_RANGE_DISTINCT_INDEX");
+  if (disable_env != nullptr && disable_env[0] == '1') {
+    return false;
+  }
+  if (!window.distinct || window.function != "COUNT" ||
+      window.args.size() != 1 || window.where_filter ||
+      !window.inner_order_by.empty() || window.inner_limit.has_value() ||
+      window.exclusion != WindowFrameExclusion::kNone) {
+    return false;
+  }
+  const Expression& arg = window.args[0];
+  if (!arg) {
+    return false;
+  }
+  const bool arg_is_col = arg->Type() == TypeTag::kColumnValue;
+  const bool arg_is_const =
+      arg->Type() == TypeTag::kConstantValue &&
+      dynamic_cast<const ParameterSlot*>(arg.get()) == nullptr;
+  if (!arg_is_col && !arg_is_const) {
+    return false;
+  }
+  if (arg_is_col) {
+    const auto& cname = arg->AsColumnValue().GetColumnName();
+    if (cname.name == "*" ||
+        !LocalColumnOffset(*runtime.schema, cname).has_value()) {
+      return false;
+    }
+  }
+  const size_t m = ordered.size();
+  if (m == 0) {
+    return true;
+  }
+
+  struct MarksNode {
+    uint32_t count{0};
+    uint32_t left{0};
+    uint32_t right{0};
+  };
+  uint32_t depth = 1;
+  while ((size_t{1} << depth) < m) {
+    ++depth;
+  }
+  std::vector<MarksNode> nodes;
+  nodes.reserve(1 + (2 * m * (depth + 1)));
+  nodes.push_back(MarksNode{});  // node 0 = empty
+
+  auto update_mark = [&](auto&& self, uint32_t node_idx, size_t pos, bool on,
+                         uint32_t d) -> uint32_t {
+    if (d == 0) {
+      if (!on) {
+        return 0;
+      }
+      const auto idx = static_cast<uint32_t>(nodes.size());
+      nodes.push_back(MarksNode{.count = 1, .left = 0, .right = 0});
+      return idx;
+    }
+    const uint32_t cur_left = nodes[node_idx].left;
+    const uint32_t cur_right = nodes[node_idx].right;
+    const size_t half = size_t{1} << (d - 1);
+    uint32_t u = cur_left;
+    uint32_t v = cur_right;
+    if (pos < half) {
+      u = self(self, cur_left, pos, on, d - 1);
+    } else {
+      v = self(self, cur_right, pos - half, on, d - 1);
+    }
+    const uint32_t total = nodes[u].count + nodes[v].count;
+    if (total == 0) {
+      return 0;
+    }
+    const auto idx = static_cast<uint32_t>(nodes.size());
+    nodes.push_back(MarksNode{.count = total, .left = u, .right = v});
+    return idx;
+  };
+
+  auto query_suffix = [&](auto&& self, uint32_t node_idx, size_t lo,
+                          uint32_t d) -> uint32_t {
+    if (node_idx == 0) {
+      return 0;
+    }
+    if (lo == 0 || d == 0) {
+      return lo == 0 ? nodes[node_idx].count : 0;
+    }
+    const size_t half = size_t{1} << (d - 1);
+    if (lo < half) {
+      return self(self, nodes[node_idx].left, lo, d - 1) +
+             nodes[nodes[node_idx].right].count;
+    }
+    return self(self, nodes[node_idx].right, lo - half, d - 1);
+  };
+
+  std::vector<uint32_t> roots;
+  roots.reserve(m + 1);
+  uint32_t tree = 0;
+  roots.push_back(tree);
+  std::unordered_map<Value, size_t> previous;
+  previous.reserve(std::min<size_t>(m, 4096));
+  for (size_t i = 0; i < m; ++i) {
+    ASSIGN_OR_RETURN(Value, v, (runtime.EvalAt(arg, rows, ordered[i])));
+    if (!v.IsNull()) {
+      Value key = CanonicalDistinctValue(v);
+      auto [it, inserted] = previous.emplace(std::move(key), i);
+      if (!inserted) {
+        tree = update_mark(update_mark, tree, it->second, false, depth);
+        it->second = i;
+      }
+      tree = update_mark(update_mark, tree, i, true, depth);
+    }
+    roots.push_back(tree);
+  }
+
+  for (size_t k = 0; k < m; ++k) {
+    ASSIGN_OR_RETURN(
+        FrameBounds, frame_bounds,
+        (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
+                                     peer_end, group_ends)));
+    const size_t lo = frame_bounds.first;
+    const size_t hi = frame_bounds.second;
+    if (hi < lo || lo >= m) {
+      (*out)[ordered[k]] = Value(int64_t{0});
+      continue;
+    }
+    const size_t hi_excl = std::min(hi + 1, m);
+    const uint32_t distinct_cnt =
+        query_suffix(query_suffix, roots[hi_excl], lo, depth);
+    (*out)[ordered[k]] = Value(static_cast<int64_t>(distinct_cnt));
+  }
+  return true;
+}
+
 Status ComputeOneWindowImpl(TransactionContext& context,
                             const WindowFunctionCallExpression& window,
                             std::vector<Row>& rows, const Schema& schema,
@@ -3983,6 +4501,13 @@ Status ComputeOneWindowImpl(TransactionContext& context,
         return StatusError(StatusCode::kInvalidArgument,
                            fn + " requires at least one argument");
       }
+      ASSIGN_OR_RETURN(
+          bool, nth_non_null_done,
+          (TryComputeNthNonNullFrame(window, rows, ordered, order_values,
+                                     peer_end, group_ends, runtime, out)));
+      if (nth_non_null_done) {
+        continue;
+      }
       for (size_t k = 0; k < m; ++k) {
         ASSIGN_OR_RETURN(
             FrameBounds, frame_bounds,
@@ -4128,6 +4653,21 @@ Status ComputeOneWindowImpl(TransactionContext& context,
                                             partition.peer_end, schema,
                                             uniform_cell_types, out));
     if (prefix_done) {
+      continue;
+    }
+
+    ASSIGN_OR_RETURN(
+        bool, distinct_done,
+        (TryComputeSlidingDistinctRows(window, rows, ordered, runtime, out)));
+    if (distinct_done) {
+      continue;
+    }
+
+    ASSIGN_OR_RETURN(
+        bool, range_distinct_done,
+        (TryComputeRangeDistinctIndex(window, rows, ordered, order_values,
+                                      peer_end, group_ends, runtime, out)));
+    if (range_distinct_done) {
       continue;
     }
 
@@ -4415,7 +4955,8 @@ Status FinalizeWindowedStatement(TransactionContext& context,
 StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                      const SelectStatement& statement,
                                      Relation&& input, const Scope* outer,
-                                     const CteMap& ctes) {
+                                     const CteMap& ctes,
+                                     bool allow_window_halo) {
   double* window_ms = nullptr;
   if (auto* runtime_stats = context.execution_runtime()) {
     window_ms = &runtime_stats->window_ms;
@@ -4491,6 +5032,346 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
 
   RETURN_IF_FAIL(input.FinishSpill());
   RETURN_IF_FAIL(input.GetStatus());
+
+  // Lean proof: lean/TinylambOpt/WindowHalo.lean (window_halo_sound)
+  // When unpartitioned bounded-ROWS window calls share the outer ORDER BY
+  // under a deterministic LIMIT/OFFSET, extract only the sorted halo slice
+  // `[offset - max_preceding, min(n, offset + limit + max_following))` before
+  // running window evaluation.
+  const char* disable_halo_env = std::getenv("TINYLAMB_DISABLE_WINDOW_HALO");
+  if ((disable_halo_env == nullptr || disable_halo_env[0] != '1') &&
+      allow_window_halo && !rank_bound && !input.HasSpill() &&
+      statement.HasLimit() && statement.Limit() > 0 && !statement.WithTies() &&
+      !statement.Qualify() && !statement.Distinct() &&
+      !statement.HasDistinctOn() && statement.GroupBy().empty() &&
+      !statement.Having() && !statement.OrderBy().empty() &&
+      statement.Offset() <=
+          std::numeric_limits<size_t>::max() - statement.Limit()) {
+    WindowNodeMap order_windows;
+    for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+      CollectWindows(term.expression, &order_windows);
+    }
+    std::vector<slot_t> order_slots;
+    std::vector<SortKeyOrder> order_specs;
+    // WindowHalo trims input only to supply frame halos for window calls in
+    // the outer ORDER BY. Ordinary ORDER BY/LIMIT belongs to the normal
+    // sort-limit path and must never enter this rewrite.
+    bool order_ok = !order_windows.empty();
+    if (order_ok) {
+      order_slots.reserve(statement.OrderBy().size());
+      order_specs.reserve(statement.OrderBy().size());
+      for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+        if (!term.expression ||
+            term.expression->Type() != TypeTag::kColumnValue) {
+          order_ok = false;
+          break;
+        }
+        const ColumnName& cn = term.expression->AsColumnValue().GetColumnName();
+        if (cn.name == "*") {
+          order_ok = false;
+          break;
+        }
+        const auto off = LocalColumnOffset(input.schema, cn);
+        if (!off.has_value()) {
+          order_ok = false;
+          break;
+        }
+        if (cn.schema.empty()) {
+          for (const NamedExpression& proj : statement.SelectList()) {
+            if (!proj.name.empty() && IdentifierEquals(proj.name, cn.name)) {
+              std::optional<slot_t> proj_off;
+              if (proj.expression &&
+                  proj.expression->Type() == TypeTag::kColumnValue) {
+                proj_off = LocalColumnOffset(
+                    input.schema,
+                    proj.expression->AsColumnValue().GetColumnName());
+              }
+              if (proj_off != off) {
+                order_ok = false;
+                break;
+              }
+            }
+          }
+          if (!order_ok) {
+            break;
+          }
+        }
+        order_slots.push_back(*off);
+        order_specs.emplace_back(term.ascending, term.nulls_first,
+                                 CollationOfExpression(term.expression));
+      }
+    }
+
+    auto halo_expr_safe = [&](auto&& self, const Expression& expr) -> bool {
+      if (!expr) {
+        return false;
+      }
+      switch (expr->Type()) {
+        case TypeTag::kWindowFunctionExp:
+          return true;
+        case TypeTag::kColumnValue: {
+          const ColumnName& cn = expr->AsColumnValue().GetColumnName();
+          return cn.name != "*" &&
+                 LocalColumnOffset(input.schema, cn).has_value();
+        }
+        case TypeTag::kConstantValue:
+          return dynamic_cast<const ParameterSlot*>(expr.get()) == nullptr;
+        case TypeTag::kBinaryExp: {
+          const auto op = expr->AsBinaryExpression().Op();
+          if (op == BinaryOperation::kDivide ||
+              op == BinaryOperation::kModulo || op == BinaryOperation::kAdd ||
+              op == BinaryOperation::kSubtract ||
+              op == BinaryOperation::kMultiply ||
+              op == BinaryOperation::kShiftLeft ||
+              op == BinaryOperation::kShiftRight) {
+            return false;
+          }
+          return self(self, expr->AsBinaryExpression().Left()) &&
+                 self(self, expr->AsBinaryExpression().Right());
+        }
+        default:
+          return false;
+      }
+    };
+    if (order_ok) {
+      for (const NamedExpression& item : statement.SelectList()) {
+        if (!halo_expr_safe(halo_expr_safe, item.expression)) {
+          order_ok = false;
+          break;
+        }
+      }
+    }
+
+    size_t max_preceding = 0;
+    size_t max_following = 0;
+    auto parse_nonneg_rows_off = [](const WindowFrameBound& b,
+                                    bool* ok) -> size_t {
+      if (!b.offset || b.offset->Type() != TypeTag::kConstantValue) {
+        *ok = false;
+        return 0;
+      }
+      const Value& val = b.offset->AsConstantValue().GetValue();
+      if (val.IsNull() || val.type != ValueType::kInt64 || val.IsUnsigned() ||
+          val.value.int_value < 0) {
+        *ok = false;
+        return 0;
+      }
+      return static_cast<size_t>(val.value.int_value);
+    };
+    if (order_ok) {
+      for (const auto& [win_ptr, win_idx] : windows) {
+        (void)win_idx;
+        if (win_ptr == nullptr || !win_ptr->partition_by.empty() ||
+            !win_ptr->has_frame ||
+            win_ptr->frame_unit != WindowFrameUnit::kRows ||
+            win_ptr->exclusion != WindowFrameExclusion::kNone ||
+            win_ptr->where_filter || !win_ptr->inner_order_by.empty() ||
+            win_ptr->inner_limit.has_value() ||
+            (win_ptr->function != "SUM" && win_ptr->function != "COUNT" &&
+             win_ptr->function != "AVG" && win_ptr->function != "MIN" &&
+             win_ptr->function != "MAX")) {
+          order_ok = false;
+          break;
+        }
+        for (const Expression& arg : win_ptr->args) {
+          if (!arg ||
+              (arg->Type() != TypeTag::kColumnValue &&
+               (arg->Type() != TypeTag::kConstantValue ||
+                dynamic_cast<const ParameterSlot*>(arg.get()) != nullptr))) {
+            order_ok = false;
+            break;
+          }
+          if (arg->Type() == TypeTag::kColumnValue) {
+            const ColumnName& cn = arg->AsColumnValue().GetColumnName();
+            if (cn.name != "*" &&
+                !LocalColumnOffset(input.schema, cn).has_value()) {
+              order_ok = false;
+              break;
+            }
+          }
+        }
+        if (!order_ok || win_ptr->order_by.size() != order_slots.size()) {
+          order_ok = false;
+          break;
+        }
+        for (size_t j = 0; j < order_slots.size(); ++j) {
+          const WindowOrderTerm& wt = win_ptr->order_by[j];
+          const SelectStatement::OrderByTerm& ot = statement.OrderBy()[j];
+          if (!wt.expression ||
+              wt.expression->Type() != TypeTag::kColumnValue) {
+            order_ok = false;
+            break;
+          }
+          const auto wslot = LocalColumnOffset(
+              input.schema, wt.expression->AsColumnValue().GetColumnName());
+          if (!wslot.has_value() || *wslot != order_slots[j] ||
+              wt.ascending != ot.ascending ||
+              wt.nulls_first.value_or(wt.ascending) !=
+                  ot.nulls_first.value_or(ot.ascending) ||
+              CollationOfExpression(wt.expression) !=
+                  CollationOfExpression(ot.expression)) {
+            order_ok = false;
+            break;
+          }
+        }
+        if (!order_ok) {
+          break;
+        }
+        bool bounds_ok = true;
+        switch (win_ptr->frame_start.type) {
+          case WindowFrameBoundType::kOffsetPreceding:
+            max_preceding = std::max(
+                max_preceding,
+                parse_nonneg_rows_off(win_ptr->frame_start, &bounds_ok));
+            break;
+          case WindowFrameBoundType::kCurrentRow:
+            break;
+          case WindowFrameBoundType::kOffsetFollowing:
+            // A FOLLOWING lower bound does not require any input before the
+            // current row; parse only to reject invalid offsets.
+            (void)parse_nonneg_rows_off(win_ptr->frame_start, &bounds_ok);
+            break;
+          case WindowFrameBoundType::kUnboundedPreceding:
+          case WindowFrameBoundType::kUnboundedFollowing:
+            bounds_ok = false;
+            break;
+        }
+        switch (win_ptr->frame_end.type) {
+          case WindowFrameBoundType::kOffsetFollowing:
+            max_following =
+                std::max(max_following,
+                         parse_nonneg_rows_off(win_ptr->frame_end, &bounds_ok));
+            break;
+          case WindowFrameBoundType::kCurrentRow:
+            break;
+          case WindowFrameBoundType::kOffsetPreceding:
+            // A PRECEDING upper bound does not require any input after the
+            // current row; parse only to reject invalid offsets.
+            (void)parse_nonneg_rows_off(win_ptr->frame_end, &bounds_ok);
+            break;
+          case WindowFrameBoundType::kUnboundedPreceding:
+          case WindowFrameBoundType::kUnboundedFollowing:
+            bounds_ok = false;
+            break;
+        }
+        if (!bounds_ok) {
+          order_ok = false;
+          break;
+        }
+      }
+    }
+
+    const size_t total_n = input.HasColumnarOnly() ? input.columnar->total_rows
+                                                   : input.rows.size();
+    if (order_ok && total_n > 0 && statement.Offset() < total_n) {
+      const size_t halo_lo = statement.Offset() > max_preceding
+                                 ? (statement.Offset() - max_preceding)
+                                 : 0;
+      const size_t out_end = statement.Offset() + statement.Limit();
+      const size_t raw_halo_hi =
+          out_end <= std::numeric_limits<size_t>::max() - max_following
+              ? (out_end + max_following)
+              : std::numeric_limits<size_t>::max();
+      const size_t halo_hi = std::min(total_n, raw_halo_hi);
+      if (halo_hi > halo_lo && (halo_hi - halo_lo) < total_n) {
+        std::vector<size_t> idx(total_n);
+        std::iota(idx.begin(), idx.end(), 0);
+        const auto order_halo_indices = [&](const auto& compare) {
+          // Partition off the rows before the requested halo, then sort only
+          // the halo-sized prefix of the remainder. Sorting [0, halo_hi)
+          // would spend O(halo_hi log halo_hi) work on rows we discard.
+          if (halo_lo != 0) {
+            std::nth_element(idx.begin(),
+                             idx.begin() + static_cast<std::ptrdiff_t>(halo_lo),
+                             idx.end(), compare);
+          }
+          std::partial_sort(idx.begin() + static_cast<std::ptrdiff_t>(halo_lo),
+                            idx.begin() + static_cast<std::ptrdiff_t>(halo_hi),
+                            idx.end(), compare);
+        };
+        Relation halo_input(context.execution_runtime());
+        halo_input.schema = input.schema;
+        halo_input.uniform_cell_types = input.uniform_cell_types;
+        CopyExecutionStats(&halo_input, input);
+
+        if (input.HasColumnarOnly()) {
+          const auto& col_tbl = *input.columnar;
+          std::vector<size_t> chunk_offsets;
+          chunk_offsets.reserve(col_tbl.chunks.size() + 1);
+          chunk_offsets.push_back(0);
+          for (const auto& ch : col_tbl.chunks) {
+            if (ch.columns.size() != halo_input.schema.ColumnCount()) {
+              return StatusError(
+                  StatusCode::kCorrupt,
+                  "window halo columnar chunk does not match input schema");
+            }
+            chunk_offsets.push_back(chunk_offsets.back() + ch.rows);
+          }
+          std::vector<std::vector<Value>> sort_cols(
+              order_slots.size(), std::vector<Value>(total_n));
+          size_t base_r = 0;
+          for (const auto& ch : col_tbl.chunks) {
+            for (size_t j = 0; j < order_slots.size(); ++j) {
+              const ColumnarColumn& ccol = ch.columns[order_slots[j]];
+              for (size_t r = 0; r < ch.rows; ++r) {
+                sort_cols[j][base_r + r] = ccol.ValueAt(r);
+              }
+            }
+            base_r += ch.rows;
+          }
+          auto cmp_col = [&](size_t a, size_t b) {
+            for (size_t j = 0; j < order_specs.size(); ++j) {
+              const int c =
+                  order_specs[j].Compare(sort_cols[j][a], sort_cols[j][b]);
+              if (c != 0) {
+                return c < 0;
+              }
+            }
+            return a < b;
+          };
+          order_halo_indices(cmp_col);
+          halo_input.rows.reserve(halo_hi - halo_lo);
+          for (size_t pos = halo_lo; pos < halo_hi; ++pos) {
+            const size_t global_r = idx[pos];
+            const auto it = std::upper_bound(chunk_offsets.begin(),
+                                             chunk_offsets.end(), global_r);
+            const size_t ci =
+                static_cast<size_t>(it - chunk_offsets.begin()) - 1;
+            const size_t local_r = global_r - chunk_offsets[ci];
+            Row row = col_tbl.chunks[ci].MaterializeRow(local_r);
+            if (row.values_.size() != halo_input.schema.ColumnCount()) {
+              return StatusError(
+                  StatusCode::kCorrupt,
+                  "window halo materialized row does not match input schema");
+            }
+            halo_input.AddRow(std::move(row));
+          }
+        } else {
+          auto cmp_row = [&](size_t a, size_t b) {
+            for (size_t j = 0; j < order_specs.size(); ++j) {
+              const int c = order_specs[j].Compare(
+                  input.rows[a][order_slots[j]], input.rows[b][order_slots[j]]);
+              if (c != 0) {
+                return c < 0;
+              }
+            }
+            return a < b;
+          };
+          order_halo_indices(cmp_row);
+          halo_input.rows.reserve(halo_hi - halo_lo);
+          for (size_t pos = halo_lo; pos < halo_hi; ++pos) {
+            halo_input.AddRow(std::move(input.rows[idx[pos]]));
+          }
+        }
+        RETURN_IF_FAIL(halo_input.FinishSpill());
+        input = std::move(halo_input);
+        // Keep LIMIT unchanged: the halo contains the requested output slice
+        // plus following rows used only to evaluate its window frames. Shifting
+        // OFFSET by halo_lo keeps the post-window slice at the same rows.
+        result.statement->SetOffset(statement.Offset() - halo_lo);
+      }
+    }
+  }
 
   if (!rank_bound && input.HasColumnarOnly()) {
     if (auto* runtime_stats = context.execution_runtime()) {

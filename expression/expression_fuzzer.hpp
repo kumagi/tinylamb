@@ -20,12 +20,13 @@ namespace tinylamb {
 // self-contained `.test` file and replayed by expression_fuzzer_test.
 struct ExpressionFuzzResult {
   bool ok{true};
+  bool ignored{false};
   std::string violation;  // populated when ok == false
 };
 
 // Runs one raw libFuzzer input through the full differential pipeline.
 // Inputs that the harness ignores (too small / too large / unparseable
-// expression) return ok == true, so replaying them is a no-op guard.
+// expression) return ok == true and ignored == true.
 ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size);
 
 // Self-contained `.test` format: '#' comment header lines followed by the

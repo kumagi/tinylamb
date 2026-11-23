@@ -22,7 +22,7 @@ graph TD
 
 1. `expression.operation == LogicalOperator::kSelection`、`children.size() == 1`、`predicate` が非空であること。
 2. `SplitDisjuncts(predicate)` が `2`〜`8` 本の非空な選言枝に分かれること。
-3. すべての枝が `stable_branch`（`ExpressionCannotThrowForPlanner` が真、サブクエリ・集約・ウィンドウを含まず、`FunctionCall` はすべて `Volatility::kImmutable`、参照列はすべて `input_relations` に含まれる）を満たすこと。
+3. すべての枝が `stable_branch`（`ExpressionCannotThrowForPlanner` が真、サブクエリ・集約・ウィンドウを含まず、`FunctionCall` はすべて `Volatility::kImmutable`、修飾列は `input_relations` に属し、未修飾列は入力スキーマからちょうど 1 列に解決できる）を満たすこと。スキーマを設定しないテスト用ケースは一意性検査を省略します。
 4. すべての枝が「同一列に対する定数等式比較 `col = const`」のみではないこと（その形は `or_of_ranges_to_in` / `in_list_to_semi_join` がより効率的に扱うため対象外）。
 
 ## 意味論的根拠（D5）

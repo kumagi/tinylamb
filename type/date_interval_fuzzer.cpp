@@ -14,6 +14,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -76,8 +78,13 @@ void Try(const uint8_t* data, size_t size, bool verbose) {
     if (const StatusOr<std::string> formatted = TryFormatDateDays(days.Value());
         formatted.HasValue()) {
       const StatusOr<int64_t> reparsed = TryParseDateDays(formatted.Value());
-      assert(reparsed.HasValue());
-      assert(reparsed.Value() == days.Value());
+      // Keep the fixed-point oracle alive in NDEBUG (RelWithDebInfo) builds.
+      if (!reparsed.HasValue() || reparsed.Value() != days.Value()) {
+        (void)fprintf(stderr,
+                      "DATE parse/format/parse fixed point broken: %s -> %s\n",
+                      date_text.c_str(), formatted.Value().c_str());
+        abort();
+      }
     }
   }
 

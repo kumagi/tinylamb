@@ -196,11 +196,11 @@ TEST_F(MaterializedViewTest, DefinitionPersistsAcrossRestart) {
   Run("CREATE TABLE base_t (k INT64);");
   Run("INSERT INTO base_t VALUES (7);");
   Run("CREATE MATERIALIZED VIEW mv_p AS SELECT k FROM base_t;");
-  // Reopen: both the stored rows and the definition survive.  PreCommit the
+  // Reopen: both the stored rows and the definition survive. PreCommit the
   // session, then tear it down (engine, context, database) before opening
-  // the database again -- pages live in RAM under PageManager and are
-  // snapshotted at Database teardown; there is no per-file exclusive hold
-  // since PagePool was retired.
+  // the database again. PageManager does not write a final snapshot during
+  // teardown; reopening recovers committed changes from the WAL and any
+  // existing checkpoint.
   ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
   engine_.reset();
   context_.reset();

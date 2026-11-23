@@ -35,8 +35,10 @@ expression            expression/      (式 AST, bytecode, JIT)
   ↓
 relational            executor/detail/ (物理中間表現, scan filter, subquery,
                                         planning heuristics, explain)
-                      ※ pseudo-layer: relational_detail 名前空間。plan と
-                        executor の双方から使われる独立部品置き場 (昇格案)
+                      ※ pseudo-layer: relational_detail 名前空間。
+                        executor/relational.hpp と
+                        database/transaction_context.hpp に定義し、plan と
+                        executor の双方から使う独立部品置き場 (昇格案)
   ↓
 plan                  plan/            (Cascades memo, Plan ノード, rules)
   ↓

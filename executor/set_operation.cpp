@@ -161,9 +161,9 @@ Status SetOperationExecutor::MaterializeRows(
             if (common_types[column] == ValueType::kDouble &&
                 value.type == ValueType::kInt64) {
               value = Value(value.IsUnsigned()
-                                    ? static_cast<double>(static_cast<uint64_t>(
-                                          value.value.int_value))
-                                    : static_cast<double>(value.value.int_value));
+                                ? static_cast<double>(static_cast<uint64_t>(
+                                      value.value.int_value))
+                                : static_cast<double>(value.value.int_value));
               continue;
             }
             if (common_types[column] == ValueType::kDate &&
@@ -262,10 +262,11 @@ Status SetOperationExecutor::MaterializeRows(
                 }
                 if (common_types[column] == ValueType::kDouble &&
                     value.type == ValueType::kInt64) {
-                  value = Value(value.IsUnsigned()
-                                    ? static_cast<double>(static_cast<uint64_t>(
-                                          value.value.int_value))
-                                    : static_cast<double>(value.value.int_value));
+                  value =
+                      Value(value.IsUnsigned()
+                                ? static_cast<double>(static_cast<uint64_t>(
+                                      value.value.int_value))
+                                : static_cast<double>(value.value.int_value));
                   continue;
                 }
                 if (common_types[column] == ValueType::kDate &&
@@ -323,8 +324,7 @@ Status SetOperationExecutor::MaterializeRows(
         for (size_t i = lo; i < hi; ++i) {
           const uint64_t h = hasher(src[i].row);
           const size_t shard = (h ^ (h >> 29)) & (kShards - 1);
-          bins[shard].push_back(
-              ShardItem{.row_idx = i, .hash = h});
+          bins[shard].push_back(ShardItem{.row_idx = i, .hash = h});
         }
       }
     }));
@@ -535,9 +535,15 @@ Status SetOperationExecutor::MaterializeRows(
       }
       break;
     case SetOperationKind::kUnion: {
+      const SetOperationRowHash hasher;
       SetOperationRowSet seen;
       for (const auto& source : rows) {
-        AppendDistinct(source, &seen);
+        for (const Positioned& item : source) {
+          const HashedRowRef ref{.row = &item.row, .hash = hasher(item.row)};
+          if (seen.insert(ref).second) {
+            output_.push_back(item);
+          }
+        }
       }
       break;
     }
@@ -593,9 +599,9 @@ Status SetOperationExecutor::MaterializePartitioned() {
           if (expected == ValueType::kDouble &&
               value.type == ValueType::kInt64) {
             value = Value(value.IsUnsigned()
-                                    ? static_cast<double>(static_cast<uint64_t>(
-                                          value.value.int_value))
-                                    : static_cast<double>(value.value.int_value));
+                              ? static_cast<double>(static_cast<uint64_t>(
+                                    value.value.int_value))
+                              : static_cast<double>(value.value.int_value));
             continue;
           }
           if (expected == ValueType::kDate &&
@@ -664,16 +670,6 @@ Status SetOperationExecutor::MaterializePartitioned() {
 
 void SetOperationExecutor::AppendAll(const std::vector<Positioned>& source) {
   output_.insert(output_.end(), source.begin(), source.end());
-}
-
-void SetOperationExecutor::AppendDistinct(const std::vector<Positioned>& source,
-                                          SetOperationRowSet* seen) {
-  const SetOperationRowHash hasher;
-  for (const Positioned& item : source) {
-    if (seen->emplace(HashedRowRef{.row = &item.row, .hash = hasher(item.row)}).second) {
-      output_.push_back(item);
-    }
-  }
 }
 
 void SetOperationExecutor::AppendIntersection(
@@ -804,7 +800,11 @@ Status SetOperationExecutor::Materialize() {
         Row row = batch.RowAt(i);
         RowPosition position = batch.PositionAt(i);
         RETURN_IF_FAIL(observe_types(row));
-        if (!spilling && operation_ != SetOperationKind::kUnionAll &&
+        // UNION ALL does not need deduplication, but its input rows are
+        // materialized in `rows` just like every other set operation, so it
+        // must obey the same query memory budget. Exempting it let a large
+        // UNION ALL bypass the OOC limit entirely.
+        if (!spilling &&
             !QueryMemoryBudget::Global().CanReserve(EstimateRowBytes(row))) {
           RETURN_IF_FAIL(begin_spill());
         }

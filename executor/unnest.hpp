@@ -52,7 +52,8 @@ class UnnestExecutor final : public ExecutorBase {
   // disappearing.  INNER (the default) drops the row entirely. There is no
   // FULL OUTER UNNEST mode: UNNEST emits the array's elements, not a second
   // independent relation whose unmatched rows could be preserved, so the
-  // planner has no full-outer path to wire here.
+  // planner must not produce one -- this executor only has the left_outer_
+  // flag below and would silently treat any other mode as INNER.
   bool left_outer_{false};
   Schema output_schema_;
 

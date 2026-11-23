@@ -20,6 +20,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -88,6 +89,7 @@ class FullScan : public ExecutorBase {
   size_t emitted_{0};
   // Set by the first Next/NextBatch: past that point the iterator has already
   // consumed rows, and installing a filter could only prune them retroactively.
+  mutable std::mutex state_mutex_;
   bool started_{false};
   bool typed_folded_{false};
   // Owns the group so the iterator's raw pointer stays valid for its lifetime.

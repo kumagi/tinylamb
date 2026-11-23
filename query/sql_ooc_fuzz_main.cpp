@@ -63,6 +63,15 @@ struct Args {
   bool lenient{false};
 };
 
+// Only a known option name means "the previous flag has no value". A value
+// that merely starts with `--` (a hyphen-leading --out path or --flavor name)
+// is data, not a flag, and must reach the option that consumes it.
+bool IsOptionFlag(std::string_view arg) {
+  return arg == "--verbose" || arg == "--lenient" || arg == "--seed" ||
+         arg == "--seconds" || arg == "--scale" || arg == "--flavor" ||
+         arg == "--trace" || arg == "--out" || arg == "--op-timeout";
+}
+
 bool ParseArgs(int argc, char** argv, Args* a) {
   if (argc < 2) {
     return false;
@@ -73,7 +82,7 @@ bool ParseArgs(int argc, char** argv, Args* a) {
     auto value = [&]() -> const char* {
       // A missing value must not silently swallow the next option (e.g.
       // `--seed --verbose` would otherwise yield seed 0 and drop --verbose).
-      if (i + 1 >= argc || std::string_view(argv[i + 1]).starts_with("--")) {
+      if (i + 1 >= argc || IsOptionFlag(argv[i + 1])) {
         return nullptr;
       }
       return argv[++i];
@@ -148,28 +157,31 @@ class Watchdog {
   void Run() {
     while (!stop_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      std::string op;
       {
+        // Hold mu_ from the timeout decision through the exit. Disarm() must
+        // either win the lock first (we then see armed_ == false and skip) or
+        // not run at all: releasing the lock between the check and _Exit let
+        // a late Disarm() cancel a finding only after it was printed, giving
+        // a false hang for an op that actually completed.
         std::scoped_lock lock(mu_);
         if (!armed_ || std::chrono::duration<double>(
                            std::chrono::steady_clock::now() - started_)
                                .count() < timeout_) {
           continue;
         }
-        op = op_;
+        const std::string kind = op_.substr(0, op_.find(' '));
+        {
+          // A disarmed watchdog can still be inside this block while the main
+          // thread prints a report; osyncstream serialises the two writers so
+          // a SIGNATURE line is never interleaved with other stdout output.
+          tinylamb::platform::SyncedOStream out(std::cout);
+          out << "FINDING: op ran longer than " << timeout_
+              << " s (hang or livelock): " << op_.substr(0, 400) << "\n"
+              << "SIGNATURE: hang / " << kind << "\n"
+              << std::flush;
+        }
+        std::_Exit(3);
       }
-      const std::string kind = op.substr(0, op.find(' '));
-      {
-        // A disarmed watchdog can still be inside this block while the main
-        // thread prints a report; osyncstream serialises the two writers so a
-        // SIGNATURE line is never interleaved with other stdout output.
-        tinylamb::platform::SyncedOStream out(std::cout);
-        out << "FINDING: op ran longer than " << timeout_
-            << " s (hang or livelock): " << op.substr(0, 400) << "\n"
-            << "SIGNATURE: hang / " << kind << "\n"
-            << std::flush;
-      }
-      std::_Exit(3);
     }
   }
 
@@ -312,14 +324,21 @@ int RunMinimize(const Args& a) {
   }
   OocRunOptions lenient;
   lenient.lenient = true;
+  Watchdog watchdog(a.op_timeout);
+  lenient.on_op = [&](const std::string& op) { watchdog.Tick(op); };
   const std::string report = tinylamb::ReplayOocTrace(trace, lenient, nullptr);
   if (report.empty()) {
+    watchdog.Disarm();
     std::cout << "OK (the trace does not reproduce in-process)\n";
     return 0;
   }
   std::string final_report;
+  // Minimize replays many candidate traces; pass the same watchdog into it so
+  // --op-timeout keeps guarding every op, not just the first reproduction.
   const OocTrace minimized = tinylamb::MinimizeOocTrace(
-      trace, report, a.seconds > 0 ? a.seconds : 300, &final_report);
+      trace, report, a.seconds > 0 ? a.seconds : 300, &final_report,
+      [&](const std::string& op) { watchdog.Tick(op); });
+  watchdog.Disarm();
   std::string one_line = final_report;
   for (char& c : one_line) {
     if (c == '\n') {

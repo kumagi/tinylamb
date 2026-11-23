@@ -25,7 +25,10 @@
 ## synchronous_commit との関係
 
 - **`synchronous_commit = true`（既定）**: 自身の commit レコード終端の
-  恒久化を待つ（グループコミット、既定 1ms 間隔）。
+  恒久化を待つ（グループコミット）。既定の `sync_interval_` は 1ms で、
+  書込みが続く間の cadence に使う。idle 時は worker の待機を段階的に延ばし、
+  最大 100ms まで backoff する。durability waiter がいる場合は worker を通知して
+  早期に fsync する。
 - **`synchronous_commit = false`**: 自身の commit の fsync は待たない。
   ただし **D4 の依存 LSN バリアは無効化されない**。設定が制御するのは
   自身の commit 待機だけである。
@@ -39,7 +42,8 @@
 
 - 待機点: `WaitForDurable(レコード終端)`。AddLog 戻り値はレコード先頭 LSN
   であり恒久化地点ではない。
-- Abort 経路は恒久化を待たない。`staged_records_`（既定 4 MiB 以下の通常 Tx）を逆順に
+- Abort 経路は恒久化を待たない。`staged_records_`（通常は最大 4 MiB だが、
+  小さい Tx pool では pool の 1/4 まで縮む）を逆順に
   メモリへ適用するか、大容量トランザクションでは WAL 読み戻しモード（`ADR 0008`、
   `IsWalRereadMode()`）で `prev_lsn` 鎖を `Logger::TryCopyBuffered` /
   `RecoveryManager::ReadLog` により逆順に辿って適用し、未コミット MVCC 版を破棄して、
@@ -51,7 +55,8 @@
 - チェックポイント: transaction status / prev LSN は `transaction_table_lock`
   下で読み取られる。依存 LSN はトランザクション毎の atomic で、恒久化
   バリアのみが読む（WAL には記録しない）。
-- sync 間隔は `Logger::every_ms`（既定 1ms、0 は 1ms へ clamp）。macOS は
+- sync 間隔は `Logger::Create` の `every_ms` 引数で指定し、内部では
+  `sync_interval_` として保持する（既定 1ms、0 は 1ms へ clamp）。macOS は
   F_FULLFSYNC。
 - LSN 3種: CommittedLSN=write済み(fsync未)、DurableLSN=fdatasync済み、
   BufferedLSN=バッファ末尾。durable 判定に使うのは DurableLSN/WaitForDurable のみ。

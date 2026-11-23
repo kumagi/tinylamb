@@ -752,8 +752,8 @@ Value RowAsStructValue(const Row& row, const Schema& schema) {
   std::string json = "{";
   // One append chain per field instead of several temporary concatenations,
   // and a capacity hint to avoid repeated full-string reallocations.
-  json.reserve(2 + row.values_.size() *
-                       32);  // NOLINT(readability-math-missing-parentheses)
+  json.reserve(2 + (row.values_.size() *
+                       32));  // NOLINT(readability-math-missing-parentheses)
   for (size_t i = 0; i < row.values_.size(); ++i) {
     if (i > 0) {
       json += ",";
@@ -1509,76 +1509,10 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
 }
 
 bool Like(std::string_view value, std::string_view pattern) {
-  if (pattern.find('\\') != std::string_view::npos) {
-    return EscapedLikeMatch(value, pattern);
-  }
-  // Fast paths for the common TPC-H shapes: 'foo%', '%foo', '%foo%'.
-  if (pattern == "%") {
-    return true;
-  }
-  if (pattern.empty()) {
-    return value.empty();
-  }
-  const bool leading = pattern.front() == '%';
-  const bool trailing = pattern.back() == '%';
-  if (leading || trailing) {
-    std::string_view core = pattern;
-    if (leading) {
-      core.remove_prefix(1);
-    }
-    if (trailing && !core.empty()) {
-      core.remove_suffix(1);
-    }
-    if (core.find('%') == std::string_view::npos &&
-        core.find('_') == std::string_view::npos) {
-      if (leading && trailing) {
-        return value.find(core) != std::string_view::npos;
-      }
-      if (trailing) {
-        return value.starts_with(core);
-      }
-      if (leading) {
-        return value.size() >= core.size() &&
-               value.substr(value.size() - core.size()) == core;
-      }
-    }
-  }
-
-  size_t value_pos = 0;
-  size_t pattern_pos = 0;
-  size_t wildcard = std::string_view::npos;
-  size_t retry = 0;
-  while (value_pos < value.size()) {
-    // A pattern '%' is a wildcard even when the value character is also '%':
-    // checking it before literal equality preserves the backtrack point.
-    if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
-      wildcard = pattern_pos++;
-      retry = value_pos;
-    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '_') {
-      // '_' matches one whole UTF-8 character, not one byte (matching the
-      // canonical expression/binary_expression.cpp Like implementation).
-      value_pos += std::min(
-          Utf8SequenceLength(static_cast<unsigned char>(value[value_pos])),
-          value.size() - value_pos);
-      ++pattern_pos;
-    } else if (pattern_pos < pattern.size() &&
-               pattern[pattern_pos] == value[value_pos]) {
-      ++value_pos;
-      ++pattern_pos;
-    } else if (wildcard != std::string_view::npos) {
-      pattern_pos = wildcard + 1;
-      retry +=
-          std::min(Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
-                   value.size() - retry);
-      value_pos = retry;
-    } else {
-      return false;
-    }
-  }
-  while (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
-    ++pattern_pos;
-  }
-  return pattern_pos == pattern.size();
+  // Lean proofs: lean/TinylambOpt/LikeSegmentChain.lean (anchored_chain_iff),
+  //   lean/TinylambOpt/LikeUnderscore.lean (raw_like_fast_sound),
+  //   lean/TinylambOpt/LikeShiftAnd.lean (shiftAnd_iff)
+  return EscapedLikeMatch(value, pattern);
 }
 
 StatusOr<Value> TryBinary(BinaryOperation operation, const Value& left,
@@ -1883,19 +1817,56 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       const bool has_own_ctes = !value.Query()->WithQueries().empty();
       const bool want_scalar_only =
           !value.Exists() && !value.Test() && !value.ArrayResult();
+      auto quantified_range_op = [](BinaryOperation op) {
+        return op == BinaryOperation::kLessThan ||
+               op == BinaryOperation::kLessThanEquals ||
+               op == BinaryOperation::kGreaterThan ||
+               op == BinaryOperation::kGreaterThanEquals;
+      };
+      const char* qrs_disable =
+          std::getenv("TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY");
+      const bool want_quantified_range =
+          !has_own_ctes && !value.Exists() && value.Test() &&
+          !value.ArrayResult() && !value.Negated() &&
+          (value.Mode() == QuantifierMode::kAny ||
+           value.Mode() == QuantifierMode::kAll) &&
+          quantified_range_op(value.Op()) &&
+          (qrs_disable == nullptr || std::strcmp(qrs_disable, "1") != 0);
+      std::optional<Value> pre_evaluated_test;
+      std::optional<QuantifiedProbeSpec> quantified_spec;
+      if (want_quantified_range) {
+        ASSIGN_OR_RETURN(
+            Value, test_val,
+            (TryEvaluate(value.Test(), scope, aggregates, context, ctes)));
+        pre_evaluated_test = std::move(test_val);
+        quantified_spec = QuantifiedProbeSpec{
+            .op = value.Op(),
+            .mode = value.Mode(),
+            .test_value = *pre_evaluated_test,
+        };
+      }
       std::optional<bool> exists_answer;
       std::optional<Value> scalar_answer;
+      std::optional<Value> quantified_answer;
+      Status scalar_error = Status::kSuccess;
       std::optional<Relation> indexed =
-          has_own_ctes ? std::nullopt
-                       : ExecuteCorrelatedSingleSource(
-                             context, *value.Query(), scope, ctes,
-                             value.Exists(), &exists_answer,
-                             want_scalar_only ? &scalar_answer : nullptr);
+          has_own_ctes
+              ? std::nullopt
+              : ExecuteCorrelatedSingleSource(
+                    context, *value.Query(), scope, ctes, value.Exists(),
+                    &exists_answer, want_scalar_only ? &scalar_answer : nullptr,
+                    want_scalar_only ? &scalar_error : nullptr,
+                    quantified_spec ? &*quantified_spec : nullptr,
+                    quantified_spec ? &quantified_answer : nullptr);
+      RETURN_IF_FAIL(scalar_error);
       if (exists_answer) {
         return Value(value.Negated() ? !*exists_answer : *exists_answer);
       }
       if (scalar_answer.has_value()) {
         return std::move(*scalar_answer);
+      }
+      if (quantified_answer.has_value()) {
+        return std::move(*quantified_answer);
       }
       std::optional<Relation> executed;
       const Relation* relation = indexed ? &*indexed : nullptr;
@@ -1914,8 +1885,10 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
             !StatementContainsVolatileFunctionCached(
                 context.execution_runtime(), *value.Query());
         if (apply_cacheable) {
-          correlated_apply_key = CorrelatedApplyCacheKey(*value.Query(), &scope,
-                                                         ctes, value.Exists());
+          ASSIGN_OR_RETURN(std::string, apply_cache_key,
+                           (CorrelatedApplyCacheKey(*value.Query(), &scope,
+                                                    ctes, value.Exists())));
+          correlated_apply_key = std::move(apply_cache_key);
           const auto cached_apply =
               context.execution_runtime()->correlated_apply_results.find(
                   correlated_apply_key);
@@ -1994,19 +1967,25 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         return Value(value.Negated() ? !exists : exists);
       }
       if (value.Test()) {
-        ASSIGN_OR_RETURN(
-            Value, test,
-            (TryEvaluate(value.Test(), scope, aggregates, context, ctes)));
+        Value test;
+        if (pre_evaluated_test.has_value()) {
+          test = std::move(*pre_evaluated_test);
+        } else {
+          ASSIGN_OR_RETURN(
+              Value, evaluated_test,
+              (TryEvaluate(value.Test(), scope, aggregates, context, ctes)));
+          test = std::move(evaluated_test);
+        }
 
         if (value.Mode() != QuantifierMode::kIn) {
           std::vector<Value> candidates;
           candidates.reserve(relation->TotalRows());
-          row_source.ForEachRow([&](const Row& row) {
+          RETURN_IF_FAIL(row_source.ForEachRow([&](const Row& row) {
             candidates.push_back(
                 ProjectSubqueryRow(row, as_struct, &subquery_schema));
-          });
-          return EvaluateQuantifiedComparison(value.Op(), value.Mode(), test,
-                                              candidates);
+          }));
+          return TryEvaluateQuantifiedComparison(value.Op(), value.Mode(), test,
+                                                 candidates);
         }
         // Canonical three-valued IN membership: a match decides TRUE, any
         // NULL (test value or row value) turns a miss into UNKNOWN.
@@ -2150,13 +2129,14 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       // Empty subqueries produce an empty array, not NULL.
       if (value.ArrayResult()) {
         std::vector<Value> elements;
-        row_source.ForEachRow([&](const Row& row) {
+        elements.reserve(relation->TotalRows());
+        RETURN_IF_FAIL(row_source.ForEachRow([&](const Row& row) {
           if (row.values_.empty()) {
             return;
           }
           elements.push_back(
               ProjectSubqueryRow(row, as_struct, &subquery_schema));
-        });
+        }));
         std::string element_type = value.ArrayElementSqlType();
         if (element_type.empty()) {
           for (const Value& element : elements) {
@@ -2179,13 +2159,13 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       }
       std::optional<Row> first;
       size_t row_count = 0;
-      row_source.ForEachRow([&](const Row& row) {
+      RETURN_IF_FAIL(row_source.ForEachRow([&](const Row& row) {
         ++row_count;
         // Scalar subquery: only the first row matters.
         if (!first) {
           first = row;
         }
-      });
+      }));
       if (row_count > 1) {
         // GoogleSQL: a scalar subquery must produce at most one row.
         return StatusError(StatusCode::kInvalidArgument,

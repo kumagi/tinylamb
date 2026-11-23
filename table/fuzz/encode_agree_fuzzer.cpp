@@ -61,28 +61,35 @@ constexpr std::array<const char*, 68> kForceNames = {
 };
 constexpr size_t kForceCount = kForceNames.size();
 
+// T4270: save/restore the previous TINYLAMB_FORCE_SCHEME (ScopedEnvVar
+// style) instead of blanket-unsetting, so nesting or an externally set
+// scheme survives the guard. The harness is single-threaded by design
+// (libFuzzer's -jobs/-workers use separate processes with isolated
+// environments), so the process environment is deliberately global here;
+// the getenv/setenv/unsetenv calls carry NOLINT(concurrency-mt-unsafe)
+// annotations, matching the sibling fuzz harnesses.
 class ForceGuard {
  public:
-  // T4270: save/restore the previous TINYLAMB_FORCE_SCHEME (ScopedEnvVar
-  // style) instead of blanket-unsetting, so nesting or an externally set
-  // scheme survives the guard.
   explicit ForceGuard(const char* name) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* prev = std::getenv("TINYLAMB_FORCE_SCHEME");
     if (prev != nullptr) {
       had_prev_ = true;
       prev_ = prev;
     }
     if (name != nullptr) {
-      setenv("TINYLAMB_FORCE_SCHEME", name, 1);
+      setenv("TINYLAMB_FORCE_SCHEME", name,
+             1);  // NOLINT(concurrency-mt-unsafe)
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");
+      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ~ForceGuard() {
     if (had_prev_) {
-      setenv("TINYLAMB_FORCE_SCHEME", prev_.c_str(), 1);
+      setenv("TINYLAMB_FORCE_SCHEME", prev_.c_str(),
+             1);  // NOLINT(concurrency-mt-unsafe)
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");
+      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ForceGuard(const ForceGuard&) = delete;

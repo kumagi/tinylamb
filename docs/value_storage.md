@@ -49,11 +49,16 @@ Explicit interval values use semantic tag 4, retain field-wise
 three signed, sign-flipped big-endian 64-bit fields. Plain VARCHAR keeps byte
 identity and byte ordering even for strings such as `2-0 0 0:0:0`.
 
-Column encoding uses bit 3 for INTERVAL, bits 4–5 for integer width
-(0=64, 1=8, 2=16, 3=32), and bit 7 for unsignedness; bits 0–2 remain ValueType.
+Column encoding uses bit 3 for INTERVAL; bits 0–2 remain ValueType. For INT64,
+bit 7 marks unsignedness and bits 4–5 encode integer width
+(0=64, 1=8, 2=16, 3=32). Bit 7 is valid only for INT64. For VARCHAR with a
+declared text domain, bit 6 marks the domain and bit 4 distinguishes TIMESTAMP
+(`0x50`) from STRING (`0x40`); in that case bits 4–5 are not an integer-width
+field. Other types cannot set the width bits.
 The self-describing Value and ARRAY-element type byte uses bits 0–2 for
 ValueType and bits 3–7 for the semantic tag (0=none, 1=binary, 2=CI,
-3=unsigned, 4=interval). Old untagged values remain readable; older readers
+3=unsigned, 4=interval). The row-block spill codec stores the same tags in
+bits 3–5 and writes zero in bits 6–7. Old untagged values remain readable; older readers
 reject the tagged encodings. Recreate old interval tables that had only VARCHAR
 metadata; their previous implicit string interpretation is no longer valid.
 

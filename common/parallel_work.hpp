@@ -9,7 +9,10 @@
 
 namespace tinylamb {
 // Bound a team by available work, the query's admission budget and the
-// caller's allowed CPU set. No topology/model-specific core-count cutoff.
+// caller's allowed CPU set. The shared helper pool additionally caps its
+// worker count (kMaxPoolWorkers in parallel_work.cpp) so concurrent queries
+// cannot each spawn a core-count worth of threads; that is a concurrency
+// guard, not a topology/model-specific core-count heuristic.
 [[nodiscard]] size_t ParallelWorkerCount(size_t tasks);
 
 // Execute each index in [0, count) once and wait for every callback. Index 0

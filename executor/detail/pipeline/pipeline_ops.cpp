@@ -34,7 +34,8 @@ StatusOr<bool> ChunkVectorSource::NextBatch(PipelineContext* /*ctx*/,
     }
     return true;
   }
-  const size_t end = std::min(cur.Size(), row_in_chunk_ + max_rows);
+  const size_t end = row_in_chunk_ +
+                     std::min(cur.Size() - row_in_chunk_, max_rows);
   // Append column-wise from the source so ColumnVector metadata (collation,
   // unsigned flag, heterogeneous layout) is carried over through
   // ObserveSourceCollation; RowAt()+Append() would infer it from the row's
@@ -80,7 +81,8 @@ StatusOr<bool> SpillableStoreSource::NextBatch(PipelineContext* /*ctx*/,
     active_chunk_.Reset();
     return true;
   }
-  const size_t end = std::min(active_chunk_.Size(), active_row_ + max_rows);
+  const size_t end = active_row_ +
+                     std::min(active_chunk_.Size() - active_row_, max_rows);
   out->Reserve(end - active_row_);
   for (size_t r = active_row_; r < end; ++r) {
     out->Append(active_chunk_.RowAt(r), active_chunk_.PositionAt(r));
@@ -96,11 +98,14 @@ StatusOr<bool> SpillableStoreSource::NextBatch(PipelineContext* /*ctx*/,
 StatusOr<bool> RowVectorSource::NextBatch(PipelineContext* /*ctx*/,
                                           DataChunk* out, size_t max_rows) {
   out->Reset();
-  if (idx_ >= rows_.size() || max_rows == 0) {
+  if (max_rows == 0) {
+    return false;
+  }
+  if (idx_ >= rows_.size()) {
     rows_.clear();
     return false;
   }
-  const size_t end = std::min(rows_.size(), idx_ + max_rows);
+  const size_t end = idx_ + std::min(rows_.size() - idx_, max_rows);
   out->Reserve(end - idx_);
   for (size_t i = idx_; i < end; ++i) {
     out->Append(std::move(rows_[i]));
@@ -250,6 +255,7 @@ Status AdjacentDistinctOp::Process(PipelineContext* /*ctx*/,
                                    const DataChunk& input, DataChunk* output,
                                    bool* /*exhausted*/) {
   output->Reset();
+  output->Reserve(input.Size());
   for (size_t r = 0; r < input.Size(); ++r) {
     Row row = input.RowAt(r);
     if (!have_prev_ || !DistinctRowEqual{}(prev_, row)) {

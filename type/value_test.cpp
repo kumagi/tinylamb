@@ -285,8 +285,21 @@ TEST(ValueTest, CollationSetterRejectsUnknownTags) {
   EXPECT_FALSE(value.SetCollation(255));
   EXPECT_EQ(value.Collation(), 2);
   EXPECT_EQ(value.WithCollation(255).Collation(), 2);
+  // Tag 3 is the UINT64 marker, not a collation. The generic tag setter can
+  // restore it, but a VARCHAR payload must not read as an unsigned integer.
+  EXPECT_TRUE(value.SetCollation(3));
+  EXPECT_EQ(value.Collation(), 3);
+  EXPECT_FALSE(value.IsUnsigned());
   EXPECT_TRUE(value.SetCollation(4));
   EXPECT_EQ(value.Collation(), 4);
+  EXPECT_FALSE(value.IsUnsigned());
+  // NULL never takes a tag: WithCollation leaves it untouched, and even a
+  // direct SetCollation(3) cannot make NULL masquerade as UINT64.
+  Value null_value;
+  EXPECT_TRUE(null_value.WithCollation(3).IsNull());
+  EXPECT_EQ(null_value.WithCollation(3).Collation(), 0);
+  EXPECT_TRUE(null_value.SetCollation(3));
+  EXPECT_FALSE(null_value.IsUnsigned());
 }
 
 TEST(ValueTest, ArrayEncoderDecoderRoundTripPreservesCollation) {
@@ -1321,12 +1334,14 @@ TEST(ValueTest, Operations_OnInvalidValueType_AbortOrThrow) {
   broken.type = invalid_type;
   std::array<char, 16> buffer{};
 
-  // A bogus ValueType tag on an in-memory value is broken plumbing: the
-  // no-exception contract aborts on these paths.
-  // Size() reports an empty extent for an out-of-range tag instead of
-  // aborting: corrupt-storage data must not crash the server.
+  // The storage boundary rejects an unknown tag without touching output.
+  buffer.fill('x');
+  const auto original = buffer;
   EXPECT_EQ(broken.Size(), 0U);
-  EXPECT_DEATH(broken.Serialize(buffer.data()), "undefined type");
+  EXPECT_EQ(broken.Serialize(buffer.data()), 0U);
+  EXPECT_EQ(buffer, original);
+  // Operations that require an already-valid in-memory value keep their
+  // diagnostics for a broken tag.
   EXPECT_DEATH(std::ignore = broken.AsString(), "undefined type");
   EXPECT_DEATH(std::ignore = (broken == broken), "undefined type");
   EXPECT_DEATH(std::hash<Value>{}(broken), "undefined type");
@@ -1743,7 +1758,7 @@ TEST(ValueTypeTest, ValueTypeToString_AllEnumValues_ReturnsExpectedString) {
 }
 
 TEST(FunctionTest, DecodedArityMustFitAndAgreeWithDeclaredArguments) {
-  const auto valid = [](std::vector<Type> args, int64_t count) {
+  const auto valid = [](const std::vector<Type>& args, int64_t count) {
     std::stringstream stream;
     Encoder encoder(stream);
     encoder << std::string("f") << args << Type(TypeTag::kBigInt) << count;

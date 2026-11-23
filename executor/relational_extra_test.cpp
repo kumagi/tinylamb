@@ -7,14 +7,17 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "executor/batch_nested_loop_join.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/merge_join.hpp"
 #include "executor/parallel_merge_join.hpp"
 #include "executor/spill_file.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/row_position.hpp"
+#include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -23,6 +26,39 @@
 namespace tinylamb {
 
 namespace {
+
+TEST(MergeJoinExtraTest, RightMaterializationChecksStatementDeadline) {
+  auto left = std::make_shared<ConstantExecutor>(std::vector<Row>{});
+  auto right = std::make_shared<ConstantExecutor>(
+      Row({Value(1)}));
+  MergeJoin join(left, {0}, right, {0});
+  const Transaction::ScopedThreadStatementDeadline expired(-1);
+  ASSERT_EQ(Transaction::CheckThreadStatementTimeout(),
+            StatusCode::kQueryCanceled);
+  DataChunk batch;
+  EXPECT_EQ(join.NextBatch(&batch), 0U);
+  EXPECT_EQ(join.GetStatus(), StatusCode::kQueryCanceled);
+}
+
+TEST(BatchNestedLoopJoinExtraTest, MaterializeReportsPredicateErrorImmediately) {
+  const Schema left_schema("l", {Column("a", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("b", ValueType::kInt64)});
+  auto left = std::make_shared<ConstantExecutor>(Row({Value(1)}));
+  auto right = std::make_shared<ConstantExecutor>(
+      std::vector<Row>{Row({Value(1)}), Row({Value(0)})});
+  const auto predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("l", "a")), BinaryOperation::kDivide,
+      ColumnValueExp(ColumnName("r", "b")));
+  BatchNestedLoopJoin join(left, left_schema, right, right_schema, predicate);
+
+  join.MaterializePipeline();
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+  EXPECT_NE(join.GetStatus().GetMessage().find("division by zero"),
+            std::string::npos);
+  EXPECT_EQ(join.MaterializedRowCount(), 0U);
+  DataChunk batch;
+  EXPECT_EQ(join.NextBatch(&batch), 0U);
+}
 
 // Left-outer NULL padding must use the FULL right row width: padding only
 // the key columns mixes two widths in one output and trips the downstream

@@ -2,7 +2,7 @@
 
 ## サマリー
 
-本書に対応する実装(epoch モード・制御プレーン・shipper/receiver・router・admin)はリポジトリに一切存在しない。M1 の前提となる Phase 0 相当バイナリ（StreamLogger/EpochManager/PreCommit 分割 API/async commit）もフラグ（--wal-streams/--epochs/--distributed/--control-peers）も見当たらず、親文書 distributed.md:24 が「ネットワーク関連のコードは現在ワイヤサーバのみ」と認めている。既存コードへの参照(page_storage.cpp:52、recovery_manager.cpp:74)は正確で、WAL 無限増大や torn page→SinglePageRecovery の主張も現状と整合する。なお G-2（base backup 安全性根拠への指摘）と G-3（未知 LogType のデコード挙動への指摘）は無効として撤回した：G-2 は現行 RecoverFrom が解析失敗で例外を送出せず torn tail を刈って Status を返すため、G-3 は LST 移行後の境界付き Deserialize が未知 type を return 0 で綺麗に拒否し ValidLogEndStatus が末尾扱いするため、いずれも親文書の記述は実装と整合している。quorum パラメータの数値不整合、フェーズ対応表の欠落、簡体字混入等がある。
+本書に対応する実装(epoch モード・制御プレーン・shipper/receiver・router・admin)はリポジトリに一切存在しない。M1 の前提となる Phase 0 相当バイナリ（StreamLogger/EpochManager/PreCommit 分割 API/async commit）もフラグ（--wal-streams/--epochs/--distributed/--control-peers）も見当たらず、親文書 distributed.md:24 が「ネットワーク関連のコードは現在ワイヤサーバのみ」と認めている。既存コードへの参照(page_storage.cpp:218、recovery/recovery_manager.cpp:763)は現行の RecoverFrom 呼び出し/定義を指し、WAL 無限増大や torn page→SinglePageRecovery の主張も現状と整合する。なお G-2（base backup 安全性根拠への指摘）と G-3（未知 LogType のデコード挙動への指摘）は無効として撤回した：G-2 は現行 RecoverFrom が解析失敗で例外を送出せず torn tail を刈って Status を返すため、G-3 は LST 移行後の境界付き Deserialize が未知 type を return 0 で綺麗に拒否し ValidLogEndStatus が末尾扱いするため、いずれも親文書の記述は実装と整合している。quorum パラメータの数値不整合、フェーズ対応表の欠落、簡体字混入等がある。
 
 ## 指摘一覧
 
@@ -16,20 +16,20 @@
 ### G-2: [撤回 — 指摘は無効] base backup 安全性根拠の「解析失敗=末尾規約で刈られる」は実装と整合している
 - 区分: 撤回（実態との乖離なし）
 - 対象: docs/distributed_migration.md:142-143
-- 訂正: 初版は「n2/n3 起動時の RecoverFrom は解析失敗時に例外を送出して起動に失敗する(recovery_manager.cpp:397-399 throw std::runtime_error)」と書いたが、これは誤り。recovery/ 配下に throw は存在せず（logger.cpp:863 のコメントのみ）、:397-399 は ReadLogDetailed のシグネチャと kMinHeader 定義である。実際の RecoverFrom は ValidLogEndStatus(scan_start) で有効末尾を求め（recovery_manager.cpp:601）、torn tail を LOG して logger_->TruncateTo(valid_end) で刈り（:611-614）、2 パス目の読み直し失敗時のみ StatusError(kCorrupt) を返す（:688-690）。すなわち親文書の「末尾の不完全レコードは『解析失敗=末尾』規約で刈られる」は現行実装と整合しており、§5 の書き換えや tail 刈り WP の追加は不要である。
-- 根拠: recovery/recovery_manager.cpp:601（ValidLogEndStatus）、:604-615（"Truncating torn WAL tail" + TruncateTo）、:688-690（StatusError 返却）。grep -rn 'throw' recovery/*.cpp で実行文 0 件。
+- 訂正: 初版は「n2/n3 起動時の RecoverFrom は解析失敗時に例外を送出して起動に失敗する(recovery_manager.cpp:397-399 throw std::runtime_error)」と書いたが、これは誤り。recovery/ 配下に throw は存在せず（logger.cpp:863 のコメントのみ）、:397-399 は ReadLogDetailed のシグネチャと kMinHeader 定義である。実際の RecoverFrom は ValidLogEndStatus(scan_start) で有効末尾を求め（recovery_manager.cpp:805）、torn tail を LOG して logger_->TruncateTo(valid_end) で刈り（:818-820）、2 パス目の読み直し失敗時のみ StatusError(kCorrupt) を返す（:941-944）。すなわち親文書の「末尾の不完全レコードは『解析失敗=末尾』規約で刈られる」は現行実装と整合しており、§5 の書き換えや tail 刈り WP の追加は不要である。
+- 根拠: recovery/recovery_manager.cpp:805（RecoverFrom からの ValidLogEndStatus 呼び出し）、:634（ValidLogEndStatus 定義）、:818-820（"Truncating torn WAL tail" + TruncateTo）、:941-944（読み直し失敗時の StatusError 返却）。grep -rn 'throw' recovery/*.cpp で実行文 0 件。
 
 ### G-3: [撤回 — 指摘は無効] 「未知の LogType は解析停止(=ログ末尾扱い)」は現行デコーダの実挙動と一致する
 - 区分: 撤回（実態との乖離なし）
 - 対象: docs/distributed_migration.md:56-61(§2 互換性ポリシー)
-- 訂正: 初版は「operator>> の default 句が payload を読まず return するため Size() が破綻し誤読連鎖になる(recovery/log_record.cpp:835-838、recovery/recovery_manager.cpp:792-795)」と書いたが、現行ログ形式は 405ff4f の LST 移行で境界付き `LogRecord::Deserialize` に置き換わり、旧引用行はファイル長を超える幽霊行だった。実際の Deserialize は type バイトを範囲検査(`raw_type == 0 || raw_type > kEndCheckpoint` → return 0、log_record.cpp:353-357)し、`kUnknown` も return 0(:363-365)で payload 長を信用しない。回収側の `ValidLogEndStatus` は非 kComplete 読み取りで `return offset`(=有効末尾)を返す(recovery_manager.cpp:547-567)ため、未知レコード種は torn tail と同じく綺麗に末尾扱いで刈られる。親文書 §2 の「解析停止=末尾」記述は現行実装と整合しており、本指摘は撤回する。
-- 根拠: recovery/log_record.cpp:353-357, :363-365。recovery/recovery_manager.cpp:547-567。
+- 訂正: 初版は「operator>> の default 句が payload を読まず return するため Size() が破綻し誤読連鎖になる(recovery/log_record.cpp:835-838、recovery/recovery_manager.cpp:792-795)」と書いたが、現行ログ形式は 405ff4f の LST 移行で境界付き `LogRecord::Deserialize` に置き換わり、旧引用行はファイル長を超える幽霊行だった。実際の Deserialize は type バイトを範囲検査(`raw_type == 0 || raw_type > kEndCheckpoint` → return 0、log_record.cpp:353-357)し、`kUnknown` も return 0(:363-365)で payload 長を信用しない。回収側の `ValidLogEndStatus` は非 kComplete 読み取りで `return offset`(=有効末尾)を返す(recovery_manager.cpp:634-663)ため、未知レコード種は torn tail と同じく綺麗に末尾扱いで刈られる。親文書 §2 の「解析停止=末尾」記述は現行実装と整合しており、本指摘は撤回する。
+- 根拠: recovery/log_record.cpp:368-370（raw_type 範囲検査）、:373-375（kUnknown 判定）。recovery/recovery_manager.cpp:634-663。
 
 ### G-4: M3 手順 1 の checkpoint 要求(admin 経由)+master record 確認が実現不可能
 - 区分: 実態との乖離
 - 対象: docs/distributed_migration.md:120
-- 問題: (a) tinylamb_admin が存在しない(Membership M-2 と同根)。(b) CheckpointManager の自動契機は周期 worker に加え LSM flush/compaction コールバックとコミット閾値(checkpoint_manager.cpp の ctor は :40-51、RequestCompaction は checkpoint_manager.cpp:69)に拡張済みで、「外部から要求する経路がない」はもはや正確でない — `Database::WriteCheckpoint()`(database.hpp:206、シャットダウン経路 database.cpp:1719 や回復後アンカー page_storage.cpp:216 が使用)という公開 API は存在するが、オペレータ向けの admin/CLI 経路は依然として無い。(c) master record はリカバリで読まれず(RecoverFrom(0) で常に先頭から走査)、外部確認用ツールもない。(d) マスターレコード更新を「完了の確認」として使う前提が成立しない。
-- 根拠: grep で WriteCheckpoint 呼び出し元は worker+テスト+Database API 経由のみ。database/page_storage.cpp:189 は `rm_->RecoverFrom(0, storage->tm_.get())` で master record を参照しない。分散側の admin CLI は未実装。
+- 問題: (a) tinylamb_admin が存在しない(Membership M-2 と同根)。(b) CheckpointManager の自動契機は周期 worker に加え LSM flush/compaction コールバックとコミット閾値(checkpoint_manager.cpp の ctor は :40-51、RequestCompaction は recovery/checkpoint_manager.cpp:119（コールバック登録は :53 と :86）)に拡張済みで、「外部から要求する経路がない」はもはや正確でない — `Database::WriteCheckpoint()`(database.hpp:212)という公開 API は存在するが、database.cpp 内の呼出しは DropTable と CompactAllTablesToTlcs（現行行 :1974 と :2076）であり、シャットダウン経路ではない。回復後アンカーでは page_storage.cpp:256 から呼ばれる、オペレータ向けの admin/CLI 経路は依然として無い。(c) master record はリカバリで読まれず(RecoverFrom(0) で常に先頭から走査)、外部確認用ツールもない。(d) マスターレコード更新を「完了の確認」として使う前提が成立しない。
+- 根拠: grep で WriteCheckpoint 呼び出し元は worker+テスト+Database API 経由のみ。database/page_storage.cpp:218 は `storage->rm_->RecoverFrom(0, storage->tm_.get())` で master record を参照しない。分散側の admin CLI は未実装。
 - 提案: M3 手順を「周期 checkpoint の完了を待つ(または Phase 0 で admin トリガと master record 読取 CLI を WP に追加する)」に改める。確認手段を distributed.md §9 変更表に明示。
 
 ### G-5: M3 手順 6 の quorum=3 がメンバシップ式と矛盾

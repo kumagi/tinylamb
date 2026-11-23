@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -154,9 +155,10 @@ TEST_F(CatalogTest, AuditDropRejectsUnexpectedPageType) {
 }
 
 TEST_F(CatalogTest, Construction) {
-  // Arrange -- nothing to set up; default database created by SetUp()
-  // Act -- nothing to execute; default constructed via SetUp()
-  // Assert -- nothing to verify; gtest green on pass, death on crash
+  ASSERT_NE(rs_, nullptr);
+  auto ctx = rs_->BeginReadOnlyContext();
+  EXPECT_TRUE(rs_->ListTables(ctx).empty());
+  ASSERT_SUCCESS(ctx.PreCommit());
 }
 
 TEST_F(CatalogTest, CreateTable) {
@@ -168,9 +170,37 @@ TEST_F(CatalogTest, CreateTable) {
 
   // Act -- create table and pre-commit
   ASSERT_SUCCESS(rs_->CreateTable(ctx, new_schema).GetStatus());
-  ctx.txn_.PreCommit();
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 
   // Assert -- implicit; no crash, no explicit assertions; gtest green on pass
+}
+
+TEST_F(CatalogTest, CreateTableRejectsUnencodableColumnNameAndAllowsRetry) {
+  auto ctx = rs_->BeginContext();
+  constexpr size_t limit = std::numeric_limits<bin_size_t>::max();
+  const Schema invalid(
+      "retry_table", {Column(std::string(limit + 1, 'a'), ValueType::kInt64)});
+  EXPECT_EQ(rs_->CreateTable(ctx, invalid).GetStatus().GetCode(),
+            StatusCode::kTooBigData);
+  const Schema supported("retry_table", {Column("k", ValueType::kInt64)});
+  ASSERT_SUCCESS(rs_->CreateTable(ctx, supported).GetStatus());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(CatalogTest, TableExistsRespectsSnapshotAndIdentifierCase) {
+  auto reader = rs_->BeginReadOnlyContext();
+  auto writer = rs_->BeginContext();
+  ASSERT_SUCCESS(rs_->CreateTable(writer, Schema("MixedName", {Column("id", ValueType::kInt64)})).GetStatus());
+  for (const char* name : {"MixedName", "mixedname"}) {
+    ASSIGN_OR_ASSERT_FAIL(bool, own, writer.TableExists(name));
+    EXPECT_TRUE(own);
+    ASSIGN_OR_ASSERT_FAIL(bool, other, reader.TableExists(name));
+    EXPECT_FALSE(other);
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto fresh = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(bool, exists, fresh.TableExists("MIXEDNAME"));
+  EXPECT_TRUE(exists);
 }
 
 TEST_F(CatalogTest, GetTable) {
@@ -181,7 +211,7 @@ TEST_F(CatalogTest, GetTable) {
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSERT_SUCCESS(rs_->CreateTable(ctx, new_schema).GetStatus());
-    ctx.txn_.PreCommit();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 
   // Act -- open second context, get table, pre-commit
@@ -219,7 +249,7 @@ TEST_F(CatalogTest, Recover) {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                                 ctx.GetTable("test_schema"));
-    ctx.txn_.PreCommit();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
 
     // Assert -- recovered table's schema matches the originally created schema
     ASSERT_EQ(new_schema, tbl->GetSchema());
@@ -241,13 +271,15 @@ TEST_F(CatalogTest, CreateDuplicateTable) {
 
   // Assert -- duplicate creation is rejected with kConflicts
   ASSERT_EQ(status, Status::kConflicts);
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 TEST_F(CatalogTest, GetOrAddFunction) {
   // Arrange -- a function name that does not exist yet
   TransactionContext ctx = rs_->BeginContext();
 
+  EXPECT_EQ(rs_->GetOrAddFunction(ctx, "my_func", -1).GetStatus(),
+            Status::kInvalidArgument);
   // Act -- add it, then request it again
   auto first = rs_->GetOrAddFunction(ctx, "my_func", 2);
   auto second = rs_->GetOrAddFunction(ctx, "my_func", 2);
@@ -262,6 +294,8 @@ TEST_F(CatalogTest, GetOrAddFunction) {
   ASSERT_TRUE(first.HasValue());
   ASSERT_TRUE(second.HasValue());
   EXPECT_EQ(serialize(first.Value()), serialize(second.Value()));
+  EXPECT_EQ(rs_->GetOrAddFunction(ctx, "my_func", -1).GetStatus(),
+            Status::kInvalidArgument);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
@@ -314,6 +348,48 @@ TEST_F(CatalogTest, StatisticsUpdateAndRefresh) {
   }
 }
 
+TEST_F(CatalogTest, ContextStatisticsCacheRespectsTransactionSnapshot) {
+  // A snapshot-dependent catalog with the same live epoch for both readers.
+  class SnapshotCatalog final : public CatalogReader {
+   public:
+    [[nodiscard]] uint64_t CatalogEpoch() const noexcept override { return 1; }
+    StatusOr<Table> GetTable(TransactionContext& /*context*/, std::string_view /*name*/) override {
+      return Status::kNotExists;
+    }
+    StatusOr<TableStatistics> GetStatistics(TransactionContext& context,
+                                            std::string_view /*name*/) override {
+      TableStatistics stats(Schema{});
+      stats.Assign(context.txn_.SnapshotTimestamp(), {});
+      return stats;
+    }
+    StatusOr<Function> GetOrAddFunction(TransactionContext& /*context*/, std::string_view /*name*/,
+                                        int /*argument_count*/) override {
+      return Status::kNotExists;
+    }
+  } catalog;
+
+  TransactionContext older(std::move(rs_->BeginReadOnlyContext().txn_),
+                           &catalog);
+  auto update = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateTable(update, Schema("snapshot_stats",
+                                      {Column("id", ValueType::kInt64)}))
+          .GetStatus());
+  ASSERT_SUCCESS(update.PreCommit());
+  TransactionContext newer(std::move(rs_->BeginReadOnlyContext().txn_),
+                           &catalog);
+  ASSERT_LT(older.txn_.SnapshotTimestamp(), newer.txn_.SnapshotTimestamp());
+
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, older_stats,
+                        older.GetStats("snapshot_stats"));
+  EXPECT_EQ(older_stats->Rows(), older.txn_.SnapshotTimestamp());
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, newer_stats,
+                        newer.GetStats("snapshot_stats"));
+  EXPECT_EQ(newer_stats->Rows(), newer.txn_.SnapshotTimestamp());
+  ASSERT_SUCCESS(newer.PreCommit());
+  ASSERT_SUCCESS(older.PreCommit());
+}
+
 TEST_F(CatalogTest, BeginReadOnlyContext) {
   // Arrange -- create a table and commit it
   Schema schema("ro_tbl", {Column("c", ValueType::kInt64)});
@@ -330,7 +406,7 @@ TEST_F(CatalogTest, BeginReadOnlyContext) {
 
   // Assert -- the table is visible to the read-only transaction
   ASSERT_EQ(schema, tbl->GetSchema());
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 TEST_F(CatalogTest, StreamDatabaseAndContext) {
@@ -382,7 +458,7 @@ TEST_F(CatalogTest, TransactionContextCache) {
   // Assert -- subsequent requests hit the context-local cache
   EXPECT_EQ(tbl1.get(), tbl2.get());
   EXPECT_EQ(s1.get(), s2.get());
-  ctx.txn_.PreCommit();
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, DebugDumpMultipleTables) {
@@ -665,7 +741,7 @@ TEST_F(CatalogTest, CannotAddForeignKeyWhileParentDropWaitsForALease) {
   auto create_child = rs_->BeginContext();
   EXPECT_EQ(rs_->CreateTable(create_child, child).GetStatus(),
             Status::kConflicts);
-  create_child.Abort();
+  ASSERT_SUCCESS(create_child.Abort());
   lease.Release();
   reader.Abort();
   drop_thread.join();
@@ -702,7 +778,7 @@ TEST_F(CatalogTest, DropTableRemovesCatalogAndStatistics) {
     TransactionContext ctx = rs_->BeginContext();
     EXPECT_EQ(ctx.GetTable("drop_tbl").GetStatus(), Status::kNotExists);
     EXPECT_EQ(ctx.GetStats("drop_tbl").GetStatus(), Status::kNotExists);
-    ctx.txn_.PreCommit();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 }
 
@@ -731,7 +807,7 @@ TEST_F(CatalogTest, CreateIndexOnExistingTable) {
                                 ctx.GetTable("idx_tbl"));
     EXPECT_EQ(tbl->IndexCount(), 1U);
     EXPECT_EQ(tbl->GetIndex(0).sc_.name_, "idx_tbl|name");
-    ctx.txn_.PreCommit();
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
 }
 
@@ -893,7 +969,7 @@ TEST_F(CatalogTest, DropTableInvalidatesContextCache) {
 
   // Assert -- the dropped table is no longer served from the cache.
   EXPECT_EQ(ctx.GetTable("cache_drop").GetStatus(), Status::kNotExists);
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 TEST_F(CatalogTest, MoveAssignmentClearsCaches) {
@@ -918,7 +994,7 @@ TEST_F(CatalogTest, MoveAssignmentClearsCaches) {
   oss << moved;
   EXPECT_EQ(oss.str().find("move_ctx"), std::string::npos);
   EXPECT_NE(oss.str().find("TransactionContext"), std::string::npos);
-  moved.txn_.Abort();
+  ASSERT_SUCCESS(moved.txn_.Abort());
 }
 
 // Regression test derived from table_fuzzer (crash-5983ad8f). The fuzzer

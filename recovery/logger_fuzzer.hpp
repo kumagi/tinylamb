@@ -55,7 +55,8 @@ inline Status AppendLoggerFuzzInput(Logger& logger, ByteStream& stream,
   for (size_t i = 0; i < kMaxLogs && stream.Remaining(); ++i) {
     std::string log_data(stream.Bytes(stream.Pick(256)));
     ASSIGN_OR_RETURN(lsn_t, start, logger.AddLog(log_data));
-    durable_target = start + log_data.size();
+    (void)start;  // AddLog returns the record start, not its framed end.
+    durable_target = logger.BufferedLSN();
     if (verbose) {
       // Fuzzer bytes may contain NUL/newline/escape sequences; log a hex
       // rendering so one input cannot forge multiple log lines or terminal
@@ -102,14 +103,21 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   }
 
   std::ifstream file;
-  file.open(filename);
+  file.open(filename, std::ios::binary);
+  if (!file) {
+    return;
+  }
   size_t lsn = 0;
   for (const auto& exp : written) {
     std::string actual;
     actual.resize(exp.size());
     file.read(actual.data(), static_cast<std::streamsize>(actual.size()));
+    if (!file) {
+      return;
+    }
     if (exp != actual) {
-      LOG(FATAL) << lsn << ": expected: " << exp << " actual: " << actual;
+      LOG(FATAL) << lsn << ": expected(hex): " << digest::ToHex(exp)
+                 << " actual(hex): " << digest::ToHex(actual);
     }
     assert(actual == exp);
     lsn += exp.size();

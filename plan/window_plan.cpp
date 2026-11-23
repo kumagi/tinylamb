@@ -16,6 +16,7 @@
 
 #include "plan/window_plan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <ostream>
@@ -26,6 +27,7 @@
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/window_function_expression.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
@@ -160,6 +162,30 @@ void WindowPlan::Dump(std::ostream& output, int indent) const {
   if (child_ != nullptr) {
     DumpChild(output, *child_, indent + 2);
   }
+}
+
+bool WindowPlan::ContainsParameterSlots() const {
+  if (child_ != nullptr && child_->ContainsParameterSlots()) {
+    return true;
+  }
+  // Window function calls carry PARTITION BY / ORDER BY keys, frame bounds,
+  // FILTER and arguments inside window_outputs_. A prepared window query can
+  // bind a parameter there even when the child has none.
+  return std::ranges::any_of(window_outputs_, [](const NamedExpression& out) {
+    return ContainsParameterSlot(out.expression);
+  });
+}
+
+bool WindowPlan::InstallParameterSlots(const std::vector<Value>& parameters,
+                                       size_t* cursor,
+                                       std::vector<Expression>* slots) {
+  for (NamedExpression& out : window_outputs_) {
+    if (!CollectParameterSlots(&out.expression, slots)) {
+      return false;
+    }
+  }
+  return child_ == nullptr ||
+         child_->InstallParameterSlots(parameters, cursor, slots);
 }
 
 std::string WindowPlan::ToString() const {

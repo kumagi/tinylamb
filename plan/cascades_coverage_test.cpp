@@ -77,8 +77,8 @@ TEST(PlanMemoOracleGraph, EdgeShapedJoinGraphsStaySound) {
     for (int i = 0; i < 8; ++i) {
       std::mt19937 rng(seed++);
       const GeneratedJoinGraph graph = GenerateJoinGraph(rng, config);
-      EXPECT_TRUE(CheckExploreEquivalence(graph).empty())
-          << CheckExploreEquivalence(graph);
+      const std::string equivalence_error = CheckExploreEquivalence(graph);
+      EXPECT_TRUE(equivalence_error.empty()) << equivalence_error;
       const GeneratedJoinGraph shrunk = ShrinkJoinGraph(graph);
       EXPECT_LE(shrunk.relations.size(), graph.relations.size());
       EXPECT_LE(shrunk.conjuncts.size(), graph.conjuncts.size());

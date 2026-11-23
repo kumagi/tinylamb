@@ -2,11 +2,13 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_SUBQUERY_RUNTIME_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_SUBQUERY_RUNTIME_HPP
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,9 +17,12 @@
 #include <vector>
 
 #include "common/runtime_filter.hpp"
+#include "common/status_or.hpp"
 #include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
@@ -378,6 +383,36 @@ struct CorrelatedIndex {
   const Schema* cached_outer_schema{nullptr};
   std::array<slot_t, 2> cached_outer_slots{};
   bool cached_outer_slots_valid{false};
+
+  // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+  // (sound)
+  struct QuantifiedRangeSummaryEntry {
+    bool has_non_null{false};
+    bool has_null{false};
+    int64_t min_val{0};
+    int64_t max_val{0};
+  };
+  bool has_quantified_int_summaries{false};
+  ValueType quantified_value_type{ValueType::kInt64};
+  FlatIntKeyMap<QuantifiedRangeSummaryEntry> quantified_int_summaries;
+
+  // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+  struct DemandScalarHit {
+    Value value;
+    bool many{false};
+  };
+  bool has_demand_int_scalars{false};
+  FlatIntKeyMap<DemandScalarHit> demand_int_scalars;
+
+  // Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
+  struct IntervalCheckpoint {
+    int64_t coord{0};
+    int64_t count{0};
+  };
+  bool has_interval_count_sweep{false};
+  ValueType interval_point_type{ValueType::kInt64};
+  ColumnName interval_outer_col;
+  std::vector<IntervalCheckpoint> interval_checkpoints;
 };
 
 // Dynamic ("shared information passing") semi-join keys stashed by BuildInput
@@ -514,6 +549,10 @@ struct BaseRelationArena {
     if (run.ends[row] == begin) {
       return {};
     }
+    // `bytes` is a byte buffer (vector<uint8_t>), not a typed object whose
+    // representation is being punning-read: viewing it through char is the
+    // standard way to hand its bytes to string_view, with no
+    // alignment/endianness/strict-aliasing assumption.
     return {reinterpret_cast<const char*>(run.bytes.data()) + begin,
             run.ends[row] - begin};
   }
@@ -838,9 +877,10 @@ std::string UncorrelatedCacheKey(const SelectStatement& statement,
 // General correlated Apply fallback. The key contains the complete outer
 // scope chain, which is conservative (it may miss reuse for irrelevant outer
 // columns) but is safe for arbitrary correlated expressions.
-std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
-                                    const Scope* outer, const CteMap& ctes,
-                                    bool exists_only);
+StatusOr<std::string> CorrelatedApplyCacheKey(const SelectStatement& statement,
+                                              const Scope* outer,
+                                              const CteMap& ctes,
+                                              bool exists_only);
 
 // Volatile functions make a correlated result unsafe to reuse. Stable and
 // immutable functions are statement-stable and may participate in the cache.
@@ -1000,11 +1040,20 @@ std::shared_ptr<SelectStatement> ResolveGroupingAliases(
 Value ProjectSubqueryRow(const Row& row, bool as_struct,
                          const Schema* schema = nullptr);
 
+struct QuantifiedProbeSpec {
+  BinaryOperation op{BinaryOperation::kLessThan};
+  QuantifierMode mode{QuantifierMode::kAny};
+  Value test_value;
+};
+
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes, bool exists_only = false,
     std::optional<bool>* exists_answer = nullptr,
-    std::optional<Value>* scalar_answer = nullptr);
+    std::optional<Value>* scalar_answer = nullptr,
+    Status* scalar_error = nullptr,
+    const QuantifiedProbeSpec* quantified_probe = nullptr,
+    std::optional<Value>* quantified_answer = nullptr);
 
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,

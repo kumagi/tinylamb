@@ -46,6 +46,9 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
     // External merge only: rows buffered before a sorted run is written.
     // 0 = bound the run by the memory budget alone.
     size_t spill_threshold_rows{0};
+    // Incremental sort retains the suffix domains across consecutive runs.
+    std::shared_ptr<std::vector<SortKeyOrder>> collation_domains{};
+
   };
 
   struct Key {
@@ -67,7 +70,7 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
       : source_(std::move(source)),
         schema_(std::move(schema)),
         keys_(std::move(keys)),
-        options_(options),
+        options_(std::move(std::move(options))),
         worker_count_(std::max<size_t>(1, worker_count)) {}
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;

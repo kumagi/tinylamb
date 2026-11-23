@@ -20,6 +20,7 @@
 
 #include "common/log_message.hpp"
 #include "common/platform/os.hpp"
+#include "query/fuzz_flaky_marker.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -142,6 +143,13 @@ class ScopedDb {
         std::filesystem::remove(it->path(), ec);
       }
     }
+    if (iter_ec) {
+      // A failed enumeration (permissions, concurrent deletion, bad parent)
+      // would silently strand every remaining WAL segment and defeat this
+      // class' disk-quota purpose.
+      LOG(WARN) << "ScopedDb::RemoveDbFiles: WAL segment scan failed: "
+                << iter_ec.message();
+    }
 
     // LSM/block/TLCS companions (RemoveCompanionStorageFiles in database.cpp)
     // for both the page file (<name>.db) and the bare base name.
@@ -165,6 +173,14 @@ class ScopedDb {
           std::filesystem::remove(it->path(), remove_ec);
         }
       }
+      if (remove_ec) {
+        LOG(WARN) << "ScopedDb::RemoveDbFiles: companion remove failed for "
+                  << file << ": " << remove_ec.message();
+      }
+      if (companion_iter_ec) {
+        LOG(WARN) << "ScopedDb::RemoveDbFiles: companion scan failed for "
+                  << file << ": " << companion_iter_ec.message();
+      }
     };
     remove_companions(name_ + ".db");
     remove_companions(name_);
@@ -176,18 +192,13 @@ class ScopedDb {
     if (db_ != nullptr) {
       db_->DeleteAll();
       db_.reset();
-    } else {
-      StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
-      if (created.HasValue()) {
-        created.Value()->DeleteAll();
-      }
     }
-    // A partially failed Create can strand files even when the retry above
-    // returns an error, and Database::DeleteAll does not manage every artifact
-    // family (.log.meta.tmp, WAL segments, ...). Always sweep by name so the
-    // next iteration starts clean (same contract as the destructor): an early
-    // return in the db_ != nullptr path used to skip this and strand files
-    // until a long sweep exhausted the disk.
+    // When db_ is null (a failed Create/CrashAndReopen/CloseAndReopen), do not
+    // issue another Create just to call DeleteAll on it: under quota pressure
+    // that retry creates a fresh partial page/WAL set on every iteration and
+    // makes subsequent Creates fail more often. The name-based sweep below
+    // already removes every artifact family, including partially created ones
+    // (same contract as the destructor).
     RemoveDbFiles();
   }
 
@@ -208,6 +219,10 @@ class ScopedDb {
       // into "replay crash reopen failed" mysteries.
       LOG(ERROR) << "ScopedDb::CrashAndReopen: reopen failed: "
                  << ToString(reopened.GetStatus());
+      // Keep the harness reusable after a failed recovery attempt. Database::
+      // Create may have opened and modified some files before returning its
+      // error, and this object has no Database left to clean them up.
+      RemoveDbFiles();
       return false;
     }
     db_ = reopened.MoveValue();
@@ -225,14 +240,24 @@ class ScopedDb {
     if (!reopened.HasValue()) {
       LOG(ERROR) << "ScopedDb::CloseAndReopen: reopen failed: "
                  << ToString(reopened.GetStatus());
+      RemoveDbFiles();
       return false;
     }
     db_ = reopened.MoveValue();
     return true;
   }
 
-  [[nodiscard]] Database* operator->() const { return db_.get(); }
-  [[nodiscard]] Database& operator*() const { return *db_; }
+  // A failed Create/CloseAndReopen leaves db_ null. Dereferencing it is a
+  // caller precondition violation (check `bool(scoped_db)` first); turn the
+  // otherwise-UB into a diagnosable programmer-error tripwire instead.
+  [[nodiscard]] Database* operator->() const {
+    CHECK_MSG(db_ != nullptr, "ScopedDb::operator-> on an empty ScopedDb");
+    return db_.get();
+  }
+  [[nodiscard]] Database& operator*() const {
+    CHECK_MSG(db_ != nullptr, "ScopedDb::operator* on an empty ScopedDb");
+    return *db_;
+  }
   [[nodiscard]] Database* get() const { return db_.get(); }
   [[nodiscard]] explicit operator bool() const { return db_ != nullptr; }
   [[nodiscard]] const std::string& name() const { return name_; }
@@ -306,6 +331,7 @@ inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
                               : table_raw.substr(tstart, tend - tstart + 1));
   auto col_names = [](std::string_view list) {
     std::vector<std::string> cols;
+    cols.reserve(list.empty() ? 0 : std::ranges::count(list, ',') + 1);
     size_t p = 0;
     while (p < list.size()) {
       const size_t comma = list.find(',', p);
@@ -348,6 +374,7 @@ inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
   }
   auto slots_of = [&tbl](const std::vector<std::string>& cols,
                          std::vector<slot_t>* slots) {
+    slots->reserve(cols.size());
     for (const std::string& c : cols) {
       const int off = tbl.Value().GetSchema().Offset(ColumnName(c));
       if (off < 0) {
@@ -395,8 +422,15 @@ inline std::string FormatFuzzFailureSummary(std::string_view prefix,
     if (out.size() >= 600) {
       // Enforce the documented 600-character cap *including* the ellipsis.
       // Checking after a full append could overshoot by the appended chars
-      // (up to 3 for " | ") plus the ellipsis itself.
-      out.resize(597);
+      // (up to 3 for " | ") plus the ellipsis itself. Back up to a UTF-8
+      // character boundary: resize(597) can otherwise split a multi-byte
+      // sequence and leave invalid bytes in the `-- failure:` header.
+      size_t cut = 597;
+      while (cut > 0 &&
+             (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+        --cut;
+      }
+      out.resize(cut);
       out += "...";
       break;
     }
@@ -411,18 +445,29 @@ inline std::string FormatFuzzFailureSummary(std::string_view prefix,
   return out;
 }
 
-// A verify string containing this marker means the serialized trace replayed
-// clean; such findings are flaky and must never be persisted or abort a worker.
-inline constexpr std::string_view kFlakyVerifyMarker = "flaky";
+// A verify string containing this dedicated sentinel means the serialized
+// trace replayed clean; such findings are flaky and must never be persisted or
+// abort a worker. The marker is deliberately not a common word such as
+// "flaky": the rest of `verify` is a free-form replay report (or SQL text),
+// and a bare substring test there would silently drop genuine findings whose
+// report happens to contain that word. Only the "replay held" branch of each
+// fuzzer embeds the sentinel, via MakeFlakyVerify().
+inline std::string MakeFlakyVerify(std::string_view detail) {
+  std::string out(detail);
+  out.push_back(' ');
+  out.append(kFlakyVerifyMarker);
+  return out;
+}
 
-// Persists a verified fuzz finding (.test + .report.txt) to the working
-// directory and optionally to `TINYLAMB_FUZZ_FINDINGS_DIR`.  When
-// `TINYLAMB_FUZZ_CONTINUE=1` is set, returns after persisting so continuous
-// fuzzing campaigns can keep collecting failures without aborting the worker.
+// Persists a fuzz finding to the working directory and optionally to
+// `TINYLAMB_FUZZ_FINDINGS_DIR`. A skipped verification saves an .unverified
+// trace and lets the worker continue. Verified findings use .test and stop
+// the worker unless `TINYLAMB_FUZZ_CONTINUE` is enabled.
 inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
-                            const std::string& filename,
+                            std::string filename,
                             const std::string& test_text,
-                            std::string_view report, std::string_view verify) {
+                            std::string_view report, std::string_view verify,
+                            bool replay_skipped = false) {
   // A finding whose serialized trace replays clean is most likely flaky;
   // do not persist it as a regression (it would be a permanently green test)
   // and do not abort the worker over a non-reproducing failure.
@@ -432,6 +477,15 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
               << std::flush;
     return;
   }
+  if (replay_skipped) {
+    if (filename.ends_with(".test")) {
+      filename.resize(filename.size() - 5);
+    }
+    filename += ".unverified";
+  }
+  const std::string_view saved_message = replay_skipped
+                                             ? "unverified trace written to "
+                                             : "regression test written to ";
   auto write_pair = [&](const std::string& base_path) -> bool {
     bool ok = true;
     {
@@ -447,7 +501,7 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
     report_path += ".report.txt";
     std::ofstream rfile(report_path);
     rfile << "[" << tag << "] seed=" << seed << "\n"
-          << report << "regression test written to " << base_path
+          << report << saved_message << base_path
           << (verify.empty() ? "" : "\n" + std::string(verify)) << "\n";
     rfile.flush();
     return ok && rfile.good();
@@ -479,12 +533,13 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
   }
 
   std::cerr << "[" << tag << "] seed=" << seed << "\n"
-            << report << "regression test written to " << filename
+            << report << saved_message << filename
             << (verify.empty() ? "" : "\n" + std::string(verify)) << "\n"
             << std::flush;
 
-  if (const char* cont = std::getenv("TINYLAMB_FUZZ_CONTINUE");
-      cont != nullptr && cont[0] != '\0' && std::string_view(cont) != "0") {
+  const char* cont = std::getenv("TINYLAMB_FUZZ_CONTINUE");
+  if (replay_skipped ||
+      (cont != nullptr && cont[0] != '\0' && std::string_view(cont) != "0")) {
     return;
   }
   abort();

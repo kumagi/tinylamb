@@ -105,7 +105,12 @@ IncrementalSortExecutor::IncrementalSortExecutor(
     : source_(std::move(source)),
       schema_(std::move(schema)),
       prefix_keys_(std::move(prefix_keys)),
-      suffix_keys_(std::move(suffix_keys)) {
+      suffix_keys_(std::move(suffix_keys)),
+      suffix_orders_(std::make_shared<std::vector<SortKeyOrder>>()) {
+  for (const auto& key : prefix_keys_) { prefix_orders_.push_back(MakeSortKeyOrder(key));
+}
+  for (const auto& key : suffix_keys_) { suffix_orders_->push_back(MakeSortKeyOrder(key));
+}
   singleton_passthrough_ =
       !suffix_keys_.empty() &&
       std::ranges::all_of(suffix_keys_, [&](const auto& key) {
@@ -116,12 +121,22 @@ IncrementalSortExecutor::IncrementalSortExecutor(
       });
 }
 
+Status IncrementalSortExecutor::ObserveSingleton(const Row& row) {
+  // The singleton shortcut is only enabled for direct suffix columns.
+  for (size_t i = 0; i < suffix_keys_.size(); ++i) {
+    const int col = schema_.Offset(suffix_keys_[i].expression->AsColumnValue().GetColumnName());
+    RETURN_IF_FAIL((*suffix_orders_)[i].Observe(row[static_cast<size_t>(col)]));
+  }
+  return Status::kSuccess;
+}
+
 bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
   // Evaluate every key: an error in a later key must not be hidden by an
   // earlier unequal key short-circuiting the comparison (the AST is the
   // semantic reference and evaluates all keys).
   bool equal = true;
-  for (const auto& key : prefix_keys_) {
+  for (size_t i = 0; i < prefix_keys_.size(); ++i) {
+    const auto& key = prefix_keys_[i];
     StatusOr<Value> va_or = key.expression->TryEvaluate(a, schema_);
     StatusOr<Value> vb_or = key.expression->TryEvaluate(b, schema_);
     if (!va_or.HasValue() || !vb_or.HasValue()) {
@@ -135,7 +150,11 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       equal = false;
       continue;
     }
-    if (!EqualUnderCollation(va_or.Value(), vb_or.Value())) {
+    if (sort_error_.ok()) { sort_error_ = prefix_orders_[i].Observe(va_or.Value());
+}
+    if (sort_error_.ok()) { sort_error_ = prefix_orders_[i].Observe(vb_or.Value());
+}
+    if (prefix_orders_[i].Compare(va_or.Value(), vb_or.Value()) != 0) {
       equal = false;
     }
   }
@@ -189,6 +208,8 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         if (FailWithChildOf(*source_)) {
           return false;
         }
+        if (const Status st = ObserveSingleton(first); !st.ok()) { return FailWith(st);
+}
         *dst = std::move(first);
         if (rp != nullptr) {
           *rp = first_position;
@@ -206,6 +227,8 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         pending_row_ = std::move(candidate);
         pending_position_ = candidate_position;
         has_pending_ = true;
+        if (const Status st = ObserveSingleton(first); !st.ok()) { return FailWith(st);
+}
         *dst = std::move(first);
         if (rp != nullptr) {
           *rp = first_position;
@@ -234,7 +257,9 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         [this] { input_exhausted_ = true; });
     // SortExecutor already enforces the memory budget and spills a large
     // peer group. Only that group, rather than the entire child, is consumed.
-    group_sort_ = std::make_shared<SortExecutor>(run, schema_, suffix_keys_);
+    SortExecutor::Options options;
+    options.collation_domains = suffix_orders_;
+    group_sort_ = std::make_shared<SortExecutor>(run, schema_, suffix_keys_, 1, std::move(options));
   }
 }
 
@@ -243,6 +268,9 @@ void IncrementalSortExecutor::ExecuteIncrementalSort() {
   RowPosition position;
   while (NextStreaming(&row, &position)) {
     charge_.Add(EstimateRowBytes(row) + sizeof(RowPosition));
+    if (output_.size() == output_.capacity()) {
+      output_.reserve(std::max<size_t>(16, output_.capacity() * 2));
+    }
     output_.emplace_back(std::move(row), position);
   }
 }

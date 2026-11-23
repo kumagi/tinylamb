@@ -184,13 +184,19 @@ struct AggregateAccumulator {
   bool InsertDistinctInt(int64_t raw);
   // Total distinct non-integer values tracked (inline array + overflow set).
   [[nodiscard]] size_t DistinctValueCount() const;
+  // Conservative retained bytes of the live DISTINCT sets (hash-node overhead
+  // plus each value's footprint; VARCHAR/ARRAY payloads are charged by
+  // EstimateValueMemoryBytes). Used by the OOC skew path to charge real group
+  // memory rather than a flat per-entry floor.
+  [[nodiscard]] size_t DistinctRetainedBytes() const;
   // Inserts one canonicalized non-integer distinct value
   // (CanonicalDistinctValue already applied); false when already present.
   bool InsertDistinctValue(Value canonical);
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
   Status Add(AggregateInput input);
-  StatusOr<Value> TryFinish() const;
+  // Finalization may replay buffered input and sort group-local storage.
+  StatusOr<Value> TryFinish();
   [[nodiscard]] bool IsDone() const;
 
   const AggregateExpression* expression;
@@ -210,7 +216,7 @@ struct AggregateAccumulator {
   uint64_t uint_total = 0;
   Value extreme;
   // GoogleSQL MIN/MAX: a NaN input poisons the result.
-  mutable bool saw_nan_{false};
+  bool saw_nan_{false};
   // SUM over doubles: a finite-input sum that reaches infinity overflows and
   // must raise; infinite inputs themselves are legal and stay inf.
   bool sum_saw_infinite_input_ = false;
@@ -244,29 +250,29 @@ struct AggregateAccumulator {
   // True when the aggregate carries DISTINCT; `distinct` materializes on
   // first non-integer distinct insert.
   bool distinct_mode_{false};
-  mutable std::unique_ptr<std::vector<BufferedRow>> buffer_;
-  mutable std::vector<Value> array_values_;
-  mutable std::optional<std::string> delimiter_;
+  std::unique_ptr<std::vector<BufferedRow>> buffer_;
+  std::vector<Value> array_values_;
+  std::optional<std::string> delimiter_;
   // BIT_AND/OR/XOR fold state.
-  mutable int64_t bit_acc_{0};
-  mutable bool bit_saw_value_{false};
-  mutable bool bit_is_uint64_{false};
+  int64_t bit_acc_{0};
+  bool bit_saw_value_{false};
+  bool bit_is_uint64_{false};
   // ARRAY_AGG DISTINCT: a repeated NULL collapses to one element.
-  mutable bool array_saw_null_{false};
+  bool array_saw_null_{false};
   // ARRAY_AGG element type resolved against the input schema at
   // construction: runtime values cannot recover the declared type when
   // every element is NULL (an all-NULL INT64 column produced ARRAY<>).
-  mutable std::string resolved_element_type_;
+  std::string resolved_element_type_;
   // ARRAY_CONCAT_AGG declared element type (captured even for empty arrays).
-  mutable std::string concat_elem_type_;
+  std::string concat_elem_type_;
   // ELEMENTWISE_SUM/AVG positional state.
-  mutable std::vector<int64_t> ew_int_sum_;
-  mutable std::vector<double> ew_double_sum_;
-  mutable std::vector<int64_t> ew_count_;
-  mutable std::vector<bool> ew_saw_double_;
-  mutable size_t ew_len_{0};
-  mutable bool ew_any_input_{false};
-  mutable std::string ew_input_elem_type_;
+  std::vector<int64_t> ew_int_sum_;
+  std::vector<double> ew_double_sum_;
+  std::vector<int64_t> ew_count_;
+  std::vector<bool> ew_saw_double_;
+  size_t ew_len_{0};
+  bool ew_any_input_{false};
+  std::string ew_input_elem_type_;
 
   // Extended-aggregate state. Kept in one variant-ish blob so the common
   // aggregate path stays lean.
@@ -280,7 +286,7 @@ struct AggregateAccumulator {
   StatState stat_;
   bool saw_any_ = false;                        // ANY_VALUE captured its value
   bool saw_null_param_ = false;                 // KLL INIT: NULL precision seen
-  mutable std::vector<Value> quantile_values_;  // APPROX_QUANTILES inputs
+  std::vector<Value> quantile_values_;  // APPROX_QUANTILES inputs
   int64_t quantile_count_ = 0;
   bool quantile_count_valid_ = false;
   int64_t top_count_limit_ = 0;
@@ -294,23 +300,23 @@ struct AggregateAccumulator {
   };
   // Entries kept insertion-ordered; lookup uses NULL-aware equality because
   // NULL is a legitimate APPROX_TOP_* input and Value::operator< rejects it.
-  mutable std::vector<SumWeight> top_sums_;
-  mutable std::vector<Value> top_count_values_;
-  mutable std::vector<int64_t> top_count_counts_;
+  std::vector<SumWeight> top_sums_;
+  std::vector<Value> top_count_values_;
+  std::vector<int64_t> top_count_counts_;
   // MODE: counts keyed by value, with the value vector pinned in
   // first-insertion order so ties resolve deterministically (first value to
   // reach the maximum count wins).
-  mutable std::vector<Value> mode_values_;
-  mutable std::vector<int64_t> mode_counts_;
-  mutable std::unique_ptr<std::unordered_map<Value, size_t>> mode_index_;
-  mutable std::vector<std::string> sketch_values_;  // HLL/KLL distinct entries
-  mutable int sketch_type_ = 0;                     // 0 = unset
-  mutable int64_t sketch_precision_ = 0;
+  std::vector<Value> mode_values_;
+  std::vector<int64_t> mode_counts_;
+  std::unique_ptr<std::unordered_map<Value, size_t>> mode_index_;
+  std::vector<std::string> sketch_values_;  // HLL/KLL distinct entries
+  int sketch_type_ = 0;                     // 0 = unset
+  int64_t sketch_precision_ = 0;
   // PERCENTILE_CONT inputs and the group-wide percentile parameter.
-  mutable std::vector<double> percentile_values_;
+  std::vector<double> percentile_values_;
   // T2243: PERCENTILE_DISC must return an actual input element (type
   // preserved), so keep the original Values next to the double projection.
-  mutable std::vector<Value> percentile_originals_;
+  std::vector<Value> percentile_originals_;
   double percentile_p_ = 0;
   bool percentile_p_valid_ = false;
   // APPROX_COUNT_DISTINCT distinct-value tracking (exact within engine).
@@ -346,13 +352,13 @@ struct AggregateAccumulator {
   }
   // HLL_COUNT.MERGE folds EXTRACT into the aggregate; MERGE_PARTIAL returns
   // the merged sketch bytes instead.
-  Value FinishSketch(bool extract_count) const;
+  [[nodiscard]] Value FinishSketch(bool extract_count) const;
   Status TryElementwiseApply(const Value& array);
   // Throwing wrapper retained for callers using the throwing API.
   void ElementwiseApply(const Value& array) {
     ExcShimCheck("ElementwiseApply", TryElementwiseApply(array));
   }
-  Value FinishApproxTop(const std::vector<BufferedRow>& rows) const;
+  [[nodiscard]] Value FinishApproxTop(const std::vector<BufferedRow>& rows) const;
 };
 
 bool DecodeSketch(std::string_view bytes, int* typecode, int64_t* precision,

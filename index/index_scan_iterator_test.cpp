@@ -126,8 +126,9 @@ TEST_F(IndexScanIteratorTest, Construct) {
 // invisible) and resolve key/include slots against the table schema it
 // already holds. Dump renders the mode via IndexSchema's operator<<, so the
 // corrupt-mode arm below checks that formatter directly (a persisted mode
-// outside the enum must render kInvalid(n) instead of nothing) -- the normal
-//-mode Dump path is covered by the iterator assertions just above.
+// outside the enum must render Invalid(n) -- with no leading 'k' -- instead
+// of nothing) -- the normal-mode Dump path is covered by the iterator
+// assertions just above.
 TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
   auto read = db_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
@@ -147,8 +148,11 @@ TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
       static_cast<IndexMode>(
           200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange):
                   // exercise unknown persisted mode
-  EXPECT_NE(broken.str().find("Invalid(200)"), std::string::npos)
-      << broken.str();
+  const std::string broken_text = broken.str();
+  EXPECT_NE(broken_text.find("Invalid(200)"), std::string::npos) << broken_text;
+  // "Invalid(200)" is a substring of "kInvalid(200)": pin the exact token so
+  // reverting the formatter to the old spelling cannot pass this assertion.
+  EXPECT_EQ(broken_text.find("kInvalid"), std::string::npos) << broken_text;
   std::ostringstream pk;
   pk << IndexSchema("PK", {0});
   EXPECT_NE(pk.str().find(" Unique]"), std::string::npos) << pk.str();
@@ -1384,7 +1388,7 @@ TEST_F(IndexScanIteratorTest, AuditPointLookupKeepsSnapshotIndexValue) {
   EXPECT_TRUE(scan.IsValid());
   EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
   EXPECT_EQ(scan.GetValue(), original);
-  writer.Abort();
+  ASSERT_EQ(writer.Abort(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

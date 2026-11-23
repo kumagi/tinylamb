@@ -371,6 +371,46 @@ ARRAY<STRUCT<INT64>>[unknown order:{2}, {1}]
   ASSERT_EQ(cases[3].expected_rows.size(), 2U);
 }
 
+TEST(GoogleSqlComplianceFile, DoubleGoldenDistinguishesSignedZero) {
+  EXPECT_TRUE(ComplianceValueMatches(Value(0.0), "0.0"));
+  EXPECT_TRUE(ComplianceValueMatches(Value(-0.0), "-0.0"));
+  EXPECT_FALSE(ComplianceValueMatches(Value(0.0), "-0.0"));
+  EXPECT_FALSE(ComplianceValueMatches(Value(-0.0), "0.0"));
+}
+
+TEST(GoogleSqlComplianceFile, DefaultUnknownOrderPersistsAndCanBeOverridden) {
+  const auto cases = ParseGoogleSqlComplianceFile("defaults.test", R"test(
+[default unknown_order]
+SELECT 1
+--
+1
+==
+[unknown_order=false]
+SELECT 2
+--
+2
+==
+SELECT 3
+--
+3
+==
+[default unknown_order=false]
+SELECT 4
+--
+4
+==
+SELECT 5
+--
+5
+)test");
+  ASSERT_EQ(cases.size(), 5U);
+  EXPECT_TRUE(cases[0].unknown_order);
+  EXPECT_FALSE(cases[1].unknown_order);
+  EXPECT_TRUE(cases[2].unknown_order);
+  EXPECT_FALSE(cases[3].unknown_order);
+  EXPECT_FALSE(cases[4].unknown_order);
+}
+
 // P846: the `[unknown_order]` option line was absorbed by
 // kIgnoredOptionKeys without setting the flag, so the harness compared
 // strict row order against order-unspecified expectations.
@@ -428,6 +468,18 @@ ARRAY<INT64>[unknown order:
 )test");
   ASSERT_EQ(truncated.size(), 1U);
   EXPECT_TRUE(truncated[0].expected_rows.empty());
+}
+
+TEST(GoogleSqlComplianceFile,
+     StringArrayWithNonStringElementDoesNotReadVarchar) {
+  // A declared ARRAY<STRING>/ARRAY<BYTES> whose elements carry a non-VARCHAR
+  // tag must not read value.varchar_value (union confusion); each element is
+  // formatted by its actual type instead.
+  const Value confused_strings = Value::Array({Value(1), Value(2)}, "STRING");
+  EXPECT_EQ(FormatComplianceValue(confused_strings),
+            "ARRAY<STRING>[known order:1, 2]");
+  const Value confused_bytes = Value::Array({Value(3)}, "BYTES");
+  EXPECT_EQ(FormatComplianceValue(confused_bytes), "ARRAY<BYTES>[3]");
 }
 
 TEST(GoogleSqlComplianceFile, MatchesIntBoolAndNull) {
@@ -874,7 +926,7 @@ TEST_P(GoogleSqlComplianceFileTest, RunsFile) {
     }
     if (!test_case.unparseable_parameters.empty()) {
       ADD_FAILURE() << GetParam() << " / " << test_case.name
-                    << " has unparseable [parameters=] item(s):";
+                    << " has unparsable [parameters=] item(s):";
       for (const std::string& item : test_case.unparseable_parameters) {
         ADD_FAILURE() << "  " << item;
       }

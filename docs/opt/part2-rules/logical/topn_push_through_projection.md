@@ -38,7 +38,7 @@ graph TD
 1. 子グループ内の式が `LogicalOperator::kProjection` であり、子ノード数が 1 であること。
 2. TopN の**すべての**ソートキー式が、射影の `target_list` を通じて下位入力の列参照へと翻訳可能であること（ヘルパー `RewriteThroughOutputs` がすべて非 null を返すこと）。
 3. 翻訳後のキーリストが空でないこと。
-4. 新規派生グループ（`topn-below-proj:<count>:<offset>|<keys...>`）が現在のグループ自身または射影の子ノードと一致しないこと（自己参照防止）。
+4. 新規派生グループのタグが入力グループ、count/offset、翻訳後キー、方向、NULL 配置、WITH TIES、射影 target list、出力スキーマを含み、現在のグループ自身または射影の子ノードと一致しないこと（自己参照防止とタグ衝突防止）。
 
 ソートキーの中に、射影の出力リストに含まれない列や、射影内で翻訳不能な複雑な未対応式が含まれる場合は発火しません。
 
@@ -46,10 +46,10 @@ graph TD
 
 射影をまたぐ TopN の移動には、ソートキー値の厳密な同一性と多重度の不変性が求められます。
 
-- **順序付けの代数的一致**: TopN 演算子は指定されたキー式の値に基づいてタプルを全順序化します。`RewriteThroughOutputs` は、射影の出力エイリアスまたは出力式をその定義元の式に置き換える。例えば射影が `value = items.v` と定義している場合、TopN のキー `value` を `items.v` に置き換えて下位でソートしても、タプル間の大小関係は完全に同一です。
+- **順序付けの代数的一致**: TopN 演算子は指定されたキー式の値に基づいてタプルを全順序化します。`RewriteThroughOutputs` は、射影の出力エイリアスまたは出力式をその定義元の式に置き換えます。例えば射影が `value = items.v` と定義している場合、TopN のキー `value` を `items.v` に置き換えて下位でソートしても、タプル間の大小関係は完全に同一です。
 - **射影の保持によるスキーマ契約の保護**: TopN を下に押し込んだ後も、最上位には元の射影演算子が残されます。これにより、外部へ公開される列名（エイリアス）や型、および TopN キーとしては使われなかった他の計算列の定義がそのまま保持されます。
 - **例外発生の遅延と最適化効果**: 射影に計算列（例: 除算やキャスト）が含まれる場合、上位 $N$ 行以外については計算自体がスキップされます。これは SQL 規格における短絡評価および実行最適化の範疇であり、不要なタプルの計算コストを削減します。
-- **フィンガープリントによる派生グループ分離**: 派生グループのタグには、リミット値・オフセット値に加え、翻訳後の全ソートキーの文字列表現を含める。異なるソートキーを持つ複数の TopN 式が同一の派生グループへ混線することを防ぎます。
+- **フィンガープリントによる派生グループ分離**: 派生グループのタグには入力 group、リミット値・オフセット値、翻訳後キー、方向、NULL 配置、WITH TIES、射影 target list と output schema を含めます。異なる入力や出力契約を持つ TopN 式の混線を防ぎます。
 
 ## 実装の詳細
 
@@ -64,12 +64,15 @@ graph TD
                             .sort_ascending = expression.sort_ascending,
                             .sort_nulls_first = expression.sort_nulls_first,
                             .limit_count = expression.limit_count,
-                            .limit_offset = expression.limit_offset});
+                            .limit_offset = expression.limit_offset,
+                            .prior_limit_offset = expression.prior_limit_offset,
+                            .with_ties = expression.with_ties});
             memo.AddExpression(
                 group,
                 LogicalExpression{.operation = LogicalOperator::kProjection,
                                   .children = {pushed},
-                                  .target_list = projection.target_list});
+                                  .target_list = projection.target_list,
+                                  .output_schema = projection.output_schema});
 ```
 
 1. 下位グループ `pushed` に翻訳後のソートキーを持つ `kTopN` 式を追加します。

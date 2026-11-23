@@ -39,13 +39,13 @@ inline constexpr uint32_t kSerdesVersion = 1U;
 // Row decode runs these per column of every scanned row, so they live inline
 // here: one bswapped load beats a cross-TU call into a byte-at-a-time loop.
 #if defined(__GNUC__) || defined(__clang__)
-inline constexpr uint16_t TINYLAMB_BSWAP16(uint16_t v) {
+constexpr uint16_t TINYLAMB_BSWAP16(uint16_t v) {
   return __builtin_bswap16(v);
 }
-inline constexpr uint32_t TINYLAMB_BSWAP32(uint32_t v) {
+constexpr uint32_t TINYLAMB_BSWAP32(uint32_t v) {
   return __builtin_bswap32(v);
 }
-inline constexpr uint64_t TINYLAMB_BSWAP64(uint64_t v) {
+constexpr uint64_t TINYLAMB_BSWAP64(uint64_t v) {
   return __builtin_bswap64(v);
 }
 #else

@@ -253,8 +253,11 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
 // Replays a trace on a fresh throwaway database and returns "" when all
 // recorded oracles hold, or the mismatch diagnostic.  `skipped`, when
 // non-null, is set when no query ran because the database could not be
-// created; the report is "" there, so callers that report families as "ran"
-// must consult it first.  When `surface_skips` is true (the replay-guard
+// created; callers that report families as "ran" must consult it first. The
+// returned report is non-empty on that path too, so a replay guard that only
+// checks the report (the default `skipped == nullptr`) fails loudly instead
+// of treating an unexecuted trace as clean.
+// When `surface_skips` is true (the replay-guard
 // default), a recorded arm whose statements fail to execute is reported as
 // a skip instead of being discarded — a truncated or tampered committed
 // file must not pass vacuously.  The generation path passes false: its

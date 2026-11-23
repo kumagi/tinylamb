@@ -13,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <ostream>
 #include <ranges>
@@ -76,6 +77,9 @@ bool LogicalProperties::AreEqual(const std::string& col_a,
   if (match_names(col_a, col_b)) {
     return true;
   }
+  // Both-qualified spellings of one column (t.x vs u.x in a self-join) do not
+  // match by name alone, but they are proved equal below when both exact
+  // spellings appear in the same equivalence class; keep that path intact.
   for (const auto& ec : equivalence_classes) {
     bool has_a = false;
     bool has_b = false;
@@ -177,21 +181,42 @@ void Memo::RefreshLogicalProperties() {
     group.logical_properties_stale = true;
   }
   std::vector<uint8_t> state(groups_.size(), 0);
-  std::function<void(GroupId)> refresh = [&](GroupId group) {
-    if (group >= groups_.size() || state[group] != 0) {
-      return;
+  // Explicit post-order DFS: CTE inlining can build a memo deeper than the
+  // call stack can safely recurse (Pattern::Match has a depth guard; this
+  // walk must not be the one that overflows). state 1 is "on the stack", so
+  // cycles and already-settled groups are skipped exactly as before.
+  for (size_t root = 0; root < groups_.size(); ++root) {
+    if (state[root] != 0) {
+      continue;
     }
-    state[group] = 1;
-    for (const LogicalExpression& expression : groups_[group].expressions) {
-      for (const GroupId child : expression.children) {
-        refresh(child);
+    std::vector<std::pair<GroupId, bool>> stack;
+    stack.emplace_back(static_cast<GroupId>(root), false);
+    while (!stack.empty()) {
+      const GroupId group = stack.back().first;
+      const bool children_queued = stack.back().second;
+      if (group >= groups_.size() || state[group] == 2) {
+        stack.pop_back();
+        continue;
+      }
+      if (children_queued) {
+        DeriveLogicalProperties(group);
+        state[group] = 2;
+        stack.pop_back();
+        continue;
+      }
+      state[group] = 1;
+      stack.back().second = true;
+      const auto& expressions = groups_[group].expressions;
+      for (size_t i = expressions.size(); i > 0; --i) {
+        const auto& children = expressions[i - 1].children;
+        for (size_t j = children.size(); j > 0; --j) {
+          const GroupId child = children[j - 1];
+          if (child < groups_.size() && state[child] == 0) {
+            stack.emplace_back(child, false);
+          }
+        }
       }
     }
-    DeriveLogicalProperties(group);
-    state[group] = 2;
-  };
-  for (size_t group = 0; group < groups_.size(); ++group) {
-    refresh(group);
   }
 }
 
@@ -199,13 +224,21 @@ void Memo::InvalidateLogicalPropertyDependents(GroupId group) {
   if (group >= groups_.size()) {
     return;
   }
-  for (const GroupId dependent : groups_[group].logical_property_dependents) {
-    if (dependent >= groups_.size() ||
-        groups_[dependent].logical_properties_stale) {
-      continue;
+  std::vector<GroupId> pending;
+  for (;;) {
+    for (const GroupId dependent : groups_[group].logical_property_dependents) {
+      if (dependent >= groups_.size() ||
+          groups_[dependent].logical_properties_stale) {
+        continue;
+      }
+      groups_[dependent].logical_properties_stale = true;
+      pending.push_back(dependent);
     }
-    groups_[dependent].logical_properties_stale = true;
-    InvalidateLogicalPropertyDependents(dependent);
+    if (pending.empty()) {
+      return;
+    }
+    group = pending.back();
+    pending.pop_back();
   }
 }
 
@@ -283,21 +316,41 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
   // unknown types may be merged, for both selection and join equalities.
   const auto columns_proven_mismatched_type = [&](const ColumnName& c1,
                                                   const ColumnName& c2) {
-    if (c1.schema.empty() || c2.schema.empty()) {
-      return false;
-    }
-    const auto f1 = table_schemas_.find(c1.schema);
-    const auto f2 = table_schemas_.find(c2.schema);
-    if (f1 == table_schemas_.end() || f2 == table_schemas_.end()) {
-      return false;
-    }
-    const int o1 = f1->second.Offset(ColumnName("", c1.name));
-    const int o2 = f2->second.Offset(ColumnName("", c2.name));
-    if (o1 < 0 || o2 < 0) {
-      return false;
-    }
-    return f1->second.GetColumn(static_cast<size_t>(o1)).Type() !=
-           f2->second.GetColumn(static_cast<size_t>(o2)).Type();
+    // The catalog is keyed by relation identity, including query aliases.
+    // A bare column identifies a type only when exactly one known input
+    // exposes it and the schemas of all inputs are available.
+    const auto column_for = [&](const ColumnName& c) -> const Column* {
+      const ColumnName bare("", c.name);
+      if (!c.schema.empty()) {
+        const auto found = table_schemas_.find(c.schema);
+        if (found == table_schemas_.end()) {
+          return nullptr;
+        }
+        const int offset = found->second.Offset(bare);
+        return offset < 0
+                   ? nullptr
+                   : &found->second.GetColumn(static_cast<size_t>(offset));
+      }
+      const Column* matched = nullptr;
+      for (const auto& relation : group.relations) {
+        const auto found = table_schemas_.find(relation);
+        if (found == table_schemas_.end()) {
+          return nullptr;
+        }
+        const int offset = found->second.Offset(bare);
+        if (offset >= 0) {
+          if (matched != nullptr) {
+            return nullptr;
+          }
+          matched = &found->second.GetColumn(static_cast<size_t>(offset));
+        }
+      }
+      return matched;
+    };
+    const Column* const first = column_for(c1);
+    const Column* const second = column_for(c2);
+    return first != nullptr && second != nullptr &&
+           first->Type() != second->Type();
   };
 
   if (group.expressions.empty()) {
@@ -351,6 +404,7 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
         const auto& child = groups_[expr.children[0]].logical_properties;
         props.max_1_row = props.max_1_row || child.max_1_row;
         std::vector<std::pair<std::string, std::string>> columns;
+        columns.reserve(expr.target_list.size());
         for (size_t i = 0; i < expr.target_list.size(); ++i) {
           const auto& target = expr.target_list[i];
           if (!target.expression ||
@@ -868,12 +922,29 @@ std::string PhysicalProperties::Key() const {
   // trailing properties, not just one character per ordering column. Reserve
   // enough for the common case so the hot group x property path does not
   // reallocate on each append.
-  key.reserve(64 + ordering.size() * 32 + partition_by.size() * 32 +
-              bloom_filter_keys.size() * 32 + collation.size());
+  key.reserve(64 + (ordering.size() * 32) + (partition_by.size() * 32) +
+              (bloom_filter_keys.size() * 32) + collation.size());
+  // Names are quoted identifiers and may legally contain the delimiters used
+  // below. Escape them so ("a|b", "c") cannot share a key with ("a", "b|c").
+  const auto append_name = [&](std::string_view name) {
+    for (const char c : name) {
+      if (c == '\\' || c == '|' || c == ':' || c == ',' || c == '.') {
+        key.push_back('\\');
+      }
+      key.push_back(c);
+    }
+  };
+  const auto append_column = [&](const ColumnName& column) {
+    if (!column.schema.empty()) {
+      append_name(column.schema);
+      key.push_back('.');
+    }
+    append_name(column.name);
+  };
   key.append(wait_for_write_intent ? "|wait:1" : "|wait:0");
   for (size_t i = 0; i < ordering.size(); ++i) {
     key.push_back('|');
-    key.append(ordering[i].ToString());
+    append_column(ordering[i]);
     key.push_back(':');
     key.push_back(i >= sort_ascending.size() || sort_ascending[i] ? 'a' : 'd');
     key.push_back(i < sort_nulls_first.size() ? ':' : '=');
@@ -891,12 +962,12 @@ std::string PhysicalProperties::Key() const {
       if (i > 0) {
         key.push_back(',');
       }
-      key.append(partition_by[i].ToString());
+      append_column(partition_by[i]);
     }
   }
   if (!collation.empty()) {
     key.append("|col:");
-    key.append(collation);
+    append_name(collation);
   }
   if (!bloom_filter_keys.empty()) {
     key.append("|bf:");
@@ -904,7 +975,7 @@ std::string PhysicalProperties::Key() const {
       if (i > 0) {
         key.push_back(',');
       }
-      key.append(bloom_filter_keys[i].ToString());
+      append_column(bloom_filter_keys[i]);
     }
   }
   // NOTE: this key order is NOT the FormatPhysicalProperties (EXPLAIN) order:
@@ -912,6 +983,9 @@ std::string PhysicalProperties::Key() const {
   // while EXPLAIN puts limit/access_method/distribution/distinct before
   // unique and collation before join_multiplicity. Keep each format stable on
   // its own; do not assume a key and its EXPLAIN rendering are interchangeable.
+  // Keys are process-local memo cache keys (never persisted or used as a
+  // cross-process golden value), so the uniq prefix is safe to reorder with
+  // the rest of the trailing property block.
   if (is_unique) {
     key.append("|uniq:1");
   }
@@ -959,6 +1033,9 @@ double EstimateMemorySpillCost(OperatorCostKind kind, double input_rows,
     // The excess ratio is >1 here, so anchoring at 1.0 makes the spill cost
     // grow continuously from zero with the amount spilled. Floor 2.0 charged
     // every sub-2x spill the same 1.0 multiplier as an exactly 2x spill.
+    // The continuity is deliberate: a plan one byte over the budget must not
+    // be priced as if it spilled 2x, and the (excess_ratio - 1.0) factor still
+    // makes tiny spills nearly free without a discontinuous cost cliff.
     multiplier *= std::log2(std::max(1.0, excess_ratio));
   } else if (kind == OperatorCostKind::kHashJoin) {
     multiplier *= 1.5;
@@ -1148,18 +1225,32 @@ PhysicalProperties InferProvidedProperties(
   // the claim entirely (the property key must not advertise an order the
   // consumer cannot use).
   provided.collation = required.collation;
-  if (!provided.ordering.empty() &&
-      !SatisfiesOrderingCollation(plan, required)) {
-    // Only the collation decides whether a delivered order can stand in for
-    // the required one. A required order need not be the query's ORDER BY
-    // (GROUP BY keys, a merge join's probe order, ...), so also demanding
-    // IsOrderedBy(query.order_expressions_) erased perfectly valid provided
-    // orderings and made EXPLAIN disagree with the plan OptimizeGroup chose;
-    // actual delivery is priced there with the required ordering directly.
-    provided.ordering.clear();
-    provided.sort_ascending.clear();
-    provided.sort_nulls_first.clear();
-    provided.collation.clear();
+  if (!provided.ordering.empty()) {
+    // Re-check actual delivery with the required ordering itself (not the
+    // query's ORDER BY, which need not be the same property for GROUP BY keys
+    // or a merge join's probe order). Without this, a plan that cannot deliver
+    // the order still advertises it in EXPLAIN; OptimizeGroup prices the same
+    // delivery with the identical IsOrderedBy call, so the two now agree.
+    std::vector<Expression> requested;
+    requested.reserve(required.ordering.size());
+    for (const auto& column : required.ordering) {
+      requested.push_back(ColumnValueExp(column));
+    }
+    const std::vector<bool> ascending =
+        required.sort_ascending.empty()
+            ? std::vector<bool>(requested.size(), true)
+            : required.sort_ascending;
+    bool delivers =
+        plan->IsOrderedBy(requested, ascending, required.sort_nulls_first);
+    if (delivers) {
+      delivers = SatisfiesOrderingCollation(plan, required);
+    }
+    if (!delivers) {
+      provided.ordering.clear();
+      provided.sort_ascending.clear();
+      provided.sort_nulls_first.clear();
+      provided.collation.clear();
+    }
   }
   // `distinct` (and any partition/filter keys) is independent of ordering: a
   // plan that enforces one row per group still does so when its ORDER BY is
@@ -1198,6 +1289,7 @@ void SearchEngine::Explore(GroupId root) {
   steps_ = 0;
   budget_exhausted_ = false;
   explore_limit_reached_ = false;
+  rule_failure_count_ = 0;
   std::deque<GroupId> queue;
   std::unordered_set<GroupId> queued;
   const std::function<void(GroupId)> enqueue = [&](GroupId group) {
@@ -1273,9 +1365,10 @@ void SearchEngine::Explore(GroupId root) {
 
 // Worklist exploration: each group keeps a cursor over its
 // expressions; rules appending expressions (here or in other groups) extend
-// the work instead of rescanning settled state. No pass cap or convergence
-// exception is needed because the memo is append-only and fingerprints
-// deduplicate.
+// the work instead of rescanning settled state. The memo is append-only and
+// fingerprints deduplicate, so there is no convergence loop to detect -- but
+// exploration is still bounded by the step caps below (kMaxExploreSteps and
+// kMaxExploreRuleSteps), which set explore_limit_reached_ when hit.
 void SearchEngine::ExploreGroup(GroupId group,
                                 const std::function<void(GroupId)>& enqueue) {
   size_t& next = next_expression_[group];
@@ -1305,17 +1398,24 @@ void SearchEngine::ExploreGroup(GroupId group,
       // only advisory for callers that track memo growth.
       // PRODUCTION FIX: a buggy rule used to throw straight out of Explore,
       // failing the whole query instead of just skipping one bad alternative.
-      // Contain every rule failure here: .at()/out_of_range, allocation
-      // failures and even non-standard exceptions are all rule-local.
+      // Contain rule-local failures (.at()/out_of_range, bad StatusOr access)
+      // so a single buggy alternative is skipped instead of failing the query.
+      // Allocation failure is NOT rule-local: swallowing bad_alloc lets the
+      // search "succeed" with a half-built memo under memory pressure, so let
+      // it propagate to the caller's error path.
       try {
         if (rule.Apply(memo_, group, expression)) {
           applied_rules_.insert(rule.Name());
         }
+      } catch (const std::bad_alloc&) {
+        throw;
       } catch (const std::exception& e) {
+        ++rule_failure_count_;
         LOG(WARN) << "Cascades rule '" << rule.Name()
                   << "' threw: " << e.what();
         continue;
       } catch (...) {
+        ++rule_failure_count_;
         LOG(WARN) << "Cascades rule '" << rule.Name()
                   << "' threw a non-standard exception";
         continue;
@@ -1339,6 +1439,18 @@ std::optional<BestPlan> SearchEngine::Optimize(
   const bool profile = std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
   const auto explore_begin = std::chrono::steady_clock::now();
   Explore(root);
+  // The memo is append-only, so a truncated exploration still yields a valid
+  // plan -- but a cheaper alternative may be unexplored. Surface the cutoff
+  // instead of silently degrading plan quality (callers can also query
+  // ExploreLimitReached() directly).
+  if (ExploreLimitReached()) {
+    LOG(WARN) << "Cascades exploration limit reached; returning best plan "
+                 "from the explored subset";
+  }
+  if (RuleFailureCount() != 0) {
+    LOG(WARN) << "Cascades skipped " << RuleFailureCount()
+              << " failing rule applications";
+  }
   const auto explore_ms = PlanProfileMillisSince(explore_begin);
   const auto lower_begin = std::chrono::steady_clock::now();
   std::optional<BestPlan> result =
@@ -1416,7 +1528,11 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
       }
       return {PhysicalProperties{}, PhysicalProperties{}};
     case LogicalOperator::kAggregation:
-      // Aggregation collapses the input; ordering and row positions die here.
+      // Aggregation collapses the input; ordering and row positions die in
+      // its OUTPUT, so the default child requirement is unordered. This is
+      // not the whole story: OptimizeGroup() also tries an ordered child
+      // property (grouping_sets, or partition_by for window-style grouping)
+      // so a sort-aggregate can exploit already-ordered input.
       return {PhysicalProperties{}};
     case LogicalOperator::kSelection:
     case LogicalOperator::kLimit:
@@ -1654,8 +1770,8 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
     }
     for (const auto& candidate_properties : property_sets) {
       std::vector<BestPlan> children;
+      children.reserve(expression.children.size());
       double child_cost = 0;
-      double child_rows = 0;
       bool valid = true;
       for (size_t child = 0; child < expression.children.size(); ++child) {
         std::optional<BestPlan> child_plan =
@@ -1666,7 +1782,6 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
           break;
         }
         child_cost += child_plan->cost;
-        child_rows += child_plan->estimated_rows;
         children.push_back(std::move(*child_plan));
       }
       if (!valid) {
@@ -1675,7 +1790,6 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
       // Empty keeps its child only for schema; execution never reads it.
       if (expression.operation == LogicalOperator::kEmpty) {
         child_cost = 0;
-        child_rows = 0;
       }
       // Branch-and-bound: every alternative adds a non-negative local cost
       // (plus a non-negative sort penalty below), so an expression whose
@@ -1684,34 +1798,50 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
         continue;
       }
 
-      for (PlanAlternative alternative :
-           implement(group, memo_, expression, children, properties, context)) {
-        if (!alternative.plan) {
-          continue;
+      try {
+        for (PlanAlternative alternative :
+             implement(group, memo_, expression, children, properties,
+                       context)) {
+          if (!alternative.plan) {
+            continue;
+          }
+          AttachPlanExplainInfo(alternative, properties, context);
+          const double cost = child_cost + alternative.local_cost;
+          double score = cost;
+          // Property-driven ordering decision (D6): alternatives that cannot
+          // deliver the required ordering carry the sort the engine would have
+          // to insert; the engine-side SortExecutor remains the safety net.
+          if (needs_ordering &&
+              (!alternative.plan->IsOrderedBy(
+                   required_order, required_ascending,
+                   properties.sort_nulls_first) ||
+               !SatisfiesOrderingCollation(alternative.plan, properties))) {
+            // The enforcer sorts this alternative's output.
+            const double rows = std::max(0.0, alternative.estimated_rows);
+            score += rows * std::log2(std::max(2.0, rows));
+          }
+          if (!best || score < best_score ||
+              (score == best_score &&
+               expression.operation == LogicalOperator::kEmpty)) {
+            best_score = score;
+            best = BestPlan{.plan = std::move(alternative.plan),
+                            .cost = cost,
+                            .estimated_rows = alternative.estimated_rows,
+                            .group = group,
+                            .expression_index = index};
+          }
         }
-        AttachPlanExplainInfo(alternative, properties, context);
-        const double cost = child_cost + alternative.local_cost;
-        double score = cost;
-        // Property-driven ordering decision (D6): alternatives that cannot
-        // deliver the required ordering carry the sort the engine would have
-        // to insert; the engine-side SortExecutor remains the safety net.
-        if (needs_ordering &&
-            (!alternative.plan->IsOrderedBy(required_order, required_ascending,
-                                            properties.sort_nulls_first) ||
-             !SatisfiesOrderingCollation(alternative.plan, properties))) {
-          const double rows = std::max(alternative.estimated_rows, child_rows);
-          score += rows * std::log2(std::max(2.0, rows));
-        }
-        if (!best || score < best_score ||
-            (score == best_score &&
-             expression.operation == LogicalOperator::kEmpty)) {
-          best_score = score;
-          best = BestPlan{.plan = std::move(alternative.plan),
-                          .cost = cost,
-                          .estimated_rows = alternative.estimated_rows,
-                          .group = group,
-                          .expression_index = index};
-        }
+      } catch (const std::bad_alloc&) {
+        throw;
+      } catch (const std::exception& e) {
+        ++rule_failure_count_;
+        LOG(WARN) << "Cascades implementation for '"
+                  << static_cast<unsigned>(expression.operation) << "' threw: " << e.what();
+      } catch (...) {
+        ++rule_failure_count_;
+        LOG(WARN) << "Cascades implementation for '"
+                  << static_cast<unsigned>(expression.operation)
+                  << "' threw a non-standard exception";
       }
     }
   }

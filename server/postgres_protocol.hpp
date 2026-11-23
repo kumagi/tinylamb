@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/status_or.hpp"
+#include "executor/data_chunk.hpp"
 #include "type/row.hpp"
 #include "type/value_type.hpp"
 
@@ -61,15 +62,33 @@ std::string ReadyForQuery(char transaction_status);
 // statement errors.
 std::string ErrorResponse(std::string_view message,
                           std::string_view sqlstate = "XX000",
-                          std::string_view severity = "ERROR");
-// NoticeResponse ('N'): same field layout as ErrorResponse but severity
-// NOTICE -- non-erroneous warnings such as nested BEGIN (25001) or a
-// no-op COMMIT (25P01) that psql/JDBC notice listeners expect (P1693).
+                          std::string_view severity = "ERROR",
+                          std::optional<size_t> position = std::nullopt);
+
+struct SqlStatement {
+  std::string text;
+  size_t position{1};  // One-based UTF-8 character position in Query message.
+};
+
+// Maps a GoogleSQL parser diagnostic to a position in the original query.
+std::optional<size_t> SqlErrorPosition(std::string_view message,
+                                       const SqlStatement& statement,
+                                       size_t parsed_byte_offset);
+// NoticeResponse ('N'): same field layout as ErrorResponse. The caller chooses
+// NOTICE or WARNING severity according to the PostgreSQL condition being sent.
 std::string NoticeResponse(std::string_view message,
-                           std::string_view sqlstate = "00000");
+                           std::string_view sqlstate = "00000",
+                           std::string_view severity = "NOTICE");
 std::string EmptyQueryResponse();
+// Callers check that column and value counts fit uint16_t before encoding;
+// the encoder CHECK_MSGs as a last resort rather than desynchronize the wire.
 std::string RowDescription(const std::vector<ColumnDescription>& columns);
 std::string DataRow(const Row& row);
+// Appends one PostgreSQL DataRow wire frame straight from columnar storage,
+// byte-for-byte identical to `wire_out->append(DataRow(chunk.RowAt(row_idx)))`.
+// Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
+                              size_t row_idx);
 std::string CommandComplete(std::string_view tag);
 std::string NegotiateProtocolVersion(
     uint32_t newest_minor,
@@ -82,6 +101,8 @@ std::string NegotiateProtocolVersion(
 inline constexpr size_t kMaxSqlStatements = 100000;
 
 StatusOr<std::vector<std::string>> SplitSqlStatements(std::string_view sql);
+StatusOr<std::vector<SqlStatement>> SplitSqlStatementsWithPositions(
+    std::string_view sql);
 
 }  // namespace tinylamb::pgwire
 

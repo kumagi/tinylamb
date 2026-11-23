@@ -50,9 +50,16 @@ if (children.size() < 2) {
 ```cpp
 Plan set_operation = std::make_shared<SetOperationPlan>(
     std::move(plans), operation, std::move(order_keys));
-const double output_rows = operation == SetOperationKind::kUnionAll
-                               ? input_rows
-                               : children.front().estimated_rows;
+double output_rows = children.front().estimated_rows;
+if (operation == SetOperationKind::kUnionAll ||
+    operation == SetOperationKind::kUnion) {
+  output_rows = input_rows;
+} else if (operation == SetOperationKind::kIntersect ||
+           operation == SetOperationKind::kIntersectAll) {
+  for (const BestPlan& child : children) {
+    output_rows = std::min(output_rows, child.estimated_rows);
+  }
+}
 return std::vector<PlanAlternative>{
     PlanAlternative{.plan = std::move(set_operation),
                     .local_cost = input_rows,
@@ -77,4 +84,4 @@ return std::vector<PlanAlternative>{
 
 - `plan/cascades_test_part*.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子数バリデーションおよび上流プロパティの伝播抑制を検証します。
-  - `CascadesTest.ExceptToAntiJoinRewrite`: 反結合への書き換えが ALL なしの `kExcept` のみに限定され、`kExceptAll` が対象外であることを間接的に保証します。
+  - `CascadesTest.ExceptToAntiJoinRewrite`: ALL なしの `kExcept` が反結合へ書き換わることを検証します。このテストでは `kExceptAll` を扱わないため、ALL 版が対象外であることは保証しません。

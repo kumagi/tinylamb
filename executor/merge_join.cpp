@@ -71,7 +71,8 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
 bool MergeJoin::KeyCannotMatch(const Row& row,
                                const std::vector<slot_t>& columns) {
   return std::ranges::any_of(columns, [&](slot_t column) {
-    return row[column].IsNull() || JoinValueUnmatchable(row[column]);
+    return column >= row.Count() || row[column].IsNull() ||
+           JoinValueUnmatchable(row[column]);
   });
 }
 
@@ -106,6 +107,9 @@ Row MergeJoin::Concatenate(size_t i, size_t j) const {
 }
 
 bool MergeJoin::PairPasses(size_t i, size_t j) const {
+  if (residual_error_ != Status::kSuccess) {
+    return false;
+  }
   if (!residual_) {
     return true;
   }
@@ -163,7 +167,16 @@ void MergeJoin::Materialize() {
     output_.clear();
     return;
   }
-  while (right_->NextBatch(&batch) != 0) {
+  for (;;) {
+    const size_t fetched = right_->NextBatch(&batch);
+    if (const Status st = Transaction::CheckThreadStatementTimeout();
+        st != Status::kSuccess) {
+      FailWith(st);
+      return;
+    }
+    if (fetched == 0) {
+      break;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       Row row = batch.RowAt(i);
       materialized_charge_.Add(EstimateRowBytes(row));
@@ -234,14 +247,19 @@ void MergeJoin::Materialize() {
         ++right_end;
       }
       std::vector<char> matched_left(left_end - run_left_begin, 0);
-      for (size_t i = run_left_begin; i < left_end; ++i) {
-        for (size_t j = right_index; j < right_end; ++j) {
+      for (size_t i = run_left_begin;
+           i < left_end && residual_error_ == Status::kSuccess; ++i) {
+        for (size_t j = right_index;
+             j < right_end && residual_error_ == Status::kSuccess; ++j) {
           if (!PairPasses(i, j)) {
             continue;
           }
           matched_left[i - run_left_begin] = 1;
           break;
         }
+      }
+      if (residual_error_ != Status::kSuccess) {
+        return;
       }
       for (size_t i = run_left_begin; i < left_end; ++i) {
         const bool matched = matched_left[i - run_left_begin] != 0;
@@ -322,8 +340,10 @@ void MergeJoin::Materialize() {
     }
     std::vector<char> matched_left(left_end - left_index, 0);
     std::vector<char> matched_right(right_end - right_index, 0);
-    for (size_t i = left_index; i < left_end; ++i) {
-      for (size_t j = right_index; j < right_end; ++j) {
+    for (size_t i = left_index;
+         i < left_end && residual_error_ == Status::kSuccess; ++i) {
+      for (size_t j = right_index;
+           j < right_end && residual_error_ == Status::kSuccess; ++j) {
         if (!PairPasses(i, j)) {
           continue;
         }
@@ -331,6 +351,9 @@ void MergeJoin::Materialize() {
         matched_right[j - right_index] = 1;
         output_.push_back(left_rows_[i] + right_rows_[j]);
       }
+    }
+    if (residual_error_ != Status::kSuccess) {
+      return;
     }
     for (size_t i = left_index; i < left_end; ++i) {
       if (left_outer && matched_left[i - left_index] == 0) {

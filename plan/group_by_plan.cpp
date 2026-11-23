@@ -2,6 +2,7 @@
 
 #include "plan/group_by_plan.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <ostream>
 
@@ -10,7 +11,8 @@
 namespace tinylamb {
 
 void GroupByPlan::Dump(std::ostream& o, int indent) const {
-  o << std::string(static_cast<size_t>(indent), ' ') << "GroupByFinish:";
+  o << std::string(static_cast<size_t>(std::max(indent, 0)), ' ')
+    << "GroupByFinish:";
   // A plan built without a statement (e.g. a unit-test harness) has no
   // grouping keys to report.
   if (statement_ != nullptr) {

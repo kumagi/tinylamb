@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -208,18 +207,16 @@ class OptimizerTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
-// gtest ASSERT_TRUE is invisible to clang-tidy's dataflow, so the optional
-// probe is unwrapped through this helper: the assert keeps
-// bugprone-unchecked-optional-access quiet while the failure mode (abort in
-// debug, a benign static_cast in release) matches the tests' expectations.
+// gtest ASSERT_TRUE cannot be used in a non-void helper. value() keeps the
+// failure explicit in every build mode instead of relying on debug-only assert.
 inline const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
-  assert(probe.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-  return *probe;
+  return probe.value();
 }
 
-// Row count safely above kParallelScanMinRows / kParallelAggregationMinRows so
-// the emitted executor is the parallel one.
+// Row count above kParallelScanMinRows (8192) so a full scan is emitted as a
+// parallel scan. It is deliberately below kParallelAggregationMinRows (32768):
+// do NOT use this table to expect a ParallelAggregationExecutor -- use a
+// dedicated larger row count for that.
 inline constexpr int64_t kParallelTestRows = 9000;
 
 inline void InsertAnalyzedBigTable(Database* db, std::string_view table) {

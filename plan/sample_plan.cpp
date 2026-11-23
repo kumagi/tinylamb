@@ -57,12 +57,30 @@ std::optional<uint64_t> ConstantRows(const Expression& expression) {
   return static_cast<uint64_t>(value.value.int_value);
 }
 
+TableStatistics SampleStatistics(const TableStatistics& input,
+                                const Schema& output_schema, size_t rows) {
+  const TableStatistics scaled = input.ScaleCardinality(rows);
+  std::vector<ColumnStats> columns;
+  columns.reserve(output_schema.ColumnCount());
+  for (size_t i = 0; i < input.Columns(); ++i) {
+    columns.push_back(scaled.Column(i));
+  }
+  for (size_t i = input.Columns(); i < output_schema.ColumnCount(); ++i) {
+    columns.emplace_back(output_schema.GetColumn(i).Type());
+  }
+  TableStatistics result(Schema("", {}));
+  result.Assign(rows, std::move(columns));
+  return result;
+}
+
 }  // namespace
 
 SamplePlan::SamplePlan(Plan child, TableSampleSpec spec)
     : child_(std::move(child)),
       spec_(std::move(spec)),
-      output_schema_(BuildSchema(child_->GetSchema(), spec_)) {}
+      output_schema_(BuildSchema(child_->GetSchema(), spec_)),
+      stats_(SampleStatistics(child_->GetStats(), output_schema_,
+                              EmitRowCount())) {}
 
 size_t SamplePlan::EmitRowCount() const {
   const auto input = static_cast<double>(child_->EmitRowCount());
@@ -76,15 +94,21 @@ size_t SamplePlan::EmitRowCount() const {
     }
     const uint64_t limit = std::min<uint64_t>(
         *rows, static_cast<uint64_t>(std::numeric_limits<size_t>::max()));
-    return static_cast<size_t>(
-        std::min<double>(input, static_cast<double>(limit)));
+    // Compare in the integer domain: double(limit) can round a SIZE_MAX-sized
+    // limit up to 2^64, which is outside the size_t range for a narrowing cast.
+    return std::min(child_->EmitRowCount(), static_cast<size_t>(limit));
   }
   const std::optional<double> percent = ConstantNumber(spec_.size);
   if (!percent.has_value() || !std::isfinite(*percent) || *percent < 0.0 ||
       *percent > 100.0) {
     return child_->EmitRowCount();
   }
-  return static_cast<size_t>(std::ceil(input * (*percent / 100.0)));
+  const double scaled = std::ceil(input * (*percent / 100.0));
+  // A saturated child estimate (SIZE_MAX) converts to the double 2^64,
+  // outside the size_t range; a sample never emits more rows than its input,
+  // so clamp at the child's own count before the narrowing cast.
+  return !(scaled < input) ? child_->EmitRowCount()
+                            : static_cast<size_t>(scaled);
 }
 
 bool SamplePlan::ContainsParameterSlots() const {

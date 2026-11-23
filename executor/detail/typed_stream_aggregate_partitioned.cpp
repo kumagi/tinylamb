@@ -2143,7 +2143,7 @@ struct NumericAggCell {
 inline Status MergeNumericRawValue(const ColAggSpec& spec, bool val_is_null,
                                    int64_t val_i, double val_d,
                                    int64_t multiplicity,
-                                   NumericAggCell& st) noexcept {
+                                   NumericAggCell& st) {
   if (spec.kind == ColAggKind::kCountStar ||
       ((spec.kind == ColAggKind::kCountCol ||
         spec.kind == ColAggKind::kCountByteLen) &&
@@ -5034,8 +5034,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   std::atomic<size_t> selection_bytes{0};
   constexpr size_t kSelectionBudget = size_t{64} << 20;
   if (near_unique && !req.preds.Empty() &&
-      selection_charge.TryAdd(kSelectionBudget + req.candidate_blocks.size() *
-                                                     sizeof(SavedSelection))) {
+      selection_charge.TryAdd(kSelectionBudget + (req.candidate_blocks.size() *
+                                                     sizeof(SavedSelection)))) {
     selections.resize(req.candidate_blocks.size());
   }
   const auto scan_keys =

@@ -73,11 +73,16 @@ $$R \times D_1 \equiv R$$
 
 ## 実装の詳細
 
-生存側グループ（`survivor`）内の各式を親グループ（`group`）へと複製します。
+生存側グループの scan filter が親だけに適用されて失われないよう、単一リレーションの場合は複製の前にフィルタと branch-local 属性を親へ引き継ぎます。その後、生存側グループ（`survivor`）内の各式を親グループ（`group`）へと複製します。
 
 ```cpp
+          if (survivor != group && survivor_group.filter &&
+              memo.Get(group).relations.size() == 1) {
+            InheritBranchLocal(memo, group, survivor);
+            memo.MergeScanFilter(group, survivor_group.filter);
+          }
           for (const LogicalExpression& alternative :
-               memo.Get(survivor).expressions) {
+               survivor_group.expressions) {
             bool cycle = false;
             for (GroupId child : alternative.children) {
               if (child == group) {
@@ -108,7 +113,7 @@ $$R \times D_1 \equiv R$$
 
 ## 検証テスト
 
-- `plan/cascades_test_part1.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.JoinIdentityDummyEliminatesDummySide`: 片側が `DummyScan` であるクロス結合を探索した際、DummyScan 側が除去され生存側の式が親グループに追加されることを検証。
 - `plan/optimizer_test_part2.cpp`:
   - `OptimizerTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のないクエリにおいて DummyScan を用いた最適化が正常に機能することを検証。

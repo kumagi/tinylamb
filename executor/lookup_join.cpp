@@ -141,9 +141,8 @@ LookupJoin::LookupJoin(Transaction& txn, Executor left,
       range_position_(range_position),
       range_operation_(range_operation),
       second_range_column_(second_range_column),
-      second_range_operation_(second_range_operation),
-      range_key_type_(ValueType::kNull),
-      at_most_one_(false) {
+      second_range_operation_(second_range_operation)
+      {
   // The probe columns must be aligned with the index's key order: the seek key
   // is built from left_cols_ and has to be a prefix of the stored key image.
   // A misaligned vector seeks between unrelated keys and silently drops

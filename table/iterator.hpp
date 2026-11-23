@@ -18,6 +18,7 @@
 #define TINYLAMB_ITERATOR_HPP
 
 #include <memory>
+#include <ostream>
 
 #include "table/iterator_base.hpp"
 
@@ -67,6 +68,9 @@ class Iterator {
   // See IteratorBase::DropPageLatch.
   void DropPageLatch() { iter_->DropPageLatch(); }
   friend std::ostream& operator<<(std::ostream& o, const Iterator& it) {
+    if (it.iter_ == nullptr) {
+      return o << "Invalid iterator";
+    }
     it.iter_->Dump(o, 0);
     return o;
   }

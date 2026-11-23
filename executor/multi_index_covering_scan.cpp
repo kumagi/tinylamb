@@ -58,6 +58,15 @@ MultiIndexCoveringScan::MultiIndexCoveringScan(
   }
 }
 
+bool MultiIndexCoveringScan::AllGuardsHoldLocks() const {
+  for (const auto& guard : guards_) {
+    if (!guard.HoldsLock()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void MultiIndexCoveringScan::FillFromImage(Row* values,
                                            const Participant& participant,
                                            const Row& image) {
@@ -93,6 +102,12 @@ void MultiIndexCoveringScan::Build() {
         }
         // Duplicate entries of one index (repeated keys on a non-unique
         // index) collapse onto the same position.
+        // Grow geometrically: the narrowed participant's row count is not
+        // known up front, but reserve(size()+1) would rehash on every insert.
+        if (candidates_.size() >= candidates_.bucket_count()) {
+          candidates_.reserve(
+              std::max<size_t>(16, candidates_.bucket_count() * 2));
+        }
         candidates_.emplace(pos, std::move(candidate));
         continue;
       }

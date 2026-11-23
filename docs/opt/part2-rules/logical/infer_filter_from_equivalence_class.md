@@ -96,4 +96,4 @@ $$(T_1.c = T_2.d) \land (T_1.c\ \theta\ k) \implies (T_2.d\ \theta\ k)$$
 ## 検証テスト
 
 - `plan/cascades_test_part3.cpp`: `CascadesTest.InferFilterFromEquivalenceClass`
-  - 結合条件 `t1.id = t2.id` と選択述語 `t1.id > 10` が存在する論理プランにおいて、`t2.id > 10` を含む合成 Selection 式が生成されることを検証。
+  - 結合条件 `t1.id = t2.id` と選択述語 `t1.id > 10` を持つ論理プランを探索し、述語表示に両列名が含まれることを検査します。演算子と定数 `> 10` の保持や、推論された別述語の存在は直接検証しません。

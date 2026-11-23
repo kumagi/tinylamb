@@ -144,13 +144,38 @@ struct RuleSnapshot {
   size_t estimated_rows{0};
 };
 
+// A group filter can name columns of every relation in the group, while this
+// fixture passes only the single test table's schema. Widen the evaluation
+// schema to the group's relation set so a cross-relation conjunct resolves to
+// the right column offsets instead of being misread (or throwing) against the
+// one-table schema. Callers widen input rows the same way (NULL padding).
+Schema FilterEvaluationSchema(const cascades::Memo& memo,
+                              cascades::GroupId root, const Schema& schema) {
+  Schema result = schema;
+  const auto& table_schemas = memo.GetTableSchemas();
+  for (const std::string& relation : memo.Get(root).relations) {
+    if (relation == schema.Name()) {
+      continue;
+    }
+    const auto found = table_schemas.find(relation);
+    if (found != table_schemas.end()) {
+      result = result + found->second;
+    }
+  }
+  return result;
+}
+
 RuleSnapshot CaptureRuleSnapshot(const cascades::Memo& memo,
                                  cascades::GroupId root, const Schema& schema,
                                  const Expression& predicate,
                                  const TableStatistics& statistics,
                                  const std::vector<Row>& input) {
-  const cascades::LogicalExpression& expression =
-      memo.Get(root).expressions.front();
+  const auto& expressions = memo.Get(root).expressions;
+  if (expressions.empty()) {
+    ADD_FAILURE() << "rule exploration left the root group empty";
+    return {};
+  }
+  const cascades::LogicalExpression& expression = expressions.front();
   cascades::PhysicalProperties required;
   required.ordering = {ColumnName("phase0_contract", "id")};
   required.sort_ascending = {true};
@@ -171,13 +196,27 @@ RuleSnapshot CaptureRuleSnapshot(const cascades::Memo& memo,
   // comparisons tautologies that never touch optimizer state.
   const Expression& effective_filter =
       memo.Get(root).filter ? memo.Get(root).filter : predicate;
+  // Align the input side with the group, not just the filter: the group filter
+  // may cover more relations than |schema|, so both the row set and the
+  // estimate must be evaluated against the widened schema.
+  const Schema eval_schema = FilterEvaluationSchema(memo, root, schema);
+  std::vector<Row> eval_input = input;
+  const size_t extra_columns =
+      eval_schema.ColumnCount() - schema.ColumnCount();
+  if (extra_columns != 0) {
+    const Row padding{std::vector<Value>(extra_columns)};
+    for (Row& row : eval_input) {
+      row = row + padding;
+    }
+  }
   return RuleSnapshot{
       .schema = expression.output_schema.ColumnCount() == 0
                     ? SchemaFingerprint(schema)
                     : SchemaFingerprint(expression.output_schema),
       .ordering = ordering,
-      .rows = EvaluateSet(schema, effective_filter, input),
-      .estimated_rows = statistics.Filter(schema, effective_filter).Rows(),
+      .rows = EvaluateSet(eval_schema, effective_filter, eval_input),
+      .estimated_rows =
+          statistics.Filter(eval_schema, effective_filter).Rows(),
   };
 }
 
@@ -301,7 +340,9 @@ class Phase0ContractTest : public ::testing::Test {
 
 TEST_F(Phase0ContractTest, SqlCascadesAndDirectExecutorShareExpectedRows) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP();
+    GTEST_SKIP()
+        << "GoogleSQL frontend unavailable; SQL/Cascades/direct-executor "
+           "row-set equivalence is not verified in this build";
   }
   const Expression predicate = BinaryExpressionExp(
       ColumnValueExp(ColumnName("phase0_contract", "id")),
@@ -506,7 +547,8 @@ TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
   ASSERT_EQ(manifest.size(), 30U);
 
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP();
+    GTEST_SKIP() << "GoogleSQL frontend unavailable; the (todo, semantic) "
+                    "SQL execution matrix is not verified in this build";
   }
   // Every (todo, semantic) pair must actually run its SQL.  Caching one result
   // per semantic class made the five todo iterations indistinguishable.
@@ -563,6 +605,15 @@ TEST_F(Phase0ContractTest, RuleRewritePreservesSchemaOrderSetAndEstimate) {
   EXPECT_EQ(after.ordering, before.ordering);
   EXPECT_EQ(after.rows, before.rows);
   EXPECT_EQ(after.estimated_rows, before.estimated_rows);
+  // The test name promises an estimate check: verify the post-explore estimate
+  // against the filter the optimizer actually holds (the group filter once a
+  // rule has moved the predicate), evaluated on the group-aligned schema.
+  const Expression& after_filter =
+      explored.Get(root).filter ? explored.Get(root).filter : predicate;
+  EXPECT_EQ(after.estimated_rows,
+            statistics_->Filter(FilterEvaluationSchema(explored, root, schema),
+                                after_filter)
+                .Rows());
   EXPECT_FALSE(explored.Get(base).filter);
   ASSERT_TRUE(explored.Get(root).filter);
   EXPECT_EQ(explored.Get(root).filter->ToString(), predicate->ToString());
@@ -570,7 +621,8 @@ TEST_F(Phase0ContractTest, RuleRewritePreservesSchemaOrderSetAndEstimate) {
 
 TEST_F(Phase0ContractTest, ExplainShowsRuleOperatorAndPropertyContract) {
   if (!GoogleSqlFrontend::Available()) {
-    GTEST_SKIP();
+    GTEST_SKIP() << "GoogleSQL frontend unavailable; EXPLAIN rule/operator/"
+                    "property contract output is not verified in this build";
   }
   const std::string join_plan = Explain(
       "SELECT a.id, b.grp FROM phase0_contract a JOIN phase0_contract b "

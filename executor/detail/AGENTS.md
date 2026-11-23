@@ -42,11 +42,13 @@ Namespace `relational_detail`. Promotion to a real layer is an open item.
   inside its own definition and resolves outward, while a WITH RECURSIVE one
   reads the work table), `CteCycleStatus` and `ValidateCteDependencies`
   (dependency-order resolvability of one WITH list; a mutual reference is
-  "cyclic CTE reference among a, b"). `ExecuteQuery` resolves the list in
-  dependency order and reports the same cycle status as the backstop for
-  hand-built statements — `SqlEngine::PrepareStatement` already validated
-  SQL input.
-- `window_eval.*`, `explain_format.*` — window evaluation, EXPLAIN rendering.
+  "cyclic CTE reference among a, b"). `ValidateCteDependencies` checks
+  dependency order and cycles during SQL preparation; `ExecuteQuery` resolves
+  the list at runtime and repeats the cycle check as a backstop for hand-built
+  statements.
+- `window_eval.*`, `window_eval_columnar.cpp`, `window_eval_internal.hpp`,
+  `explain_format.*` — window evaluation (including the columnar path),
+  EXPLAIN rendering. Run `window_spill_test` for window spill changes.
 - `work_table_index.{hpp,cpp}` — `WorkTableIndex`, the hash index over a
   recursive CTE's working table. `ExecuteRecursiveCte` used to answer "did an
   earlier round already produce this row?" (UNION DISTINCT recursion) with a

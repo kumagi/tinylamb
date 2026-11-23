@@ -25,7 +25,8 @@ struct SqlScalarFunction {
   std::string name;                 // lower-cased function name
   std::vector<std::string> params;  // lower-cased parameter names
   // Parallel to `params`; null entries are required parameters, non-null
-  // entries are DEFAULT expressions evaluated when the call omits them.
+  // entries are DEFAULT expressions evaluated left-to-right against already
+  // bound preceding parameters when the call omits them.
   std::vector<Expression> defaults;
   Expression body;
 
@@ -52,8 +53,8 @@ void RegisterSqlScalarFunction(SqlScalarFunction function);
 
 // Binds evaluated argument values to the parameter names of `function`,
 // producing the synthetic single-row scope the body evaluates against.
-// Trailing parameters with DEFAULT expressions are padded; wrong argument
-// counts return InvalidArgument.
+// Trailing defaults are evaluated left-to-right with access to preceding
+// bound parameters; wrong argument counts return InvalidArgument.
 struct SqlUdfBinding {
   Row row;
   Schema schema;

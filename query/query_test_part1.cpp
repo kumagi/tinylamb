@@ -66,7 +66,7 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
   SqlEngine engine(*db_);
 
   // Writer enforcement, INSERT and UPDATE alike.  A violating statement
-  // trains out to a failed QueryResult: the DML applies rows off the
+  // turns out to a failed QueryResult: the DML applies rows off the
   // statement drain, so the rejection surfaces in the drain status.
   const auto expect_rejection = [&](std::string_view sql) {
     TransactionContext probe = db_->BeginContext();
@@ -89,7 +89,7 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
           message.find("update failed on table") != std::string::npos;
       EXPECT_TRUE(non_nullable_message) << message;
     }
-    probe.txn_.Abort();
+    ASSERT_SUCCESS(probe.txn_.Abort());
   };
   expect_rejection("INSERT INTO nn VALUES (NULL, 1, 0);");
   expect_rejection("UPDATE nn SET a = NULL WHERE a = 1;");
@@ -159,7 +159,7 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
       RunSql(ctx, *db_, "SELECT g, COUNT(a) FROM nn GROUP BY g ORDER BY g;"),
       (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{2})}),
                         Row({Value(int64_t{2}), Value(int64_t{1})})}));
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 // Error-absorbing calls (ISERROR / NULLIFERROR) in a grouped HAVING must be
@@ -167,9 +167,9 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
 // ISERROR keeps it and NULLIFERROR's absorbed-NULL comparison rejects it.
 // The query used to lose whole groups when the scan-filter compile boundary
 // "decided" the column-bearing conjunct against the result of an
-// empty-schema evaluation, so these statements are pinned at the SQL level
-// (the compile-level half lives in ScanFilterTest.
-// ConstantResidualBoundaryNeverDecidesColumnConjuncts).
+// empty-schema evaluation, so these statements are pinned at the SQL level.
+// The compile-level counterpart is ScanFilterTest's
+// ConstantResidualBoundaryNeverDecidesColumnConjuncts test.
 TEST_F(QueryTest, GroupedHavingErrorAbsorptionStaysPerRow) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_,
@@ -217,7 +217,7 @@ TEST_F(QueryTest, GroupedHavingErrorAbsorptionStaysPerRow) {
                     "SELECT MAX(B) FROM T GROUP BY A HAVING "
                     "IFERROR(1/A, -999) > -100;")),
       (std::vector<Row>{Row({Value(int64_t{10})}), Row({Value(int64_t{20})})}));
-  probe.txn_.Abort();
+  ASSERT_SUCCESS(probe.txn_.Abort());
 }
 
 TEST_F(QueryTest, ColumnDefaultKeywordInValuesResolvesTargetColumn) {
@@ -247,15 +247,31 @@ TEST_F(QueryTest, InsertValidatesWidthBeforeEvaluatingValues) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE WidthCheck(a INT64 DEFAULT 7)");
   SqlEngine engine(*db_);
+  // Use well-formed values first: the only possible failure is the width
+  // check, so the diagnostic cannot be produced by expression evaluation.
   for (const auto& [sql, message] :
-       {std::pair{"INSERT INTO WidthCheck VALUES (1, 1/0)",
+       {std::pair{"INSERT INTO WidthCheck VALUES (1, 2)",
                   "value count does not match"},
-        std::pair{"INSERT INTO WidthCheck(a) VALUES (1, 1/0)",
+        std::pair{"INSERT INTO WidthCheck(a) VALUES (1, 2)",
                   "column/value count mismatch"}}) {
     const auto result = engine.Prepare(ctx, sql);
     EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
     EXPECT_NE(engine.LastError().find(message), std::string::npos);
   }
+  // The poisoned case pins the ordering: the width error wins over 1/0.
+  const auto poisoned =
+      engine.Prepare(ctx, "INSERT INTO WidthCheck VALUES (1, 1/0)");
+  EXPECT_EQ(poisoned.GetStatus(), Status::kInvalidArgument);
+  EXPECT_NE(engine.LastError().find("value count does not match"),
+            std::string::npos);
+  // A single scalar is not a whole-row STRUCT: it must not be accepted by
+  // the allow_struct=true early check for a multi-column table.
+  RunSql(ctx, *db_, "CREATE TABLE WidthCheckPair(a INT64, b INT64);");
+  const auto scalar =
+      engine.Prepare(ctx, "INSERT INTO WidthCheckPair VALUES (1);");
+  EXPECT_EQ(scalar.GetStatus(), Status::kInvalidArgument);
+  EXPECT_NE(engine.LastError().find("value count does not match"),
+            std::string::npos);
   RunSql(ctx, *db_, "INSERT INTO WidthCheck VALUES (DEFAULT)");
   EXPECT_EQ(RunSql(ctx, *db_, "SELECT a FROM WidthCheck"),
             (std::vector<Row>{Row({Value(7)})}));
@@ -296,7 +312,7 @@ TEST_F(QueryTest, ColumnDefaultRejectsVolatileExpressions) {
       engine.Prepare(ctx, "CREATE TABLE tv (a INT64 DEFAULT (RAND() * 10));");
   EXPECT_FALSE(rejected.HasValue());
   EXPECT_EQ(engine.LastError(), "column DEFAULT must be a constant expression");
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 // Persisted views: CREATE VIEW stores the defining query in the catalog
@@ -337,7 +353,7 @@ TEST_F(QueryTest, ViewPersistsAcrossRestartAndDropsCleanly) {
   EXPECT_EQ(dropped.Value()->GetStatus(), Status::kSuccess);
   StatusOr<Executor> gone = dropping.Prepare(reopened_ctx, "SELECT * FROM vv;");
   EXPECT_FALSE(gone.HasValue());
-  reopened_ctx.txn_.Abort();
+  ASSERT_SUCCESS(reopened_ctx.txn_.Abort());
   db_ = std::move(reopened);
   TransactionContext verify_ctx = db_->BeginContext();
   const auto rolled_back = RunSql(verify_ctx, *db_, "SELECT COUNT(*) FROM vv;");
@@ -356,7 +372,7 @@ TEST_F(QueryTest, ViewPersistsAcrossRestartAndDropsCleanly) {
   StatusOr<Executor> missing_drop = engine2.Prepare(verify2, "DROP VIEW vv;");
   EXPECT_FALSE(missing_drop.HasValue());
   EXPECT_EQ(engine2.LastError(), "view vv does not exist");
-  verify2.txn_.Abort();
+  ASSERT_SUCCESS(verify2.txn_.Abort());
   db_ = std::move(reopened2);
 }
 
@@ -384,7 +400,7 @@ TEST_F(QueryTest, ViewOrReplaceAndNameConflicts) {
   StatusOr<Executor> not_a_view = engine.Prepare(ctx, "DROP VIEW plain;");
   EXPECT_FALSE(not_a_view.HasValue());
   EXPECT_EQ(engine.LastError(), "view plain does not exist");
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, DropIfExistsOnMissingObjects) {
@@ -689,7 +705,7 @@ TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
   ASSERT_EQ(rows.size(), 1U);
 
   // Physical positions come from a plain read.
-  Table table = db_->GetTable(ctx, "fu").Value();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(ctx, "fu"));
   std::unordered_map<int64_t, RowPosition> positions;
   for (Iterator it = table.BeginFullScan(ctx.txn_); it.IsValid(); ++it) {
     for (int64_t k = 1; k <= 3; ++k) {
@@ -713,7 +729,7 @@ TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
   TransactionContext writer = db_->BeginContext();
   EXPECT_FALSE(writer.txn_.TryAddWriteSet(positions[1]));
   // Aborting the locker releases the row to the writer.
-  locker.txn_.Abort();
+  ASSERT_SUCCESS(locker.txn_.Abort());
   EXPECT_TRUE(writer.txn_.TryAddWriteSet(positions[1]));
   writer.txn_.Abort();
 
@@ -729,8 +745,8 @@ TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
     }
     EXPECT_TRUE(again.txn_.HasWriteSet(positions[1]));
   }
-  again.txn_.Abort();
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(again.txn_.Abort());
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 // GoogleSQL has no NOWAIT, so the locking select's wait policy is an embedder
@@ -763,7 +779,7 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
     EXPECT_EQ(rows, 2U);
   }
   TransactionContext reader = db_->BeginContext();
-  Table table = db_->GetTable(reader, "fu_nowait").Value();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "fu_nowait"));
   RowPosition first;
   for (Iterator it = table.BeginFullScan(reader.txn_); it.IsValid(); ++it) {
     if ((*it).values_[0] == Value(1)) {
@@ -786,10 +802,16 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
                                 std::chrono::steady_clock::now() - started)
                                 .count();
   EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
-  // The blocking policy would sit here for the 5s wait cap.
-  EXPECT_LT(elapsed_ms, 2000.0) << elapsed_ms << "ms";
-  other.txn_.Abort();
-  holder.txn_.Abort();
+  // A try-lock rejection is recorded as kConflict at once; a plan filled
+  // under kWait would instead park until the write-intent wait cap (and
+  // report kTimeout).  Assert the recorded reason rather than a tight wall
+  // clock budget, which is flaky under a loaded parallel ctest run.
+  EXPECT_EQ(other.txn_.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kConflict);
+  // Loose sanity bound only; the reason above is the real wait/no-wait check.
+  EXPECT_LT(elapsed_ms, 10000.0) << elapsed_ms << "ms";
+  ASSERT_SUCCESS(other.txn_.Abort());
+  ASSERT_SUCCESS(holder.txn_.Abort());
   reader.txn_.Abort();
 }
 
@@ -841,8 +863,12 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitWhitespaceVariantFailsFast) {
                                 std::chrono::steady_clock::now() - started)
                                 .count();
   EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
-  EXPECT_LT(elapsed_ms, 2000.0) << elapsed_ms << "ms";
-  other.txn_.Abort();
+  // Same reason-based check as the single-space spelling: the whitespace
+  // variant must still take the try-lock path, not park for the wait cap.
+  EXPECT_EQ(other.txn_.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kConflict);
+  EXPECT_LT(elapsed_ms, 10000.0) << elapsed_ms << "ms";
+  ASSERT_SUCCESS(other.txn_.Abort());
   holder.txn_.Abort();
   reader.txn_.Abort();
 }
@@ -863,6 +889,9 @@ TEST_F(QueryTest, SqlEngineCalcMergesDuplicateScanFilters) {
     text.reserve(8192);
     StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
     EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    if (!prepared.HasValue()) {
+      return text;
+    }
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
       text += row[0].AsString();
@@ -1618,7 +1647,9 @@ TEST_F(QueryTest, SqlEngineAnalyzeRefreshesStatistics) {
   ASSERT_EQ(stats_before.GetStatus(), Status::kSuccess);
   const std::shared_ptr<TableStatistics>& before = stats_before.Value();
   EXPECT_EQ(before->Rows(), 0);
-  EXPECT_EQ(before->Rows(), 0);
+  // The schema is known even before ANALYZE; check a second, independent
+  // statistic instead of repeating the row count.
+  EXPECT_EQ(before->Columns(), 1U);
 
   // Act -- force a statistics refresh.
   StatusOr<Executor> analyzed = engine.Prepare(ctx, "ANALYZE stats_t;");
@@ -1873,20 +1904,35 @@ TEST_F(QueryTest, SqlEngineTemplateCacheEvictsFullShard) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
   }
   SqlEngine engine(*db_);
-  for (size_t i = 0; i < 50; ++i) {
+  const uint64_t evictions_before =
+      PlanCacheStats().template_evictions.load(std::memory_order_relaxed);
+  // Every fingerprint must resolve against the real table, otherwise the
+  // template fill never happens.  Keep the SQL shape identical and vary only
+  // a comment so each statement has its own literal-free fingerprint.  The
+  // loop stops as soon as a shard actually overflows (16 shards x 64 entries
+  // => at most 1025 fingerprints by pigeonhole; the bound is just a guard).
+  for (size_t i = 0;
+       i < 2048 &&
+       PlanCacheStats().template_evictions.load(std::memory_order_relaxed) ==
+           evictions_before;
+       ++i) {
     const std::string sql =
-        "INSERT INTO tpl_tbl" + std::to_string(i) + " VALUES (1);";
+        "INSERT INTO tpl_t /* " + std::to_string(i) + " */ VALUES (1);";
     TransactionContext ctx = db_->BeginContext();
-    (void)engine.Prepare(ctx, sql);
-    ctx.txn_.Abort();
+    ASSERT_TRUE(engine.Prepare(ctx, sql).HasValue())
+        << sql << "\n" << engine.LastError();
+    ASSERT_SUCCESS(ctx.txn_.Abort());
   }
-  // Assert -- implicit; preparing a templatable statement afterwards still
-  // succeeds and can hit the (now-trimmed) cache without crashing.
+  // Assert -- the shard really overflowed and dropped its oldest template.
+  EXPECT_GT(PlanCacheStats().template_evictions.load(std::memory_order_relaxed),
+            evictions_before);
+  // Assert -- preparing a templatable statement afterwards still succeeds
+  // and can hit the (now-trimmed) cache without crashing.
   {
     TransactionContext ctx = db_->BeginContext();
     ASSERT_TRUE(
         engine.Prepare(ctx, "INSERT INTO tpl_t VALUES (1);").HasValue());
-    ctx.txn_.Abort();
+    ASSERT_SUCCESS(ctx.txn_.Abort());
   }
 }
 

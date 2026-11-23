@@ -29,18 +29,36 @@ class OocRng {
     }
     return static_cast<uint32_t>(rng_());
   }
+  // Two 32-bit draws forming a 64-bit value: draw % span uses the full
+  // range, so narrow spans are NOT insulated from the high word (only spans
+  // that divide 2^32 would be). The 64-bit draw is required to cover spans
+  // wider than 2^32 without modulo bias toward the low word.
+  uint64_t Next64() {
+    const uint64_t lo = Next32();
+    const uint64_t hi = Next32();
+    return lo | (hi << 32);
+  }
   int64_t Pick(int64_t lo, int64_t hi) {
     if (hi <= lo) {
       return lo;
     }
     const uint64_t span = static_cast<uint64_t>(hi) -
                           static_cast<uint64_t>(lo) + 1;
-    const uint32_t draw = Next32();
-    // A zero span represents the entire INT64 domain (2^64 values).
-    return lo + static_cast<int64_t>(span == 0 ? draw : draw % span);
+    // A zero span represents the entire INT64 domain (2^64 values). A 64-bit
+    // draw is required to cover that domain (and any span wider than 2^32);
+    // a single 32-bit draw would only ever reach [lo, lo + 2^32).
+    const uint64_t draw = Next64();
+    // Unsigned addition keeps the wrap well-defined even when lo + offset
+    // would overflow a signed int64_t.
+    return static_cast<int64_t>(static_cast<uint64_t>(lo) +
+                                (span == 0 ? draw : draw % span));
   }
-  // Percentages outside [0, 100] saturate. Always consume one draw.
+  // Percentages outside [0, 100] saturate. Always call Pick once (two 32-bit
+  // draws through Next64).
   bool Chance(int pct) { return Pick(0, 99) < pct; }
+  // Callers must pass a non-empty vector. An empty choice set is a caller
+  // bug, so std::out_of_range from at() is deliberate fail-fast behavior
+  // (pinned by OocRngTest.EmptyChoicesRaiseAndSingletonReturnsMember).
   template <typename T>
   const T& OneOf(const std::vector<T>& v) {
     return v.at(static_cast<size_t>(Pick(0, static_cast<int64_t>(v.size()) - 1)));

@@ -25,16 +25,20 @@ graph TD
 
 ## 適用条件
 
-パターンは `Selection(Join(Any(), Any(), "input"))` であり、対象演算子は `LogicalOperator::kSelection` です。DSL の `Join` パターンは内部結合（`kJoin`）のみにマッチし、外部結合（`kOuterJoin`）にはマッチしません。
+パターンは `Selection(Join(Any(), Any(), "input"))` であり、対象演算子は `LogicalOperator::kSelection` です。DSL の `Join` パターンは内部結合（`kJoin`）のみにマッチし、実装はさらに共有スキャンの安全性と同じ Group に外部結合 alternative があるかをガードします。
 
 ```cpp
     // Selection(Join(L, R), A AND B) with A over L and B over R: push both
-    // sides. Guard rail: no outer-join pushdown yet.
+    // sides only when shared scans and outer-join alternatives are safe.
     built.Add(Rule(
         "split_selection_over_join",
         Selection(Join(Any(), Any(), "input")),
-        [](const Bindings&, Memo& memo, GroupId,
+        [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
+          if (!SelectionMayStrengthenSharedScans(memo, group) ||
+              HasOuterJoinAlternative(memo, bindings.at("input"))) {
+            return;
+          }
           PushSingleRelationConjuncts(memo, *expression.predicate,
                                       [](const std::string&) { return true; });
         },
@@ -45,7 +49,7 @@ graph TD
 
 1. 連言述語が参照するスキーマ修飾付きリレーション名集合のサイズが厳密に 1 であること（`touched.size() == 1`）。未修飾の列名は所属関係が未確定なため押し込み対象にしません。
 2. 複数リレーションにまたがる `OR` 述語については、補助ヘルパー `PushOrLocalConditions` により各リレーションの局所条件として安全に抽出できる場合のみ部分抽出を行います。
-3. 外部結合に対しては発火しないこと（ガードレール）。
+3. `SelectionMayStrengthenSharedScans` が真であり、対象 Group に外部結合 alternative がないこと。両ガードで他の alternative や NULL 補完の意味を変えるプッシュダウンを避けます。
 
 ## 意味論的根拠と三値論理・例外保護
 
@@ -53,7 +57,7 @@ graph TD
 
 - **単一リレーション局所述語の可換性**: 内部結合において、述語 $A(L)$ は結合の前に評価しても結合の後に評価しても全く同じタプルをフィルタリングします。内部結合は交差積の部分集合であり、各入力タプルの通過条件は他の入力と独立であるためです。
 - **結合述語（相関述語）の保持**: $L.x = R.y$ のような複数関係にまたがる述語を片側のスキャンに押し込むことは、相手側の属性が未定義となるため不可能です。押し込めない述語は結合ノードまたは上位 Selection に残留します。
-- **外部結合プッシュダウンの禁止（ガードレール）**: LEFT OUTER JOIN の右入力に対して述語を押し込むと、本来 NULL 補完されて残るべき左側行が除外されるか、あるいは逆に左側から右側へ押し込むことで結果が変質します。tinylamb は Null-rejection（NULL 棄却性）解析が未実装であるため、安全性の観点から外部結合へのプッシュダウンを全面的に禁止しています。
+- **外部結合プッシュダウンの禁止（ガードレール）**: LEFT OUTER JOIN の右入力に対して述語を押し込むと、本来 NULL 補完されて残るべき左側行が除外され、結果が変質することがあります。本 Rule は内部結合に限定されています。専用の NULL 排除性解析は実装済みで、上位 Selection による外部結合の限定的な内部結合化は `outer_to_inner_join_on_null_rejecting_filter` が扱いますが、一般的な外部結合の scan filter への押し込みを許可するものではありません。
 - **OR 述語の局所条件抽出**: `OR(AND(t1.a=1, t2.b=2), AND(t1.a=3, t2.b=4))` のような式において、すべての OR 枝に `t1` の局所条件が含まれる場合に限り `OR(t1.a=1, t1.a=3)` を `t1` の scan filter へ先行フィルタとして押し込む。抽出後も元の OR 述語全体は残留述語として結合後に評価されるため、意味論的一致が厳密に保たれる。
 
 ## 実装の詳細
@@ -61,7 +65,8 @@ graph TD
 `plan/cascades.cpp` の変換処理は、`PushSingleRelationConjuncts` を介して行います。
 
 ```cpp
-    if (touched.size() == 1 && relation_enabled(*touched.begin())) {
+    if (touched.size() == 1 && memo.ContainsRelation({*touched.begin()}) &&
+        relation_enabled(*touched.begin())) {
       memo.MergeScanFilter(memo.EnsureGroup({*touched.begin()}), conjunct);
       continue;
     }

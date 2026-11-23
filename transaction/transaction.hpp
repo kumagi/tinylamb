@@ -119,31 +119,18 @@ class TransactionWriteSet final {
  public:
   using iterator = BasicIterator<std::vector<RowPosition>::iterator,
                                  std::unordered_set<RowPosition>::iterator>;
-  using const_iterator =
-      BasicIterator<std::vector<RowPosition>::const_iterator,
-                    std::unordered_set<RowPosition>::const_iterator>;
 
-  iterator begin() {
+ private:
+  // Only resident erase operations use these iterators. Public enumeration
+  // must propagate errors from reading a spilled segment through ForEach.
+  iterator ResidentBegin() {
     return spilled_ ? iterator(spill_.begin()) : iterator(small_.begin());
   }
-
-  iterator end() {
+  iterator ResidentEnd() {
     return spilled_ ? iterator(spill_.end()) : iterator(small_.end());
   }
 
-  const_iterator begin() const {
-    return spilled_ ? const_iterator(spill_.begin())
-                    : const_iterator(small_.begin());
-  }
-
-  const_iterator end() const {
-    return spilled_ ? const_iterator(spill_.end())
-                    : const_iterator(small_.end());
-  }
-
-  const_iterator cbegin() const { return begin(); }
-  const_iterator cend() const { return end(); }
-
+ public:
   [[nodiscard]] bool contains(const value_type& value) const {
     if (disk_spilled_) {
       return std::ranges::any_of(
@@ -217,7 +204,7 @@ class TransactionWriteSet final {
             spill_.erase(std::get<std::unordered_set<RowPosition>::iterator>(
                 position.value_))};
       }
-      return end();
+      return ResidentEnd();
     }
     if (std::holds_alternative<std::vector<RowPosition>::iterator>(
             position.value_)) {
@@ -230,7 +217,7 @@ class TransactionWriteSet final {
       }
       return {small_.begin() + offset};
     }
-    return end();
+    return ResidentEnd();
   }
 
   template <typename Predicate>
@@ -241,7 +228,7 @@ class TransactionWriteSet final {
       return removed;
     }
     size_type removed = 0;
-    for (auto position = begin(); position != end();) {
+    for (auto position = ResidentBegin(); position != ResidentEnd();) {
       if (predicate(*position)) {
         position = erase(position);
         ++removed;
@@ -422,11 +409,9 @@ class Transaction final {
   void MarkTableDrop() {
     has_table_drop_.store(true, std::memory_order_release);
   }
-  void AddFinishHook(std::shared_ptr<TransactionFinishHook> hook) {
-    if (hook != nullptr) {
-      finish_hooks_.push_back(std::move(hook));
-    }
-  }
+  // Registers a completion callback. After finalization, invoke it
+  // immediately with the terminal status, outside the registration lock.
+  void AddFinishHook(std::shared_ptr<TransactionFinishHook> hook);
   void FinalizeFinishHooks() noexcept;
   bool IsFinished() const {
     const TransactionStatus current = status_.load(std::memory_order_relaxed);
@@ -774,6 +759,7 @@ class Transaction final {
   void DebugSetTid(int64_t tid) noexcept {
     debug_tid_.store(tid, std::memory_order_relaxed);
   }
+  [[nodiscard]] bool NoWaitForConflicts() const;
   void NoteWaitForHolder(txn_id_t holder, RowPosition row) const;
   void ClearWaitForHolder() const;
   // Why the last AcquireWriteIntent (via AddWriteSet) returned false.  Owner-
@@ -845,7 +831,7 @@ class Transaction final {
       page_id_t root, std::string_view key,
       const std::function<void(const LogRecord&)>& fn) const;
 
-  void ReserveIndexUndoBytes(page_id_t pid, size_t bytes);
+  Status ReserveIndexUndoBytes(page_id_t pid, size_t bytes);
 
   StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type);
   StatusOr<lsn_t> DestroyPageLog(page_id_t page_id,
@@ -1020,6 +1006,7 @@ class Transaction final {
   std::vector<std::pair<page_id_t, uint64_t>> index_undo_reservations_{};
   std::vector<LogRecord> staged_records_{};
   ProcessMemoryCharge staged_charge_{MemoryPoolKind::kTx, 0, /*forced=*/false};
+  std::mutex finish_hooks_mu_{};
   std::vector<std::shared_ptr<TransactionFinishHook>> finish_hooks_;
   std::string serialization_scratch_{};
   // Serializes WAL chain maintenance ({AppendLog, PreCommit's commit record,

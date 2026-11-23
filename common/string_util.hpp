@@ -15,6 +15,27 @@
 
 namespace tinylamb {
 
+// An empty search target matches all code-point boundaries, including the
+// boundary after the last character. Position is nonzero and occurrence is
+// positive. A negative position is one-based from the end (`-1` starts at the
+// last character), matching the non-empty-target search.
+[[nodiscard]] inline int64_t InstrEmptyTargetPosition(size_t length,
+                                                      int64_t position,
+                                                      int64_t occurrence) {
+  const uint64_t start =
+      position > 0 ? static_cast<uint64_t>(position - 1)
+                   : static_cast<uint64_t>(-(position + 1)) + uint64_t{1};
+  const auto extra = static_cast<uint64_t>(occurrence - 1);
+  if (start > length || extra > length - start) {
+    return 0;
+  }
+  const auto offset = static_cast<size_t>(start + extra);
+  const size_t index = position > 0 ? offset : length - offset;
+  return index < static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+             ? static_cast<int64_t>(index) + 1
+             : 0;
+}
+
 // Appends an integer's decimal representation without allocating a temporary
 // std::string. std::to_chars writes into a stack buffer, so repeated use in a
 // loop (e.g. building signature/tag strings) performs no per-call heap
@@ -233,6 +254,9 @@ inline constexpr char kDefaultTrimCutset[] =
     } else if (multi_byte_count < multi_byte_points.size()) {
       multi_byte_points[multi_byte_count++] = point;
     } else {
+      if (overflow_points.empty()) {
+        overflow_points.reserve(16);
+      }
       overflow_points.push_back(point);
     }
     i += len;
@@ -250,11 +274,16 @@ inline constexpr char kDefaultTrimCutset[] =
     }
     return std::ranges::find(overflow_points, point) != overflow_points.end();
   };
+  const auto contains_single_byte_cutset_member = [&](std::string_view point) {
+    return std::ranges::any_of(point, [&](char c) {
+      const auto byte = static_cast<unsigned char>(c);
+      return ((single_byte_bits[byte >> 6] >> (byte & 63U)) & 1U) != 0U;
+    });
+  };
   // A cutset byte that is not a complete sequence (e.g. a lone 0xAC from a
-  // BYTES literal) only ever forms a one-byte point. Match it byte by byte in
-  // the text even when the text byte is part of a well-formed sequence, so a
-  // BYTES cutset keeps byte semantics while a valid multi-byte STRING cutset
-  // keeps code-point semantics.
+  // BYTES literal) matches a valid edge code point when any of its bytes
+  // matches. Remove the complete code point so trimming does not leave broken
+  // UTF-8. Malformed text still falls back to byte-wise trimming.
   if (leading) {
     while (!text.empty()) {
       const size_t len = std::min(
@@ -263,8 +292,16 @@ inline constexpr char kDefaultTrimCutset[] =
         text.remove_prefix(len);
         continue;
       }
-      if (len > 1 && in_cutset(text.substr(0, 1))) {
-        text.remove_prefix(1);
+      const std::string_view edge = text.substr(0, len);
+      const bool complete_sequence =
+          len > 1 && std::ranges::all_of(edge.substr(1), [](char c) {
+            return (static_cast<unsigned char>(c) & 0xC0U) == 0x80U;
+          });
+      if (complete_sequence && contains_single_byte_cutset_member(edge)) {
+        // Keep a valid UTF-8 edge code point intact. A one-byte BYTES cutset
+        // may match any byte within it, but trimming only that byte would
+        // leave a malformed prefix and differ from the trailing path.
+        text.remove_prefix(len);
         continue;
       }
       break;
@@ -287,8 +324,9 @@ inline constexpr char kDefaultTrimCutset[] =
         text.remove_suffix(len);
         continue;
       }
-      if (len > 1 && in_cutset(text.substr(text.size() - 1, 1))) {
-        text.remove_suffix(1);
+      if (len > 1 &&
+          contains_single_byte_cutset_member(text.substr(start, len))) {
+        text.remove_suffix(len);
         continue;
       }
       break;

@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -202,9 +204,13 @@ void CheckSerializeRoundTrip(const Value& v) {
   Value decoded;
   const auto des = decoded.TryDeserialize(buffer.data(), v.type);
   if (v.type != ValueType::kArray) {
-    // Plain values must survive byte-for-byte.
-    assert(des.HasValue());
-    assert(SameValue(decoded, v));
+    // Plain values must survive byte-for-byte. Do not use assert(): NDEBUG
+    // (the default RelWithDebInfo build) would silently drop this oracle.
+    if (!des.HasValue() || !SameValue(decoded, v)) {
+      (void)fprintf(stderr, "VALUE serialize round trip broken: %s\n",
+                    v.AsString().c_str());
+      abort();
+    }
   } else {
     // Arrays serialize their envelope; accept either full support or a
     // clean Status error, but never a crash or a wrong type.
@@ -273,8 +279,12 @@ void CheckTrichotomy(const Value& a, const Value& b) {
   [[maybe_unused]] const bool eq = (a == b);
   if (a.type == ValueType::kDouble &&
       (std::isnan(a.value.double_value) || std::isnan(b.value.double_value))) {
-    // NaN compares false against everything (SQL and IEEE).
-    assert(!lt.Value() && !gt.Value());
+    // TryLess/Greater follow CompareForOrderBy's total order: NaN sorts before
+    // numbers, while two NaNs compare neither way.
+    const bool a_nan = std::isnan(a.value.double_value);
+    const bool b_nan = std::isnan(b.value.double_value);
+    assert(lt.Value() == (a_nan && !b_nan));
+    assert(gt.Value() == (!a_nan && b_nan));
     return;
   }
   assert(static_cast<int>(lt.Value()) + static_cast<int>(gt.Value()) +

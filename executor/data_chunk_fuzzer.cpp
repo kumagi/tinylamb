@@ -169,7 +169,13 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     scalar.Append(model[row], source.PositionAt(row));
   }
   for (size_t row = 0; row < model.size(); ++row) {
-    assert(scalar.RowAt(row) == model[row]);
+    // assert() compiles away under NDEBUG (RelWithDebInfo fuzz builds); this
+    // reference check must abort like CheckChunkMatches does.
+    if (!(scalar.RowAt(row) == model[row])) {
+      std::cerr << "scalar reference mismatch at row " << row << "\n"
+                << std::flush;
+      std::abort();
+    }
   }
 
   // (2) Append(source, i) path.
@@ -182,6 +188,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   // (3) AppendGather with a random selection vector.
   std::vector<uint32_t> selection;
   const size_t gather = 1 + (c.Next() % 32);
+  selection.reserve(gather);
   for (size_t i = 0; i < gather && !c.Done() && source.Size() > 0; ++i) {
     selection.push_back(c.Next() % static_cast<uint32_t>(source.Size()));
   }
@@ -205,6 +212,15 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   }
   CheckChunkMatches(scalar, from_columns, "AppendRowFromColumns");
 
+  // assert() compiles away under NDEBUG (RelWithDebInfo fuzz builds); every
+  // oracle check below must abort like CheckChunkMatches does.
+  const auto check = [](bool ok, const char* what) {
+    if (!ok) {
+      std::cerr << "data_chunk oracle mismatch: " << what << "\n" << std::flush;
+      std::abort();
+    }
+  };
+
   // (4) ColumnVector::AppendFrom matches scalar appends.
   for (size_t col = 0; col < source.ColumnCount(); ++col) {
     ColumnVector from_col(schema.GetColumn(col).Type(), 0);
@@ -213,10 +229,10 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       from_col.AppendFrom(source.ColumnAt(col), i);
       scalar_col.Append(source.ColumnAt(col).ValueAt(i));
     }
-    assert(from_col.Size() == scalar_col.Size());
+    check(from_col.Size() == scalar_col.Size(), "AppendFrom size");
     for (size_t i = 0; i < from_col.Size(); ++i) {
-      assert(from_col.IsNull(i) == scalar_col.IsNull(i));
-      assert(from_col.ValueAt(i) == scalar_col.ValueAt(i));
+      check(from_col.IsNull(i) == scalar_col.IsNull(i), "AppendFrom nullness");
+      check(from_col.ValueAt(i) == scalar_col.ValueAt(i), "AppendFrom value");
     }
   }
 
@@ -246,17 +262,20 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   const Value agg_xor = source.AggregateBitXor(0);
   const Value agg_land = source.AggregateLogicalAnd(0);
   const Value agg_lor = source.AggregateLogicalOr(0);
-  assert(agg_and.IsNull() == !any_non_null);
-  assert(agg_or.IsNull() == !any_non_null);
-  assert(agg_xor.IsNull() == !any_non_null);
-  assert(agg_land.IsNull() == !any_non_null);
-  assert(agg_lor.IsNull() == !any_non_null);
+  check(agg_and.IsNull() == !any_non_null, "BIT_AND nullness");
+  check(agg_or.IsNull() == !any_non_null, "BIT_OR nullness");
+  check(agg_xor.IsNull() == !any_non_null, "BIT_XOR nullness");
+  check(agg_land.IsNull() == !any_non_null, "LOGICAL_AND nullness");
+  check(agg_lor.IsNull() == !any_non_null, "LOGICAL_OR nullness");
   if (any_non_null) {
-    assert(static_cast<uint64_t>(agg_and.value.int_value) == bit_and);
-    assert(static_cast<uint64_t>(agg_or.value.int_value) == bit_or);
-    assert(static_cast<uint64_t>(agg_xor.value.int_value) == bit_xor);
-    assert(agg_land.Truthy() == bool_and);
-    assert(agg_lor.Truthy() == bool_or);
+    check(static_cast<uint64_t>(agg_and.value.int_value) == bit_and,
+          "BIT_AND value");
+    check(static_cast<uint64_t>(agg_or.value.int_value) == bit_or,
+          "BIT_OR value");
+    check(static_cast<uint64_t>(agg_xor.value.int_value) == bit_xor,
+          "BIT_XOR value");
+    check(agg_land.Truthy() == bool_and, "LOGICAL_AND value");
+    check(agg_lor.Truthy() == bool_or, "LOGICAL_OR value");
   }
   (void)verbose;
 }

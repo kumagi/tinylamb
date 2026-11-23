@@ -34,7 +34,13 @@ graph TD
         Join(Any("left"), Pattern::Op(LogicalOperator::kJoin,
                                       {Any("rl"), Any("rr")}, "right")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
-           const LogicalExpression&) {
+           const LogicalExpression& expression) {
+          if (memo.JoinEnumerationClaimed(group) ||
+              !HasCanonicalStoredJoinPredicate(memo, expression.children[0],
+                                               expression.children[1],
+                                               expression)) {
+            return;
+          }
           const GroupId inner = memo.EnsureGroup(
               UnionRelations(memo.Get(bindings.at("left")).relations,
                              memo.Get(bindings.at("rl")).relations));
@@ -46,11 +52,14 @@ graph TD
 適用条件は以下のとおりです。
 
 1. **右子ノードの演算子**: 右子ノードの Group 内に `LogicalOperator::kJoin` を持つ式が存在すること。
-2. **中間 Group の確保**: $left$ と $rl$ の関係リストの和集合（`UnionRelations`）をもとに `EnsureGroup` を呼び出し、中間 Group `inner` を取得できること。
+2. **JoinEnumeration が未担当**: `memo.JoinEnumerationClaimed(group)` が偽であること。担当済みの Group では `join_enumeration` が分割を列挙するため、本 Rule は重複探索を避けて発火しません。
+3. **保存述語が正規形**: `HasCanonicalStoredJoinPredicate(memo, expression.children[0], expression.children[1], expression)` が真であること。保存述語が正規形でない Join では述語の再導出が一致しないため発火しません。
+4. **中間 Group の確保**: $left$ と $rl$ の関係リストの和集合（`UnionRelations`）をもとに `EnsureGroup` を呼び出し、中間 Group `inner` を取得できること。
 
-式がメモに追加されない条件は以下の2点に限られます。
+式がメモに追加されない条件は以下のとおりです。
 
 - 右子ノードの Group 内に結合式が存在しない（パターン不一致）。
+- 上記ガード 2 または 3 に該当する（JoinEnumeration が担当済み、または保存述語が正規形でない）。
 - 追加対象の式が指紋照合で重複と判定されたか、または式の登録上限（`expression_cap_`）に達して棄却された場合（第20章 20-7節）。
 
 ## 意味論的根拠と重複制御
@@ -73,14 +82,22 @@ graph TD
 両方向の回転によって生じる同一の結合式は、`Memo::AddExpression` の指紋照合によって登録前に破棄されます。
 
 ```cpp
-  const std::string fingerprint = expression.Fingerprint();
+  std::optional<std::string> fingerprint;
   const bool duplicate =
       std::ranges::any_of(target.expressions, [&](const auto& existing) {
-        return existing.Fingerprint() == fingerprint;
+        if (existing.operation != expression.operation ||
+            existing.table != expression.table ||
+            existing.children != expression.children) {
+          return false;
+        }
+        if (!fingerprint) {
+          fingerprint = expression.Fingerprint();
+        }
+        return existing.Fingerprint() == *fingerprint;
       });
 ```
 
-この重複排除は式上限カウントの前に実行されるため、探索予算を浪費することなく安全に冗長な変形を処理できます。
+まず演算子・テーブル参照・子 Group の前方一致で弾き、一致した場合のみ `Fingerprint()` を遅延計算します。大半の代替はこの前方一致で棄却されるため、毎回の完全なシリアライズは発生しません。この重複排除は式上限カウントの前に実行されるため、探索予算を浪費することなく安全に冗長な変形を処理できます。
 
 ## 実装の詳細
 
@@ -94,7 +111,7 @@ graph TD
 
 ## 関連 Rule との相互作用
 
-- `join_associativity_left`: 鏡像関係にある左回転 Rule。重複出力は指紋照合で棄却しつつ、相互補完的に結合順序空間を探索します。
+- `join_associativity_left`: 鏡像関係にある右回転 Rule。重複出力は指紋照合で棄却しつつ、相互補完的に結合順序空間を探索します。
 - `join_commutativity`: 回転の前後で左右オペランドを交換し、順序付けられた結合列を完成させます。
 - `join_enumeration`: 二分割全列挙 Rule。探索領域が重なる場合は、指紋照合により後続の重複式が自動的に排除されます。
 - `Memo::AddExpression`: 重複排除と式上限の管理（第20章 20-7節）。

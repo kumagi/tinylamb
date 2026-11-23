@@ -39,6 +39,7 @@ constexpr uint8_t kFlagFallbackValues = 1U << 2;
 constexpr uint8_t kFlagHasNulls = 1U << 3;
 constexpr unsigned kCollationShift = 5;
 constexpr uint8_t kCollationMask = 0x03U;
+constexpr uint32_t kMaxFrameRows = 1U << 22;
 
 }  // namespace
 
@@ -76,16 +77,22 @@ size_t EstimateChunkMemoryBytes(const DataChunk& chunk) noexcept {
   return total;
 }
 
-Status EncodeDataChunk(const DataChunk& chunk, std::string* dst) {
-  if (dst == nullptr) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "null dst in EncodeDataChunk");
+namespace {
+
+Status ValidateChunkColumns(const DataChunk& chunk) {
+  for (size_t i = 0; i < chunk.ColumnCount(); ++i) {
+    const ColumnVector& column = chunk.ColumnAt(i);
+    if (column.Size() != chunk.Size() ||
+        (column.Type() == ValueType::kVarChar && !column.IsHeterogeneous() &&
+         column.StringData().size() != chunk.Size())) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "inconsistent column width in DataChunk spill input");
+    }
   }
-  if (chunk.Size() > std::numeric_limits<uint32_t>::max() ||
-      chunk.ColumnCount() > std::numeric_limits<uint32_t>::max()) {
-    return StatusError(StatusCode::kTooBigData,
-                       "DataChunk dimensions exceed uint32_t");
-  }
+  return Status::kSuccess;
+}
+
+Status EncodeDataChunkPayload(const DataChunk& chunk, std::string* dst) try {
   const auto row_count = static_cast<uint32_t>(chunk.Size());
   const auto col_count = static_cast<uint32_t>(chunk.ColumnCount());
   AppendPod(row_count, dst);
@@ -219,13 +226,36 @@ Status EncodeDataChunk(const DataChunk& chunk, std::string* dst) {
     }
   }
   return Status::kSuccess;
+} catch (const std::length_error&) {
+  return Status::kTooBigData;
+} catch (const std::bad_alloc&) {
+  return Status::kMemoryLimitExceeded;
 }
 
-Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) try {
-  if (src == nullptr || chunk_out == nullptr) {
+}  // namespace
+
+Status EncodeDataChunk(const DataChunk& chunk, std::string* dst) {
+  if (dst == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
-                       "null argument in DecodeDataChunk");
+                       "null dst in EncodeDataChunk");
   }
+  if (chunk.Size() > kMaxFrameRows ||
+      chunk.ColumnCount() > std::numeric_limits<uint32_t>::max()) {
+    return StatusError(StatusCode::kTooBigData,
+                       "DataChunk dimensions exceed frame limit");
+  }
+  RETURN_IF_FAIL(ValidateChunkColumns(chunk));
+  const size_t original_size = dst->size();
+  const Status encoded = EncodeDataChunkPayload(chunk, dst);
+  if (!encoded.ok()) {
+    dst->resize(original_size);
+  }
+  return encoded;
+}
+
+namespace {
+
+Status DecodeDataChunkPayload(std::string_view* src, DataChunk* chunk_out) try {
   uint32_t row_count = 0;
   uint32_t col_count = 0;
   uint8_t has_positions = 0;
@@ -240,7 +270,6 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) try {
   // Without these checks a corrupted header drives multi-GiB resize /
   // Initialize calls whose std::bad_alloc / std::length_error escapes the
   // Status boundary (project invariant 1).
-  constexpr uint32_t kMaxFrameRows = 1U << 22;
   constexpr size_t kColumnHeaderBytes = 2;
   if (col_count > src->size() / kColumnHeaderBytes) {
     return StatusError(StatusCode::kCorrupt,
@@ -301,16 +330,23 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) try {
 
     ColumnVector& col = chunk_out->ColumnAt(c);
     ZoneMap* zm = chunk_out->MutableZoneMapAt(c);
+    // The collation field is written for every frame (heterogeneous columns
+    // carry per-value tags instead, but the bits must still be in range).
+    const auto collation =
+        static_cast<Collation>((flags >> kCollationShift) & kCollationMask);
+    if (collation > Collation::kCaseInsensitive) {
+      return StatusError(StatusCode::kCorrupt,
+                         "invalid collation in DataChunk frame");
+    }
     if (is_hetero) {
       col.SetAllowHeterogeneous(true);
     } else {
-      const auto collation =
-          static_cast<Collation>((flags >> kCollationShift) & kCollationMask);
-      if (collation > Collation::kCaseInsensitive) {
+      // A frame must always rebind an empty column; a non-empty one means a
+      // corrupt frame or a reused output chunk and cannot be decoded safely.
+      if (!col.RebindEmptyType(vt, is_unsigned, collation)) {
         return StatusError(StatusCode::kCorrupt,
-                           "invalid collation in DataChunk frame");
+                           "non-empty column in DataChunk frame");
       }
-      col.RebindEmptyType(vt, is_unsigned, collation);
     }
 
     if (row_count == 0) {
@@ -413,8 +449,6 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) try {
   return Status::kMemoryLimitExceeded;
 }
 
-namespace {
-
 // Upper-bound estimate of the `EncodeDataChunk` bytes contributed by one row
 // (per-row null-mask byte, fixed cell widths, varchar length prefixes,
 // fallback Value payloads, and the position block).  Overestimating is safe:
@@ -465,7 +499,8 @@ Status WriteRowRange(SpillSegmentWriter* writer, const DataChunk& chunk,
   }
   RETURN_IF_FAIL(EncodeDataChunk(*payload, buf));
   const size_t payload_bytes = buf->size() - sizeof(uint32_t);
-  if (payload_bytes > max_frame_bytes && end - begin > 1) {
+  if (max_frame_bytes != 0 && payload_bytes > max_frame_bytes &&
+      end - begin > 1) {
     const size_t mid = begin + ((end - begin) / 2);
     RETURN_IF_FAIL(
         WriteRowRange(writer, chunk, begin, mid, max_frame_bytes, buf));
@@ -482,52 +517,70 @@ Status WriteRowRange(SpillSegmentWriter* writer, const DataChunk& chunk,
 
 }  // namespace
 
+Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
+  if (src == nullptr || chunk_out == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "null argument in DecodeDataChunk");
+  }
+  std::string_view remaining = *src;
+  const Status decoded = DecodeDataChunkPayload(&remaining, chunk_out);
+  if (!decoded.ok()) {
+    *chunk_out = DataChunk{};
+    return decoded;
+  }
+  *src = remaining;
+  return Status::kSuccess;
+}
+
 // Spill frames carry only a length header; no magic/version. Spill files are
 // process-local temporaries, so format drift cannot mix readers/writers across
 // binaries; corruption relies on the payload decoder's own end checks.
 Status WriteDataChunk(SpillSegmentWriter* writer, const DataChunk& chunk,
-                      std::string* scratch_buffer, size_t max_frame_bytes) {
+                      std::string* scratch_buffer,
+                      size_t max_frame_bytes) try {
   if (writer == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null writer in WriteDataChunk");
   }
+  RETURN_IF_FAIL(ValidateChunkColumns(chunk));
   std::string local;
   std::string* buf = (scratch_buffer != nullptr) ? scratch_buffer : &local;
-  if (max_frame_bytes > 0 && chunk.Size() > 1) {
-    // Greedy row-batch packing: emit contiguous row groups whose estimated
-    // encoded size stays under the cap (re-split on misestimate).
-    size_t begin = 0;
-    size_t acc = 0;
-    while (begin < chunk.Size()) {
-      size_t end = begin;
-      while (end < chunk.Size()) {
+  if (chunk.Size() <= kMaxFrameRows &&
+      (max_frame_bytes == 0 || chunk.Size() <= 1)) {
+    return WriteRowRange(writer, chunk, 0, chunk.Size(), max_frame_bytes, buf);
+  }
+  for (size_t begin = 0; begin < chunk.Size();) {
+    const size_t row_limit = begin + std::min<size_t>(
+                                         kMaxFrameRows, chunk.Size() - begin);
+    size_t end = row_limit;
+    if (max_frame_bytes != 0) {
+      // Pack rows against the estimated size and split again if the encoded
+      // size exceeds the cap. Always allow at least one row.
+      end = begin;
+      size_t acc = 0;
+      const size_t row_budget =
+          max_frame_bytes - std::min(max_frame_bytes, size_t{64});
+      while (end < row_limit) {
         const size_t row_bytes = EstimateEncodedRowBytes(chunk, end);
         // Leave 64B headroom for the frame/column headers; `WriteRowRange`
         // re-verifies the encoded size and re-splits on any misestimate.
-        if (end > begin && acc + row_bytes + 64 > max_frame_bytes) {
+        if (end > begin &&
+            row_bytes > row_budget - std::min(acc, row_budget)) {
           break;
         }
         acc += row_bytes;
         ++end;
       }
-      RETURN_IF_FAIL(
-          WriteRowRange(writer, chunk, begin, end, max_frame_bytes, buf));
-      begin = end;
-      acc = 0;
     }
-    return Status::kSuccess;
+    RETURN_IF_FAIL(
+        WriteRowRange(writer, chunk, begin, end, max_frame_bytes, buf));
+    begin = end;
   }
-  buf->clear();
-  buf->resize(sizeof(uint32_t));
-  RETURN_IF_FAIL(EncodeDataChunk(chunk, buf));
-  const size_t payload_bytes = buf->size() - sizeof(uint32_t);
-  if (payload_bytes > std::numeric_limits<uint32_t>::max()) {
-    return StatusError(StatusCode::kTooBigData,
-                       "DataChunk spill frame exceeds uint32_t");
-  }
-  const auto frame_len = static_cast<uint32_t>(payload_bytes);
-  std::memcpy(buf->data(), &frame_len, sizeof(uint32_t));
-  return writer->Write(buf->data(), buf->size());
+  return Status::kSuccess;
+} catch (const std::length_error&) {
+  return Status::kTooBigData;
+} catch (const std::bad_alloc&) {
+  return Status::kMemoryLimitExceeded;
 }
 
 StatusOr<bool> ReadDataChunk(SpillSegmentReader* reader, DataChunk* chunk_out,
@@ -568,6 +621,7 @@ StatusOr<bool> ReadDataChunk(SpillSegmentReader* reader, DataChunk* chunk_out,
   std::string_view sv(*buf);
   RETURN_IF_FAIL(DecodeDataChunk(&sv, chunk_out));
   if (!sv.empty()) {
+    *chunk_out = DataChunk{};
     return StatusError(StatusCode::kCorrupt,
                        "trailing unconsumed bytes in DataChunk spill frame");
   }

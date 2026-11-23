@@ -8,6 +8,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <ratio>
 #include <string>
@@ -30,6 +31,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr int kMaxClients = 65536;
 
 struct Options {
   std::string database_path;
@@ -38,6 +40,7 @@ struct Options {
   int warmup_seconds{2};
   int measure_seconds{10};
   uint64_t seed{20260819};
+  bool help{false};
   bool verify_only{false};
   bool reuse_existing{false};
   bool synchronous_commit{true};
@@ -115,7 +118,8 @@ std::string ClassifyAbortReason(std::string_view error) {
 void Usage(std::ostream& out, std::string_view program) {
   out << "usage: " << program << " <new-database-path> [options]\n"
       << "  --scale-factor N    TPC-C warehouses W (default: 1)\n"
-      << "  --clients N         terminals (default: 10 per warehouse)\n"
+      << "  --clients N         terminals (default: 10 per warehouse, max: "
+      << kMaxClients << ")\n"
       << "  --warmup N          warmup seconds (default: 2)\n"
       << "  --seconds N         measurement seconds (default: 10)\n"
       << "  --seed N            random seed\n"
@@ -150,7 +154,8 @@ bool ParseInteger(std::string_view value, Integer* destination) {
 bool ParseOptions(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--help") {
-      return false;
+      options->help = true;
+      return true;
     }
   }
   if (argc < 2) {
@@ -223,6 +228,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     }
   }
   return options->scale_factor >= 1 && options->clients >= 0 &&
+         options->clients <= kMaxClients &&
          options->warmup_seconds >= 0 && options->measure_seconds > 0 &&
          options->wal_sync_ms > 0;
 }
@@ -273,6 +279,10 @@ int main(int argc, char** argv) {
     Usage(std::cerr, argc == 0 ? "tinylamb_tpcc_benchmark" : argv[0]);
     return 2;
   }
+  if (options.help) {
+    Usage(std::cout, argc == 0 ? "tinylamb_tpcc_benchmark" : argv[0]);
+    return 0;
+  }
   if (!options.transaction_only.empty()) {
     bool known = false;
     for (size_t i = 0; i < tinylamb::kTpccTransactionTypeCount; ++i) {
@@ -288,10 +298,21 @@ int main(int argc, char** argv) {
   }
   const tinylamb::TpccScale scale =
       tinylamb::TpccScale::Official(options.scale_factor);
+  if (scale.warehouses >
+      std::numeric_limits<int>::max() / scale.districts_per_warehouse) {
+    std::cerr << "scale factor produces too many terminals\n";
+    return 2;
+  }
+  const int terminals = scale.Terminals();
   const tinylamb::TpccNurand nurand =
       tinylamb::TpccNurand::FromSeed(options.seed);
   if (options.clients == 0) {
-    options.clients = scale.Terminals();
+    if (terminals > kMaxClients && !options.verify_only) {
+      std::cerr << "default client count exceeds " << kMaxClients
+                << "; set --clients explicitly\n";
+      return 2;
+    }
+    options.clients = terminals;
   }
 
   std::cout << "benchmark=tinylamb_tpcc\n"
@@ -312,6 +333,10 @@ int main(int argc, char** argv) {
     if (s == "deadlock_detect" || s == "detect") {
       return tinylamb::Database::DeadlockPolicy::kDeadlockDetect;
     }
+    if (!s.empty() && s != "legacy" && s != "0") {
+      std::cerr << "warning: unknown deadlock policy '" << s
+                << "', using legacy\n";
+    }
     return tinylamb::Database::DeadlockPolicy::kLegacy;
   };
   const char* deadlock_env = std::getenv("TINYLAMB_DEADLOCK_POLICY");
@@ -322,6 +347,9 @@ int main(int argc, char** argv) {
         deadlock_arg = argv[++i];
       }
     }
+  }
+  if (deadlock_env != nullptr && deadlock_env[0] == '\0') {
+    deadlock_env = nullptr;
   }
   // No --deadlock-policy flag and no environment override: measure the
   // ENGINE default instead of pinning kLegacy, so benchmark runs track the
@@ -417,7 +445,9 @@ int main(int argc, char** argv) {
       tinylamb::SqlEngine::SetThreadRuntimeProfiling(options.profile_waits);
       tinylamb::TpccWorkload workload(
           database, scale, options.seed + static_cast<uint64_t>(worker) + 1,
-          (worker * scale.Terminals()) / options.clients, nurand);
+          static_cast<int>((static_cast<int64_t>(worker) * terminals) /
+                           options.clients),
+          nurand);
       std::this_thread::sleep_until(start);
       const auto next_type = [&] {
         if (options.transaction_only.empty()) {
@@ -501,7 +531,10 @@ int main(int argc, char** argv) {
   // Opt-in instruction profiling excludes database recovery, verification,
   // population and warmup.  Those phases otherwise dwarf a short OLTP run
   // under Callgrind and produce a confidently wrong optimization target.
-  if (std::getenv("TINYLAMB_CALLGRIND_MEASUREMENT") != nullptr) {
+  const char* callgrind_flag = std::getenv("TINYLAMB_CALLGRIND_MEASUREMENT");
+  if (callgrind_flag != nullptr && callgrind_flag[0] != '\0' &&
+      std::string_view(callgrind_flag) != "0" &&
+      std::string_view(callgrind_flag) != "false") {
     std::this_thread::sleep_until(measured_start);
     CALLGRIND_START_INSTRUMENTATION;
     std::this_thread::sleep_until(measured_end);
@@ -651,19 +684,25 @@ int main(int argc, char** argv) {
   if (!first_error.empty()) {
     std::cout << "first_error=\"" << TruncateDiagnostic(first_error) << "\"\n";
   }
-  const uint64_t plan_hits =
-      tinylamb::PlanCacheStats().hits.load(std::memory_order_relaxed) -
-      plan_hits_before;
-  const uint64_t plan_misses =
-      tinylamb::PlanCacheStats().misses.load(std::memory_order_relaxed) -
-      plan_misses_before;
-  const uint64_t plan_replays =
-      tinylamb::PlanCacheStats().replays.load(std::memory_order_relaxed) -
-      plan_replays_before;
-  const uint64_t plan_parameter_mismatches =
+  // Plan cache counters are process-wide and may be reset by another
+  // session during the benchmark. Keep a reset from wrapping the reported
+  // delta to a huge value.
+  const auto plan_counter_delta = [](uint64_t after, uint64_t before) {
+    return after >= before ? after - before : 0;
+  };
+  const uint64_t plan_hits = plan_counter_delta(
+      tinylamb::PlanCacheStats().hits.load(std::memory_order_relaxed),
+      plan_hits_before);
+  const uint64_t plan_misses = plan_counter_delta(
+      tinylamb::PlanCacheStats().misses.load(std::memory_order_relaxed),
+      plan_misses_before);
+  const uint64_t plan_replays = plan_counter_delta(
+      tinylamb::PlanCacheStats().replays.load(std::memory_order_relaxed),
+      plan_replays_before);
+  const uint64_t plan_parameter_mismatches = plan_counter_delta(
       tinylamb::PlanCacheStats().parameter_mismatches.load(
-          std::memory_order_relaxed) -
-      plan_parameter_mismatches_before;
+          std::memory_order_relaxed),
+      plan_parameter_mismatches_before);
   std::cout << "plan_cache_hits=" << plan_hits << '\n'
             << "plan_cache_misses=" << plan_misses << '\n'
             << "plan_cache_replays=" << plan_replays << '\n'
@@ -678,25 +717,51 @@ int main(int argc, char** argv) {
   if (options.profile_waits) {
     const tinylamb::TransactionRuntimeStats txn_after =
         database.TransactionStats();
+    // Counters are process-wide and may be reset by another session; never
+    // report a wrapped huge delta for a smaller after-value.
+    const auto delta = [](uint64_t after, uint64_t before) {
+      return after >= before ? after - before : 0;
+    };
     const uint64_t wal_waits =
-        txn_after.wal_wait_count - txn_stats_before.wal_wait_count;
+        delta(txn_after.wal_wait_count, txn_stats_before.wal_wait_count);
     const uint64_t wal_wait_ns =
-        txn_after.wal_wait_ns - txn_stats_before.wal_wait_ns;
-    const uint64_t intent_attempts = txn_after.write_intent_attempts -
-                                     txn_stats_before.write_intent_attempts;
-    const uint64_t intent_conflicts = txn_after.write_intent_conflicts -
-                                      txn_stats_before.write_intent_conflicts;
+        delta(txn_after.wal_wait_ns, txn_stats_before.wal_wait_ns);
+    const uint64_t intent_attempts =
+        delta(txn_after.write_intent_attempts,
+              txn_stats_before.write_intent_attempts);
+    const uint64_t intent_conflicts =
+        delta(txn_after.write_intent_conflicts,
+              txn_stats_before.write_intent_conflicts);
     const uint64_t intent_timeouts =
-        txn_after.write_intent_wait_timeouts -
-        txn_stats_before.write_intent_wait_timeouts;
+        delta(txn_after.write_intent_wait_timeouts,
+              txn_stats_before.write_intent_wait_timeouts);
     const uint64_t intent_holder_abort_giveups =
-        txn_after.write_intent_holder_abort_giveups -
-        txn_stats_before.write_intent_holder_abort_giveups;
-    const uint64_t intent_wait_ns = txn_after.write_intent_mutex_wait_ns -
-                                    txn_stats_before.write_intent_mutex_wait_ns;
-    const uint64_t commit_wait_ns = txn_after.commit_shard_mutex_wait_ns -
-                                    txn_stats_before.commit_shard_mutex_wait_ns;
+        delta(txn_after.write_intent_holder_abort_giveups,
+              txn_stats_before.write_intent_holder_abort_giveups);
+    const uint64_t intent_wait_ns =
+        delta(txn_after.write_intent_mutex_wait_ns,
+              txn_stats_before.write_intent_mutex_wait_ns);
+    const uint64_t commit_wait_ns =
+        delta(txn_after.commit_shard_mutex_wait_ns,
+              txn_stats_before.commit_shard_mutex_wait_ns);
+    const bool wait_counter_delta_valid =
+        txn_after.wal_wait_count >= txn_stats_before.wal_wait_count &&
+        txn_after.wal_wait_ns >= txn_stats_before.wal_wait_ns &&
+        txn_after.write_intent_attempts >=
+            txn_stats_before.write_intent_attempts &&
+        txn_after.write_intent_conflicts >=
+            txn_stats_before.write_intent_conflicts &&
+        txn_after.write_intent_wait_timeouts >=
+            txn_stats_before.write_intent_wait_timeouts &&
+        txn_after.write_intent_holder_abort_giveups >=
+            txn_stats_before.write_intent_holder_abort_giveups &&
+        txn_after.write_intent_mutex_wait_ns >=
+            txn_stats_before.write_intent_mutex_wait_ns &&
+        txn_after.commit_shard_mutex_wait_ns >=
+            txn_stats_before.commit_shard_mutex_wait_ns;
     std::cout
+        << "wait.counter_deltas_valid="
+        << (wait_counter_delta_valid ? "true" : "false") << '\n'
         << "wait.wal.count=" << wal_waits << '\n'
         << "wait.wal.total_ms="
         << static_cast<double>(wal_wait_ns) / 1'000'000.0 << '\n'

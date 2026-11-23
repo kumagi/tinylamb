@@ -44,7 +44,7 @@ struct RowEntry {
   // Sync() drains the entry: flushed runs carry the collapsed newest state.
   std::vector<RowEntry> older_versions;
   RowEntry() = default;
-  explicit RowEntry(Row r) : row(std::move(r)), is_deleted(false) {}
+  explicit RowEntry(Row r) : row(std::move(r)) {}
   RowEntry(Row r, bool del) : row(std::move(r)), is_deleted(del) {}
   RowEntry(Row r, bool del, uint64_t v)
       : row(std::move(r)), is_deleted(del), version(v) {}

@@ -75,27 +75,24 @@ StatusOr<Value> MergeAppendExecutor::KeyValue(
                       .Type())));
     value = std::move(coerced);
   }
-  // Same collation contract as the sort operators: a case-insensitive key
-  // folds its text once, before the merge compares it.
-  return ApplyKeyCollation(value, key.collation);
+  return value;
 }
 
-Status MergeAppendExecutor::RefreshSortKeys(Head* head) const {
+Status MergeAppendExecutor::RefreshSortKeys(Head* head) {
   head->sort_keys.clear();
   head->sort_keys.reserve(keys_.size());
   for (const SortExecutor::Key& key : keys_) {
     ASSIGN_OR_RETURN(Value, value, KeyValue(*head, key));
     head->sort_keys.push_back(std::move(value));
   }
-  return Status::kSuccess;
+  return ObserveSortKeys(key_orders_, head->sort_keys);
 }
 
 bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
   for (size_t ki = 0; ki < keys_.size(); ++ki) {
-    const SortExecutor::Key& key = keys_[ki];
     const Value& lhs = left.sort_keys[ki];
     const Value& rhs = right.sort_keys[ki];
-    const int comparison = MakeSortKeyOrder(key).Compare(lhs, rhs);
+    const int comparison = key_orders_[ki].Compare(lhs, rhs);
     if (comparison != 0) {
       return comparison < 0;
     }

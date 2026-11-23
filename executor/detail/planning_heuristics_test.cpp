@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -169,6 +171,29 @@ TEST(PlanningHeuristicsTest, EstimateJoinRowsOnSpilledRelations) {
   EXPECT_EQ(EstimateJoinRowsCached(left, right, preds, &cache), est);
 }
 
+TEST(PlanningHeuristicsTest, BuildAndProbeUseTheSameSamplingTarget) {
+  Relation alternating;
+  alternating.schema = Schema("many", {Column("k", ValueType::kInt64)});
+  for (int64_t i = 0; i < 3000; ++i) {
+    alternating.rows.emplace_back(std::vector<Value>{Value(i % 2)});
+  }
+  Relation single;
+  single.schema = Schema("one", {Column("k", ValueType::kInt64)});
+  single.rows.emplace_back(std::vector<Value>{Value(0)});
+  const auto predicate = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("many", "k")), BinaryOperation::kEquals,
+      ColumnValueExp(ColumnName("one", "k")));
+
+  const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+  const std::string_view value = legacy != nullptr ? legacy : "";
+  const bool sampling_disabled =
+      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+  const bool legacy_target = !value.empty() && value != "0" && value != "false";
+  const size_t expected = sampling_disabled || legacy_target ? 1500U : 3000U;
+  EXPECT_EQ(EstimateJoinRows(alternating, single, {predicate}), expected);
+  EXPECT_EQ(EstimateJoinRows(single, alternating, {predicate}), expected);
+}
+
 TEST(PlanningHeuristicsTest,
      ColumnarMaterializeFlatIntoMultiHopGatheredAndNulls) {
   const Schema schema("t", {Column(ColumnName("t", "id"), ValueType::kInt64),
@@ -251,6 +276,13 @@ TEST(PlanningHeuristicsTest,
 TEST(PlanningHeuristicsTest, HybridHashJoinResidentCapHonorsUnlimitedBudget) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   const size_t prev_limit = budget.Limit();
+  // Any ASSERT below returns early; restore the global budget on every exit
+  // path so a failure cannot leave later tests isolated from the process.
+  struct RestoreBudget {
+    QueryMemoryBudget& budget;
+    size_t limit;
+    ~RestoreBudget() { budget.ResetForTest(limit); }
+  } restore{.budget=budget, .limit=prev_limit};
   budget.ResetForTest(0, /*isolate_from_process=*/true);
   ASSERT_TRUE(budget.Unlimited());
 
@@ -300,8 +332,6 @@ TEST(PlanningHeuristicsTest, HybridHashJoinResidentCapHonorsUnlimitedBudget) {
       },
       /*left_join=*/false, &comparisons, /*null_safe=*/false,
       /*right_join=*/false);
-
-  budget.ResetForTest(prev_limit);
 
   ASSERT_TRUE(joined.HasValue()) << joined.GetStatus();
   EXPECT_EQ(comparisons, 4U);

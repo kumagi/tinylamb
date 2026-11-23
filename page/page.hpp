@@ -52,7 +52,7 @@ class Page {
     // and abort paths call PageInit without a PageRef, so a leftover thread
     // id would make IsExclusivelyOwnedByCurrentThread() spuriously true and
     // cause lock_page_if_needed to skip the content latch (data race).
-    exclusive_owner_.store(std::thread::id{}, std::memory_order_relaxed);
+    ClearExclusiveOwner();
     in_eviction_queue_ = false;
     accounted_bytes_ = 0;
     accounted_emergency_bytes_ = 0;
@@ -104,13 +104,31 @@ class Page {
   [[nodiscard]] std::shared_mutex* Latch() const { return &latch_; }
   void SetExclusiveOwner(std::thread::id id) const {
     exclusive_owner_.store(id, std::memory_order_relaxed);
+    exclusive_owner_epoch_.fetch_add(1, std::memory_order_release);
   }
   void ClearExclusiveOwner() const {
     exclusive_owner_.store(std::thread::id{}, std::memory_order_relaxed);
+    exclusive_owner_epoch_.fetch_add(1, std::memory_order_release);
   }
   [[nodiscard]] bool IsExclusivelyOwnedByCurrentThread() const {
-    return exclusive_owner_.load(std::memory_order_relaxed) ==
-           std::this_thread::get_id();
+    // Seqlock-style validation: the epoch brackets the owner read so a torn
+    // (pre-clear) owner value cannot be mistaken for a live grant -- without
+    // it a relaxed load could return a stale thread::id that coincidentally
+    // matches a recycled id and skip the content latch. The acquire on the
+    // first epoch load pairs with the release bumps above: once a clear's
+    // bump is observed, the cleared owner store is visible too. e1 == e2
+    // means no set/clear intervened during the read, so `owner` is the value
+    // paired with that epoch.
+    const uint64_t e1 =
+        exclusive_owner_epoch_.load(std::memory_order_acquire);
+    const std::thread::id owner =
+        exclusive_owner_.load(std::memory_order_relaxed);
+    // e2 must also be acquire: a relaxed second load may be reordered before
+    // the owner load, so e1 == e2 could hold while `owner` is already the
+    // post-clear/post-set value -- a torn read the seqlock exists to reject.
+    const uint64_t e2 =
+        exclusive_owner_epoch_.load(std::memory_order_acquire);
+    return e1 == e2 && owner == std::this_thread::get_id();
   }
 
   void Dump(std::ostream& o, int indent = 0) const;
@@ -147,6 +165,7 @@ class Page {
  private:
   mutable std::shared_mutex latch_;
   mutable std::atomic<std::thread::id> exclusive_owner_{};
+  mutable std::atomic<uint64_t> exclusive_owner_epoch_{0};
   std::atomic<bool> evicted_{false};
   std::atomic<bool> referenced_{false};
 };

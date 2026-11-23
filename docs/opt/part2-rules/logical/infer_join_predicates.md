@@ -1,7 +1,7 @@
 # infer_join_predicates
 
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
-- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録式。変換はヘルパー `InferJoinConstants` および `PropagateEqualityConstants` に委譲）
+- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録式。変換はヘルパー `InferJoinConstants` と、その内部で呼ぶ `EqualityConstantExpr` に委譲。`PropagateEqualityConstants` は `plan/optimizer.cpp` の別経路のヘルパーで、本 Rule の委譲先ではない）
 
 ## 概要
 
@@ -32,14 +32,17 @@ graph TD
 パターン照合は `Join()` であり、対象演算子は `LogicalOperator::kJoin` に限定されます。
 
 ```cpp
-        [](const Bindings&, Memo& memo, GroupId,
+        [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (expression.predicate) {
+          if (SelectionMayStrengthenSharedScans(memo, group) &&
+              expression.predicate) {
             InferJoinConstants(memo, *expression.predicate);
           }
         },
         LogicalOperator::kJoin));
 ```
+
+まず `SelectionMayStrengthenSharedScans(memo, group)` が真でなければ推論しません。これは `or_to_union` / `push_filter_past_setop` が作った branch_local な Selection 下の Join で scan filter を強化すると、別分岐の行まで消してしまう（D5）ためのガードレールです（`inferred_inequality_pushdown.md` と同じ条件）。
 
 ヘルパー関数 `InferJoinConstants` 内で、以下の条件を満たす連言が処理対象となります。
 
@@ -47,6 +50,7 @@ graph TD
 2. **対象連言の形式**: 連言が修飾名を持つ「列 = 列」の等号二項式（`kEquals`）であること。定数等式や不等号は対象外です。
 3. **完全修飾名の要求**: 結合述語の左右の列双方が空でない修飾名（`schema`）を持つこと。
 4. **関係集合の存在確認**: メモが参照先リレーションを保持していること（`memo.ContainsRelation({from.schema, to.schema})` が真）。
+5. **異型列ペアの除外**: `ColumnsProvenDifferentType(memo, left, right)` が真なら、その等式からは推論しません。異なる型の列へ述語を移して比較意味を変えることを避けます。
 
 ## 意味論的根拠と三値論理・代数的一致
 
@@ -54,13 +58,19 @@ graph TD
 
 内側結合の出力行において、結合条件 `a.x = b.y` は必ず真（TRUE）でなければなりません。三値論理において、どちらかが NULL の場合、比較結果は UNKNOWN となり内側結合の出力から除去されます。同時に `a.x = 1` が真である行のみが `a` 側のフィルタを通過するため、出力行において `b.y` が 1 以外の値または NULL を取ることはあり得ません。したがって、`b.y = 1` を `b` のスキャンフィルタに追加しても、元々結合結果に残るはずだった行は一切除外されず、行集合の同値性が厳密に保たれます。
 
-本 Rule が内側結合に厳密に制限される理由は以下の通りです。外部結合（例: `a LEFT JOIN b ON a.x = b.y`）では、`b` 側にマッチする行が存在しない場合、`b.y` は NULL で補完されて出力されます。このとき誤って `b.y = 1` を `b` のスキャンへプッシュダウンすると、本来 NULL 補完として残るべき行の結合候補自体が変質し、正しい外部結合結果が得られなくなります。tinylamb では null-rejection 解析が未整備なため、パターンレベルで `kJoin` に限定するガードレールを採用しています。
+本 Rule が内側結合に厳密に制限される理由は以下の通りです。外部結合（例: `a LEFT JOIN b ON a.x = b.y`）では、`b` 側にマッチする行が存在しない場合、`b.y` は NULL で補完されて出力されます。このとき誤って `b.y = 1` を `b` のスキャンへプッシュダウンすると、本来 NULL 補完として残るべき行の結合候補自体が変質し、正しい外部結合結果が得られなくなります。専用の null-rejection 解析と外部結合の限定的な内部結合化 Rule は実装済みですが、本 Rule では scan filter に追加した述語がこの意味論を保つか証明しないため、パターンレベルで `kJoin` に限定するガードレールを採用しています。
 
 また、`memo.ContainsRelation({from.schema, to.schema})` によるガードは、相関サブクエリ（`Apply` 演算子配下の式）などにおいて外部参照列が混入した際に、未定義な表グループを生成して `RelationMask` の表明違反（CHECK）を引き起こすことを防ぐ契約上の制約です。
 
 ## 実装の詳細
 
-推論の主処理は `plan/cascades.cpp` の `InferJoinConstants` に実装されています。等式の対称性に基づき、左右双方向へ同一の処理を行います。
+推論の主処理は `plan/cascades.cpp` の `InferJoinConstants` に実装されています。これは join_predicate の連言を走査し、各「列 = 列」等式について下記の内部ヘルパー `push` を左右双方向へ呼び出します。`ColumnsProvenDifferentType(memo, left, right)` が真の列ペアは除外し、その後 `push` を左右双方向へ呼び出します。`push` はその中で定数抽出ヘルパー `EqualityConstantExpr` を呼ぶ補助関数であり、主処理そのものではありません。
+
+```cpp
+    if (ColumnsProvenDifferentType(memo, left, right)) {
+      continue;
+    }
+```
 
 ```cpp
     const auto push = [&](const ColumnName& from, const ColumnName& to) {

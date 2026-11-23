@@ -224,9 +224,7 @@ StatusOr<Expression> RewriteGroupingSetBranch(
           is_grouping_id ? "GROUPING_ID requires at least one argument"
                          : "GROUPING requires at least one argument");
     }
-    // GROUPING_ID packs one flag bit per argument; an int64_t can hold at
-    // most 64 of them, and bit 63 is set via an unsigned shift to avoid the
-    // undefined signed left shift at the 64th argument.
+    // GROUPING_ID packs one flag per argument into a 64-bit mask.
     if (grouping_args.size() > 64) {
       return AstError<Expression>("GROUPING_ID accepts at most 64 arguments");
     }
@@ -253,7 +251,11 @@ StatusOr<Expression> RewriteGroupingSetBranch(
         mask |= uint64_t{1} << (grouping_args.size() - 1 - i);
       }
     }
-    return ConstantValueExp(Value(static_cast<int64_t>(mask)));
+    Value result(static_cast<int64_t>(mask));
+    if (std::cmp_greater(mask, std::numeric_limits<int64_t>::max())) {
+      result.SetUnsigned();
+    }
+    return ConstantValueExp(result);
   }
   switch (expression->Type()) {
     case TypeTag::kAggregateExp:
@@ -272,6 +274,10 @@ StatusOr<Expression> RewriteGroupingSetBranch(
   if (context.all_key_texts.contains(text)) {
     // Inactive grouping key: the branch NULL-pads this output.
     return ConstantValueExp(Value());
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    return AstError<Expression>(
+        "selected column must appear in a GROUP BY grouping set: " + text);
   }
   std::vector<Expression> children = ExpressionChildren(expression);
   bool changed = false;
@@ -1090,6 +1096,8 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     }
 
     std::vector<NamedExpression> branch_select;
+    branch_select.reserve(
+        (base.query != nullptr ? base.query->SelectList().size() : 1) + 2);
     // UNPIVOT converts the IN columns into value/name columns; leaving `*` in
     // the branch would keep the original IN columns as duplicate output.
     // Expand the base select list explicitly, skipping every IN source column.
@@ -1118,8 +1126,9 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
               Lower(named.name.empty()
                         ? named.expression->AsColumnValue().GetColumnName().name
                         : named.name);
-          if (in_columns.contains(col))
+          if (in_columns.contains(col)) {
             continue;  // NOLINT(readability-braces-around-statements)
+}
           branch_select.emplace_back(
               named.name,
               ColumnValueExp(ColumnName(
@@ -1385,6 +1394,10 @@ StatusOr<std::string> ValidateCreateTableOptions(const GoogleSqlAstNode& root) {
         break;
       }
       ASSIGN_OR_RETURN(Expression, expr, (VisitExpression(*child)));
+      if (!expr) {
+        return AstStatus(
+            "GoogleSQL AST: unsupported CREATE TABLE engine option expression");
+      }
       StatusOr<Value> val = expr->TryEvaluate(Row(), Schema());
       if (!val.HasValue() || val.Value().type != ValueType::kVarChar) {
         return AstStatus(
@@ -1806,8 +1819,10 @@ StatusOr<std::unique_ptr<Statement>> VisitInsert(const GoogleSqlAstNode& root) {
   std::vector<std::vector<Expression>> rows;
   const GoogleSqlAstNode* row_list = root.Child("InsertValuesRowList");
   if (row_list != nullptr) {
+    rows.reserve(row_list->children.size());
     for (const GoogleSqlAstNode* row : row_list->Children("InsertValuesRow")) {
       std::vector<Expression> values;
+      values.reserve(row->children.size());
       for (const auto& value : row->children) {
         if (value->kind == "Location" || value->kind == "Hint") {
           continue;
@@ -1841,6 +1856,7 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
     return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad UPDATE");
   }
   std::vector<std::pair<ColumnName, Expression>> assignments;
+  assignments.reserve(items->children.size());
   std::vector<NestedDmlItem> nested_items;
   // Extracts "WHERE <expr>" plus an optional ASSERT_ROWS_MODIFIED from a
   // nested DELETE/UPDATE statement node; remaining children are ignored
@@ -1864,7 +1880,10 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
         return AstStatus(
             "GoogleSQL AST: nested DML RETURNING is not supported");
       }
-      if (child->kind == "Alias" || child->kind == "FromClause") {
+      if (child->kind == "FromClause") {
+        return AstStatus("GoogleSQL AST: nested DML FROM is not supported");
+      }
+      if (child->kind == "Alias") {
         continue;
       }
       candidates.push_back(child.get());
@@ -1959,8 +1978,9 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
       parsed.target_path = std::move(hv224208_0);
       if (const GoogleSqlAstNode* row_list =
               nested->Child("InsertValuesRowList")) {
-        for (const GoogleSqlAstNode* row :
-             row_list->Children("InsertValuesRow")) {
+        const auto insert_rows = row_list->Children("InsertValuesRow");
+        parsed.insert_values.reserve(insert_rows.size());
+        for (const GoogleSqlAstNode* row : insert_rows) {
           std::vector<Expression> values;
           for (const auto& value : row->children) {
             if (value->kind == "Location" || value->kind == "Hint") {
@@ -2278,6 +2298,7 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
         "GoogleSQL AST: bad MERGE target");
   }
   ASSIGN_OR_RETURN(std::string, merge_target, Path(*target_path));
+  ASSIGN_OR_RETURN(std::string, target_alias, Alias(root));
   const GoogleSqlAstNode* source_table = root.Child("TablePathExpression");
   const GoogleSqlAstNode* source_subquery = root.Child("TableSubquery");
   if (source_table == nullptr && source_subquery == nullptr) {
@@ -2293,16 +2314,8 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
           "GoogleSQL AST: bad MERGE source");
     }
     ASSIGN_OR_RETURN(std::string, source_name, Path(*source_path));
-    source_alias = source_name;
-    // `USING src AS s` attaches an Alias node to the table expression; use it
-    // so ON `s.k` resolves (VisitUpdate does the same for UPDATE ... FROM).
-    if (const GoogleSqlAstNode* alias_node = source_table->Child("Alias");
-        alias_node != nullptr) {
-      ASSIGN_OR_RETURN(std::string, table_alias_tmp, (Alias(*alias_node)));
-      if (!table_alias_tmp.empty()) {
-        source_alias = std::move(table_alias_tmp);
-      }
-    }
+    ASSIGN_OR_RETURN(std::string, table_alias, Alias(*source_table));
+    source_alias = table_alias.empty() ? source_name : std::move(table_alias);
     // A bare table source reads as SELECT * FROM <table>; the star expands
     // during the prepare-time relation materialization in SqlEngine.
     source = std::make_shared<SelectStatement>(
@@ -2335,7 +2348,8 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
   for (const auto& child : root.children) {
     if (child.get() == target_path || child.get() == source_table ||
         child.get() == source_subquery || child->kind == "Location" ||
-        child->kind == "Hint" || child->kind == "MergeWhenClauseList") {
+        child->kind == "Hint" || child->kind == "Alias" ||
+        child->kind == "MergeWhenClauseList") {
       continue;
     }
     on_node = child.get();
@@ -2350,8 +2364,9 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
   on_condition = std::move(merge_on_tmp);
 
   std::vector<MergeWhenClause> clauses;
-  for (const GoogleSqlAstNode* clause_node :
-       clause_list->Children("MergeWhenClause")) {
+  const auto when_clause_nodes = clause_list->Children("MergeWhenClause");
+  clauses.reserve(when_clause_nodes.size());
+  for (const GoogleSqlAstNode* clause_node : when_clause_nodes) {
     MergeWhenClause parsed;
     const std::string& match = clause_node->detail;
     if (match == "match_type=NOT_MATCHED_BY_TARGET") {
@@ -2400,7 +2415,9 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
         return AstError<std::unique_ptr<Statement>>(
             "GoogleSQL AST: bad MERGE UPDATE SET");
       }
-      for (const GoogleSqlAstNode* item : items->Children("UpdateItem")) {
+      const auto update_items = items->Children("UpdateItem");
+      parsed.action.set_clause.reserve(update_items.size());
+      for (const GoogleSqlAstNode* item : update_items) {
         const GoogleSqlAstNode* assignment = item->Child("UpdateSetValue");
         if (assignment == nullptr || assignment->children.size() < 2) {
           return AstError<std::unique_ptr<Statement>>(
@@ -2477,6 +2494,7 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
   auto statement = std::make_unique<MergeStatement>(
       std::move(merge_target), std::move(source), std::move(source_alias),
       std::move(on_condition));
+  statement->SetTargetAlias(std::move(target_alias));
   statement->SetClauses(std::move(clauses));
   return statement;
 }

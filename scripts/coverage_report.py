@@ -20,8 +20,10 @@ the files with the most uncovered lines.
 import argparse
 import collections
 import os
+import atexit
 import subprocess
 import sys
+import tempfile
 
 # lcov accepts a comma-separated list per --ignore-errors flag; the kinds are
 # split into two flags only to keep each line short/readable.
@@ -35,8 +37,14 @@ def main() -> int:
     parser.add_argument("--top", type=int, default=40)
     parser.add_argument(
         "--info",
-        default=f"/tmp/cov_prod_{os.getpid()}.info")
+        default=None,
+        help="lcov .info file (default: a unique temporary file, removed at exit)")
     args = parser.parse_args()
+    if args.info is None:
+        fd, args.info = tempfile.mkstemp(prefix="cov_prod_", suffix=".info")
+        os.close(fd)
+        os.unlink(args.info)  # lcov creates it
+        atexit.register(lambda p=args.info: os.path.exists(p) and os.unlink(p))
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ignore_flags = [
@@ -55,6 +63,11 @@ def main() -> int:
     if capture.returncode != 0:
         print(capture.stderr[-2000:], file=sys.stderr)
         return 1
+    if not os.path.exists(args.info):
+        # lcov succeeded but emitted no .info (empty/ignored build); report
+        # n/a instead of crashing on the unguarded open() below.
+        print("line coverage: n/a (lcov produced no info file)")
+        return 0
 
     # Exclude tests, fuzzers, benchmarks, generated deps and CLI mains: the
     # report targets the production engine sources.

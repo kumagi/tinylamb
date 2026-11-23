@@ -64,11 +64,13 @@ if (logical.limit_count != 0) {
     for (const SortKey& key : sort->Keys()) {
       keys.push_back(TopNKey{.expression = key.expression,
                              .ascending = key.ascending,
-                             .nulls_first = key.nulls_first});
+                             .nulls_first = key.nulls_first,
+                             .collation = key.collation});
     }
     Plan topn = std::make_shared<TopNPlan>(
         sort->Child(), std::move(keys), logical.limit_count,
-        logical.limit_offset);
+        logical.limit_offset, /*with_ties=*/false,
+        logical.prior_limit_offset);
     return std::vector<PlanAlternative>{PlanAlternative{
         .plan = std::move(topn),
         .local_cost = children[0].estimated_rows,
@@ -104,7 +106,8 @@ const double emitted =
     LimitOutputRows(children[0].estimated_rows, logical.limit_count,
                     logical.limit_offset);
 Plan limit = std::make_shared<LimitPlan>(
-    children[0].plan, logical.limit_count, logical.limit_offset);
+    children[0].plan, logical.limit_count, logical.limit_offset,
+    logical.prior_limit_offset);
 return std::vector<PlanAlternative>{
     PlanAlternative{.plan = std::move(limit),
                     .local_cost = rows,

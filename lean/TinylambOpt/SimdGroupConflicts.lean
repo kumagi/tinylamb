@@ -444,4 +444,96 @@ theorem all_null_group_sum_is_not_zero :
     batchAgg allNullLanes = ⟨0, none⟩ := by
   decide
 
+def lookupAgg [DecidableEq K] (k : K) : List (K × Agg) → Agg
+  | [] => aggZero
+  | (j,a) :: rest => if j = k then a else lookupAgg k rest
+
+private theorem lookup_insert [DecidableEq K] (k : K) (rs : List (K × Agg)) (l : Lane K) :
+    lookupAgg k (addToReps rs l) =
+    if l.key = k then aggStep (lookupAgg k rs) l else lookupAgg k rs := by
+  induction rs with
+  | nil => simp [lookupAgg, addToReps, aggStep_zero]
+  | cons p rs ih =>
+    obtain ⟨j,a⟩ := p
+    by_cases h : l.key = j <;> by_cases e : j = k <;>
+      simp_all [addToReps, lookupAgg, aggStep]
+
+/-- Every key sees exactly its sequential nullable COUNT and SUM, including
+    keys absent from the batch. The lookup uses the actual representative table. -/
+theorem representatives_per_key [DecidableEq K] (lanes : List (Lane K)) (k : K) :
+    lookupAgg k (representatives lanes) = seqAgg (lanes.filter (fun l => l.key == k)) := by
+  suffices h : ∀ rs : List (K × Agg), lookupAgg k (lanes.foldl addToReps rs) =
+      (lanes.filter (fun l => l.key == k)).foldl aggStep (lookupAgg k rs) from h []
+  induction lanes with
+  | nil => intro rs; rfl
+  | cons l ls ih =>
+    intro rs
+    by_cases h : l.key = k <;> simp [h, ih, lookup_insert]
+
+def fits (a : Agg) : Bool :=
+  a.sum.all fun v => decide (-(2^63) ≤ v ∧ v < 2^63)
+
+def sequentialChecked : List (Lane K) → Agg → Option Agg
+  | [], a => some a
+  | l :: ls, a =>
+    let b := aggStep a l
+    if fits b then sequentialChecked ls b else none
+
+def safePrefixes : List (Lane K) → Agg → Prop
+  | [], _ => True
+  | l :: ls, a => fits (aggStep a l) = true ∧ safePrefixes ls (aggStep a l)
+
+private theorem checked_fold (ls : List (Lane K)) (a : Agg) (hs : safePrefixes ls a) :
+    sequentialChecked ls a = some (ls.foldl aggStep a) := by
+  induction ls generalizing a with
+  | nil => rfl
+  | cons l ls ih => simpa [sequentialChecked, hs.1] using ih _ hs.2
+
+theorem checked_scatter_per_key [DecidableEq K] (lanes : List (Lane K)) (k : K)
+    (initial : Agg)
+    (safe : safePrefixes (lanes.filter (fun l => l.key == k)) initial)
+    (partialSafe : safePrefixes (lanes.filter (fun l => l.key == k)) aggZero) :
+    sequentialChecked (lanes.filter (fun l => l.key == k)) aggZero =
+      some (lookupAgg k (representatives lanes)) ∧
+    sequentialChecked (lanes.filter (fun l => l.key == k)) initial =
+      some (aggMerge initial (lookupAgg k (representatives lanes))) := by
+  rw [checked_fold _ _ partialSafe, checked_fold _ _ safe, representatives_per_key]
+  exact ⟨rfl, congrArg some (foldl_aggStep_eq _ _)⟩
+
+/-- The reduction actually aborts before storing an out-of-range partial
+    state. Independent keys can be interleaved in any order within a batch. -/
+def checkedReps [DecidableEq K] (table : List (K × Agg)) :
+    List (Lane K) → Option (List (K × Agg))
+  | [] => some table
+  | l :: ls =>
+    if fits (aggStep (lookupAgg l.key table) l) then checkedReps (addToReps table l) ls
+    else none
+
+theorem checked_table_sound [DecidableEq K] (table : List (K × Agg)) (ls : List (Lane K))
+    (safe : ∀ k, safePrefixes (ls.filter (fun l => l.key == k)) (lookupAgg k table)) :
+    checkedReps table ls = some (ls.foldl addToReps table) := by
+  induction ls generalizing table with
+  | nil => rfl
+  | cons l ls ih =>
+    have atKey := safe l.key
+    simp only [List.filter_cons,beq_self_eq_true,↓reduceIte,safePrefixes] at atKey
+    rw [checkedReps,if_pos atKey.1,List.foldl_cons]
+    apply ih
+    intro k
+    rw [lookup_insert]
+    by_cases hk : l.key = k
+    · subst k
+      simpa using atKey.2
+    · simpa [hk] using safe k
+
+theorem checked_batch_scatter [DecidableEq K] (ls : List (Lane K))
+    (initial : K → Agg) (safe : ∀ k,
+      safePrefixes (ls.filter (fun l => l.key == k)) (initial k))
+    (partials : ∀ k, safePrefixes (ls.filter (fun l => l.key == k)) aggZero) :
+    ∃ table, checkedReps [] ls = some table ∧ ∀ k,
+      sequentialChecked (ls.filter (fun l => l.key == k)) (initial k) =
+        some (aggMerge (initial k) (lookupAgg k table)) := by
+  exact ⟨representatives ls, checked_table_sound [] ls partials,
+    fun k => (checked_scatter_per_key ls k _ (safe k) (partials k)).2⟩
+
 end TinylambOpt.SimdGroupConflicts

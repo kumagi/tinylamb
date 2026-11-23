@@ -132,6 +132,34 @@ TEST_F(ParallelIndexScanTest, MatchesSerialScanRowForRow) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+TEST_F(ParallelIndexScanTest, TextBoundariesKeepCaseVariantsAndDuplicates) {
+  auto writer = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->CreateTable(
+      writer, Schema("TextIdx", {Column("k", ValueType::kVarChar),
+                                 Column("payload", ValueType::kInt64)})));
+  constexpr int distinct = 384;
+  for (int i = 0; i < distinct; ++i) {
+    const std::string suffix = std::to_string(1000 + i);
+    for (const auto* prefix : {"Key", "key"}) {
+      for (int dup : {0, 1}) {
+        Value key = Value(std::string(prefix) + suffix).WithCollation(2);
+        ASSERT_SUCCESS(table.Insert(writer.txn_, Row({key, Value(i * 2 + dup)})).GetStatus());
+      }
+    }
+  }
+  ASSERT_SUCCESS(db_->CreateIndex(writer, "TextIdx", IndexSchema("TextKey", {0}, {}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, indexed, reader.GetTable("TextIdx"));
+  const Index& index = indexed->GetIndex(0);
+  size_t morsels = 0;
+  const auto serial = DrainSerial(reader.txn_, *indexed, index, {}, {});
+  const auto parallel = DrainParallel(reader.txn_, *indexed, index, {}, {}, 4, 1, &morsels);
+  ASSERT_GT(morsels, 1U);
+  ASSERT_EQ(serial.size(), 4U * distinct);
+  EXPECT_EQ(parallel, serial);
+}
+
 TEST_F(ParallelIndexScanTest, FullRangeMatchesSerialScan) {
   TransactionContext ctx = db_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,

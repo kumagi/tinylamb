@@ -13,10 +13,9 @@
 // nodes evaluate subqueries through that interface and never see
 // TransactionContext, CteMap or executor types.
 //
-// Header-only by design: the query layer owns the wiring and no new build
-// target is introduced.  SqlEngine attaches an instance per statement
-// execution (also reachable through
-// TransactionContext::set_evaluation_context()).
+// Header-only by design. This adapter describes the intended boundary, but
+// it is not currently instantiated by SqlEngine; production subquery
+// evaluation still uses relational_detail's direct runtime helpers.
 
 #include <optional>
 #include <utility>
@@ -80,11 +79,10 @@ class RelationalEvaluationContext : public EvaluationContext {
     projected.reserve(relation->TotalRows());
     const bool as_struct = statement.AsStruct();
     const Schema& subquery_schema = relation->schema;
-    relation->ForEachRow([&](const Row& row) {
+    RETURN_IF_FAIL(relation->ForEachRow([&](const Row& row) {
       projected.push_back(relational_detail::ProjectSubqueryRow(
           row, as_struct, &subquery_schema));
-    });
-    last_element_type_hint_.clear();
+    }));
     if (subquery_schema.ColumnCount() > 0) {
       last_element_type_hint_ =
           std::string(ElementSqlTypeName(subquery_schema.GetColumn(0).Type()));
@@ -92,15 +90,13 @@ class RelationalEvaluationContext : public EvaluationContext {
     return {std::move(projected)};
   }
 
-  [[nodiscard]] StatusOr<SubqueryResult> RunSubqueryDetailed(
-      const SelectStatement& statement, const Row* outer_row) override {
-    StatusOr<std::vector<Value>> values = RunSubquery(statement, outer_row);
-    if (!values.HasValue()) {
-      return values.GetStatus();
-    }
-    return SubqueryResult{
-        .values = values.MoveValue(),
-        .element_type_hint = std::move(last_element_type_hint_)};
+  // Supply the declared element type through the base class's hook rather
+  // than overriding RunSubqueryDetailed. That keeps one execution path in
+  // production and tests, and RunSubquery has already cached the type from
+  // the result schema by the time the hook is called.
+  [[nodiscard]] std::string SubqueryElementTypeHint(
+      const SelectStatement& /*statement*/) override {
+    return last_element_type_hint_;
   }
 
   [[nodiscard]] const AggregateResultMap* CurrentAggregates() const override {

@@ -441,6 +441,15 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
   return res;
 }
 
+// Static-audit triage (2026-11-22 "unchecked-decode" findings): parse/decode
+// results in this file are *not* discarded. `ASSIGN_OR_RETURN(dst,
+// (ParseX(...)))` passes the StatusOr as the macro's parenthesized third
+// argument (the `(expr));` text the audit matched), and the decoders returning
+// an optional/pointer (DecodeUtf8Pair, ParseTimestampTextNanos,
+// platform::ParseTime) assign to a value explicitly tested with has_value() or
+// nullptr before use. A lambda's `return ParseI64Strict(...)` propagates the
+// StatusOr to an ASSIGN_OR_RETURN at its call site. Keep this note so the
+// pattern scan is not re-reported against these already-checked call sites.
 StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
                                   const CivilTime* ct = nullptr,
                                   bool at_utc = false) {
@@ -485,20 +494,29 @@ CivilTime ShiftCivilTimeSeconds(const CivilTime& ct, int64_t delta_seconds) {
 
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
   std::array<char, 16> buf{};
-  int abs_sec = std::abs(tz_offset_sec);
-  int h = abs_sec / 3600;
-  int m = (abs_sec % 3600) / 60;
+  // Widen before negating: std::abs(INT_MIN) is undefined behaviour.
+  const int64_t wide_sec = tz_offset_sec;
+  const int64_t abs_sec = wide_sec < 0 ? -wide_sec : wide_sec;
+  const int h = static_cast<int>(abs_sec / 3600);
+  const int m = static_cast<int>((abs_sec % 3600) / 60);
+  // Historical (LMT) offsets carry a non-zero second component; match the
+  // AST evaluator's ±HH:MM:SS rendering instead of dropping it.
+  const int s = static_cast<int>(abs_sec % 60);
   char sign = tz_offset_sec < 0 ? '-' : '+';
-  if (m == 0) {
+  if (m == 0 && s == 0) {
     (void)snprintf(buf.data(), buf.size(), "%c%02d", sign, h);
-  } else {
+  } else if (s == 0) {
     (void)snprintf(buf.data(), buf.size(), "%c%02d:%02d", sign, h, m);
+  } else {
+    (void)snprintf(buf.data(), buf.size(), "%c%02d:%02d:%02d", sign, h, m, s);
   }
   return {buf.data()};
 }
 
 void ExpandNumericTimeZone(std::string& format, int offset_seconds) {
-  const int magnitude = std::abs(offset_seconds);
+  const int64_t wide_seconds = offset_seconds;
+  const int64_t magnitude =
+      wide_seconds < 0 ? -wide_seconds : wide_seconds;
   const char sign = offset_seconds < 0 ? '-' : '+';
   for (size_t i = format.find('%');
        i != std::string::npos && i + 1 < format.size();
@@ -514,9 +532,10 @@ void ExpandNumericTimeZone(std::string& format, int offset_seconds) {
       continue;
     }
     std::array<char, 16> offset{};
-    (void)snprintf(offset.data(), offset.size(), "%c%02d%s%02d", sign,
-                   magnitude / 3600, spec == 'E' ? ":" : "",
-                   (magnitude / 60) % 60);
+    (void)snprintf(offset.data(), offset.size(), "%c%02lld%s%02lld", sign,
+                   static_cast<long long>(magnitude / 3600),
+                   spec == 'E' ? ":" : "",
+                   static_cast<long long>((magnitude / 60) % 60));
     format.replace(i, modified ? 3 : 2, offset.data());
   }
 }
@@ -966,22 +985,6 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // Compare with known-length literals without out-of-line string/char*
   // comparisons, which otherwise dominate scalar calls in dictionary folds.
   const std::string_view name_view(name);
-  // COALESCE stops at the first non-NULL argument.
-  if (name_view == "coalesce" || name_view == "ifnull") {
-    if (name_view == "ifnull" && call.Args().size() != 2) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "IFNULL requires 2 arguments");
-    }
-    for (const Expression& argument : call.Args()) {
-      ASSIGN_OR_RETURN(
-          Value, value,
-          (TryEvaluate(argument, scope, aggregates, context, ctes)));
-      if (!value.IsNull()) {
-        return value;
-      }
-    }
-    return Value();
-  }
   // Proto-field guards emitted by the GoogleSQL frontend: NEW constructors
   // and SELECT AS <proto> route non-constant repeated-field arrays and enum
   // values through them so invalid data fails execution instead of being
@@ -1290,6 +1293,30 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return value;
   };
+  // COALESCE stops at the first non-NULL argument.
+  if (name_view == "coalesce" || name_view == "ifnull") {
+    if (name_view == "ifnull" && call.Args().size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
+    }
+    TypeTag common = TypeTag::kInvalid;
+    if (name_view == "coalesce") {
+      static const Schema empty_schema;
+      const Schema& schema = (scope.schema != nullptr) ? *scope.schema : empty_schema;
+      const Schema* outer = (scope.outer != nullptr) ? scope.outer->schema : nullptr;
+      ASSIGN_OR_RETURN(TypeTag, resolved, (call.CoalesceType(schema, outer)));
+      common = resolved;
+    }
+    for (const Expression& argument : call.Args()) {
+      ASSIGN_OR_RETURN(
+          Value, value,
+          (TryEvaluate(argument, scope, aggregates, context, ctes)));
+      if (!value.IsNull()) {
+        return normalize(std::move(value), common == TypeTag::kDouble);
+      }
+    }
+    return Value();
+  }
   if (name_view == "if") {
     if (call.Args().size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -1468,20 +1495,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       // (FORMAT_TIMESTAMP semantics), not as local wall-clock fields.
       ASSIGN_OR_RETURN(int, tz_offset_sec,
                        (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
-      ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
-      int rem_mins = (tz_offset_sec % 3600) / 60;
-      if (rem_mins != 0) {
-        int total_m = ct.minute + rem_mins;
-        if (total_m >= 60) {
-          ct.minute = total_m - 60;
-          ct = ShiftCivilTimeHours(ct, 1);
-        } else if (total_m < 0) {
-          ct.minute = total_m + 60;
-          ct = ShiftCivilTimeHours(ct, -1);
-        } else {
-          ct.minute = total_m;
-        }
-      }
+      // Apply the whole offset (minute *and* second residues) in one go so
+      // historic LMT zones do not lose their sub-minute component; this is
+      // the same rule the AST evaluator uses.
+      ct = ShiftCivilTimeSeconds(ct, tz_offset_sec);
     }
     if (name_view == "extract_date") {
       std::chrono::year_month_day ymd{
@@ -1564,9 +1581,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       int week_num =
           yday < first_sunday
               ? 0
-              : (yday -
+              : ((yday -
                  first_sunday) /  // NOLINT(readability-math-missing-parentheses)
-                        7 +  // NOLINT(readability-math-missing-parentheses)
+                        7) +  // NOLINT(readability-math-missing-parentheses)
                     1;       // NOLINT(readability-math-missing-parentheses)
       return Value(static_cast<int64_t>(week_num));
     }
@@ -1666,6 +1683,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__struct_set requires 3 arguments");
+    }
+    // A NULL struct or field name must propagate as SQL NULL, exactly like
+    // the AST evaluator (function_call_expression.cpp __struct_set arm) and
+    // get_field: raw_str(NULL) would otherwise create a literal "NULL"
+    // member. A NULL *value* is a legitimate JSON null member.
+    if (arguments[0].IsNull() || arguments[1].IsNull()) {
+      return Value();
     }
     // T2398: call the StatusOr route directly; the throwing
     // StructSetField shim leaked std::runtime_error across the
@@ -1907,24 +1931,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       // (FORMAT_TIMESTAMP semantics), not as local wall-clock fields.
       ASSIGN_OR_RETURN(int, tz_offset_sec,
                        (ParseTimeZoneOffset(tz_str, &ct, /*at_utc=*/true)));
-      ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
-      int rem_mins = (tz_offset_sec % 3600) / 60;
-      if (rem_mins != 0) {
-        int total_m = ct.minute + rem_mins;
-        if (total_m >= 60) {
-          ct.minute = total_m - 60;
-          ct = ShiftCivilTimeHours(ct, 1);
-        } else if (total_m < 0) {
-          ct.minute = total_m + 60;
-          ct = ShiftCivilTimeHours(ct, -1);
-        } else {
-          ct.minute = total_m;
-        }
-      }
+      // Apply the whole offset (minute *and* second residues) in one go so
+      // historic LMT zones do not lose their sub-minute component; this is
+      // the same rule the AST evaluator uses.
+      ct = ShiftCivilTimeSeconds(ct, tz_offset_sec);
       return Value(FormatCivilTime(ct) + FormatTimeZoneOffset(tz_offset_sec));
     }
     if (arguments[0].type == ValueType::kDate) {
-      return Value(FormatDateDays(arguments[0].DateDays()));
+      ASSIGN_OR_RETURN(std::string, text,
+                       TryFormatDateDays(arguments[0].DateDays()));
+      return Value(std::move(text));
     }
     return Value(raw_str(arguments[0]));
   }
@@ -3271,20 +3287,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         tz_offset_sec = parsed_offset;
       }
     }
-    ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
-    int rem_mins = (tz_offset_sec % 3600) / 60;
-    if (rem_mins != 0) {
-      int total_m = ct.minute + rem_mins;
-      if (total_m >= 60) {
-        ct.minute = total_m - 60;
-        ct = ShiftCivilTimeHours(ct, 1);
-      } else if (total_m < 0) {
-        ct.minute = total_m + 60;
-        ct = ShiftCivilTimeHours(ct, -1);
-      } else {
-        ct.minute = total_m;
-      }
-    }
+    // Apply the full offset (including sub-minute LMT seconds) in one go,
+    // matching the AST FORMAT_* arm.
+    ct = ShiftCivilTimeSeconds(ct, tz_offset_sec);
     struct tm tm = {};
     tm.tm_year = ct.year - 1900;
     tm.tm_mon = ct.month - 1;
@@ -3466,23 +3471,28 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       if (unit == "month" || unit == "months" || unit == "quarter" ||
           unit == "quarters" || unit == "year" || unit == "years") {
-        int64_t step_m = amount;
-        if (unit.starts_with("year")) {
-          step_m = amount * 12;
-        } else if (unit.starts_with("quarter")) {
-          step_m = amount * 3;
-        }
-        if (step_m == 0) {
+        const int64_t month_scale = unit.starts_with("year")
+                                        ? 12
+                                        : (unit.starts_with("quarter") ? 3 : 1);
+        int64_t step_m = 0;
+        if (__builtin_mul_overflow(amount, month_scale, &step_m)) {
           return StatusError(StatusCode::kInvalidArgument,
-                             name + ": interval must not be zero");
+                             name + ": interval width out of range");
         }
-        int64_t m_diff = (static_cast<int64_t>(d_ct.year - orig_ct.year) * 12) +
-                         (d_ct.month - orig_ct.month);
-        int64_t bucket_m = floor_div(m_diff, step_m) * step_m;
-        int64_t total_m = (orig_ct.year * 12 + orig_ct.month - 1) + bucket_m;
-        int bucket_y = static_cast<int>(floor_div(total_m, 12));
-        int bucket_mon = static_cast<int>(
-            total_m - (static_cast<int64_t>(bucket_y) * 12) + 1);
+        const int64_t origin_month =
+            (static_cast<int64_t>(orig_ct.year) * 12) + orig_ct.month - 1;
+        const int64_t m_diff = (static_cast<int64_t>(d_ct.year) * 12) +
+                               d_ct.month - 1 - origin_month;
+        const auto total_m =
+            origin_month +
+            (static_cast<platform::Int128>(floor_div(m_diff, step_m)) * step_m);
+        if (total_m < 12 || total_m >= static_cast<platform::Int128>(10000 * 12)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             name + ": bucket start out of range");
+        }
+        const auto month_index = static_cast<int>(total_m);
+        const int bucket_y = month_index / 12;
+        const int bucket_mon = (month_index % 12) + 1;
         CivilTime res_ct = orig_ct;
         res_ct.year = bucket_y;
         res_ct.month = bucket_mon;
@@ -3637,9 +3647,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             StatusCode::kInvalidArgument,
             "Failed to parse input string " + Value(std::move(val)).AsString());
       }
-      const int w = 10 * (val[0] - '0') + (val[1] - '0');
+      const int w = (10 * (val[0] - '0')) + (val[1] - '0');
       const int y =
-          val.size() == 3 ? val[2] - '0' : 10 * (val[2] - '0') + (val[3] - '0');
+          val.size() == 3 ? val[2] - '0' : (10 * (val[2] - '0')) + (val[3] - '0');
       if (w > 53) {
         return StatusError(StatusCode::kIsInfinity,
                            "week out of range in PARSE_DATE: " + val);
@@ -3791,10 +3801,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     };
     int64_t total_m = (static_cast<int64_t>(int(ymd.year())) * 12) +
                       unsigned(ymd.month()) - 1 + n;
-    int target_y = static_cast<int>(floor_div(total_m, 12));
-    if (target_y < 1 || target_y > 9999) {
+    // Check the year while it is still int64_t: narrowing first could wrap a
+    // huge month offset into the accepted [1, 9999] range.
+    const int64_t target_y_64 = floor_div(total_m, 12);
+    if (target_y_64 < 1 || target_y_64 > 9999) {
       return StatusError(StatusCode::kIsInfinity, "DATE value out of range");
     }
+    const int target_y = static_cast<int>(target_y_64);
     int target_m =
         static_cast<int>(total_m - (static_cast<int64_t>(target_y) * 12) + 1);
 
@@ -3878,6 +3891,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     year_month_day_last last2{ymd2.year(), month_day_last{ymd2.month()}};
 
     int y1 = int(ymd1.year()), y2 = int(ymd2.year());
+    // year_month_day built from sys_days always yields month in [1,12] and
+    // day in [1,31], so these narrowing casts are value-preserving.
     int m1 = static_cast<int>(unsigned(ymd1.month()));
     int m2 = static_cast<int>(unsigned(ymd2.month()));
     int d1 = static_cast<int>(unsigned(ymd1.day()));
@@ -4013,6 +4028,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
+    if (arguments[0].type == ValueType::kDate) {
+      RETURN_IF_FAIL(TryFormatDateDays(arguments[0].DateDays()).GetStatus());
+    }
     const StringArgView arg(arguments[0]);
     return Value(static_cast<int64_t>(arg.view.size()));
   }
@@ -4030,6 +4048,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     // every byte that is not a UTF-8 continuation byte (0x80-0xBF) is one
     // character, so malformed input skips orphans rather than counting each
     // as a character.
+    if (arguments[0].type == ValueType::kDate) {
+      RETURN_IF_FAIL(TryFormatDateDays(arguments[0].DateDays()).GetStatus());
+    }
     const StringArgView arg(arguments[0]);
     size_t code_points = 0;
     for (const char ch : arg.view) {
@@ -4285,11 +4306,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     // at the end).
     const size_t t_cps = utf8_len(target);
     if (t_cps == 0) {
-      const size_t s_cps = utf8_len(source);
-      if (occurrence == 1 && static_cast<size_t>(position) <= s_cps + 1) {
-        return Value(position);
-      }
-      return Value(int64_t{0});
+      return Value(
+          InstrEmptyTargetPosition(utf8_len(source), position, occurrence));
     }
     std::array<size_t, 33> small_bounds{};
     std::vector<size_t> heap_bounds;
@@ -4474,7 +4492,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
       return ToInt64Exact(v, def);
     };
-    const int64_t start = to_i64(arguments[1], 1);
+    // The AST keeps the signed bit pattern for INT64 positions, including
+    // UINT64 values used as end-relative offsets; keep the batch path aligned.
+    const int64_t start = arguments[1].value.int_value;
     if (arguments.size() == 3) {
       const int64_t len = to_i64(arguments[2], 0);
       if (len < 0) {
@@ -4526,7 +4546,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
       return ToInt64Exact(v, def);
     };
-    const int64_t start = to_i64(arguments[1], 1);
+    // Match SUBSTR's AST semantics for the shared INT64 storage of UINT64.
+    const int64_t start = arguments[1].value.int_value;
     if (arguments.size() == 3) {
       const int64_t len = to_i64(arguments[2], 0);
       if (len < 0) {
@@ -4802,7 +4823,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsUnsigned()) {
       // UINT64 keeps the kInt64 tag; the bit pattern is the true value and
       // >= 2^63 would otherwise read back as a negative int64.
-      const uint64_t u = static_cast<uint64_t>(code);
+      const auto u = static_cast<uint64_t>(code);
       if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
         return StatusError(StatusCode::kIsInfinity,
                            "CHR argument out of range");
@@ -4848,8 +4869,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     elements.reserve(arguments[0].value.varchar_value.size());
     for (const uint32_t cp :
          CodePointsOfBatch(arguments[0].value.varchar_value)) {
-      elements.push_back(
-          Value(static_cast<int64_t>(cp)));  // NOLINT(modernize-use-emplace)
+      elements.emplace_back(static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -4915,7 +4935,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (elem.IsUnsigned()) {
         // UINT64 elements keep the kInt64 tag; diagnose by the true value
         // instead of letting >= 2^63 surface as a negative code point.
-        const uint64_t u = static_cast<uint64_t>(cp);
+        const auto u = static_cast<uint64_t>(cp);
         if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
           return StatusError(StatusCode::kInvalidArgument,
                              "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -4974,7 +4994,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (elem.IsUnsigned()) {
         // UINT64 elements keep the kInt64 tag; diagnose by the true value
         // instead of letting >= 2^63 surface as a negative byte.
-        const uint64_t u = static_cast<uint64_t>(b);
+        const auto u = static_cast<uint64_t>(b);
         if (u > 255) {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -5015,15 +5035,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull() || arguments[1].IsNull()) {
       return Value();
     }
-    const std::string s = raw_str(arguments[0]);
-    const std::string pat = raw_str(arguments[1]);
-    try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      return Value(std::regex_search(s, re));
-    } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
-    }
+    std::string s_owned;
+    std::string pat_owned;
+    const std::string_view s_view =
+        arguments[0].type == ValueType::kVarChar
+            ? arguments[0].value.varchar_value
+            : std::string_view(s_owned = raw_str(arguments[0]));
+    const std::string_view pat_view =
+        arguments[1].type == ValueType::kVarChar
+            ? arguments[1].value.varchar_value
+            : std::string_view(pat_owned = raw_str(arguments[1]));
+    ASSIGN_OR_RETURN(bool, found, CheckedRegexContains(s_view, pat_view));
+    return Value(found);
   }
 
   if (name_view == "regexp_match") {
@@ -5216,7 +5239,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const int64_t occ = arguments.size() >= 3 ? to_i64(arguments[2], 1) : 1;
 
     std::vector<std::string> parts;
-    parts.reserve(delim.empty() ? 1U : str.size() / delim.size() + 1U);
+    parts.reserve(delim.empty() ? 1U : (str.size() / delim.size()) + 1U);
     if (delim.empty()) {
       parts.push_back(str);
     } else {
@@ -5503,9 +5526,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
 
   // JSON_EXTRACT family: delegate to the single canonical implementation
-  // shared with the AST evaluator and the constant-fold rewrite. The local
-  // JVal parser used here used to diverge from it on invalid JSON, number
-  // canonicalization, surrogate pairs and NULL array elements.
+  // shared with the AST evaluator and the constant-fold rewrite. A local
+  // JVal parser once diverged from it on invalid JSON, number canonicalization,
+  // surrogate pairs and NULL array elements; this path no longer has one.
   if (name_view == "json_extract" || name_view == "json_query" ||
       name_view == "json_value" || name_view == "json_extract_scalar" ||
       name_view == "json_extract_array" || name_view == "json_query_array" ||
@@ -6367,11 +6390,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          static_cast<uint64_t>(arguments[1].value.int_value))
                    : static_cast<double>(arguments[1].value.int_value))
             : arguments[1].value.double_value;
-    // SAFE_* return NULL on overflow; the double path must not leak +/-inf.
+    // SAFE_* suppresses the overflow error (finite inputs producing inf), but
+    // must not swallow a NaN/Inf already present in an input: IEEE propagation
+    // is the answer, not an error to mask. Keep the finite-inputs +
+    // non-finite-result gate in sync with the AST evaluator and SAFE_DIVIDE.
     const double checked = name_view == "safe_add"
                                ? l + r
                                : (name_view == "safe_subtract" ? l - r : l * r);
-    if (std::isinf(checked) || std::isnan(checked)) {
+    if (std::isfinite(l) && std::isfinite(r) && !std::isfinite(checked)) {
       return Value();
     }
     return Value(checked);

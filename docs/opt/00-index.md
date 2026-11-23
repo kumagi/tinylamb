@@ -6,12 +6,12 @@
 - 執筆方針は [AGENTS.md](AGENTS.md)。各ターン開始時に本表を確認し、
   終了時に更新する。
 - 状態: **未執筆 / draft / review / done**
-- 基準リビジョン: `9ce7837` (2026-09-25)。**引用の検証は作業ツリー
-  (HEAD `9ce7837` + 未コミット差分を含む)に対して行われている。**
+- 基準リビジョン: `909b1b5` (2026-11-22)。**引用の検証は現行作業ツリー
+  (HEAD `909b1b5` + 未コミット差分を含む)に対して行われている。**
 - 第2部のファイルパスは `part2-rules/<種別>/<rule-name>.md`(表では種別列で省略)。
 - 分類(A〜K など)は暫定。執筆時に前後してもよい(AGENTS.md §11)。
 
-進捗サマリ: 全 182 ファイル（基礎編 7、第 2 部 173 [論理 91・実装 46・式個別 36]、管理文書 2。2026-11-18 照合）の原稿を作成済み。
+進捗サマリ: 全 184 ファイル（基礎編 7、第 2 部 175 [論理解説 93・実装解説 46・式個別 36]、管理文書 2。2026-11-23 照合）の原稿を作成済み。現行コードの登録数は 97 論理・46 物理ルールで、解説ファイル数とは一致しない。
 2026-09-20 に全原稿の日本語を再点検し、敬体の統一、重複の削除、直訳調・冗長表現の修正を実施した。内容とコード引用のレビュー状況は、以下の表にある各章の状態で管理する。
 
 ## 第1部 基礎編(`part1-foundations/`)
@@ -49,7 +49,7 @@
 - [limit_prefix_ordered_window](part2-rules/logical/limit_prefix_ordered_window.md)
 - [json_family_constant_fold](part2-rules/expression/json_family_constant_fold.md)
 
-### 論理 Rule(91 本)
+### 論理 Rule(97 本)
 
 | Rule 名 | 分類 | 状態 |
 |---|---|---|
@@ -136,11 +136,20 @@
 | `or_to_union` | 現行登録 | draft |
 | `distinct_eager_over_join` | 現行登録 | draft |
 | `topn_push_through_union_all` | 現行登録 | draft |
+| `window_halo_topn` | 現行登録 | draft |
+| `push_topn_with_ties_through_left_join` | 現行登録 | draft |
 | `distinct_idempotent_aggregate_elimination` | F 集約 | draft |
 | `inner_join_to_semijoin_idempotent_aggs` | F 集約 | draft |
 | `having_extremum_bound_pushdown` | F 集約 | draft |
 | `outer_to_inner_join_on_null_rejecting_having` | H 結合種別 | draft |
 | `eager_aggregation_over_join` | F 集約 | draft |
+| `constant_unnest_to_values` | 現行登録 | draft |
+| `limit_prefix_ordered_window` | 現行登録 | draft |
+| `limit_prefix_unordered_window` | 現行登録 | draft |
+| `disjoint_union_group_by_bypass` | 現行登録 | draft |
+| `outer_to_anti_join_through_inner_join` | 現行登録 | draft |
+| `self_join_agg_to_window` | 現行登録 | draft |
+| `eager_distinct_fact_keys_before_join` | 現行登録 | draft |
 
 ### 実装 Rule(46 本)
 

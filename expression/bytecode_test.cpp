@@ -5,21 +5,47 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/test_util.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/expression.hpp"
 #include "expression/jit.hpp"
 #include "expression/parameter_slot.hpp"
 #include "gtest/gtest.h"
+#include "type/collation.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(BytecodeTest, IsTrueAndFalseRejectNonBooleanIntegerValues) {
+  const Schema schema("input", {Column("x", ValueType::kInt64)});
+  for (const auto op :
+       {UnaryOperation::kIsTrue, UnaryOperation::kIsNotTrue,
+        UnaryOperation::kIsFalse, UnaryOperation::kIsNotFalse}) {
+    const auto expression = UnaryExpressionExp(ColumnValueExp("x"), op);
+    const auto program = BytecodeCompiler::Compile(expression, schema);
+    ASSERT_TRUE(program.has_value());
+    for (const Value& value :
+         {Value(), Value(0), Value(1), Value(-1), Value(2)}) {
+      const Row row({value});
+      DataChunk input(schema);
+      input.Append(row);
+      const auto expected = expression->TryEvaluate(row, schema);
+      const auto actual = program->TryEvaluateBatch(input);
+      EXPECT_EQ(actual.GetStatus(), expected.GetStatus());
+      if (expected.HasValue() && actual.HasValue()) {
+        EXPECT_EQ(actual.Value().ValueAt(0), expected.Value());
+      }
+    }
+  }
+}
 
 TEST(BytecodeTest, AuditBatchProjectionPreservesUnsignedValuesAfterNull) {
   Column column("u", ValueType::kInt64);
@@ -345,6 +371,18 @@ TEST(BytecodeTest, ScalarCacheKeySnapshotsCurrentBindingsAndDeclinesFunctions) {
   const Expression deferred =
       std::make_shared<ParameterSlot>(0, ValueType::kInt64, prepared);
   EXPECT_FALSE(ScalarExpressionCacheKey({deferred}, schema));
+}
+
+TEST(BytecodeTest, OversizedSchemaNameFallsBackToUncachedCompilation) {
+  constexpr size_t limit = std::numeric_limits<bin_size_t>::max();
+  const Schema schema(std::string(limit + 1, 'a'),
+                      {Column("k", ValueType::kInt64)});
+  const auto expression = ColumnValueExp("k");
+  EXPECT_FALSE(ScalarExpressionCacheKey({expression}, schema));
+  const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
+  ASSERT_TRUE(program.has_value());
+  ASSERT_SUCCESS_AND_EQ(TryEvaluateRowAuto(*program, Row({Value(7)})),
+                        Value(7));
 }
 
 TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
@@ -741,7 +779,8 @@ TEST(BytecodeTest, StringSetRespectsRuntimeCollation) {
     return op.opcode == BytecodeOp::kInStringSet;
   }));
   for (const char* text : {"abc", "missing"}) {
-    const Row row({Value(text).WithCollation(2)});
+    const Row row({Value(text).WithCollation(
+        static_cast<uint8_t>(Collation::kCaseInsensitive))});
     const auto expected = expression->TryEvaluate(row, schema);
     const auto actual = program->TryEvaluateRow(row);
     ASSERT_TRUE(expected.HasValue());
@@ -1180,6 +1219,498 @@ TEST(BytecodeTest, DemotedFallbackStringsOwnTheirPayload) {
   ASSERT_EQ(fallback[2].type, ValueType::kVarChar);
   EXPECT_EQ(fallback[2].value.varchar_value, "second");
   EXPECT_FALSE(fallback[2].owned_data.empty());
+}
+
+TEST(BytecodeTest, SimdInRangeMatchesAstAndJitAcrossExtremes) {
+  ScopedEnvVar guard("TINYLAMB_DISABLE_SIMD_IN_RANGE", nullptr);
+
+  const Schema schema("t", {Column("x", ValueType::kInt64)});
+  const int64_t kMin = std::numeric_limits<int64_t>::min();
+  const int64_t kMax = std::numeric_limits<int64_t>::max();
+  struct Case {
+    int64_t lo;
+    int64_t hi;
+    bool strict_lo;
+    bool strict_hi;
+    bool expect_fused;
+  };
+  const std::vector<Case> cases = {
+      {-5, 5, false, false, true},
+      {kMin, kMax, false, false, true},
+      {kMin, kMin, false, false, true},
+      {kMax, kMax, false, false, true},
+      {10, 20, true, true, true},
+      {20, 10, false, false, false},  // lo > hi must not fuse
+  };
+  const std::vector<Value> test_vals = {
+      Value(),   Value(kMin),     Value(kMin + 1), Value(-6), Value(-5),
+      Value(0),  Value(5),        Value(10),       Value(11), Value(19),
+      Value(20), Value(kMax - 1), Value(kMax)};
+
+  for (const Case& c : cases) {
+    Expression expr = BinaryExpressionExp(
+        BinaryExpressionExp(ColumnValueExp("x"),
+                            c.strict_lo ? BinaryOperation::kGreaterThan
+                                        : BinaryOperation::kGreaterThanEquals,
+                            ConstantValueExp(Value(c.lo))),
+        BinaryOperation::kAnd,
+        BinaryExpressionExp(ColumnValueExp("x"),
+                            c.strict_hi ? BinaryOperation::kLessThan
+                                        : BinaryOperation::kLessThanEquals,
+                            ConstantValueExp(Value(c.hi))));
+    auto prog = BytecodeCompiler::Compile(expr, schema,
+                                          BytecodeCompiler::Context::kFilter);
+    ASSERT_TRUE(prog.has_value());
+    bool has_range_op = false;
+    for (const auto& inst : prog->Instructions()) {
+      if (inst.opcode == BytecodeOp::kInt64InRange) {
+        has_range_op = true;
+      }
+    }
+    EXPECT_EQ(has_range_op, c.expect_fused);
+
+    auto jit = JitBranchlessProgram::Compile(*prog, schema);
+    for (const Value& v : test_vals) {
+      Row row({v});
+      auto ast_or = expr->TryEvaluate(row, schema);
+      ASSERT_TRUE(ast_or.HasValue());
+      if (c.lo > c.hi && !v.IsNull()) {
+        EXPECT_EQ(ast_or.Value(), Value(false));
+      }
+      auto vm_or = prog->TryEvaluateRow(row);
+      ASSERT_TRUE(vm_or.HasValue());
+      Value fast_val;
+      Status fast_err;
+      ASSERT_EQ(prog->TryEvaluateRowFast(row, &fast_val, &fast_err),
+                BytecodeProgram::FastEval::kDone);
+      if (c.lo > c.hi && !v.IsNull()) {
+        EXPECT_EQ(ast_or.Value(), Value(false));
+      }
+      EXPECT_EQ(vm_or.Value(), ast_or.Value());
+      EXPECT_EQ(fast_val, ast_or.Value());
+      if (jit.has_value()) {
+        std::vector<int64_t> col_vals{v.IsNull() ? int64_t{0}
+                                                 : v.value.int_value};
+        std::vector<uint8_t> col_nulls{static_cast<uint8_t>(v.IsNull())};
+        const JitColumnInput cin{.values = col_vals.data(),
+                                 .nulls = col_nulls.data(),
+                                 .has_nulls = v.IsNull(),
+                                 .has_bounds = false,
+                                 .min_value = 0,
+                                 .max_value = 0};
+        std::array<int64_t, 1> out_vals{};
+        std::array<uint8_t, 1> out_nulls{};
+        bool any_null = false;
+        bool used_unchecked = false;
+        ASSERT_TRUE(jit->Evaluate(std::span<const JitColumnInput>(&cin, 1), 1,
+                                  out_vals.data(), out_nulls.data(), &any_null,
+                                  &used_unchecked));
+        EXPECT_TRUE(used_unchecked);
+        if (ast_or.Value().IsNull()) {
+          EXPECT_NE(out_nulls[0], 0U);
+        } else {
+          EXPECT_EQ(out_nulls[0], 0U);
+          EXPECT_EQ(out_vals[0], ast_or.Value().value.int_value);
+        }
+      }
+    }
+
+    // Columnar tight loop on non-null INT64 inputs
+    std::vector<int64_t> nonnull_inputs;
+    for (const Value& v : test_vals) {
+      if (!v.IsNull()) {
+        nonnull_inputs.push_back(v.value.int_value);
+      }
+    }
+    BytecodeColumnView col_view{.type = ValueType::kInt64,
+                                .is_unsigned = false,
+                                .is_uniform = true,
+                                .has_null = false,
+                                .ints = nonnull_inputs.data()};
+    std::vector<int64_t> out_ints;
+    BytecodeColumnSink sink;
+    sink.type = ValueType::kInt64;
+    sink.ints = &out_ints;
+    Status err;
+    ASSERT_EQ(prog->TryEvaluateColumnarBatch(
+                  std::span<const BytecodeColumnView>(&col_view, 1), nullptr,
+                  nonnull_inputs.size(), &sink, &err),
+              BytecodeProgram::FastEval::kDone);
+    ASSERT_EQ(out_ints.size(), nonnull_inputs.size());
+    for (size_t i = 0; i < nonnull_inputs.size(); ++i) {
+      auto ast_or = expr->TryEvaluate(Row({Value(nonnull_inputs[i])}), schema);
+      ASSERT_TRUE(ast_or.HasValue());
+      EXPECT_EQ(out_ints[i], ast_or.Value().value.int_value);
+    }
+  }
+}
+
+TEST(BytecodeTest, ReciprocalDivModMatchesAstAndJitAcrossExtremes) {
+  ScopedEnvVar guard("TINYLAMB_DISABLE_RECIPROCAL_DIVMOD", nullptr);
+
+  const Schema schema("t", {Column("x", ValueType::kInt64)});
+  const int64_t kMin = std::numeric_limits<int64_t>::min();
+  const int64_t kMax = std::numeric_limits<int64_t>::max();
+  const std::vector<int64_t> divisors = {
+      kMin, -1000000007LL, -7, -2, -1, 0, 1, 2, 3, 7, 1000000007LL, kMax};
+  const std::vector<Value> xs = {Value(),      Value(kMin),     Value(kMin + 1),
+                                 Value(-1000), Value(-7),       Value(-1),
+                                 Value(0),     Value(1),        Value(7),
+                                 Value(1000),  Value(kMax - 1), Value(kMax)};
+
+  for (const int64_t d : divisors) {
+    for (const bool is_div : {true, false}) {
+      Expression expr =
+          FunctionCallExp(is_div ? "div" : "mod",
+                          {ColumnValueExp("x"), ConstantValueExp(Value(d))});
+      auto prog = BytecodeCompiler::Compile(expr, schema,
+                                            BytecodeCompiler::Context::kValue);
+      const bool expect_recip = (d != 0 && d != 1 && d != -1);
+      EXPECT_EQ(prog.has_value(), expect_recip)
+          << "d=" << d << " div=" << is_div;
+      if (!prog.has_value()) {
+        continue;
+      }
+      bool has_recip = false;
+      for (const auto& inst : prog->Instructions()) {
+        if ((is_div && inst.opcode == BytecodeOp::kDivInt64Const) ||
+            (!is_div && inst.opcode == BytecodeOp::kModInt64Const)) {
+          has_recip = true;
+        }
+      }
+      EXPECT_EQ(has_recip, expect_recip) << "d=" << d << " div=" << is_div;
+
+      auto jit = JitBranchlessProgram::Compile(*prog, schema);
+      for (const Value& x : xs) {
+        Row row({x});
+        auto ast_or = expr->TryEvaluate(row, schema);
+        auto vm_or = prog->TryEvaluateRow(row);
+        EXPECT_EQ(vm_or.HasValue(), ast_or.HasValue());
+        if (ast_or.HasValue() && vm_or.HasValue()) {
+          EXPECT_EQ(vm_or.Value(), ast_or.Value());
+          Value fast_val;
+          Status fast_err;
+          ASSERT_EQ(prog->TryEvaluateRowFast(row, &fast_val, &fast_err),
+                    BytecodeProgram::FastEval::kDone);
+          EXPECT_EQ(fast_val, ast_or.Value());
+          if (jit.has_value()) {
+            std::vector<int64_t> col_vals{x.IsNull() ? int64_t{0}
+                                                     : x.value.int_value};
+            std::vector<uint8_t> col_nulls{static_cast<uint8_t>(x.IsNull())};
+            const JitColumnInput cin{.values = col_vals.data(),
+                                     .nulls = col_nulls.data(),
+                                     .has_nulls = x.IsNull(),
+                                     .has_bounds = false,
+                                     .min_value = 0,
+                                     .max_value = 0};
+            std::array<int64_t, 1> out_vals{};
+            std::array<uint8_t, 1> out_nulls{};
+            bool any_null = false;
+            bool used_unchecked = false;
+            ASSERT_TRUE(jit->Evaluate(std::span<const JitColumnInput>(&cin, 1),
+                                      1, out_vals.data(), out_nulls.data(),
+                                      &any_null, &used_unchecked));
+            EXPECT_TRUE(used_unchecked);
+            if (ast_or.Value().IsNull()) {
+              EXPECT_NE(out_nulls[0], 0U);
+            } else {
+              EXPECT_EQ(out_nulls[0], 0U);
+              EXPECT_EQ(out_vals[0], ast_or.Value().value.int_value);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(BytecodeTest, FilterEvalOrderReordersErrorFreeAndPreservesThrowingOrder) {
+  ScopedEnvVar guard("TINYLAMB_DISABLE_FILTER_ORDER", nullptr);
+
+  const Schema schema(
+      "t", {Column("k", ValueType::kInt64), Column("s", ValueType::kVarChar)});
+  // Safe error-free predicate: `s LIKE '%foo%bar%' AND k = 5` should move
+  // `k = 5` (load column 0) ahead of `s LIKE ...` (load column 1).
+  Expression safe_pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("%foo%bar%"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{5}))));
+  auto safe_prog = BytecodeCompiler::Compile(
+      safe_pred, schema, BytecodeCompiler::Context::kFilter);
+  ASSERT_TRUE(safe_prog.has_value());
+  ASSERT_FALSE(safe_prog->Instructions().empty());
+  EXPECT_EQ(safe_prog->Instructions()[0].opcode, BytecodeOp::kLoadColumn);
+  EXPECT_EQ(safe_prog->Instructions()[0].operand, 0U);
+  for (const Row& r :
+       {Row({Value(), Value("xfooybarz")}), Row({Value(int64_t{5}), Value()}),
+        Row({Value(int64_t{5}), Value("xfooybarz")}),
+        Row({Value(int64_t{7}), Value("xfooybarz")})}) {
+    auto ast = safe_pred->TryEvaluate(r, schema);
+    auto vm = safe_prog->TryEvaluateRow(r);
+    ASSERT_TRUE(ast.HasValue());
+    ASSERT_TRUE(vm.HasValue());
+    EXPECT_EQ(vm.Value(), ast.Value());
+  }
+
+  // Fallible predicate: `k > 0 AND (10 % k) > 0` must NOT swap `(10 % k)`
+  // ahead of `k > 0` when k = 0, preserving short-circuit FALSE without error!
+  Expression throwing_pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0}))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          BinaryExpressionExp(ConstantValueExp(Value(int64_t{10})),
+                              BinaryOperation::kModulo, ColumnValueExp("k")),
+          BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t{0}))));
+  auto throw_prog = BytecodeCompiler::Compile(
+      throwing_pred, schema, BytecodeCompiler::Context::kFilter);
+  ASSERT_TRUE(throw_prog.has_value());
+  const Row zero_row({Value(int64_t{0}), Value("x")});
+  auto ast_zero = throwing_pred->TryEvaluate(zero_row, schema);
+  auto vm_zero = throw_prog->TryEvaluateRow(zero_row);
+  ASSERT_TRUE(ast_zero.HasValue());
+  ASSERT_TRUE(vm_zero.HasValue());
+  EXPECT_EQ(vm_zero.Value(), ast_zero.Value());
+}
+
+// An IN predicate whose child/candidate have conflicting explicit collations
+// raises kInvalidArgument at evaluation (in_expression.cpp). It is therefore
+// NOT error-free even though its static ValueTypes match; the filter-order
+// pass must not move it ahead of a FALSE conjunct or it would surface an
+// error the AST's left-to-right AND short-circuits away.
+TEST(BytecodeTest, FilterOrderKeepsCollationConflictingInPredicate) {
+  const Schema schema(
+      "t", {Column("k", ValueType::kInt64), Column("s", ValueType::kVarChar)});
+  // Constant Values carrying different collation tags: CollationOfExpression
+  // sees no COLLATE() call, but HaveConflictingCollations at evaluation time
+  // still rejects the pair. The static error-free analysis must therefore
+  // report false so the filter-order pass never moves this predicate ahead
+  // of a short-circuiting FALSE conjunct.
+  Expression conflicting_in =
+      InExpressionExp(ConstantValueExp(Value("abc").WithCollation(
+                          static_cast<uint8_t>(Collation::kCaseInsensitive))),
+                      {ConstantValueExp(Value("xyz").WithCollation(
+                          static_cast<uint8_t>(Collation::kBinary)))});
+  EXPECT_FALSE(AuditIsErrorFreePredicateForOrdering(conflicting_in, schema));
+
+  // Control: a plain VARCHAR IN is genuinely error-free.
+  Expression plain_in =
+      InExpressionExp(ColumnValueExp("s"), {ConstantValueExp(Value("xyz"))});
+  EXPECT_TRUE(AuditIsErrorFreePredicateForOrdering(plain_in, schema));
+
+  // The conflict is still an error at evaluation time.
+  const Row row({Value(int64_t{7}), Value("abc")});
+  auto ast = conflicting_in->TryEvaluate(row, schema);
+  ASSERT_FALSE(ast.HasValue());
+  EXPECT_EQ(ast.GetStatus().GetCode(), StatusCode::kInvalidArgument);
+}
+
+// The fast row interpreter guards every stack-consuming opcode: a program
+// whose stack runs dry must surface kCorrupt, never read an empty vector.
+// Compiler output is always balanced, but the flag is also settable by hand
+// (SetFastInterpretable), so the contract has to hold for any marked program.
+TEST(BytecodeTest, FastRowEvaluatorRejectsStackUnderflow) {
+  const Row row;
+  Value actual;
+  Status error;
+
+  {
+    BytecodeProgram program;
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kBinaryInt64, .binary = BinaryOperation::kAdd});
+    program.SetFastInterpretable(true);
+    EXPECT_EQ(program.TryEvaluateRowFast(row, &actual, &error),
+              BytecodeProgram::FastEval::kError);
+    EXPECT_EQ(error.GetCode(), StatusCode::kCorrupt);
+  }
+  {
+    // One operand is still short for a binary op: right pops, left underflows.
+    BytecodeProgram program;
+    uint16_t constant = 0;
+    ASSERT_TRUE(program.AddConstant(Value(int64_t{1}), &constant));
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kLoadConstant, .operand = constant});
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kBinaryInt64, .binary = BinaryOperation::kAdd});
+    program.SetFastInterpretable(true);
+    EXPECT_EQ(program.TryEvaluateRowFast(row, &actual, &error),
+              BytecodeProgram::FastEval::kError);
+    EXPECT_EQ(error.GetCode(), StatusCode::kCorrupt);
+  }
+  {
+    BytecodeProgram program;
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kUnaryInt64, .unary = UnaryOperation::kNot});
+    program.SetFastInterpretable(true);
+    EXPECT_EQ(program.TryEvaluateRowFast(row, &actual, &error),
+              BytecodeProgram::FastEval::kError);
+    EXPECT_EQ(error.GetCode(), StatusCode::kCorrupt);
+  }
+  {
+    BytecodeProgram program;
+    program.AddInstruction({.opcode = BytecodeOp::kSubstr, .operand = 2});
+    program.SetFastInterpretable(true);
+    EXPECT_EQ(program.TryEvaluateRowFast(row, &actual, &error),
+              BytecodeProgram::FastEval::kError);
+    EXPECT_EQ(error.GetCode(), StatusCode::kCorrupt);
+  }
+}
+
+// AST Evaluate is the reference: SUBSTR accepts UINT64 start/length (the
+// unsigned tag shares kInt64). The start keeps its raw bit pattern (so a
+// UINT64 near 2^64 is an end-relative offset) and the length saturates.
+// Bytecode used to reject both with a type error at execution time only.
+TEST(BytecodeTest, SubstrAcceptsUnsignedArgumentsLikeAst) {
+  const Schema schema("input", {});
+  const Value str = Value(std::string("abcdef"));
+  const Value u64_max = Value(int64_t{-1}).WithUnsigned();
+  const Value u64_max_minus_1 = Value(int64_t{-2}).WithUnsigned();
+  const std::vector<Expression> expressions{
+      FunctionCallExp("substr",
+                      {ConstantValueExp(str), ConstantValueExp(u64_max)}),
+      FunctionCallExp("substr",
+                      {ConstantValueExp(str), ConstantValueExp(u64_max_minus_1),
+                       ConstantValueExp(Value(int64_t{2}))}),
+      FunctionCallExp(
+          "substr", {ConstantValueExp(str), ConstantValueExp(Value(int64_t{2})),
+                     ConstantValueExp(u64_max)}),
+      FunctionCallExp("substring",
+                      {ConstantValueExp(str), ConstantValueExp(u64_max)}),
+  };
+  for (const Expression& expression : expressions) {
+    const auto program = BytecodeCompiler::Compile(expression, schema);
+    ASSERT_TRUE(program.has_value()) << expression->ToString();
+    if (!program) {
+      continue;
+    }
+    const Row row;
+    const auto expected = expression->TryEvaluate(row, schema);
+    const auto actual = program->TryEvaluateRow(row);
+    const auto automatic = TryEvaluateRowAuto(*program, row);
+    ASSERT_TRUE(expected.HasValue()) << expression->ToString();
+    ASSERT_TRUE(actual.HasValue())
+        << expression->ToString() << ": " << actual.GetStatus().GetMessage();
+    ASSERT_TRUE(automatic.HasValue())
+        << expression->ToString() << ": " << automatic.GetStatus().GetMessage();
+    EXPECT_EQ(actual.Value(), expected.Value()) << expression->ToString();
+    EXPECT_EQ(automatic.Value(), expected.Value()) << expression->ToString();
+  }
+}
+
+// Lean proof: lean/TinylambOpt/ProposedProofs/RowInMask.lean (sound)
+TEST(BytecodeTest, RowInMaskMatchesAstAcrossNullsWideTuplesAndMultiWord) {
+  struct ScopedEnv {
+    const char* name;
+    std::string prev;
+    bool had_prev{false};
+    ScopedEnv(const char* n, const char* val) : name(n) {
+      if (const char* cur = std::getenv(name)) {
+        prev = cur;
+        had_prev = true;
+      }
+      if (val != nullptr) {
+        ::setenv(name, val, 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+    ~ScopedEnv() {
+      if (had_prev) {
+        ::setenv(name, prev.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Expression struct_expr = FunctionCallExp(
+      "__struct_json__",
+      {ConstantValueExp(Value("f1")), ColumnValueExp("a"),
+       ConstantValueExp(Value(0)), ConstantValueExp(Value("f2")),
+       ColumnValueExp("b"), ConstantValueExp(Value(0))});
+
+  std::vector<Expression> candidates;
+  const int64_t kMin = std::numeric_limits<int64_t>::min();
+  const int64_t kMax = std::numeric_limits<int64_t>::max();
+  candidates.push_back(ConstantValueExp(
+      Value(std::string(R"({"f1":)" + std::to_string(kMin) + R"(,"f2":)" +
+                        std::to_string(kMax) + "}"))));
+  // Add > 64 tuples (including a duplicate and a NULL-field tuple) to span
+  // multiple 64-bit bitmap words.
+  for (int64_t i = 0; i < 72; ++i) {
+    candidates.push_back(ConstantValueExp(
+        Value(std::string(R"({"f1":)" + std::to_string(i * 3) + R"(,"f2":)" +
+                          std::to_string((i * 5) + 1) + "}"))));
+  }
+  // Duplicate tuple in word 1 + tuple with second component NULL.
+  candidates.push_back(
+      ConstantValueExp(Value(std::string(R"({"f1":3,"f2":6})"))));
+  candidates.push_back(
+      ConstantValueExp(Value(std::string(R"({"f1":500,"f2":null})"))));
+
+  const Expression expr = InExpressionExp(struct_expr, candidates);
+
+  auto has_row_in_mask_op = [](const BytecodeProgram& prog) {
+    return std::ranges::any_of(prog.Instructions(),
+                               [](const BytecodeInstruction& inst) {
+                                 return inst.opcode == BytecodeOp::kRowInMask;
+                               });
+  };
+
+  std::optional<BytecodeProgram> prog_on;
+  {
+    ScopedEnv enable("TINYLAMB_DISABLE_ROW_IN_MASK", nullptr);
+    prog_on = BytecodeCompiler::Compile(expr, schema);
+  }
+  ASSERT_TRUE(prog_on.has_value());
+  EXPECT_TRUE(has_row_in_mask_op(*prog_on));
+
+  std::optional<BytecodeProgram> prog_off;
+  {
+    ScopedEnv disable("TINYLAMB_DISABLE_ROW_IN_MASK", "1");
+    prog_off = BytecodeCompiler::Compile(expr, schema);
+  }
+  EXPECT_FALSE(prog_off.has_value());
+
+  const std::vector<Row> probes{
+      Row({Value(kMin), Value(kMax)}),  // hit in word 0 (extreme values)
+      Row({Value(3), Value(6)}),        // hit in word 0 (duplicate entry)
+      Row({Value(210), Value(351)}),    // hit in word 1 (index 71)
+      Row({Value(999), Value(888)}),    // clean miss (no ambiguous NULL)
+      Row({Value(500),
+           Value(123)}),  // partial match w/ ("f1":500,"f2":null) -> NULL
+      Row({Value(500),
+           Value()}),            // NULL matched vs ("f1":500,"f2":null) -> NULL
+      Row({Value(), Value(6)}),  // LHS NULL matches f2=6 of (3,6) -> NULL
+      Row({Value(), Value(7777)}),  // LHS NULL never matches any f2 -> FALSE
+      Row({Value(), Value()}),      // both NULL -> NULL
+  };
+
+  DataChunk batch_in(schema);
+  for (const Row& row : probes) {
+    batch_in.Append(row);
+    const auto expected = expr->TryEvaluate(row, schema);
+    const auto got_on = prog_on->TryEvaluateRow(row);
+    const auto got_auto = TryEvaluateRowAuto(*prog_on, row);
+    ASSERT_TRUE(expected.HasValue()) << row.ToString();
+    ASSERT_TRUE(got_on.HasValue()) << row.ToString();
+    ASSERT_TRUE(got_auto.HasValue()) << row.ToString();
+    EXPECT_EQ(got_on.Value(), expected.Value()) << row.ToString();
+    EXPECT_EQ(got_auto.Value(), expected.Value()) << row.ToString();
+  }
+
+  const auto batch_out = prog_on->TryEvaluateBatch(batch_in);
+  ASSERT_TRUE(batch_out.HasValue());
+  ASSERT_EQ(batch_out.Value().Size(), probes.size());
+  for (size_t i = 0; i < probes.size(); ++i) {
+    const auto expected = expr->TryEvaluate(probes[i], schema);
+    ASSERT_TRUE(expected.HasValue());
+    EXPECT_EQ(batch_out.Value().ValueAt(i), expected.Value()) << "row " << i;
+  }
 }
 
 }  // namespace tinylamb

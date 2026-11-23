@@ -118,6 +118,19 @@ bool RewriteFullOuterIndicatorSumsToSemiJoin(SelectStatement* select);
 // self_join_group_agg_to_window_sound, self_join_agg_window_null_key_bug).
 bool RewriteSelfJoinAggregateToWindow(SelectStatement* outer);
 
+// Pushes partition-only QUALIFY conjuncts below window computation into WHERE
+// when all window functions share the referenced partition columns (and GROUP
+// BY keys if grouped). Lean proof:
+// lean/TinylambOpt/ProposedProofs/QualifyPushdown.lean (sound)
+bool PushPartitionOnlyQualifyToWhere(SelectStatement* select);
+
+// Rewrites grouped `COUNT(*)` over two-table FULL OUTER / LEFT / INNER
+// equi-joins into a join of pre-aggregated per-key frequency histograms
+// `(k, COUNT(*) AS __cnt)`.
+// Lean proof: lean/TinylambOpt/ResearchProofs/OuterJoinCounts.lean (sound)
+bool RewriteOuterJoinGroupedCountToHistograms(SelectStatement* select,
+                                              TransactionContext& ctx);
+
 // Hoists duplicate expensive uncorrelated derived subqueries into a shared CTE
 // so MaterializeCtes evaluates the subquery once (e.g. TPC-DS Q44 V1/V2).
 bool HoistIdenticalDerivedSubqueriesToCte(SelectStatement* outer);
@@ -242,7 +255,7 @@ bool RewriteHavingCountDistinctToMinMax(SelectStatement* select,
 // Lean: TpchSf10Discovery.lean
 //   (grouped_having_global_sum_fubini_sound,
 //    grouped_having_distinct_sum_fubini_bug).
-bool RewriteHavingGlobalSumFubini(SelectStatement* select,
+bool RewriteHavingGlobalSumFubini(SelectStatement* stmt,
                                   TransactionContext& ctx);
 
 // Rewrites `FROM F, D WHERE D.pk = F.fk AND <D preds> AND F.c op (SELECT
@@ -250,7 +263,7 @@ bool RewriteHavingGlobalSumFubini(SelectStatement* select,
 // UNIQUE NOT NULL) into a single-scan shared CTE over `F ⋈ D`.
 // Lean: TpchSf10VectorizedExec.lean
 //   (self_join_unique_dim_cte_decorrelate_sound).
-bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* select,
+bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* stmt,
                                            TransactionContext& ctx);
 
 // Pushes the filtered outer key domain into a heavy `k IN (SELECT r_k FROM
@@ -258,7 +271,7 @@ bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* select,
 // `r_k`), materializing the filtered outer domain once as a CTE. Lean:
 // TpchSf10VectorizedExec.lean
 //   (semijoin_domain_pushdown_in_subquery_sound).
-bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* select,
+bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* stmt,
                                                   TransactionContext& ctx);
 
 // Pushes the intersected key domain `(L_keys) ∩ (R1_keys ∪ R2_keys)` into
@@ -267,22 +280,22 @@ bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* select,
 // `COALESCE(r1.qty, 0) > 0 OR COALESCE(r2.qty, 0) > 0`, TPC-DS Q78).
 // Lean: TpchSf10VectorizedExec.lean
 //   (disjunctive_left_join_semijoin_pushdown_sound).
-bool RewriteDisjunctiveLeftJoinCteKeyDomain(SelectStatement* select,
+bool RewriteDisjunctiveLeftJoinCteKeyDomain(SelectStatement* stmt,
                                             TransactionContext& ctx);
-bool RewriteDistributeJoinOverUnionAll(SelectStatement* select,
+bool RewriteDistributeJoinOverUnionAll(SelectStatement* stmt,
                                        TransactionContext& ctx);
-bool RewriteDistributeGroupedSumOverUnionAll(SelectStatement* select,
+bool RewriteDistributeGroupedSumOverUnionAll(SelectStatement* root,
                                              TransactionContext& ctx);
-bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* select,
+bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* root,
                                                 TransactionContext& ctx);
-bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* select,
+bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* root,
                                       TransactionContext& ctx);
 
 // Merges a cross-join of two ungrouped scalar-aggregate derived tables over
 // the same base join (either with differing local predicates, or where one
 // side adds a single certified-unique-PK dimension table) into a single-pass
 // conditional-aggregate derived table.
-bool RewriteScalarAggCrossJoinMerge(SelectStatement* select,
+bool RewriteScalarAggCrossJoinMerge(SelectStatement* root,
                                     TransactionContext& ctx);
 
 // Decomposes `SUM(col ± c)` into `SUM(col) + (±c * COUNT(col))` when signed

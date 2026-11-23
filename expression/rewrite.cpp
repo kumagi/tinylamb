@@ -87,9 +87,12 @@ namespace {
 const Schema* ActiveRewriteSchema();
 }  // namespace
 
-// Reducing x + x to x * 2 changes the number of evaluations of x from two to
-// one, so it must not be applied when x is volatile or is a subquery. An
-// immutable expression can still raise an evaluation error (e.g. `1/0`,
+// Despite its historical name, this guard applies whenever a rewrite changes
+// evaluation count, including duplication. For example, x + x -> x * 2
+// reduces two evaluations to one, while XOR expansion can evaluate each
+// operand twice instead of once; either is unsafe for volatile expressions
+// or subqueries. An immutable expression can still raise an evaluation error
+// (e.g. `1/0`,
 // `CAST('abc' AS INT64)`); duplicating or fanning it out changes which branch
 // raises first.  That error-freedom proof needs column types, so it is applied
 // when a schema is in scope (SafeToReduceEvaluationCountWithSchema).  Without
@@ -177,6 +180,9 @@ Value EvaluateJsonFunction(std::string_view func_name,
     return {};
   }
   std::string_view s = json_str;
+  // ParseJsonSimple is a tolerant parser that returns a JVal (it has no Status
+  // result to check); strict malformed-JSON rejection is performed by the
+  // json_text::IsValid gate above. A failed navigation below yields NULL.
   const json_doc::JVal root = json_doc::ParseJsonSimple(s);
   const json_doc::JVal* cur = json_doc::NavigateJsonPath(root, path_str);
   if (cur == nullptr) {
@@ -396,6 +402,9 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
       if (ContainsParameterSlot(expr)) {
         return std::nullopt;
       }
+      // MakeConstantSchemaBoundType takes a const Value& and stores it in the
+      // returned struct; this is one necessary copy into the result, not a
+      // per-lookup copy of the constant node.
       return MakeConstantSchemaBoundType(expr->AsConstantValue().GetValue());
     }
     case TypeTag::kColumnValue: {
@@ -916,10 +925,16 @@ bool IsZero(const Expression& expression) {
     return false;
   }
   if (constant.type == ValueType::kInt64) {
-    return constant.value.int_value == 0;
+    // UINT64(0) shares the raw bit pattern but is a different number; folding
+    // it as a signed identity would lose unsigned type/overflow semantics.
+    return !constant.IsUnsigned() && constant.value.int_value == 0;
   }
   if (constant.type == ValueType::kDouble) {
-    return constant.value.double_value == 0.0;
+    // IEEE: x - (-0.0) == x + 0.0, which differs from x when x is -0.0.
+    // Treat only positive zero as a candidate. Addition separately checks
+    // whether the value being added to can itself be negative zero.
+    return constant.value.double_value == 0.0 &&
+           !std::signbit(constant.value.double_value);
   }
   return false;
 }
@@ -933,7 +948,8 @@ bool IsOne(const Expression& expression) {
     return false;
   }
   if (constant.type == ValueType::kInt64) {
-    return constant.value.int_value == 1;
+    // UINT64(1) is not the signed integer identity literal 1 (see IsZero).
+    return !constant.IsUnsigned() && constant.value.int_value == 1;
   }
   if (constant.type == ValueType::kDouble) {
     return constant.value.double_value == 1.0;
@@ -946,7 +962,10 @@ bool IsInt64Constant(const Expression& expression) {
     return false;
   }
   const Value constant = expression->AsConstantValue().GetValue();
-  return !constant.IsNull() && constant.type == ValueType::kInt64;
+  // UINT64 shares the kInt64 bit pattern; the int64_t* overload below rejects
+  // it explicitly, so this overload must do the same.
+  return !constant.IsNull() && constant.type == ValueType::kInt64 &&
+         !constant.IsUnsigned();
 }
 
 std::optional<int64_t> NegativeInt64Constant(const Expression& expression) {
@@ -964,6 +983,10 @@ std::optional<int64_t> NegativeInt64Constant(const Expression& expression) {
 bool HasLikeWildcard(std::string_view pattern) {
   return pattern.find('%') != std::string_view::npos ||
          pattern.find('_') != std::string_view::npos;
+}
+
+bool HasLikeEscape(std::string_view pattern) {
+  return pattern.find('\\') != std::string_view::npos;
 }
 
 // Recursing per child without a bound lets attacker-controlled deeply nested
@@ -1033,6 +1056,9 @@ bool StaticallyNumeric(const Expression& expression) {
 
 // Division promotes to DOUBLE unconditionally, so an identity rewrite of
 // `x / 1` must only fire when the surviving side is already double-typed.
+// With no active schema, a column reference cannot be resolved and this
+// deliberately returns false ("not proven DOUBLE") rather than folding;
+// that is the contract of this guard.
 bool StaticallyDouble(const Expression& expression) {
   if (!expression) {
     return false;
@@ -1044,6 +1070,26 @@ bool StaticallyDouble(const Expression& expression) {
   } catch (const std::exception&) {
     return false;
   }
+}
+
+Expression PreserveNumericIdentity(const Expression& input,
+                                   const Expression& identity,
+                                   BinaryOperation operation) {
+  if (StaticallyNonNumeric(input)) {
+    return {};
+  }
+  const bool addition = operation == BinaryOperation::kAdd;
+  if (IsInt64Constant(identity)) {
+    return addition && StaticallyDouble(input) ? Expression{} : input;
+  }
+  if (StaticallyInt64(input)) {
+    return CastExpressionExp(input, "FLOAT64");
+  }
+  // Adding positive zero to negative zero produces positive zero, so keep
+  // addition when the survivor may already be floating point. Subtracting
+  // positive zero preserves signed zero; INT64 inputs were cast above to keep
+  // the FLOAT64 result type of mixed INT64/DOUBLE arithmetic.
+  return !addition && StaticallyDouble(input) ? input : Expression{};
 }
 
 // Opposite-direction guard for rewrites that must abort when the operand
@@ -1858,22 +1904,13 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         "identity_add_zero",
         Binary(BinaryOperation::kAdd, Any("left"), Any("right")),
         [](const Expression&, const ExpressionBindings& bindings) {
-          // A floating zero can promote the other operand to DOUBLE.
           const Expression& left = bindings.at("left");
           const Expression& right = bindings.at("right");
           if (IsZero(left)) {
-            if (StaticallyNonNumeric(right) ||
-                (!IsInt64Constant(left) && !StaticallyDouble(right))) {
-              return Expression{};
-            }
-            return right;
+            return PreserveNumericIdentity(right, left, BinaryOperation::kAdd);
           }
           if (IsZero(right)) {
-            if (StaticallyNonNumeric(left) ||
-                (!IsInt64Constant(right) && !StaticallyDouble(left))) {
-              return Expression{};
-            }
-            return left;
+            return PreserveNumericIdentity(left, right, BinaryOperation::kAdd);
           }
           return Expression{};
         }));
@@ -1885,11 +1922,13 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           const Expression& left = bindings.at("left");
           const Expression& right = bindings.at("right");
-          if (!IsZero(right) || StaticallyNonNumeric(left) ||
-              (!IsInt64Constant(right) && !StaticallyDouble(left))) {
+          // A negative-zero subtrahend is rejected by IsZero: x - (-0.0)
+          // equals x + 0.0, which flips a -0.0 survivor to +0.0.
+          if (!IsZero(right)) {
             return Expression{};
           }
-          return left;
+          return PreserveNumericIdentity(left, right,
+                                         BinaryOperation::kSubtract);
         }));
     // Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
     //   (int64_identities_negation_and_abs_sound)
@@ -1900,18 +1939,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const Expression& left = bindings.at("left");
           const Expression& right = bindings.at("right");
           if (IsOne(left)) {
-            if (StaticallyNonNumeric(right) ||
-                (!IsInt64Constant(left) && !StaticallyDouble(right))) {
-              return Expression{};
-            }
-            return right;
+            return PreserveNumericIdentity(right, left,
+                                           BinaryOperation::kMultiply);
           }
           if (IsOne(right)) {
-            if (StaticallyNonNumeric(left) ||
-                (!IsInt64Constant(right) && !StaticallyDouble(left))) {
-              return Expression{};
-            }
-            return left;
+            return PreserveNumericIdentity(left, right,
+                                           BinaryOperation::kMultiply);
           }
           return Expression{};
         }));
@@ -2259,6 +2292,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             return Expression{};
           }
           if (HasLikeWildcard(pattern.value.varchar_value) ||
+              HasLikeEscape(pattern.value.varchar_value) ||
               TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
           }
@@ -2281,6 +2315,12 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               return Expression{};
             }
           }
+          // Column result types (including INTERVAL-tagged VARCHAR) are not
+          // available to this schema-free expression rule. Keep NOT LIKE when
+          // the left operand is a column.
+          if (bindings.at("left")->Type() == TypeTag::kColumnValue) {
+            return Expression{};
+          }
           const Value pattern =
               bindings.at("pattern")->AsConstantValue().GetValue();
           if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
@@ -2292,6 +2332,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             return Expression{};
           }
           if (HasLikeWildcard(pattern.value.varchar_value) ||
+              HasLikeEscape(pattern.value.varchar_value) ||
               TimestampShapedConstant(pattern.value.varchar_value)) {
             return Expression{};
           }
@@ -2848,7 +2889,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         [](const Expression&, const ExpressionBindings& bindings) {
           const Expression a = bindings.at("left");
           const Expression b = bindings.at("right");
-          // The expansion evaluates a and b up to three times; a volatile
+          // The expansion evaluates a and b up to two times; a volatile
           // expression or a subquery would change meaning under the rewrite.
           if (!SafeToReduceEvaluationCount(a) ||
               !SafeToReduceEvaluationCount(b)) {
@@ -2917,13 +2958,13 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           const Expression child =
               bindings.at("left")->AsUnaryExpression().Child();
           if (val.value.int_value == 1) {
-            // IS TRUE = 1 -> child (since IS TRUE returns 1/0/NULL)
-            // but we need to preserve: IS TRUE -> (child IS TRUE)
+            // IS predicates always return 1/0 (never NULL), so pred = 1 is
+            // the IS-predicate node itself: IS TRUE -> (child IS TRUE).
             return bindings.at("left");
           }
           if (val.value.int_value != 0) {
             // Only 0/1 can invert a boolean predicate; comparing an
-            // IS-predicate (1/0/NULL) against e.g. 5 must not invert the
+            // IS-predicate (1/0) against e.g. 5 must not invert the
             // predicate.
             return Expression{};
           }
@@ -2972,60 +3013,16 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               // instead of fabricating a NULL constant.
               return Expression{};
             }
+            // A later argument can determine the common type even when an
+            // earlier constant determines the value. Drop only untyped NULLs.
             std::vector<Expression> new_args;
-            new_args.reserve(fn.Args().size());
-            bool changed = false;
-            for (const Expression& arg : fn.Args()) {
-              if (!arg) {
-                continue;
-              }
-              // Flatten nested coalesce
-              if (arg->Type() == TypeTag::kFunctionCallExp &&
-                  arg->AsFunctionCallExpression().FuncName() == "coalesce") {
-                for (const Expression& inner_arg :
-                     arg->AsFunctionCallExpression().Args()) {
-                  if (inner_arg && IsConstant(inner_arg) &&
-                      inner_arg->AsConstantValue().GetValue().IsNull()) {
-                    changed = true;
-                    continue;
-                  }
-                  new_args.push_back(inner_arg);
-                  if (inner_arg && IsConstant(inner_arg) &&
-                      !inner_arg->AsConstantValue().GetValue().IsNull()) {
-                    changed = true;
-                    break;
-                  }
-                }
-                changed = true;
-                if (!new_args.empty() && IsConstant(new_args.back()) &&
-                    !new_args.back()->AsConstantValue().GetValue().IsNull()) {
-                  break;
-                }
-                continue;
-              }
-              // Skip leading/middle NULL constants
-              if (IsConstant(arg) &&
-                  arg->AsConstantValue().GetValue().IsNull()) {
-                changed = true;
-                continue;
-              }
+            for (const auto& arg : fn.Args()) {
+              if (arg && IsConstant(arg) && arg->AsConstantValue().GetValue().IsNull() &&
+                  !arg->ResultType(Schema{}).IsValid()) { continue;
+}
               new_args.push_back(arg);
-              // If we encounter a non-null constant, arguments after it will
-              // never be reached.
-              if (IsConstant(arg) &&
-                  !arg->AsConstantValue().GetValue().IsNull()) {
-                if (new_args.size() < fn.Args().size()) {
-                  changed = true;
-                }
-                break;
-              }
             }
-            // Remove trailing NULL constants if any slipped through
-            while (!new_args.empty() && IsConstant(new_args.back()) &&
-                   new_args.back()->AsConstantValue().GetValue().IsNull()) {
-              new_args.pop_back();
-              changed = true;
-            }
+            const bool changed = new_args.size() != fn.Args().size();
             if (new_args.empty()) {
               return ConstantValueExp(Value());
             }
@@ -3220,7 +3217,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (cast.Child()->Type() == TypeTag::kConstantValue) {
             if (StatusOr<Value> folded =
                     expression->TryEvaluate(Row(), Schema());
-                folded.HasValue()) {
+                folded.HasValue() && !folded.Value().IsNull()) {
               return ConstantValueExp(folded.MoveValue());
             }
             return Expression{};
@@ -5033,9 +5030,51 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
                                    return ContainsNotOfOrderedDoubleComparison(
                                        element, schema);
                                  });
-    case TypeTag::kAggregateExp:
-      return ContainsNotOfOrderedDoubleComparison(
-          expression->AsAggregateExpression().Child(), schema);
+    case TypeTag::kAggregateExp: {
+      const auto& aggregate = expression->AsAggregateExpression();
+      if (ContainsNotOfOrderedDoubleComparison(aggregate.Child(), schema)) {
+        return true;
+      }
+      // Aggregates carry per-row sub-expressions beyond Child() — the FILTER
+      // (WHERE) clause, HAVING MAX/MIN condition, inner ORDER BY keys,
+      // STRING_AGG delimiter, trailing args and inner GROUP BY keys can each
+      // hide a NOT(ordered double comparison), exactly like the window arm
+      // below. ExpressionChildren deliberately enumerates only Child() for
+      // aggregates (WithExpressionChildren's arity contract), so walk the
+      // extra slots explicitly.
+      if (aggregate.HasWhereFilter() &&
+          ContainsNotOfOrderedDoubleComparison(aggregate.WhereFilter(),
+                                               schema)) {
+        return true;
+      }
+      if (aggregate.HavingCondition() &&
+          ContainsNotOfOrderedDoubleComparison(aggregate.HavingCondition(),
+                                               schema)) {
+        return true;
+      }
+      for (const auto& term : aggregate.InnerOrderBy()) {
+        if (term.expression &&
+            ContainsNotOfOrderedDoubleComparison(term.expression, schema)) {
+          return true;
+        }
+      }
+      if (aggregate.SecondaryArg() &&
+          ContainsNotOfOrderedDoubleComparison(aggregate.SecondaryArg(),
+                                               schema)) {
+        return true;
+      }
+      for (const Expression& arg : aggregate.TrailingArgs()) {
+        if (ContainsNotOfOrderedDoubleComparison(arg, schema)) {
+          return true;
+        }
+      }
+      for (const Expression& key : aggregate.InnerGroupBy()) {
+        if (ContainsNotOfOrderedDoubleComparison(key, schema)) {
+          return true;
+        }
+      }
+      return false;
+    }
     case TypeTag::kCastExp:
       return ContainsNotOfOrderedDoubleComparison(
           expression->AsCastExpression().Child(), schema);
@@ -5048,6 +5087,13 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
           ExpressionChildren(expression), [&schema](const Expression& child) {
             return ContainsNotOfOrderedDoubleComparison(child, schema);
           });
+    case TypeTag::kLambdaExp:
+      // ExpressionChildren deliberately treats a lambda as opaque (generic
+      // rebuilders have no lambda arm), so walk its body explicitly: a
+      // NOT(ordered double comparison) inside a window function's lambda
+      // argument must still suppress not_comparison rewrites.
+      return ContainsNotOfOrderedDoubleComparison(
+          expression->AsLambdaExpression().Body(), schema);
     default:
       return false;
   }

@@ -68,10 +68,11 @@ if (kind != JoinAlternativeKind::kInner && !residual_conjuncts.empty()) {
 推定出力行数は、反結合の特性上、保守的な安全上界として左側の行数 `l_rows` を採用します。
 
 ```cpp
-if (kind == JoinAlternativeKind::kAnti) {
-  estimated_rows = left.estimated_rows;
-} else if (kind == JoinAlternativeKind::kSemi) {
-  estimated_rows = std::min(left.estimated_rows, estimated_rows);
+if (kind == JoinAlternativeKind::kSemi ||
+    kind == JoinAlternativeKind::kAnti) {
+  equi_estimate = std::isfinite(equi_estimate)
+                      ? std::min(equi_estimate, left.estimated_rows)
+                      : left.estimated_rows;
 }
 ```
 

@@ -87,7 +87,8 @@ bool DoubleKeyOrderIsSound(const Table& table, const Index& index,
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
                   const std::vector<bool>& ascending,
-                  const std::vector<std::optional<bool>>& nulls_first = {}) {
+                  const std::vector<std::optional<bool>>& nulls_first,
+                  std::string_view scan_relation) {
   if (provided.empty() || expressions.empty() ||
       expressions.size() != ascending.size() ||
       expressions.size() > provided.size()) {
@@ -101,15 +102,34 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     if (requested != scan_ascending) {
       return false;
     }
-    if (expressions[i]->Type() != TypeTag::kColumnValue) {
+    // NULL placement alone does not determine the value direction: a
+    // memcomparable forward scan yields NULLS FIRST + ascending values, while
+    // a reverse scan yields descending values + NULLS LAST.  An explicit
+    // `ASC NULLS LAST` therefore matches a reverse scan's NULL position but
+    // not its value order; likewise `DESC NULLS FIRST` cannot be served by a
+    // forward scan.  IndexScanPlan::OrderMatches re-checks this as well.
+    if (ascending[i] != scan_ascending) {
       return false;
     }
-    if (expressions[i]->AsColumnValue().GetColumnName().name !=
-        provided[i].name) {
+    if (!expressions[i] || expressions[i]->Type() != TypeTag::kColumnValue) {
       return false;
     }
-    // The requested NULL placement already encodes the direction check for
-    // memcomparable keys (NULL is smallest); do not re-check ascending here.
+    const ColumnName& requested_column =
+        expressions[i]->AsColumnValue().GetColumnName();
+    if (requested_column.name != provided[i].name) {
+      return false;
+    }
+    // Same qualifier contract as IndexScanPlan::OrderMatches: an
+    // unqualified provided name belongs to the scanned relation, so a
+    // request qualified with any other relation must not match on the bare
+    // name alone.
+    const std::string_view provided_relation =
+        provided[i].schema.empty() ? scan_relation
+                                   : std::string_view(provided[i].schema);
+    if (!requested_column.schema.empty() &&
+        requested_column.schema != provided_relation) {
+      return false;
+    }
   }
   return true;
 }
@@ -239,7 +259,8 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
 
 bool IndexOnlyScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                     const std::vector<bool>& ascending) const {
-  return OrderMatches(provided_order_, ascending_, expressions, ascending) &&
+  return OrderMatches(provided_order_, ascending_, expressions, ascending, {},
+                      table_.GetSchema().Name()) &&
          DoubleKeyOrderIsSound(
              table_, index_, stats_, end_key_,
              std::span{provided_order_}.first(expressions.size()));
@@ -250,7 +271,7 @@ bool IndexOnlyScanPlan::IsOrderedBy(
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending,
-                      nulls_first) &&
+                      nulls_first, table_.GetSchema().Name()) &&
          DoubleKeyOrderIsSound(
              table_, index_, stats_, end_key_,
              std::span{provided_order_}.first(expressions.size()));

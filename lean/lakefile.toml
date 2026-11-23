@@ -6,7 +6,6 @@ defaultTargets = ["TinylambOpt", "demo", "CheckProofs"]
 [leanOptions]
 pp.unicode.fun = true # pretty-prints `fun a ↦ b`
 relaxedAutoImplicit = false
-maxSynthPendingDepth = 3
 
 [[lean_lib]]
 name = "TinylambOpt"

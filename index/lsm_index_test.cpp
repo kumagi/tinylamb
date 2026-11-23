@@ -209,12 +209,20 @@ TEST_F(LsmIndexTest, PartitionBoundariesPropagateScanFailure) {
   auto reader = tm_->Begin();
   struct rlimit original{};
   ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  // The descriptor limit is process-global. Restore it by RAII so an ASSERT
+  // or early return while it is lowered cannot poison every later test in
+  // this binary (no fd can be opened at all).
+  struct LimitGuard {
+    explicit LimitGuard(const struct rlimit& saved) : saved_(saved) {}
+    LimitGuard(const LimitGuard&) = delete;
+    LimitGuard& operator=(const LimitGuard&) = delete;
+    ~LimitGuard() { setrlimit(RLIMIT_NOFILE, &saved_); }
+    struct rlimit saved_;
+  } limit_guard(original);
   struct rlimit limited = original;
   limited.rlim_cur = 0;
   ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limited), 0);
   auto boundaries = idx.ScanPartitionBoundaries(reader, "", "", 1);
-  const int restore_result = setrlimit(RLIMIT_NOFILE, &original);
-  ASSERT_EQ(restore_result, 0);
   EXPECT_EQ(boundaries.GetStatus(), Status::kIOError);
   ASSERT_SUCCESS(reader.Abort());
 }

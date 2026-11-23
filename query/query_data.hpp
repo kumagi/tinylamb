@@ -120,8 +120,31 @@ struct QueryData {
         << " rows=" << (cte ? cte->rows.size() : 0);
     }
     for (const auto& [alias, ref] : q.lifted_ctes_.recursive) {
-      (void)ref;
-      o << "\nRECURSIVE " << alias;
+      o << "\nRECURSIVE " << alias << " schema=" << ref.output_schema;
+      if (ref.depth_spec) {
+        o << " depth=" << ref.depth_spec->column << "["
+          << ref.depth_spec->lower << "," << ref.depth_spec->upper << "]";
+      }
+      if (ref.body) {
+        o << " body=SELECT[";
+        for (size_t i = 0; i < ref.body->SelectList().size(); ++i) {
+          if (0 < i) {
+            o << ", ";
+          }
+          o << ref.body->SelectList()[i];
+        }
+        o << "] FROM[";
+        for (size_t i = 0; i < ref.body->FromClause().size(); ++i) {
+          if (0 < i) {
+            o << ", ";
+          }
+          o << ref.body->FromClause()[i];
+        }
+        o << "]";
+        if (ref.body->WhereClause()) {
+          o << " WHERE " << *ref.body->WhereClause();
+        }
+      }
     }
     o << ";";
     return o;
@@ -164,8 +187,8 @@ struct QueryData {
   // UPDATE/DELETE executors need the physical row position. An index-only
   // scan deliberately has no table row position and must not be selected.
   bool require_row_position_{false};
-  // UPDATE waits briefly for a conflicting writer; DELETE defaults to
-  // NOWAIT so queue consumers can retry rather than convoy behind one row.
+  // Default scans wait briefly for a conflicting writer. DELETE and an
+  // explicit FOR UPDATE NOWAIT policy override this to avoid row-lock convoy.
   bool wait_for_write_intent_{true};
   std::vector<Expression> order_expressions_;
   std::vector<bool> order_ascending_;

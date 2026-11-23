@@ -56,9 +56,9 @@ struct PackedSlots {
     if (end > blob.size() || start > blob.size() || end <= start) {
       return {};
     }
-    return std::string_view(
+    return {
         blob.data() + start,
-        end - start);  // NOLINT(modernize-return-braced-init-list)
+        end - start};  // NOLINT(modernize-return-braced-init-list)
   }
 
   [[nodiscard]] bool EmptySlot(size_t slot) const noexcept {
@@ -174,6 +174,7 @@ class RowPage {
     disk_dirty_ = false;
     disk_offset_ = kInvalidDiskOffset;
     disk_length_ = 0;
+    disk_file_gen_ = 0;
   }
 
   void ClearLiveState() {
@@ -241,6 +242,7 @@ class RowPage {
     disk_dirty_ = false;
     disk_offset_ = kInvalidDiskOffset;
     disk_length_ = 0;
+    disk_file_gen_ = 0;
     evicted_ = false;
     ++committed_seq_;
   }

@@ -1,0 +1,7 @@
+[name=approx_top_count_preserves_delimiter_in_value]
+SELECT APPROX_TOP_COUNT(x, 1)[OFFSET(0)].value
+FROM UNNEST(['a,b', 'c', 'a,b']) AS x
+--
+ARRAY<STRUCT<value STRING>>[{"a,b"}]
+
+==

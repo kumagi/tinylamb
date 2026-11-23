@@ -6,9 +6,11 @@
 // GoogleSQL hashing functions (MD5(), SHA1(), SHA256(), SHA512()).  Raw
 // digests are returned as byte strings; TO_HEX() performs the encoding.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -17,6 +19,9 @@ namespace tinylamb::digest {
 inline std::string ToHex(std::string_view raw) {
   static constexpr std::string_view kDigits = "0123456789abcdef";
   std::string out;
+  if (raw.size() > out.max_size() / 2) {
+    throw std::length_error("hex digest is too large");
+  }
   out.reserve(raw.size() * 2);
   for (const char c : raw) {
     const auto b = static_cast<unsigned char>(c);
@@ -32,9 +37,20 @@ template <size_t BlockSize, size_t LengthOffset>
 std::string_view Padding(size_t buffered) {
   static constexpr std::array<char, BlockSize> padding{'\x80'};
   const size_t size =
-      (BlockSize + LengthOffset - buffered - 1) % BlockSize + 1;
+      ((BlockSize + LengthOffset - buffered - 1) % BlockSize) + 1;
   return {padding.data(), size};
 }
+
+struct Sha512BitLength {
+  uint64_t high{0};
+  uint64_t low{0};
+
+  constexpr void AddBytes(uint64_t bytes) noexcept {
+    const uint64_t previous = low;
+    low += bytes << 3;
+    high += (bytes >> 61) + (low < previous ? 1 : 0);
+  }
+};
 
 }  // namespace detail
 
@@ -76,7 +92,7 @@ class Md5 {
 
  private:
   std::string FinalizeInPlace() {
-    const uint64_t bits = static_cast<uint64_t>(total_) * 8;
+    const uint64_t bits = total_ * 8;
     Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 0; i < 8; ++i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
@@ -149,7 +165,7 @@ class Md5 {
     d_ += d;
   }
   uint32_t a_{}, b_{}, c_{}, d_{};
-  size_t total_{0};
+  uint64_t total_{0};
   std::string buffer_;
 };
 
@@ -198,7 +214,7 @@ class Sha1 {
 
  private:
   std::string FinalizeInPlace() {
-    const uint64_t bits = static_cast<uint64_t>(total_) * 8;
+    const uint64_t bits = total_ * 8;
     Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 7; i >= 0; --i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
@@ -256,7 +272,7 @@ class Sha1 {
     h_[4] += e;
   }
   std::array<uint32_t, 5> h_{};
-  size_t total_{0};
+  uint64_t total_{0};
   std::string buffer_;
 };
 
@@ -308,7 +324,7 @@ class Sha256 {
 
  private:
   std::string FinalizeInPlace() {
-    const uint64_t bits = static_cast<uint64_t>(total_) * 8;
+    const uint64_t bits = total_ * 8;
     Update(detail::Padding<64, 56>(buffer_.size()));
     for (int i = 7; i >= 0; --i) {
       buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
@@ -380,7 +396,7 @@ class Sha256 {
     h_[7] += h;
   }
   std::array<uint32_t, 8> h_{};
-  size_t total_{0};
+  uint64_t total_{0};
   std::string buffer_;
 };
 
@@ -403,11 +419,11 @@ class Sha512 {
     h_[5] = 0x9b05688c2b3e6c1fULL;
     h_[6] = 0x1f83d9abfb41bd6bULL;
     h_[7] = 0x5be0cd19137e2179ULL;
-    total_ = 0;
+    bit_length_ = {};
     buffer_.clear();
   }
   void Update(std::string_view data) {
-    total_ += data.size();
+    bit_length_.AddBytes(data.size());
     size_t pos = 0;
     if (!buffer_.empty()) {
       const size_t take = std::min<size_t>(128 - buffer_.size(), data.size());
@@ -432,15 +448,12 @@ class Sha512 {
 
  private:
   std::string FinalizeInPlace() {
-    const uint64_t bits = static_cast<uint64_t>(total_) * 8;
+    const detail::Sha512BitLength message_length = bit_length_;
     Update(detail::Padding<128, 112>(buffer_.size()));
-    // SHA-512 appends a 128-bit length field: eight zero bytes followed by
-    // the 64-bit bit count.
-    for (int i = 0; i < 8; ++i) {
-      buffer_.push_back('\0');
-    }
-    for (int i = 7; i >= 0; --i) {
-      buffer_.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
+    for (const uint64_t word : {message_length.high, message_length.low}) {
+      for (int i = 7; i >= 0; --i) {
+        buffer_.push_back(static_cast<char>((word >> (8 * i)) & 0xFF));
+      }
     }
     Block(buffer_.data());
     buffer_.clear();
@@ -524,7 +537,7 @@ class Sha512 {
     h_[7] += h;
   }
   std::array<uint64_t, 8> h_{};
-  size_t total_{0};
+  detail::Sha512BitLength bit_length_;
   std::string buffer_;
 };
 

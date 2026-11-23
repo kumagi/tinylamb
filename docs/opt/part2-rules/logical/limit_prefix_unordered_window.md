@@ -18,7 +18,7 @@ graph TD
 
 ## 適用条件
 
-LIMIT が非ゼロ、WITH TIES なし、Window が一子で全 target がウィンドウ関数、全呼び出しの partition/order 仕様が一致している必要があります。`WindowPrefixGate` が各値の接尾切断に対する安定性を調べます。順位関数 ROW_NUMBER/RANK/DENSE_RANK は prefix を数え、NTILE/PERCENT_RANK/CUME_DIST/LAG/LEAD/PERCENTILE_CONT/PERCENTILE_DISC はフレーム指定があっても拒否します。その他の呼び出しは明示 ROWS フレームの両端が CURRENT ROW 以前であることを検査します。子孫に別の Window がある場合、既に prefix 変換された Group、循環参照になる Group は拒否します。 この版は order term 数がゼロであることを追加で要求します。
+LIMIT が非ゼロ、WITH TIES なし、Window が一子で全 target がウィンドウ関数、全呼び出しの partition/order 仕様が一致している必要があります。`WindowPrefixGate` が各値の接尾切断に対する安定性を調べます。順位関数 ROW_NUMBER/RANK/DENSE_RANK と LAG は prefix を数える形で受け入れます。NTILE/PERCENT_RANK/CUME_DIST/LEAD/PERCENTILE_CONT/PERCENTILE_DISC はフレーム指定があっても拒否します。その他の呼び出しは明示 ROWS フレームの両端が CURRENT ROW 以前であることを検査します。子孫に別の Window がある場合、既に prefix 変換された Group、循環参照になる Group は拒否します。 この版は order term 数がゼロであることを追加で要求します。
 
 ```cpp
             if (!gate.has_value() || !gate->stable || gate->order_terms != 0 ||

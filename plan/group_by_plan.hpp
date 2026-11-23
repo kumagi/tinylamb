@@ -43,7 +43,7 @@ class GroupByPlan final : public PlanBase {
   GroupByPlan(const GroupByPlan&) = delete;
   GroupByPlan(GroupByPlan&&) = delete;
   GroupByPlan& operator=(const GroupByPlan&) = delete;
-  GroupByPlan& operator=(const GroupByPlan&&) = delete;
+  GroupByPlan& operator=(GroupByPlan&&) = delete;
   ~GroupByPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& context) const override;
@@ -69,7 +69,7 @@ class GroupByPlan final : public PlanBase {
     return child_->AccessRowCount();
   }
   [[nodiscard]] size_t EmitRowCount() const override { return stats_.Rows(); }
-  [[nodiscard]] Plan Child() const { return child_; }
+  [[nodiscard]] const Plan& Child() const { return child_; }
   [[nodiscard]] const std::shared_ptr<const SelectStatement>& Statement()
       const {
     return statement_;

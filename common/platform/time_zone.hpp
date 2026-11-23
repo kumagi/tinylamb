@@ -28,7 +28,8 @@ namespace tinylamb::platform {
 // against the system zoneinfo tree); Windows uses the C++20 tzdb too.
 
 // Whether `name` is a known IANA zone identifier (exact, case-sensitive).
-bool IsKnownTimeZone(std::string_view name);
+// Returns false when the system cannot resolve the name.
+bool IsKnownTimeZone(std::string_view name) noexcept;
 
 // UTC offset in seconds (east positive) of zone `name` at the given local
 // wall-clock time, i.e. `std::chrono::time_zone::get_info(local).first`:

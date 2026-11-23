@@ -59,6 +59,7 @@ struct SessionStep {
   // record so a later crash recovers from the DPT instead of LSN 0.  No
   // visible-state change — the in-flight transaction stays open.
   bool is_checkpoint{false};
+  bool allow_checkpoint_compaction{true};
   // Dual-transaction sessions: "-- begin2" opens context 1's first
   // transaction (context 0 begins implicitly at session start; commit/abort
   // re-begin their own context, crash re-begins both).
@@ -104,6 +105,18 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
 
 // Replays a trace on a fresh throwaway database; "" = all checks hold.
 std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose = false);
+
+// Refreshes only statements previously marked must-fail that now succeed,
+// recomputes recorded row dumps, then atomically replaces the self-contained
+// regression file after replaying it cleanly. Returns an empty string on
+// success or a diagnostic on failure.
+std::string RefreshSessionTrace(
+    SessionTrace* trace,
+    const std::vector<std::string>& refreshable_failure_sql,
+    bool verbose = false);
+std::string RefreshSessionRegressionFile(
+    const std::string& path,
+    const std::vector<std::string>& refreshable_failure_sql);
 
 // Self-contained text format ("-- key: value" lines, positional).
 std::string SerializeSessionTest(uint64_t seed, const SessionTrace& trace,

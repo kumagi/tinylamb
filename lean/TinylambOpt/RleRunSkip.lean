@@ -283,4 +283,23 @@ theorem runSeg_output_in_bounds {V : Type} (r : Run V) (vis : Nat → Bool)
                 · exact Nat.lt_of_lt_of_le hidx.2 (Nat.min_le_left _ _)
                 · exact hf.2
 
+def validRuns (pos n : Nat) : List (Run V) → Bool
+  | [] => pos == n
+  | r :: rs => r.start == pos && 0 < r.len && r.start+r.len ≤ n &&
+      validRuns (r.start+r.len) n rs
+
+theorem validRuns_iff (pos n : Nat) (runs : List (Run V)) :
+    validRuns pos n runs = true ↔ runsCover V pos n runs := by
+  induction runs generalizing pos with
+  | nil => simp [validRuns,runsCover]
+  | cons r rs ih => simp [validRuns,runsCover,ih,and_assoc]
+
+theorem validated_run_scan (runs : List (Run V)) (n lo hi : Nat) (vis : Nat → Bool)
+    (pred : V → PredResult) :
+    (if validRuns 0 n runs then runGo runs vis lo hi (fun _ => pred) else none) =
+      refScan runs n lo hi vis (fun _ => pred) := by
+  by_cases h : runsCover V 0 n runs
+  · simp [validRuns_iff, h,refScan,refGo_eq_runGo runs vis lo hi (fun _ => pred) (by intros; rfl)]
+  · simp [validRuns_iff,h,refScan]
+
 end TinylambOpt.RleRunSkip

@@ -45,8 +45,10 @@ graph TD
             const GroupId input = projection.children[0];
             const GroupId limited = memo.EnsureDerivedGroup(
                 memo.Get(input).relations,
-                "lim-below-proj:" + std::to_string(expression.limit_count) +
-                    ":" + std::to_string(expression.limit_offset));
+                "lim-below-proj:" + GroupIdsTag({input}) +
+                    std::to_string(expression.limit_count) + ":" +
+                    std::to_string(expression.limit_offset) +
+                    (expression.with_ties ? ":ties" : ":no-ties"));
             if (limited == group || limited == input) {
               continue;
             }
@@ -54,15 +56,16 @@ graph TD
 
 - 子グループの代替のうち実際に `kProjection` のものだけを相手にします
   (パターンはグループを束縛するだけなので、式レベルでの再確認が必要です)。
-- 新しい派生グループのタグ `lim-below-proj:<count>:<offset>` が Limit の値を
-  指紋に含めます。count や offset が違う Limit が同じタグを共有すると、
-  別の行数制限を表すグループが混線するためです(D5 の「派生グループの
-  タグは意味の指紋であるべき」に対応)。
+- 新しい派生グループのタグ `lim-below-proj:` + `GroupIdsTag({input})` +
+  `<count>:<offset>`(＋ WITH TIES の有無)が、**入力グループ ID と** Limit の
+  値を指紋に含めます。同じ count/offset でも異なる Projection 入力の下へ
+  押し込むケースがあり、入力 ID を省くと別の substitutes が衝突します。
+  count や offset が違う Limit が同じタグを共有しても同様に混線するためです
+  (D5 の「派生グループのタグは意味の指紋であるべき」に対応)。
 - `limited == group || limited == input` のときはスキップ — 自分自身や
   入力そのものを下に置く再帰的ループの自衛です。
 
-発火しないケース: 子グループに kProjection の代替が無い、派生グループが
-循環を生む、の 2 つです。
+発火しないケースには、Limit に順序要件（`target_list`、`sort_ascending`、`sort_nulls_first`）または `WITH TIES` がある、子グループに `kProjection` の代替がない、派生グループの作成結果が元グループまたは射影入力グループと一致する場合があります。
 
 ## 意味論的根拠と単射射影の行数保存
 
@@ -79,9 +82,7 @@ graph TD
 
 もう 1 つの要点は「射影を上に残す」ことです。射影の `target_list`
 (出力列の定義)はそのままに、子を Limit 済みグループへ付け替えるだけで、
-出力列の名前と定義は変わりません。なお新しく追加される上側の射影式には
-`output_schema` を設定していません(元の射影の `output_schema` も引き継ぎ
-ません)。列の名前と定義は `target_list` が担うためです。
+出力列の名前と定義は変わりません。上側に追加する射影式は `target_list` を保持します。`output_schema` はこの再構成式では明示設定されず、グループの論理プロパティから扱われます。
 
 ## 実装の詳細
 
@@ -99,7 +100,8 @@ graph TD
                 group,
                 LogicalExpression{.operation = LogicalOperator::kProjection,
                                   .children = {limited},
-                                  .target_list = projection.target_list});
+                                  .target_list = projection.target_list,
+                                  .output_schema = projection.output_schema});
 ```
 
 - 1 つ目の式は「`X` を count/offset で切る Limit」を新グループへ追加。
@@ -122,14 +124,14 @@ graph TD
 
 - 射影の計算量が「全入力行 × 1 行あたり計算」から「Limit 後の行 × 同」に
   減ります（特に計算量の多い射影で効果があります）。
-- 物理化の際、Limit の下のスキャンが `limit_hint` を受け取り、行数上限を
+- 物理化の際、Limit の下のスキャンが `limit_hint` を受け取り、
   上限件数を考慮したコスト見積もりと早期打ち切りを適用できます（第 1 部 50 章）。
 - UNION ALL や結合の下にさらに押し込む可能性が生まれます。
 
 ## 関連 Rule との相互作用
 
 - `merge_limits`: 押し込んだ先に既存の Limit があると二重 Limit になり、
-  `merge_limits` が合成します。
+  既存ルールが合成します。
 - `topn_push_through_projection`: TopN 版の兄弟 Rule です。TopN はソート
   キーを射影の出力から入力側へ翻訳できる場合にのみ押し込めます(Limit は
   キーを気にしないので無条件に押せる、という対比になります)。

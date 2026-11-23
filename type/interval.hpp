@@ -60,7 +60,7 @@ struct IntervalValue {
       return StatusError(StatusCode::kInvalidArgument,
                          "INTERVAL computation out of range");
     }
-    return AddChecked(result);
+    return result;
   }
   [[nodiscard]] StatusOr<IntervalValue> TryMinus(const IntervalValue& o) const {
     IntervalValue result{};
@@ -70,7 +70,7 @@ struct IntervalValue {
       return StatusError(StatusCode::kInvalidArgument,
                          "INTERVAL computation out of range");
     }
-    return AddChecked(result);
+    return result;
   }
   [[nodiscard]] StatusOr<IntervalValue> TryNegate() const {
     IntervalValue result{};
@@ -80,7 +80,7 @@ struct IntervalValue {
       return StatusError(StatusCode::kInvalidArgument,
                          "INTERVAL computation out of range");
     }
-    return AddChecked(result);
+    return result;
   }
   [[nodiscard]] StatusOr<IntervalValue> TryMultiply(int64_t k) const {
     IntervalValue result{};
@@ -90,7 +90,7 @@ struct IntervalValue {
       return StatusError(StatusCode::kInvalidArgument,
                          "INTERVAL computation out of range");
     }
-    return AddChecked(result);
+    return result;
   }
 
   [[nodiscard]] StatusOr<IntervalValue> TryJustifyHours() const;
@@ -138,14 +138,6 @@ struct IntervalValue {
     return ExcShimUnwrap(TryParse(text, unit), "IntervalValue::Parse");
   }
 
- private:
-  // Keeps a composed result representable (same check TotalNanos does).
-  [[nodiscard]] static StatusOr<IntervalValue> AddChecked(
-      const IntervalValue& result) {
-    ASSIGN_OR_RETURN(int64_t, unused, result.TryTotalNanos());
-    std::ignore = unused;
-    return result;
-  }
 };
 
 // Session constants live in a thread-local ledger, but several connections

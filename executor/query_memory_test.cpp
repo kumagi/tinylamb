@@ -99,6 +99,23 @@ TEST_F(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
 TEST_F(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
   const char* previous = std::getenv("TINYLAMB_QUERY_MEMORY_BYTES");
   const std::string saved = previous != nullptr ? previous : "";
+  // Restore the process-global env var even if an assertion below aborts the
+  // test; a manual restore at the end would leak the value into later tests.
+  struct RestoreEnv {
+    explicit RestoreEnv(bool had_value, std::string  value)
+        : had_value_(had_value), value_(std::move(value)) {}
+    RestoreEnv(const RestoreEnv&) = delete;
+    RestoreEnv& operator=(const RestoreEnv&) = delete;
+    ~RestoreEnv() {
+      if (had_value_) {
+        setenv("TINYLAMB_QUERY_MEMORY_BYTES", value_.c_str(), 1);
+      } else {
+        unsetenv("TINYLAMB_QUERY_MEMORY_BYTES");
+      }
+    }
+    bool had_value_;
+    std::string value_;
+  } restore_env(previous != nullptr, saved);
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   setenv("TINYLAMB_QUERY_MEMORY_BYTES", "424242", 1);
   budget.ResetForTest(1024);
@@ -109,11 +126,6 @@ TEST_F(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
   setenv("TINYLAMB_QUERY_MEMORY_BYTES", "0", 1);
   budget.ResetForTest(1024);
   EXPECT_EQ(budget.Limit(), 1024U);
-  if (previous != nullptr) {
-    setenv("TINYLAMB_QUERY_MEMORY_BYTES", saved.c_str(), 1);
-  } else {
-    unsetenv("TINYLAMB_QUERY_MEMORY_BYTES");
-  }
   budget.ResetForTest(0);
 }
 
@@ -203,7 +215,7 @@ TEST_F(QueryMemoryTest, QueryMemoryCharge_RaiiScope_AcquiresAndReleasesMemory) {
 TEST_F(QueryMemoryTest, QueryMemoryCharge_Adopt_OverflowSaturates) {
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
   budget.ResetForTest(0, /*isolate_from_process=*/true);
-  constexpr size_t kMax = static_cast<size_t>(-1);
+  constexpr auto kMax = static_cast<size_t>(-1);
   {
     // kAlreadyReserved bytes are not re-reserved; adopting a value that would
     // wrap bytes_ must not turn the charge into a tiny one that under-releases.
@@ -215,6 +227,40 @@ TEST_F(QueryMemoryTest, QueryMemoryCharge_Adopt_OverflowSaturates) {
   }
   EXPECT_EQ(budget.Used(), 0U);
   budget.ResetForTest(0);
+}
+
+TEST_F(QueryMemoryTest, QueryMemoryCharge_AddAndTryAddDoNotWrap) {
+  QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  budget.ResetForTest(0, /*isolate_from_process=*/true);
+  constexpr size_t kMax = std::numeric_limits<size_t>::max();
+  ASSERT_TRUE(budget.TryReserve(kMax - 1));
+  QueryMemoryCharge charge(QueryMemoryCharge::kAlreadyReserved{}, kMax - 1);
+
+  EXPECT_FALSE(charge.TryAdd(2));
+  EXPECT_EQ(charge.Bytes(), kMax - 1);
+  EXPECT_EQ(budget.Used(), kMax - 1);
+  charge.Add(2);
+  EXPECT_EQ(charge.Bytes(), kMax);
+  EXPECT_EQ(budget.Used(), kMax);
+  EXPECT_FALSE(charge.TryAdd(1));
+  charge.ReleaseAll();
+  EXPECT_EQ(budget.Used(), 0U);
+}
+
+TEST_F(QueryMemoryTest, QueryMemoryCharge_DetachTransfersAReservation) {
+  QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  budget.ResetForTest(0, /*isolate_from_process=*/true);
+  QueryMemoryCharge destination(50);
+  {
+    QueryMemoryCharge source(25);
+    destination.Adopt(source.DetachBytes());
+    EXPECT_EQ(source.Bytes(), 0U);
+    EXPECT_EQ(destination.Bytes(), 75U);
+    EXPECT_EQ(budget.Used(), 75U);
+  }
+  EXPECT_EQ(budget.Used(), 75U);
+  destination.ReleaseAll();
+  EXPECT_EQ(budget.Used(), 0U);
 }
 
 TEST_F(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {

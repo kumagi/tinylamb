@@ -38,7 +38,7 @@ graph TD
 7. `year-01-01` および `(year+1)-01-01` の 2 つの日付文字列が `Value::TryDate` により有効な Date 値として構築可能であること。
 8. 比較演算子が `=`, `<`, `<=`, `>`, `>=` のいずれかであること。
 
-条件を満たした場合、`memo.MergeScanFilter(memo.EnsureGroup({column.schema}), bounds)` を呼び出し、対象テーブル Group の scan filter に境界条件を結合します。
+条件を満たした場合、Selection を所有する単一リレーション Group に `memo.MergeScanFilter(group, bounds)` を呼び出し、その Group の scan filter に境界条件を結合します。
 
 ## 意味論的根拠と三値論理・単一リレーション契約
 
@@ -62,7 +62,7 @@ graph TD
   | `extract = year` | `col >= Jan1(year) AND col < Jan1(year + 1)` |
 
 - **DATE 型の厳格化と TIMESTAMP の除外**:
-  TIMESTAMP 型は時刻成分およびタイムゾーン補正を内包するため、単純な日付区間 `[Jan1, Jan1)` では正確な切り捨て・境界判定を再現できません。したがって DATE 型に限定して発火させます。
+  TIMESTAMP 型は時刻成分およびタイムゾーン補正を内包するため、単純な日付区間 `[Jan1(year), Jan1(year + 1))` では正確な切り捨て・境界判定を再現できません。したがって DATE 型に限定して発火させます。
 - **三値論理（NULL セマンティクス）の保持**:
   `d` が NULL の場合、`extract_year(d)` は NULL となり比較結果は UNKNOWN（偽扱い）となります。変換後の日付比較 `d >= lower AND d < upper` においても NULL に対する比較結果は UNKNOWN となり、フィルタの通過可否は完全に一致します。
 
@@ -83,8 +83,7 @@ graph TD
             const Expression upper = ConstantValueExp(upper_status.Value());
             std::vector<Expression> bounds;
             // ... switch 文による 5 case (=, <, <=, >, >=) の境界条件組み立て ...
-            memo.MergeScanFilter(memo.EnsureGroup({column.schema}),
-                                 CombineConjuncts(bounds));
+            memo.MergeScanFilter(group, CombineConjuncts(bounds));
 ```
 
 本 Rule は元の Selection 式を除去せず、scan filter を更新します。Memo 内で正規化した連言を scan filter に蓄積し、スキャン演算子を物理化するときにインデックス境界条件として取り出します。

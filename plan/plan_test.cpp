@@ -729,7 +729,16 @@ TEST_F(PlanTest, SortAndTopNPlansReportSortedPrefixes) {
     EXPECT_TRUE(plan->IsOrderedBy({first}, {true}));
     EXPECT_TRUE(plan->IsOrderedBy({first, second}, {true, true}));
     EXPECT_FALSE(plan->IsOrderedBy({first}, {false}));
+    EXPECT_FALSE(plan->IsOrderedBy({nullptr}, {true}, {std::nullopt}));
   }
+  const SortPlan sort_missing(scan, {{nullptr, true, std::nullopt}});
+  const TopNPlan topn_missing(scan, {{nullptr, true, std::nullopt}}, 3, 0);
+  EXPECT_FALSE(sort_missing.IsOrderedBy({first}, {true}, {std::nullopt}));
+  EXPECT_FALSE(topn_missing.IsOrderedBy({first}, {true}, {std::nullopt}));
+  EXPECT_NE(sort_missing.ToString().find("<missing expression>"),
+            std::string::npos);
+  EXPECT_NE(topn_missing.ToString().find("<missing expression>"),
+            std::string::npos);
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
@@ -1079,6 +1088,14 @@ TEST_F(PlanTest, JoinPlansPreserveExplicitManyToManyCardinality) {
   EXPECT_EQ(merge->GetStats().Rows(), 100U);
 }
 
+TEST_F(PlanTest, MergeJoinPlanChecksChildrenBeforeDereferencing) {
+  // The initializer list reads child schemas/stats before the constructor
+  // body, so a null child used to segfault instead of failing the CHECK.
+  EXPECT_DEATH(MergeJoinPlan(nullptr, {ColumnName("l.id")}, nullptr,
+                             {ColumnName("r.id")}, JoinKind{}, Expression()),
+               "non-null children");
+}
+
 TEST_F(PlanTest, MergeJoinPlanCarriesSortedKeyContractAndOutputSchema) {
   auto ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl1, ctx.GetTable("Sc1"));
@@ -1261,7 +1278,7 @@ TEST_F(PlanTest, NullSafeIndexJoinShapeFallsBackToHashJoin) {
           *tbl1_or.Value(), TableStatistics(tbl1_or.Value()->GetSchema())),
       {ColumnName("Sc1.c1")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d1")}, *stats2_or.Value()));
-  static_cast<ProductPlan&>(*prop).SetJoinNotes(
+  dynamic_cast<ProductPlan&>(*prop).SetJoinNotes(
       {true},
       Expression());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = prop->EmitExecutor(ctx);
@@ -1299,7 +1316,7 @@ TEST_F(PlanTest, LookupProbeDerivesPrefixInIndexKeyOrder) {
       *reloaded.Value(), reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d4"), ColumnName("Sc2.d1"), ColumnName("Sc2.d3")},
       *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(
+  auto& product = dynamic_cast<ProductPlan&>(
       *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   const std::optional<LookupSeek>& probe = product.Lookup();
   ASSERT_TRUE(probe.has_value());
@@ -1353,7 +1370,7 @@ TEST_F(PlanTest, LookupRangeAcceptsOnlyInt64AndDate) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c2")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d3")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(
+  auto& product = dynamic_cast<ProductPlan&>(
       *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // The bound has to land on the index key column at that offset; d3 is a
@@ -1430,7 +1447,7 @@ TEST_F(PlanTest, LookupRangeRejectsNonWhitelistedKeyColumnType) {
       {ColumnName("Sc1.c1"), ColumnName("Sc1.c3")}, *reloaded.Value(),
       reloaded.Value()->GetIndex(1),
       {ColumnName("Sc2.d1"), ColumnName("Sc2.d4")}, *stats2_or.Value()));
-  auto& product = static_cast<ProductPlan&>(
+  auto& product = dynamic_cast<ProductPlan&>(
       *plan);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   ASSERT_EQ(SeekOf(product.Lookup()).right_columns.size(), 1U);
   // d3 is the right index key column at that offset and both operands are
@@ -1463,7 +1480,7 @@ TEST_F(PlanTest, LookupSeekIsAbsentWithoutALeadingKeyJoinColumn) {
       {ColumnName("Sc1.c3")}, *tbl2_or.Value(), tbl2_or.Value()->GetIndex(0),
       {ColumnName("Sc2.d4")}, *stats2_or.Value()));
   EXPECT_EQ(
-      static_cast<ProductPlan&>(*plan).Lookup(),
+      dynamic_cast<ProductPlan&>(*plan).Lookup(),
       std::nullopt);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
   Executor executor = plan->EmitExecutor(ctx);
   std::ostringstream dump;
@@ -1543,7 +1560,71 @@ TEST_F(PlanTest, IndexOnlyScanPlanOrderedBy) {
   EXPECT_FALSE(
       plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d2"))}, {true}));
   EXPECT_FALSE(plan->IsOrderedBy({}, {true}));
+  EXPECT_FALSE(plan->IsOrderedBy({nullptr}, {true}));
+  EXPECT_FALSE(plan->IsOrderedBy({nullptr}, {true}, {std::nullopt}));
   EXPECT_FALSE(plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {}));
+}
+
+// An explicit NULLS FIRST/LAST must not be mistaken for a direction check:
+// a reverse scan puts NULLs last but also reverses the value order, so it
+// cannot serve `ASC NULLS LAST`, and a forward scan cannot serve
+// `DESC NULLS FIRST`.  IndexOnlyScanPlan used to drop the Sort for both.
+TEST_F(PlanTest, IndexOnlyScanRejectsNullPlacementReversingValueOrder) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
+
+  const std::vector<Expression> key{ColumnValueExp(ColumnName("Sc2.d1"))};
+  const std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
+  Plan forward(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                     nullptr, provided));
+  Plan reverse(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, false,
+                                     nullptr, provided));
+
+  // Matching NULL placement and value direction: both plans may keep order.
+  EXPECT_TRUE(forward->IsOrderedBy(key, {true}, {true}));
+  EXPECT_TRUE(reverse->IsOrderedBy(key, {false}, {false}));
+  // NULL placement matches the scan direction while the value order does
+  // not: these used to be advertised as ordered and lost the Sort.
+  EXPECT_FALSE(reverse->IsOrderedBy(key, {true}, {false}));  // ASC NULLS LAST
+  EXPECT_FALSE(forward->IsOrderedBy(key, {false}, {true}));  // DESC NULLS FIRST
+  // The complementary mixed cases are rejected by the NULL check already.
+  EXPECT_FALSE(forward->IsOrderedBy(key, {true}, {false}));
+  EXPECT_FALSE(reverse->IsOrderedBy(key, {false}, {true}));
+}
+
+// A provided order name belongs to the scanned relation: a request qualified
+// with a *different* relation must not match on the bare column name
+// (self-join / cross-relation ORDER BY safety). IndexOnlyScanPlan previously
+// compared only the bare name, so `other.d1` matched a `Sc2.d1` index order.
+TEST_F(PlanTest, IndexScanPlansRejectForeignRelationQualifier) {
+  auto ctx = rs_->BeginContext();
+  const auto tbl_or = (ctx.GetTable("Sc2"));
+  ASSERT_EQ(tbl_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<Table>& tbl = tbl_or.Value();
+  const auto ts_or = (ctx.GetStats("Sc2"));
+  ASSERT_EQ(ts_or.GetStatus(), Status::kSuccess);
+  const std::shared_ptr<TableStatistics>& ts = ts_or.Value();
+
+  const std::vector<ColumnName> provided{ColumnName("Sc2.d1")};
+  Plan covering(new IndexOnlyScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                                      nullptr, provided));
+  Plan heap(new IndexScanPlan(*tbl, tbl->GetIndex(0), *ts, {}, {}, true,
+                              nullptr, provided));
+
+  for (const Plan& plan : {covering, heap}) {
+    EXPECT_TRUE(
+        plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2.d1"))}, {true}));
+    EXPECT_TRUE(plan->IsOrderedBy({ColumnValueExp(ColumnName("d1"))}, {true}));
+    EXPECT_FALSE(
+        plan->IsOrderedBy({ColumnValueExp(ColumnName("other", "d1"))}, {true}));
+    EXPECT_FALSE(
+        plan->IsOrderedBy({ColumnValueExp(ColumnName("Sc2", "d2"))}, {true}));
+  }
 }
 
 TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
@@ -1577,8 +1658,8 @@ TEST_F(PlanTest, IndexOnlyScanPlanHistoricalRead) {
 
   // Assert -- only the 6 committed rows are visible to the reader
   ASSERT_EQ(count, 6);
-  reader.txn_.Abort();
-  writer.txn_.Abort();
+  ASSERT_SUCCESS(reader.txn_.Abort());
+  ASSERT_SUCCESS(writer.txn_.Abort());
 }
 
 TEST_F(PlanTest, ProjectionExpressionCtorAccessors) {
@@ -1776,7 +1857,7 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleIndexKeysFallback) {
 
   // Assert -- the reader's snapshot hides the committed row: 6 rows visible
   ASSERT_EQ(count, 6);
-  reader.txn_.Abort();
+  ASSERT_SUCCESS(reader.txn_.Abort());
 }
 
 TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
@@ -1827,7 +1908,7 @@ TEST_F(PlanTest, IndexOnlyScanPlanStaleFallbackProjectsIncludedColumns) {
 
   // Assert -- only the 6 snapshot-visible rows are returned
   ASSERT_EQ(count, 6);
-  reader.txn_.Abort();
+  ASSERT_SUCCESS(reader.txn_.Abort());
 }
 
 TEST_F(PlanTest, IndexScanPlanPendingOrdinaryKeyReplacementPreservesSnapshot) {
@@ -2062,7 +2143,7 @@ TEST_F(PlanTest, LateralJoinExpansion) {
     ++cnt;
   }
   EXPECT_GT(cnt, 0U);
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 TEST_F(PlanTest, BatchInsertChunking) {
@@ -2088,7 +2169,7 @@ TEST_F(PlanTest, BatchInsertChunking) {
     ++cnt;
   }
   EXPECT_EQ(cnt, 6 + 70);
-  ctx.txn_.Abort();
+  ASSERT_SUCCESS(ctx.txn_.Abort());
 }
 
 }  // namespace tinylamb

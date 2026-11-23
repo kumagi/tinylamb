@@ -28,13 +28,13 @@ namespace {
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
   StatusOr<QueryResult> result = engine->Execute(*ctx, sql);
+  if (!result.HasValue() && engine->LastErrorIsTransientParseFailure()) {
+    result = engine->Execute(*ctx, sql);
+  }
   if (!result.HasValue()) {
-    if (engine->LastError().empty()) {
-      result = engine->Execute(*ctx, sql);
-    }
-    if (!result.HasValue()) {
-      throw std::runtime_error(engine->LastError());
-    }
+    throw std::runtime_error(engine->LastError().empty()
+                                 ? result.GetStatus().GetMessage()
+                                 : engine->LastError());
   }
   std::vector<Row> rows;
   QueryResult drained = result.MoveValue();

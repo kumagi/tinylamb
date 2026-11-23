@@ -16,9 +16,11 @@
 
 #include "common/platform/time_zone.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -123,12 +125,16 @@ bool ZoneFileExistsExactCase(std::string_view name) {
 }
 
 CFTimeZoneRef FindZone(std::string_view name) {
+  // Intentionally function-local and process-wide: this mutex guards the two
+  // caches below, so it must stay static for the caches to stay shared.
   static std::mutex mu;
   static std::unordered_map<std::string, CFTimeZoneRef, ZoneNameHash,
                             std::equal_to<>>
       cache;
   // Unknown names are cached too: otherwise each typo re-scans the whole
-  // zoneinfo tree (opendir + readdir + exact-case compare).
+  // zoneinfo tree (opendir + readdir + exact-case compare). Both the read
+  // below and the emplace after the exact-case check hold `mu`, so this
+  // process-wide negative cache is fully synchronized.
   static std::unordered_set<std::string, ZoneNameHash, std::equal_to<>> unknown;
   {
     std::scoped_lock lock(mu);
@@ -141,6 +147,10 @@ CFTimeZoneRef FindZone(std::string_view name) {
     unknown.emplace(name);
     return nullptr;
   }
+  // CFStringCreateWithBytes takes a byte pointer. The cast only re-labels the
+  // char storage as UInt8 (unsigned char) -- the one type allowed to alias any
+  // object representation -- and no value is read through UInt8 here, so
+  // there is no strict-aliasing / alignment / endianness type punning.
   const std::unique_ptr<const void, CfRelease> cf_name(CFStringCreateWithBytes(
       kCFAllocatorDefault, reinterpret_cast<const UInt8*>(name.data()),
       static_cast<CFIndex>(name.size()), kCFStringEncodingUTF8, false));
@@ -159,7 +169,13 @@ CFTimeZoneRef FindZone(std::string_view name) {
 int OffsetAtUtc(CFTimeZoneRef zone, int64_t unix_seconds) {
   const CFAbsoluteTime at = static_cast<CFAbsoluteTime>(unix_seconds) -
                             kCFAbsoluteTimeIntervalSince1970;
-  return static_cast<int>(CFTimeZoneGetSecondsFromGMT(zone, at));
+  // CFIndex is 64-bit on macOS. A real UTC offset is bounded to +/-1 day, but
+  // clamp explicitly so a malformed value cannot wrap when narrowed to the
+  // `int` the public optional<int> API returns.
+  const int64_t offset =
+      static_cast<int64_t>(CFTimeZoneGetSecondsFromGMT(zone, at));
+  return static_cast<int>(std::clamp<int64_t>(
+      offset, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
 }
 
 #endif
@@ -168,8 +184,12 @@ int OffsetAtUtc(CFTimeZoneRef zone, int64_t unix_seconds) {
 
 #ifdef __APPLE__
 
-bool IsKnownTimeZone(std::string_view name) {
-  return !name.empty() && FindZone(name) != nullptr;
+bool IsKnownTimeZone(std::string_view name) noexcept {
+  try {
+    return !name.empty() && FindZone(name) != nullptr;
+  } catch (...) {
+    return false;
+  }
 }
 
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
@@ -211,41 +231,73 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
 #else
 
 namespace {
-// T2093: mirror the macOS branch's name cache.  std::chrono::tzdb is a
-// process-wide singleton, so resolved zone pointers stay valid; unknown
-// names cache as nullptr so repeated lookups of a bad name cost a hash
-// probe instead of another locate_zone search.
+// T2093: mirror the macOS branch's name cache. std::chrono::tzdb is a
+// process-wide singleton; unknown names cache as nullptr so repeated lookups
+// of a bad name cost a hash probe instead of another locate_zone search.
 //
 // T2096: only std::runtime_error from locate_zone means "unknown zone".
 // Anything else (bad_alloc, tzdb load failure) is a transient/infra error
 // and now propagates instead of being laundered into kInvalidArgument by
 // callers such as type/date.cpp.
+//
+// reload_tzdb() leaves an equal-version database untouched and prepends a
+// new version without invalidating old pointers. Invalidate cached lookups on
+// version changes so callers see the new zone rules.
+//
+// T2104: never hold the cache mutex while resolving a miss -- locate_zone
+// may load and parse the tzdb from disk on first use, so unrelated lookups
+// must not queue up behind it (double-checked locking below).
 const std::chrono::time_zone* FindZoneCached(std::string_view name) {
+  // Intentionally function-local and process-wide: guards the cache and its
+  // version (cf. the macOS branch's static mutex).
   static std::mutex mu;
   static std::unordered_map<std::string, const std::chrono::time_zone*,
                             ZoneNameHash, std::equal_to<>>
       cache;
-  std::lock_guard<std::mutex> lock(mu);  // NOLINT(modernize-use-scoped-lock)
-  const auto it = cache.find(name);
-  if (it != cache.end()) {
-    return it->second;
+  static std::string cached_version;
+  const auto current_version = []() -> std::string {
+    try {
+      return std::chrono::get_tzdb().version;
+    } catch (const std::runtime_error&) {
+      return {};  // tzdb unavailable; locate_zone reports "unknown zone"
+    }
+  };
+  for (;;) {
+    const std::string version = current_version();
+    {
+      std::lock_guard<std::mutex> lock(mu);  // NOLINT(modernize-use-scoped-lock)
+      if (version != cached_version) {
+        cache.clear();
+        cached_version = version;
+      }
+      const auto it = cache.find(name);
+      if (it != cache.end()) {
+        return it->second;
+      }
+    }
+    const std::chrono::time_zone* zone = nullptr;
+    try {
+      zone = std::chrono::locate_zone(name);
+    } catch (const std::runtime_error&) {
+      zone = nullptr;  // unknown zone name
+    }
+    std::lock_guard<std::mutex> lock(mu);  // NOLINT(modernize-use-scoped-lock)
+    if (current_version() != version) {
+      // A reload raced with resolution; the pointer belongs to the old db,
+      // so discard it and start over against the new one.
+      continue;
+    }
+    return cache.emplace(std::string(name), zone).first->second;
   }
-  const std::chrono::time_zone* zone = nullptr;
-  try {
-    zone = std::chrono::locate_zone(name);
-  } catch (const std::runtime_error&) {
-    zone = nullptr;  // unknown zone name
-  }
-  cache.emplace(name, zone);
-  return zone;
 }
 }  // namespace
 
-bool IsKnownTimeZone(std::string_view name) {
-  if (name.empty()) {
+bool IsKnownTimeZone(std::string_view name) noexcept {
+  try {
+    return !name.empty() && FindZoneCached(name) != nullptr;
+  } catch (...) {
     return false;
   }
-  return FindZoneCached(name) != nullptr;
 }
 
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
@@ -273,8 +325,12 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
     const std::chrono::local_seconds local{seconds};
     return static_cast<int>(zone->get_info(local).first.offset.count());
   } catch (...) {
-    // This optional-returning API promises not to let lookup or allocation
-    // failures escape, matching the other platform implementation.
+    // time_zone.hpp promises "Never throws" for this API (T2095), matching
+    // the macOS branch. T2096's "only runtime_error means an unknown zone"
+    // rule applies one level down in FindZoneCached/IsKnownTimeZone, which
+    // still let genuine infra failures (bad_alloc, tzdb load errors)
+    // propagate; here they must become the documented "no offset" result
+    // instead of escaping to callers such as type/date.cpp.
     return std::nullopt;
   }
 }

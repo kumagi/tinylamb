@@ -61,6 +61,7 @@ FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows,
 bool FullScan::AttachRuntimeFilter(
     const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
     ValueType type) {
+  std::scoped_lock lock(state_mutex_);
   if (started_ || group == nullptr || group->empty()) {
     return false;
   }
@@ -88,6 +89,7 @@ bool FullScan::AttachRuntimeFilter(
 }
 
 size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
+  std::scoped_lock lock(state_mutex_);
   if (typed_folded_) {
     destination->Reset();
     return 0;
@@ -96,28 +98,33 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
   const size_t remaining = max_rows_ - std::min(emitted_, max_rows_);
   const size_t batch_limit = std::min(max_rows, remaining);
   destination->Reset(output_schema_, batch_limit);
+  if (batch_limit == 0 || !ok()) {
+    return 0;
+  }
   while (iter_.IsValid() && emitted_ < max_rows_ &&
          destination->Size() < batch_limit) {
     const RowPosition position = iter_.Position();
-    destination->Append(std::move(*iter_), position);
+    Row& row = *iter_;
+    if (const Status status = iter_.GetStatus(); !status.ok()) {
+      FailWith(status);
+      destination->Reset();
+      return 0;
+    }
+    destination->Append(std::move(row), position);
     ++iter_;
     ++emitted_;
   }
-  if (!iter_.IsValid() && destination->Size() < batch_limit) {
-    // Iterator contract (table/iterator_base.hpp): a scan that stops early
-    // latches the failure in GetStatus(). Treating it as plain exhaustion
-    // would serve a truncated result set as a success.
-    const Status status = iter_.GetStatus();
-    if (status != Status::kSuccess) {
-      FailWith(status);
-      return 0;
-    }
+  if (const Status status = iter_.GetStatus(); !status.ok()) {
+    FailWith(status);
+    destination->Reset();
+    return 0;
   }
   return destination->Size();
 }
 
 StatusOr<bool> FullScan::TryFoldTypedBatches(
     const std::function<Status(size_t, const TypedCellBatch&)>& consume) {
+  std::scoped_lock lock(state_mutex_);
   if (started_) {
     return false;
   }
@@ -191,6 +198,7 @@ StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
 }
 
 std::optional<uint64_t> FullScan::TryExactUnfilteredRowCount() const {
+  std::scoped_lock lock(state_mutex_);
   if (started_ || lock_rows_ ||
       max_rows_ != std::numeric_limits<size_t>::max() ||
       runtime_filter_ != nullptr || txn_ == nullptr || table_ == nullptr ||

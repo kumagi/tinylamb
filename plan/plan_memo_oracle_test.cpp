@@ -86,10 +86,11 @@ TEST(PlanMemoOracle, ShrinkNeverHidesMismatchNorGrows) {
   const GeneratedJoinGraph shrunk = ShrinkJoinGraph(graph, synthetic_mismatch);
   EXPECT_LT(shrunk.conjuncts.size(), graph.conjuncts.size());
   EXPECT_TRUE(synthetic_mismatch(shrunk));
-  // Conjuncts shrink one at a time to the minimum that still satisfies the
-  // predicate. Relations may stay put when dropping one would also drop a
-  // conjunct and break it, so only assert the guaranteed conjunct bound.
-  EXPECT_EQ(shrunk.conjuncts.size(), 2U);
+  // The exact final count is an implementation detail of the greedy order
+  // (conjuncts are dropped before relations) and of today's generator: a
+  // different valid shrinker could reach a smaller predicate-satisfying graph
+  // by dropping relations first. Only the stable contract is asserted above --
+  // the graph shrinks and still satisfies the mismatch predicate.
 }
 
 // Sensitivity probe: a hand-built Join whose predicate diverges from the

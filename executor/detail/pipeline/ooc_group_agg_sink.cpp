@@ -27,11 +27,13 @@ uint64_t HashGroupKeyRow(const Row& key) { return std::hash<Row>{}(key); }
 // Every modifier the sorted path cannot replay disqualifies it: WHERE
 // filters, HAVING modifiers, inner ORDER BY/LIMIT, secondary/trailing args
 // and inner GROUP BY (NeedsGroupContext/HasInnerGroupBy cover them all).
-// Per-entry byte estimate for a live DISTINCT-set element when the skew
-// path charges group memory: an unordered_set node plus the Value payload
-// (varchar heap bytes are not introspectable, so this is a floor -- the
-// guard still bounds cardinality, which is the unbounded-growth axis).
-inline constexpr size_t kSkewDistinctEntryEstimateBytes = 128;
+// Saturating add for per-group byte accounting: an extreme cardinality must
+// not wrap accounted_bytes below the budget so that kTooBigData still fires.
+constexpr size_t SaturatingAddBytes(size_t a, size_t b) noexcept {
+  return b > std::numeric_limits<size_t>::max() - a
+             ? std::numeric_limits<size_t>::max()
+             : a + b;
+}
 
 // Only COUNT/SUM/AVG qualify: they are the non-idempotent-insensitive
 // aggregates whose distinct set is the only growing state, and a plain
@@ -212,9 +214,9 @@ class GroupAggLeafSource final
             store_, leaf, [&](Row&& raw) -> Status {
               ASSIGN_OR_RETURN(Row, key, ExtractKeyFromRaw(raw));
               const size_t before = table->size();
-              // FindOrCreate(Row) takes by value and stores the key in its own
-              // index node, so this local `key` is owned by the table and
-              // stays valid for the Accumulate below.
+              // FindOrCreate(Row) takes by value, so this lvalue is copied
+              // into the table's index node. Keep the local `key` for group
+              // accounting below; Accumulate uses the original raw row.
               ASSIGN_OR_RETURN(size_t, gid, table->FindOrCreate(key));
               if (table->size() > before) {
                 RETURN_IF_FAIL(account_new_group(key));
@@ -269,7 +271,7 @@ class GroupAggLeafSource final
   Status MergePackedPartialRow(AggregateGroupTable* table,
                                const Row& packed) const {
     const size_t gcnt = group_keys_.size();
-    if (packed.Count() < gcnt + aggregates_.size()) {
+    if (packed.Count() < gcnt || packed.Count() - gcnt != aggregates_.size()) {
       return StatusError(StatusCode::kCorrupt,
                          "corrupt packed partial aggregate row");
     }
@@ -280,14 +282,24 @@ class GroupAggLeafSource final
     }
     ASSIGN_OR_RETURN(size_t, gid,
                      table->FindOrCreate(Row(std::move(key_vals))));
+    return MergePackedPartialStates(table, gid, packed);
+  }
+
+  Status MergePackedPartialStates(AggregateGroupTable* table, size_t gid,
+                                  const Row& packed) const {
+    const size_t gcnt = group_keys_.size();
     for (size_t a = 0; a < aggregates_.size(); ++a) {
       if (aggregates_[a] == nullptr) {
         continue;
       }
       const Value& blob_val = packed[gcnt + a];
+      if (blob_val.type != ValueType::kVarChar) {
+        return StatusError(StatusCode::kCorrupt,
+                           "invalid packed partial aggregate state");
+      }
       std::string_view sv = blob_val.value.varchar_value;
-      RETURN_IF_FAIL(
-          table->StateFor(gid, a).MergeSerializedPartialState(&sv, shapes_[a]));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, table->StateFor(gid, a));
+      RETURN_IF_FAIL(state->MergeSerializedPartialState(&sv, shapes_[a]));
     }
     return Status::kSuccess;
   }
@@ -336,8 +348,12 @@ class GroupAggLeafSource final
     // consumer_guard_ stays alive through skew_sorter_ usage.
     const size_t gcnt = group_keys_.size();
     std::vector<OocSortKey> sort_keys;
-    sort_keys.reserve(gcnt);
     if (partial_mode_) {
+      if (gcnt != 0 && gcnt - 1 > std::numeric_limits<slot_t>::max()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "partial aggregate key column index out of range");
+      }
+      sort_keys.reserve(gcnt);
       for (size_t i = 0; i < gcnt; ++i) {
         sort_keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(i)});
       }
@@ -355,36 +371,58 @@ class GroupAggLeafSource final
       // key_0..g-1]
       // (+ optional distinct_val column for the O(1) skewed
       // single-DISTINCT path).
-      const size_t raw_width = input_schema_.ColumnCount();
-      // T4853: the raw suffix indexes land in OocSortKey::column_index
-      // (uint16); reject wrap-around instead of silently aliasing a low
-      // input column (same rule as the ooc_sort_distinct_sink sites).
-      if (raw_width + gcnt > std::numeric_limits<slot_t>::max()) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "sort key column index out of range");
-      }
-      for (size_t i = 0; i < gcnt; ++i) {
-        sort_keys.push_back(
-            OocSortKey{.column_index = static_cast<slot_t>(raw_width + i)});
-      }
+      // The trailing key offset is the ACTUAL row width, not
+      // input_schema_.ColumnCount(): a partial projection / unset schema may
+      // be narrower than the rows a chunk carries, and schema-derived key
+      // indices would then point at raw input columns instead of the appended
+      // group-key / distinct_val columns (wrong group boundaries -> WA).
       const bool single_cd = UseSingleCountDistinctSort();
-      if (single_cd) {
-        sort_keys.push_back(
-            OocSortKey{.column_index = static_cast<slot_t>(raw_width + gcnt)});
-      }
-      skew_raw_width_ = raw_width;
-      ExternalSorter::Options opts;
-      opts.spill_store = store_;
-      opts.memory_budget_bytes = budget_bytes_;
-      opts.grant = grant_;
-      opts.keys = std::move(sort_keys);
-      skew_sorter_ = std::make_unique<ExternalSorter>(std::move(opts));
+      auto build_sorter = [&](size_t raw_width) -> Status {
+        // T4853: the raw suffix indexes land in OocSortKey::column_index
+        // (uint16); reject wrap-around instead of silently aliasing a low
+        // input column (same rule as the ooc_sort_distinct_sink sites).
+        const size_t max_slot = std::numeric_limits<slot_t>::max();
+        const size_t key_count = gcnt + static_cast<size_t>(single_cd);
+        if (key_count != 0 &&
+            (raw_width > max_slot || key_count - 1 > max_slot - raw_width)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "sort key column index out of range");
+        }
+        std::vector<OocSortKey> keys;
+        keys.reserve(key_count);
+        for (size_t i = 0; i < gcnt; ++i) {
+          keys.push_back(
+              OocSortKey{.column_index = static_cast<slot_t>(raw_width + i)});
+        }
+        if (single_cd) {
+          keys.push_back(OocSortKey{
+              .column_index = static_cast<slot_t>(raw_width + gcnt)});
+        }
+        ExternalSorter::Options opts;
+        opts.spill_store = store_;
+        opts.memory_budget_bytes = budget_bytes_;
+        opts.grant = grant_;
+        opts.keys = std::move(keys);
+        skew_sorter_ = std::make_unique<ExternalSorter>(std::move(opts));
+        return Status::kSuccess;
+      };
+      skew_raw_width_ = input_schema_.ColumnCount();
+      RETURN_IF_FAIL(build_sorter(skew_raw_width_));
+      bool first_row = true;
       RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
           store_, leaf, [&](Row&& raw) -> Status {
-            ASSIGN_OR_RETURN(Row, key, ExtractKeyFromRaw(raw));
-            if (skew_raw_width_ == 0) {
+            if (raw.Count() != skew_raw_width_) {
+              if (!first_row) {
+                return StatusError(StatusCode::kCorrupt,
+                                   "inconsistent raw aggregate spill row width");
+              }
+              // First row reveals the real width; rebuild the still-empty
+              // sorter so its keys land on the appended columns.
               skew_raw_width_ = raw.Count();
+              RETURN_IF_FAIL(build_sorter(skew_raw_width_));
             }
+            first_row = false;
+            ASSIGN_OR_RETURN(Row, key, ExtractKeyFromRaw(raw));
             raw.values_.reserve(raw.Count() + gcnt + 1);
             for (const Value& kv : key.values_) {
               raw.values_.push_back(kv);
@@ -393,7 +431,7 @@ class GroupAggLeafSource final
               Value dv;
               if (single_distinct_child_slot_.has_value()) {
                 const slot_t dslot = *single_distinct_child_slot_;
-                dv = dslot < raw.Count() ? raw[dslot] : Value();
+                dv = dslot < skew_raw_width_ ? raw[dslot] : Value();
               } else {
                 ASSIGN_OR_RETURN(Value, ev,
                                  EvalRowExpression(aggregates_[0]->Child(),
@@ -415,6 +453,9 @@ class GroupAggLeafSource final
 
   Status PumpSkewSorter(DataChunk* out, size_t max_rows) {
     const size_t gcnt = group_keys_.size();
+    const bool single_cd = !partial_mode_ && UseSingleCountDistinctSort();
+    const size_t key_start = partial_mode_ ? 0 : skew_raw_width_;
+    const size_t suffix_count = partial_mode_ ? aggregates_.size() : static_cast<size_type>(single_cd);
     Row sorted_row;
     while (out->Size() < max_rows) {
       ASSIGN_OR_RETURN(bool, has, skew_sorter_->NextRow(&sorted_row));
@@ -430,18 +471,15 @@ class GroupAggLeafSource final
         break;
       }
 
-      Row cur_key;
-      if (partial_mode_) {
-        cur_key.values_.assign(
-            sorted_row.values_.begin(),
-            sorted_row.values_.begin() + static_cast<ptrdiff_t>(gcnt));
-      } else {
-        cur_key.values_.assign(
-            sorted_row.values_.begin() +
-                static_cast<ptrdiff_t>(skew_raw_width_),
-            sorted_row.values_.begin() +
-                static_cast<ptrdiff_t>(skew_raw_width_ + gcnt));
+      const size_t total_columns = sorted_row.Count();
+      if (key_start > total_columns || gcnt > total_columns - key_start ||
+          total_columns - key_start - gcnt != suffix_count) {
+        return StatusError(StatusCode::kCorrupt,
+                           "skew aggregate spill row width mismatch");
       }
+      Row cur_key;
+      auto begin = sorted_row.values_.begin() + static_cast<ptrdiff_t>(key_start);
+      cur_key.values_.assign(begin, begin + static_cast<ptrdiff_t>(gcnt));
 
       if (have_active_skew_key_ &&
           !relational_detail::GroupKeyEqual{}(active_skew_key_, cur_key)) {
@@ -471,16 +509,8 @@ class GroupAggLeafSource final
       }
 
       if (partial_mode_) {
-        for (size_t a = 0; a < aggregates_.size(); ++a) {
-          if (aggregates_[a] == nullptr) {
-            continue;
-          }
-          std::string_view sv = sorted_row[gcnt + a].value.varchar_value;
-          RETURN_IF_FAIL(
-              skew_table_->StateFor(0, a).MergeSerializedPartialState(
-                  &sv, shapes_[a]));
-        }
-      } else if (UseSingleCountDistinctSort()) {
+        RETURN_IF_FAIL(MergePackedPartialStates(skew_table_.get(), 0, sorted_row));
+      } else if (single_cd) {
         // Sorted by (group_key, distinct_val): deduplicate adjacent equal
         // distinct_vals and feed each once into the DISTINCT-stripped
         // skew-table clone, so the accumulator keeps O(1) state per group
@@ -491,7 +521,17 @@ class GroupAggLeafSource final
                                           prev_distinct_val_, dval)) {
             prev_distinct_val_ = dval;
             have_prev_distinct_ = true;
-            RETURN_IF_FAIL(skew_table_->StateFor(0, 0).Add(dval));
+            // Only one distinct value is resident here, but it can still be a
+            // huge VARCHAR. Charge that value (replacing the previous one's
+            // charge) so a single oversized value trips the budget guard.
+            skew_group_bytes_ = EstimateValueMemoryBytes(prev_distinct_val_);
+            if (budget_bytes_ > 0 && skew_group_bytes_ > budget_bytes_) {
+              return StatusError(
+                  StatusCode::kTooBigData,
+                  "Single aggregate group exceeds operator memory budget");
+            }
+            ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, skew_table_->StateFor(0, 0));
+            RETURN_IF_FAIL(state->Add(dval));
           }
         }
       } else {
@@ -501,26 +541,29 @@ class GroupAggLeafSource final
         if (has_collection_agg_) {
           // Collection aggregates (ARRAY_AGG/STRING_AGG) buffer every input
           // row, so the raw-row byte estimate is the retained-state size.
-          skew_group_bytes_ += EstimateRowMemoryBytes(sorted_row);
-          accounted_bytes += skew_group_bytes_;
+          skew_group_bytes_ =
+              SaturatingAddBytes(skew_group_bytes_, EstimateRowMemoryBytes(sorted_row));
+          accounted_bytes = SaturatingAddBytes(accounted_bytes, skew_group_bytes_);
         }
         if (has_distinct_state_agg_) {
           // DISTINCT accumulators retain one set entry per distinct value,
           // not per row: charging raw row bytes would reject
           // duplicate-heavy inputs whose real footprint is tiny. Charge the
-          // live distinct-set cardinalities instead (a stripped single
-          // DISTINCT aggregate never reaches this branch -- its clone is
-          // not distinct_mode).
-          size_t entries = 0;
+          // live sets' real retained bytes (VARCHAR payloads included) via
+          // DistinctRetainedBytes, saturating on add so an extreme cardinality
+          // cannot wrap past the budget check (a stripped single DISTINCT
+          // aggregate never reaches this branch -- its clone is not
+          // distinct_mode).
+          size_t distinct_bytes = 0;
           for (size_t a = 0; a < aggregates_.size(); ++a) {
             if (aggregates_[a] == nullptr || !shapes_[a].distinct_mode) {
               continue;
             }
-            const relational_detail::AggregateAccumulator& st =
-                skew_table_->StateFor(0, a);
-            entries += st.DistinctIntCount() + st.DistinctValueCount();
+            ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, st, skew_table_->StateFor(0, a));
+            distinct_bytes =
+                SaturatingAddBytes(distinct_bytes, st->DistinctRetainedBytes());
           }
-          accounted_bytes += entries * kSkewDistinctEntryEstimateBytes;
+          accounted_bytes = SaturatingAddBytes(accounted_bytes, distinct_bytes);
         }
         if ((has_collection_agg_ || has_distinct_state_agg_) &&
             budget_bytes_ > 0 && accounted_bytes > budget_bytes_) {
@@ -636,9 +679,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
       // T4853: schema offsets also feed slot_t; keep a too-wide schema
       // column out of the fast-path slot list rather than wrapping it.
       if (offset >= 0 &&
-          static_cast<uint64_t>(offset) <=
+          std::cmp_less_equal(offset,
               std::numeric_limits<slot_t>::
-                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+                  max())) {  // NOLINT(modernize-use-integer-sign-comparison)
         group_key_slots_[i] = static_cast<slot_t>(offset);
       }
     }
@@ -688,9 +731,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
           strip_agg->Child()->AsColumnValue().GetColumnName());
       // T4853: same uint16 bound as the group-key slots above.
       if (off >= 0 &&
-          static_cast<uint64_t>(off) <=
+          std::cmp_less_equal(off,
               std::numeric_limits<slot_t>::
-                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+                  max())) {  // NOLINT(modernize-use-integer-sign-comparison)
         single_distinct_child_slot_ = static_cast<slot_t>(off);
       }
     }
@@ -744,7 +787,8 @@ Status OocGroupAggSink::FlushPartialTableToPartitioner() {
         continue;
       }
       blob.clear();
-      RETURN_IF_FAIL(agg_table_->StateFor(g, a).SerializePartialState(&blob));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, agg_table_->StateFor(g, a));
+      RETURN_IF_FAIL(state->SerializePartialState(&blob));
       packed.emplace_back(std::move(blob));
     }
     RETURN_IF_FAIL(partitioner_->AddRow(Row(std::move(packed))));
@@ -766,7 +810,7 @@ Status OocGroupAggSink::TransitionNonCombinableToSpill(PipelineContext* ctx) {
   opts.spill_store = &ctx->spill_store;
   opts.memory_budget_bytes = budget_bytes_;
   opts.grant = &ctx->grant;
-  partitioner_ = std::make_unique<RecursivePartitioner>(
+  auto candidate = std::make_unique<RecursivePartitioner>(
       opts, [this](const Row& raw) -> uint64_t {
         Row key;
         Status st = ExtractCanonicalGroupKeys(raw, &key);
@@ -780,11 +824,19 @@ Status OocGroupAggSink::TransitionNonCombinableToSpill(PipelineContext* ctx) {
         }
         return HashGroupKeyRow(key);
       });
-  for (Row& r : raw_rows_) {
-    RETURN_IF_FAIL(partitioner_->AddRow(std::move(r)));
+  for (const Row& r : raw_rows_) {
+    // The partitioner's hash functor cannot return Status; it records an
+    // ExtractCanonicalGroupKeys failure in partition_key_status_ and routes
+    // the row to bucket 0. Stop immediately so subsequent rows are not
+    // needlessly spilled into the wrong bucket and the error surfaces here.
+    RETURN_IF_FAIL(partition_key_status_);
+    RETURN_IF_FAIL(candidate->AddRow(r));
   }
-  raw_rows_.clear();
-  raw_rows_.shrink_to_fit();
+  RETURN_IF_FAIL(partition_key_status_);
+  partitioner_ = std::move(candidate);
+  // T3462: shrink_to_fit can throw bad_alloc across the Status boundary;
+  // swap-with-empty frees the capacity without allocating (T2060 idiom).
+  std::vector<Row>().swap(raw_rows_);
   mem_bytes_ = 0;
   if (grant_cache_.has_value()) {
     grant_cache_->ReleaseAll();
@@ -905,6 +957,7 @@ Status OocGroupAggSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
   for (size_t r = 0; r < input.Size(); ++r) {
     Row row = input.RowAt(r);
     if (spilled_) {
+      RETURN_IF_FAIL(partition_key_status_);
       RETURN_IF_FAIL(partitioner_->AddRow(std::move(row)));
       continue;
     }
@@ -913,6 +966,7 @@ Status OocGroupAggSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
          mem_bytes_ + rb > budget_bytes_) ||
         (grant_cache_.has_value() && !grant_cache_->Reserve(rb))) {
       RETURN_IF_FAIL(TransitionNonCombinableToSpill(ctx));
+      RETURN_IF_FAIL(partition_key_status_);
       RETURN_IF_FAIL(partitioner_->AddRow(std::move(row)));
       continue;
     }
@@ -940,7 +994,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
         row = Row();
       }
       raw_rows_.clear();
-      raw_rows_.shrink_to_fit();
+      std::vector<Row>().swap(raw_rows_);
     }
     if (group_keys_.empty() && agg_table_->empty()) {
       RETURN_IF_FAIL(agg_table_->FindOrCreate(Row{}).GetStatus());
@@ -1018,7 +1072,7 @@ OocGroupAggSink::TryConsumeExactRowCount(PipelineContext* /*ctx*/,
   finalized_ = true;
   agg_table_.reset();
   raw_rows_.clear();
-  raw_rows_.shrink_to_fit();
+  std::vector<Row>().swap(raw_rows_);
   mem_bytes_ = 0;
   if (grant_cache_.has_value()) {
     grant_cache_->ReleaseAll();
@@ -1033,10 +1087,12 @@ void OocGroupAggSink::Explain(std::ostream& out, int indent) const {
   // After a spill the real path is GroupAggLeafSource over sorted partition
   // streams (merging partial states when all_combinable_, re-folding raw rows
   // otherwise), not the in-memory hash table.
-  const char* strategy = group_keys_.empty() ? "scalar"
-                         : spilled_
+  // A spill switches to the sorted leaf path even with zero group keys: the
+  // keyless in-memory route is only "scalar" while it stays resident.
+  const char* strategy = spilled_
                              ? (all_combinable_ ? "sort-combine" : "sort")
-                             : "hash";
+                             : group_keys_.empty() ? "scalar"
+                                                   : "hash";
   out << pad << (explain_header_.empty() ? label_ : explain_header_)
       << " Aggregate strategy=" << strategy << "\n";
 }

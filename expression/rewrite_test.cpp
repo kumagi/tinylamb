@@ -861,6 +861,33 @@ TEST(ExpressionRewriteTest,
   EXPECT_EQ(rewrite(factor_sqrt)->Type(), TypeTag::kBinaryExp);
 }
 
+TEST(ExpressionRewriteTest, FloatingIdentitiesKeepResultTypeAndSignedZero) {
+  const Schema schema("", {Column("i", ValueType::kInt64),
+                            Column("d", ValueType::kDouble)});
+  const Row row({Value(0), Value(-0.0)});
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
+  for (const auto operation : {BinaryOperation::kAdd, BinaryOperation::kSubtract,
+                                BinaryOperation::kMultiply}) {
+    const auto literal = operation == BinaryOperation::kMultiply ? 1.0 : 0.0;
+    const Expression simplified = rewriter.Rewrite(BinaryExpressionExp(
+        ColumnValueExp("i"), operation, ConstantValueExp(Value(literal))));
+    EXPECT_EQ(simplified->Type(), TypeTag::kCastExp);
+    EXPECT_EQ(simplified->Evaluate(row, schema).type, ValueType::kDouble);
+  }
+
+  const auto with_double = [&](BinaryOperation operation, double literal) {
+    return rewriter.Rewrite(BinaryExpressionExp(
+        ColumnValueExp("d"), operation, ConstantValueExp(Value(literal))));
+  };
+  const Expression add = with_double(BinaryOperation::kAdd, 0.0);
+  EXPECT_EQ(add->Type(), TypeTag::kBinaryExp);
+  EXPECT_FALSE(std::signbit(add->Evaluate(row, schema).AsDouble()));
+  const Expression multiply = with_double(BinaryOperation::kMultiply, 1.0);
+  EXPECT_EQ(multiply->Type(), TypeTag::kColumnValue);
+  EXPECT_TRUE(std::signbit(multiply->Evaluate(row, schema).AsDouble()));
+}
+
 TEST(ExpressionRewriteTest, ArithmeticIdentitiesAndDoubleNegation) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
@@ -2492,7 +2519,8 @@ TEST(ExpressionRewriteTest, DeterministicFunctionCse) {
   ASSERT_EQ(rewritten_case->Type(), TypeTag::kFunctionCallExp);
   EXPECT_EQ(rewritten_case->AsFunctionCallExpression().FuncName(), "upper");
 
-  // Volatile rand() - rand() must NOT be eliminated to 0
+  // Volatile GoogleSQL RAND() - RAND() must NOT be eliminated to 0
+  // (these are FunctionCallExp("rand", {}) nodes, not a C library RNG call.)
   Expression rand_call = FunctionCallExp("rand", {});
   Expression sub_rand =
       BinaryExpressionExp(rand_call, BinaryOperation::kSubtract, rand_call);
@@ -2753,22 +2781,16 @@ TEST(ExpressionRewriteTest, CoalesceAndNullifSimplification) {
   Expression const_42 = ConstantValueExp(Value(int64_t{42}));
   Expression const_99 = ConstantValueExp(Value(int64_t{99}));
 
-  // COALESCE(NULL, 42, x) -> 42
+  // An unbound trailing column can determine the common type.
   Expression c1 = FunctionCallExp("coalesce", {null_val, const_42, x});
   Expression rewritten_c1 = rewriter.Rewrite(c1);
-  ASSERT_EQ(rewritten_c1->Type(), TypeTag::kConstantValue);
-  EXPECT_EQ(rewritten_c1->AsConstantValue().GetValue(), Value(int64_t{42}));
+  ASSERT_EQ(rewritten_c1->Type(), TypeTag::kFunctionCallExp);
+  EXPECT_EQ(rewritten_c1->AsFunctionCallExpression().Args(),
+            (std::vector<Expression>{const_42, x}));
 
-  // COALESCE(x, 42, y) -> COALESCE(x, 42) (y is eliminated after first non-null
-  // constant)
   Expression c2 = FunctionCallExp("coalesce", {x, const_42, y});
-  Expression rewritten_c2 = rewriter.Rewrite(c2);
-  ASSERT_EQ(rewritten_c2->Type(), TypeTag::kFunctionCallExp);
-  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args().size(), 2);
-  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args()[0]->Type(),
-            TypeTag::kColumnValue);
-  EXPECT_EQ(rewritten_c2->AsFunctionCallExpression().Args()[1]->Type(),
-            TypeTag::kConstantValue);
+  EXPECT_EQ(rewriter.Rewrite(c2)->AsFunctionCallExpression().Args(),
+            c2->AsFunctionCallExpression().Args());
 
   // COALESCE(x, y, NULL) -> COALESCE(x, y) (trailing NULL eliminated)
   Expression c3 = FunctionCallExp("coalesce", {x, y, null_val});
@@ -3179,7 +3201,7 @@ TEST(ExpressionRewriteTest, BitwiseAndSafeArithmeticPreserveSemantics) {
 TEST(ExpressionRewriteTest, VolatileExpressionsNotCollapsed) {
   ExpressionRewriter rewriter(ExpressionRuleSet::Default());
 
-  // greatest(rand(), rand()) must not fold to rand()
+  // greatest(GoogleSQL RAND(), RAND()) must not fold to RAND()
   Expression rand1 = FunctionCallExp("rand", {});
   Expression rand2 = FunctionCallExp("rand", {});
   Expression greatest_rand = FunctionCallExp("greatest", {rand1, rand2});
@@ -3188,20 +3210,20 @@ TEST(ExpressionRewriteTest, VolatileExpressionsNotCollapsed) {
   EXPECT_EQ(rewritten_greatest->AsFunctionCallExpression().FuncName(),
             "greatest");
 
-  // least(rand(), rand()) must not fold to rand()
+  // least(GoogleSQL RAND(), RAND()) must not fold to RAND()
   Expression least_rand = FunctionCallExp("least", {rand1, rand2});
   Expression rewritten_least = rewriter.Rewrite(least_rand);
   EXPECT_EQ(rewritten_least->Type(), TypeTag::kFunctionCallExp);
   EXPECT_EQ(rewritten_least->AsFunctionCallExpression().FuncName(), "least");
 
-  // coalesce(rand(), rand()) must not fold to rand()
+  // coalesce(GoogleSQL RAND(), RAND()) must not fold to RAND()
   Expression coalesce_rand = FunctionCallExp("coalesce", {rand1, rand2});
   Expression rewritten_coalesce = rewriter.Rewrite(coalesce_rand);
   EXPECT_EQ(rewritten_coalesce->Type(), TypeTag::kFunctionCallExp);
   EXPECT_EQ(rewritten_coalesce->AsFunctionCallExpression().FuncName(),
             "coalesce");
 
-  // ifnull(rand(), rand()) must not fold to rand()
+  // ifnull(GoogleSQL RAND(), RAND()) must not fold to RAND()
   Expression ifnull_rand = FunctionCallExp("ifnull", {rand1, rand2});
   Expression rewritten_ifnull = rewriter.Rewrite(ifnull_rand);
   EXPECT_EQ(rewritten_ifnull->Type(), TypeTag::kFunctionCallExp);
@@ -3214,7 +3236,7 @@ TEST(ExpressionRewriteTest, VolatileExpressionsNotCollapsed) {
   Expression rewritten_nullif = rewriter.Rewrite(nullif_uuid);
   EXPECT_NE(rewritten_nullif->Type(), TypeTag::kConstantValue);
 
-  // uniform_case_result: CASE WHEN rand() > 0.5 THEN 1 ELSE 1 END must preserve
+  // uniform_case_result: CASE WHEN RAND() > 0.5 THEN 1 ELSE 1 END must preserve
   // condition
   Expression cond = BinaryExpressionExp(rand1, BinaryOperation::kGreaterThan,
                                         ConstantValueExp(Value(0.5)));
@@ -3369,6 +3391,30 @@ TEST(ExpressionAuditTest, SyntheticJsonNodesOwnRawText) {
   EXPECT_EQ(json_doc::LaxToString(*child), Value("1234567890123456789"));
 }
 
+TEST(ExpressionAuditTest, LaxStringPreservesBorrowedJsonNumberSpelling) {
+  const char* const number = "1234567890123456789012345678901234567890.10000";
+  const auto result = json_doc::family::Evaluate("lax_string", {Value(number)});
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result.Value(), Value(number));
+}
+
+TEST(ExpressionAuditTest, JsonStringTokensRetainOnlyTheirOwnStorage) {
+  constexpr size_t count = 1024;
+  std::string document = "[\"x\"";
+  for (size_t i = 1; i < count; ++i) {
+    document += ",\"x\"";
+  }
+  document += ']';
+  const auto root = json_doc::ParseDocument(document);
+  ASSERT_TRUE(root.has_value());
+  ASSERT_EQ(root->arr.size(), count);
+  for (const auto& item : root->arr) {
+    ASSERT_NE(item, nullptr);
+    ASSERT_EQ(item->str, "x");
+    ASSERT_LT(item->str.capacity(), 64U);
+  }
+}
+
 TEST(ExpressionAuditTest, JsonPathQuotedMembersAndInvalidSuffixes) {
   const auto root = json_doc::ParseDocument(R"({"a b":[10,20]})");
   if (!root.has_value()) {
@@ -3380,7 +3426,8 @@ TEST(ExpressionAuditTest, JsonPathQuotedMembersAndInvalidSuffixes) {
     ASSERT_NE(selected, nullptr) << path;
     EXPECT_EQ(selected->raw, "20");
   }
-  for (const char* path : {"$['a b'][1junk]", "$['a b'][1", "$['a b'][]"}) {
+  for (const char* path :
+       {"$['a b'][1junk]", "$['a b'][1", "$['a b'][]", "$.\"a b"}) {
     EXPECT_EQ(json_doc::NavigateJsonPath(*root, path), nullptr) << path;
   }
 }

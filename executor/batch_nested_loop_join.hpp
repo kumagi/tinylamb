@@ -59,13 +59,15 @@ class BatchNestedLoopJoin : public ExecutorBase, public PipelineBreaker {
 
  private:
   void EnsureMaterialized();
-  mutable Status predicate_error_{Status::kSuccess};
   // Reused scratch row for residual-predicate evaluation: one concatenation
   // per candidate instead of a fresh Row allocation (VARCHAR payloads are
   // deep-copied by Row::operator+).
-  mutable Row predicate_scratch_;
+  Row predicate_scratch_;
   void ExecuteBlockJoin();
-  [[nodiscard]] bool EvaluatePredicate(const Row& left, const Row& right) const;
+  [[nodiscard]] bool TryExecuteDisjunctiveHashJoin(
+      const std::vector<std::pair<Row, RowPosition>>& right_rows);
+  [[nodiscard]] StatusOr<bool> EvaluatePredicate(const Row& left,
+                                                 const Row& right);
 
   Executor left_;
   Schema left_schema_;

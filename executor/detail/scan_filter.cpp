@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -31,6 +32,7 @@
 #include "common/literal_like_pattern.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
+#include "common/regex_guard.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
@@ -151,93 +153,13 @@ bool IsIntLike(const Value& value) {
 }  // namespace
 
 bool FastLikeMatch(std::string_view value, std::string_view pattern) {
-  if (pattern.find('\\') != std::string_view::npos) {
-    return EscapedLikeMatch(value, pattern);
-  }
-  if (pattern.find('_') == std::string_view::npos) {
-    const size_t first_wild = pattern.find('%');
-    if (first_wild == std::string_view::npos) {
-      return value == pattern;
-    }
-    size_t pos = 0;
-    if (first_wild > 0) {
-      if (value.size() < first_wild ||
-          std::memcmp(value.data(), pattern.data(), first_wild) != 0) {
-        return false;
-      }
-      pos = first_wild;
-    }
-    const size_t last_wild = pattern.rfind('%');
-    const size_t tail_len = pattern.size() - last_wild - 1;
-    size_t p = first_wild;
-    while (p < last_wild) {
-      size_t sep = pattern.find('%', p + 1);
-      if (sep == std::string_view::npos || sep > last_wild) {
-        sep = last_wild;
-      }
-      const size_t seg_len = sep - (p + 1);
-      if (seg_len > 0) {
-        const size_t avail =
-            value.size() >= pos + tail_len ? value.size() - tail_len - pos : 0;
-        if (seg_len > avail) {
-          return false;
-        }
-        const size_t found =
-            value.substr(pos, avail).find(pattern.substr(p + 1, seg_len));
-        if (found == std::string_view::npos) {
-          return false;
-        }
-        pos += found + seg_len;
-      }
-      p = sep;
-    }
-    if (tail_len > 0) {
-      if (value.size() < pos + tail_len ||
-          std::memcmp(value.data() + value.size() - tail_len,
-                      pattern.data() + last_wild + 1, tail_len) != 0) {
-        return false;
-      }
-    }
-    return true;
-  }
-  size_t value_pos = 0;
-  size_t pattern_pos = 0;
-  size_t wildcard = std::string_view::npos;
-  size_t retry = 0;
-  while (value_pos < value.size()) {
-    if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
-      wildcard = pattern_pos++;
-      retry = value_pos;
-    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '_') {
-      // '_' matches one whole UTF-8 character, not one byte (same rule as
-      // the AST evaluator's Like); truncated trailing sequences count as
-      // that one character.
-      value_pos += std::min(
-          Utf8SequenceLength(static_cast<unsigned char>(value[value_pos])),
-          value.size() - value_pos);
-      ++pattern_pos;
-    } else if (pattern_pos < pattern.size() &&
-               pattern[pattern_pos] == value[value_pos]) {
-      ++value_pos;
-      ++pattern_pos;
-    } else if (wildcard != std::string_view::npos) {
-      pattern_pos = wildcard + 1;
-      // '%' retries at the next UTF-8 character boundary, not the next byte
-      // (same rule as the AST and expression_eval Like evaluators): a
-      // byte-wise retry could restart a literal comparison inside a
-      // multi-byte sequence.
-      retry +=
-          std::min(Utf8SequenceLength(static_cast<unsigned char>(value[retry])),
-                   value.size() - retry);
-      value_pos = retry;
-    } else {
-      return false;
-    }
-  }
-  while (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
-    ++pattern_pos;
-  }
-  return pattern_pos == pattern.size();
+  // Keep scan filters on the shared escape-aware matcher used by expression
+  // evaluation. Its compiled literal/%/_ paths fall back to the UTF-8 matcher,
+  // so this adapter does not maintain a second LIKE escape implementation.
+  // Lean proofs: lean/TinylambOpt/LikeSegmentChain.lean (anchored_chain_iff),
+  //   lean/TinylambOpt/LikeUnderscore.lean (like_underscore_split_iff),
+  //   lean/TinylambOpt/LikeShiftAnd.lean (shiftAnd_iff)
+  return EscapedLikeMatch(value, pattern);
 }
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred,
@@ -368,7 +290,7 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred,
           break;
       }
     } catch (...) {
-      // An unparseable date string is an evaluation error, not a clean
+      // An unparsable date string is an evaluation error, not a clean
       // FALSE: route it through the exact evaluator so the status reaches
       // the caller like every other coerced comparison.
       return exact(TryBinary(pred.op, value, pred.constant));
@@ -695,15 +617,15 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   }
   if (target_col.Type() == ValueType::kDate &&
       compiled.constant.type == ValueType::kVarChar) {
-    try {
-      compiled.int_constant =
-          ParseDateDays(compiled.constant.value.varchar_value);
-      compiled.date_string_payload = true;
-    } catch (const std::exception&) {
+    const StatusOr<int64_t> parsed =
+        TryParseDateDays(compiled.constant.value.varchar_value);
+    if (!parsed.HasValue()) {
       // An invalid date literal is a query error in the checked evaluator;
       // a fast-path compare would silently reject every row instead.
       return std::nullopt;
     }
+    compiled.int_constant = parsed.Value();
+    compiled.date_string_payload = true;
   }
   // Numeric-vs-string and string-vs-numeric comparisons raise "type
   // mismatch" in the checked evaluator. The payload matchers below would
@@ -1154,7 +1076,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
               }
             }
             std::vector<slot_t> needed{col_idx};
-            needed.reserve(1 + local_simple.size() * 2);
+            needed.reserve(1 + (local_simple.size() * 2));
             for (const auto& compare : local_simple) {
               needed.push_back(compare.column);
               if (compare.column_payload) {
@@ -3850,6 +3772,93 @@ CompiledScanFilter CompileScanFilterUncached(
       }
     }
   }
+  // Lean proof: lean/TinylambOpt/FilterEvalOrder.lean (filter_eval_order_sound)
+  // Order error-free residual conjuncts by ascending evaluation cost before
+  // sequential/bytecode evaluation so cheap predicates short-circuit expensive
+  // LIKE / REGEXP_CONTAINS / OR checks.
+  if (compiled.residual.size() >= 2) {
+    const char* disable_order = std::getenv("TINYLAMB_DISABLE_FILTER_ORDER");
+    if (disable_order == nullptr || disable_order[0] != '1') {
+      auto residual_error_free = [&](const Expression& expr) -> bool {
+        if (IsNonThrowingLocalFilter(expr, schema, nullptr)) {
+          return true;
+        }
+        if (expr && expr->Type() == TypeTag::kFunctionCallExp) {
+          const auto& call = expr->AsFunctionCallExpression();
+          if (call.FuncName() == "regexp_contains" && call.Args().size() == 2 &&
+              call.Args()[0] &&
+              call.Args()[0]->Type() == TypeTag::kColumnValue &&
+              LocalColumnOffset(schema,
+                                call.Args()[0]->AsColumnValue().GetColumnName())
+                  .has_value() &&
+              call.Args()[1] &&
+              call.Args()[1]->Type() == TypeTag::kConstantValue) {
+            const Value& pat = call.Args()[1]->AsConstantValue().GetValue();
+            if (pat.IsNull()) {
+              return true;
+            }
+            if (pat.type == ValueType::kVarChar) {
+              return CompileCheckedRegex(std::string(pat.value.varchar_value))
+                  .HasValue();
+            }
+          }
+        }
+        return false;
+      };
+      auto residual_cost = [&](const auto& self,
+                               const Expression& expr) -> int {
+        if (!expr) {
+          return 100;
+        }
+        if (expr->Type() == TypeTag::kUnaryExp) {
+          return 1;
+        }
+        if (expr->Type() == TypeTag::kFunctionCallExp &&
+            expr->AsFunctionCallExpression().FuncName() == "regexp_contains") {
+          return 60;
+        }
+        if (expr->Type() == TypeTag::kInExp) {
+          return 8;
+        }
+        if (expr->Type() == TypeTag::kBinaryExp) {
+          const auto& b = expr->AsBinaryExpression();
+          if (!b.Left() || !b.Right()) {
+            return 100;
+          }
+          if (b.Op() == BinaryOperation::kLike ||
+              b.Op() == BinaryOperation::kNotLike) {
+            return 25;
+          }
+          if (b.Op() == BinaryOperation::kOr) {
+            return std::min(55, self(self, b.Left()) + self(self, b.Right()));
+          }
+          if (b.Op() == BinaryOperation::kAnd) {
+            return std::min(55, self(self, b.Left()) + self(self, b.Right()));
+          }
+          const TypeTag lt = b.Left()->ResultType(schema).GetType();
+          const TypeTag rt = b.Right()->ResultType(schema).GetType();
+          if (lt == TypeTag::kInteger || lt == TypeTag::kBigInt ||
+              lt == TypeTag::kDate || rt == TypeTag::kInteger ||
+              rt == TypeTag::kBigInt || rt == TypeTag::kDate) {
+            return 2;
+          }
+          if (lt == TypeTag::kDouble || rt == TypeTag::kDouble) {
+            return 3;
+          }
+          return 6;
+        }
+        return 10;
+      };
+      if (std::ranges::all_of(compiled.residual, residual_error_free)) {
+        std::stable_sort(compiled.residual.begin(), compiled.residual.end(),
+                         [&](const Expression& a, const Expression& b) {
+                           return residual_cost(residual_cost, a) <
+                                  residual_cost(residual_cost, b);
+                         });
+      }
+    }
+  }
+
   // Compile residual expressions into bytecode for fast row-by-row evaluation.
   // Bytecode avoids recursive expression tree traversal and virtual dispatch,
   // which is the dominant cost for non-selective filters like TPC-H Q20.
@@ -3905,6 +3914,12 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
     return CompileScanFilterUncached(predicates, schema, env);
   }
   key->push_back(BytecodeEnabled() ? char{1} : char{0});
+  {
+    const char* disable_order = std::getenv("TINYLAMB_DISABLE_FILTER_ORDER");
+    key->push_back(disable_order != nullptr && disable_order[0] == '1'
+                       ? char{1}
+                       : char{0});
+  }
   struct Cache {
     size_t bytes{0};
     std::unordered_map<std::string, CompiledScanFilter> entries;
@@ -4820,7 +4835,7 @@ bool TryFilterColumnarTable(TransactionContext& context,
         bop == BinaryOperation::kLessThanEquals ||
         bop == BinaryOperation::kGreaterThan ||
         bop == BinaryOperation::kGreaterThanEquals) {
-      auto unwrap_double_cast = [](const Expression& e) -> const Expression& {
+      auto unwrap_double_cast = [](const Expression& e) -> Expression {
         if (e && e->Type() == TypeTag::kCastExp &&
             e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
             e->AsCastExpression().Child() != nullptr) {
@@ -4830,7 +4845,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
       };
       auto extract_col = [&](const Expression& raw_e, slot_t* out) -> bool {
         const Expression& e = unwrap_double_cast(raw_e);
-        if (!e || e->Type() != TypeTag::kColumnValue) return false;
+        if (!e || e->Type() != TypeTag::kColumnValue) { return false;
+}
         const auto off =
             LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -4844,11 +4860,14 @@ bool TryFilterColumnarTable(TransactionContext& context,
       };
       auto extract_const = [&](const Expression& raw_e, double* out) -> bool {
         const Expression& e = unwrap_double_cast(raw_e);
-        if (!e || e->Type() != TypeTag::kConstantValue) return false;
+        if (!e || e->Type() != TypeTag::kConstantValue) { return false;
+}
         const Value& v = e->AsConstantValue().GetValue();
-        if (v.IsNull()) return false;
+        if (v.IsNull()) { return false;
+}
         if (v.type == ValueType::kDouble) {
-          if (!std::isfinite(v.value.double_value)) return false;
+          if (!std::isfinite(v.value.double_value)) { return false;
+}
           *out = v.value.double_value;
           return true;
         }
@@ -4935,7 +4954,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
         bop == BinaryOperation::kEquals || bop == BinaryOperation::kNotEquals) {
       auto extract_id_col = [&](const Expression& e, slot_t* out,
                                 ValueType* vt_out) -> bool {
-        if (!e || e->Type() != TypeTag::kColumnValue) return false;
+        if (!e || e->Type() != TypeTag::kColumnValue) { return false;
+}
         const auto off =
             LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -4952,7 +4972,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
         return true;
       };
       auto extract_i64_const = [](const Expression& e, int64_t* out) -> bool {
-        if (!e || e->Type() != TypeTag::kConstantValue) return false;
+        if (!e || e->Type() != TypeTag::kConstantValue) { return false;
+}
         const Value& v = e->AsConstantValue().GetValue();
         if (v.IsNull() || v.type != ValueType::kInt64 || v.IsUnsigned()) {
           return false;
@@ -4963,7 +4984,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
       auto extract_shifted = [&](const Expression& e, slot_t* col_out,
                                  ValueType* vt_out,
                                  int64_t* delta_out) -> bool {
-        if (!e || e->Type() != TypeTag::kBinaryExp) return false;
+        if (!e || e->Type() != TypeTag::kBinaryExp) { return false;
+}
         const auto& ab = e->AsBinaryExpression();
         if (ab.Op() != BinaryOperation::kAdd &&
             ab.Op() != BinaryOperation::kSubtract) {
@@ -4973,7 +4995,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
         if (extract_id_col(ab.Left(), col_out, vt_out) &&
             extract_i64_const(ab.Right(), &k)) {
           if (ab.Op() == BinaryOperation::kSubtract) {
-            if (k == std::numeric_limits<int64_t>::min()) return false;
+            if (k == std::numeric_limits<int64_t>::min()) { return false;
+}
             k = -k;
           }
           *delta_out = k;
@@ -5030,7 +5053,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
   if (fast_scaled_cmp.active) {
     fast_residual_covers_all_chunks = true;
     for (const ColumnarChunk& ch : input.chunks) {
-      if (ch.rows == 0) continue;
+      if (ch.rows == 0) { continue;
+}
       if (fast_scaled_cmp.lhs_col >= ch.columns.size() ||
           fast_scaled_cmp.rhs_col >= ch.columns.size()) {
         fast_residual_covers_all_chunks = false;
@@ -5049,7 +5073,8 @@ bool TryFilterColumnarTable(TransactionContext& context,
     const ValueType want_vt =
         fast_date_cmp.is_date ? ValueType::kDate : ValueType::kInt64;
     for (const ColumnarChunk& ch : input.chunks) {
-      if (ch.rows == 0) continue;
+      if (ch.rows == 0) { continue;
+}
       if (fast_date_cmp.lhs_col >= ch.columns.size() ||
           fast_date_cmp.rhs_col >= ch.columns.size()) {
         fast_residual_covers_all_chunks = false;
@@ -6579,6 +6604,12 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
       (movable_source != nullptr && movable_source != &source)) {
     return false;
   }
+  // Register the relation being filtered so a correlated-subquery build
+  // triggered while evaluating deferred residuals (MatchScanFilter on the
+  // consumer thread, or inside TryFilterColumnarTable) can prune its build
+  // scan to this pipeline's outer key domain — the same contract the serial
+  // path in relational.cpp establishes around its ForEachRow loop.
+  ScopedCorrelatedOuter correlated_outer(context, source);
   if (source.HasColumnarOnly()) {
     return TryFilterColumnarTable(context, source.columnar, filter,
                                   match_schema, outer, ctes, runtime_filter,
@@ -7325,8 +7356,9 @@ StatusOr<bool> TrySelectiveIndexSource(
     }
     IndexScanIterator iterator(table, *selected, context.txn_, begin, end, true,
                                false, &guard);
-    if (projection != nullptr)
+    if (projection != nullptr) {
       RETURN_IF_FAIL(iterator.SetProjection(*projection));
+}
     while (iterator.IsValid()) {
       if (++visited > kMaxRows) {
         return false;
@@ -7708,6 +7740,9 @@ bool TryFilterArenaCache(
               key_null_rejected.fetch_add(local_key_null_rej,
                                           std::memory_order_relaxed);
             } catch (...) {
+              // This and the worker-creation catch below take error_mu in
+              // disjoint, sequential scopes (no nested acquisition and no
+              // second mutex), so the lock order cannot be inverted here.
               std::scoped_lock lock(error_mu);
               if (error_ex == Status::kSuccess) {
                 error_ex =
@@ -8180,7 +8215,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       size_t table_input_rows = 0;
       if (!context.txn_.HasAnyPageVersionChains()) {
         std::shared_ptr<const LSTableStore> lst_store = GetOrBuildLSTableStore(
-            context.txn_, *table.Value(), true, projection);
+            context.txn_, *table.Value(), true, projection,
+            /*allow_block_lazy=*/true);
         if (lst_store != nullptr && lst_store->uncommitted_owner_txn == 0 &&
             lst_store->layout_generation == table.Value()->LayoutGeneration() &&
             lst_store->first_pid == table.Value()->FirstPageId()) {
@@ -8283,12 +8319,18 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         std::sort(sorted_keys.begin(), sorted_keys.end());
         keyed_cache_key.reserve(
             keyed_cache_key.size() +
-            sorted_keys
+            (sorted_keys
                     .size() *  // NOLINT(readability-math-missing-parentheses)
                 sizeof(
-                    int64_t));  // NOLINT(readability-math-missing-parentheses)
+                    int64_t)));  // NOLINT(readability-math-missing-parentheses)
         for (int64_t k : sorted_keys) {
-          keyed_cache_key.append(reinterpret_cast<const char*>(&k), sizeof(k));
+          // Copy the object representation explicitly instead of treating the
+          // int64 object as a char array: a cache key only needs stable bytes
+          // within this process, and memcpy keeps the aliasing/alignment
+          // contract unambiguous.
+          char k_bytes[sizeof(k)];
+          std::memcpy(k_bytes, &k, sizeof(k));
+          keyed_cache_key.append(k_bytes, sizeof(k));
         }
         const auto k_it =
             context.execution_runtime()->base_relations.find(keyed_cache_key);

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -25,11 +26,18 @@ size_t TopNPlan::EmitRowCount() const {
   if (limit_ == 0) {
     return 0;
   }
-  const size_t input = child_->EmitRowCount();
-  if (input <= offset_) {
+  // The executor skips prior_offset_ rows in an outer LIMIT node plus this
+  // node's own offset_. EnforcesLimit() already accounts for both; the row
+  // estimate must too, or cost/spill decisions see too many output rows.
+  if (offset_ > std::numeric_limits<size_t>::max() - prior_offset_) {
     return 0;
   }
-  const size_t remaining = input - offset_;
+  const size_t skip = prior_offset_ + offset_;
+  const size_t input = child_->EmitRowCount();
+  if (input <= skip) {
+    return 0;
+  }
+  const size_t remaining = input - skip;
   if (with_ties_) {
     return remaining;
   }
@@ -61,7 +69,8 @@ bool TopNPlan::IsOrderedBy(
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
-    if (keys_[i].ascending != ascending[i] ||
+    if (keys_[i].ascending != ascending[i] || !keys_[i].expression ||
+        !expressions[i] ||
         keys_[i].expression->ToString() != expressions[i]->ToString()) {
       return false;
     }
@@ -98,7 +107,8 @@ std::string TopNPlan::ToString() const {
     if (i > 0) {
       output << ", ";
     }
-    output << keys_[i].expression->ToString()
+    output << (keys_[i].expression ? keys_[i].expression->ToString()
+                                   : "<missing expression>")
            << (keys_[i].ascending ? " ASC" : " DESC");
     // T2668: mirror SortPlan::KeysToString -- explicit NULLS placement is
     // part of the order contract IsOrderedBy checks, so it belongs in the

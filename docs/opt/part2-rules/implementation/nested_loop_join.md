@@ -36,8 +36,9 @@ graph TD
 
 1. **子ノード数**: 子ノードがちょうど2 つであること。
 2. **行位置要求の非存在**: 物理プロパティとして `require_row_position` が要求されていないこと。
+3. **等値結合代替案の優先**: 等値列ペアがあり、カタログ型が互換な場合は本 Rule から外し、hash/merge 等の実装へ委ねます。
 
-本 Rule は等値キー対の存在を要求しません。したがって、非等値条件のみを持つ結合であっても常に候補計画を返却します。
+本 Rule 自体は等値キー対を必要としません。ただし、型互換な等値列ペアがある結合は専用の hash/merge 実装へ委ねるため、本 Rule は候補を返しません。
 
 ## 意味論的根拠と述語の完全評価
 
@@ -80,8 +81,8 @@ graph TD
   }
 ```
 
-- **局所コスト計算**: $(|L| \times |R|) + |L| + |R|$。両入力の全件走査コストに加え、直積サイズに比例するタプルペア評価コストを加算します。
-- **ブロック化ネステッドループとの優先関係**: ブロック単位で処理を行う `batch_nested_loop` Rule とコストおよび行数見積もりが同点となりますが、RuleSetへの登録順において本 Rule（タプル版）が先に配置されているため、同点判定では本 Rule が優先されます。
+- **局所コスト計算**: $(|L| \times |R|) + |L| + |R|$。
+- **ブロック化ネステッドループとの優先関係**: `batch_nested_loop` は直積ペア部分に 0.8 の係数を適用するため、同じ入力ではタプル版より低コストになります。勝者は登録順ではなくコスト比較で決まります。
 
 ## 最適化効果
 
@@ -98,4 +99,4 @@ graph TD
 - `plan/optimizer_test_part2.cpp`:
   - `OptimizerTest.BatchNestedLoopExecutesNonEquiInnerJoin`: `nested_loop_join` を無効化した際にブロック化版へ正常に切り替わることを検証。
   - `OptimizerTest.BatchNestedLoopGateKeepsEquiJoins`: 等値結合において他の全結合 Rule が無効化された場合の挙動を検証。
-  - `OptimizerTest.CrossTableResidualPredicateIsAppliedByTheJoin`: 表間にまたがる述語が結合オペレータによって確実に評価されることを検証。
+  - `OptimizerTest.CrossTableResidualPredicateIsAppliedByTheJoin`: 表間述語の実行結果を検査しますが、タプル版 `NestedLoopJoin` の物理計画が選択されたことは assertion していません。前2件も当該 Rule を無効化するテストです。

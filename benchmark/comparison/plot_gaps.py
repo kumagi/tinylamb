@@ -57,7 +57,8 @@ def main():
         for engine in ('tinylamb', 'postgresql')}
     if any([r['trial'] for r in items] != list(range(5)) for items in hot.values()):
         p.error('five complete hot_update trials per engine are required')
-    reference = next(r['before']['postgresql'] for r in rows
+    reference_engine = rows[0]['before'].get('reference_engine', 'postgresql')
+    reference = next(r['before'][reference_engine] for r in rows
                      if r['before']['profile'] == 'unindexed' and
                      r['before']['workload'] == 'hot_update' and
                      r['before']['metric'] == 'p50_ms')

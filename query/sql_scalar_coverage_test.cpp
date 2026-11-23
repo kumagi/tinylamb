@@ -84,6 +84,17 @@ class SqlScalarCoverageTest : public ::testing::Test {
 
 // ------------------------------------------------------------- timestamps ---
 
+TEST_F(SqlScalarCoverageTest, CoalesceResolvesNumericTypeWithoutEvaluatingLaterArguments) {
+  for (const char* sql : {"SELECT COALESCE(1, 2.5)",
+                          "SELECT COALESCE(CAST(NULL AS FLOAT64), 1)",
+                          "SELECT COALESCE(1, CAST(1 / 0 AS FLOAT64))"}) {
+    SCOPED_TRACE(sql);
+    const Value value = Scalar(sql);
+    EXPECT_EQ(value.type, ValueType::kDouble);
+    EXPECT_EQ(value, Value(1.0));
+  }
+}
+
 TEST_F(SqlScalarCoverageTest, TimestampParsingHandlesFractionsAndTimeOnly) {
   // Explicit UTC keeps the epoch math independent of the host time zone.
   ExpectValue(
@@ -260,8 +271,8 @@ TEST_F(SqlScalarCoverageTest, JsonFunctionFamily) {
 // Bug 68: both JSON parsers (ParseJsonSimple in rewrite.cpp used by the
 // constant-fold rule, and parse_j in executor/detail/expression_eval.cpp)
 // recursed once per '['/'{' with no depth bound -- a deeply nested document
-// overflowed the stack.  Nesting beyond 512 levels now fails the parse and
-// yields NULL instead of crashing.
+// overflowed the stack. Nesting beyond the 256-level bound now fails the parse
+// and yields NULL instead of crashing.
 TEST_F(SqlScalarCoverageTest, JsonDeepNestingTerminatesCleanly) {
   const std::string deep_arr =
       std::string(600, '[') + "1" + std::string(600, ']');

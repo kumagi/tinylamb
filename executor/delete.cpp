@@ -119,13 +119,21 @@ bool DeleteExecutor::Execute(Row* dst, RowPosition* rp) {
       // still be supplied by a parent row the statement keeps
       // (p=(1,10),(1,20); DELETE WHERE tag=10 leaves a=1). On a unique
       // column no survivor can share the key and the match is final.
-      if (target_->GetSchema()
-              .GetColumn(check.parent_offset)
+      const Schema& target_schema = target_->GetSchema();
+      // The FK metadata may be stale (e.g. after a schema change); GetColumn
+      // has no bounds check, so validate the offset before indexing it.
+      if (check.parent_offset >= target_schema.ColumnCount()) {
+        return FailWith(StatusError(
+            StatusCode::kCorrupt,
+            "foreign key parent_offset out of range for table " +
+                std::string(target_schema.Name())));
+      }
+      if (target_schema.GetColumn(check.parent_offset)
               .GetConstraint()
               .IsUnique()) {
         return FailWith(StatusError(
             StatusCode::kConflicts,
-            "delete on table " + std::string(target_->GetSchema().Name()) +
+            "delete on table " + std::string(target_schema.Name()) +
                 " violates foreign key constraint (referenced by " +
                 std::string(check.child->GetSchema().Name()) + ")"));
       }
@@ -240,7 +248,6 @@ bool DeleteExecutor::Execute(Row* dst, RowPosition* rp) {
   }
   if (assert_rows_modified_ >= 0 && count != assert_rows_modified_) {
     return FailWith(StatusError(StatusCode::kInvalidArgument,
-
                                 "ASSERT_ROWS_MODIFIED was specified with " +
                                     std::to_string(assert_rows_modified_) +
                                     " rows, but " + std::to_string(count) +

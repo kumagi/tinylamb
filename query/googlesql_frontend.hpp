@@ -28,17 +28,23 @@ struct GoogleSqlParseResult {
   bool ok{false};
   std::string ast;
   std::string error;
+  bool retryable{false};
 };
 
 // Runs the pinned GoogleSQL parser and returns its parser AST dump. Tinylamb
 // consumes this tree directly and never parses the SQL text a second time.
 // Parses are memoised in a sharded cache whose total capacity is configured at
-// runtime by TINYLAMB_PARSE_CACHE_SIZE; the shard count and capacity are not
-// fixed constants of this API.
+// runtime by TINYLAMB_PARSE_CACHE_SIZE; the implementation currently uses a
+// fixed 16-shard cache.
 class GoogleSqlFrontend {
  public:
   [[nodiscard]] static GoogleSqlParseResult Parse(std::string_view sql);
   [[nodiscard]] static bool Available();
+
+  // Test hook: total memoised statements across all cache shards. Lets the
+  // eviction test prove the cache stays bounded instead of only checking that
+  // a fresh statement still parses.
+  [[nodiscard]] static size_t CachedStatementCountForTest();
 };
 
 }  // namespace tinylamb

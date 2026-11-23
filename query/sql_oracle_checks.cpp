@@ -647,6 +647,9 @@ bool CheckTlpAgg(Database& db, TransactionContext& ctx,
                  const std::vector<std::string>& tlp_agg, std::string* report,
                  bool verbose) {
   if (tlp_agg.size() != 4) {
+    *report += "[TLP AGG MISSING ARMS]\n";
+    *report += "  expected 4 aggregate arms, got " +
+               std::to_string(tlp_agg.size()) + "\n";
     return true;
   }
   std::string error;
@@ -669,7 +672,15 @@ bool CheckTlpAgg(Database& db, TransactionContext& ctx,
       // would let 1-2 cell rows through into the out-of-bounds r[1]/r[2] reads.
       if (r.Count() < 3 || r[1].IsNull() || r[1].type != ValueType::kInt64 ||
           (!r[2].IsNull() && r[2].type != ValueType::kInt64)) {
-        return false;  // unexpected aggregate output shape: skip
+        // A short/typed-wrong aggregate row is a result-shape regression, not
+        // an unavailable oracle. Returning false here used to be converted to
+        // "skipped recorded oracle arm" by ReplayOracleTrace, letting a
+        // committed regression replay as a false green.
+        *report += "[TLP AGG ROW SHAPE MISMATCH]\n";
+        *report += "  sql: " + tlp_agg[static_cast<size_t>(i)] + "\n";
+        *report += "  unexpected aggregate output row shape (cells=" +
+                   std::to_string(r.Count()) + ")\n";
+        return true;
       }
     }
   }
@@ -948,6 +959,8 @@ void AnalyzeCreatedTables(Database& db, TransactionContext& ctx,
 bool CheckPqs(Database& db, TransactionContext& ctx, const OracleTrace& t,
               std::string* report, bool verbose) {
   if (t.pqs_count.empty() || t.pqs_u.empty()) {
+    *report += "[PQS MISSING ARMS]\n";
+    *report += "  count=" + t.pqs_count + " pivot=" + t.pqs_u + "\n";
     return true;
   }
   std::string error;
@@ -960,20 +973,24 @@ bool CheckPqs(Database& db, TransactionContext& ctx, const OracleTrace& t,
     return false;
   }
   bool pivot_found = false;
+  bool shape_bad = false;
   for (const Row& r : *us) {
     // A schema/EXPLAIN regression can yield rows with no cells; r[0] would
     // be an out-of-bounds access. Count() is the cell count (Size() is the
-    // serialized byte length).
+    // serialized byte length). Such a row is itself a shape regression, not
+    // something to skip: another row holding the pivot must not hide it.
     if (r.Count() < 1) {
+      *report += "[PQS ROW SHAPE MISMATCH]\n";
+      *report += "  " + t.pqs_u + "\n";
+      shape_bad = true;
       continue;
     }
     if (r[0] == Value(t.pqs_pivot_u)) {
       pivot_found = true;
-      break;
     }
   }
   const bool count_ok = *count == std::to_string(t.pqs_expected);
-  if (count_ok && pivot_found) {
+  if (count_ok && pivot_found && !shape_bad) {
     return true;
   }
   *report += "[PQS MISMATCH]\n";
@@ -1011,7 +1028,13 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
     }
   }
   if (!t.table.empty()) {
-    RunUpdate(db, ctx, "ANALYZE " + t.table + ";");
+    std::string analyze_error;
+    if (!RunUpdate(db, ctx, "ANALYZE " + t.table + ";", &analyze_error)) {
+      *report += "[INDEX ANALYZE FAILED]\n";
+      *report += "  table: " + t.table + "\n";
+      *report += "  error: " + analyze_error + "\n";
+      return true;
+    }
   }
   auto after = RunScalar(db, ctx, t.index_probe, &error);
   if (!after.has_value()) {
@@ -1121,10 +1144,16 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
   // (e.g. the suffixed table below) publishes them as well and the oracle
   // probes an inconsistent catalog. Roll back the partial work first, then
   // continue from a fresh context.
-  if (!lst_ready || ctx.txn_.PreCommit() != Status::kSuccess) {
-    static_cast<void>(ctx.txn_.Abort());
-  }
+  const Status rollback_status =
+      !lst_ready || ctx.txn_.PreCommit() != Status::kSuccess
+          ? ctx.txn_.Abort()
+          : Status::kSuccess;
   ctx = db.BeginContext();
+  if (rollback_status != Status::kSuccess) {
+    *report += "[XMODE SETUP ROLLBACK FAILED] " + rollback_status.GetMessage() +
+               "\n";
+    return false;
+  }
 
   for (const std::string& sql : t.xmode_probes) {
     std::string error;
@@ -1466,7 +1495,10 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
       const int64_t u = CellInt(r[0]);
       const int64_t got = CellInt(r[1]);
       rendered.push_back(std::to_string(u) + "=" + std::to_string(got));
-      if (!seen_u.insert(u).second) {
+      // Shape-only kinds (empty model) validate the frame shape, not a pinned
+      // key set, so a repeated u is legitimate there. Guard the duplicate
+      // check the same way the extra/missing checks below are guarded.
+      if (!expected.empty() && !seen_u.insert(u).second) {
         *report += "[WINDOW DUPLICATE ROW]\n";
         *report += "  sql: " + sql + "\n";
         *report += "  u=" + std::to_string(u) + " returned more than once\n";

@@ -16,7 +16,10 @@
 #include "executor/zone_map.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/in_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "gtest/gtest.h"
+#include "table/lstable_bridge.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -24,6 +27,16 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(DataChunkTest, EmptyReboundColumnDoesNotAdvertiseCollation) {
+  ColumnVector column(ValueType::kNull);
+  column.RebindEmptyType(ValueType::kVarChar, false,
+                         Collation::kCaseInsensitive);
+  EXPECT_EQ(column.ColumnCollation(), Collation::kNone);
+
+  column.Append(Value());
+  EXPECT_EQ(column.ColumnCollation(), Collation::kCaseInsensitive);
+}
 
 TEST(DataChunkTest, AuditIntervalsRetainDomainAcrossBatchCopies) {
   ColumnVector column(ValueType::kVarChar);
@@ -719,8 +732,10 @@ TEST(DataChunkTest, ZoneMapStringExtremesStayCorrectUnderBufferReuse) {
   map.AddString("cc");
   ASSERT_TRUE(map.Minimum().has_value());
   ASSERT_TRUE(map.Maximum().has_value());
-  EXPECT_EQ(map.Minimum()->value.varchar_value, "aa");  // NOLINT(bugprone-unchecked-optional-access)
-  EXPECT_EQ(map.Maximum()->value.varchar_value, long_hi);  // NOLINT(bugprone-unchecked-optional-access)
+  EXPECT_EQ(map.Minimum()->value.varchar_value,
+            "aa");  // NOLINT(bugprone-unchecked-optional-access)
+  EXPECT_EQ(map.Maximum()->value.varchar_value,
+            long_hi);  // NOLINT(bugprone-unchecked-optional-access)
   EXPECT_EQ(map.ValueCount(), 6U);
 }
 
@@ -811,6 +826,125 @@ TEST(ZoneMapTest, NanRowsNoLongerDisableFiniteEnvelope) {
   nan_only.AddDouble(nan);
   EXPECT_TRUE(nan_only.MayMatch(BinaryOperation::kEquals, Value(1.0)));
   EXPECT_TRUE(nan_only.MayMatch(BinaryOperation::kGreaterThan, Value(1.0)));
+}
+
+TEST(ZoneMapTest, BlockKleenePrunesCompoundDisjunctionsNullsAndAllPass) {
+  const Schema schema(
+      "bk", {Column("x", ValueType::kInt64), Column("d", ValueType::kDouble)});
+
+  LSTablePageBlock blk;
+  blk.row_count = 100;
+  blk.columns.resize(2);
+  blk.columns[0].type = ValueType::kInt64;
+  blk.columns[0].has_null = false;
+  blk.columns[0].has_min_max = true;
+  blk.columns[0].min_int = 10;
+  blk.columns[0].max_int = 20;
+
+  blk.columns[1].type = ValueType::kDouble;
+  blk.columns[1].has_null = false;
+  blk.columns[1].has_double_min_max = true;
+  blk.columns[1].min_double = 1.0;
+  blk.columns[1].max_double = 5.0;
+
+  // `(x < 0 OR x > 100)` -> F or F = F -> CanSkip.
+  Expression disj_skip = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(0))),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(100))));
+  KleeneMask m = EvaluateBlockKleene(disj_skip, schema, blk);
+  EXPECT_EQ(m, kKleeneF);
+  EXPECT_TRUE(BlockKleeneCanSkip(m));
+  EXPECT_FALSE(BlockKleeneAllPass(m));
+
+  // `NOT (x < 0 OR x > 100)` -> T -> AllPass.
+  Expression not_disj = UnaryExpressionExp(disj_skip, UnaryOperation::kNot);
+  m = EvaluateBlockKleene(not_disj, schema, blk);
+  EXPECT_EQ(m, kKleeneT);
+  EXPECT_FALSE(BlockKleeneCanSkip(m));
+  EXPECT_TRUE(BlockKleeneAllPass(m));
+
+  // `(x IN (5, 25))` -> F -> CanSkip; `(x IN (5, 15))` -> TF.
+  Expression in_miss = InExpressionExp(
+      ColumnValueExp("x"),
+      {ConstantValueExp(Value(5)), ConstantValueExp(Value(25))});
+  EXPECT_TRUE(BlockKleeneCanSkip(EvaluateBlockKleene(in_miss, schema, blk)));
+
+  Expression in_hit = InExpressionExp(
+      ColumnValueExp("x"),
+      {ConstantValueExp(Value(5)), ConstantValueExp(Value(15))});
+  EXPECT_EQ(EvaluateBlockKleene(in_hit, schema, blk), kKleeneTF);
+
+  // `x IS NULL` on non-null block -> F -> CanSkip; `IS NOT NULL` -> T ->
+  // AllPass.
+  Expression x_is_null =
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNull);
+  Expression x_is_not_null =
+      UnaryExpressionExp(ColumnValueExp("x"), UnaryOperation::kIsNotNull);
+  EXPECT_TRUE(BlockKleeneCanSkip(EvaluateBlockKleene(x_is_null, schema, blk)));
+  EXPECT_TRUE(
+      BlockKleeneAllPass(EvaluateBlockKleene(x_is_not_null, schema, blk)));
+
+  // All-NULL INT64 and DOUBLE blocks: comparisons yield only U -> CanSkip.
+  LSTablePageBlock all_null;
+  all_null.row_count = 50;
+  all_null.columns.resize(2);
+  all_null.columns[0].type = ValueType::kInt64;
+  all_null.columns[0].has_null = true;
+  all_null.columns[0].has_min_max = false;
+  all_null.columns[1].type = ValueType::kDouble;
+  all_null.columns[1].has_null = true;
+  all_null.columns[1].has_double_min_max = false;
+  all_null.columns[1].has_nan = false;
+
+  EXPECT_EQ(EvaluateBlockKleene(disj_skip, schema, all_null), kKleeneU);
+  EXPECT_TRUE(
+      BlockKleeneCanSkip(EvaluateBlockKleene(disj_skip, schema, all_null)));
+  EXPECT_TRUE(
+      BlockKleeneAllPass(EvaluateBlockKleene(x_is_null, schema, all_null)));
+  EXPECT_TRUE(BlockKleeneCanSkip(EvaluateBlockKleene(
+      BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(2.0))),
+      schema, all_null)));
+
+  // NaN-bearing DOUBLE block: conservatively refuses AllPass and keeps T/F/U/E.
+  LSTablePageBlock nan_blk = blk;
+  nan_blk.columns[1].has_nan = true;
+  Expression d_eq_3 =
+      BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(3.0)));
+  EXPECT_FALSE(
+      BlockKleeneCanSkip(EvaluateBlockKleene(d_eq_3, schema, nan_blk)));
+  EXPECT_FALSE(
+      BlockKleeneAllPass(EvaluateBlockKleene(d_eq_3, schema, nan_blk)));
+
+  // Error-propagating disjunction: `(x = 5) OR (1 / 0 = 1)`:
+  // Even though x in [10,20] makes `x = 5` F, the second arm has kKleeneE so
+  // BlockKleeneCanSkip MUST be false!
+  Expression boom_or = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                              BinaryOperation::kDivide,
+                                              ConstantValueExp(Value(0))),
+                          BinaryOperation::kEquals,
+                          ConstantValueExp(Value(1))));
+  m = EvaluateBlockKleene(boom_or, schema, blk);
+  EXPECT_NE(m & kKleeneE, 0);
+  EXPECT_FALSE(BlockKleeneCanSkip(m));
+  EXPECT_FALSE(BlockKleeneAllPass(m));
+
+  // Partial projected block missing column 1 must conservatively return
+  // kKleeneAll without throwing out_of_range.
+  LSTablePageBlock proj_blk;
+  proj_blk.row_count = 10;
+  std::vector<size_t> proj_offsets = {0, SIZE_MAX};
+  proj_blk.columns.Project(proj_offsets, 1);
+  proj_blk.columns[0] = blk.columns[0];
+  EXPECT_EQ(EvaluateBlockKleene(d_eq_3, schema, proj_blk), kKleeneAll);
 }
 
 }  // namespace tinylamb

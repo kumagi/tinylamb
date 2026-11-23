@@ -186,9 +186,7 @@ int FuzzChunkFooterOneInput(const uint8_t* data, size_t size) {
   }
 
   int64_t probe = 0;
-  if (size >= 16) {
-    std::memcpy(&probe, data + size - 8, 8);
-  }
+  std::memcpy(&probe, data + size - 8, sizeof(probe));
 
   const size_t trailer_lo = bytes.size() - 4;
 

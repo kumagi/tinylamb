@@ -1,5 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include <cstddef>
+
 #include "executor/executor_feature_test.hpp"
 
 namespace tinylamb {
@@ -427,7 +429,7 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationSpillsUnderTinyBudget) {
   Run("CREATE TABLE big2(x INT64)");
   for (int64_t base = 0; base < 4; ++base) {
     std::string values;
-    values.reserve(40 * 6);
+    values.reserve(static_cast<size_type>(40 * 6));
     for (int64_t i = 0; i < 40; ++i) {
       if (i != 0) {
         values += ", ";
@@ -445,6 +447,12 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationSpillsUnderTinyBudget) {
   const auto intersect = Exec(
       "SELECT x FROM big1 INTERSECT DISTINCT SELECT x FROM big2 ORDER BY x");
   EXPECT_EQ(intersect.size(), 40U);
+  // UNION ALL used to be exempt from the budget check although its input is
+  // materialized identically. Under the same tiny budget it must still return
+  // every row from both sources.
+  const auto union_all =
+      Exec("SELECT x FROM big1 UNION ALL SELECT x FROM big2 ORDER BY x");
+  EXPECT_EQ(union_all.size(), 320U);
 }
 
 // ===========================================================================

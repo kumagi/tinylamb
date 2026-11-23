@@ -96,7 +96,7 @@ if (reflexive) {
 ## 関連 Rule との相互作用
 
 - `not_null_is_not_null_elimination`: 対象列がカタログ上で NOT NULL 宣言されている場合、本 Rule が生成した `x IS NOT NULL` をさらに完全消去します。
-- `eliminate_true_selection`: `x <= x` 等から生じた恒真述語を後続で消去します。
+- `eliminate_true_selection`: 定数 `TRUE` の Selection を消去します。NULL 保存のため本 Rule が生成する CASE 式は定数ではないため、この後続 Rule の対象にはなりません。
 
 ## 検証テスト
 

@@ -322,8 +322,7 @@ ARRAY<STRUCT<dept_id INT64, role STRING, total_sal INT64>>[
   {10, NULL, 22000},
   {20, "Lead", 7000},
   {20, "Sales", 5000},
-  {20, NULL, 12000},
-  {NULL, NULL, 34000}
+  {20, NULL, 12000}
 ]
 ==
 
@@ -336,13 +335,13 @@ GROUP BY ROLLUP (dept_id, role)
 ORDER BY dept_id, role
 --
 ARRAY<STRUCT<dept_id INT64, role STRING, total_sal INT64>>[
+  {NULL, NULL, 34000},
   {10, "Eng", 14000},
   {10, "Lead", 8000},
   {10, NULL, 22000},
   {20, "Lead", 7000},
   {20, "Sales", 5000},
-  {20, NULL, 12000},
-  {NULL, NULL, 34000}
+  {20, NULL, 12000}
 ]
 ==
 

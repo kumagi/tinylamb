@@ -236,6 +236,18 @@ TEST(CollationTest, CompareWithCollationIsATotalOrder) {
   }
 }
 
+TEST(CollationTest, InclusiveComparisonAcceptsCaseInsensitivePeers) {
+  const Value upper = Ci("A");
+  const Value lower("a");
+  EXPECT_FALSE(upper < lower);
+  EXPECT_FALSE(upper > lower);
+  EXPECT_TRUE(upper <= lower);
+  EXPECT_TRUE(upper >= lower);
+  EXPECT_TRUE(lower <= upper);
+  EXPECT_TRUE(lower >= upper);
+  EXPECT_NE(upper, lower);
+}
+
 TEST(CollationTest, EqualUnderCollationKeepsValueEqualitySemantics) {
   EXPECT_TRUE(EqualUnderCollation(Ci("abc"), Ci("ABC")));
   EXPECT_TRUE(EqualUnderCollation(Ci("abc"), Value("ABC")));
@@ -297,14 +309,17 @@ TEST(CollationTest, SortKeyOrderResolvesKeyAndValueCollationsTogether) {
   const SortKeyOrder from_value{true};
   EXPECT_EQ(from_value.Compare(Ci("a"), Ci("B")),
             from_key.Compare(Value("a"), Value("B")));
-  // A binary key keeps byte order for two untagged operands, but an operand
-  // that carries a case-insensitive tag still resolves for the whole
-  // comparison, exactly as it does for the `=` predicate.
-  const SortKeyOrder binary{true, std::nullopt, Collation::kBinary};
+  SortKeyOrder binary{true, std::nullopt, Collation::kBinary};
   EXPECT_LT(binary.Compare(Value("B"), Value("a")), 0);
-  EXPECT_LT(binary.Compare(Ci("a"), Ci("B")), 0);
-  EXPECT_EQ(binary.Compare(Ci("a"), Value("A")), 0);
-  EXPECT_FALSE(binary.Precedes(Value("a"), Ci("A")));
+  EXPECT_EQ(binary.Observe(Value("B")), Status::kSuccess);
+  EXPECT_EQ(binary.Observe(Ci("b")), Status::kInvalidArgument);
+  SortKeyOrder dynamic{true};
+  EXPECT_EQ(dynamic.Observe(Value()), Status::kSuccess);
+  EXPECT_EQ(dynamic.Observe(Ci("b")), Status::kSuccess);
+  EXPECT_EQ(dynamic.Observe(Value("B")), Status::kInvalidArgument);
+  EXPECT_LT(dynamic.Compare(Value("B"), Value("a")), 0);
+  EXPECT_LT(dynamic.Compare(Value("a"), Ci("b")), 0);
+  EXPECT_LT(dynamic.Compare(Value("B"), Ci("b")), 0);
 }
 
 TEST(CollationTest, MakeSortKeyOrderMatchesAnyKeyShape) {

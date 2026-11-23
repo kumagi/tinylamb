@@ -8,7 +8,7 @@
 
 ## 概要
 
-論理 ORDER BY の2つの物理形 (`plan/sort_plan.hpp` 参照) のうち、
+論理 ORDER BY の3つの物理形（バッファソート、外部マージソート、増分ソート）のうち、
 推定行数が `SortRowCapacity(SortMemoryPolicy)` を超える場合の
 外部マージソート半分です。`spill_threshold_rows` 到達ごとに整列済みランを
 spill file へ書き出し (末尾ランも含む)、`merge_window_rows` 行のウィンドウで

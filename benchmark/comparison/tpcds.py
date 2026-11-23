@@ -37,6 +37,19 @@ def sha(path):
     return h.hexdigest()
 
 
+def cpu_model():
+    try:
+        lines = Path('/proc/cpuinfo').read_text(errors='replace').splitlines()
+    except OSError:
+        lines = []
+    for key in ('model name', 'Hardware', 'Processor'):
+        model = next((line.split(':', 1)[1].strip() for line in lines
+                      if line.startswith(key + ':')), '')
+        if model:
+            return model
+    return platform.processor() or platform.machine() or 'unknown'
+
+
 def freeze_build_inputs(binary, cache_text, output):
     """Keep optional profile/allocator inputs needed to reproduce the build."""
     destination = output / 'build-inputs'
@@ -343,7 +356,8 @@ def report(out):
     ax.set_ylabel('DuckDB / tinylamb median time (log)')
     ax.grid(axis='y', alpha=.2)
     ax.set_title(f'{label} derived / SF={meta["dataset"]["scale_factor"]} / {meta["args"]["threads"]} threads / '
-                 f'tinylamb faster on {summary["tinylamb_wins"]}/{len(records)} queries\n'
+                 f'tinylamb faster on {summary["tinylamb_wins"]}/{len(records)} attempted queries; '
+                 f'{len(summary["unattempted_queries"])} not attempted\n'
                  'Above 1: tinylamb faster; below 1: DuckDB faster. Binary64; not a certified TPC score.')
     fig.savefig(out / 'speedup.png', dpi=180)
     fig.savefig(out / 'speedup.svg')
@@ -475,7 +489,7 @@ def main(suite="tpcds"):
                                    'python': sys.version, 'platform': platform.platform(),
                                    'compiler': subprocess.check_output([compiler, '--version'], text=True).strip(),
                                    'load_average': os.getloadavg(),
-                                   'cpu_model': Path('/proc/cpuinfo').read_text().split('model name')[1].splitlines()[0],
+                                   'cpu_model': cpu_model(),
                                    'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                                    'binary_sha256': sha(binary), 'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                    'timing': 'embedded Execute + full result collection; serialization, transaction setup and load excluded'})

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -38,6 +39,14 @@ inline void StoreWordMask(ValidityBitmap* out_mask, size_t word_index,
   auto& words = out_mask->Words();
   const uint64_t valid_mask = (uint64_t{1} << valid_bits) - 1;
   words[word_index] |= word_mask & valid_mask;
+}
+
+// BinaryExpression::TryEvaluateBinary returns TRUE for `NaN != anything`
+// (including NaN != NaN). Every CompareDouble path -- vector body, scalar
+// tail and generic fallback -- must use the same unordered predicate so the
+// answer cannot depend on the row count or the host CPU.
+inline bool DoubleNotEquals(double value, double target) {
+  return value != target || std::isnan(value) || std::isnan(target);
 }
 
 template <typename T, typename Cmp>
@@ -242,7 +251,8 @@ TINYLAMB_AVX2_TARGET void EvaluateScalarDoubleAvx2Op(const double* data,
       const double value = data[base + i];
       const bool matches =
           (op == BinaryOperation::kEquals && value == target) ||
-          (op == BinaryOperation::kNotEquals && value != target) ||
+          (op == BinaryOperation::kNotEquals &&
+           DoubleNotEquals(value, target)) ||
           (op == BinaryOperation::kLessThan && value < target) ||
           (op == BinaryOperation::kLessThanEquals && value <= target) ||
           (op == BinaryOperation::kGreaterThan && value > target) ||
@@ -263,10 +273,10 @@ void EvaluateScalarDoubleAvx2(const double* data, size_t count,
       EvaluateScalarDoubleAvx2Op<_CMP_EQ_OQ>(data, count, target, op, out_mask);
       return;
     case BinaryOperation::kNotEquals:
-      // OQ (quiet, ordered) matches the IEEE scalar tail where NaN != NaN is
-      // false. UQ would report true for NaN and split the result depending on
-      // whether the row landed in the vector body or the scalar tail.
-      EvaluateScalarDoubleAvx2Op<_CMP_NEQ_OQ>(data, count, target, op,
+      // UQ (unordered) matches the engine's `NaN != anything == true` rule.
+      // OQ made the vector body disagree with the scalar tail whenever a NaN
+      // row was involved, so the answer depended on the row count.
+      EvaluateScalarDoubleAvx2Op<_CMP_NEQ_UQ>(data, count, target, op,
                                               out_mask);
       return;
     case BinaryOperation::kLessThan:
@@ -448,6 +458,9 @@ void EvaluateScalarDoubleNeon(const double* data, size_t count,
         c1 = vceqq_f64(v1, target_vec);
         break;
       case BinaryOperation::kNotEquals:
+        // Inverting the ordered-equal mask yields the *unordered* not-equal
+        // mask (true for NaN lanes), which is what the engine's
+        // TryEvaluateBinary and the scalar tail below both return.
         c0 = vreinterpretq_u64_u32(
             vmvnq_u32(vreinterpretq_u32_u64(vceqq_f64(v0, target_vec))));
         c1 = vreinterpretq_u64_u32(
@@ -483,7 +496,8 @@ void EvaluateScalarDoubleNeon(const double* data, size_t count,
       const double value = data[base + i];
       const bool matches =
           (op == BinaryOperation::kEquals && value == target) ||
-          (op == BinaryOperation::kNotEquals && value != target) ||
+          (op == BinaryOperation::kNotEquals &&
+           DoubleNotEquals(value, target)) ||
           (op == BinaryOperation::kLessThan && value < target) ||
           (op == BinaryOperation::kLessThanEquals && value <= target) ||
           (op == BinaryOperation::kGreaterThan && value > target) ||
@@ -563,8 +577,9 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
                                out_mask);
       break;
     case BinaryOperation::kNotEquals:
-      EvaluateScalarComparison(data, count, target, std::not_equal_to<>(),
-                               out_mask);
+      EvaluateScalarComparison(
+          data, count, target,
+          [](double a, double b) { return DoubleNotEquals(a, b); }, out_mask);
       break;
     case BinaryOperation::kLessThan:
       EvaluateScalarComparison(data, count, target, std::less<>(), out_mask);
@@ -587,9 +602,9 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
 }
 
 void SimdComparisonKernel::CompareString(const std::string_view* data,
-                                               size_t count, BinaryOperation op,
-                                               std::string_view target,
-                                               ValidityBitmap* out_mask) {
+                                         size_t count, BinaryOperation op,
+                                         std::string_view target,
+                                         ValidityBitmap* out_mask) {
   if (out_mask == nullptr) {
     return;
   }

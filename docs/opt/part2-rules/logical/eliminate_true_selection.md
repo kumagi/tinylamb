@@ -35,7 +35,8 @@ graph TD
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           if (!expression.predicate || !*expression.predicate ||
-              (*expression.predicate)->Type() != TypeTag::kConstantValue) {
+              (*expression.predicate)->Type() != TypeTag::kConstantValue ||
+              ContainsParameterSlot(*expression.predicate)) {
             return;
           }
           const Value value =
@@ -47,7 +48,7 @@ graph TD
 
 適用条件は以下の2点です。
 
-1. **定数述語の存在**: 述語ポインタが有効であり、かつ型が静的な定数（`TypeTag::kConstantValue`）であること。
+1. **定数述語の存在**: 述語ポインタが有効であり、かつ型が静的な定数（`TypeTag::kConstantValue`）であること。さらに `ContainsParameterSlot(*expression.predicate)` が真でも発火しません。パラメータスロットは埋め込み時に TRUE リテラルに見えても実行時に FALSE になり得るため、これを消すと行が過剰に出力されます。
 2. **非NULLかつ真**: 定数値が NULL でなく、かつ `Truthy()` が真であること。
 
 ガード条件を通過した場合、入力 Group（`bindings.at("input")`）に属する各代替式を親 Group（`group`）へ複製します。この際、自己参照ループを防ぐため、親 Group 自身を子ノードとして参照している式は複製から除外されます。
@@ -76,6 +77,10 @@ graph TD
 複製ループ内の `refs_group` チェックは、メモ内における循環参照の発生を防止する必須の事前条件です。入力 Group 内の式が親 Group 自身を参照している場合、それを親 Group へそのまま登録すると「自分自身を子に持つ式」が形成され、`Memo::AddExpression` の契約違反アサーションが失敗します。
 
 ## 実装の詳細
+
+複製に先立って `InheritBranchLocal(memo, group, input)` と
+`memo.MergeScanFilter(group, input_group.filter)` を実行し、branch-local
+印と scan filter を親 Group へ移します。
 
 - **複製による短絡化**: 本 Rule は選択演算ノードを削除するのではなく、子 Group 内の式群を親 Group に複製（インライン化）することで短絡経路を構築します。これにより、物理計画探索器は選択オペレータを完全にスキップして入力アクセスパスを直接採用できます。
 - **指紋照合による重複排除**: 親 Group にすでに同一の式が存在する場合、`Memo::AddExpression` の指紋照合によって重複登録が阻止されます。

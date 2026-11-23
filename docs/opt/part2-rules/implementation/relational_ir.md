@@ -102,5 +102,5 @@ Cascades 最適化パイプラインにおける致命的エラーを回避し�
 ## 検証テスト
 
 - `plan/plan_extra_test.cpp`:
-  - `RelationalPlanExtraTest.DumpToStringAndRowCounts`: `RelationalPlan` の文字列表現、行数アクセス（`AccessRowCount` / `EmitRowCount` が 0）、走査ソースの非存在を検証。
+  - `RelationalPlanExtraTest.DumpToStringAndRowCounts`: `RelationalPlan` の表示と行数アクセスの基本契約を検証します。これは kRelational の Rule 発火や `OptimizeRelational` の縮退経路を検証するものではありません。
 

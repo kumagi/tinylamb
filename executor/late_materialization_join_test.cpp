@@ -147,10 +147,11 @@ class LateMaterializationJoinTest : public ::testing::Test {
     ASSERT_SUCCESS(setup.txn_.PreCommit());
 
     TransactionContext statistics_context = database_->BeginContext();
-    database_->RefreshStatistics(statistics_context, "LMLeft");
-    database_->RefreshStatistics(statistics_context, "LMRight");
-    database_->RefreshStatistics(statistics_context, "LMRightUnique");
-    database_->RefreshStatistics(statistics_context, "LMEmpty");
+    ASSERT_SUCCESS(database_->RefreshStatistics(statistics_context, "LMLeft"));
+    ASSERT_SUCCESS(database_->RefreshStatistics(statistics_context, "LMRight"));
+    ASSERT_SUCCESS(
+        database_->RefreshStatistics(statistics_context, "LMRightUnique"));
+    ASSERT_SUCCESS(database_->RefreshStatistics(statistics_context, "LMEmpty"));
     ASSERT_SUCCESS(statistics_context.txn_.PreCommit());
 
     context_ = std::make_unique<TransactionContext>(database_->BeginContext());
@@ -164,7 +165,7 @@ class LateMaterializationJoinTest : public ::testing::Test {
 
   void TearDown() override {
     if (context_ != nullptr && !context_->IsFinished()) {
-      context_->txn_.PreCommit();
+      EXPECT_SUCCESS(context_->txn_.PreCommit());
     }
     database_->DeleteAll();
   }

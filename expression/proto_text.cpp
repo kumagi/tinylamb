@@ -435,7 +435,11 @@ StatusOr<Value> ApplyReadConversion(FieldFormat format, Value v) {
         // Decimal-encoded 0 reads as NULL (unset DATE).
         return Value();
       }
-      if (dec < 9999999) {
+      // A YYYYMMDD decimal has at least five digits (0001-01-01 -> 10101).
+      // The old 9999999 cutoff rejected every date before year 1000 and
+      // returned the raw INT64, breaking the DATE round-trip. Values that
+      // cannot be a date decimal (fewer than five digits) stay untouched.
+      if (dec < 10000) {
         return v;
       }
       const int day = static_cast<int>(dec % 100);
@@ -487,15 +491,16 @@ StatusOr<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
       if (v.type != ValueType::kDate) {
         return v;
       }
-      const std::string text = FormatDateDays(v.DateDays());
-      // The text is produced by FormatDateDays and is always a valid date.
-      const int yr =
-          std::atoi(text.substr(0, 4).c_str());  // NOLINT(cert-err34-c)
-      const int mon =
-          std::atoi(text.substr(5, 2).c_str());  // NOLINT(cert-err34-c)
-      const int day =
-          std::atoi(text.substr(8, 2).c_str());  // NOLINT(cert-err34-c)
-      return Value((int64_t{yr} * 10000) + (int64_t{mon} * 100) + day);
+      ASSIGN_OR_RETURN(std::string, text, TryFormatDateDays(v.DateDays()));
+      // The formatter emits decimal year, month and day separated by '-'.
+      // Its year field can exceed four digits.
+      int64_t decimal = 0;
+      for (const char c : text) {
+        if (c != '-') {
+          decimal = (decimal * 10) + (c - '0');
+        }
+      }
+      return Value(decimal);
     }
     case FieldFormat::kTsSeconds:
     case FieldFormat::kTsMillis:
@@ -596,10 +601,6 @@ std::optional<Value> DefaultForAbsentField(std::string_view field) {
       if (format == FieldFormat::kDateDays ||
           format == FieldFormat::kDateDecimal) {
         return Value::DateFromDays(ParseDateDays(entry.text));
-      }
-      const std::optional<int64_t> nanos = ParseTimestampText(entry.text);
-      if (nanos.has_value()) {
-        return Value(entry.text);
       }
       return Value(entry.text);
     }
@@ -986,7 +987,6 @@ bool IsKnownMessageField(std::string_view lower_name) {
           "array_of_nullable_date",
           "nullable_array_of_nullable_date",
           "string_int32_map",
-          "value",  // extension wrapper message (KitchenSinkPB.value)
       });
   return kFields->contains(std::string(lower_name));
 }
@@ -1053,11 +1053,14 @@ KnownEnumFields() {
           {"googlesql_test.kitchensinkpb/test_enum",
            {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
           {"googlesql_test.kitchensinkenumpb/required_test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2", "TESTENUM2147483647",
+            "TESTENUMNEGATIVE"}},
           {"googlesql_test.kitchensinkenumpb/test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2", "TESTENUM2147483647",
+            "TESTENUMNEGATIVE"}},
           {"googlesql_test.kitchensinkenumpb/repeated_test_enum",
-           {"TESTENUM0", "TESTENUM1", "TESTENUM2"}},
+           {"TESTENUM0", "TESTENUM1", "TESTENUM2", "TESTENUM2147483647",
+            "TESTENUMNEGATIVE"}},
           {"googlesql_test.proto3kitchensink/test_enum",
            {"ENUM0", "ENUM1", "ENUM2"}},
           {"googlesql_test.proto3kitchensink/repeated_test_enum",
@@ -1571,6 +1574,7 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
 
   // Intermediate segment: descend into matching message entries.
   std::vector<ProtoTextEntry> rewritten = entries;
+  bool changed = false;
   for (ProtoTextEntry& entry : rewritten) {
     if (!NameEquals(entry.name, target) || !entry.is_message) {
       continue;
@@ -1580,16 +1584,22 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
         SetFieldInBody(entry.text, path, depth + 1, new_value, type_name));
     if (nested.has_value()) {
       entry.text = *nested;
-      std::string merged;
-      merged.reserve(rewritten.size());
-      for (const ProtoTextEntry& e : rewritten) {
-        if (!merged.empty()) {
-          merged.push_back(' ');
-        }
-        merged += RenderEntry(e);
-      }
-      return std::optional<std::string>(std::move(merged));
+      changed = true;
     }
+  }
+  // The read path visits every parent with this name, so SET must rewrite
+  // every one of them. Returning at the first match left later parents with
+  // the old leaf value and made GET mix updated and stale values.
+  if (changed) {
+    std::string merged;
+    merged.reserve(rewritten.size());
+    for (const ProtoTextEntry& e : rewritten) {
+      if (!merged.empty()) {
+        merged.push_back(' ');
+      }
+      merged += RenderEntry(e);
+    }
+    return std::optional<std::string>(std::move(merged));
   }
   // GoogleSQL refuses to assign through a missing intermediate submessage
   // (it reads as NULL); creating it implicitly is not allowed.
@@ -1667,10 +1677,11 @@ Status TryValidateEnumFieldValue(const std::string& type_name,
     if (proto3) {
       return Status::kSuccess;
     }
-    return StatusError(
-        StatusCode::kInvalidArgument,
-        "Could not store value with type INT64 into proto field " + type_name +
-            "." + field_name + " which has a SQL enum type");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Could not store value with type " +
+                           std::string(ValueTypeToString(value.type)) +
+                           " into proto field " + type_name + "." + field_name +
+                           " which has a SQL enum type");
   }
   if (value.type != ValueType::kVarChar) {
     return Status::kSuccess;
@@ -1955,11 +1966,12 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
             "googlesql_test.KitchenSinkPB.OptionalGroup.OptionalGroupNested";
       }
       if (!nested_type.empty()) {
-        const std::optional<std::string> decoded =
+        std::optional<std::string> decoded =
             DecodeProtoWireBytes(nested_type, nested);
-        if (decoded.has_value()) {
-          entries.emplace_back(field_it->second.name, *decoded);
+        if (!decoded.has_value()) {
+          return std::nullopt;
         }
+        entries.emplace_back(field_it->second.name, std::move(*decoded));
       } else if (std::string_view(field_it->second.name) == "string_val") {
         std::string escaped;
         escaped.reserve(nested.size() + 2);
@@ -1987,15 +1999,23 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
       continue;
     }
     const std::string name = field_it->second.name;
-    const bool known_member =
-        !proto2 || (value <= 2);  // TestEnum members TESTENUM0..2
+    // proto2 varints are unsigned on the wire but the enum's declared values
+    // are int32: TESTENUMNEGATIVE (-1) arrives as UINT64_MAX and
+    // TESTENUM2147483647 above the three small members. Checking `value <= 2`
+    // silently demoted both to raw "field: number" entries.
+    const auto enum_value = static_cast<int32_t>(value);
+    const bool known_member = !proto2 || enum_value == 0 || enum_value == 1 ||
+                              enum_value == 2 || enum_value == 2147483647 ||
+                              enum_value == -1;
     if (!known_member) {
       entries.emplace_back(IntegerToString(field_number),
                            IntegerToString(static_cast<int64_t>(value)));
       continue;
     }
-    std::string token = proto2 ? ("TESTENUM" + IntegerToString(value))
-                               : IntegerToString(static_cast<int64_t>(value));
+    std::string token =
+        proto2 ? (enum_value == -1 ? std::string("TESTENUMNEGATIVE")
+                                   : "TESTENUM" + IntegerToString(enum_value))
+               : IntegerToString(static_cast<int64_t>(value));
     entries.emplace_back(name, std::move(token));
   }
   // Proto wire decoding may see a singular field more than once.  Scalar

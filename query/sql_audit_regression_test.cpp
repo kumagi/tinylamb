@@ -203,6 +203,10 @@ TEST_F(SqlAuditRegressionTest, FailedViewRegistrationRetriesSameEpoch) {
   }
   const auto epoch = database_->CatalogEpoch();
   EXPECT_EQ(Rows("SELECT 1"), std::vector<Row>{Row({Value(1)})});
+  const auto broken_view = Run("SELECT x FROM audit_retry_view");
+  EXPECT_FALSE(broken_view.HasValue());
+  EXPECT_NE(engine_->LastError().find("view definition could not be loaded"),
+            std::string::npos);
   {
     auto ctx = database_->BeginContext();
     // The broken definition is still stored, so the retry replaces it

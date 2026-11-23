@@ -236,7 +236,7 @@ class JitBranchlessProgram {
 
   // Batch-level O(1) interval range check (ZoneMap -> pure `nsw` SIMD upgrade).
   [[nodiscard]] bool ProveOverflowFree(
-      std::span<const JitColumnInput> columns) const noexcept;
+      std::span<const JitColumnInput> columns) const;
 
   // Evaluates `count` rows branchlessly. Returns `true` iff no reachable
   // subexpression raised an arithmetic/domain error on any row; when `false`,
@@ -286,6 +286,8 @@ inline void InsertPacked2x32Bloom(uint64_t hash, uint64_t* bloom_words,
 //   (jit_dense_split_radix_agg_sound)
 class JitDenseSplitRadixAgg {
  public:
+  static constexpr uint8_t kMaxPartShift = 24;
+  static constexpr uint32_t kInvalidExtractCount = UINT32_MAX;
   enum class ExprOp : uint8_t {
     kColDouble = 0,
     kColInt64 = 1,
@@ -321,7 +323,8 @@ class JitDenseSplitRadixAgg {
       const uint8_t* n0, const int64_t* v1, const uint8_t* n1,
       const int64_t* v2, const uint8_t* n2, const int64_t* v3,
       const uint8_t* n3, double div_const, uint32_t* out_tagged_gids,
-      double* out_vals, uint32_t* part_hist);
+      double* out_vals, uint32_t* part_hist, uint32_t source_count,
+      uint64_t part_count);
 
   using ScatterFn = void (*)(uint32_t count, const uint32_t* in_tagged_gids,
                              const double* in_vals, uint32_t* const* dst_gids,
@@ -334,9 +337,15 @@ class JitDenseSplitRadixAgg {
 
   class ExtractKernel {
    public:
-    // Caller must zero-initialize `part_hist[0..P-1]` before calling.
+    // Input columns contain source_count rows. A selection, when enabled,
+    // supplies count indices into those columns. The output arrays hold
+    // count entries. part_count is the length of part_hist, not a logical
+    // partition count. Each histogram index is gid >> part_shift. Initialize
+    // the histogram before the first batch and use the same shift for Scatter.
+    // Discard partial outputs when Run returns kInvalidExtractCount.
     [[nodiscard]] uint32_t Run(
-        uint32_t count, const uint32_t* sel, const int64_t* jk_vals,
+        uint32_t count, uint32_t source_count, const uint32_t* sel,
+        const int64_t* jk_vals,
         const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
         const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
         const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
@@ -344,7 +353,7 @@ class JitDenseSplitRadixAgg {
         const uint8_t* n0, const int64_t* v1, const uint8_t* n1,
         const int64_t* v2, const uint8_t* n2, const int64_t* v3,
         const uint8_t* n3, double div_const, uint32_t* out_tagged_gids,
-        double* out_vals, uint32_t* part_hist) const noexcept;
+        double* out_vals, std::span<uint32_t> part_hist) const noexcept;
 
    private:
     friend class JitDenseSplitRadixAgg;
@@ -366,6 +375,8 @@ class JitDenseSplitRadixAgg {
 
   class AccumKernel {
    public:
+    // With overflow tracking enabled, initialize *inf_flag to zero per
+    // partition. The flag stays set across batches of that partition.
     void Run(uint32_t count, const uint32_t* local_tagged_gids,
              const double* vals, double* sums, uint64_t* counts,
              uint64_t* matched_bits, uint64_t* nonnull_bits,
@@ -461,6 +472,8 @@ class JitPacked2x32RadixDedup {
 
   class DedupKernel {
    public:
+    // Initialize ht_gens to zero and use a nonzero cur_gen for active rows.
+    // Clear ht_gens before reusing a generation after counter wrap.
     [[nodiscard]] uint32_t Run(uint32_t count, const uint64_t* in_keys,
                                uint64_t* ht_keys, uint32_t* ht_gens,
                                uint32_t cur_gen, uint64_t ht_mask,
@@ -497,6 +510,8 @@ class JitRadixKeyDoubleAgg {
   [[nodiscard]] static std::optional<JitRadixKeyDoubleAgg> Compile(
       bool check_inf);
 
+  // Initialize ht_gens to zero and use a nonzero cur_gen for active rows.
+  // Clear ht_gens before reusing a generation after counter wrap.
   [[nodiscard]] uint32_t Accumulate(uint32_t count, const uint64_t* in_keys,
                                     const double* in_vals,
                                     const uint8_t* in_valids, uint64_t* ht_keys,

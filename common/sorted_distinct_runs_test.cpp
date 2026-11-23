@@ -59,9 +59,9 @@ TEST(SortedDistinctRunsTest, FailedAbsorbPreservesBothInputs) {
   SortedDistinctRuns left, right;
   ASSERT_SUCCESS(left.Add(std::array<uint64_t, 2>{1, 3}));
   ASSERT_SUCCESS(right.Add(std::array<uint64_t, 2>{2, 4}));
-  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  left.SetFailNextMergeForTest(true);
   EXPECT_FALSE(left.Absorb(std::move(right)).ok());
-  SortedDistinctRuns::SetFailNextMergeForTest(false);
+  left.SetFailNextMergeForTest(false);
   ASSERT_SUCCESS(left.Absorb(std::move(right)));
   std::vector<uint64_t> actual;
   ASSERT_SUCCESS(left.ForEach([&](uint64_t v) { actual.push_back(v); }));
@@ -74,9 +74,9 @@ TEST(SortedDistinctRunsTest, FailedForEachMergePreservesAllRuns) {
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{2, 3}));
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{3, 4}));
   ASSERT_EQ(runs.RunCountForTest(), 2U);
-  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  runs.SetFailNextMergeForTest(true);
   EXPECT_FALSE(runs.ForEach([](uint64_t) {}).ok());
-  SortedDistinctRuns::SetFailNextMergeForTest(false);
+  runs.SetFailNextMergeForTest(false);
   std::vector<uint64_t> actual;
   ASSERT_SUCCESS(runs.ForEach([&](uint64_t v) { actual.push_back(v); }));
   EXPECT_EQ(actual, (std::vector<uint64_t>{1, 2, 3, 4}));
@@ -86,9 +86,9 @@ TEST(SortedDistinctRunsTest, FailedMergeKeepsPriorRunsUsable) {
   SortedDistinctRuns runs;
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{1, 3}));
   // The second Add at level 0 triggers a Merge with the existing run.
-  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  runs.SetFailNextMergeForTest(true);
   EXPECT_FALSE(runs.Add(std::array<uint64_t, 2>{2, 4}).ok());
-  SortedDistinctRuns::SetFailNextMergeForTest(false);
+  runs.SetFailNextMergeForTest(false);
 
   // The first run must still own its file: no moved-from NULL in levels_.
   std::vector<uint64_t> result;
@@ -101,6 +101,11 @@ TEST(SortedDistinctRunsTest, CallbackExceptionsBecomeStatus) {
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 1>{1}));
   EXPECT_FALSE(
       runs.ForEach([](uint64_t) { throw std::runtime_error("stop"); }).ok());
-  EXPECT_TRUE(runs.Empty());
+  // A throwing callback is a failed ForEach like any other: the run must
+  // survive so a retry still yields the distinct values.
+  EXPECT_FALSE(runs.Empty());
+  std::vector<uint64_t> actual;
+  ASSERT_SUCCESS(runs.ForEach([&](uint64_t v) { actual.push_back(v); }));
+  EXPECT_EQ(actual, (std::vector<uint64_t>{1}));
 }
 }  // namespace tinylamb

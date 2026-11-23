@@ -418,8 +418,12 @@ StatusOr<bool> Logger::FixedSizeSegmentFormat(
     const std::filesystem::path& base) {
   bool exists = false;
   bool fixed = false;
-  ASSIGN_OR_RETURN(size_t, unused, ReadSegmentMetadata(base, &exists, &fixed));
-  (void)unused;
+  // Only the fixed-format flag matters here; check the StatusOr directly
+  // instead of binding a value we would have to discard.
+  StatusOr<size_t> metadata = ReadSegmentMetadata(base, &exists, &fixed);
+  if (!metadata.HasValue()) {
+    return metadata.GetStatus();
+  }
   return fixed;
 }
 
@@ -458,6 +462,12 @@ StatusOr<size_t> Logger::SegmentLogicalSize(const std::filesystem::path& base,
     return tail.GetStatus();
   }
   return tail.Value().end;
+}
+
+StatusOr<size_t> Logger::ReadSegmentLogicalSize(uint64_t index,
+                                                 bool allow_torn_footer) const {
+  std::scoped_lock footer_guard(footer_mu_);
+  return SegmentLogicalSize(base_path_, index, segment_size_, allow_torn_footer);
 }
 
 namespace {
@@ -882,9 +892,21 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
                            SegmentPath(logfile, start_segment).string() + ": " +
                            ec.message());
   }
+  // start_segment comes from a segment file name, so the product must be
+  // range-checked before it becomes an LSN (a wrapped start LSN would make
+  // recovery skip records).
+  const auto segment_offset =
+      static_cast<lsn_t>(fixed_size ? fixed_tail.end : seg_size);
+  if (start_segment > std::numeric_limits<lsn_t>::max() / segment_size ||
+      static_cast<lsn_t>(start_segment) >
+          (std::numeric_limits<lsn_t>::max() - segment_offset) / segment_size) {
+    platform::CloseFile(fd);
+    return StatusError(StatusCode::kCorrupt,
+                       "WAL segment index overflows the LSN space");
+  }
   const lsn_t file_size =
       (static_cast<lsn_t>(start_segment) * static_cast<lsn_t>(segment_size)) +
-      static_cast<lsn_t>(fixed_size ? fixed_tail.end : seg_size);
+      segment_offset;
   if (FdataSync(fd) != 0) {
     const int saved = errno;
     platform::CloseFile(fd);
@@ -994,9 +1016,17 @@ void Logger::NotifyWorker() {
 }
 
 void Logger::SetFailed(int err) {
+  // docs/lock_order.md: durable_mu_ and work_mu_ are leaf mutexes here. This
+  // function is also called with segment_mu_ held (segment rolls / flushes),
+  // giving enqueue latch -> segment_mu_ -> durable_mu_/work_mu_. Never take
+  // segment_mu_ or the enqueue latch from within either scope below.
   {
     std::scoped_lock lock(durable_mu_);
-    error_number_.store(err, std::memory_order_relaxed);
+    // Keep the FIRST failure's errno: a later cleanup/sync error must not
+    // mask the root cause (e.g. ENOSPC) that CheckFailed() reports upward.
+    int expected_error = 0;
+    error_number_.compare_exchange_strong(expected_error, err,
+                                          std::memory_order_relaxed);
     failed_.store(true, std::memory_order_release);
   }
   // Name the volume state for the two failure classes an operator can act
@@ -1058,6 +1088,7 @@ void Logger::SetBeforeSyncHookForTest(std::function<int(int)> hook) {
 }
 
 int Logger::WriteFixedTail(size_t logical_end) {
+  std::scoped_lock footer_guard(footer_mu_);
   if (logical_end > segment_size_ ||
       footer_generation_ == std::numeric_limits<uint64_t>::max()) {
     errno = EOVERFLOW;
@@ -1120,6 +1151,9 @@ Status Logger::WaitForDurable(lsn_t lsn) {
   // condition_variable::wait may throw std::system_error. Without this guard
   // the waiter count would stay elevated forever, making the worker's
   // "waiters present" branch fsync on every tick and killing idle backoff.
+  // The guard is constructed immediately after the increment, before any
+  // early-return check, so every exit -- including the already-satisfied path
+  // and the exception translation below -- decrements the waiter count.
   struct WaiterGuard {
     std::atomic<int>& count;
     ~WaiterGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
@@ -1487,13 +1521,13 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
       LOG(WARN) << "Cannot open WAL segment " << path.string() << " for advise";
       continue;
     }
-    const lsn_t advise_from = std::max(segment_start, lsn_t{0});
+    // lsn_t is unsigned, so segment_start is already the lower bound; the
+    // old std::max(segment_start, 0) was a signed-era no-op.
     const lsn_t advise_to =
         std::min<lsn_t>(segment_start + segment_size_, before);
-    if (advise_to > advise_from) {
+    if (advise_to > segment_start) {
       platform::AdviseDontNeed(
-          fd, static_cast<int64_t>(advise_from - segment_start),
-          static_cast<int64_t>(advise_to - advise_from));
+          fd, 0, static_cast<int64_t>(advise_to - segment_start));
     }
     platform::CloseFile(fd);
   }
@@ -1501,7 +1535,10 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
 
 void Logger::SetRecycleBoundaryValidator(std::function<bool(lsn_t)> validator) {
   // RecycleUpTo reads this under segment_mu_; take the same lock here so
-  // installation cannot race with a running checkpoint worker.
+  // installation cannot race with a running checkpoint worker. This is the
+  // only mutex acquired in this function -- the other segment_mu_ sites the
+  // static audit counted are in separate functions/scopes, so there is no
+  // nested A->B / B->A acquisition (docs/lock_order.md).
   std::scoped_lock segment_guard(segment_mu_);
   recycle_boundary_validator_ = std::move(validator);
 }
@@ -1622,35 +1659,45 @@ Status Logger::Finish() {
   return CheckFailed();
 }
 
+Status Logger::CheckAppendSize(size_t size) const {
+  // D1: refuse records the recovery reader could never parse back.
+  if (size > kMaxRecordSize) {
+    return StatusError(StatusCode::kTooBigData,
+                       "WAL record exceeds Logger::kMaxRecordSize: " +
+                           std::to_string(size) + " > " +
+                           std::to_string(kMaxRecordSize));
+  }
+  if (size > segment_size_) {
+    return StatusError(StatusCode::kTooBigData,
+                       "WAL record exceeds the configured segment size: " +
+                           std::to_string(size) + " > " +
+                           std::to_string(segment_size_));
+  }
+  return Status::kSuccess;
+}
+
 StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
   RETURN_IF_FAIL(CheckFailed());
   if (finish_.load(std::memory_order_acquire)) {
     return StatusError(StatusCode::kRuntimeError, "logger is finished");
   }
-  // D1: refuse records the recovery reader could never parse back.
-  if (payload.size() > kMaxRecordSize) {
-    return StatusError(StatusCode::kTooBigData,
-                       "WAL record exceeds Logger::kMaxRecordSize: " +
-                           std::to_string(payload.size()) + " > " +
-                           std::to_string(kMaxRecordSize));
-  }
-  if (payload.size() > segment_size_) {
-    return StatusError(StatusCode::kTooBigData,
-                       "WAL record exceeds the configured segment size: " +
-                           std::to_string(payload.size()) + " > " +
-                           std::to_string(segment_size_));
-  }
+  RETURN_IF_FAIL(CheckAppendSize(payload.size()));
   std::unique_lock enq_lk{enqueue_latch_};
   if (finish_.load(std::memory_order_acquire)) {
     return StatusError(StatusCode::kRuntimeError, "logger is finished");
   }
   lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
+  const lsn_t remaining = std::numeric_limits<lsn_t>::max() - lsn;
+  const lsn_t segment_tail = segment_size_ - (lsn % segment_size_);
+  const lsn_t padding = payload.size() > segment_tail ? segment_tail : 0;
+  if (padding > remaining || payload.size() > remaining - padding) {
+    return StatusError(StatusCode::kTooBigData, "WAL LSN space exhausted");
+  }
   // Pre-roll keeps the next segment on a record boundary for recycling.
   // A framed old segment keeps its actual data end in the CRC slots; recovery
   // skips only the positively declared unused suffix, never arbitrary zeros.
-  if (!payload.empty() &&
-      payload.size() >
-          segment_size_ - static_cast<size_t>(lsn % segment_size_)) {
+  if (padding != 0) {
+    const lsn_t next_lsn = lsn + padding;
     RETURN_IF_FAIL(WaitForDurable(lsn));
     if (finish_.load(std::memory_order_acquire)) {
       return StatusError(StatusCode::kRuntimeError, "logger is finished");
@@ -1663,7 +1710,7 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
       return StatusError(StatusCode::kIOError,
                          "WAL segment roll lost its durability barrier");
     }
-    const uint64_t next_segment = SegmentIndex(lsn, segment_size_) + 1;
+    const uint64_t next_segment = SegmentIndex(next_lsn, segment_size_);
     if (current_segment_ < next_segment) {
       const Status roll_status = RollToLocked(next_segment);
       if (roll_status != Status::kSuccess) {
@@ -1676,8 +1723,6 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
       return StatusError(StatusCode::kCorrupt,
                          "WAL segment cursor moved backwards");
     }
-    const lsn_t next_lsn =
-        static_cast<lsn_t>(next_segment) * static_cast<lsn_t>(segment_size_);
     // Zero the rolled pre-roll padding gap in the ring buffer so concurrent
     // in-memory WAL re-read scans (ADR 0008 / WalkWalRecordsForward) see zeros
     // matching disk instead of stale bytes from an earlier ring lap.
@@ -1715,8 +1760,8 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
     // Self-written under the enqueue latch (relaxed is enough) and read from
     // the worker's release stores (acquire orders the ring bytes we may not
     // overwrite). The former seq_cst pair cost two full fences per chunk.
-    const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_relaxed);
-    const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_acquire);
+    const lsn_t buffered_lsn = buffered_lsn_.load(std::memory_order_relaxed);
+    const lsn_t flushed_lsn = flushed_lsn_.load(std::memory_order_acquire);
 
     if (buffered_lsn - flushed_lsn == buffer_.size()) {
       // D1: the enqueue latch is held until the ENTIRE record has landed in
@@ -1775,7 +1820,14 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
 }
 
 void Logger::LoggerWork() {
-  assert(!buffer_.empty());
+  // A zero-sized ring would make every modulo below divide by zero. This is a
+  // void worker thread, so report the misconfiguration through SetFailed()
+  // (observed by CheckFailed / WaitForDurable) instead of an assert that
+  // disappears under NDEBUG.
+  if (buffer_.empty()) {
+    SetFailed(EINVAL);
+    return;
+  }
   using Clock = std::chrono::steady_clock;
   auto last_sync = Clock::now();
   bool dirty = false;
@@ -1785,14 +1837,14 @@ void Logger::LoggerWork() {
                : sync_interval_;
   };
   // Adaptive idle cadence for the empty-queue sleep below; see kIdleWaitCap.
-  std::chrono::milliseconds idle_wait = sync_interval_;
+  std::chrono::milliseconds idle_wait = std::min(sync_interval_, kIdleWaitCap);
   while (!failed_.load(std::memory_order_acquire) &&
          (!finish_.load(std::memory_order_acquire) ||
           flushed_lsn_.load(std::memory_order_acquire) <
               buffered_lsn_.load(std::memory_order_acquire) ||
           dirty)) {
-    const size_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
-    const size_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
+    const lsn_t flushed_lsn = flushed_lsn_.load(std::memory_order_relaxed);
+    const lsn_t buffered_lsn = buffered_lsn_.load(std::memory_order_acquire);
 
     if (flushed_lsn == buffered_lsn) {
       if (dirty &&
@@ -1856,8 +1908,8 @@ void Logger::LoggerWork() {
            buffered_lsn_.load(std::memory_order_acquire)) {
       {
         std::scoped_lock segment_guard(segment_mu_);
-        const size_t flushed = flushed_lsn_.load(std::memory_order_relaxed);
-        const size_t buffered = buffered_lsn_.load(std::memory_order_acquire);
+        const lsn_t flushed = flushed_lsn_.load(std::memory_order_relaxed);
+        const lsn_t buffered = buffered_lsn_.load(std::memory_order_acquire);
         if (flushed >= buffered) {
           break;
         }
@@ -1912,6 +1964,10 @@ void Logger::LoggerWork() {
     // flushed < buffered keeps the main loop out of the idle sleep below
     // until the next pass runs this check again.
     {
+      // Lock-order audit note (docs/lock_order.md D1): this work_mu_ critical
+      // section is self-contained and ends before the segment_mu_ / durable_mu_
+      // acquisitions below. Nothing takes segment_mu_ or durable_mu_ while
+      // this work_mu_ is held, so no A->B / B->A inversion is possible here.
       std::scoped_lock lock(work_mu_);
       if (full_buffer_waiters_ != 0) {
         work_cv_.notify_all();
@@ -1929,6 +1985,12 @@ void Logger::LoggerWork() {
     if (finish_.load(std::memory_order_acquire) || timer_elapsed ||
         waiter_present) {
       {
+        // Lock-order audit note: this segment_mu_ scope is independent of the
+        // work_mu_ scope above (which already ended) and of the other
+        // segment_mu_ scope below. SetFailed may take durable_mu_ / work_mu_
+        // under this lock, which matches docs/lock_order.md's direction
+        // (enqueue latch -> segment mutex -> durable/work mutex); the reverse
+        // order is never taken.
         std::scoped_lock segment_guard(segment_mu_);
         if (dst_ < 0 || SyncSegment() != 0) {
           const int saved = errno == 0 ? EIO : errno;
@@ -1949,11 +2011,15 @@ void Logger::LoggerWork() {
     if (failed_.load(std::memory_order_acquire)) {
       return;
     }
+    // A flush that has not caught up with a segment roll must not wrap the
+    // unsigned difference into a bogus logical end. Match SyncSegment's guard.
+    const lsn_t segment_start =
+        current_segment_ * static_cast<lsn_t>(segment_size_);
+    const lsn_t flushed = flushed_lsn_.load(std::memory_order_relaxed);
+    const auto logical_end = static_cast<size_t>(
+        flushed >= segment_start ? flushed - segment_start : 0);
     if (dst_ < 0 ||
-        (fixed_size_segments_ &&
-         WriteFixedTail(static_cast<size_t>(
-             flushed_lsn_.load() -
-             (current_segment_ * static_cast<lsn_t>(segment_size_)))) != 0) ||
+        (fixed_size_segments_ && WriteFixedTail(logical_end) != 0) ||
         FdataSync(dst_) != 0) {
       const int saved = errno == 0 ? EIO : errno;
       SetFailed(saved);

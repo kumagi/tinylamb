@@ -5,7 +5,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -179,6 +178,10 @@ namespace {
 // UnwindInfoManager::deregisterSectionsImpl). The OS reclaims the JIT memory
 // at exit anyway.
 using KernelImplPtr = std::shared_ptr<JitInt64Kernels::Impl>;
+// The single process-wide JIT cache latch. Most kernel paths scope it around
+// cache lookup and publication, but some specialized Compile routines hold it
+// while compiling their ORC module. No path may acquire another mutex while
+// holding it, which keeps the lock order acyclic.
 // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
 std::mutex& jit_cache_mutex = *new std::mutex;
 // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
@@ -324,8 +327,11 @@ std::shared_ptr<JitInt64Kernels::Impl> CreateImpl(
   } else if (symbol == "tinylamb_project_checked") {
     impl->projection_checked =
         address->toPtr<JitInt64Kernels::ProjectionCheckedFn>();
+  } else if (symbol != "tinylamb_sum_checked") {
+    // Unknown symbol: fail closed instead of relying on assert(), which is
+    // compiled out in NDEBUG builds.
+    return nullptr;
   } else {
-    assert(symbol == "tinylamb_sum_checked");
     impl->sum_checked = address->toPtr<JitInt64Kernels::SumCheckedFn>();
   }
   return impl;
@@ -347,9 +353,9 @@ llvm::Value* Comparison(llvm::IRBuilder<>& builder, BinaryOperation operation,
     case BinaryOperation::kGreaterThanEquals:
       return builder.CreateICmpSGE(left, right);
     default:
-      // CompileFilter already gates on IsComparison; if this switch and that
-      // predicate ever drift, fail loudly instead of feeding nullptr to LLVM.
-      std::abort();
+      // Let callers decline JIT compilation so the expression can use the
+      // ordinary evaluator if this switch and its operation gates drift.
+      return nullptr;
   }
 }
 
@@ -414,6 +420,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileFilter(
   auto* input_ptr = builder.CreateGEP(i64, input, index);
   auto* value = builder.CreateLoad(i64, input_ptr);
   auto* compared = Comparison(builder, operation, value, constant);
+  if (compared == nullptr) {
+    return std::nullopt;
+  }
   auto* output_ptr = builder.CreateGEP(i8, output, index);
   builder.CreateStore(builder.CreateZExt(compared, i8), output_ptr);
   auto* next = builder.CreateAdd(index, builder.getInt64(1));
@@ -701,6 +710,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileFilterProjectSum(
   builder.SetInsertPoint(body);
   auto* key = builder.CreateLoad(i64, builder.CreateGEP(i64, keys, index));
   auto* pass = Comparison(builder, op, key, constant);
+  if (pass == nullptr) {
+    return std::nullopt;
+  }
   const auto project = [&] {
     auto* value =
         builder.CreateLoad(i64, builder.CreateGEP(i64, payload, index));
@@ -831,6 +843,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileFilterHashProbe(
       vector_type, builder.CreateGEP(i64, filter, block_end), llvm::Align(8));
   auto* passes =
       Comparison(builder, op, vector, builder.CreateVectorSplat(8, constant));
+  if (passes == nullptr) {
+    return std::nullopt;
+  }
   auto* bits = builder.CreateBitCast(passes, builder.getInt8Ty());
   block_end->addIncoming(builder.CreateAdd(block_end, width), compare_vector);
   pending->addIncoming(builder.CreateZExt(bits, i64), compare_vector);
@@ -839,6 +854,9 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileFilterHashProbe(
 
   builder.SetInsertPoint(compare_tail);
   auto* pass = Comparison(builder, op, load(filter, block_end), constant);
+  if (pass == nullptr) {
+    return std::nullopt;
+  }
   block_end->addIncoming(builder.CreateAdd(block_end, one), compare_tail);
   pending->addIncoming(builder.CreateSelect(pass, builder.getInt64(128), zero),
                        compare_tail);
@@ -1122,6 +1140,8 @@ std::optional<JitLiteralSearch> JitLiteralSearch::Compile(
     FindFn find;
   };
   // ORC must outlive the compiled handles, including at static destruction.
+  // Process-lifetime cache: lazy init is thread-safe by C++11 and every
+  // subsequent access is serialized by jit_cache_mutex below.
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto* const cache = new std::unordered_map<std::string, Entry>;
   const std::scoped_lock lock(jit_cache_mutex);
@@ -1600,6 +1620,9 @@ std::optional<JitDatePartHash> JitDatePartHash::Compile(unsigned offset) {
     std::unique_ptr<llvm::orc::LLJIT> jit;
     HashFn hash{nullptr};
   };
+  // Process-lifetime cache: lazy init is thread-safe by C++11 and all slot
+  // reads/writes below are serialized by jit_cache_mutex.
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto* const cache = new std::array<Entry, 2>;
   const std::scoped_lock lock(jit_cache_mutex);
   auto& slot = (*cache)[offset == 11 ? 0 : 1];
@@ -1733,6 +1756,9 @@ std::optional<JitStringFingerprint> JitStringFingerprint::Compile() {
     return std::nullopt;
   }
   const std::scoped_lock lock(jit_cache_mutex);
+  // Both statics are guarded by jit_cache_mutex, acquired just above; the
+  // ORC owner must outlive the compiled handle even at process exit.
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto* const owner = new std::unique_ptr<llvm::orc::LLJIT>;
   static HashFn compiled = nullptr;
   if (compiled != nullptr) {
@@ -1987,8 +2013,12 @@ constexpr size_t kZeroNullSliceRows = 4096;
 alignas(64) constexpr std::array<uint8_t, kZeroNullSliceRows> kZeroNullSlice{};
 
 struct ValidatedProgram {
+  static constexpr size_t kUnreached = std::numeric_limits<size_t>::max();
+
   std::vector<BytecodeInstruction> instructions;
   std::vector<Value> constants;
+  std::vector<Int64RangeSpec> int64_ranges;
+  std::vector<ReciprocalDivModSpec> reciprocals;
   std::vector<uint16_t> referenced_columns;
   std::vector<uint16_t> inst_dense_col;
   std::vector<size_t> depths;
@@ -2009,6 +2039,8 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
   ValidatedProgram out;
   out.instructions = program.Instructions();
   out.constants = program.Constants();
+  out.int64_ranges = program.Int64Ranges();
+  out.reciprocals = program.Reciprocals();
   const size_t n = out.instructions.size();
   out.inst_dense_col.assign(n, 0);
 
@@ -2088,6 +2120,30 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
       case BytecodeOp::kAbs:
         out.has_fallible_ops = true;
         break;
+      case BytecodeOp::kInt64InRange: {
+        if (inst.operand >= out.int64_ranges.size()) {
+          return std::nullopt;
+        }
+        const Int64RangeSpec& rspec = out.int64_ranges[inst.operand];
+        if ((rspec.expected_type != ValueType::kInt64 &&
+             rspec.expected_type != ValueType::kDate) ||
+            rspec.lo > rspec.hi) {
+          return std::nullopt;
+        }
+        break;
+      }
+      case BytecodeOp::kDivInt64Const:
+      case BytecodeOp::kModInt64Const: {
+        if (inst.operand >= out.reciprocals.size()) {
+          return std::nullopt;
+        }
+        const ReciprocalDivModSpec& rspec = out.reciprocals[inst.operand];
+        if (rspec.abs_d < 2 || rspec.divisor == 0 || rspec.divisor == 1 ||
+            rspec.divisor == -1) {
+          return std::nullopt;
+        }
+        break;
+      }
       case BytecodeOp::kPop:
       case BytecodeOp::kDup:
         break;
@@ -2110,14 +2166,13 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
   }
 
   // Forward abstract stack-depth check (`ValidStackDepths` in Lean).
-  constexpr size_t kUnreached = std::numeric_limits<size_t>::max();
-  out.depths.assign(n + 1, kUnreached);
+  out.depths.assign(n + 1, ValidatedProgram::kUnreached);
   out.depths[0] = 0;
   auto propagate = [&](size_t target, size_t depth) -> bool {
     if (target > n) {
       return false;
     }
-    if (out.depths[target] == kUnreached) {
+    if (out.depths[target] == ValidatedProgram::kUnreached) {
       out.depths[target] = depth;
       return true;
     }
@@ -2126,10 +2181,7 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
 
   for (size_t pc = 0; pc < n; ++pc) {
     const size_t d = out.depths[pc];
-    if (d == kUnreached) {
-      // Unreachable dead code slot after an unconditional jump: assign a
-      // dummy depth of 0 if needed, though BytecodeCompiler never emits
-      // unreachable roots; reject if it cannot be typed consistently.
+    if (d == ValidatedProgram::kUnreached) {
       continue;
     }
     const BytecodeInstruction& inst = out.instructions[pc];
@@ -2147,6 +2199,9 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
         break;
       case BytecodeOp::kUnaryInt64:
       case BytecodeOp::kAbs:
+      case BytecodeOp::kInt64InRange:
+      case BytecodeOp::kDivInt64Const:
+      case BytecodeOp::kModInt64Const:
         if (d < 1 || !propagate(pc + 1, d)) {
           return std::nullopt;
         }
@@ -2187,11 +2242,6 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
   if (out.depths[n] != 1) {
     return std::nullopt;
   }
-  for (size_t pc = 0; pc <= n; ++pc) {
-    if (out.depths[pc] == kUnreached) {
-      out.depths[pc] = 0;
-    }
-  }
 
   // Build deterministic cache key over dense-column-normalized bytecode +
   // literal constants so identical shapes across tables/queries share one
@@ -2215,6 +2265,17 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
         key.push_back('I');
         key.append(std::to_string(c.value.int_value));
       }
+    } else if (inst.opcode == BytecodeOp::kInt64InRange) {
+      const Int64RangeSpec& rspec = out.int64_ranges[inst.operand];
+      key.push_back('R');
+      key.append(std::to_string(rspec.lo));
+      key.push_back(',');
+      key.append(std::to_string(rspec.hi));
+    } else if (inst.opcode == BytecodeOp::kDivInt64Const ||
+               inst.opcode == BytecodeOp::kModInt64Const) {
+      const ReciprocalDivModSpec& rspec = out.reciprocals[inst.operand];
+      key.push_back(inst.opcode == BytecodeOp::kDivInt64Const ? 'D' : 'M');
+      key.append(std::to_string(rspec.divisor));
     } else {
       key.append(std::to_string(inst.operand));
       key.push_back(',');
@@ -2324,7 +2385,7 @@ struct SsaCutEdge {
 // Emits an `internal noinline` inner loop with direct `NoAlias` output pointer
 // arguments (so LLVM BasicAA + LoopVectorize sees zero memory aliasing) plus
 // an external C-callable wrapper accepting pointer arrays.
-void EmitBranchlessKernelPair(llvm::Module* module,
+bool EmitBranchlessKernelPair(llvm::Module* module,
                               const ValidatedProgram& spec, bool nullable_cols,
                               bool checked_arith, bool filter_only,
                               std::string_view outer_name) {
@@ -2462,13 +2523,17 @@ void EmitBranchlessKernelPair(llvm::Module* module,
   const size_t num_insts = spec.instructions.size();
   auto select_stack = [&](llvm::Value* cond, const std::vector<SsaLane>& on_t,
                           const std::vector<SsaLane>& on_f) {
-    assert(on_t.size() == on_f.size());
-    std::vector<SsaLane> merged(on_t.size());
-    for (size_t s = 0; s < on_t.size(); ++s) {
-      merged[s] = {
-          .bits = builder.CreateSelect(cond, on_t[s].bits, on_f[s].bits),
-          .is_null =
-              builder.CreateSelect(cond, on_t[s].is_null, on_f[s].is_null)};
+    // Defensive: keep the merged stack depth well-defined even if a future
+    // edit breaks the equal-depth invariant (assert() vanishes under NDEBUG).
+    const size_t depth = on_t.size() > on_f.size() ? on_t.size() : on_f.size();
+    const SsaLane missing{.bits = builder.getInt64(0),
+                          .is_null = builder.getTrue()};
+    std::vector<SsaLane> merged(depth);
+    for (size_t s = 0; s < depth; ++s) {
+      const SsaLane& t = s < on_t.size() ? on_t[s] : missing;
+      const SsaLane& f = s < on_f.size() ? on_f[s] : missing;
+      merged[s] = {.bits = builder.CreateSelect(cond, t.bits, f.bits),
+                   .is_null = builder.CreateSelect(cond, t.is_null, f.is_null)};
     }
     return merged;
   };
@@ -2520,9 +2585,16 @@ void EmitBranchlessKernelPair(llvm::Module* module,
       builder.getInt64(std::numeric_limits<int64_t>::min());
 
   for (size_t pc = 0; pc < num_insts; ++pc) {
+    const size_t depth = spec.depths[pc];
+    if (depth == ValidatedProgram::kUnreached) {
+      continue;
+    }
     llvm::Value* active = nullptr;
     std::vector<SsaLane> stk;
-    merge_incoming(pc, spec.depths[pc], &cut_edges, &active, &stk);
+    merge_incoming(pc, depth, &cut_edges, &active, &stk);
+    if (stk.size() != depth) {
+      return false;
+    }
 
     const BytecodeInstruction& inst = spec.instructions[pc];
     llvm::Value* local_err = builder.getFalse();
@@ -2628,6 +2700,19 @@ void EmitBranchlessKernelPair(llvm::Module* module,
         SsaLane out_lane{};
         llvm::Value* truthy = builder.CreateICmpNE(
             child.bits, const_cast<llvm::Value*>(i64_zero));
+        // AST rejects a non-BOOL INT64 for IS [NOT] TRUE/FALSE. Mirror that
+        // domain check so a JIT filter cannot silently turn 2 into TRUE.
+        const bool bool_test = inst.unary == UnaryOperation::kIsTrue ||
+                               inst.unary == UnaryOperation::kIsNotTrue ||
+                               inst.unary == UnaryOperation::kIsFalse ||
+                               inst.unary == UnaryOperation::kIsNotFalse;
+        llvm::Value* is_bool = builder.CreateICmpULE(
+            child.bits, const_cast<llvm::Value*>(i64_one));
+        llvm::Value* bool_truthy = builder.CreateAnd(truthy, is_bool);
+        if (bool_test) {
+          local_err = builder.CreateAnd(builder.CreateNot(child.is_null),
+                                        builder.CreateNot(is_bool));
+        }
         switch (inst.unary) {
           case UnaryOperation::kIsNull:
             out_lane = {.bits = builder.CreateZExt(child.is_null, i64),
@@ -2639,29 +2724,29 @@ void EmitBranchlessKernelPair(llvm::Module* module,
                         .is_null = builder.getFalse()};
             break;
           case UnaryOperation::kIsTrue:
-            out_lane = {
-                .bits = builder.CreateZExt(
-                    builder.CreateAnd(builder.CreateNot(child.is_null), truthy),
-                    i64),
-                .is_null = builder.getFalse()};
+            out_lane = {.bits = builder.CreateZExt(
+                            builder.CreateAnd(builder.CreateNot(child.is_null),
+                                              bool_truthy),
+                            i64),
+                        .is_null = builder.getFalse()};
             break;
           case UnaryOperation::kIsNotTrue:
-            out_lane = {
-                .bits = builder.CreateZExt(
-                    builder.CreateOr(child.is_null, builder.CreateNot(truthy)),
-                    i64),
-                .is_null = builder.getFalse()};
+            out_lane = {.bits = builder.CreateZExt(
+                            builder.CreateOr(child.is_null,
+                                             builder.CreateNot(bool_truthy)),
+                            i64),
+                        .is_null = builder.getFalse()};
             break;
           case UnaryOperation::kIsFalse:
             out_lane = {.bits = builder.CreateZExt(
                             builder.CreateAnd(builder.CreateNot(child.is_null),
-                                              builder.CreateNot(truthy)),
+                                              builder.CreateNot(bool_truthy)),
                             i64),
                         .is_null = builder.getFalse()};
             break;
           case UnaryOperation::kIsNotFalse:
             out_lane = {.bits = builder.CreateZExt(
-                            builder.CreateOr(child.is_null, truthy), i64),
+                            builder.CreateOr(child.is_null, bool_truthy), i64),
                         .is_null = builder.getFalse()};
             break;
           case UnaryOperation::kNot:
@@ -2777,6 +2862,11 @@ void EmitBranchlessKernelPair(llvm::Module* module,
           case BinaryOperation::kGreaterThanEquals: {
             llvm::Value* cmp =
                 Comparison(builder, inst.binary, left.bits, right.bits);
+            if (cmp == nullptr) {
+              res = {.bits = builder.getInt64(0), .is_null = builder.getTrue()};
+              local_err = builder.getTrue();
+              break;
+            }
             res = {.bits = builder.CreateZExt(cmp, i64),
                    .is_null = either_null};
             break;
@@ -2829,7 +2919,10 @@ void EmitBranchlessKernelPair(llvm::Module* module,
             break;
           }
           default:
-            assert(false);
+            // Unknown binary op: emit a NULL error lane instead of assert(),
+            // which is compiled out under NDEBUG and would leave res empty.
+            res = {.bits = builder.getInt64(0), .is_null = builder.getTrue()};
+            local_err = builder.getTrue();
             break;
         }
 
@@ -2840,16 +2933,78 @@ void EmitBranchlessKernelPair(llvm::Module* module,
             {.target = pc + 1, .cond = active, .stk = std::move(stk)});
         break;
       }
-      default:
-        assert(false);
+      case BytecodeOp::kInt64InRange: {
+        // Lean proof: lean/TinylambOpt/SimdInRange.lean
+        //   (simd_in_range_sound, int64_range_lowering)
+        // Wrapping subtraction (no nsw/nuw) matches unsigned range test across
+        // full [INT64_MIN, INT64_MAX].
+        const Int64RangeSpec& rspec = spec.int64_ranges[inst.operand];
+        SsaLane child = stk.back();
+        const auto ulo = static_cast<uint64_t>(rspec.lo);
+        const uint64_t uwidth = static_cast<uint64_t>(rspec.hi) - ulo;
+        llvm::Value* diff =
+            builder.CreateSub(child.bits, builder.getInt64(ulo));
+        llvm::Value* in_range =
+            builder.CreateICmpULE(diff, builder.getInt64(uwidth));
+        stk.back() = {.bits = builder.CreateZExt(in_range, i64),
+                      .is_null = child.is_null};
+        cut_edges.push_back(
+            {.target = pc + 1, .cond = active, .stk = std::move(stk)});
         break;
+      }
+      case BytecodeOp::kDivInt64Const:
+      case BytecodeOp::kModInt64Const: {
+        // Lean proof: lean/TinylambOpt/ResearchProofs/ReciprocalDivMod.lean
+        //   (est_bounds, divModConst_sound)
+        const ReciprocalDivModSpec& rspec = spec.reciprocals[inst.operand];
+        SsaLane child = stk.back();
+        llvm::Type* i128 = builder.getInt128Ty();
+        llvm::Value* x_neg = builder.CreateICmpSLT(
+            child.bits, const_cast<llvm::Value*>(i64_zero));
+        llvm::Value* neg_x =
+            builder.CreateSub(const_cast<llvm::Value*>(i64_zero), child.bits);
+        llvm::Value* ax = builder.CreateSelect(x_neg, neg_x, child.bits);
+        llvm::Value* ax128 = builder.CreateZExt(ax, i128);
+        llvm::Value* recip128 = llvm::ConstantInt::get(i128, rspec.recip);
+        llvm::Value* prod = builder.CreateMul(ax128, recip128);
+        llvm::Value* q_est =
+            builder.CreateTrunc(builder.CreateLShr(prod, 64), i64);
+        llvm::Value* abs_d128 = llvm::ConstantInt::get(i128, rspec.abs_d);
+        llvm::Value* over = builder.CreateICmpUGT(
+            builder.CreateMul(builder.CreateZExt(q_est, i128), abs_d128),
+            ax128);
+        llvm::Value* q =
+            builder.CreateSub(q_est, builder.CreateZExt(over, i64));
+        llvm::Value* result = nullptr;
+        if (inst.opcode == BytecodeOp::kDivInt64Const) {
+          llvm::Value* res_neg =
+              rspec.divisor < 0 ? builder.CreateNot(x_neg) : x_neg;
+          llvm::Value* neg_q =
+              builder.CreateSub(const_cast<llvm::Value*>(i64_zero), q);
+          result = builder.CreateSelect(res_neg, neg_q, q);
+        } else {
+          llvm::Value* qd = builder.CreateMul(q, builder.getInt64(rspec.abs_d));
+          llvm::Value* rem = builder.CreateSub(ax, qd);
+          llvm::Value* neg_r =
+              builder.CreateSub(const_cast<llvm::Value*>(i64_zero), rem);
+          result = builder.CreateSelect(x_neg, neg_r, rem);
+        }
+        stk.back() = {.bits = result, .is_null = child.is_null};
+        cut_edges.push_back(
+            {.target = pc + 1, .cond = active, .stk = std::move(stk)});
+        break;
+      }
+      default:
+        return false;
     }
   }
 
   llvm::Value* end_active = nullptr;
   std::vector<SsaLane> end_stk;
   merge_incoming(num_insts, 1, &cut_edges, &end_active, &end_stk);
-  assert(end_stk.size() == 1);
+  if (end_stk.size() != 1) {
+    return false;
+  }
   const SsaLane& final_lane = end_stk[0];
 
   if (filter_only) {
@@ -2920,6 +3075,7 @@ void EmitBranchlessKernelPair(llvm::Module* module,
   }
   builder.CreateCall(inner_fn, call_args);
   builder.CreateRetVoid();
+  return true;
 }
 
 }  // namespace
@@ -2945,12 +3101,23 @@ std::optional<JitBranchlessProgram> JitBranchlessProgram::Compile(
   if (!validated) {
     return std::nullopt;
   }
-  {
+  const auto find_compiled = [&]() -> BranchlessImplPtr {
     std::scoped_lock lock(jit_cache_mutex);
     const auto it = branchless_program_cache.find(validated->cache_key);
-    if (it != branchless_program_cache.end()) {
-      return JitBranchlessProgram(it->second);
-    }
+    return it == branchless_program_cache.end() ? nullptr : it->second;
+  };
+  if (auto cached = find_compiled()) {
+    return JitBranchlessProgram(std::move(cached));
+  }
+
+  // Only the first miss for a key needs to build the LLVM module. Shard the
+  // compilation locks so unrelated modules can still build in parallel.
+  static std::array<std::mutex, 16> compile_mutexes;
+  const size_t stripe =
+      std::hash<std::string>{}(validated->cache_key) % compile_mutexes.size();
+  std::unique_lock compile_lock(compile_mutexes[stripe]);
+  if (auto cached = find_compiled()) {
+    return JitBranchlessProgram(std::move(cached));
   }
 
   InitializeLlvm();
@@ -2959,32 +3126,32 @@ std::optional<JitBranchlessProgram> JitBranchlessProgram::Compile(
   auto module =
       std::make_unique<llvm::Module>("tinylamb_branchless_bytecode", *context);
 
-  EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/false,
-                           /*checked_arith=*/true, /*filter_only=*/false,
-                           "tinylamb_bc_eval_nonnull_checked");
-  EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/true,
-                           /*checked_arith=*/true, /*filter_only=*/false,
-                           "tinylamb_bc_eval_nullable_checked");
-  EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/false,
-                           /*checked_arith=*/true, /*filter_only=*/true,
-                           "tinylamb_bc_filter_nonnull_checked");
-  EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/true,
-                           /*checked_arith=*/true, /*filter_only=*/true,
-                           "tinylamb_bc_filter_nullable_checked");
-
-  if (validated->has_fallible_ops) {
-    EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/false,
-                             /*checked_arith=*/false, /*filter_only=*/false,
-                             "tinylamb_bc_eval_nonnull_unchecked");
-    EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/true,
-                             /*checked_arith=*/false, /*filter_only=*/false,
-                             "tinylamb_bc_eval_nullable_unchecked");
-    EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/false,
-                             /*checked_arith=*/false, /*filter_only=*/true,
-                             "tinylamb_bc_filter_nonnull_unchecked");
-    EmitBranchlessKernelPair(module.get(), *validated, /*nullable_cols=*/true,
-                             /*checked_arith=*/false, /*filter_only=*/true,
-                             "tinylamb_bc_filter_nullable_unchecked");
+  struct KernelVariant {
+    bool nullable_cols;
+    bool filter_only;
+    std::string_view checked_symbol;
+    std::string_view unchecked_symbol;
+  };
+  constexpr std::array<KernelVariant, 4> variants{{
+      {.nullable_cols=false, .filter_only=false, .checked_symbol="tinylamb_bc_eval_nonnull_checked",
+       .unchecked_symbol="tinylamb_bc_eval_nonnull_unchecked"},
+      {.nullable_cols=true, .filter_only=false, .checked_symbol="tinylamb_bc_eval_nullable_checked",
+       .unchecked_symbol="tinylamb_bc_eval_nullable_unchecked"},
+      {.nullable_cols=false, .filter_only=true, .checked_symbol="tinylamb_bc_filter_nonnull_checked",
+       .unchecked_symbol="tinylamb_bc_filter_nonnull_unchecked"},
+      {.nullable_cols=true, .filter_only=true, .checked_symbol="tinylamb_bc_filter_nullable_checked",
+       .unchecked_symbol="tinylamb_bc_filter_nullable_unchecked"},
+  }};
+  for (const auto& variant : variants) {
+    if (!EmitBranchlessKernelPair(module.get(), *validated, variant.nullable_cols,
+                                  true, variant.filter_only,
+                                  variant.checked_symbol) ||
+        (validated->has_fallible_ops &&
+         !EmitBranchlessKernelPair(module.get(), *validated, variant.nullable_cols,
+                                   false, variant.filter_only,
+                                   variant.unchecked_symbol))) {
+      return std::nullopt;
+    }
   }
 
   auto jit = OptimizeAndCompileModule(std::move(module), std::move(context),
@@ -3053,25 +3220,21 @@ std::optional<JitBranchlessProgram> JitBranchlessProgram::Compile(
   impl->compile_ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - begin)
                          .count();
+  // Retain an evicted LLJIT until after both cache and stripe locks are
+  // released; its destructor can be expensive and must not run under either.
   BranchlessImplPtr evicted;
-  BranchlessImplPtr selected;
   {
     std::scoped_lock lock(jit_cache_mutex);
-    const auto existing = branchless_program_cache.find(impl->spec.cache_key);
-    if (existing != branchless_program_cache.end()) {
-      selected = existing->second;
-    } else {
-      if (branchless_program_cache.size() >= kMaxBranchlessCacheEntries) {
-        auto victim = branchless_program_cache.begin();
-        evicted = std::move(victim->second);
-        branchless_program_cache.erase(victim);
-      }
-      branchless_program_cache.emplace(impl->spec.cache_key, impl);
-      selected = impl;
+    if (branchless_program_cache.size() >= kMaxBranchlessCacheEntries) {
+      auto victim = branchless_program_cache.begin();
+      evicted = std::move(victim->second);
+      branchless_program_cache.erase(victim);
     }
+    branchless_program_cache.emplace(impl->spec.cache_key, impl);
   }
   // LLJIT destruction can be expensive; do it outside the shared cache lock.
-  return JitBranchlessProgram(std::move(selected));
+  compile_lock.unlock();
+  return JitBranchlessProgram(std::move(impl));
 #endif
 }
 
@@ -3093,7 +3256,7 @@ bool JitBranchlessProgram::HasUncheckedFastPath() const noexcept {
 //   (`zonemap_interval_mul_4corners_sound`,
 //    `zonemap_interval_add_sub_abs_neg_sound`)
 bool JitBranchlessProgram::ProveOverflowFree(
-    std::span<const JitColumnInput> columns) const noexcept {
+    std::span<const JitColumnInput> columns) const {
   if (!impl_) {
     return false;
   }
@@ -3110,6 +3273,9 @@ bool JitBranchlessProgram::ProveOverflowFree(
   edges.push_back({.target = 0, .may_be_active = true, .stk = {}});
 
   for (size_t pc = 0; pc < n; ++pc) {
+    if (spec.depths[pc] == ValidatedProgram::kUnreached) {
+      continue;
+    }
     bool active = false;
     std::vector<AbstractSlot> stk(spec.depths[pc]);
     bool first = true;
@@ -3384,6 +3550,52 @@ bool JitBranchlessProgram::ProveOverflowFree(
             {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
         break;
       }
+      case BytecodeOp::kInt64InRange: {
+        const AbstractSlot child = stk.back();
+        stk.back() = {.may_be_nonnull = true,
+                      .may_be_null = child.may_be_null,
+                      .lo = 0,
+                      .hi = 1};
+        edges.push_back(
+            {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
+        break;
+      }
+      case BytecodeOp::kDivInt64Const: {
+        const AbstractSlot child = stk.back();
+        const ReciprocalDivModSpec& rspec = spec.reciprocals[inst.operand];
+        if (child.may_be_nonnull) {
+          const int64_t q0 = rspec.Div(child.lo);
+          const int64_t q1 = rspec.Div(child.hi);
+          stk.back() = {.may_be_nonnull = true,
+                        .may_be_null = child.may_be_null,
+                        .lo = std::min(q0, q1),
+                        .hi = std::max(q0, q1)};
+        } else {
+          stk.back() = {.may_be_nonnull = false, .may_be_null = true};
+        }
+        edges.push_back(
+            {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
+        break;
+      }
+      case BytecodeOp::kModInt64Const: {
+        const AbstractSlot child = stk.back();
+        const ReciprocalDivModSpec& rspec = spec.reciprocals[inst.operand];
+        if (child.may_be_nonnull) {
+          const uint64_t rem_bound = std::min<uint64_t>(
+              rspec.abs_d - 1,
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+          const auto bound = static_cast<int64_t>(rem_bound);
+          stk.back() = {.may_be_nonnull = true,
+                        .may_be_null = child.may_be_null,
+                        .lo = child.lo < 0 ? -bound : 0,
+                        .hi = child.hi > 0 ? bound : 0};
+        } else {
+          stk.back() = {.may_be_nonnull = false, .may_be_null = true};
+        }
+        edges.push_back(
+            {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
+        break;
+      }
       default:
         return false;
     }
@@ -3583,11 +3795,14 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   (void)spec;
   return std::nullopt;
 #else
-  if (spec.part_shift == 0 || spec.part_shift > 21 ||
+  if (spec.part_shift == 0 || spec.part_shift > kMaxPartShift ||
       static_cast<uint8_t>(spec.op) >
           static_cast<uint8_t>(ExprOp::kCoalesceMulIntZero)) {
     return std::nullopt;
   }
+  // div_const is a runtime argument. The fusion caller only enables the
+  // kSubDivConst / kSubSubAddDivConst shapes when fast_div != 0.0, so the
+  // fdiv emitted below keeps AST's non-zero-divisor contract.
   uint8_t used_mask = 0x03U;
   if (spec.op == ExprOp::kColDouble || spec.op == ExprOp::kColInt64) {
     used_mask = 0x01U;
@@ -3609,7 +3824,8 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::unordered_map<uint32_t, CacheEntry>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (auto it = cache.find(key); it != cache.end()) {
     return ExtractKernel(it->second.fn);
   }
@@ -3625,9 +3841,9 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   auto* f64 = b.getDoubleTy();
   auto* ptr = b.getPtrTy();
   constexpr std::string_view kSymbol = "tinylamb_dense_split_extract";
-  std::array<llvm::Type*, 25> arg_tys{
+  std::array<llvm::Type*, 27> arg_tys{
       i32, ptr, ptr, ptr, i64, i64, ptr, ptr, ptr, i64, i64, ptr, i32,
-      ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, f64, ptr, ptr, ptr};
+      ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, f64, ptr, ptr, ptr, i32, i64};
   auto* fn =
       llvm::Function::Create(llvm::FunctionType::get(i32, arg_tys, false),
                              llvm::Function::ExternalLinkage, kSymbol, *module);
@@ -3661,27 +3877,40 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   auto* out_tagged = fn->getArg(22);
   auto* out_vals = fn->getArg(23);
   auto* part_hist = fn->getArg(24);
+  auto* source_count = fn->getArg(25);
+  auto* part_count = fn->getArg(26);
 
   const auto blk = [&](std::string_view name) {
     return llvm::BasicBlock::Create(*ctx, name, fn);
   };
   auto* entry = blk("entry");
+  auto* valid_input = blk("valid.input");
   auto* loop_hdr = blk("loop.hdr");
   auto* loop_latch = blk("loop.latch");
   auto* exit_blk = blk("exit");
+  auto* invalid_input = blk("invalid.input");
 
   b.SetInsertPoint(entry);
-  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, loop_hdr);
+  b.CreateCondBr(b.CreateICmpEQ(count, b.getInt32(0)), exit_blk, valid_input);
+
+  b.SetInsertPoint(valid_input);
+  auto* inputs_ok = spec.use_sel ? b.CreateIsNotNull(sel)
+                                  : b.CreateICmpULE(count, source_count);
+  b.CreateCondBr(inputs_ok, loop_hdr, invalid_input);
 
   b.SetInsertPoint(loop_hdr);
   auto* idx_phi = b.CreatePHI(i32, 2, "idx");
   auto* m_phi = b.CreatePHI(i32, 2, "m");
-  idx_phi->addIncoming(b.getInt32(0), entry);
-  m_phi->addIncoming(b.getInt32(0), entry);
+  idx_phi->addIncoming(b.getInt32(0), valid_input);
+  m_phi->addIncoming(b.getInt32(0), valid_input);
 
   llvm::Value* r64 = b.CreateZExt(idx_phi, i64);
   if (spec.use_sel) {
     auto* r32 = b.CreateLoad(i32, b.CreateInBoundsGEP(i32, sel, r64));
+    auto* selected_row = blk("selected.row");
+    b.CreateCondBr(b.CreateICmpULT(r32, source_count), selected_row,
+                   invalid_input);
+    b.SetInsertPoint(selected_row);
     r64 = b.CreateZExt(r32, i64);
   }
 
@@ -3815,19 +4044,24 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
 
   auto* emit_val =
       b.CreateSelect(any_null, llvm::ConstantFP::get(f64, 0.0), raw_val);
+  // The fusion caller bounds dom = r_subgid * pk0_card + p_subgid to 2^21,
+  // so a valid gid never sets bit31 and cannot collide with the NULL marker
+  // added below.
   llvm::Value* tagged = gid;
   if (!is_coalesce && masked_val_nulls != 0U) {
     auto* sign_bit = b.CreateShl(b.CreateZExt(any_null, i32), b.getInt32(31));
     tagged = b.CreateOr(gid, sign_bit);
   }
+  auto* p64 = b.CreateZExt(b.CreateLShr(gid, b.getInt32(spec.part_shift)), i64);
+  auto* emit_blk = blk("emit");
+  b.CreateCondBr(b.CreateICmpULT(p64, part_count), emit_blk, invalid_input);
+  b.SetInsertPoint(emit_blk);
   auto* m64 = b.CreateZExt(m_phi, i64);
   b.CreateStore(tagged, b.CreateInBoundsGEP(i32, out_tagged, m64));
   b.CreateStore(emit_val, b.CreateInBoundsGEP(f64, out_vals, m64));
-  auto* p64 = b.CreateZExt(b.CreateLShr(gid, b.getInt32(spec.part_shift)), i64);
   auto* hist_p = b.CreateInBoundsGEP(i32, part_hist, p64);
   b.CreateStore(b.CreateAdd(b.CreateLoad(i32, hist_p), b.getInt32(1)), hist_p);
   auto* m_inc = b.CreateAdd(m_phi, b.getInt32(1));
-  auto* emit_blk = b.GetInsertBlock();
   b.CreateBr(loop_latch);
 
   b.SetInsertPoint(loop_latch);
@@ -3847,6 +4081,9 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   ret_phi->addIncoming(b.getInt32(0), entry);
   ret_phi->addIncoming(m_next, loop_latch);
   b.CreateRet(ret_phi);
+
+  b.SetInsertPoint(invalid_input);
+  b.CreateRet(b.getInt32(kInvalidExtractCount));
 
   auto jit = OptimizeAndCompileModule(std::move(module), std::move(ctx),
                                       "dense-split-extract");
@@ -3870,7 +4107,7 @@ JitDenseSplitRadixAgg::CompileScatter(uint8_t part_shift) {
   (void)part_shift;
   return std::nullopt;
 #else
-  if (part_shift == 0 || part_shift > 24) {
+  if (part_shift == 0 || part_shift > kMaxPartShift) {
     return std::nullopt;
   }
   struct CacheEntry {
@@ -3879,7 +4116,8 @@ JitDenseSplitRadixAgg::CompileScatter(uint8_t part_shift) {
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::unordered_map<uint8_t, CacheEntry>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (auto it = cache.find(part_shift); it != cache.end()) {
     return ScatterKernel(it->second.fn);
   }
@@ -3967,7 +4205,7 @@ JitDenseSplitRadixAgg::CompileAccum(bool is_avg, bool check_inf) {
   (void)check_inf;
   return std::nullopt;
 #else
-  const uint8_t key =
+  const auto key =
       static_cast<uint8_t>((is_avg ? 1U : 0U) | (check_inf ? 2U : 0U));
   struct CacheEntry {
     std::unique_ptr<llvm::orc::LLJIT> jit;
@@ -3975,7 +4213,8 @@ JitDenseSplitRadixAgg::CompileAccum(bool is_avg, bool check_inf) {
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::array<CacheEntry, 4>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (cache[key].fn != nullptr) {
     return AccumKernel(cache[key].fn);
   }
@@ -4130,7 +4369,8 @@ JitDenseSplitRadixAgg::CompileAccum(bool is_avg, bool check_inf) {
 
 TINYLAMB_JIT_CALL_BOUNDARY
 uint32_t JitDenseSplitRadixAgg::ExtractKernel::Run(
-    uint32_t count, const uint32_t* sel, const int64_t* jk_vals,
+    uint32_t count, uint32_t source_count, const uint32_t* sel,
+    const int64_t* jk_vals,
     const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
     const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
     const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
@@ -4138,11 +4378,14 @@ uint32_t JitDenseSplitRadixAgg::ExtractKernel::Run(
     const uint8_t* n0, const int64_t* v1, const uint8_t* n1, const int64_t* v2,
     const uint8_t* n2, const int64_t* v3, const uint8_t* n3, double div_const,
     uint32_t* out_tagged_gids, double* out_vals,
-    uint32_t* part_hist) const noexcept {
+    std::span<uint32_t> part_hist) const noexcept {
+  if (count == kInvalidExtractCount) {
+    return kInvalidExtractCount;
+  }
   return fn_(count, sel, jk_vals, jk_nulls, jk_min, jk_span, key_to_rsubgid,
              pk0_vals, pk0_nulls, pk0_min, pk0_span, pk0_subgid, pk0_card, v0,
              n0, v1, n1, v2, n2, v3, n3, div_const, out_tagged_gids, out_vals,
-             part_hist);
+             part_hist.data(), source_count, part_hist.size());
 }
 
 TINYLAMB_JIT_CALL_BOUNDARY
@@ -4175,7 +4418,7 @@ std::optional<JitPacked2x32HashProbe> JitPacked2x32HashProbe::Compile(
   (void)has_bias;
   return std::nullopt;
 #else
-  const uint8_t key =
+  const auto key =
       static_cast<uint8_t>((has_null0 ? 1U : 0U) | (has_null1 ? 2U : 0U) |
                            (has_bloom ? 4U : 0U) | (has_bias ? 8U : 0U));
   struct CacheEntry {
@@ -4184,7 +4427,8 @@ std::optional<JitPacked2x32HashProbe> JitPacked2x32HashProbe::Compile(
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::array<CacheEntry, 16>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (cache[key].fn != nullptr) {
     return JitPacked2x32HashProbe(cache[key].fn);
   }
@@ -4344,6 +4588,14 @@ std::optional<JitPacked2x32HashProbe> JitPacked2x32HashProbe::Compile(
     b.SetInsertPoint(probe_hdr);
     auto* slot_phi = b.CreatePHI(i64, 2);
     slot_phi->addIncoming(init_slot, probe_pred);
+    auto* probes_phi = b.CreatePHI(i64, 2);
+    probes_phi->addIncoming(b.getInt64(0), probe_pred);
+    // A full walk of the table is the longest useful probe. Without this
+    // bound a completely full hash table spins forever on a missing key.
+    auto* exhausted = b.CreateICmpUGT(probes_phi, ht_mask);
+    auto* check_head = mk(".check_head");
+    b.CreateCondBr(exhausted, write_miss, check_head);
+    b.SetInsertPoint(check_head);
     auto* head =
         b.CreateLoad(i32, b.CreateInBoundsGEP(i32, ht_heads, slot_phi));
     b.CreateCondBr(b.CreateICmpEQ(head, b.getInt32(UINT32_MAX)), write_miss,
@@ -4363,6 +4615,8 @@ std::optional<JitPacked2x32HashProbe> JitPacked2x32HashProbe::Compile(
     auto* next_slot =
         b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask);
     slot_phi->addIncoming(next_slot, next_slot_blk);
+    probes_phi->addIncoming(b.CreateAdd(probes_phi, b.getInt64(1)),
+                            next_slot_blk);
     b.CreateBr(probe_hdr);
 
     b.SetInsertPoint(write_miss);
@@ -4437,7 +4691,8 @@ JitPacked2x32RadixDedup::CompilePack(bool has_null0, bool has_null1,
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::unordered_map<uint32_t, CacheEntry>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (auto it = cache.find(key); it != cache.end()) {
     return PackKernel(it->second.fn);
   }
@@ -4599,7 +4854,8 @@ JitPacked2x32RadixDedup::CompileScatter(uint8_t part_shift) {
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::unordered_map<uint8_t, CacheEntry>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   if (auto it = cache.find(part_shift); it != cache.end()) {
     return ScatterKernel(it->second.fn);
   }
@@ -4673,7 +4929,8 @@ JitPacked2x32RadixDedup::CompileOpenAddrDedup() {
 #ifndef TINYLAMB_HAS_LLVM
   return std::nullopt;
 #else
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto* const owner = new std::unique_ptr<llvm::orc::LLJIT>;
   static DedupFn compiled = nullptr;
@@ -4795,8 +5052,17 @@ JitPacked2x32RadixDedup::CompileOpenAddrDedup() {
     b.CreateCondBr(b.CreateICmpEQ(hk, k), latch, next_slot);
 
     b.SetInsertPoint(next_slot);
+    // max_load must bound the probe even when every visited slot carries
+    // cur_gen: a generation-only full table otherwise loops forever.
+    full_preds.emplace_back(i_phi, next_slot);
+    full_occ_preds.emplace_back(occ_phi, next_slot);
+    auto* has_room = b.CreateICmpULT(occ_phi, max_load);
+    auto* advance_slot = mk(".advance_slot");
+    b.CreateCondBr(has_room, advance_slot, full_exit);
+    b.SetInsertPoint(advance_slot);
     slot_phi->addIncoming(
-        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask), next_slot);
+        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask),
+        advance_slot);
     b.CreateBr(probe_hdr);
 
     b.SetInsertPoint(latch);
@@ -4892,7 +5158,8 @@ std::optional<JitRadixKeyDoubleAgg> JitRadixKeyDoubleAgg::Compile(
   };
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
   static auto& cache = *new std::array<CacheEntry, 2>;
-  const std::scoped_lock lock(jit_cache_mutex);
+  static std::mutex cache_mutex;
+  const std::scoped_lock lock(cache_mutex);
   const size_t key = check_inf ? 1U : 0U;
   if (cache[key].fn != nullptr) {
     return JitRadixKeyDoubleAgg(cache[key].fn);

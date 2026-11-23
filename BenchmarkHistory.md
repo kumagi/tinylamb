@@ -33,13 +33,13 @@
 - **Verification (`RelWithDebInfo`):**
   - `python3 scripts/check_layering.py`: exit 0 (`allowlisted=99`).
   - `python3 scripts/check_ooc_invariants.py`: exit 0 (`42 allowlisted occurrences across 16 entries`; snapshot at this revision, not the current baseline).
-  - P2 unit tests (`PlatformUnlinkedTempFileTest`, `SpillStoreTest`, `RowBlockCodecTest`, `ChunkCodecTest`, `SpillableStoreTest`, `ExternalSorterTest`, `RecursivePartitionerTest`): `20/20` passed (`0.12 sec`).
+  - P2 unit tests (`PlatformUnlinkedTempFileTest`, `SpillStoreTest`, `RowBlockCodecTest`, `ChunkCodecTest`, `SpillableStoreTest`, `OocPrimitivesSorterTest`, `RecursivePartitionerTest`): `20/20` passed (`0.12 sec`).
   - `OocScaleBaselineTest.G2ExternalSortOneGiBUnderOneMiBBudget`: `1,048,576` rows (> 1 GiB spilled) sorted under strict `1 MiB` working budget with multi-pass merge (`>= 2` passes) and `<= 64 MiB` RSS delta: passed (`5.11 sec`).
 
 ## 2026-11-16 — Out-of-Core P1 Unified Budget, Reclaim & Coordinator (`ooca-v2.md` §6 P1, ADRs 0003/0004/0012)
 
 - **Changes verified:**
-  - `StatusCode::kMemoryLimitExceeded` (`16`) -> PostgreSQL `53200`, `StatusCode::kNoSpace` -> `53100` (`common/constants.hpp`, `server/postgres_server.cpp`).
+  - `StatusCode::kMemoryLimitExceeded` (`16`) -> PostgreSQL `53200`, `StatusCode::kNoSpace` -> `53100` (`common/constants.hpp`).
   - `ProcessMemoryBudget` pool floors (`25% storage / 0% columnar / 25% query / 5% tx` of `M_t = 0.80 M`), RSS warn threshold `0.875 M`, emergency non-failing reservation (`PageManager` & `TlcsFile` fallback), and `ReclaimStage` ordered callbacks (`kColumnar` -> `kCleanStorage` -> `kSpillableQuery`) (`common/memory_budget.*`, `common/incarnation.hpp`, `page/page_manager.*`, `table/tlcs_file.*`, `table/lstable_bridge.*`).
   - WAL ring buffer (`recovery/logger.*`) and `LSTableStore` (`table/lstable_bridge.*`) wired into `MemoryPoolKind::kTx` / `MemoryPoolKind::kColumnar`.
   - `QueryMemoryCoordinator` + `QueryMemoryGrant` + `ActiveConsumerGuard` + `LocalBatchCache` + `ComputeEffectiveDop` (`common/query_grant.*`).
@@ -82,14 +82,14 @@
   The generator batches some SQL. Identity with older frozen clients was not
   established, so older/current TPS differences are not attributed to DB fixes.
 - **Fixed profile:** previously validated Tinylamb C8, PostgreSQL 18.6,
-  MySQL 8.4.13; server CPUs0–15, data buffers512 MiB, synchronous commit.
-  Tiny query budget256 MiB, PG work_mem64 MiB; total memory scopes differ.
+  MySQL 8.4.13; server CPUs 0–15, data buffers 512 MiB, synchronous commit.
+  Tiny query budget 256 MiB, PG work_mem 64 MiB; total memory scopes differ.
   Restore the same W=1 snapshot before each trial, including its recorded
   small prior preflight modifications.
 - **Median successful TPS [min–max]:** Tiny **1,712.30 [1,701.93–1,825.40]**,
   PG **1,373.27 [1,343.87–1,454.60]**, MySQL **4,376.43 [4,347.30–4,650.57]**.
   New-Order TPS: Tiny **993.43**, PG **617.23**, MySQL **1,981.73**.
-  MySQL total successful TPS is2.56x Tiny /3.19x PG in this profile.
+  MySQL total successful TPS is 2.56x Tiny / 3.19x PG in this profile.
 - **Unexpected abort rates:** Tiny **41.23%**, PG **.46%**, MySQL **1.21%**.
   Intentional New-Order rollback: .34%/.42%/.45% of all measured requests.
   Rates pool counts across selected trials; percentiles use successful work.
@@ -119,8 +119,8 @@
   this measures the validated C8 server. Balance/order-count checks are not
   a complete TPC-C serial oracle. Both figures visually checked.
 - **Artifacts:** Historical 2026-11-06 report archived/removed,
-  [primary matrix, selection audit, CSV and plots](benchmark/comparison/results/2026-11-06-tpcc-three-quiet/),
-  [two final replacements](benchmark/comparison/results/2026-11-06-tpcc-three-quiet-repeat1/).
+  primary matrix, selection audit, CSV and plots (historical artifacts removed: `benchmark/comparison/results/2026-11-06-tpcc-three-quiet/`),
+  two final replacements (historical artifacts removed: `benchmark/comparison/results/2026-11-06-tpcc-three-quiet-repeat1/`).
   Earlier final/repeat1 directories are preserved as provisional records.
   Owned containers/servers and scratch DBs removed after measurement.
 
@@ -167,7 +167,7 @@
   DuckDB TPC-C, SF=1, embedded/direct and no-secondary profiles are unmeasured.
   Owned servers/containers/data cleaned; official images/extensions cached.
 - **Artifacts:** Historical 2026-11-05 report removed,
-  [raw records, plans, runtime scripts, audit and recovery](benchmark/comparison/results/2026-11-05-duckdb-5engine-indexed/).
+  raw records, plans, runtime scripts, audit and recovery (historical artifacts removed: `benchmark/comparison/results/2026-11-05-duckdb-5engine-indexed/`).
 
 ## 2026-10-31 — Oracle AI Database Free added: four-engine, two-core comparison
 
@@ -201,7 +201,7 @@
   all remain valid by post-trial invariants. Successful TPS excludes failures.
   Zero result mismatches/validation failures across all products.
 - **Artifacts:** Historical 2026-10-31 report removed,
-  [all raw records, plans, frozen runtime scripts and audit](benchmark/comparison/results/2026-10-31-oracle-2core-indexed-final/).
+  all raw records, plans, frozen runtime scripts and audit (historical artifacts removed: `benchmark/comparison/results/2026-10-31-oracle-2core-indexed-final/`).
   Four-engine tables/plots generated and visually checked; harness **40 tests pass**.
   Comparison-owned containers/data removed; the official image remains cached.
   Earlier ARCHIVELOG/configuration preparation attempts are retained separately
@@ -225,16 +225,16 @@
   No page/WAL format changes. UPDATE now retains the lower status/message.
 - A self-contained **65-row** restart regression fails before the fix with
   the same tail conflict, passes after it for commit and abort, validates
-  old-snapshot reads, hidden pending tail and all65 unique rows after reopen.
+  old-snapshot reads, hidden pending tail and all 65 unique rows after reopen.
   The old 64-row prototype did not force growth (preallocated empty tail)
-  and is explicitly excluded. The saved TPC-C failure also passes all5
+  and is explicitly excluded. The saved TPC-C failure also passes all 5
   preflights after C8; that working fixture has now advanced.
-- Same W1/10-terminal client, CPU0–15, buffers512 MiB, sync settings,
-  seed20260819, gold fixture, warmup5 s +30 s ×3; all **6/6 trials valid**.
+- Same W1/10-terminal client, CPU 0–15, buffers 512 MiB, sync settings,
+  seed 20260819, gold fixture, warmup 5 s + 30 s ×3; all **6/6 trials valid**.
   No build/test/profiler/fuzzer overlaps. Delivery p50 **33.0719 →8.85851 ms**,
   p95 **80.4137 →11.8984**, p99 **95.5595 →16.0609** (C7→C8 Tiny).
   Delivery success TPS **23.4667 →65.3**, contemporaneous PG **45.2333**.
-  The latency goal still fails: **nine of20** transaction-type metrics ≥1.5x.
+  The latency goal still fails: **nine of 20** transaction-type metrics ≥1.5x.
 
 | Transaction | p50 Tiny / PG ms (ratio) | p95 Tiny / PG ms (ratio) | p99 Tiny / PG ms (ratio) |
 | --- | ---: | ---: | ---: |
@@ -251,9 +251,9 @@
   peak212 MiB; layering66 allowlisted, format/diff checks pass. Unchanged
   Python harness had40 passing checks. Source hashes match the frozen C8
   server `81f7650cf20e3a702a23eea10af4bc6a5e62a885d8c15b9ab9a9f72e711e83e1`.
-- [All trials/errors/invariants](benchmark/comparison/results/2026-10-31-pg15-tpcc-c8/),
-  [all20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c8-targets.json),
-  [validation and before/after regression logs](benchmark/comparison/results/2026-10-30-pg15/).
+- All trials/errors/invariants (historical artifacts removed: `benchmark/comparison/results/2026-10-31-pg15-tpcc-c8/`),
+  all20 median ratios (historical artifacts removed: `benchmark/comparison/results/2026-10-30-pg15/tpcc-c8-targets.json`),
+  validation and before/after regression logs (historical artifacts removed: `benchmark/comparison/results/2026-10-30-pg15/`).
 - Next measured CPU lead: successful one-client Order-Status Callgrind
   (21,705 traced type2 statements, no SQL errors) attributes53.35% inclusive
   instructions to cache replay,25.39% to Projection construction.
@@ -283,8 +283,8 @@
   **1323.47 / 1333.97 / 1336.17**. Tiny engine-abort rates are
   **42.92–43.12%**, PG **.48–.54%** of attempts; successful latency/TPS
   must not conceal the different no-wait/locking behavior or failed work.
-- [All trials, errors and invariants](benchmark/comparison/results/2026-10-31-pg15-tpcc-c7/),
-  [all 20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c7-targets.json)
+- All trials, errors and invariants (historical artifacts removed: `benchmark/comparison/results/2026-10-31-pg15-tpcc-c7/`),
+  all 20 median ratios (historical artifacts removed: `benchmark/comparison/results/2026-10-30-pg15/tpcc-c7-targets.json`)
   (historical 2026-10-30 `postgresql_1_5_plan` removed).
   Frozen C7 SHA256: `09e138998180774c7dd552d96b3df007eb2843a1090af09b33a5508c85d3ed9e`.
   Targeted page/history tests 27 + 8 passed; full post-C7 QA: 4,192 CTest entries, failure 0, existing skips 3; SQL oracle 601 s / 788 runs / 676 new units, mismatch/crash 0; harness 40 pass, layering 66 allowlisted.
@@ -332,8 +332,8 @@
 | Q12 | 51.084 | 137.922 | 0.370 |
 | Q02 | 12.616 | 92.791 | 0.136 |
 
-[All inputs/settings/SQL/plans/results](benchmark/comparison/results/2026-10-31-pg15-tpch-sf1-c7/),
-[sorted ratios](benchmark/comparison/results/2026-10-30-pg15/tpch-sf1-c7-targets.json).
+All inputs/settings/SQL/plans/results (historical artifacts removed: `benchmark/comparison/results/2026-10-31-pg15-tpch-sf1-c7/`),
+sorted ratios (historical artifacts removed: `benchmark/comparison/results/2026-10-30-pg15/tpch-sf1-c7-targets.json`).
 Oracle Free SF=1 is not measured here; its four-engine SF=.01 comparison
 uses a separate two-core profile above.
 
@@ -352,7 +352,7 @@ uses a separate two-core profile above.
 - **Reproducibility:** both targets were rebuilt, then copied to frozen binaries;
   all C++ source and frozen binary hashes matched before/after. Raw logs, plans,
   commands, input hashes, source patch, build log and results are under
-  [`benchmark/comparison/results/2026-10-30-tpc-native/`](benchmark/comparison/results/2026-10-30-tpc-native/).
+  `benchmark/comparison/results/2026-10-30-tpc-native/` (historical artifacts removed).
 
 ### TPC-C W=1, 10 terminals
 
@@ -488,9 +488,9 @@ removed during doc cleanup.)
   460-481 ms vs off 483-524 ms (−5~12%). The remaining Q13 wall is the
   hoisted residual eval (1.5M × NOT LIKE over the build), the 906K-entry
   build itself, and the 150K representative Row copies.
-- **Single-pread page reads** (`page/page_pool.cpp` + `Page::
-  DecodeDiskInPlace` in page.cpp/page.hpp, hatch
-  `TINYLAMB_DISABLE_FAST_PAGE_READ=1`). `ReadFrom` pread the page into a
+- **Single-pread page reads** (historical implementation: retired `PagePool` in
+  `page/page_pool.cpp` + `Page::DecodeDiskInPlace` in page.cpp/page.hpp; hatch
+  `TINYLAMB_DISABLE_FAST_PAGE_READ=1` is a retired historical hatch. At the time, `ReadFrom` pread the page into a
   stack buffer and `DecodeDisk` then copied the 32 KiB body into the page
   object — one extra full body copy per page read, sitting next to the
   syscall in scan profiles. The fast path preads straight into the `Page`
@@ -1041,7 +1041,7 @@ BASE_DISABLE="TINYLAMB_DISABLE_SUBQUERY_FOLD=1 TINYLAMB_DISABLE_PREFIX_IN=1" \
      chunks w, w+W, …), the same determinism fix the parallel table scan
      got in 2026-10-01 — shard contents become a pure function of the
      input, which FP-sensitive aggregates read as exact bits.
-  2. `PagePool::ReadFrom` (page/page_pool.cpp): every page read paid a full
+  2. Historical `PagePool::ReadFrom` in the retired `page/page_pool.cpp` paid a full
      256 KiB `all_of` zero-scan before decode (fresh-sparse-region
      detection). A page whose 48-byte header holds any non-zero byte cannot
      be all-zero, and every readable page carries a non-zero magic there —

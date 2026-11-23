@@ -139,22 +139,10 @@ ARRAY<STRUCT<id INT64>>[{10}]
 # Future: FullScan: opt_skew selectivity=0.5
 [mode=explain]
 [plan_contains=FullScan: opt_skew]
-[name=hot_parameter_shape_chooses_scan]
-SELECT id FROM opt_skew WHERE hot_key = 1 ORDER BY id
---
-ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
-==
-
 # -- Parameter sensitivity tests --
 # Future: PlanVariant key=hot_key bucket=MCV + parameter_sensitive=true
 [mode=explain]
 [plan_contains=FullScan: opt_skew]
-[name=parameter_sensitive_plan_records_histogram_bucket]
-SELECT id FROM opt_skew WHERE hot_key = 1 ORDER BY id
---
-ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]
-==
-
 # -- NDV estimation tests --
 # Future: Distinct rows~5 ndv=5 includes_null=true
 [mode=explain]

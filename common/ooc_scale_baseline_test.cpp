@@ -23,7 +23,9 @@ namespace tinylamb {
 
 TEST(OocScaleBaselineTest, ReportsBaselineStructureFootprintsAndPressure) {
   const uint64_t rss = platform::CurrentProcessRssBytes();
-  EXPECT_GT(rss, 0U);
+  if (rss == 0) {
+    GTEST_SKIP() << "process RSS unavailable on this platform";
+  }
   // Pin the per-unit structure footprints observed in P0 (Linux/x86-64,
   // libstdc++): the row-page shell is heap-backed (PackedSlots), so a
   // non-resident Page carries a 432 B shell including the 304 B RowPage,

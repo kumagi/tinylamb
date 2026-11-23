@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -15,7 +16,8 @@ namespace tinylamb {
 namespace {
 
 // Classic RFC 1321 / 3174 / 4634 vectors plus a block-boundary input that
-// makes the streaming buffer hand off exactly one full block.
+// exercises a 64-byte boundary for MD5, SHA-1, and SHA-256; SHA-512 uses
+// 128-byte blocks, so this input remains a half-block case for that digest.
 constexpr std::array<std::string_view, 4> kInputs = {
     "", "abc", "The quick brown fox jumps over the lazy dog",
     "0123456789012345678901234567890123456789012345678901234567890123"};
@@ -91,6 +93,19 @@ TEST(DigestExtraTest, IncrementalUpdatesEqualOneShotAcrossBlockBoundaries) {
   }
 }
 
+TEST(DigestExtraTest, Sha512BitLengthRetainsHighWord) {
+  digest::detail::Sha512BitLength length;
+  length.AddBytes((uint64_t{1} << 61) - 1);
+  EXPECT_EQ(length.high, 0U);
+  EXPECT_EQ(length.low, UINT64_MAX - 7);
+  length.AddBytes(2);
+  EXPECT_EQ(length.high, 1U);
+  EXPECT_EQ(length.low, 8U);
+  length.AddBytes(uint64_t{1} << 62);
+  EXPECT_EQ(length.high, 3U);
+  EXPECT_EQ(length.low, 8U);
+}
+
 TEST(DigestExtraTest, FarmFingerprint64MatchesReferenceValues) {
   EXPECT_EQ(digest::FarmFingerprint64(""),
             static_cast<uint64_t>(-7286425919675154353LL));
@@ -123,7 +138,7 @@ TEST(DigestExtraTest, ToHexEncodesNibblesAndFixedOutputSize) {
 
 TEST(JsonStringTest, EscapedNulIsPreservedAndRawNulIsRejected) {
   const std::string value({'a', '\0', 'b'});
-  const auto decoded = json_text::DecodeJsonString("\"a\\u0000b\"");
+  const auto decoded = json_text::DecodeJsonString(R"("a\u0000b")");
   ASSERT_TRUE(decoded.has_value());
   EXPECT_EQ(*decoded, value);
   EXPECT_EQ(digest::ToHex(*decoded), "610062");

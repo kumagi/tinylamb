@@ -555,15 +555,21 @@ TEST_F(AnalyticalFeaturesTest, PipeSyntaxComposesOperators) {
 TEST_F(AnalyticalFeaturesTest, PipeOffsetRejectsInvalidOperands) {
   RunSql(engine_.get(), context_.get(), "CREATE TABLE po (k INT64);");
   RunSql(engine_.get(), context_.get(), "INSERT INTO po VALUES (1), (2), (3);");
-  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
-                            "FROM po |> LIMIT 5 OFFSET NULL"),
-               std::runtime_error);
-  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
-                            "FROM po |> LIMIT 5 OFFSET -1"),
-               std::runtime_error);
-  EXPECT_THROW((void)RunSql(engine_.get(), context_.get(),
-                            "FROM po |> LIMIT 5 OFFSET k"),
-               std::runtime_error);
+  // A bare exception type is not enough: a parser error or an unimplemented
+  // pipe operator would throw std::runtime_error too. Pin the diagnostic to
+  // the OFFSET validation path so a silently-folded OFFSET cannot pass.
+  const auto expect_offset_error = [&](const char* sql) {
+    try {
+      (void)RunSql(engine_.get(), context_.get(), sql);
+      FAIL() << "expected an OFFSET diagnostic for: " << sql;
+    } catch (const std::runtime_error& e) {
+      EXPECT_NE(std::string(e.what()).find("OFFSET"), std::string::npos)
+          << sql << ": " << e.what();
+    }
+  };
+  expect_offset_error("FROM po |> LIMIT 5 OFFSET NULL");
+  expect_offset_error("FROM po |> LIMIT 5 OFFSET -1");
+  expect_offset_error("FROM po |> LIMIT 5 OFFSET k");
   // A valid literal still applies the offset.
   EXPECT_EQ(RunSql(engine_.get(), context_.get(), "FROM po |> LIMIT 5 OFFSET 1")
                 .size(),

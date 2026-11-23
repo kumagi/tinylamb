@@ -83,6 +83,24 @@ TEST(DistinctExecutorTest, CollapsesAllNan) {
   EXPECT_EQ(CountDistinct(std::move(rows)), 1);
 }
 
+TEST(DistinctExecutorTest, DistinctOnFailureClearsPartialBatchAndStaysFailed) {
+  const Schema schema("input", {Column("v", ValueType::kInt64)});
+  auto key = BinaryExpressionExp(ConstantValueExp(Value(1)),
+                                 BinaryOperation::kDivide,
+                                 ColumnValueExp("v"));
+  auto source = std::make_shared<FakeSource>(Rows({Value(1), Value(0), Value(2)}));
+  DistinctExecutor distinct(source, schema, {key});
+  DataChunk result;
+  EXPECT_EQ(distinct.NextBatch(&result), 0U);
+  EXPECT_EQ(result.Size(), 0U);
+  const Status failure = distinct.GetStatus();
+  ASSERT_FALSE(failure.ok());
+  EXPECT_NE(failure.GetMessage().find("division by zero"), std::string::npos);
+  EXPECT_EQ(distinct.NextBatch(&result), 0U);
+  EXPECT_EQ(result.Size(), 0U);
+  EXPECT_EQ(distinct.GetStatus(), failure);
+}
+
 TEST(DistinctExecutorTest, CollapsesSignedZeros) {
   std::vector<Value> vals{Value(-0.0), Value(0.0), Value(+0.0)};
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 1);

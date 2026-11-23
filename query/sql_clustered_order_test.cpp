@@ -141,10 +141,10 @@ class SqlClusteredOrderTest : public ::testing::Test {
   // reader-pinned chains persist, and those clear on a later iteration.
   void WaitForChainFreePages() const {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (database_->TransactionStats().version_chains != 0) {
       ASSERT_LT(std::chrono::steady_clock::now(), deadline)
-          << "background GC did not drop version chains within 30s despite "
+          << "background GC did not drop version chains within 10s despite "
              "synchronous sweeps";
       TransactionContext ctx = database_->BeginContext();
       ctx.txn_.SweepCommittedVersionChains();
@@ -535,8 +535,7 @@ TEST_F(SqlClusteredOrderTest, ClaimedScanStaysOrderedAfterAConcurrentWrite) {
 
 // The SQL COUNT(*) index-only path serves its entries from the visibility
 // map once the committed rows' version chains are gone: the answer is
-// unchanged and the heap fetch is skipped.  (The plan shape itself is
-// pinned by the plan-shape assertions.)
+// unchanged and the heap fetch is skipped.
 TEST_F(SqlClusteredOrderTest, CountStarIndexOnlyScanServesVisibilityMap) {
   WaitForChainFreePages();
   TransactionContext ctx = database_->BeginReadOnlyContext();

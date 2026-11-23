@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "common/status_or.hpp"
+#include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "plan/plan.hpp"
 #include "query/query_data.hpp"
@@ -63,6 +64,10 @@ class QueryResult {
         column_types_(std::move(column_types)) {}
 
   bool Next(Row* row);
+  // Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+  size_t NextBatch(DataChunk* chunk, size_t max_rows = kDefaultVectorSize);
+  // Streaming methods preserve rows emitted before a later executor failure.
+  // Check GetStatus() after iteration before treating the result as complete.
   [[nodiscard]] Status GetStatus() const {
     return executor_ ? executor_->GetStatus() : Status::kSuccess;
   }
@@ -97,31 +102,25 @@ class SqlEngine {
 
   StatusOr<QueryResult> Execute(TransactionContext& ctx, std::string_view sql);
   StatusOr<Executor> Prepare(TransactionContext& ctx, std::string_view sql);
-  // Per-worker ingress count used by benchmark integrity gates.  It advances
-  // before parsing/preparing, so exceptions cannot make a SQL invocation
-  // disappear from the measurement.
+  // Per-worker count of SqlEngine::Execute ingress calls, used by benchmark
+  // integrity gates. Direct Prepare calls are planning operations and are not
+  // included. The count advances before parsing/preparing, so exceptions do
+  // not make an Execute invocation disappear from the measurement.
   [[nodiscard]] static uint64_t ThreadExecutionCount();
   static void SetThreadRuntimeProfiling(bool enabled);
   [[nodiscard]] static SqlRuntimeStats ThreadRuntimeStats();
   [[nodiscard]] const std::string& LastError() const { return last_error_; }
+  // Byte offset of the input passed to the parser when the last parse failed.
+  [[nodiscard]] std::optional<size_t> LastParseInputOffset() const {
+    return last_parse_input_offset_;
+  }
   // True only for the external parser child's transient start-up failures
   // (pipe/fork creation, worker spawn, deadline). These are safe to retry:
   // no statement was prepared, so no write could have been published.
   // Every other failure -- including a status-only failure that left
   // LastError() empty after a write was published -- must NOT be replayed.
   [[nodiscard]] bool LastErrorIsTransientParseFailure() const {
-    static constexpr std::string_view kTransientPrefixes[] = {
-        "cannot create GoogleSQL pipe",
-        "cannot start GoogleSQL",
-        "cannot start parser pipe workers",
-        "GoogleSQL parser timed out",
-    };
-    for (const std::string_view prefix : kTransientPrefixes) {
-      if (last_error_.starts_with(prefix)) {
-        return true;
-      }
-    }
-    return false;
+    return last_parse_failure_retryable_;
   }
   // Conservative certification of a parsed, table-free literal arithmetic
   // SELECT. Consumers may reuse a successful complete result under exact SQL.
@@ -341,10 +340,12 @@ class SqlEngine {
   // registry is thread_local, so the "registered at (database, epoch)" stamp
   // is per-thread (T485): a quiet statement's cost stays one compare, no
   // matter how many SqlEngine wrappers that thread constructs.
-  void EnsureViewsRegistered(TransactionContext& ctx);
+  Status EnsureViewsRegistered(TransactionContext& ctx);
 
   Database* database_;
   std::string last_error_;
+  std::optional<size_t> last_parse_input_offset_;
+  bool last_parse_failure_retryable_{false};
   std::optional<StatementType> last_statement_type_;
   bool last_query_is_literal_constant_{false};
   std::string last_dml_table_;
@@ -379,6 +380,8 @@ class SqlEngine {
     std::vector<std::string> column_names_;
     std::vector<ValueType> column_types_;
     std::string error_;
+    std::optional<size_t> parse_input_offset_;
+    bool parse_failure_retryable_;
     std::string fingerprint_;
     std::vector<Value> parameters_;
 
@@ -391,6 +394,8 @@ class SqlEngine {
           column_names_(engine.result_column_names_),
           column_types_(engine.result_column_types_),
           error_(engine.last_error_),
+          parse_input_offset_(engine.last_parse_input_offset_),
+          parse_failure_retryable_(engine.last_parse_failure_retryable_),
           fingerprint_(engine.plan_cache_fingerprint_),
           parameters_(engine.plan_cache_parameters_) {}
     NestedPrepareState(const NestedPrepareState&) = delete;
@@ -404,6 +409,8 @@ class SqlEngine {
       engine_.result_column_names_ = std::move(column_names_);
       engine_.result_column_types_ = std::move(column_types_);
       engine_.last_error_ = std::move(error_);
+      engine_.last_parse_input_offset_ = parse_input_offset_;
+      engine_.last_parse_failure_retryable_ = parse_failure_retryable_;
       engine_.plan_cache_fingerprint_ = std::move(fingerprint_);
       engine_.plan_cache_parameters_ = std::move(parameters_);
     }

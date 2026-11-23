@@ -47,6 +47,11 @@ size_t Row::Serialize(char* dst) const {
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   // Slot width is 16 bits and the top bit is the null-bitmap flag; a row with
   // >= 32768 columns would silently wrap the count and corrupt the image.
+  // Programmer-error precondition (documented on Row::Serialize): callers
+  // accepting user-built rows must run CheckSerializable() at the Status
+  // boundary first. This CHECK is the invariant assertion for that contract,
+  // not a recoverable error channel -- emitting a truncated image here would
+  // corrupt the table, so there is no size_t-only fallback to return.
   CHECK_MSG(values_.size() < kNullBitmapFlag,
             "too many columns to serialize a row");
   const auto count = static_cast<slot_t>(values_.size());
@@ -145,92 +150,18 @@ StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
   return static_cast<size_t>(src - original_offset);
 }
 
-namespace {
-// Legacy projected decode (clear + emplace per kept column). Kept only for
-// malformed (non-ascending) projections, where producing the narrow row is
-// the observable contract violation downstream checks abort on.
-StatusOr<size_t> DeserializeProjectedUnchecked(
-    const char* src, const Schema& sc, const std::vector<slot_t>& columns,
-    std::vector<Value>& values_out) {
-  const char* const original_offset = src;
-  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
-  slot_t encoded_count = 0;
-  src += DeserializeSlot(src, &encoded_count);
-  const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
-  const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
-  if (count != sc.ColumnCount()) {
-    return StatusError(StatusCode::kCorrupt, "row image column count mismatch");
-  }
-  const char* bitmap = nullptr;
-  if (has_null) {
-    bitmap = src;
-    src += (count + 7) / 8;
-  }
-  const Column* const schema_columns = count != 0 ? &sc.GetColumn(0) : nullptr;
-  const size_t kept_count = columns.size();
-  const slot_t* const kept = kept_count != 0 ? columns.data() : nullptr;
-  Status error = Status::kSuccess;
-  values_out.clear();
-  values_out.reserve(kept_count);
-  size_t projection = 0;
-  for (slot_t i = 0; i < count;) {
-    const bool keep = projection < kept_count && kept[projection] == i;
-    if (has_null) {
-      if ((bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
-        if (keep) {
-          values_out.emplace_back();
-          ++projection;
-        }
-        ++i;
-        continue;
-      }
-    }
-    const ValueType type = schema_columns[i].Type();
-    if (keep) {
-      Value& value = values_out.emplace_back();
-      const size_t consumed = value.DeserializeInto(src, type, &error);
-      if (error != Status::kSuccess) [[unlikely]] {
-        return error;
-      }
-      src += consumed;
-      if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
-        value.SetUnsigned();
-      }
-      if (schema_columns[i].IsInterval() && !value.IsNull()) {
-        value.SetInterval();
-      }
-      ++projection;
-    } else {
-      const size_t skipped = Value::SkipSerializedInto(src, type, &error);
-      if (error != Status::kSuccess) [[unlikely]] {
-        return error;
-      }
-      src += skipped;
-    }
-    ++i;
-  }
-  return static_cast<size_t>(src - original_offset);
-}
-}  // namespace
-
 StatusOr<size_t> Row::TryDeserializeProjected(
     const char* src, const Schema& sc, const std::vector<slot_t>& columns) {
   const size_t kept_count = columns.size();
-  // The slot-reuse decode below presumes the caller contract (ascending,
-  // in-range projection). An out-of-range column is rejected up front, just
-  // like Row::TryExtract: otherwise a {100}-style projection on a 2-column
-  // schema never matches a stored slot and silently yields all-NULL values.
-  // A non-ascending but in-range projection keeps reproducing the legacy
-  // clear()+emplace decode, which yields a row narrower than the chunk layout
-  // so downstream width checks still catch the violation
-  // (ParallelScanReorderedProjectionThrows).
+  // Slot reuse requires strictly ascending, in-range storage columns.
   for (size_t k = 0; k < kept_count; ++k) {
     if (columns[k] >= sc.ColumnCount()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "row projection column is out of range");
     }
     if (k != 0 && columns[k - 1] >= columns[k]) {
-      return DeserializeProjectedUnchecked(src, sc, columns, values_);
+      return StatusError(StatusCode::kInvalidArgument,
+                         "row projection must be strictly ascending");
     }
   }
   const char* const original_offset = src;
@@ -586,10 +517,13 @@ StatusOr<std::optional<int64_t>> Row::TryPeekInteger(const char* src,
       // the peek without constructing a Value (row decode ran this per row).
       int64_t key = 0;
       DeserializeInteger(src, &key);
-      // UINT64 images are stored as raw int64 bits; a 2^63+ value must peek
-      // as a large positive magnitude, not a negative number. DATE is a
-      // day-count domain and never takes part in unsigned key comparison,
-      // so ignore a stray unsigned flag on a DATE column.
+      // UINT64 images are stored as raw int64 bits. Peeking reinterprets
+      // those bits as int64 so the value compares equal to the original
+      // Value's int_value (RuntimeFilter matches the bit pattern); a 2^63+
+      // value therefore wraps to a negative int64 here. int64 has no positive
+      // representation for it, and no caller reads this as a magnitude. DATE
+      // is a day-count domain and never takes part in unsigned key
+      // comparison, so ignore a stray unsigned flag on a DATE column.
       if (type == ValueType::kInt64 && sc.GetColumn(i).IsUnsigned()) {
         return static_cast<int64_t>(static_cast<uint64_t>(key));
       }
@@ -636,9 +570,17 @@ std::string Row::ToString() const {
 }
 
 StatusOr<std::string> Row::TryEncodeMemcomparableFormat() const {
-  std::string encoded;
+  std::vector<std::string> parts;
+  parts.reserve(values_.size());
+  size_t total = 0;
   for (const auto& v : values_) {
     ASSIGN_OR_RETURN(std::string, part, v.TryEncodeMemcomparableFormat());
+    total += part.size();
+    parts.push_back(std::move(part));
+  }
+  std::string encoded;
+  encoded.reserve(total);
+  for (const std::string& part : parts) {
     encoded += part;
   }
   return encoded;
@@ -702,6 +644,13 @@ size_t PeekValueSerializedSize(  // NOLINT(misc-no-recursion)
       }
       uint32_t elem_count = 0;
       need += DeserializeU32(src + need, &elem_count);
+      // Match Value::DeserializeInto / SkipSerializedInto: without this cap a
+      // corrupt image with many elements but enough trailing bytes would be
+      // "valid" to Peek and then rejected by the real decoder.
+      constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
+      if (elem_count > kMaxEncodedArrayElements) {
+        throw std::runtime_error("corrupt array element count");
+      }
       bin_size_t type_len = 0;
       DeserializeSlot(src + need, &type_len);
       if (max_len - need < sizeof(bin_size_t) + type_len) {
@@ -806,6 +755,9 @@ StatusOr<Row> Row::TryExtract(const std::vector<slot_t>& elms) const {
       return StatusError(StatusCode::kInvalidArgument,
                          "row projection column is out of range");
     }
+    // Value owns its variable-length payload, and TryExtract is const, so a
+    // deep copy is required for the returned Row to outlive this one; there
+    // is no reference-based projection in this representation.
     extracted.push_back(values_[offset]);
   }
   return Row(std::move(extracted));

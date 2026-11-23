@@ -15,10 +15,12 @@ namespace tinylamb {
 // executor stack is lazy.
 class LimitPlan final : public PlanBase {
  public:
-  LimitPlan(Plan src, size_t limit_count, size_t limit_offset)
+  LimitPlan(Plan src, size_t limit_count, size_t limit_offset,
+            size_t prior_offset = 0)
       : src_(std::move(src)),
         limit_count_(limit_count),
-        limit_offset_(limit_offset) {}
+        limit_offset_(limit_offset),
+        prior_offset_(prior_offset) {}
   LimitPlan(const LimitPlan&) = delete;
   LimitPlan(LimitPlan&&) = delete;
   LimitPlan& operator=(const LimitPlan&) = delete;
@@ -68,7 +70,8 @@ class LimitPlan final : public PlanBase {
   }
   [[nodiscard]] bool EnforcesLimit(size_t limit_count,
                                    size_t limit_offset) const override {
-    return limit_count == limit_count_ && limit_offset == limit_offset_;
+    return limit_count == limit_count_ && limit_offset >= prior_offset_ &&
+           limit_offset - prior_offset_ == limit_offset_;
   }
   [[nodiscard]] bool EnforcesDistinct() const override {
     // A limit of exactly one row is trivially distinct; zero (unbounded /
@@ -78,6 +81,7 @@ class LimitPlan final : public PlanBase {
   [[nodiscard]] const Plan& Src() const { return src_; }
   [[nodiscard]] size_t LimitCount() const { return limit_count_; }
   [[nodiscard]] size_t LimitOffset() const { return limit_offset_; }
+  [[nodiscard]] size_t PriorOffset() const { return prior_offset_; }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 
@@ -85,6 +89,7 @@ class LimitPlan final : public PlanBase {
   Plan src_;
   size_t limit_count_;
   size_t limit_offset_;
+  size_t prior_offset_{0};
 };
 
 }  // namespace tinylamb

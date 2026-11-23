@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "common/log_message.hpp"
 #include "executor/zone_map.hpp"
 #include "page/row_position.hpp"
 #include "type/collation.hpp"
@@ -72,28 +73,42 @@ class ColumnVector {
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] bool IsHeterogeneous() const { return heterogeneous_; }
   void SetAllowHeterogeneous(bool allow) { allow_heterogeneous_ = allow; }
-  void RebindEmptyType(ValueType type, bool is_unsigned,
+  // Returns false (and changes nothing) when the column is not empty. Callers
+  // that rely on the rebind must check the result; the old void form silently
+  // left the old type in place while the caller believed it had changed.
+  bool RebindEmptyType(ValueType type, bool is_unsigned,
                        Collation collation = Collation::kNone) {
     // assert() disappears under NDEBUG; leaving stale integers_/doubles_
     // data behind a changed type_ would make ValueAt() silently wrong.
     if (size_ != 0) {
-      return;
+      return false;
     }
     type_ = type;
     unsigned_ = is_unsigned;
     heterogeneous_ = false;
+    // An empty rebind is a fresh column: do not carry the previous schema's
+    // heterogeneous constraint into the new binding (DataChunk::Reset does
+    // the same).
+    allow_heterogeneous_ = true;
     // The column is empty, so no existing cell is observable. Still drop the
     // storage (and collation state) left by the previous binding: assert() is
     // gone under NDEBUG, and appending the new type without this would let
     // ValueAt() read the old integers_/doubles_/strings_ payload.
+    // `collation` comes from the frame/schema, not from an observed cell;
+    // ColumnCollation() reports kNone while Empty() so an empty column never
+    // announces a COLLATE to downstream key selection.
     collation_ = type == ValueType::kVarChar ? collation : Collation::kNone;
     observed_collation_ = collation_ != Collation::kNone;
     mixed_collation_ = false;
-    null_bitmap_.clear();
-    integers_.clear();
-    doubles_.clear();
-    strings_.clear();
-    nested_.clear();
+    // clear() keeps capacity: a huge VARCHAR batch would keep its strings_
+    // buffer alive after being rebound to INT64. Swap with an empty vector so
+    // RSS follows the current binding rather than the previous peak.
+    std::vector<uint64_t>().swap(null_bitmap_);
+    std::vector<int64_t>().swap(integers_);
+    std::vector<double>().swap(doubles_);
+    std::vector<std::string>().swap(strings_);
+    std::vector<Value>().swap(nested_);
+    return true;
   }
   // VARCHAR only: the collator shared by every value in this column, so a
   // value that arrived tagged (COLLATE) leaves the batch carrying it and the
@@ -101,7 +116,7 @@ class ColumnVector {
   // row-at-a-time. A column that mixes collators degrades to the engine
   // default (binary) rather than folding some rows and not others.
   [[nodiscard]] Collation ColumnCollation() const {
-    return mixed_collation_ ? Collation::kNone : collation_;
+    return Empty() || mixed_collation_ ? Collation::kNone : collation_;
   }
   [[nodiscard]] bool HasMixedCollation() const noexcept {
     return mixed_collation_;
@@ -178,11 +193,13 @@ class DataChunk {
 
   [[nodiscard]] Row RowAt(size_t row_index) const;
   [[nodiscard]] const RowPosition& PositionAt(size_t row_index) const {
-    assert(row_index < size_ && "DataChunk::PositionAt out of range");
+    // CHECK is active in release builds; assert() vanishes under NDEBUG and
+    // leaves the vector subscript unchecked.
+    CHECK_MSG(row_index < size_, "DataChunk::PositionAt out of range");
     return positions_[row_index];
   }
   void SetPositionAt(size_t row_index, RowPosition pos) {
-    assert(row_index < size_ && "DataChunk::SetPositionAt out of range");
+    CHECK_MSG(row_index < size_, "DataChunk::SetPositionAt out of range");
     positions_[row_index] = pos;
   }
   [[nodiscard]] size_t Size() const { return size_; }
@@ -190,20 +207,23 @@ class DataChunk {
   [[nodiscard]] size_t ColumnCount() const { return columns_.size(); }
   [[nodiscard]] bool HasLayout(const Schema& schema) const;
   [[nodiscard]] const ColumnVector& ColumnAt(size_t index) const {
-    assert(index < columns_.size() && "DataChunk::ColumnAt out of range");
+    CHECK_MSG(index < columns_.size(), "DataChunk::ColumnAt out of range");
     return columns_[index];
   }
   [[nodiscard]] ColumnVector& ColumnAt(size_t index) {
-    assert(index < columns_.size() && "DataChunk::ColumnAt out of range");
+    CHECK_MSG(index < columns_.size(), "DataChunk::ColumnAt out of range");
     return columns_[index];
   }
   [[nodiscard]] const ZoneMap& ZoneMapAt(size_t index) const {
-    assert(index < zone_maps_.size() && "DataChunk::ZoneMapAt out of range");
+    CHECK_MSG(index < zone_maps_.size(), "DataChunk::ZoneMapAt out of range");
     return zone_maps_[index];
   }
+  // The returned pointer borrows zone_maps_: any operation that changes the
+  // column count (EnsureLayout/Initialize/Reset) may reallocate and invalidate
+  // it. Use it only within the current batch-append scope.
   [[nodiscard]] ZoneMap* MutableZoneMapAt(size_t index) {
-    assert(index < zone_maps_.size() &&
-           "DataChunk::MutableZoneMapAt out of range");
+    CHECK_MSG(index < zone_maps_.size(),
+              "DataChunk::MutableZoneMapAt out of range");
     return &zone_maps_[index];
   }
   void CommitBatchAppend(size_t appended_rows);

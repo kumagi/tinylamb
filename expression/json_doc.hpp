@@ -132,9 +132,12 @@ inline void SkipWs(std::string_view& s) {
   }
 }
 
-inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"') {
+inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"',
+                                        bool* closed = nullptr) {
   std::string res;
-  res.reserve(s.size());
+  if (closed != nullptr) {
+    *closed = false;
+  }
   if (s.empty() || s.front() != quote) {
     return res;
   }
@@ -143,6 +146,9 @@ inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"') {
     char c = s.front();
     s.remove_prefix(1);
     if (c == quote) {
+      if (closed != nullptr) {
+        *closed = true;
+      }
       break;
     }
     if (c == '\\' && !s.empty()) {
@@ -300,7 +306,8 @@ inline JVal ParseJsonSimple(std::string_view& s, size_t depth) {
     SkipWs(s);
     while (!s.empty() && s.front() != '}') {
       SkipWs(s);
-      if (s.front() != '"') {
+      // SkipWs can consume the last characters, so re-check before front().
+      if (s.empty() || s.front() != '"') {
         break;
       }
       std::string key = ParseJsonStringToken(s);
@@ -387,7 +394,6 @@ struct PathSegment {
 inline std::optional<std::vector<PathSegment>> ParsePathSegments(
     std::string_view path) {
   std::vector<PathSegment> segments;
-  segments.reserve(path.size());
   if (path.empty() || path == "$") {
     return segments;
   }
@@ -398,9 +404,12 @@ inline std::optional<std::vector<PathSegment>> ParsePathSegments(
     if (path.front() == '.') {
       path.remove_prefix(1);
       std::string key;
-      key.reserve(path.size());
       if (!path.empty() && path.front() == '"') {
-        key = ParseJsonStringToken(path);
+        bool closed = false;
+        key = ParseJsonStringToken(path, '"', &closed);
+        if (!closed) {
+          return std::nullopt;
+        }
       } else {
         while (!path.empty() && path.front() != '.' && path.front() != '[') {
           key += path.front();
@@ -452,7 +461,6 @@ inline std::optional<std::vector<PathSegment>> ParsePathSegments(
       // A leading bare name without '.' ("$.a" minus the '$' already
       // handled; "a.b" style).  Consume the name as the first hop.
       std::string key;
-      key.reserve(path.size());
       while (!path.empty() && path.front() != '.' && path.front() != '[') {
         key += path.front();
         path.remove_prefix(1);
@@ -1115,7 +1123,9 @@ inline StatusOr<Value> Evaluate(std::string_view func_name,
     // JSON form directly instead of round-tripping through TextOf.
     std::optional<JVal> root;
     if (arguments[0].type == ValueType::kVarChar) {
-      root = ParseDocument(TextOf(arguments[0]));
+      // Parsed scalar spellings borrow the input. The argument lives through
+      // the LAX conversion, including LAX_STRING's copy of the raw text.
+      root = ParseDocument(arguments[0].value.varchar_value);
     } else {
       root = JValFromSqlValue(arguments[0]);
     }

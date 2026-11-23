@@ -84,6 +84,11 @@ struct LogicalExpression {
   std::vector<Row> values{};
   size_t limit_count{0};
   size_t limit_offset{0};
+  // Prefix rows already skipped by a lower operator (e.g. window_halo_topn's
+  // inner TopN offset), so LimitPlan/TopNPlan skips limit_offset locally
+  // while reporting EnforcesLimit(limit_count, limit_offset +
+  // prior_limit_offset).
+  size_t prior_limit_offset{0};
   // FETCH FIRST ... WITH TIES: the TopN boundary keeps peers of the last
   // row. Carried through costing (TopNPlan::EnforcesLimit is false for ties,
   // so the engine remains the safety net) and ready for the Cascades
@@ -169,7 +174,7 @@ struct Group {
   // implementation of this group (D1: the group, not the expression, owns the
   // scan filter so all alternatives filter identically).
   Expression filter{};
-  // Bitset over the memo-wide relation index (D5 join-graph metadata).
+  // Bitset over the memo-wide relation index (join-graph metadata; not design.md D5).
   uint64_t relation_mask{0};
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
@@ -318,8 +323,8 @@ class Memo {
 
   // Provide table schemas so Scan expressions carry output_schema for
   // constraint-based optimization rules.
-  void SetTableSchemas(const std::unordered_map<std::string, Schema>& schemas) {
-    table_schemas_ = schemas;
+  void SetTableSchemas(std::unordered_map<std::string, Schema> schemas) {
+    table_schemas_ = std::move(schemas);
     RefreshLogicalProperties();
   }
   [[nodiscard]] const std::unordered_map<std::string, Schema>& GetTableSchemas()
@@ -828,6 +833,9 @@ class SearchEngine {
   [[nodiscard]] bool ExploreLimitReached() const {
     return explore_limit_reached_;
   }
+  // Number of transformation rules that threw and were contained during the
+  // last Explore(); a non-zero value means some alternatives were skipped.
+  [[nodiscard]] size_t RuleFailureCount() const { return rule_failure_count_; }
   [[nodiscard]] std::optional<BestPlan> Optimize(
       GroupId root, const PhysicalProperties& properties,
       const Implement& implement, const RuleContext& context);
@@ -877,6 +885,7 @@ class SearchEngine {
   size_t steps_{0};
   bool budget_exhausted_{false};
   bool explore_limit_reached_{false};
+  size_t rule_failure_count_{0};
 };
 
 bool IsStrictOnRelations(const Expression& expr,

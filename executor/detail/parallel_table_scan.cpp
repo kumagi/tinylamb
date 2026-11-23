@@ -122,7 +122,7 @@ bool DenseRfBitsAllSet(const RuntimeFilterGroup& rf) noexcept {
     return false;
   }
   const uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
-  const size_t full_words = static_cast<size_t>(span >> 6);
+  const auto full_words = static_cast<size_t>(span >> 6);
   const size_t nwords = rf.dense_bits_word_count();
   if (full_words >= nwords) {
     return false;
@@ -154,7 +154,7 @@ uint32_t SelectIntegerRange(const LSTableColumnBlock& col, uint32_t count,
     return SelectIntegerRange(col, count, lo, hi, selection);
   }
   const int64_t* __restrict__ cells = col.int_cells.data();
-  const uint64_t lo_u = static_cast<uint64_t>(lo);
+  const auto lo_u = static_cast<uint64_t>(lo);
   const uint64_t span_u = static_cast<uint64_t>(hi) - lo_u;
   const uint64_t* __restrict__ bits = rf.dense_bits_data();
   uint32_t selected = 0;
@@ -580,6 +580,10 @@ void AppendLSTableColumnSlice(const LSTableColumnBlock& blk_col,
       }
       if (blk_col.HasRawIntCells() &&
           src_offset + count <= blk_col.int_cells.size()) {
+        // Viewing the int cell array as bytes is the intended zero-copy path:
+        // uint8_t (unsigned char) is the one type allowed to alias any object
+        // representation, and `data() + src_offset` is already suitably
+        // aligned for the 8-byte frame the callee reinterprets it as.
         dst->SetBorrowedFrameOfReference(
             owner, blk_col.type, blk_col.is_unsigned, 8, 0,
             reinterpret_cast<const uint8_t*>(blk_col.int_cells.data() +
@@ -947,7 +951,8 @@ bool TryParallelTableScan(
       morsel_filter_batch_ok = false;
     }
     for (const SimpleComparePredicate& pred : scan_filter->simple) {
-      if (!morsel_filter_batch_ok) break;
+      if (!morsel_filter_batch_ok) { break;
+}
       if (pred.column_payload || pred.column >= result_schema.ColumnCount() ||
           !is_batch_cmp_op(pred.op)) {
         morsel_filter_batch_ok = false;
@@ -966,7 +971,8 @@ bool TryParallelTableScan(
     }
     for (const PrebuiltMembershipPredicate& pm :
          scan_filter->prebuilt_membership) {
-      if (!morsel_filter_batch_ok) break;
+      if (!morsel_filter_batch_ok) { break;
+}
       if (pm.negated || pm.column >= result_schema.ColumnCount() ||
           (pm.runtime_filter == nullptr && pm.values == nullptr)) {
         morsel_filter_batch_ok = false;
@@ -991,7 +997,8 @@ bool TryParallelTableScan(
       }
     }
     std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
-        context.txn_, table, true, projection != nullptr ? &needed : nullptr);
+        context.txn_, table, true, projection != nullptr ? &needed : nullptr,
+        /*allow_block_lazy=*/true);
     if (store != nullptr &&
         store->layout_generation == table.LayoutGeneration() &&
         store->first_pid == table.FirstPageId()) {
@@ -1120,6 +1127,10 @@ bool TryParallelTableScan(
                   batch.Reset();
                   const size_t n = iter.DecodeNextTypedBatch(&batch, 2048);
                   if (n == 0) {
+                    // End of scan or a decode failure: the iterator keeps a
+                    // sticky Status, checked just below via iter.GetStatus()
+                    // and propagated into zm_errs. A zero-row batch is never
+                    // mistaken for a successful read of corrupt input.
                     break;
                   }
                   const int64_t* cp = batch.cells.data();
@@ -1127,8 +1138,8 @@ bool TryParallelTableScan(
                   for (size_t r = 0; r < n; ++r) {
                     if (np[r] == 0) {
                       const int64_t v = cp[r];
-                      if (v < pmin) pmin = v;
-                      if (v > pmax) pmax = v;
+                      pmin = std::min(v, pmin);
+                      pmax = std::max(v, pmax);
                     }
                   }
                 }
@@ -1345,12 +1356,12 @@ bool TryParallelTableScan(
   };
   std::vector<LSTableDictColFilter> lstable_dict_filters;
   std::vector<LSTableWideDictFilter> lstable_wide_filters;
-  lstable_wide_filters.reserve(scan_filter ? scan_filter->simple.size() : 0);
+  lstable_wide_filters.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<DisjBranchFilter> lstable_disj_branches;
   std::vector<LSTableDoubleZonePredicate> lstable_double_zones;
-  lstable_double_zones.reserve(scan_filter ? scan_filter->simple.size() : 0);
+  lstable_double_zones.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<LSTableIntColCompare> lstable_col_compares;
-  lstable_col_compares.reserve(scan_filter ? scan_filter->simple.size() : 0);
+  lstable_col_compares.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<LSTableExtraRf> lstable_extra_rfs;
   std::vector<uint8_t> simple_covered_by_dict;
   std::vector<uint8_t> prefix_covered_by_dict;
@@ -1438,7 +1449,11 @@ bool TryParallelTableScan(
     prefix_covered_by_dict.assign(scan_filter->prefix_in.size(), 0);
     prebuilt_membership_covered.assign(scan_filter->prebuilt_membership.size(),
                                        0);
-    std::vector<int> col_to_df(table.GetSchema().ColumnCount(), -1);
+    // size_t throughout: the vector is indexed by a slot_t column id and its
+    // values are indices into lstable_dict_filters, so an int (with its
+    // signed/unsigned narrowing cast) is both unnecessary and lossy.
+    std::vector<size_t> col_to_df(table.GetSchema().ColumnCount(),
+                                  std::numeric_limits<size_t>::max());
     const auto dict_size_of =
         [](const LSTableColumnDictionary& dict) noexcept -> size_t {
       if (dict.value_type == ValueType::kInt64 ||
@@ -1451,8 +1466,8 @@ bool TryParallelTableScan(
       return dict.StringEntryCount();
     };
     auto get_or_init_df = [&](slot_t full_col) -> LSTableDictColFilter& {
-      if (col_to_df[full_col] < 0) {
-        col_to_df[full_col] = static_cast<int>(lstable_dict_filters.size());
+      if (col_to_df[full_col] == std::numeric_limits<size_t>::max()) {
+        col_to_df[full_col] = lstable_dict_filters.size();
         LSTableDictColFilter df;
         df.column = full_col;
         df.allow_null = true;
@@ -1464,7 +1479,7 @@ bool TryParallelTableScan(
         }
         lstable_dict_filters.push_back(df);
       }
-      return lstable_dict_filters[static_cast<size_t>(col_to_df[full_col])];
+      return lstable_dict_filters[col_to_df[full_col]];
     };
     const auto eval_pred_on_dict_code = [&](const SimpleComparePredicate& pred,
                                             const LSTableColumnDictionary& dict,
@@ -1483,10 +1498,10 @@ bool TryParallelTableScan(
         // `code` 0 doubles as the "is this predicate dictionary-decidable"
         // probe, so an empty dictionary (every row NULL, or a store built
         // under a tiny columnar budget) must not be indexed.
-        if (code >= dict.entries.size()) {
+        if (code >= dict.StringEntryCount()) {
           return false;
         }
-        const std::string_view text = dict.entries[code];
+        const std::string_view text = dict.StringEntryAt(code);
         const std::string_view pat = pred.constant.value.varchar_value;
         if (pred.op == BinaryOperation::kLike ||
             pred.op == BinaryOperation::kNotLike) {
@@ -1642,9 +1657,56 @@ bool TryParallelTableScan(
         }
       }
       if (!scan_filter->disjunctive_branches.empty()) {
+        // Lean proof: lean/TinylambOpt/ResearchProofs/NullOrLikeDictBitmapPrefilter.lean (sound)
+        // Strictly recognizes pure `(col IS NULL)` branches (never `AND` or
+        // `NOT (col = x)`) so `(col IS NULL OR col LIKE pat)` evaluates in a
+        // single dictionary bitmap pass without falling back to row bytecode.
+        const auto extract_pure_is_null_col =
+            [&](const CompiledScanFilter::DisjunctiveBranch& br,
+                slot_t* out_full_col) -> bool {
+          if (!br.simple.empty() || !br.prefix_in.empty() ||
+              !br.prebuilt_membership.empty() || br.residual.size() != 1 ||
+              !br.residual[0]) {
+            return false;
+          }
+          const Expression& rx = br.residual[0];
+          if (rx->Type() != TypeTag::kUnaryExp) {
+            return false;
+          }
+          const auto& unary = rx->AsUnaryExpression();
+          if (unary.Op() != UnaryOperation::kIsNull || !unary.Child() ||
+              unary.Child()->Type() != TypeTag::kColumnValue) {
+            return false;
+          }
+          const auto off = LocalColumnOffset(
+              result_schema, unary.Child()->AsColumnValue().GetColumnName());
+          if (!off.has_value()) {
+            return false;
+          }
+          *out_full_col = to_full_col(static_cast<slot_t>(*off));
+          return true;
+        };
         std::optional<slot_t> common_col;
         bool single_dict_col_or = true;
+        bool any_is_null_branch = false;
         for (const auto& br : scan_filter->disjunctive_branches) {
+          slot_t null_fc = 0;
+          if (extract_pure_is_null_col(br, &null_fc)) {
+            if (!common_col.has_value()) {
+              common_col = null_fc;
+            } else if (*common_col != null_fc) {
+              single_dict_col_or = false;
+              break;
+            }
+            if (null_fc >= lstable_store->dictionaries.size() ||
+                !lstable_store->dictionaries[null_fc].active ||
+                table.GetSchema().GetColumn(null_fc).IsUnsigned()) {
+              single_dict_col_or = false;
+              break;
+            }
+            any_is_null_branch = true;
+            continue;
+          }
           if (!br.prefix_in.empty() || !br.prebuilt_membership.empty() ||
               !br.residual.empty() || br.simple.empty()) {
             single_dict_col_or = false;
@@ -1679,7 +1741,9 @@ bool TryParallelTableScan(
         if (single_dict_col_or && common_col.has_value()) {
           const slot_t fc = *common_col;
           LSTableDictColFilter& df = get_or_init_df(fc);
-          df.allow_null = false;
+          // Conjunction with any earlier conjunct on `fc`: OR permits NULL iff
+          // an OR branch is `fc IS NULL`, AND earlier conjuncts allow NULL.
+          df.allow_null = df.allow_null && any_is_null_branch;
           const auto& dict = lstable_store->dictionaries[fc];
           const size_t ncodes = dict_size_of(dict);
           df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
@@ -1689,6 +1753,11 @@ bool TryParallelTableScan(
             }
             bool any_br_ok = false;
             for (const auto& br : scan_filter->disjunctive_branches) {
+              slot_t null_fc = 0;
+              if (extract_pure_is_null_col(br, &null_fc)) {
+                // Non-null `code` makes `col IS NULL` FALSE; try next branch.
+                continue;
+              }
               bool br_ok = true;
               for (const SimpleComparePredicate& sp : br.simple) {
                 bool sup = false;
@@ -1746,6 +1815,35 @@ bool TryParallelTableScan(
           built_branches.reserve(scan_filter->disjunctive_branches.size());
           bool all_branches_dict_covered = true;
           for (const auto& br : scan_filter->disjunctive_branches) {
+            slot_t null_fc = 0;
+            if (extract_pure_is_null_col(br, &null_fc)) {
+              if (null_fc >= table.GetSchema().ColumnCount() ||
+                  table.GetSchema().GetColumn(null_fc).IsUnsigned() ||
+                  null_fc >= lstable_store->dictionaries.size()) {
+                all_branches_dict_covered = false;
+                break;
+              }
+              const auto& dict = lstable_store->dictionaries[null_fc];
+              if (dict.active) {
+                DisjBranchFilter db;
+                LSTableDictColFilter& df = get_branch_narrow(db, null_fc);
+                df.allow_null = true;
+                df.pass.fill(0);
+                df.pass_mask = {0ULL, 0ULL, 0ULL, 0ULL};
+                built_branches.push_back(std::move(db));
+                continue;
+              }
+              if (dict.wide_code_bytes != 0) {
+                DisjBranchFilter db;
+                LSTableWideDictFilter& wf = get_branch_wide(db, null_fc);
+                wf.allow_null = true;
+                std::fill(wf.pass.begin(), wf.pass.end(), 0);
+                built_branches.push_back(std::move(db));
+                continue;
+              }
+              all_branches_dict_covered = false;
+              break;
+            }
             if (!br.residual.empty() ||
                 (br.simple.empty() && br.prefix_in.empty() &&
                  br.prebuilt_membership.empty())) {
@@ -2286,9 +2384,8 @@ bool TryParallelTableScan(
          scan_filter->simple.size() == integer_peeks.size());
     const bool tlcs_rf_ok = runtime_filter == nullptr ||
                             (full_key_column.has_value() &&
-                             (runtime_filter_type == ValueType::kInt64 ||
-                              runtime_filter_type == ValueType::kDate));
-    bool tlcs_schema_ok = result_schema.ColumnCount() > 0;
+                   auto  (runtime_filter_type == ValueType::kInt64 ||
+                              runtime_filter_type == ValueType::kDate));autol tlcs_schema_ok = result_schema.ColumnCount() > 0;
     for (slot_t k = 0; k < result_schema.ColumnCount() && tlcs_schema_ok; ++k) {
       const Column& col = result_schema.GetColumn(k);
       const ValueType vt = col.Type();
@@ -2343,8 +2440,9 @@ bool TryParallelTableScan(
               stage2_cols.push_back(fc);
             } else {
               out_stage_idx[k] =
-                  static_cast<size_t>(std::distance(stage2_cols.begin(), it2));
-            }
+                  static_cast<size_t>(std::distance(stage2_cols.begin(), it {2));
+          
+}  }
           }
         }
         const uint32_t total_blocks = clean_tlcs->BlockCount();
@@ -2357,7 +2455,8 @@ bool TryParallelTableScan(
         std::mutex tlcs_err_mu;
         Status tlcs_err{Status::kSuccess};
 
-        const bool rf_has_dense =
+  {       const bo
+}ol rf_has_dense =
             runtime_filter != nullptr && runtime_filter->has_dense_bits();
         const int64_t rf_lo = rf_has_dense ? runtime_filter->Lo() : 0;
         const uint64_t rf_span =
@@ -2369,7 +2468,8 @@ bool TryParallelTableScan(
 
         auto tlcs_worker = [&](size_t w) {
           const uint32_t b_begin = static_cast<uint32_t>(
-              (static_cast<uint64_t>(total_blocks) * w) / tworkers);
+              (static_cast<uint64_t>(total_bl {ocks) * w) / two
+}rkers);
           const uint32_t b_end = static_cast<uint32_t>(
               (static_cast<uint64_t>(total_blocks) * (w + 1)) / tworkers);
           if (b_begin >= b_end) {
@@ -2414,7 +2514,7 @@ bool TryParallelTableScan(
                 break;
               }
             }
-            if (!extra_zm_ok) {
+            if (!eautom_ok) {
               continue;
             }
             const bool all_match_peek =
@@ -2458,7 +2558,7 @@ bool TryParallelTableScan(
             } else {
               // Stage 1: decode filter columns only.
               const Status st1 = clean_tlcs->DecodeBlockColumns(
-                  b, stage1_cols, table.GetSchema(), &blk1, true, &io_scratch);
+                  b, stage1_cols, table.GetSchauto &blk1, true, &io_scratch);
               if (!st1.ok()) {
                 std::scoped_lock lk(tlcs_err_mu);
                 if (tlcs_err.ok()) tlcs_err = st1;
@@ -2571,7 +2671,8 @@ bool TryParallelTableScan(
                           out_n += static_cast<size_t>(pcells[r] != rhs);
                         }
                         break;
-                      case BinaryOperation::kLessThan:
+     {                
+}  case BinaryOperation::kLessThan:
                         for (size_t i = 0; i < sel_n; ++i) {
                           const uint32_t r = sel[i];
                           sel[out_n] = r;
@@ -2767,6 +2868,8 @@ bool TryParallelTableScan(
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - tlcs_begin)
                     .count();
+            // Debug output is best effort and cannot change the scan status.
+            // NOLINTNEXTLINE(cert-err33-c)
             std::fprintf(stderr,
                          "[scan-tlcs] blocks=%u out_cols=%zu stage1=%zu "
                          "stage2=%zu ms=%.2f\n",
@@ -3152,6 +3255,21 @@ bool TryParallelTableScan(
         std::vector<uint32_t> pending_sel;
         size_t pending_rows = 0;
         std::vector<uint8_t> pending_null_scratch;
+        std::vector<std::unique_ptr<LSTableStore::LazyBlockScratch>>
+            free_scratches;
+        std::vector<std::unique_ptr<LSTableStore::LazyBlockScratch>>
+            pending_scratches;
+        std::unique_ptr<LSTableStore::LazyBlockScratch> active_scratch;
+        std::shared_ptr<const void> active_transient_keep;
+        std::vector<std::shared_ptr<const void>> pending_transient_keeps;
+        const auto release_pending_scratches = [&]() {
+          for (auto& s : pending_scratches) {
+            s->transient.clear();
+            free_scratches.push_back(std::move(s));
+          }
+          pending_scratches.clear();
+          pending_transient_keeps.clear();
+        };
         if (use_columnar_sink) {
           sel_buf.reserve(kColumnarChunkRows);
           if (!apply_pushed_proj) {
@@ -3185,10 +3303,14 @@ bool TryParallelTableScan(
                                        ps.src_offset, nullptr, ps.count,
                                        &out_chunk.columns[k], 0);
             }
+            for (auto& tk : pending_transient_keeps) {
+              out_chunk.AppendKeepaliveUnique(tk);
+            }
             worker_columnar[w].AppendChunk(std::move(out_chunk));
             pending_blocks.clear();
             pending_sel.clear();
             pending_rows = 0;
+            release_pending_scratches();
             return;
           }
           const uint32_t* __restrict sel_all = pending_sel.data();
@@ -3395,10 +3517,14 @@ bool TryParallelTableScan(
               out_off += ps.count;
             }
           }
+          for (auto& tk : pending_transient_keeps) {
+            out_chunk.AppendKeepaliveUnique(tk);
+          }
           worker_columnar[w].AppendChunk(std::move(out_chunk));
           pending_blocks.clear();
           pending_sel.clear();
           pending_rows = 0;
+          release_pending_scratches();
         };
         const auto flush_block_selection =
             [&](const LSTablePageBlock& blk,
@@ -3433,6 +3559,7 @@ bool TryParallelTableScan(
                 ColumnarChunk full_chunk;
                 full_chunk.InitFromSchema(columnar_schema, 0);
                 full_chunk.rows = kColumnarChunkRows;
+                full_chunk.AppendKeepaliveUnique(active_transient_keep);
                 for (size_t k = 0; k < ncols; ++k) {
                   AppendLSTableColumnSlice(resolve_blk_col(k), lstable_store,
                                            offset, nullptr, kColumnarChunkRows,
@@ -3444,6 +3571,9 @@ bool TryParallelTableScan(
               }
               const size_t space = kColumnarChunkRows - pending_rows;
               const size_t n = std::min(space, count - offset);
+              if (active_transient_keep != nullptr) {
+                pending_transient_keeps.push_back(active_transient_keep);
+              }
               if (sel == nullptr) {
                 pending_blocks.push_back(
                     PendingSelBlock{.blk = &blk,
@@ -3564,6 +3694,7 @@ bool TryParallelTableScan(
               cur_chunk.keepalives.push_back(lstable_store);
               cur_chunk_init = true;
             }
+            cur_chunk.AppendKeepaliveUnique(active_transient_keep);
             const size_t space = kColumnarChunkRows - cur_chunk.rows;
             const size_t n = std::min(space, count - offset);
             const size_t prev_rows = cur_chunk.rows;
@@ -3736,8 +3867,11 @@ bool TryParallelTableScan(
             bool dict_all_pass = lstable_wide_filters.empty();
             for (const LSTableDictColFilter& df : lstable_dict_filters) {
               const LSTableColumnBlock& dcol = blk->columns[df.column];
+              const bool has_dict_codes =
+                  !dcol.dict_codes.empty() ||
+                  (lstable_store->is_block_lazy && dcol.dict != nullptr);
               const bool non_null_any =
-                  !dcol.dict_codes.empty() &&
+                  has_dict_codes &&
                   (((dcol.dict_mask[0] & df.pass_mask[0]) |
                     (dcol.dict_mask[1] & df.pass_mask[1]) |
                     (dcol.dict_mask[2] & df.pass_mask[2]) |
@@ -3746,8 +3880,7 @@ bool TryParallelTableScan(
                 zone_rejected = true;
                 break;
               }
-              if ((dcol.has_null && !df.allow_null) ||
-                  dcol.dict_codes.empty() ||
+              if ((dcol.has_null && !df.allow_null) || !has_dict_codes ||
                   ((dcol.dict_mask[0] & ~df.pass_mask[0]) |
                    (dcol.dict_mask[1] & ~df.pass_mask[1]) |
                    (dcol.dict_mask[2] & ~df.pass_mask[2]) |
@@ -3763,8 +3896,11 @@ bool TryParallelTableScan(
                 bool br_all_pass = db.wide_cols.empty();
                 for (const LSTableDictColFilter& df : db.narrow_cols) {
                   const LSTableColumnBlock& dcol = blk->columns[df.column];
+                  const bool has_dict_codes =
+                      !dcol.dict_codes.empty() ||
+                      (lstable_store->is_block_lazy && dcol.dict != nullptr);
                   const bool non_null_any =
-                      !dcol.dict_codes.empty() &&
+                      has_dict_codes &&
                       (((dcol.dict_mask[0] & df.pass_mask[0]) |
                         (dcol.dict_mask[1] & df.pass_mask[1]) |
                         (dcol.dict_mask[2] & df.pass_mask[2]) |
@@ -3773,8 +3909,7 @@ bool TryParallelTableScan(
                     possible = false;
                     break;
                   }
-                  if ((dcol.has_null && !df.allow_null) ||
-                      dcol.dict_codes.empty() ||
+                  if ((dcol.has_null && !df.allow_null) || !has_dict_codes ||
                       ((dcol.dict_mask[0] & ~df.pass_mask[0]) |
                        (dcol.dict_mask[1] & ~df.pass_mask[1]) |
                        (dcol.dict_mask[2] & ~df.pass_mask[2]) |
@@ -4010,6 +4145,47 @@ bool TryParallelTableScan(
             }
             if (null_rejected) {
               continue;
+            }
+            if (lstable_store->is_block_lazy) {
+              if (active_scratch != nullptr) {
+                if (!pending_blocks.empty() &&
+                    pending_blocks.back().blk == &active_scratch->block) {
+                  pending_scratches.push_back(std::move(active_scratch));
+                } else {
+                  active_scratch->transient.clear();
+                  free_scratches.push_back(std::move(active_scratch));
+                }
+              }
+              if (!free_scratches.empty()) {
+                active_scratch = std::move(free_scratches.back());
+                free_scratches.pop_back();
+              } else {
+                active_scratch =
+                    std::make_unique<LSTableStore::LazyBlockScratch>();
+              }
+              active_transient_keep.reset();
+              const LSTablePageBlock* mat_blk =
+                  lstable_store->MaterializeBlockView(bi, active_scratch.get());
+              if (mat_blk == nullptr) {
+                abort_columnar_scan.store(true, std::memory_order_relaxed);
+                std::scoped_lock lock(error_mu);
+                if (error != nullptr && *error == Status::kSuccess) {
+                  *error = Status::kIOError;
+                } else if (error == nullptr && error_ex == Status::kSuccess) {
+                  error_ex = Status::kIOError;
+                }
+                break;
+              }
+              if (use_columnar_sink && !active_scratch->transient.empty())
+                  [[unlikely]] {
+                auto keep = std::make_shared<
+                    std::vector<std::unique_ptr<LSTableLazyDecodedBlock>>>(
+                    std::move(active_scratch->transient));
+                active_scratch->transient.clear();
+                worker_columnar[w].AppendKeepalive(keep);
+                active_transient_keep = std::move(keep);
+              }
+              blk = mat_blk;
             }
             const size_t col_count = projection != nullptr
                                          ? projection->size()
@@ -4916,6 +5092,10 @@ bool TryParallelTableScan(
             batch.Reset();
             const size_t n = iterator.DecodeNextTypedBatch(&batch, 2048);
             if (n == 0) {
+              // A zero-row batch ends this morsel; any decode/serdes failure
+              // is carried by the iterator's sticky Status, which is checked
+              // after the loop below and propagated to `error` before any
+              // shard is merged. Corrupt input cannot silently produce rows.
               break;
             }
             shard_counts[w].seen += n;
@@ -4932,7 +5112,7 @@ bool TryParallelTableScan(
                 const size_t base = i * ncols;
                 bool ok = true;
                 for (const SimpleComparePredicate& pred : scan_filter->simple) {
-                  const size_t idx = base + pred.column;
+                  const size_t idx = base (+ pred.co)lumn;
                   if (np[idx] != 0) {
                     ok = false;
                     break;
@@ -4990,7 +5170,7 @@ bool TryParallelTableScan(
                 ColumnarColumn& dst = cur_chunk.columns[c];
                 const ValueType vt = btypes[c];
                 if ((vt == ValueType::kInt64 || vt == ValueType::kDate) &&
-                    dst.encoding == ColumnarColumn::Encoding::kFlat &&
+                    dst.encoding == (ColumnarC)olumn::Encoding::kFlat &&
                     dst.is_uniform && dst.type == vt &&
                     dst.is_unsigned == bunsigned[c]) {
                   dst.ints.resize(dst_base + take);
@@ -5001,8 +5181,8 @@ bool TryParallelTableScan(
                     out_p[k] = cp[idx];
                     any_null |= (np[idx] != 0);
                   }
-                  if (any_null) {
-                    if (!dst.has_null) {
+                  if (any_(null) {
+ )                   if (!dst.has_null) {
                       dst.nulls.assign(dst_base, 0);
                       dst.has_null = true;
                     }
@@ -5394,6 +5574,7 @@ bool TryParallelTableScan(
             if (MatchScanFilter(row, result_schema, *scan_filter, outer,
                                 context, ctes, &deferred_error)) {
               result->AddRow(std::move(row));
+              record_error(result->GetStatus());
             }
             if (!deferred_error.ok() && error != nullptr && error->ok()) {
               *error = std::move(deferred_error);

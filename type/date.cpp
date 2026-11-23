@@ -43,9 +43,21 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
     const size_t colon = offset.find(':');
     std::string_view hours = offset;
     std::string_view minutes;
+    std::string_view seconds;
     if (colon != std::string_view::npos) {
       hours = offset.substr(0, colon);
       minutes = offset.substr(colon + 1);
+      // FormatTimeZoneOffset emits ±HH:MM:SS for historic LMT offsets; accept
+      // that spelling so STRING(ts, zone) round-trips through a TIMESTAMP
+      // literal's zone suffix.
+      const size_t second_colon = minutes.find(':');
+      if (second_colon != std::string_view::npos) {
+        seconds = minutes.substr(second_colon + 1);
+        minutes = minutes.substr(0, second_colon);
+        if (seconds.size() != 2) {
+          return invalid();
+        }
+      }
       if (minutes.size() != 2) {
         return invalid();
       }
@@ -69,12 +81,14 @@ StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
       return value;
     };
     const int h = digits(hours), m = digits(minutes);
+    const int sec = seconds.empty() ? 0 : digits(seconds);
     // Real IANA/GoogleSQL offsets never exceed 14 hours; reject implausible
     // numeric offsets instead of accepting a wall clock no zone can have.
-    if (h < 0 || h > 14 || m < 0 || m > 59 || (h == 14 && m != 0)) {
+    if (h < 0 || h > 14 || m < 0 || m > 59 || sec < 0 || sec > 59 ||
+        (h == 14 && (m != 0 || sec != 0))) {
       return invalid();
     }
-    return sign * (h * 3600 + m * 60);
+    return sign * (h * 3600 + m * 60 + sec);
   }
   if (zone == "NZ-CHAT") {
     zone = "Pacific/Chatham";

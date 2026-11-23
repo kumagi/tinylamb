@@ -23,10 +23,13 @@ namespace tinylamb::relational_detail {
 bool HasWindowFunctions(const SelectStatement& statement);
 
 // Hash of a PARTITION BY key tuple, consistent with the partition equality in
-// the safe direction: equal tuples hash equally. `std::hash<Value>`
-// canonicalizes NULL, NaN and interval-shaped text exactly like
-// `ValuesEqual`, so a hash collision can never merge two partitions -- the
-// equality decides -- while an equal pair always lands in one bucket. Shared by
+// the safe direction: equal tuples hash equally. VARCHAR components are folded
+// under kCaseInsensitive when any component carries a CI tag before hashing
+// (std::hash<Value> alone cannot fold a one-sided CI peer into the same
+// bucket), then `std::hash<Value>` canonicalizes NULL, NaN and interval-shaped
+// text like `ValuesEqual`, so a hash collision can never merge two partitions
+// -- the equality decides -- while an equal pair always lands in one bucket.
+// Shared by
 // the in-memory grouping table and the spill-file router so the two can never
 // disagree about where a partition lives.
 size_t WindowPartitionKeyHash(const std::vector<Value>& key);
@@ -41,10 +44,14 @@ struct WindowedInput {
 // `$winN` columns appended to the input rows, and rewrites the statement so
 // those calls become plain column references.  Must run after WHERE filtering
 // and before projection (SQL: WHERE -> window -> QUALIFY -> ORDER BY).
+// `allow_window_halo` enables bounded input trimming for compatible TopN and
+// ROWS-window shapes; pass true only when WHERE has already been applied to
+// the input. The default false keeps the complete input.
 StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                      const SelectStatement& statement,
                                      Relation&& input, const Scope* outer,
-                                     const CteMap& ctes);
+                                     const CteMap& ctes,
+                                     bool allow_window_halo = false);
 
 // Single-window entry point for the Cascades WindowExecutor (same evaluator,
 // one call at a time; window clauses without subquery scope pass null/empty

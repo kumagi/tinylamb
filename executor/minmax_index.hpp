@@ -15,9 +15,16 @@ class MinMaxIndexExecutor final : public ExecutorBase {
   // with exactly that direction (and its leading key on the aggregate
   // column), so the first non-NULL value pulled by NextBatch is the extremum.
   // A generic/unordered child would only yield an arbitrary non-NULL row, so
-  // do not wire this executor to one.
-  MinMaxIndexExecutor(Executor source, size_t value_slot)
-      : source_(std::move(source)), value_slot_(value_slot) {}
+  // do not wire this executor to one. `descending` is the child's scan
+  // direction (true for MAX): NextBatch verifies ordering only for the
+  // scalar types whose Value order agrees with the index key order
+  // (signed INT64/DATE); VARCHAR/FLOAT64/unsigned children are not checked
+  // because their canonical orders can legitimately differ.
+  MinMaxIndexExecutor(Executor source, size_t value_slot,
+                      bool descending = false)
+      : source_(std::move(source)),
+        value_slot_(value_slot),
+        descending_(descending) {}
 
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
@@ -26,6 +33,7 @@ class MinMaxIndexExecutor final : public ExecutorBase {
  private:
   Executor source_;
   size_t value_slot_;
+  bool descending_{false};
   bool emitted_{false};
 };
 

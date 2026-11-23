@@ -44,14 +44,18 @@ Current implementation, verified against the source on 2026-11-11.
 
 `TransactionManager::Abort` reverses in-memory `staged_records_` through
 `PageManager::ApplyTransactionAbort` when the staged copy stays within the
-`kTx` threshold (`4 MiB`, ADR 0008), removes pending MVCC versions and appends
-one `kAbort` when the transaction has logged. Large transactions above the
-threshold drop `staged_records_` into WAL re-read mode: runtime abort walks the
+effective `kTx` threshold (default 4 MiB, ADR 0008). The configured threshold
+is clamped to `max(4 KiB, effective kTx pool limit / 4)` when a pool limit is
+available. Abort removes pending MVCC versions and appends one `kAbort` when
+the transaction has logged. Transactions above the effective threshold drop
+`staged_records_` into WAL re-read mode: runtime abort walks the
 transaction's `prev_lsn` chain backward through `Logger::TryCopyBuffered` and
 `RecoveryManager::ReadLog` without writing per-operation CLRs, appending
 `kCommit`, or waiting for abort durability; commit reflection forward-scans
-`[FirstLSN(), commit_start)` (`FirstLSN()` in `ActiveTransactionTable` keeps
-the needed WAL segments pinned against recycling).
+`[FirstLSN(), commit_start)`. `FirstLSN()` belongs to `Transaction`; checkpoint
+capture walks `TransactionManager::active_transactions_` under the transaction
+table lock and uses the minimum active first LSN to keep required WAL segments
+from being recycled.
 A failure during rollback/append is surfaced and can fail-stop the transaction
 engine. Restart needs no loser undo because it never replays those transactions.
 
@@ -75,9 +79,7 @@ for new writes, not a reason to discard an undo image.
    water mark. Seed the next transaction ID from that mark.
 4. Scan again in LSN order and apply only records whose owner committed. Both
    passes are single-threaded and skip recognized segment padding.
-5. `PageStorage::Create` attempts an end-of-recovery checkpoint unless
-   `TINYLAMB_DISABLE_EOR_CHECKPOINT` is present. Failure logs a warning and keeps
-   the retained WAL; subsequent compaction/explicit checkpoints can retry.
+5. `PageStorage::Create` attempts an end-of-recovery checkpoint only when the WAL end is known and nonzero, the recovery snapshot does not already cover it, and `TINYLAMB_DISABLE_EOR_CHECKPOINT` is absent. Failure logs a warning and retains the WAL; periodic retry depends on the checkpoint worker being enabled.
 
 The current implementation has no restart UNDO phase, full-page-image repair,
 allocated-page checksum sweep, parallel page replay, or `.last_checkpoint`

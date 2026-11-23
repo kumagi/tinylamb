@@ -17,6 +17,7 @@
 #include "recovery/checkpoint_manager.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -40,7 +41,7 @@ namespace tinylamb {
 CheckpointManager::CheckpointManager(std::string_view path,
                                      TransactionManager* tm, PageManager* pm,
                                      size_t interval)
-    : master_record_path(path), tm_(tm), pm_(pm), interval_seconds_(interval) {
+    : database_path_(path), tm_(tm), pm_(pm), interval_seconds_(interval) {
   // Do NOT start the worker in the member-init list. SetCompactionCallback
   // copies a std::function and can throw bad_alloc; if the constructor body
   // throws after a joinable thread was started, ~thread calls terminate
@@ -61,6 +62,11 @@ void CheckpointManager::Start() {
   // registration and the worker (re)spawn must be observed as one step,
   // otherwise the loser of a Start/Stop race can leave a stale callback or
   // erase a freshly installed one.
+  // lifecycle_mu_ serializes this transition. SetCompactionCallback briefly
+  // takes and releases PageManager's compaction_cb_mu_; only then do we take
+  // worker_wait_mu_ below. These are sequential acquisitions, not a nested
+  // three-lock scope. The callback path itself runs under compaction_cb_mu_
+  // and may take worker_wait_mu_, so register before taking worker_wait_mu_.
   std::scoped_lock lifecycle_guard(lifecycle_mu_);
   // T3687: Stop() joined the worker thread out of existence, so a plain
   // predicate flip could never resume processing.  Re-arm stop_, re-
@@ -92,7 +98,9 @@ void CheckpointManager::Start() {
 
 void CheckpointManager::Stop() {
   // Pairs with Start()'s lifecycle_guard: a concurrent Stop/Start pair can no
-  // longer interleave their SetCompactionCallback calls.
+  // longer interleave their SetCompactionCallback calls. Same order as Start:
+  // lifecycle_mu_ -> compaction_cb_mu_ (SetCompactionCallback below) ->
+  // worker_wait_mu_. join() waits for a worker that never takes lifecycle_mu_.
   std::scoped_lock lifecycle_guard(lifecycle_mu_);
   if (pm_ != nullptr) {
     pm_->SetCompactionCallback({});
@@ -110,6 +118,10 @@ void CheckpointManager::Stop() {
 
 void CheckpointManager::RequestCompaction() {
   {
+    // This is the only mutex held here, and it is released before the
+    // notification. The compaction callback holds compaction_cb_mu_ while
+    // calling in, matching the lifecycle_mu_ -> cb_mu_ -> worker_wait_mu_
+    // order used by Start()/Stop().
     std::scoped_lock lk(worker_wait_mu_);
     compaction_requested_ = true;
     ++request_generation_;
@@ -153,6 +165,13 @@ void CheckpointManager::WorkerThreadTask() {
       // embedded caller may run without a transaction manager / logger, in
       // which case there is no WAL lag to measure.
       if (tm_ == nullptr || tm_->logger_ == nullptr) {
+        // Without a logger there is no WAL to checkpoint and no lag to
+        // measure. Keep the worker alive (so a later logger can be used) but
+        // make the otherwise silent no-op visible once to the operator.
+        if (!no_logger_warned_.exchange(true, std::memory_order_relaxed)) {
+          LOG(WARN) << "CheckpointManager: no transaction logger; background "
+                       "checkpointing is idle (no WAL lag to measure)";
+        }
         continue;
       }
       const lsn_t lowest_retained = tm_->logger_->LowestRetainedLSN();
@@ -182,6 +201,9 @@ void CheckpointManager::WorkerThreadTask() {
     // instead of dropping the checkpoint until the next threshold/callback.
     if (checkpoint_ok) {
       worker_checkpoints_.fetch_add(1, std::memory_order_release);
+      // No other mutex is held at this point (the wait_lock scope ended
+      // above); this worker_wait_mu_ acquisition is disjoint from the one
+      // used later in the failure branch, so no nested lock pair exists.
       std::scoped_lock lk(worker_wait_mu_);
       // Clear only the request this pass consumed; a RequestCompaction that
       // arrived while the checkpoint ran keeps the next pass armed.
@@ -191,17 +213,25 @@ void CheckpointManager::WorkerThreadTask() {
     } else if (requested) {
       // T4262 companion: the predicate would re-satisfy immediately with the
       // request still pending, retrying in a hot loop until success.  Wait
-      // out one interval (only stop_ short-circuits) as the retry backoff.
+      // out one interval as the retry backoff — but a NEWER request (a
+      // bumped generation) still wakes the worker early instead of waiting
+      // out the full interval.
       std::unique_lock wait_lock(worker_wait_mu_);
       worker_wait_cv_.wait_for(
           wait_lock, std::chrono::seconds(interval_seconds_),
-          [this] { return stop_.load(std::memory_order_acquire); });
+          [this, consumed_generation] {
+            return stop_.load(std::memory_order_acquire) ||
+                   request_generation_ != consumed_generation;
+          });
     }
   }
 }
 
 StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     const std::function<void()>& func_for_test) {
+  // checkpoint_mu_ is this class's outermost private lock: it serializes
+  // checkpoints and is held before transaction_table_lock / chain_mu_ below
+  // (docs/lock_order.md rule 8). No path acquires it while holding those.
   std::scoped_lock checkpoint_guard(checkpoint_mu_);
   if (tm_ == nullptr || tm_->logger_ == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
@@ -219,10 +249,30 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
                        "cannot checkpoint without a page manager");
   }
 
+  // Run the test hook BEFORE capturing snap_lsn: any WAL it appends is then
+  // inside the durability target below, so a snapshot that reflects those
+  // records can never outlive their COMMIT record (WAL-before-data).
+  if (func_for_test) {
+    try {
+      func_for_test();
+    } catch (const std::exception& error) {
+      return StatusError(StatusCode::kRuntimeError,
+                         std::string("checkpoint test hook failed: ") +
+                             error.what());
+    } catch (...) {
+      return StatusError(StatusCode::kRuntimeError,
+                         "checkpoint test hook failed with unknown exception");
+    }
+  }
+
   lsn_t oldest_active_first_lsn = std::numeric_limits<lsn_t>::max();
   txn_id_t oldest_active_txn_id = 0;
   lsn_t snap_lsn = 0;
   {
+    // CheckpointManager's outermost private lock, acquired above the
+    // transaction table lock and per-transaction chain mutexes below it
+    // (docs/lock_order.md rule 8). Nothing takes checkpoint_mu_ while
+    // holding a transaction/chain lock, so this order cannot invert.
     std::scoped_lock lk(tm_->transaction_table_lock);
     snap_lsn = tm_->logger_->BufferedLSN();
     for (const auto& it : tm_->active_transactions_) {
@@ -238,19 +288,15 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
 
   const lsn_t replay_start_lsn = std::min(snap_lsn, oldest_active_first_lsn);
 
-  func_for_test();
-
   // Wait for the LSN captured under the transaction-table lock, not a fresh
   // BufferedLSN(): the snapshot's replay anchor is derived from snap_lsn, so
-  // WAL appended after the capture (by func_for_test or unrelated txns) is not
-  // part of this checkpoint and must not hold up the fsync wait. See
-  // docs/recovery_invariants.md ("waits for the WAL's captured durable
-  // target").
+  // unrelated WAL appended after the capture is not part of this checkpoint
+  // and must not hold up the fsync wait. See docs/recovery_invariants.md
+  // ("waits for the WAL's captured durable target").
   RETURN_IF_FAIL(tm_->logger_->WaitForDurable(snap_lsn));
 
-  if (pm_ != nullptr) {
-    RETURN_IF_FAIL(pm_->WriteFuzzyCheckpoint(replay_start_lsn));
-  }
+  // pm_ was checked non-null above; no need to test it again here.
+  RETURN_IF_FAIL(pm_->WriteFuzzyCheckpoint(replay_start_lsn));
 
   tm_->logger_->AdviseOldBytesDurable(replay_start_lsn);
   tm_->logger_->RecycleUpTo(replay_start_lsn);
@@ -317,8 +363,12 @@ void CheckpointManager::MaybeWarnWalRetention(
             << ", durable_lsn=" << durable_lsn
             << ", replay_anchor_lsn=" << replay_anchor_lsn
             << ", oldest_active_txn=" << oldest_txn
+            // With no active transaction there is no "oldest first LSN";
+            // printing the checkpoint's replay anchor under that label would
+            // misdiagnose the retention cause.
             << ", oldest_active_first_lsn="
-            << (oldest_txn != 0 ? oldest_first_lsn : replay_anchor_lsn)
+            << (oldest_txn != 0 ? std::to_string(oldest_first_lsn)
+                                : std::string("none"))
             << "). Finish or abort long-running transactions to recycle old "
                "WAL segments.";
 }

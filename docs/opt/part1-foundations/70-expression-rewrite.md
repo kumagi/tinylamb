@@ -283,20 +283,18 @@ const ExpressionRuleSet& NotComparisonFreeRules();
 加算の恒等式 `identity_add_zero` には、最適化の品質と厳密な型付けの兼ね合いが存在します（`expression/rewrite.cpp`）。
 
 ```cpp
-          // NOTE: intentional deviation from the AST ground truth (kept for
-          // optimizer quality, pinned by the optimizer_arithmetic compliance
-          // file): the identities fire on numeric/int columns even though
-          // the AST types e.g. `a + 0.0` as double.  Known IEEE gap: a
-          // -0.0 survivor is normalized to +0.0.
+// Lean proof: lean/TinylambOpt/ScalarOverflowAndCoreAlgebra.lean
+//   (int64_identities_negation_and_abs_sound)
+built.Add(ExpressionRule("identity_add_zero", ...));
 ```
 
-AST の厳密な評価基準では、`a + 0.0` は DOUBLE 型へ昇格します。一方、この
-Rule はインデックス照合を維持するため、整数型の列にも適用されます。この挙動は
-コンプライアンステストで固定された既知の仕様差です。
+Rule は `PreserveNumericIdentity` を通じて数値恒等式の適用時に型・値の扱いを
+保ちます。`-0.0` に関する特別な注意は減算 Rule にあり、負のゼロを減数として
+除去すると符号付きゼロが変化するため、そのケースを `IsZero` が拒否します。
 
 | Rule | パターン → 書き換え | guard（適用除外条件） |
 |---|---|---|
-| `identity_add_zero` | `x + 0` または `0 + x` → `x` | 残存側が静的に非数値型 |
+| `identity_add_zero` | `x + 0` または `0 + x` → `x` | `PreserveNumericIdentity` が適用できない場合 |
 | `identity_subtract_zero` | `x - 0` → `x` | 右辺がゼロ定数でない、または左辺が静的に非数値型 |
 | `identity_multiply_one` | `x * 1` または `1 * x` → `x` | 残存側が静的に非数値型 |
 | `identity_divide_one` | `x / 1` → `x` | 右辺が定数 1 でない、または左辺が静的に非数値型 |

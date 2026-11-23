@@ -446,6 +446,10 @@ def eval_node(node):
         if isinstance(a, int) and not isinstance(a, bool):
             return a
         if isinstance(a, float):
+            if not math.isfinite(a):
+                # std::ceil/std::floor preserve infinities and NaNs in the
+                # engine; Python's math.ceil/floor instead raises for them.
+                return a
             return float(math.ceil(a) if op != "floor" else math.floor(a))
         raise OracleError(op + " requires numeric argument")
     if op in ("round", "trunc", "truncate"):
@@ -559,8 +563,9 @@ def eval_node(node):
             libm.cbrt.argtypes = [ctypes.c_double]
             return libm.cbrt(to_float(a))
     if op in ("ln", "log", "log10"):
-        # [PY-DIFF] out-of-range inputs return -inf/NaN like libm, not
-        # Python's ValueError.  log takes an optional base.
+        # The engine follows GoogleSQL: non-positive arguments and LOG base
+        # 1 / <= 0 are domain errors, not libm's -inf/NaN.  Log takes an
+        # optional base; base == 1 with a non-finite argument yields NaN.
         a = eval_node(node[1])
         if is_null(a):
             return Null("float")
@@ -572,19 +577,22 @@ def eval_node(node):
             base = to_float(bv)
         else:
             base = None
+        if op == "log" and base is not None:
+            if base == 1.0:
+                if not math.isfinite(v):
+                    return float("nan")
+                raise OracleError("LOG base must not be 1")
+            if v == 1.0 and math.isinf(base):
+                return float("nan")
+        if v <= 0.0:
+            raise OracleError(op.upper() + " of non-positive number")
+        if op == "log" and base is not None and base <= 0.0:
+            raise OracleError("LOG base must be positive")
         if op == "log10":
-            res = math.log10(v) if v > 0 else (
-                float("nan") if v < 0 else float("-inf"))
-            return res
-        logv = math.log(v) if v > 0 else (
-            float("nan") if v < 0 else float("-inf"))
+            return math.log10(v)
         if base is None:
-            return logv
-        if v == 1.0 and math.isinf(base):
-            return float("nan")
-        logb = math.log(base) if base > 0 else (
-            float("nan") if base < 0 else float("-inf"))
-        return logv / logb
+            return math.log(v)
+        return math.log(v) / math.log(base)
     if op == "exp":
         a = eval_node(node[1])
         if is_null(a):
@@ -633,9 +641,11 @@ def eval_node(node):
             return Null("int")
         if not isinstance(a, str):
             raise OracleError(op + " requires string argument")
-        # length/byte_length count bytes; char_length counts code points.
-        return len(a) if op in ("char_length",
-                                "character_length") else len(a.encode())
+        # GoogleSQL: length/char_length/character_length count code points
+        # (e.g. LENGTH('€') = 1); only octet_length/byte_length count bytes.
+        if op in ("octet_length", "byte_length"):
+            return len(a.encode())
+        return len(a)
     if op == "ascii":
         a = eval_node(node[1])
         if is_null(a):
@@ -774,7 +784,15 @@ def eval_node(node):
                               op.upper() + " cannot be negative")
         if n == 0:
             return ""
-        return s[:n] if op.endswith("left") else s[max(0, len(s) - n):]
+        if op in ("byte_left", "byte_right"):
+            # BYTE_LEFT/BYTE_RIGHT slice the raw UTF-8 bytes (std::string
+            # substr in the engine); LEFT/RIGHT slice code points via
+            # utf8_substr. surrogateescape keeps a partially cut multi-byte
+            # character representable instead of silently dropping bytes.
+            raw = s.encode("utf-8", errors="surrogateescape")
+            part = raw[:n] if op == "byte_left" else raw[max(0, len(raw) - n):]
+            return part.decode("utf-8", errors="surrogateescape")
+        return s[:n] if op == "left" else s[max(0, len(s) - n):]
     if op in ("__bit_and", "__bit_or", "__bit_xor"):
         l = eval_node(node[1])
         r = eval_node(node[2])
@@ -891,27 +909,33 @@ def parse_operand(tokens, pos):
 
 
 def parse_list(tokens, pos):
-    assert tokens[pos] == "("
+    def peek(p):
+        if p >= len(tokens):
+            raise OracleError("unterminated list")
+        return tokens[p]
+
+    if peek(pos) != "(":
+        raise OracleError("expected '('")
     pos += 1
-    if tokens[pos] == "(":
+    if peek(pos) == "(":
         # Branch pair (cond val) used by case: not an application.
         cond, pos = parse_operand(tokens, pos)
         val, pos = parse_operand(tokens, pos)
-        if tokens[pos] != ")":
+        if peek(pos) != ")":
             raise OracleError("malformed branch pair")
         return ["pair", cond, val], pos + 1
-    if tokens[pos] == ")":
+    if peek(pos) == ")":
         raise OracleError("expected operator")
     op = tokens[pos]
     pos += 1
     if op in ("i", "f", "b", "s", "n"):
         # Literal constructor: the payload is raw, not a typed operand.
         payload, pos = parse_literal_payload(tokens, pos, op)
-        if tokens[pos] != ")":
+        if peek(pos) != ")":
             raise OracleError("malformed literal")
         return [op, payload], pos + 1
     items = [op]
-    while tokens[pos] != ")":
+    while peek(pos) != ")":
         node, pos = parse_operand(tokens, pos)
         items.append(node)
     return items, pos + 1
@@ -919,6 +943,8 @@ def parse_list(tokens, pos):
 
 def parse_literal_payload(tokens, pos, op):
     import math
+    if pos >= len(tokens):
+        raise OracleError("unterminated literal")
     tok = tokens[pos]
     if op == "n":
         if tok not in ("int", "float", "bool", "string"):

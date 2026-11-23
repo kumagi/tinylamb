@@ -91,7 +91,7 @@ graph TD
   含まれなければ押しません。
 
 (4) 押せる項が 1 つもなければ発火しません。派生グループ
-(`win_part_push:<押せる連言>`)の循環チェックもあります。
+(`"win_part_push:" + GroupIdsTag({win_child}) + combined->ToString()`)の循環チェックもあります。子 ID を指紋に含むため、同じウィンドウ出力を異なる子 Group で扱っても混線しません。
 
 ## 意味論的根拠とパーティション独立性
 
@@ -133,7 +133,9 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
               memo.AddExpression(group, std::move(new_win));
             } else {
               const GroupId new_win_group = memo.EnsureDerivedGroup(
-                  memo.Get(input_id).relations, "win_pushed");
+                  memo.Get(input_id).relations,
+                  "win_pushed:" + GroupIdsTag({win_child_filtered}) +
+                      TargetListFingerprint(win_expr.target_list));
 ```
 
 - `remaining` が空なら、Window をそのままフィルタ済みの子に付け替えた式を
@@ -141,8 +143,11 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 - `remaining` が空でなければ、Window を載せた派生グループ(`win_pushed`)を
   経由して、残りの連言を上に被せた形を外側グループへ追加します
   (`memo.AddExpression(group, …)` で `Selection(new_win_group, remaining)`)。
-- 派生グループのタグ `win_part_push:<連言>` は押し込む述語を指紋に含むため、
-  別の述語の押し込みが同じ下位グループに混線しません。
+  この派生グループのタグは `"win_pushed:" + GroupIdsTag({win_child_filtered}) + TargetListFingerprint(win_expr.target_list)` で、
+  子 ID とウィンドウの target list の指紋を含みます。
+- 押し込み先の派生グループのタグ `win_part_push:` + `GroupIdsTag({win_child})` + `combined->ToString()`
+  は押し込む述語に加えて子 ID も指紋に含むため、別の述語の押し込みや異なる子 Group の
+  ウィンドウ出力が同じ下位グループに混線しません。
 
 この Rule の登録は一つです。共通のパーティション列として扱うのは
 各 `PARTITION BY` に現れる単純な列参照であり、`p + 1` のような式から
@@ -151,7 +156,7 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 ## 最適化効果
 
 - パーティション列のフィルタ選択率が高い場合、ウィンドウ計算の入力行が
-  減り、パーティション構築の成本が下がります。
+  減り、パーティション構築のコストが下がります。
 - 押し込まれた Selection は、スキャンフィルタへの統合
   (`push_selection_into_scan`)やインデックス選択の材料にもなります。
 
@@ -165,5 +170,5 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 - `plan/cascades_test_part3.cpp` の
   `CascadesTest.PushSelectionThroughWindowOnPartitionColumns` —
   `part_col = 10 AND rn <= 5` のうち `part_col = 10` が Window の下の
-  Selection として現れる(部分押し込み)ことを検証します。
+  Selection が Window の下に現れることを検証しますが、その述語式が `part_col = 10` であることは assertion していません。したがって window 結果依存述語の誤押し込みをこのテスト単独では検出できません。
 - 本ルールの単体登録確認テストは個別には定義されていません。

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -1035,7 +1036,8 @@ TEST(DifferentialTest,
      CompileProjection_LinearTransformation_MatchesAstAndBytecode) {
   const auto jit = JitInt64Kernels::CompileProjection();
   if (!jit.has_value()) {
-    GTEST_SKIP() << "skipped";
+    GTEST_SKIP() << "JIT CompileProjection() unavailable; AST/bytecode/JIT "
+                    "projection differential not verified";
   }
   constexpr int64_t kMultiplier = 3;
   constexpr int64_t kAddend = 2;
@@ -1202,9 +1204,9 @@ TEST(DifferentialTest, EvaluateDetailPath_ThreeValuedLogic_MatchesCanonical) {
 }
 
 // The detail-path numeric core is forwarded to the canonical EvaluateBinary,
-// so int/int division truncates to
-// INT64 and add/sub/mul overflow plus INT64_MIN % -1 raise the canonical
-// errors -- exactly like the AST evaluator.
+// so int/int division promotes to DOUBLE and add/sub/mul overflow plus
+// INT64_MIN % -1 raise the canonical errors -- exactly like the AST
+// evaluator.
 TEST(DifferentialTest, EvaluateDetailPath_NumericEdgeCases_MatchesCanonical) {
   const Schema& schema = IntSchema();
   const Row seven_three({Value(int64_t{7}), Value(int64_t{3})});
@@ -1245,7 +1247,8 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   // throws. The checked kernels must report overflow on the same inputs.
   const auto sum = JitInt64Kernels::CompileSumChecked();
   if (!sum.has_value()) {
-    GTEST_SKIP() << "skipped";
+    GTEST_SKIP() << "JIT CompileSumChecked() unavailable; checked SUM overflow "
+                    "differential not verified";
   }
   {
     const std::array<int64_t, 2> inputs{std::numeric_limits<int64_t>::max(),
@@ -1262,7 +1265,8 @@ TEST(DifferentialTest, CheckedJitKernels_OverflowMatchesAstThrow) {
   }
   const auto proj = JitInt64Kernels::CompileProjectionChecked();
   if (!proj.has_value()) {
-    GTEST_SKIP() << "skipped";
+    GTEST_SKIP() << "JIT CompileProjectionChecked() unavailable; checked "
+                    "projection overflow differential not verified";
   }
   {
     const int64_t input = std::numeric_limits<int64_t>::max();
@@ -1358,6 +1362,100 @@ TEST(DifferentialTest, AuditDateExtractKeepsSignedAndWideYears) {
     }
   }
   tally.Summarize("audit wide dates");
+}
+
+TEST(DifferentialTest, AuditRowInMaskMultiWordAndThreeValuedParity) {
+  struct ScopedEnv {
+    const char* name;
+    std::string prev;
+    bool had_prev{false};
+    ScopedEnv(const char* n, const char* val) : name(n) {
+      if (const char* cur = std::getenv(name)) {
+        prev = cur;
+        had_prev = true;
+      }
+      if (val != nullptr) {
+        ::setenv(name, val, 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+    ~ScopedEnv() {
+      if (had_prev) {
+        ::setenv(name, prev.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+
+  const Schema schema(
+      "nums", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Expression struct_expr = FunctionCallExp(
+      "__struct_json__",
+      {ConstantValueExp(Value("f1")), ColumnValueExp("a"),
+       ConstantValueExp(Value(0)), ConstantValueExp(Value("f2")),
+       ColumnValueExp("b"), ConstantValueExp(Value(0))});
+  std::vector<Expression> candidates;
+  for (int64_t i = -5; i < 75; ++i) {
+    candidates.push_back(ConstantValueExp(
+        Value(std::string(R"({"f1":)" + std::to_string(i * 2) + R"(,"f2":)" +
+                          std::to_string(i * 7) + "}"))));
+  }
+  candidates.push_back(
+      ConstantValueExp(Value(std::string(R"({"f1":null,"f2":14})"))));
+  const Expression in_expr = InExpressionExp(struct_expr, candidates);
+  const Expression not_in_expr =
+      UnaryExpressionExp(in_expr, UnaryOperation::kNot);
+
+  std::optional<BytecodeProgram> in_on;
+  std::optional<BytecodeProgram> not_in_on;
+  {
+    ScopedEnv enable("TINYLAMB_DISABLE_ROW_IN_MASK", nullptr);
+    in_on = BytecodeCompiler::Compile(in_expr, schema);
+    not_in_on = BytecodeCompiler::Compile(not_in_expr, schema);
+  }
+  std::optional<BytecodeProgram> in_off;
+  std::optional<BytecodeProgram> not_in_off;
+  {
+    ScopedEnv disable("TINYLAMB_DISABLE_ROW_IN_MASK", "1");
+    in_off = BytecodeCompiler::Compile(in_expr, schema);
+    not_in_off = BytecodeCompiler::Compile(not_in_expr, schema);
+  }
+  ASSERT_TRUE(in_on.has_value());
+  ASSERT_TRUE(not_in_on.has_value());
+  EXPECT_FALSE(in_off.has_value());
+  EXPECT_FALSE(not_in_off.has_value());
+
+  DifferentialTally tally;
+  for (const Row& row : std::vector<Row>{
+           Row({Value(-10), Value(-35)}),
+           Row({Value(140), Value(490)}),
+           Row({Value(140), Value(999)}),
+           Row({Value(4), Value(14)}),
+           Row({Value(999), Value(14)}),
+           Row({Value(), Value(14)}),
+           Row({Value(), Value(7777)}),
+           Row({Value(4), Value()}),
+       }) {
+    const Attempt ast_in = EvaluateAst(in_expr, row, schema);
+    ASSERT_EQ(ast_in.kind, Attempt::Kind::kValue);
+    tally.Compare("row_in_mask", row.ToString(),
+                  {{"ast", ast_in},
+                   {"bytecode_on", EvaluateBytecode(in_on, schema, row)},
+                   {"relational", EvaluateDetailPath(in_expr, row, schema)}},
+                  ast_in.value);
+
+    const Attempt ast_not_in = EvaluateAst(not_in_expr, row, schema);
+    ASSERT_EQ(ast_not_in.kind, Attempt::Kind::kValue);
+    tally.Compare(
+        "row_not_in_mask", row.ToString(),
+        {{"ast", ast_not_in},
+         {"bytecode_on", EvaluateBytecode(not_in_on, schema, row)},
+         {"relational", EvaluateDetailPath(not_in_expr, row, schema)}},
+        ast_not_in.value);
+  }
+  tally.Summarize("audit RowInMask multi-word and 3VL");
 }
 
 }  // namespace tinylamb

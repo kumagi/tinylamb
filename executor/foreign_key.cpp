@@ -191,8 +191,8 @@ ForeignKeyCounts& ForeignKeyCounts::operator=(
 
 void ForeignKeyCounts::ReleaseSpillSegment() noexcept {
   if (store_ != nullptr && segment_id_ != kInvalidSpillSegmentId) {
-    // DropSegment's Status cannot cross this noexcept boundary (destructor /
-    // move assignment); a failure leaks the segment's temp space silently.
+    // DropSegment is noexcept and returns void, so there is no Status to
+    // propagate across this noexcept boundary (destructor / move assignment).
     // NOLINTNEXTLINE(readability-redundant-casting) cast documents intent
     (void)store_->DropSegment(segment_id_);
   }
@@ -613,8 +613,12 @@ Status ForeignKeyCounts::IncrementKey(const Value& key) {
       in_mem_bytes_ += entry_bytes;
       return Status::kSuccess;
     }
+    // This key was NOT charged (AlwaysSpill, over-budget, or a failed
+    // TryAddWithReclaim). It still has to be written into the sorted segment,
+    // but its bytes must not be added to in_mem_bytes_: the spill path
+    // releases the whole counter from mem_charge_, so counting uncharged
+    // bytes here would under-flow the process-wide budget.
     counts_.emplace(std::move(encoded), 1);
-    in_mem_bytes_ += entry_bytes;
     return SpillInMemoryToSortedSegment();
   }
   return ApplySpilledDelta(std::move(encoded), 1);
@@ -822,9 +826,15 @@ Status SpillableRowPositionList::PushBack(const RowPosition& pos) {
       std::min<size_t>(kRowPosFlushBatch, budget_bytes_ / sizeof(RowPosition)));
   if (!mem_charge_.TryAddWithReclaim(add_bytes) ||
       in_memory_.size() >= tail_limit || force_spill) {
-    RETURN_IF_FAIL(FlushBatchToSpill(in_memory_.data(), in_memory_.size()));
+    // Release the staged-row charge on *every* exit from this block.  A failed
+    // flush used to RETURN_IF_FAIL before ReleaseAll (and a failed second
+    // reclaim likewise left the first attempt's charge live), leaking budget
+    // until the query ended.  Capture the status, release, then return it.
+    const Status flush_status =
+        FlushBatchToSpill(in_memory_.data(), in_memory_.size());
     in_memory_.clear();
     mem_charge_.ReleaseAll();
+    RETURN_IF_FAIL(flush_status);
     if (!mem_charge_.TryAddWithReclaim(add_bytes)) {
       // No room even for one staged row: write it straight to the spill file.
       RETURN_IF_FAIL(FlushBatchToSpill(&pos, 1));

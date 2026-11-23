@@ -61,10 +61,10 @@ class RecoveryManager {
         std::memory_order_relaxed);
   }
   void SetTornTailTruncationAllowedForInstance(bool allowed) {
-    torn_tail_truncation_allowed_ = allowed;
+    torn_tail_truncation_allowed_.store(allowed, std::memory_order_relaxed);
   }
   [[nodiscard]] bool TornTailTruncationAllowedForInstance() const {
-    return torn_tail_truncation_allowed_;
+    return torn_tail_truncation_allowed_.load(std::memory_order_relaxed);
   }
 
   RecoveryManager(std::string_view log_path, PageManager* pm,
@@ -89,8 +89,15 @@ class RecoveryManager {
                                                  lsn_t* next_lsn_out) const;
   [[nodiscard]] uint8_t DebugReadStatusFor(lsn_t lsn) const;
 
+  // Lossy convenience wrapper: returns 0 both for an empty WAL and for an
+  // unreadable one. Callers that must distinguish the two (recovery, tests,
+  // metrics) must use LogStartStatus() instead.
   [[nodiscard]] lsn_t LogStart() const;
-  // An unreadable WAL is distinct from an empty WAL.
+  // An unreadable WAL is distinct from an empty WAL. Both LogEnd() and
+  // LogEndStatus() return StatusOr<lsn_t>: callers must check HasValue() /
+  // GetStatus() (there is no longer a 0-on-I/O-failure variant). Do not feed
+  // the result to an lsn_t parameter or compare it as an integer without
+  // unwrapping first -- Value() on a failed StatusOr aborts.
   [[nodiscard]] StatusOr<lsn_t> LogEnd() const;
   [[nodiscard]] StatusOr<lsn_t> LogEndStatus() const;
   [[nodiscard]] lsn_t ValidLogEnd(lsn_t from) const;
@@ -154,7 +161,7 @@ class RecoveryManager {
   [[nodiscard]] StatusOr<lsn_t> ValidLogEndStatus(lsn_t from) const;
 
   inline static std::atomic<bool> default_torn_tail_truncation_allowed_{false};
-  bool torn_tail_truncation_allowed_{false};
+  std::atomic<bool> torn_tail_truncation_allowed_{false};
 
   std::string log_name_;
   size_t segment_size_;

@@ -233,4 +233,39 @@ theorem adaptive_selection_sound_from_dense (start k : Nat) (cands : List Nat)
     simpa [← inv₀] using h.2
   exact ⟨h1, h2, h1.trans hs.1.symm, h2.trans hs.2.symm⟩
 
+/-- Next physical offset, with zero representing the position before row 0. -/
+def consumedLanes : Nat → List Bool → Nat
+  | 0, _ | _, [] => 0
+  | k+1, b :: bs => 1 + consumedLanes (if b then k else k+1) bs
+
+def selected (base : Nat) : List Bool → List Nat
+  | [] => []
+  | b :: bs => (if b then [base] else []) ++ selected (base+1) bs
+
+theorem physical_switch (mask : List Bool) (base k : Nat) :
+    let n := consumedLanes k mask
+    selected (base+n) (mask.drop n) = (selected base mask).drop k ∧
+    selected base (mask.take n) = (selected base mask).take k := by
+  induction mask generalizing base k with
+  | nil => cases k <;> simp [selected, consumedLanes]
+  | cons b bs ih =>
+    cases k with
+    | zero => simp [consumedLanes, selected]
+    | succ k =>
+      cases b <;> simp [consumedLanes, selected, Nat.add_comm 1, Nat.add_right_comm,
+        Nat.add_assoc, List.drop_succ_cons, List.take_succ_cons] at *
+      all_goals first | exact ih (base+1) k | exact ih (base+1) (k+1) | grind
+
+theorem cursor_after_switch (bits : List Bool) (first next : Nat) :
+    let offset := consumedLanes first bits
+    offset + consumedLanes next (bits.drop offset) = consumedLanes (first+next) bits := by
+  induction bits generalizing first next with
+  | nil => cases first <;> cases next <;> rfl
+  | cons b bs ih =>
+    cases first with
+    | zero => simp [consumedLanes]
+    | succ k =>
+      cases b <;> simp [consumedLanes, Nat.succ_add, Nat.add_comm 1,
+        List.drop_succ_cons, Nat.succ_add, ih]
+
 end TinylambOpt.AdaptiveSelection

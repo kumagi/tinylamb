@@ -102,8 +102,14 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   if (source.IsNull()) {
     assert(first.HasValue() && first.Value().IsNull());
   }
-  if (safe) {
-    assert(first.HasValue());  // SAFE casts never fail.
+  // SAFE casts never fail. Keep this check in release builds too: an
+  // assert() would be compiled out under NDEBUG (the default RelWithDebInfo
+  // build), silently disabling the oracle.
+  if (safe && !first.HasValue()) {
+    (void)fprintf(stderr, "SAFE cast failed: (%d)%s -> %s: %s\n",
+                  static_cast<int>(source.type), source.AsString().c_str(),
+                  type.c_str(), ToString(first.GetStatus()).c_str());
+    abort();
   }
   if (type == "STRING" && source.type == ValueType::kInt64 &&
       first.HasValue() && !first.Value().IsNull()) {

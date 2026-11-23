@@ -33,7 +33,7 @@ PATTERNS = (
     "*.log",
     "*.log.meta",
     "*.log.meta.tmp",
-    "*.log.[0-9]" + "[0-9]" * 19,
+    "*.log.[0-9]*",
     "*.last_checkpoint",
     "*.last_checkpoint.tmp",
     "*.wal",
@@ -95,6 +95,17 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     tracked = tracked_files(repo_root)
 
+    # Precompute the ancestor directories of every tracked file once. The
+    # recursive findings-dir check below then is O(1) per detection instead
+    # of rescanning all of `git ls-files` for every bucket directory.
+    tracked_dirs: set[str] = set()
+    if tracked is not None:
+        for name in tracked:
+            parent = os.path.dirname(name)
+            while parent:
+                tracked_dirs.add(parent)
+                parent = os.path.dirname(parent)
+
     removed = 0
 
     def sweep_directory(root: Path, temp_only: bool = False) -> None:
@@ -123,15 +134,17 @@ def main() -> int:
                     # When git failed, `tracked` is None: the tracked set is
                     # unknown, so nothing may be deleted (same rule as the
                     # regular-file branch below).
-                    if tracked is None or any(
-                            f.startswith(str(relative_dir) + os.sep)
-                            for f in tracked):
+                    if tracked is None or str(relative_dir) in tracked_dirs:
                         continue  # unknown or versioned findings dir
                     verb = "would remove" if args.dry_run else "removed"
                     print(f"{verb}: {entry}/")
                     if not args.dry_run:
-                        shutil.rmtree(entry, ignore_errors=True)
-                        removed += 1
+                        try:
+                            shutil.rmtree(entry)
+                        except OSError as exc:
+                            print(f"could not remove {entry}/: {exc}")
+                        else:
+                            removed += 1
                 continue
             if temp_only:
                 if not fnmatch.fnmatch(entry.name, "tinylamb-spill-*.bin"):

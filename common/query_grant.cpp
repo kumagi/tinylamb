@@ -1,6 +1,8 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "common/query_grant.hpp"
 
+#include "common/log_message.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -17,7 +19,12 @@ size_t ReadGrantEnvU64(const char* name, size_t fallback) noexcept {
   if (raw == nullptr || raw[0] == '\0') {
     return fallback;
   }
-  if (raw[0] == '-' || raw[0] == '+') {
+  const char* first = raw;
+  while (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r' ||
+         *first == '\f' || *first == '\v') {
+    ++first;
+  }
+  if (*first == '-' || *first == '+') {
     return fallback;
   }
   char* end = nullptr;
@@ -67,12 +74,17 @@ bool QueryMemoryGrant::LocalBatchCache::Reserve(size_t bytes) {
   if (bytes == 0) {
     return true;
   }
+  constexpr size_t kMaxBytes = std::numeric_limits<size_t>::max();
+  if (bytes > kMaxBytes - held_bytes_) {
+    return false;
+  }
   if (cached_bytes_ >= bytes) {
     cached_bytes_ -= bytes;
     held_bytes_ += bytes;
     return true;
   }
   if (grant_ == nullptr) {
+    cached_bytes_ = 0;
     held_bytes_ += bytes;
     return true;
   }
@@ -81,9 +93,10 @@ bool QueryMemoryGrant::LocalBatchCache::Reserve(size_t bytes) {
     return false;
   }
   const size_t deficit = bytes - cached_bytes_;
-  const size_t chunk = std::max(deficit, refill_bytes_);
+  const size_t available = kMaxBytes - held_bytes_ - cached_bytes_;
+  const size_t chunk = std::max(deficit, std::min(refill_bytes_, available));
   if (grant_->TryConsume(chunk)) {
-    cached_bytes_ += chunk - bytes;
+    cached_bytes_ = chunk - deficit;
     held_bytes_ += bytes;
     return true;
   }
@@ -147,6 +160,13 @@ QueryMemoryGrant::QueryMemoryGrant(QueryMemoryGrant&& other) noexcept
           other.active_consumers_.load(std::memory_order_acquire)),
       limited_(other.limited_),
       wait_ns_(other.wait_ns_) {
+  // ActiveConsumerGuard holds a raw pointer to the grant whose counter it
+  // increments. Copying the atomics cannot make (used_bytes_,
+  // active_consumers_) a consistent snapshot if a guard updates them
+  // concurrently: the guard would keep adjusting the moved-from object.
+  // Moving a grant with live consumers is therefore forbidden.
+  CHECK_MSG(other.active_consumers_.load(std::memory_order_acquire) == 0,
+            "moving a QueryMemoryGrant with active consumers is unsafe");
   other.budget_ = nullptr;
   other.granted_bytes_.store(0, std::memory_order_release);
   other.used_bytes_.store(0, std::memory_order_release);
@@ -158,6 +178,13 @@ QueryMemoryGrant::QueryMemoryGrant(QueryMemoryGrant&& other) noexcept
 QueryMemoryGrant& QueryMemoryGrant::operator=(
     QueryMemoryGrant&& other) noexcept {
   if (this != &other) {
+    // Both sides must be free of ActiveConsumerGuards: guards on `other`
+    // would keep updating the moved-from counters, and guards on `this`
+    // would keep updating counters we are about to overwrite.
+    CHECK_MSG(active_consumers_.load(std::memory_order_acquire) == 0,
+              "assigning to a QueryMemoryGrant with active consumers is unsafe");
+    CHECK_MSG(other.active_consumers_.load(std::memory_order_acquire) == 0,
+              "moving a QueryMemoryGrant with active consumers is unsafe");
     alive_token_.reset();
     ReleaseGrant();
     alive_token_ = std::move(other.alive_token_);
@@ -192,6 +219,9 @@ size_t QueryMemoryGrant::OperatorBudgetBytes(size_t b_min) const noexcept {
   }
   const size_t grant = granted_bytes_.load(std::memory_order_acquire);
   if (grant == 0) {
+    if (limited_) {
+      return b_min;
+    }
     const size_t ceiling = QueryMemoryCoordinator::Global().MaxGrantFromEnv();
     return b_min == 0 ? ceiling : std::max(b_min, ceiling);
   }
@@ -240,10 +270,21 @@ bool QueryMemoryGrant::TryConsume(size_t bytes) noexcept {
   }
   const size_t limit = granted_bytes_.load(std::memory_order_acquire);
   if (!limited_ || limit == 0) {
-    const size_t used_after =
-        used_bytes_.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
-    RecordPeak(used_after);
-    return true;
+    // Unlimited grants still track usage for peak telemetry and fair-share
+    // accounting; saturate instead of wrapping around SIZE_MAX.
+    size_t prev = used_bytes_.load(std::memory_order_acquire);
+    while (true) {
+      const size_t next =
+          bytes > std::numeric_limits<size_t>::max() - prev
+              ? std::numeric_limits<size_t>::max()
+              : prev + bytes;
+      if (used_bytes_.compare_exchange_weak(prev, next,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+        RecordPeak(next);
+        return true;
+      }
+    }
   }
   size_t cur = used_bytes_.load(std::memory_order_acquire);
   while (true) {
@@ -280,7 +321,6 @@ void QueryMemoryGrant::ReleaseGrant() noexcept {
     budget_->Release(MemoryPoolKind::kQuery, granted);
   }
   budget_ = nullptr;
-  limited_ = false;
 }
 
 QueryMemoryCoordinator& QueryMemoryCoordinator::Global() {
@@ -325,12 +365,11 @@ size_t QueryMemoryCoordinator::MaxGrantFromEnv() const noexcept {
 uint64_t QueryMemoryCoordinator::WaitTimeoutMsFromEnv() noexcept {
   const uint64_t raw =
       ReadGrantEnvU64("TINYLAMB_GRANT_WAIT_TIMEOUT_MS", kDefaultWaitTimeoutMs);
-  // 0 is not a meaningful wait budget: AcquireGrant would time out on its
-  // first poll and turn a transient memory contention into a hard failure.
-  // Treat it like an unset/invalid value (same policy as the parser).
-  if (raw == 0) {
-    return kDefaultWaitTimeoutMs;
-  }
+  // 0 is a valid setting meaning "do not wait": AcquireGrant then fails on
+  // its first poll instead of turning an intentional no-wait configuration
+  // into a 30 second timeout. ReadGrantEnvU64 already treats 0 as a parsed
+  // value (only unset/negative/garbage fall back to the default), so keep
+  // it here as well.
   // Keep the configured timeout within the signed millisecond range used
   // by callers displaying this setting.
   return std::min<uint64_t>(

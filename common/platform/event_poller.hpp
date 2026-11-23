@@ -47,12 +47,15 @@ enum PollEvent : uint32_t {
 struct PollResult {
   SocketFd fd{-1};
   uint32_t events{0};
+  // kqueue reports the pending socket error in EV_ERROR's event.data. 0 means
+  // unavailable/unknown (epoll and WSAPoll do not report a per-event errno).
+  int error{0};
 };
 
 // Level-triggered readiness notification over file descriptors: epoll(7) on
 // Linux, kqueue(2) on macOS/BSD, WSAPoll on Windows. Semantics follow epoll's
 // level-triggered mode: a descriptor is reported on every Wait while ready, and
-// most once per Wait (kqueue's separate read/write filters are merged).
+// at most once per Wait (kqueue's separate read/write filters are merged).
 // kPollPeerClosed is only observable together with kPollReadable interest
 // (kqueue reports EOF on the read filter); request both.
 //
@@ -107,7 +110,11 @@ class EventPoller {
 // non-blocking pipe on macOS/BSD, a loopback TCP socket pair on Windows.
 // Register ReadFd() for kPollReadable; any
 // thread may call Wake(); the polling thread calls Drain() when ReadFd() is
-// reported readable.
+// reported readable. The polling thread serializes Open(), Drain(), ReadFd(),
+// and Close(). Wake() calls may run concurrently with each other, but
+// every Wake() source must be joined before Close() (or the destructor) runs:
+// the atomic fd below only prevents a data race on the descriptor number, it
+// cannot keep the descriptor alive across a concurrent close/reuse.
 class Waker {
  public:
   Waker() = default;
@@ -126,9 +133,11 @@ class Waker {
 
  private:
   SocketFd read_fd_{-1};
-  // == read_fd_ for eventfd. Atomic because the header contract lets any
-  // thread call Wake() while the polling thread may run Close(); a plain
-  // int made the Wake()/Close() pair a data race (TSAN) on the fd number.
+  // == read_fd_ for eventfd. Atomic so a Wake() that races with Close() does
+  // not create a data race (TSAN) on the fd number: it either sees the old
+  // value or -1. This does NOT make a close/Wake race safe -- a Wake() that
+  // loaded the old fd may still write to a closed (and possibly reused)
+  // descriptor. Callers must join all Wake() sources before Close().
   std::atomic<SocketFd> write_fd_{-1};
 };
 

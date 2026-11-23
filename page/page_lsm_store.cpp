@@ -131,9 +131,9 @@ class LsmRunStreamWriter {
     }
     // Header (magic/count), entry fields, and trailing CRC all occupy space
     // in the reader's bounded block. Avoid overflow while checking lengths.
-    constexpr size_t kBlockOverhead = 2 * sizeof(uint32_t) + sizeof(uint32_t);
+    constexpr size_t kBlockOverhead = (2 * sizeof(uint32_t)) + sizeof(uint32_t);
     constexpr size_t kEntryOverhead =
-        sizeof(uint64_t) + sizeof(uint8_t) + 2 * sizeof(uint32_t);
+        sizeof(uint64_t) + sizeof(uint8_t) + (2 * sizeof(uint32_t));
     constexpr size_t kMaxPayload =
         kMaxDecodedBlockBytes - kBlockOverhead - kEntryOverhead;
     if (e.key.size() > kMaxPayload ||
@@ -143,10 +143,10 @@ class LsmRunStreamWriter {
     const size_t entry_bytes = kEntryOverhead + e.key.size() + e.value.size();
     // Readers use lower_bound on block last_keys; an unsorted producer would
     // silently break Find/Seek. Catch it at the primitive boundary.
-    CHECK_MSG(
-        !has_prev_key_ ||
-            e.key >= prev_key_,  // NOLINT(readability-simplify-boolean-expr)
-        "LsmRunStreamWriter requires sorted keys");
+    if (has_prev_key_ && e.key < prev_key_) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "LsmRunStreamWriter requires sorted keys");
+    }
     prev_key_ = e.key;
     has_prev_key_ = true;
     if (block_count_ > 0 &&
@@ -302,7 +302,7 @@ StatusOr<std::shared_ptr<const DecodedLsmBlock>> LoadAndDecodeLsmBlock(
     return Status::kCorrupt;
   }
   constexpr size_t kMinimumEntryBytes =
-      sizeof(uint64_t) + sizeof(uint8_t) + 2 * sizeof(uint32_t);
+      sizeof(uint64_t) + sizeof(uint8_t) + (2 * sizeof(uint32_t));
   if (count > (payload_size - off) / kMinimumEntryBytes) {
     return Status::kCorrupt;
   }
@@ -847,8 +847,9 @@ Status MergeLsmSourcesToFd(
     }
   }
   if (mem_valid) {
-    pq.push(HeapItem{
-        .key = mem_cur.key, .source_id = mem_source_id, .entry = mem_cur});
+    pq.push(HeapItem{.key = mem_cur.key,
+                     .source_id = mem_source_id,
+                     .entry = std::move(mem_cur)});
   }
 
   LsmRunStreamWriter writer(out_fd, out_file_mu, out_append_offset, blocks_out);
@@ -857,8 +858,9 @@ Status MergeLsmSourcesToFd(
     if (src_id == mem_source_id) {
       mem_valid = next_mem_entry(&mem_cur);
       if (mem_valid) {
-        pq.push(HeapItem{
-            .key = mem_cur.key, .source_id = mem_source_id, .entry = mem_cur});
+        pq.push(HeapItem{.key = mem_cur.key,
+                         .source_id = mem_source_id,
+                         .entry = std::move(mem_cur)});
       }
       return Status::kSuccess;
     }

@@ -7,7 +7,11 @@ Omits differential-privacy / anonymization files. Origin is Apache-2.0.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
+import tempfile
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -46,6 +50,16 @@ def main() -> None:
     )
     out = root / "query" / "testdata" / "googlesql_compliance"
     out.mkdir(parents=True, exist_ok=True)
+    # A hard process exit can leave an atomic-download scratch file behind.
+    # Requests below time out after 60 seconds, so a day-old partial is stale
+    # even if another fetch process is still running.
+    stale_before = time.time() - 24 * 60 * 60
+    for partial in out.glob("*.test.part.*"):
+        try:
+            if partial.is_file() and partial.stat().st_mtime < stale_before:
+                partial.unlink()
+        except OSError:
+            pass
     request = urllib.request.Request(
         repo, headers=HEADERS
     )
@@ -65,12 +79,21 @@ def main() -> None:
 
     wanted = set(names)
 
+    stage_root = Path(tempfile.mkdtemp(prefix=".googlesql-fetch-", dir=out))
+
     def fetch(name: str) -> tuple[str, str | None]:
-        dest = out / name
+        dest = stage_root / name
         try:
             request = urllib.request.Request(raw + name, headers=HEADERS)
             with urllib.request.urlopen(request, timeout=60) as response:
-                dest.write_bytes(response.read())
+                payload = response.read()
+            tmp = dest.with_name(
+                dest.name + f".part.{os.getpid()}.{threading.get_ident()}")
+            try:
+                tmp.write_bytes(payload)
+                os.replace(tmp, dest)
+            finally:
+                tmp.unlink(missing_ok=True)
             return name, None
         except Exception as exc:  # noqa: BLE001
             return name, str(exc)
@@ -81,14 +104,20 @@ def main() -> None:
             if error:
                 errors.append((name, error))
     if errors:
-        # Keep the existing testdata intact on any transient failure: deleting
-        # first would leave neither old nor new files on a partial download.
+        # Staged downloads are discarded, so failed requests leave the checked-in
+        # testdata untouched.
+        for staged in stage_root.iterdir():
+            staged.unlink(missing_ok=True)
+        stage_root.rmdir()
         raise SystemExit(f"failed {len(errors)} files: {errors[:5]}")
-    # Delete every stale upstream file, not just *.test: upstream may drop a
-    # .json (or other) fixture, and leaving the old copy behind silently runs
-    # compliance against outdated data.
+    for name in names:
+        os.replace(stage_root / name, out / name)
+    stage_root.rmdir()
+    # Prune only files this script could have fetched (upstream *.test).
+    # Other files in the directory are local fixtures/documentation; deleting
+    # them would silently break tests that reference them.
     for existing in out.iterdir():
-        if not existing.is_file():
+        if not existing.is_file() or not existing.name.endswith(".test"):
             continue
         if (existing.name not in wanted and
                 not existing.name.startswith(LOCAL_PREFIXES) and

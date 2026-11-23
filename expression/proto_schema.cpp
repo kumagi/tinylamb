@@ -3,6 +3,8 @@
  */
 #include "expression/proto_schema.hpp"
 
+#include "common/log_message.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +54,21 @@ std::vector<EnumSchema> BuildEnums() {
                     {"ENUM2", 2},
                     {"ENUM2147483647", 2147483647}},
                    false});
+  // OrdinalForEnumMemberName scans every enum's members with no enum-type
+  // context (CAST(str AS INT64) carries none), so member names must be unique
+  // across the registry: a collision would silently return the first enum's
+  // ordinal for the string.
+  {
+    std::map<std::string, std::string> member_owner;
+    for (const EnumSchema& schema : enums) {
+      for (const auto& member_entry : schema.members) {
+        const bool inserted =
+            member_owner.emplace(member_entry.first, schema.short_name).second;
+        CHECK_MSG(inserted,
+                  "duplicate enum member name across proto schema enums");
+      }
+    }
+  }
   return enums;
 }
 

@@ -135,6 +135,43 @@ TEST(RuntimeFilterTest, ExactKeyEnclosureKeepsConjunctiveMembership) {
   EXPECT_EQ(empty.ExactKeys(), nullptr);
 }
 
+TEST(RuntimeFilterTest, GroupIgnoresMissingParts) {
+  std::vector<std::unique_ptr<RuntimeFilter>> missing;
+  missing.emplace_back(nullptr);
+  const RuntimeFilterGroup empty(std::move(missing));
+  ASSERT_TRUE(empty.empty());
+  EXPECT_FALSE(empty.Reject(4));
+  EXPECT_EQ(empty.Describe(), "none");
+
+  std::vector<std::unique_ptr<RuntimeFilter>> parts;
+  parts.emplace_back(nullptr);
+  parts.push_back(
+      std::make_unique<ExactSetRuntimeFilter>(std::vector<int64_t>{3, 5, 9}));
+  parts.emplace_back(nullptr);
+  const RuntimeFilterGroup group(std::move(parts));
+  ASSERT_TRUE(group.has_dense_bits());
+  EXPECT_TRUE(group.Has(RuntimeFilterKind::kExactSet));
+  EXPECT_FALSE(group.Reject(3));
+  EXPECT_TRUE(group.Reject(4));
+  EXPECT_EQ(group.DistinctKeys(), 3U);
+  EXPECT_GT(group.MemoryBytes(), sizeof(RuntimeFilterGroup));
+  EXPECT_NE(group.Describe().find("keys=3"), std::string::npos);
+}
+
+TEST(RuntimeFilterTest, IncompletePrebuiltBitmapKeepsExactKeys) {
+  std::vector<std::unique_ptr<RuntimeFilter>> parts;
+  parts.push_back(nullptr);
+  parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
+      std::vector<int64_t>{3, 99}));
+  const RuntimeFilterGroup group(std::move(parts), {uint64_t{1} << 3}, 0, 100);
+  EXPECT_FALSE(group.has_dense_bits());
+  EXPECT_FALSE(group.Reject(3));
+  EXPECT_FALSE(group.Reject(99));
+  EXPECT_FALSE(group.RejectRange(98, 100));
+  EXPECT_TRUE(group.Reject(50));
+  EXPECT_GT(group.MemoryBytes(), sizeof(group));
+}
+
 TEST(RuntimeFilterTest, DenseBitsNeverClaimKeysThePartsReject) {
   // The dense bitmap replaces the parts scan in Reject()/RejectRange(), so a
   // candidate key a part rejects must keep a clear bit even when the caller's
@@ -229,6 +266,17 @@ TEST(RuntimeFilterTest, ExactSetHandlesEveryInt64Boundary) {
   // INT64_MAX - 1 and INT64_MIN + 1 are one step inside the domain.
   EXPECT_TRUE(group->Reject(kMaxI64 - 1));
   EXPECT_TRUE(group->Reject(kMinI64 + 1));
+}
+
+TEST(RuntimeFilterTest, ExactSetAccountsOnlyForAllocatedHashSlots) {
+  const ExactSetRuntimeFilter hashed({1, 3, 5});
+  const ExactSetRuntimeFilter sorted({1, 3, 5}, true, true);
+  EXPECT_EQ(sorted.MemoryBytes(),
+            sizeof(sorted) + sorted.Keys().capacity() * sizeof(int64_t));
+  EXPECT_GT(hashed.MemoryBytes(), sorted.MemoryBytes());
+  for (int64_t key = 0; key <= 6; ++key) {
+    EXPECT_EQ(hashed.Reject(key), sorted.Reject(key));
+  }
 }
 
 TEST(RuntimeFilterTest, MinMaxEnclosureRejectsStrictlyOutsideOnly) {

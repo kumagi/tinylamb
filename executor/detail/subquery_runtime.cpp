@@ -8,9 +8,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2152,12 +2155,279 @@ void StashBuildDomainFilter(
   stored.SetOwner(statement);
 }
 
+bool SubqueryEnvDisabled(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+// Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
+std::unique_ptr<CorrelatedIndex> TryBuildIntervalCountSweep(
+    TransactionContext& context, const SelectStatement& statement,
+    const Scope& outer, const CteMap& ctes, const RelationPtr& source_cte,
+    const Schema& peek_schema) {
+  if (statement.Sources().size() != 1 || peek_schema.ColumnCount() == 0 ||
+      !statement.WhereClause() || !statement.GroupBy().empty() ||
+      statement.Having() != nullptr || statement.Distinct() ||
+      statement.HasLimit() || statement.Offset() != 0 ||
+      !statement.OrderBy().empty() || statement.SelectList().size() != 1) {
+    return nullptr;
+  }
+  const SelectSource& from = statement.Sources()[0];
+  if (from.query != nullptr || from.unnest != nullptr || from.sample ||
+      from.join_condition != nullptr || from.table.empty()) {
+    return nullptr;
+  }
+  const Expression& sel_expr = statement.SelectList()[0].expression;
+  if (!sel_expr || sel_expr->Type() != TypeTag::kAggregateExp) {
+    return nullptr;
+  }
+  const AggregateExpression& agg = sel_expr->AsAggregateExpression();
+  if (agg.GetType() != AggregationType::kCount || agg.Distinct() ||
+      agg.HasWhereFilter() || agg.NeedsGroupContext() ||
+      agg.HasInnerGroupBy() || agg.Having() != AggregateHavingModifier::kNone) {
+    return nullptr;
+  }
+  if (agg.Child() != nullptr) {
+    if (agg.Child()->Type() == TypeTag::kColumnValue) {
+      if (agg.Child()->AsColumnValue().GetColumnName().name != "*") {
+        return nullptr;
+      }
+    } else if (agg.Child()->Type() == TypeTag::kConstantValue) {
+      if (agg.Child()->AsConstantValue().GetValue().IsNull()) {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+
+  struct Bound {
+    ColumnName local_col;
+    ColumnName outer_col;
+    bool strict{false};
+  };
+  std::optional<Bound> lo_bound;
+  std::optional<Bound> hi_bound;
+  std::vector<Expression> local_preds;
+
+  for (const Expression& pred : SplitConjuncts(statement.WhereClause())) {
+    if (!pred) {
+      return nullptr;
+    }
+    bool classified_as_bound = false;
+    if (pred->Type() == TypeTag::kBinaryExp) {
+      const BinaryExpression& bin = pred->AsBinaryExpression();
+      const BinaryOperation op = bin.Op();
+      if ((op == BinaryOperation::kLessThan ||
+           op == BinaryOperation::kLessThanEquals ||
+           op == BinaryOperation::kGreaterThan ||
+           op == BinaryOperation::kGreaterThanEquals) &&
+          bin.Left() && bin.Right() &&
+          bin.Left()->Type() == TypeTag::kColumnValue &&
+          bin.Right()->Type() == TypeTag::kColumnValue) {
+        const ColumnName& lhs = bin.Left()->AsColumnValue().GetColumnName();
+        const ColumnName& rhs = bin.Right()->AsColumnValue().GetColumnName();
+        const auto lhs_local = LocalColumnOffset(peek_schema, lhs);
+        const auto rhs_local = LocalColumnOffset(peek_schema, rhs);
+        if (lhs_local.has_value() != rhs_local.has_value()) {
+          const bool local_is_lhs = lhs_local.has_value();
+          const ColumnName& lcol = local_is_lhs ? lhs : rhs;
+          const ColumnName& ocol = local_is_lhs ? rhs : lhs;
+          bool is_lower = false;
+          bool strict = false;
+          if (local_is_lhs) {
+            if (op == BinaryOperation::kLessThan ||
+                op == BinaryOperation::kLessThanEquals) {
+              is_lower = true;
+              strict = (op == BinaryOperation::kLessThan);
+            } else {
+              is_lower = false;
+              strict = (op == BinaryOperation::kGreaterThan);
+            }
+          } else {
+            if (op == BinaryOperation::kGreaterThan ||
+                op == BinaryOperation::kGreaterThanEquals) {
+              is_lower = true;
+              strict = (op == BinaryOperation::kGreaterThan);
+            } else {
+              is_lower = false;
+              strict = (op == BinaryOperation::kLessThan);
+            }
+          }
+          if (is_lower) {
+            if (lo_bound.has_value()) {
+              return nullptr;
+            }
+            lo_bound = Bound{.local_col=lcol, .outer_col=ocol, .strict=strict};
+          } else {
+            if (hi_bound.has_value()) {
+              return nullptr;
+            }
+            // Note: for upper bound `x < hi` vs `x <= hi`, strict=true here
+            // means strict inequality (x < hi, i.e., NOT inclusive).
+            hi_bound = Bound{.local_col=lcol, .outer_col=ocol, .strict=strict};
+          }
+          classified_as_bound = true;
+        }
+      }
+    }
+    if (!classified_as_bound) {
+      if (ContainsQuery(pred) || ContainsAggregate(pred)) {
+        return nullptr;
+      }
+      for (const ColumnName& col : pred->TouchedColumns()) {
+        if (col.name != "*" &&
+            !LocalColumnOffset(peek_schema, col).has_value()) {
+          return nullptr;
+        }
+      }
+      local_preds.push_back(pred);
+    }
+  }
+  if (!lo_bound.has_value() || !hi_bound.has_value() ||
+      !(lo_bound->outer_col == hi_bound->outer_col)) {
+    return nullptr;
+  }
+  const auto lo_peek_off = LocalColumnOffset(peek_schema, lo_bound->local_col);
+  const auto hi_peek_off = LocalColumnOffset(peek_schema, hi_bound->local_col);
+  if (!lo_peek_off.has_value() || !hi_peek_off.has_value()) {
+    return nullptr;
+  }
+  const Column& lo_col_meta = peek_schema.GetColumn(*lo_peek_off);
+  const Column& hi_col_meta = peek_schema.GetColumn(*hi_peek_off);
+  if (lo_col_meta.Type() != hi_col_meta.Type() ||
+      (lo_col_meta.Type() != ValueType::kInt64 &&
+       lo_col_meta.Type() != ValueType::kDate) ||
+      lo_col_meta.IsUnsigned() || hi_col_meta.IsUnsigned()) {
+    return nullptr;
+  }
+  const ValueType point_type = lo_col_meta.Type();
+
+  Relation source;
+  if (source_cte) {
+    auto loaded = LoadSource(context, from, &outer, ctes);
+    if (!loaded.HasValue()) {
+      return nullptr;
+    }
+    source = loaded.MoveValue();
+  } else {
+    std::vector<slot_t> projection =
+        RequiredColumns(statement, peek_schema, true);
+    StatusOr<Relation> loaded = LoadSource(
+        context, from, &outer, ctes, projection.empty() ? nullptr : &projection,
+        nullptr, nullptr);
+    if (!loaded.HasValue()) {
+      return nullptr;
+    }
+    source = loaded.MoveValue();
+  }
+  const auto lo_src_off = LocalColumnOffset(source.schema, lo_bound->local_col);
+  const auto hi_src_off = LocalColumnOffset(source.schema, hi_bound->local_col);
+  if (!lo_src_off.has_value() || !hi_src_off.has_value()) {
+    return nullptr;
+  }
+  const auto lo_slot = static_cast<slot_t>(*lo_src_off);
+  const auto hi_slot = static_cast<slot_t>(*hi_src_off);
+
+  struct SweepEvent {
+    int64_t coord{0};
+    int64_t delta{0};
+  };
+  std::vector<SweepEvent> events;
+  events.reserve(source.TotalRows() * 2);
+  const CompiledScanFilter local_filter =
+      CompileScanFilter(local_preds, source.schema);
+  Status filter_error = Status::kSuccess;
+  const Status iter_st = source.ForEachRow([&](const Row& row) {
+    if (filter_error != Status::kSuccess) {
+      return;
+    }
+    if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
+                         ctes, &filter_error)) {
+      return;
+    }
+    const Value& lv = row[lo_slot];
+    const Value& hv = row[hi_slot];
+    if (lv.IsNull() || hv.IsNull()) {
+      return;
+    }
+    if (lv.type != point_type || hv.type != point_type ||
+        (point_type == ValueType::kInt64 &&
+         (lv.IsUnsigned() || hv.IsUnsigned()))) {
+      filter_error = StatusError(StatusCode::kInvalidArgument,
+                                 "Interval sweep column type mismatch");
+      return;
+    }
+    const int64_t lo = lv.value.int_value;
+    const int64_t hi = hv.value.int_value;
+    if (lo_bound->strict && lo == std::numeric_limits<int64_t>::max()) {
+      return;
+    }
+    const int64_t eff_lo = lo_bound->strict ? lo + 1 : lo;
+    const bool hi_strict = hi_bound->strict;
+    if (hi_strict) {
+      if (eff_lo >= hi) {
+        return;
+      }
+      events.push_back({eff_lo, 1});
+      events.push_back({hi, -1});
+    } else {
+      if (eff_lo > hi) {
+        return;
+      }
+      events.push_back({eff_lo, 1});
+      if (hi < std::numeric_limits<int64_t>::max()) {
+        events.push_back({hi + 1, -1});
+      }
+    }
+  });
+  source.rows.clear();
+  source.rows.shrink_to_fit();
+  source.columnar.reset();
+  source.ReleaseCharge();
+  source.spill.reset();
+  source.extra_spills.clear();
+  source.spill_tail_.reset();
+  if (iter_st != Status::kSuccess || filter_error != Status::kSuccess) {
+    return nullptr;
+  }
+
+  std::sort(events.begin(), events.end(),
+            [](const SweepEvent& a, const SweepEvent& b) {
+              return a.coord < b.coord;
+            });
+  auto created = std::make_unique<CorrelatedIndex>();
+  created->source_cte = source_cte;
+  created->has_interval_count_sweep = true;
+  created->interval_point_type = point_type;
+  created->interval_outer_col = lo_bound->outer_col;
+  created->interval_checkpoints.reserve(events.size());
+  int64_t running = 0;
+  for (size_t i = 0; i < events.size();) {
+    const int64_t c = events[i].coord;
+    while (i < events.size() && events[i].coord == c) {
+      running += events[i].delta;
+      ++i;
+    }
+    if (created->interval_checkpoints.empty()) {
+      if (running != 0) {
+        created->interval_checkpoints.push_back({c, running});
+      }
+    } else if (created->interval_checkpoints.back().count != running) {
+      created->interval_checkpoints.push_back({c, running});
+    }
+  }
+  return created;
+}
+
 }  // namespace
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes, bool exists_only,
-    std::optional<bool>* exists_answer, std::optional<Value>* scalar_answer) {
+    std::optional<bool>* exists_answer, std::optional<Value>* scalar_answer,
+    Status* scalar_error, const QuantifiedProbeSpec* quantified_probe,
+    std::optional<Value>* quantified_answer) {
   if (context.execution_runtime() == nullptr) {
     return std::nullopt;
   }
@@ -2179,7 +2449,13 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // the outer context it was built for; reusing it under any other
       // context (including no context) would silently miss rows.  Unfiltered
       // builds (serial 0) stay universally valid.
-      if (candidate->source_cte == source_cte &&
+      const bool kind_compatible =
+          (!candidate->has_quantified_int_summaries ||
+           (quantified_probe != nullptr && quantified_answer != nullptr)) &&
+          (!candidate->has_demand_int_scalars ||
+           (scalar_answer != nullptr && scalar_error != nullptr)) &&
+          (!candidate->has_interval_count_sweep || scalar_answer != nullptr);
+      if (kind_compatible && candidate->source_cte == source_cte &&
           (candidate->outer_filter_serial == 0 ||
            (candidate->outer_filter_relation ==
                 context.execution_runtime()->correlated_outer_relation &&
@@ -2277,6 +2553,21 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     };
     if (statement.Sources().size() == 1 && peek_schema.ColumnCount() > 0 &&
         !has_correlated_equality(peek_schema)) {
+      if (scalar_answer != nullptr && !exists_only &&
+          quantified_probe == nullptr &&
+          !SubqueryEnvDisabled("TINYLAMB_DISABLE_INTERVAL_COUNT_SWEEP")) {
+        std::unique_ptr<CorrelatedIndex> sweep_index =
+            TryBuildIntervalCountSweep(context, statement, outer, ctes,
+                                       source_cte, peek_schema);
+        if (sweep_index != nullptr) {
+          index = sweep_index.get();
+          CacheEntryIsCurrent(statement, *context.execution_runtime());
+          context.execution_runtime()->correlated_indexes.emplace(
+              &statement, std::move(sweep_index));
+          ++context.execution_runtime()->correlated_index_builds;
+          goto probe_cached_index;
+        }
+      }
       context.execution_runtime()->unindexable_queries.insert(&statement);
       return std::nullopt;
     }
@@ -3515,7 +3806,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         }
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
-        for (const AggregateAccumulator& accumulator : group.accumulators) {
+        for (AggregateAccumulator& accumulator : group.accumulators) {
           StatusOr<Value> finished = accumulator.TryFinish();
           if (!finished.HasValue()) {
             group_error = finished.GetStatus();
@@ -3558,7 +3849,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
-        for (const AggregateAccumulator& accumulator : group.accumulators) {
+        for (AggregateAccumulator& accumulator : group.accumulators) {
           StatusOr<Value> finished = accumulator.TryFinish();
           if (!finished.HasValue()) {
             group_error = finished.GetStatus();
@@ -3852,6 +4143,143 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
       }
       created->exists_key_set = true;
+    } else if (quantified_probe != nullptr && quantified_answer != nullptr &&
+               !exists_only &&
+               !SubqueryEnvDisabled(
+                   "TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY") &&
+               !aggregate_only &&
+               std::ranges::all_of(
+                   created->cache_outer_columns,
+                   [&](const ColumnName& column) {
+                     return std::ranges::find(created->outer_columns, column) !=
+                            created->outer_columns.end();
+                   }) &&
+               statement.GroupBy().empty() && statement.Having() == nullptr &&
+               statement.OrderBy().empty() && !statement.Distinct() &&
+               !statement.HasLimit() && statement.Offset() == 0 &&
+               SingleIntegerJoinKey(source.schema, created->local_columns) &&
+               statement.SelectList().size() == 1 &&
+               statement.SelectList()[0].expression != nullptr &&
+               statement.SelectList()[0].expression->Type() ==
+                   TypeTag::kColumnValue &&
+               statement.SelectList()[0]
+                       .expression->AsColumnValue()
+                       .GetColumnName()
+                       .name != "*" &&
+               LocalColumnOffset(source.schema, statement.SelectList()[0]
+                                                    .expression->AsColumnValue()
+                                                    .GetColumnName())
+                   .has_value()) {
+      // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+      // (sound)
+      const size_t proj_slot =
+          *LocalColumnOffset(source.schema, statement.SelectList()[0]
+                                                .expression->AsColumnValue()
+                                                .GetColumnName());
+      const Column& proj_col = source.schema.GetColumn(proj_slot);
+      if (proj_col.Type() != ValueType::kDate &&
+          (proj_col.Type() != ValueType::kInt64 || proj_col.IsUnsigned())) {
+        return std::nullopt;
+      }
+      const ValueType proj_type = proj_col.Type();
+      const CompiledScanFilter local_filter =
+          CompileScanFilter(local_predicates, source.schema);
+      const slot_t key_col = created->local_columns[0];
+      bool type_ok = true;
+      const Status iteration = source.ForEachRow([&](const Row& row) {
+        if (group_error != Status::kSuccess || !type_ok ||
+            HasNullKey(row, created->local_columns)) {
+          return;
+        }
+        if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
+                             ctes, &group_error)) {
+          return;
+        }
+        const int64_t key = IntegerJoinKey(row, key_col);
+        auto* entry = created->quantified_int_summaries.TryEmplace(key);
+        const Value& pv = row[proj_slot];
+        if (pv.IsNull()) {
+          entry->has_null = true;
+          return;
+        }
+        if (pv.type != proj_type ||
+            (proj_type == ValueType::kInt64 && pv.IsUnsigned())) {
+          type_ok = false;
+          return;
+        }
+        const int64_t v = pv.value.int_value;
+        if (!entry->has_non_null) {
+          entry->min_val = v;
+          entry->max_val = v;
+          entry->has_non_null = true;
+        } else {
+          entry->min_val = std::min(v, entry->min_val);
+          entry->max_val = std::max(v, entry->max_val);
+        }
+      });
+      if (!type_ok || iteration != Status::kSuccess ||
+          group_error != Status::kSuccess) {
+        return std::nullopt;
+      }
+      created->quantified_value_type = proj_type;
+      created->has_quantified_int_summaries = true;
+    } else if (scalar_answer != nullptr && scalar_error != nullptr &&
+               !exists_only && quantified_probe == nullptr &&
+               !SubqueryEnvDisabled("TINYLAMB_DISABLE_DEMAND_SCALAR") &&
+               !aggregate_only &&
+               std::ranges::all_of(
+                   created->cache_outer_columns,
+                   [&](const ColumnName& column) {
+                     return std::ranges::find(created->outer_columns, column) !=
+                            created->outer_columns.end();
+                   }) &&
+               statement.GroupBy().empty() && statement.Having() == nullptr &&
+               statement.OrderBy().empty() && !statement.Distinct() &&
+               !statement.HasLimit() && statement.Offset() == 0 &&
+               SingleIntegerJoinKey(source.schema, created->local_columns) &&
+               statement.SelectList().size() == 1 &&
+               statement.SelectList()[0].expression != nullptr &&
+               statement.SelectList()[0].expression->Type() ==
+                   TypeTag::kColumnValue &&
+               statement.SelectList()[0]
+                       .expression->AsColumnValue()
+                       .GetColumnName()
+                       .name != "*" &&
+               LocalColumnOffset(source.schema, statement.SelectList()[0]
+                                                    .expression->AsColumnValue()
+                                                    .GetColumnName())
+                   .has_value()) {
+      // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+      const size_t proj_slot =
+          *LocalColumnOffset(source.schema, statement.SelectList()[0]
+                                                .expression->AsColumnValue()
+                                                .GetColumnName());
+      const CompiledScanFilter local_filter =
+          CompileScanFilter(local_predicates, source.schema);
+      const slot_t key_col = created->local_columns[0];
+      const Status iteration = source.ForEachRow([&](const Row& row) {
+        if (group_error != Status::kSuccess ||
+            HasNullKey(row, created->local_columns)) {
+          return;
+        }
+        if (!MatchScanFilter(row, source.schema, local_filter, nullptr, context,
+                             ctes, &group_error)) {
+          return;
+        }
+        const int64_t key = IntegerJoinKey(row, key_col);
+        bool inserted = false;
+        auto* hit = created->demand_int_scalars.TryEmplace(key, &inserted);
+        if (inserted) {
+          hit->value = row[proj_slot];
+          hit->many = false;
+        } else {
+          hit->many = true;
+        }
+      });
+      if (iteration != Status::kSuccess || group_error != Status::kSuccess) {
+        return std::nullopt;
+      }
+      created->has_demand_int_scalars = true;
     } else {
       const Status iteration = source.ForEachRow([&](const Row& row) {
         if (HasNullKey(row, created->local_columns)) {
@@ -3897,9 +4325,229 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     ++context.execution_runtime()->correlated_index_builds;
   }
 
+probe_cached_index:
   ++context.execution_runtime()->correlated_index_probes;
 
+  if (index->has_interval_count_sweep) {
+    // Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean
+    // (sound)
+    if (scalar_answer == nullptr) {
+      return std::nullopt;
+    }
+    const Value* outer_ptr = nullptr;
+    StatusOr<Value> owned_outer(Status::kSuccess);
+    if (outer.outer == nullptr && outer.row != nullptr &&
+        outer.schema != nullptr) {
+      if (index->cached_outer_schema != outer.schema) {
+        index->cached_outer_schema = outer.schema;
+        index->cached_outer_slots_valid = false;
+        if (const auto off =
+                LocalColumnOffset(*outer.schema, index->interval_outer_col);
+            off.has_value() && *off < outer.schema->ColumnCount()) {
+          const Column& oc = outer.schema->GetColumn(*off);
+          if (oc.Type() == index->interval_point_type &&
+              (index->interval_point_type == ValueType::kDate ||
+               !oc.IsUnsigned())) {
+            index->cached_outer_slots[0] = static_cast<slot_t>(*off);
+            index->cached_outer_slots_valid = true;
+          }
+        }
+      }
+      if (index->cached_outer_slots_valid &&
+          index->cached_outer_slots[0] < outer.row->Count()) {
+        outer_ptr = &(*outer.row)[index->cached_outer_slots[0]];
+      }
+    }
+    if (outer_ptr == nullptr) {
+      owned_outer = TryLookup(index->interval_outer_col, outer);
+      if (!owned_outer.HasValue()) {
+        return std::nullopt;
+      }
+      outer_ptr = &owned_outer.Value();
+    }
+    const Value& probe = *outer_ptr;
+    if (probe.IsNull()) {
+      *scalar_answer = Value(int64_t{0});
+      return Relation{};
+    }
+    if (probe.type != index->interval_point_type ||
+        (index->interval_point_type == ValueType::kInt64 &&
+         probe.IsUnsigned())) {
+      return std::nullopt;
+    }
+    const int64_t x = probe.value.int_value;
+    const auto& cps = index->interval_checkpoints;
+    const auto it = std::upper_bound(
+        cps.begin(), cps.end(), x,
+        [](int64_t val, const CorrelatedIndex::IntervalCheckpoint& cp) {
+          return val < cp.coord;
+        });
+    const int64_t cnt = (it == cps.begin()) ? 0 : std::prev(it)->count;
+    ++context.execution_runtime()->correlated_result_cache_hits;
+    *scalar_answer = Value(cnt);
+    return Relation{};
+  }
+
   if (index->local_columns.size() != index->outer_columns.size()) {
+    return std::nullopt;
+  }
+  if ((index->has_quantified_int_summaries && quantified_probe != nullptr &&
+       quantified_answer != nullptr) ||
+      (index->has_demand_int_scalars && scalar_answer != nullptr &&
+       scalar_error != nullptr)) {
+    bool use_cached_slots = false;
+    if (outer.outer == nullptr && outer.row != nullptr &&
+        outer.schema != nullptr) {
+      if (index->cached_outer_schema != outer.schema) {
+        index->cached_outer_schema = outer.schema;
+        index->cached_outer_slots_valid = false;
+        if (const auto off =
+                LocalColumnOffset(*outer.schema, index->outer_columns[0]);
+            off.has_value() && *off < outer.schema->ColumnCount()) {
+          const Column& oc = outer.schema->GetColumn(*off);
+          const Column& lc = index->schema.GetColumn(index->local_columns[0]);
+          if (oc.Type() == lc.Type() && oc.IsUnsigned() == lc.IsUnsigned()) {
+            index->cached_outer_slots[0] = static_cast<slot_t>(*off);
+            index->cached_outer_slots_valid = true;
+          }
+        }
+      }
+      use_cached_slots = index->cached_outer_slots_valid;
+    }
+    const Value* v0_ptr = nullptr;
+    StatusOr<Value> ov0(Status::kSuccess);
+    if (use_cached_slots && index->cached_outer_slots[0] < outer.row->Count()) {
+      v0_ptr = &(*outer.row)[index->cached_outer_slots[0]];
+    } else {
+      ov0 = TryLookup(index->outer_columns[0], outer);
+      if (!ov0.HasValue()) {
+        return std::nullopt;
+      }
+      v0_ptr = &ov0.Value();
+    }
+    const Value& v0 = *v0_ptr;
+    if (index->has_quantified_int_summaries) {
+      // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+      // (sound)
+      if (v0.IsNull()) {
+        index->null_parameter_seen = true;
+        *quantified_answer =
+            Value(quantified_probe->mode == QuantifierMode::kAll);
+        return Relation{};
+      }
+      if (!use_cached_slots) {
+        const Column& c0 = index->schema.GetColumn(index->local_columns[0]);
+        const bool ok0 =
+            (c0.Type() == ValueType::kDate && v0.type == ValueType::kDate) ||
+            (c0.Type() == ValueType::kInt64 && v0.type == ValueType::kInt64 &&
+             c0.IsUnsigned() == v0.IsUnsigned());
+        if (!ok0) {
+          return std::nullopt;
+        }
+      }
+      const int64_t k0 = v0.value.int_value;
+      const auto* entry = index->quantified_int_summaries.Find(k0);
+      ++context.execution_runtime()->correlated_result_cache_hits;
+      if (entry == nullptr) {
+        *quantified_answer =
+            Value(quantified_probe->mode == QuantifierMode::kAll);
+        return Relation{};
+      }
+      if (!entry->has_non_null || quantified_probe->test_value.IsNull()) {
+        *quantified_answer = Value();
+        return Relation{};
+      }
+      const Value& tv = quantified_probe->test_value;
+      if (tv.type != index->quantified_value_type ||
+          (index->quantified_value_type == ValueType::kInt64 &&
+           tv.IsUnsigned())) {
+        return std::nullopt;
+      }
+      const int64_t x = tv.value.int_value;
+      const BinaryOperation op = quantified_probe->op;
+      if (quantified_probe->mode == QuantifierMode::kAny) {
+        bool witness = false;
+        switch (op) {
+          case BinaryOperation::kLessThan:
+            witness = x < entry->max_val;
+            break;
+          case BinaryOperation::kLessThanEquals:
+            witness = x <= entry->max_val;
+            break;
+          case BinaryOperation::kGreaterThan:
+            witness = x > entry->min_val;
+            break;
+          case BinaryOperation::kGreaterThanEquals:
+            witness = x >= entry->min_val;
+            break;
+          default:
+            return std::nullopt;
+        }
+        if (witness) {
+          *quantified_answer = Value(true);
+        } else if (entry->has_null) {
+          *quantified_answer = Value();
+        } else {
+          *quantified_answer = Value(false);
+        }
+      } else {
+        bool counterexample = false;
+        switch (op) {
+          case BinaryOperation::kLessThan:
+            counterexample = x >= entry->min_val;
+            break;
+          case BinaryOperation::kLessThanEquals:
+            counterexample = x > entry->min_val;
+            break;
+          case BinaryOperation::kGreaterThan:
+            counterexample = x <= entry->max_val;
+            break;
+          case BinaryOperation::kGreaterThanEquals:
+            counterexample = x < entry->max_val;
+            break;
+          default:
+            return std::nullopt;
+        }
+        if (counterexample) {
+          *quantified_answer = Value(false);
+        } else if (entry->has_null) {
+          *quantified_answer = Value();
+        } else {
+          *quantified_answer = Value(true);
+        }
+      }
+      return Relation{};
+    }
+    // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+    if (v0.IsNull()) {
+      index->null_parameter_seen = true;
+      *scalar_answer = Value();
+      return Relation{};
+    }
+    if (!use_cached_slots) {
+      const Column& c0 = index->schema.GetColumn(index->local_columns[0]);
+      const bool ok0 =
+          (c0.Type() == ValueType::kDate && v0.type == ValueType::kDate) ||
+          (c0.Type() == ValueType::kInt64 && v0.type == ValueType::kInt64 &&
+           c0.IsUnsigned() == v0.IsUnsigned());
+      if (!ok0) {
+        return std::nullopt;
+      }
+    }
+    const int64_t k0 = v0.value.int_value;
+    const auto* hit = index->demand_int_scalars.Find(k0);
+    ++context.execution_runtime()->correlated_result_cache_hits;
+    if (hit == nullptr) {
+      *scalar_answer = Value();
+    } else if (hit->many) {
+      *scalar_error = StatusError(StatusCode::kInvalidArgument,
+                                  "Scalar subquery produced more than one row");
+    } else {
+      *scalar_answer = hit->value;
+    }
+    return Relation{};
+  }
+  if (index->has_quantified_int_summaries || index->has_demand_int_scalars) {
     return std::nullopt;
   }
   if ((index->has_preagg_int_scalars || index->has_preagg_str_scalars) &&
@@ -4684,9 +5332,10 @@ std::string UncorrelatedCacheKey(const SelectStatement& statement,
   return key;
 }
 
-std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
-                                    const Scope* outer, const CteMap& ctes,
-                                    bool exists_only) {
+StatusOr<std::string> CorrelatedApplyCacheKey(const SelectStatement& statement,
+                                              const Scope* outer,
+                                              const CteMap& ctes,
+                                              bool exists_only) {
   std::string key = UncorrelatedCacheKey(statement, ctes, exists_only);
   key += "|outer=";
   std::unordered_set<ColumnName> referenced_columns;
@@ -4795,6 +5444,9 @@ std::string CorrelatedApplyCacheKey(const SelectStatement& statement,
     // The memcomparable index encoding rejects NULL. Apply parameters may be
     // NULL, so use Row's null-bitmap serializer instead.
     const Row parameter_row(std::move(parameters));
+    // Row::Serialize CHECK-fails above 32767 columns. This key can fall back
+    // to the complete outer row, so validate at this Status boundary first.
+    RETURN_IF_FAIL(parameter_row.CheckSerializable());
     std::string encoded(parameter_row.Size(), '\0');
     const size_t serialized = parameter_row.Serialize(encoded.data());
     encoded.resize(serialized);

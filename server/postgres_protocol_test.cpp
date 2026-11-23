@@ -185,14 +185,29 @@ TEST(PostgresProtocolTest, EmptyQueryAndNegotiateProtocolVersion) {
   EXPECT_NE(negotiated.find("_pq_.bar"), std::string::npos);
 }
 
-TEST(PostgresProtocolTest, ErrorResponseCarriesGoogleSqlLineAndColumn) {
-  const std::string response = ErrorResponse("syntax error [at 3:17]", "42601");
-  EXPECT_NE(response.find(std::string("L3\0", 3)), std::string::npos);
-  EXPECT_NE(response.find(std::string("P17\0", 4)), std::string::npos);
-  // Non-numeric positions must not produce bogus fields.
-  const std::string malformed = ErrorResponse("syntax error [at x:y]", "42601");
-  EXPECT_EQ(malformed.find("Lx"), std::string::npos);
-  EXPECT_EQ(malformed.find("Py"), std::string::npos);
+TEST(PostgresProtocolTest, ErrorResponseUsesPositionInOriginalQuery) {
+  const auto statements = SplitSqlStatementsWithPositions(
+      "SELECT '雪';\r\n \tSELECT\n\t)");
+  ASSERT_TRUE(statements.HasValue());
+  ASSERT_EQ(statements.Value().size(), 2U);
+  const SqlStatement& statement = statements.Value().back();
+  constexpr std::string_view diagnostic = "ERROR: syntax error [at 2:9]";
+  const auto position = SqlErrorPosition(diagnostic, statement, 0);
+  EXPECT_EQ(position, 24U);
+  const std::string response = ErrorResponse(diagnostic, "42601", "ERROR", position);
+  EXPECT_NE(response.find(std::string("P24\0", 4)), std::string::npos);
+  EXPECT_EQ(response.find(std::string("L2\0", 3)), std::string::npos);
+
+  const auto no_position = ErrorResponse(diagnostic, "42601");
+  const size_t message_start = no_position.find(diagnostic);
+  ASSERT_NE(message_start, std::string::npos);
+  const size_t message_end = no_position.find('\0', message_start);
+  ASSERT_NE(message_end, std::string::npos);
+  EXPECT_EQ(message_end, no_position.size() - 1);
+  EXPECT_EQ(SqlErrorPosition("ERROR: syntax error [at x:y]", statement, 0),
+            std::nullopt);
+  EXPECT_EQ(SqlErrorPosition("ERROR: syntax error [at 2:7]", statement, 0),
+            std::nullopt);
 }
 
 TEST(PostgresProtocolTest, ErrorResponseSanitizesFields) {

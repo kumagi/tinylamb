@@ -4989,7 +4989,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     std::vector<size_t> out_to_agg(agg_count, SIZE_MAX);
     bool all_fast_cc = true;
     auto eval_const_i64 = [](const Expression& e, int64_t* out) -> bool {
-      if (!e) return false;
+      if (!e) { return false;
+}
       if (e->Type() == TypeTag::kConstantValue) {
         const Value& v = e->AsConstantValue().GetValue();
         if (v.IsNull() ||
@@ -5029,7 +5030,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     std::function<bool(const Expression&, std::vector<FastIntCmp>*)>
         parse_and_cmps =
             [&](const Expression& e, std::vector<FastIntCmp>* out) -> bool {
-      if (!e || e->Type() != TypeTag::kBinaryExp) return false;
+      if (!e || e->Type() != TypeTag::kBinaryExp) { return false;
+}
       const auto& b = e->AsBinaryExpression();
       if (b.Op() == BinaryOperation::kAnd) {
         return parse_and_cmps(b.Left(), out) && parse_and_cmps(b.Right(), out);
@@ -5043,7 +5045,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
         return false;
       }
       auto extract_col = [&](const Expression& ce, slot_t* slot_out) -> bool {
-        if (!ce || ce->Type() != TypeTag::kColumnValue) return false;
+        if (!ce || ce->Type() != TypeTag::kColumnValue) { return false;
+}
         const auto off = LocalColumnOffset(input.schema,
                                            ce->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -5066,14 +5069,15 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
       }
       if (eval_const_i64(b.Left(), &val) && extract_col(b.Right(), &col)) {
         BinaryOperation flipped = op;
-        if (op == BinaryOperation::kLessThan)
+        if (op == BinaryOperation::kLessThan) {
           flipped = BinaryOperation::kGreaterThan;
-        else if (op == BinaryOperation::kLessThanEquals)
+        } else if (op == BinaryOperation::kLessThanEquals) {
           flipped = BinaryOperation::kGreaterThanEquals;
-        else if (op == BinaryOperation::kGreaterThan)
+        } else if (op == BinaryOperation::kGreaterThan) {
           flipped = BinaryOperation::kLessThan;
-        else if (op == BinaryOperation::kGreaterThanEquals)
+        } else if (op == BinaryOperation::kGreaterThanEquals) {
           flipped = BinaryOperation::kLessThanEquals;
+}
         out->push_back({col, flipped, val});
         return true;
       }
@@ -5121,7 +5125,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     if (all_fast_cc && columnar_only) {
       const ColumnarTable& col_tbl = *input.columnar;
       for (const ColumnarChunk& ch : col_tbl.chunks) {
-        if (ch.rows == 0) continue;
+        if (ch.rows == 0) { continue;
+}
         for (size_t a = 0; a < agg_count && all_fast_cc; ++a) {
           for (const auto& cmp : fcases[a]) {
             if (cmp.col >= ch.columns.size() ||
@@ -5134,7 +5139,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
             }
           }
         }
-        if (!all_fast_cc) break;
+        if (!all_fast_cc) { break;
+}
       }
     }
     if (all_fast_cc) {
@@ -5170,7 +5176,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
                 ? std::min<size_t>(max_w, (total_rows + 4095) / 4096)
                 : 1;
         std::vector<std::array<int64_t, 16>> wcounts(workers);
-        for (auto& arr : wcounts) arr.fill(0);
+        for (auto& arr : wcounts) { arr.fill(0);
+}
         if (columnar_only) {
           const ColumnarTable& col_tbl = *input.columnar;
           std::vector<uint32_t> chunk_prefix;
@@ -5184,7 +5191,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
           auto run_w = [&](size_t w) {
             const size_t begin = (total_rows * w) / workers;
             const size_t end = (total_rows * (w + 1)) / workers;
-            if (begin >= end) return;
+            if (begin >= end) { return;
+}
             size_t ci_hint = 0;
             auto [ci, lr_start] = TypedWorkerGroups::LocateColumnarChunkRow(
                 chunk_prefix, static_cast<uint32_t>(begin), &ci_hint);

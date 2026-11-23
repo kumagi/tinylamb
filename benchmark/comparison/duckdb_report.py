@@ -6,6 +6,7 @@ from collections import Counter
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 
@@ -102,7 +103,7 @@ def audit(directory):
     return env, records, engines, labels, result
 
 
-def report(directory):
+def report(directory, output_dir=Path.cwd()):
     env, records, engines, labels, result = audit(directory)
     args = env['args']
     if (set(engines) != {'tinylamb', 'postgresql', 'mysql', 'oracle', 'duckdb'}
@@ -144,7 +145,7 @@ def report(directory):
     tps = markdown(['処理', '接続', *[label + ' 成功TPS' for label in labels]], tps_rows)
     errors = markdown(['製品', '計測中SQL失敗', 'warmup失敗', '失敗を含む試行'],
                       [[label, *result['errors'][e].values()] for e, label in zip(engines, labels)])
-    relative = '../benchmark/comparison/results/' + directory.name
+    relative = os.path.relpath(directory.resolve(), start=output_dir.resolve())
     duck_settings = dict(env['settings']['duckdb']['settings'])
     mysql_cache = int(dict(env['settings']['mysql'])['innodb_buffer_pool_size']) / 2**20
     oracle_cache_start = dict(env['settings']['oracle']['sga'])['Buffer Cache Size'] / 2**20
@@ -285,7 +286,7 @@ def main():
     parser.add_argument('directory', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    result, text = report(args.directory)
+    result, text = report(args.directory, args.output.parent)
     (args.directory / 'audit.json').write_text(json.dumps(result, indent=2))
     args.output.write_text(text)
     print(json.dumps(result, indent=2))

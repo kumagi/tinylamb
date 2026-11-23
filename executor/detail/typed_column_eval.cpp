@@ -973,7 +973,7 @@ Value EvaluateTypedCoalesceDoubleOnRow(const TypedCoalesceDoubleInput& coalesce,
   return value;
 }
 
-ValueType ValueTypeFromTypeTag(TypeTag tag) {
+static ValueType ValueTypeFromTypeTag(TypeTag tag) {
   switch (tag) {
     case TypeTag::kInteger:
     case TypeTag::kBigInt:
@@ -2227,7 +2227,9 @@ bool CanUseExactIntegerGroupingSets(TransactionContext& context,
                // that shape via valid_partial_agg_child().
                // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
                //   (rollup_two_level_state_combine_sound,
-               //    rollup_three_level_state_combine_sound)
+               //    rollup_three_level_state_combine_sound),
+               //   lean/TinylambOpt/ProposedProofs/GroupingSetsReuse.lean
+               //   (sound)
                if (ContainsQuery(child) || ContainsAggregate(child) ||
                    ContainsParameterSlot(child) ||
                    ContainsVolatileCall(child)) {

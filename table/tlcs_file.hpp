@@ -68,10 +68,12 @@ enum class TlcsDictKind : uint8_t {
 // file and exposes a resident `LSTableStore` (`is_persistent_tlcs = true`).
 // Larger tables run in paged mode using projected `platform::Pread` calls
 // with a bounded LRU cache for point lookups.
-class TlcsFile {
+class TlcsFile : public std::enable_shared_from_this<TlcsFile> {
  public:
   static constexpr uint64_t kDefaultResidentMmapLimitBytes = uint64_t{1}
                                                              << 30;  // 1 GiB
+  static constexpr uint64_t kEagerResidentFileBytes = uint64_t{64}
+                                                      << 20;  // 64 MiB
   static constexpr uint32_t kFormatVersion = 3;
   static constexpr uint32_t kDirGroupSize = 128;
 
@@ -259,6 +261,13 @@ class TlcsFile {
   [[nodiscard]] std::string_view SerializedColumnStats() const noexcept {
     return serialized_column_stats_;
   }
+  [[nodiscard]] bool HasColumnSynopses() const noexcept {
+    return has_col_synopses_;
+  }
+  [[nodiscard]] const std::vector<ColumnSynopsis>& ColumnSynopses()
+      const noexcept {
+    return col_synopses_;
+  }
   [[nodiscard]] uint32_t FormatVersion() const noexcept {
     return format_version_;
   }
@@ -268,10 +277,11 @@ class TlcsFile {
       const std::vector<IntegerPeekCompare>& peek_compares) const noexcept;
   [[nodiscard]] const LSTableColumnDictionary& Dictionary(
       slot_t col) const noexcept {
-    return dicts_[col];
+    static const LSTableColumnDictionary empty;
+    return col < dicts_.size() ? dicts_[col] : empty;
   }
   [[nodiscard]] TlcsDictKind DictionaryKind(slot_t col) const noexcept {
-    return dict_kinds_[col];
+    return col < dict_kinds_.size() ? dict_kinds_[col] : TlcsDictKind::kNone;
   }
   struct IntFrequencies {
     std::optional<int64_t> first_value;
@@ -371,8 +381,9 @@ class TlcsFile {
 
   // Bounded-cache lookup helpers for stub RowPage point reads, stub full scans,
   // and lazy page hydration on UPDATE/DELETE.
-  // Point-read a single row without unpacking the whole 32K-row block. Only
-  // the bytes for the requested row are fetched from each column segment.
+  // Point-read a single row without unpacking the whole block. Only the bytes
+  // for the requested row are fetched from each column segment; block row
+  // counts are variable up to the format limit.
   [[nodiscard]] Status DecodeSingleRowByBlockIndex(uint32_t block_idx,
                                                    uint32_t row_idx,
                                                    const Schema& schema,
@@ -419,10 +430,20 @@ class TlcsFile {
       bool* capacity_rejected = nullptr) const;
 
   [[nodiscard]] std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
-  BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
-                          const std::vector<slot_t>& columns,
-                          uint64_t effective_max_bytes,
-                          std::vector<slot_t>* rejected_cols = nullptr) const;
+  BuildColumnCacheEntries(
+      const Schema& schema, uint64_t generation,
+      const std::vector<slot_t>& columns, uint64_t effective_max_bytes,
+      std::vector<slot_t>* rejected_cols = nullptr,
+      const std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>*
+          existing_lazy = nullptr) const;
+
+  [[nodiscard]] std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
+  BuildLazyColumnCacheEntries(const Schema& schema, uint64_t generation,
+                              const std::vector<slot_t>& columns) const;
+
+  [[nodiscard]] bool DecodeSingleColumnBlockForCache(
+      uint32_t block_idx, slot_t col, const LSTableColumnCacheEntry& entry,
+      std::unique_ptr<LSTableLazyDecodedBlock>* out) const;
 
  private:
   struct ColumnDecodePlan {
@@ -482,6 +503,9 @@ class TlcsFile {
   // GetOrLoadCachedFullBlock so the column decode is also done at most once.
   [[nodiscard]] StatusOr<std::shared_ptr<const std::vector<std::string>>>
   GetOrLoadCachedEncodedRows(uint32_t block_idx, const Schema& schema) const;
+
+  [[nodiscard]] std::shared_ptr<const platform::MemoryMap> EnsureResidentMmap()
+      const;
 
   [[nodiscard]] std::shared_ptr<LSTableStore> BuildResidentStoreInternal(
       const Schema& schema, const std::vector<slot_t>* projection,

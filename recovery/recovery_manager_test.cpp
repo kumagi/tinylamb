@@ -16,6 +16,7 @@
 
 #include "recovery/recovery_manager.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -76,17 +77,22 @@ TEST(LogRecordTest, FailedDeserializeLeavesFullyInvalidRecord) {
   LogRecord decoded;
   ASSERT_GT(decoded.Deserialize(valid.data(), valid.size()), 0U);
   ASSERT_NE(decoded, LogRecord{});
+  // A failed decode leaves all fields cleared, but record_lsn is deliberately
+  // 0 rather than kUnknownRecordLsn so the record can never be mistaken for a
+  // live in-memory record waiting for its LSN assignment.
+  LogRecord expected_failed;
+  expected_failed.record_lsn = 0;
 
   // Fails after the field reset (total exceeds the available bytes).
   const std::string truncated = valid.substr(0, valid.size() - 4);
   EXPECT_EQ(decoded.Deserialize(truncated.data(), truncated.size()), 0U);
-  EXPECT_EQ(decoded, LogRecord{});
+  EXPECT_EQ(decoded, expected_failed);
 
   // Fails before the field reset (bad magic) -- must also clear stale state.
   std::string bad_magic = valid;
   bad_magic[0] = static_cast<char>(bad_magic[0] ^ 0xFF);
   EXPECT_EQ(decoded.Deserialize(bad_magic.data(), bad_magic.size()), 0U);
-  EXPECT_EQ(decoded, LogRecord{});
+  EXPECT_EQ(decoded, expected_failed);
 }
 
 class RecoveryManagerTest : public ::testing::Test {
@@ -147,6 +153,7 @@ class RecoveryManagerTest : public ::testing::Test {
     // a test's own remove() cannot leave debris behind.
     RemoveLogAndSegments(prefix_ + "-size-limit.log");
     RemoveLogAndSegments(prefix_ + "-inflated-length.log");
+    RemoveLogAndSegments(prefix_ + "-fixed-inflated-length.log");
     RemoveLogAndSegments(prefix_ + "-small-ring.log");
   }
 
@@ -204,7 +211,18 @@ TEST_F(RecoveryManagerTest, TornTailWithoutLoggerIsNotReportedRepaired) {
   RecoveryManager reader(path, nullptr, size_t{64} << 20);
   EXPECT_EQ(reader.RecoverFrom(0, nullptr), Status::kCorrupt);
   EXPECT_EQ(std::filesystem::file_size(path), valid.size() + tail.size() / 2);
-  std::filesystem::remove(path);
+  EXPECT_TRUE(std::filesystem::remove(path));
+}
+
+TEST_F(RecoveryManagerTest, ZeroSegmentSizeIsRejectedAtEntryPoints) {
+  const std::string path = prefix_ + ".log";
+  EXPECT_EQ(Logger::Create(path, 4096, 1, /*segment_size=*/0).GetStatus(),
+            StatusCode::kInvalidArgument);
+  RecoveryManager reader(path, nullptr, /*segment_size=*/0);
+  EXPECT_EQ(reader.LogEndStatus().GetStatus(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(reader.RecoverFrom(0, nullptr), StatusCode::kInvalidArgument);
+  LogRecord record;
+  EXPECT_FALSE(reader.ReadLog(0, &record));
 }
 
 TEST_F(RecoveryManagerTest, ReadsRecordLargerThanLoggerRing) {
@@ -214,7 +232,7 @@ TEST_F(RecoveryManagerTest, ReadsRecordLargerThanLoggerRing) {
   RecoveryManager reader(path, pm_->GetPool(), logger->SegmentSize());
   reader.SetLogger(logger.get());
   const auto original = LogRecord::LsmPutLogRecord(
-      0, 10, 3, "key", std::string(128 * 1024, 'x'), "", false);
+      0, 10, 3, "key", std::string(static_cast<size_type>(128 * 1024), 'x'), "", false);
   const auto position = logger->AddLog(original.Serialize());
   ASSERT_TRUE(position.HasValue());
   LogRecord decoded;
@@ -237,7 +255,7 @@ TEST_F(RecoveryManagerTest, RejectsCorruptFooterOnCurrentSegment) {
   ASSERT_NE(logger, nullptr);
   ASSERT_TRUE(logger->FixedSizeSegments());
 
-  const std::string payload(128 * 1024, 'x');
+  const std::string payload(static_cast<size_type>(128 * 1024), 'x');
   const auto record =
       LogRecord::LsmPutLogRecord(0, 10, 3, "key", payload, "", false);
   const auto pos = logger->AddLog(record.Serialize());
@@ -323,7 +341,7 @@ TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
 
   // Inflate damaged's total_len past the end of the file so ReadLogDetailed
   // reports kShort at its offset even though `committed` follows it.
-  const uint32_t inflated = static_cast<uint32_t>(
+  const auto inflated = static_cast<uint32_t>(
       first.size() + damaged.size() + committed.size() + 4096);
   ASSERT_GE(inflated, 30U);
   ASSERT_LE(inflated, Logger::kMaxRecordSize);
@@ -346,6 +364,37 @@ TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
     EXPECT_EQ(forced.RecoverFrom(0, nullptr), Status::kCorrupt);
   }
   std::filesystem::remove(path);
+}
+
+TEST_F(RecoveryManagerTest, FixedSegmentRejectsDamageInsidePublishedEnd) {
+  const std::string path = prefix_ + "-fixed-inflated-length.log";
+  constexpr size_t kSegment = 4096;
+  const std::string first = LogRecord::BeginLogRecord(0, 1).Serialize();
+  const std::string damaged =
+      LogRecord::BeginLogRecord(first.size(), 2).Serialize();
+  const std::string committed =
+      LogRecord::CommitLogRecord(first.size() + damaged.size(), 2).Serialize();
+  const size_t published_end = first.size() + damaged.size() + committed.size();
+  {
+    ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                          Logger::Create(path, 4096, 1, kSegment, true));
+    ASSERT_TRUE(fixed->FixedSizeSegments());
+    ASSERT_SUCCESS(fixed->AddLog(first + damaged + committed).GetStatus());
+    ASSERT_SUCCESS(fixed->Finish());
+  }
+  {
+    std::fstream segment(path, std::ios::binary | std::ios::in | std::ios::out);
+    const auto inflated = static_cast<uint32_t>(published_end + 1);
+    segment.seekp(static_cast<std::streamoff>(first.size() + 4));
+    segment.write(reinterpret_cast<const char*>(&inflated), sizeof(inflated));
+    ASSERT_TRUE(segment.good());
+  }
+  RecoveryManager reader(path, nullptr, kSegment);
+  reader.SetTornTailTruncationAllowedForInstance(false);
+  ASSERT_EQ(reader.LogEndStatus().Value(), published_end);
+  EXPECT_EQ(reader.RecoverFrom(0, nullptr), Status::kCorrupt);
+  EXPECT_EQ(reader.LogEndStatus().Value(), published_end);
+  ASSERT_FALSE(reader.RecoveryTornTailTruncated());
 }
 
 TEST_F(RecoveryManagerTest, ReplaysCommittedAndIgnoresUncommittedLosers) {

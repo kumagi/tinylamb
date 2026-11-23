@@ -1,5 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "plan/cascades_test.hpp"
+#include "plan/sort_plan.hpp"
+#include "plan/values_plan.hpp"
 
 namespace tinylamb::cascades {
 
@@ -107,13 +109,28 @@ TEST(CascadesTest, JoinCommutativityPreservesInheritedPredicate) {
     }
     found_commuted = true;
     ASSERT_TRUE(expression.predicate.has_value());
-    // The plain assert teaches the optional-access checker what ASSERT_TRUE
-    // already guarantees.
-    assert(expression.predicate.has_value());
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     EXPECT_EQ(expression.predicate.value()->ToString(), predicate->ToString());
   }
   EXPECT_TRUE(found_commuted);
+}
+
+TEST(CascadesTest, SubsetRebuildOnlyRefreshesItsOwnScanFilters) {
+  const auto predicate = [](const char* relation) {
+    return BinaryExpressionExp(ColumnValueExp(ColumnName(relation, "id")),
+                               BinaryOperation::kEquals, ConstantValueExp(Value(1)));
+  };
+  Memo memo;
+  (void)memo.Build({"a","b"}, {{.conjunct=predicate("a"), .relations={"a"}},
+                                {.conjunct=predicate("b"), .relations={"b"}}});
+  const auto a = memo.EnsureGroup({"a"});
+  const auto b = memo.EnsureGroup({"b"});
+  ASSERT_TRUE(memo.Get(a).filter);
+  const auto original_b = memo.Get(b).filter;
+  ASSERT_TRUE(original_b);
+  ASSERT_TRUE(memo.TryBuild({"a"}).HasValue());
+  EXPECT_FALSE(memo.Get(a).filter);
+  EXPECT_EQ(memo.Get(b).filter, original_b);
 }
 
 TEST(CascadesTest, NonCanonicalJoinPredicateDoesNotReassociate) {
@@ -471,6 +488,71 @@ TEST(CascadesTest, PhysicalPropertiesKeyIncludesDistinctAndNullPlacement) {
   EXPECT_NE(base.Key(), distinct.Key());
   EXPECT_NE(base.Key(), explicit_last.Key());
   EXPECT_NE(base.Key(), missing.Key());
+}
+
+TEST(CascadesTest, PhysicalPropertiesKeysKeepColumnComponentsDistinct) {
+  const ColumnName catalog_with_period("catalog.schema", "column");
+  const ColumnName name_with_period("catalog", "schema.column");
+  const ColumnName unqualified("", "catalog.schema.column");
+  for (auto member : {&PhysicalProperties::ordering,
+                      &PhysicalProperties::partition_by,
+                      &PhysicalProperties::bloom_filter_keys}) {
+    PhysicalProperties first;
+    PhysicalProperties second;
+    PhysicalProperties third;
+    first.*member = {catalog_with_period};
+    second.*member = {name_with_period};
+    third.*member = {unqualified};
+    EXPECT_NE(first.Key(), second.Key());
+    EXPECT_NE(first.Key(), third.Key());
+    EXPECT_NE(second.Key(), third.Key());
+  }
+}
+
+TEST(CascadesTest, OrderingPenaltyUsesSelectiveJoinOutput) {
+  Memo memo;
+  const GroupId root = memo.Build({"a", "b"});
+  RuleSet rules;
+  SearchEngine search(std::move(memo), rules);
+  const ColumnName key("a", "k");
+  PhysicalProperties required;
+  required.ordering = {key};
+  auto source = std::make_shared<ValuesPlan>(
+      Schema("a", {Column("k", ValueType::kInt64)}), std::vector<Row>{});
+  auto sorted = std::make_shared<SortPlan>(
+      source, std::vector<SortKey>{{.expression = ColumnValueExp(key)}});
+  const auto best = search.Optimize(root, required,
+      [&](GroupId group, const Memo&, const LogicalExpression&, const std::vector<BestPlan>&,
+          const PhysicalProperties&, const RuleContext&) {
+        if (group != root) {
+          return std::vector<PlanAlternative>{{.plan = source, .estimated_rows = 1000000}};
+        }
+        return std::vector<PlanAlternative>{{.plan = source, .local_cost = 1,
+                                             .estimated_rows = 10},
+                                            {.plan = sorted, .local_cost = 1000,
+                                             .estimated_rows = 10}};
+      }, RuleContext{});
+  ASSERT_TRUE(best.has_value());
+  EXPECT_EQ(best->plan, source);
+}
+
+TEST(CascadesTest, ProvidedSortPropertiesRequireMatchingNullPlacement) {
+  const ColumnName column("t", "k");
+  auto source = std::make_shared<ValuesPlan>(
+      Schema("t", {Column("k", ValueType::kInt64)}), std::vector<Row>{});
+  PlanAlternative alternative{
+      .plan = std::make_shared<SortPlan>(
+          source, std::vector<SortKey>{{.expression = ColumnValueExp(column),
+                                       .ascending = true,
+                                       .nulls_first = false}})};
+  PhysicalProperties required;
+  required.ordering = {column};
+  required.sort_nulls_first = {true};
+  AttachPlanExplainInfo(alternative, required, RuleContext{});
+  EXPECT_TRUE(alternative.provided_properties.ordering.empty());
+  required.sort_nulls_first = {false};
+  AttachPlanExplainInfo(alternative, required, RuleContext{});
+  EXPECT_EQ(alternative.provided_properties.ordering, required.ordering);
 }
 
 TEST(CascadesTest, ExploreRequeuesGroupTouchedAfterItWasPopped) {

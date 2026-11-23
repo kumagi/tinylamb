@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <unordered_set>
 #include <vector>
 
@@ -31,6 +32,13 @@ namespace tinylamb {
 
 class Schema {
  public:
+  // The row image stores the column count in a 16-bit slot whose top bit is
+  // the null-bitmap flag (type/row.cpp), so a serialized row holds at most
+  // 32767 columns. Admitting more here would let CreateTable succeed and
+  // then CHECK-abort on the first Row::Serialize.
+  static constexpr slot_t kMaxColumns =
+      static_cast<slot_t>((slot_t{1} << 15) - 1);
+
   // Value type: every instance owns its name and column data (copies are deep
   // copies). Copying from a reference whose pointee was destroyed therefore
   // faults right here in the copy constructor -- if this line crashes, the
@@ -45,8 +53,10 @@ class Schema {
   Schema(std::string_view schema_name, std::vector<Column> columns,
          uint16_t key_column_index = 0, uint64_t schema_version = 0);
   [[nodiscard]] slot_t ColumnCount() const {
-    return static_cast<slot_t>(std::min<size_t>(
-        columns_.size(), std::numeric_limits<slot_t>::max()));
+    return static_cast<slot_t>(std::min<size_t>(columns_.size(), kMaxColumns));
+  }
+  [[nodiscard]] bool HasSupportedColumnCount() const noexcept {
+    return columns_.size() <= kMaxColumns;
   }
   [[nodiscard]] std::string_view Name() const { return name_; }
   void SetName(std::string name) { name_ = std::move(name); }
@@ -64,6 +74,7 @@ class Schema {
     }
     columns_[idx].SetHint(h);
   }
+  // An empty schema has no key; index zero is its default sentinel.
   [[nodiscard]] uint16_t KeyColumnIndex() const { return key_column_index_; }
   [[nodiscard]] uint64_t SchemaVersion() const { return schema_version_; }
   void SetSchemaVersion(uint64_t v) { schema_version_ = v; }

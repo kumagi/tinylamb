@@ -3,13 +3,43 @@
 #define TINYLAMB_EXECUTOR_ZONE_MAP_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "expression/expression.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+struct LSTablePageBlock;
+class Schema;
+
+// Lean proof: lean/TinylambOpt/BlockKleene.lean
+//   (aeval_contains_ceval, block_kleene_sound, block_all_pass_sound)
+// 4-valued abstract domain {T, F, U, E} for compound block-level pruning.
+using KleeneMask = uint8_t;
+inline constexpr KleeneMask kKleeneNone = 0;
+inline constexpr KleeneMask kKleeneT = 1U << 0U;
+inline constexpr KleeneMask kKleeneF = 1U << 1U;
+inline constexpr KleeneMask kKleeneU = 1U << 2U;
+inline constexpr KleeneMask kKleeneE = 1U << 3U;
+inline constexpr KleeneMask kKleeneTF = kKleeneT | kKleeneF;
+inline constexpr KleeneMask kKleeneAll =
+    kKleeneT | kKleeneF | kKleeneU | kKleeneE;
+
+[[nodiscard]] KleeneMask EvaluateBlockKleene(const Expression& expr,
+                                             const Schema& schema,
+                                             const LSTablePageBlock& blk);
+
+[[nodiscard]] inline bool BlockKleeneCanSkip(KleeneMask mask) noexcept {
+  return (mask & (kKleeneT | kKleeneE)) == 0;
+}
+
+[[nodiscard]] inline bool BlockKleeneAllPass(KleeneMask mask) noexcept {
+  return mask == kKleeneT;
+}
 
 class ZoneMap {
  public:

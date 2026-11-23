@@ -23,7 +23,8 @@ enum class UtcTimestampTruncUnit : uint8_t { kSecond, kMinute, kHour, kDay };
 std::optional<UtcTimestampTruncUnit> CompileUtcTimestampTrunc(
     const FunctionCallExpression& call);
 
-// Recognizes canonical civil text with an optional +00 suffix. The packed
+// Recognizes canonical space-separated civil text (YYYY-MM-DD HH:MM:SS) with
+// an optional +00 suffix. The packed
 // YYYYMMDDhhmmss key preserves equality and ordering of the canonical UTC
 // output strings for years 0001..9999. A rejected input requires ordinary
 // evaluation; rejection itself is not a SQL error.

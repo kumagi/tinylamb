@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -60,15 +61,19 @@ enum class Collation : uint8_t {
 // serialization: "" (empty) means "engine default", which is binary order.
 [[nodiscard]] std::string_view CollationName(Collation collation);
 
-// Inverse of CollationName: "" is "no collator" (the engine default),
-// otherwise the name names a collator. Only the property name uses this —
-// COLLATE() itself resolves its spec through CollationOfSpec.
+// Inverse of CollationName, for PhysicalProperties::collation wire names
+// only: "" is "no collator" (the engine default) and every other name is
+// resolved to a collator. Unknown/legacy property names (e.g. "en_US") are
+// deliberately mapped to case-insensitive here — see
+// CollationTest.NamesRoundTripAndSpecResolution. This is NOT the COLLATE()
+// spec parser; use CollationOfSpec when an unsupported spec must be rejected.
 [[nodiscard]] Collation CollationFromName(std::string_view spec);
 
-// The collator COLLATE(value, 'spec') attaches. GoogleSQL only permits
-// 'binary' and 'und:ci'; every other spec (including the empty string and
-// typos such as 'und-cl') is unsupported and must be rejected with an error
-// rather than silently folded to case-insensitive.
+// The strict COLLATE(value, 'spec') parser. GoogleSQL only permits 'binary'
+// and 'und:ci'; every other spec (including typos such as 'und-cl') returns
+// nullopt so callers can reject it with an error instead of silently folding
+// it to case-insensitive. CollationFromName has a deliberately different,
+// lenient policy for stored physical-property names.
 [[nodiscard]] std::optional<Collation> CollationOfSpec(std::string_view spec);
 
 // The collation that governs a comparison of two operands. GoogleSQL resolves
@@ -180,6 +185,9 @@ class SortKeyOrder {
         nulls_first_(nulls_first.value_or(ascending)),
         collation_(collation) {}
 
+  // Observe every input before heap admission or spill partitioning. NULL and
+  // non-text keys carry no string ordering requirement.
+  [[nodiscard]] Status Observe(const Value& value);
   // Total order over this key's operands: < 0 when `left` sorts before
   // `right`, 0 when they are peers under both the collation and the type's
   // ordering, > 0 otherwise.
@@ -195,7 +203,16 @@ class SortKeyOrder {
   bool ascending_{true};
   bool nulls_first_{true};
   Collation collation_{Collation::kNone};
+  Collation observed_{Collation::kNone};
 };
+
+inline Status ObserveSortKeys(std::span<SortKeyOrder> orders,
+                              std::span<const Value> values) {
+  for (size_t i = 0; i < orders.size(); ++i) {
+    RETURN_IF_FAIL(orders[i].Observe(values[i]));
+  }
+  return Status::kSuccess;
+}
 
 // Builds the contract for any sort key struct that exposes the three fields
 // the engine shares (SortExecutor::Key, TopNExecutor::Key, SortKey,

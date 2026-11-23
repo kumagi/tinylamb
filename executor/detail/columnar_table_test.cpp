@@ -29,6 +29,19 @@ using relational_detail::ColumnarColumn;
 using relational_detail::ColumnarTable;
 using relational_detail::CompiledColumnarProjection;
 
+TEST(ColumnarTableTest, MixedFallbackRetainsLogicalAndPerCellTypes) {
+  ColumnarColumn column;
+  column.InitFallback(ValueType::kInt64, 3);
+  EXPECT_EQ(column.type, ValueType::kInt64);
+  EXPECT_FALSE(column.is_uniform);
+  column.AppendValue(Value(7), nullptr, 0);
+  column.AppendValue(Value(), nullptr, 1);
+  column.AppendValue(Value("text"), nullptr, 2);
+  EXPECT_EQ(column.ValueAt(0), Value(7));
+  EXPECT_TRUE(column.ValueAt(1).IsNull());
+  EXPECT_EQ(column.ValueAt(2), Value("text"));
+}
+
 TEST(ColumnarTableTest, DictionaryNullsStayNullThroughScalarAccessors) {
   const std::array<uint8_t, 2> codes{0, LSTableColumnDictionary::kNullCode};
   LSTableColumnDictionary dictionary;

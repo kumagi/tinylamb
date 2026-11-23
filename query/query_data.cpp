@@ -201,6 +201,9 @@ Expression BindColumnQualifiedFieldReads(
   std::vector<Expression> children = ExpressionChildren(expr);
   bool changed = false;
   for (Expression& child : children) {
+    if (!child) {
+      continue;
+    }
     Expression mapped = BindColumnQualifiedFieldReads(
         child, col_table_map, ambiguous_column_name, col_types, relations,
         relation_column_counts);
@@ -367,6 +370,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       // denotes that relation's whole row as a struct ("SELECT s FROM t s").
       if (FindRelation(relations, col_name.name) != relations.end()) {
         std::vector<Expression> args;
+        args.reserve(all_cols.size() * 2);
         for (const ColumnName& column : all_cols) {
           if (!CaseInsensitiveEquals(column.schema, col_name.name)) {
             continue;
@@ -461,6 +465,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       }
       agg->SetInnerOrderBy(std::move(order));
       std::vector<Expression> group_by;
+      group_by.reserve(src.InnerGroupBy().size());
       for (const Expression& key : src.InnerGroupBy()) {
         ASSIGN_OR_RETURN(Expression, resolved, resolve(key));
         group_by.push_back(std::move(resolved));
@@ -506,6 +511,7 @@ Status ResolveSelect(
         // represented by ColumnName(schema, "*").
         if (!col_name.schema.empty()) {
           std::vector<ColumnName> matched;
+          matched.reserve(all_cols.size());
           for (const ColumnName& column : all_cols) {
             if (CaseInsensitiveEquals(column.schema, col_name.schema)) {
               matched.push_back(column);
@@ -561,11 +567,10 @@ Status ResolveSelect(
           continue;
         }
         for (const auto& cols : all_cols) {
-          if (ambiguous_column_name.contains(ToLowerCopy(cols.name))) {
-            it = select.insert(it, NamedExpression(cols));
-          } else {
-            it = select.insert(it, NamedExpression(cols.name, cols));
-          }
+          // SELECT * preserves duplicate output names by design. Ambiguity is
+          // an error for a bare reference, not a reason to drop the output
+          // name from an explicitly expanded star column.
+          it = select.insert(it, NamedExpression(cols.name, cols));
           ++it;
         }
         continue;

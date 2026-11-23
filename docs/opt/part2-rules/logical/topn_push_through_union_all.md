@@ -26,7 +26,8 @@ graph TD
 1. 親が `LogicalOperator::kTopN`、子数 1、`!expression.with_ties`（タイ行が `limit + offset` を超えて残る可能性がある `WITH TIES` は対象外）。
 2. `limit_count + limit_offset` が `size_t` オーバーフローせず `> 0` であり、`!target_list.empty()` かつ `target_list.size() == sort_ascending.size()`。
 3. 入力グループ `input_id` に `children.size() >= 2` の `LogicalOperator::kUnionAll` 式があること。
-4. いずれの枝にも同じソートキー・方向・NULL 配置かつ `limit_offset == 0 && limit_count <= limit_count + limit_offset` な `kTopN` がまだ載っていないこと（冪等・停止条件）。
+4. いずれの枝にも同じソートキー・方向・NULL 配置かつ `branch.limit_offset == 0 && branch.limit_count <= parent.limit_count + parent.limit_offset` な `kTopN` がまだ載っていないこと（冪等・停止条件）。
+5. 親の `prior_limit_offset == 0` であること（先行する LIMIT/OFFSET の累積がある形は対象外）。
 
 ## 意味論的根拠（D5 / D6）
 

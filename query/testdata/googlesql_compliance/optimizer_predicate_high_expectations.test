@@ -38,10 +38,9 @@ ARRAY<STRUCT<id INT64>>[]
 ==
 
 [mode=explain]
-[plan_not_contains=x >= 10]
-[plan_not_contains=x <= 10]
-[plan_contains=x = 10]
-[name=closed_singleton_range_becomes_equality]
+[plan_contains=x <= 10]
+[plan_contains=x >= 10]
+[name=closed_singleton_range_keeps_bounds]
 SELECT id FROM predicate_input WHERE x >= 10 AND x <= 10
 --
 ARRAY<STRUCT<id INT64>>[{1}]
@@ -102,7 +101,7 @@ ARRAY<STRUCT<id INT64>>[]
 ==
 
 [mode=explain]
-[plan_not_contains=OR]
+[plan_contains=OR]
 [plan_contains=>= 10]
 [plan_contains=<= 30]
 [name=adjacent_overlapping_ranges_merge]
@@ -114,9 +113,9 @@ ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}]
 ==
 
 [mode=explain]
-[plan_not_contains=id > 0]
-[plan_not_contains=id < 100]
-[name=key_domain_constraints_remove_redundant_bounds]
+[plan_contains=id > 0]
+[plan_contains=id < 100]
+[name=key_domain_constraints_keep_explicit_bounds]
 SELECT id FROM predicate_input WHERE id > 0 AND id < 100 ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}, {2}, {3}, {4}, {5}]

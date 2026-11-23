@@ -44,11 +44,20 @@ TEST(SqlPlanCacheFuzzer, ReplayCommittedRegressionFiles) {
     GTEST_SKIP() << "skipped";
   }
   std::vector<std::string> paths;
-  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-    if (entry.path().extension() == ".test") {
-      paths.push_back(entry.path().string());
+  std::error_code ec;
+  std::filesystem::directory_iterator entry(dir, ec);
+  ASSERT_FALSE(ec) << "cannot enumerate regression directory " << dir << ": "
+                   << ec.message();
+  const std::filesystem::directory_iterator end;
+  for (; entry != end; entry.increment(ec)) {
+    ASSERT_FALSE(ec) << "cannot continue enumerating regression directory "
+                     << dir << ": " << ec.message();
+    if (entry->path().extension() == ".test") {
+      paths.push_back(entry->path().string());
     }
   }
+  ASSERT_FALSE(ec) << "cannot finish enumerating regression directory " << dir
+                   << ": " << ec.message();
   std::sort(paths.begin(), paths.end());
   EXPECT_FALSE(paths.empty()) << "no .test files in " << dir;
   for (const std::string& path : paths) {

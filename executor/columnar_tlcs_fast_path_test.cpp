@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "common/memory_budget.hpp"
+#include "common/test_util.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -316,13 +318,10 @@ TEST(ColumnarTlcsFastPathTest, SumDoubleOverflowRaisesButInfInputPropagates) {
   // The columnar TLCS aggregate fast path is driven by the legacy
   // relational executor; pipeline lowering bypasses
   // TryRunColumnarTlcsAggregate.
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard is
-  // non-copyable by design
-  struct
-      ScopedLegacyEngine {  // NOLINT(cppcoreguidelines-special-member-functions)
-    ScopedLegacyEngine() { setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1); }
-    ~ScopedLegacyEngine() { unsetenv("TINYLAMB_EXEC_ENGINE"); }
-  } legacy_guard;
+  // ScopedEnvVar restores a pre-existing TINYLAMB_EXEC_ENGINE instead of
+  // unconditionally unsetting it, so running under `=legacy` stays legacy
+  // for later tests in the same process.
+  const ScopedEnvVar legacy_guard("TINYLAMB_EXEC_ENGINE", "legacy");
   BudgetResetGuard budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
   budget.ResetForTest(size_t{256} << 20, size_t{64} << 20, size_t{64} << 20,
@@ -388,13 +387,7 @@ TEST(ColumnarTlcsFastPathTest, L1SelfDisableHitAtThresholdKeepsResultsExact) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "execute_query unavailable";
   }
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
-  // non-copyable by design
-  struct
-      ScopedLegacyEngine {  // NOLINT(cppcoreguidelines-special-member-functions)
-    ScopedLegacyEngine() { setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1); }
-    ~ScopedLegacyEngine() { unsetenv("TINYLAMB_EXEC_ENGINE"); }
-  } legacy_guard;
+  const ScopedEnvVar legacy_guard("TINYLAMB_EXEC_ENGINE", "legacy");
   BudgetResetGuard budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
   budget.ResetForTest(size_t{256} << 20, size_t{64} << 20, size_t{64} << 20,
@@ -589,7 +582,7 @@ TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
   BudgetResetGuard budget_guard;
   const auto& budget = QueryMemoryBudget::Global();
   const size_t baseline = budget.Used();
-  ProcessMemoryBudget::Global().ResetForTest(24 * 1024);
+  ProcessMemoryBudget::Global().ResetForTest(static_cast<size_t>(24 * 1024));
   const std::vector<ColGroupKeySpec> keys{
       MakeKeySpec(ColKeyKind::kColInt64, 0, "a"),
       MakeKeySpec(ColKeyKind::kColInt64, 1, "b")};
@@ -675,7 +668,7 @@ TEST(ColumnarTlcsFastPathTest, DistinctAggregateMemoryFollowsMovedState) {
   }
   EXPECT_EQ(budget.Used(), baseline);
 
-  process.ResetForTest(4 * 1024 * 1024);
+  process.ResetForTest(static_cast<size_t>(4 * 1024 * 1024));
   {
     QueryMemoryCharge arena_charge;
     PagedStringArena arena(&arena_charge);
@@ -1260,17 +1253,7 @@ TEST(ColumnarTlcsFastPathTest, ClickBenchSixOptimizationsAndSemanticTraps) {
     return RunSql(&eng, &ctx, sql);
   };
   auto run_ref = [&](const std::string& sql) {
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
-    // non-copyable by design
-    struct
-        ScopedDisableTlcsAgg {  // NOLINT(cppcoreguidelines-special-member-functions)
-      ScopedDisableTlcsAgg() {
-        setenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1", 1);
-      }
-      ~ScopedDisableTlcsAgg() {
-        unsetenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG");
-      }
-    } guard;
+    const ScopedEnvVar guard("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1");
     TransactionContext ctx = db->BeginReadOnlyContext();
     SqlEngine eng(*db);
     eng.SetForceRelationalFallback(true);
@@ -1458,9 +1441,9 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
         okey = Value(int64_t{20000});
       } else {
         const int64_t base =
-            static_cast<int64_t>(
+            (static_cast<int64_t>(
                 blk) *   // NOLINT(readability-math-missing-parentheses)
-                10000 +  // NOLINT(readability-math-missing-parentheses)
+                10000) +  // NOLINT(readability-math-missing-parentheses)
             static_cast<int64_t>((off / 4) * 2);
         const int64_t jitter = (off % 2 == 0) ? 1 : 0;
         okey = Value(std::min<int64_t>(base + jitter,
@@ -1472,9 +1455,9 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
           (okey.IsNull() ? 90.0 : 50.0) + static_cast<double>((r * 7) % 45);
       const double price =
           100.0 +
-          static_cast<double>(
+          (static_cast<double>(
               r % 250) *  // NOLINT(readability-math-missing-parentheses)
-              1.25;       // NOLINT(readability-math-missing-parentheses)
+              1.25);       // NOLINT(readability-math-missing-parentheses)
       const double disc = static_cast<double>(r % 11) * 0.01;
       const double tax = static_cast<double>(r % 9) * 0.01;
       ASSERT_TRUE(
@@ -1496,15 +1479,7 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
     return RunSql(&eng, &ctx, sql);
   };
   auto run_ref = [&](const std::string& sql) {
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-    struct ScopedDisableTlcsAgg {
-      ScopedDisableTlcsAgg() {
-        setenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1", 1);
-      }
-      ~ScopedDisableTlcsAgg() {
-        unsetenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG");
-      }
-    } guard;
+    const ScopedEnvVar guard("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1");
     TransactionContext ctx = db->BeginReadOnlyContext();
     SqlEngine eng(*db);
     eng.SetForceRelationalFallback(true);
@@ -1707,15 +1682,7 @@ TEST(ColumnarTlcsFastPathTest,
     return RunSql(&eng, &ctx, sql);
   };
   auto run_ref = [&](const std::string& sql) {
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-    struct ScopedDisableTlcsAgg {
-      ScopedDisableTlcsAgg() {
-        setenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1", 1);
-      }
-      ~ScopedDisableTlcsAgg() {
-        unsetenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG");
-      }
-    } guard;
+    const ScopedEnvVar guard("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1");
     TransactionContext ctx = db->BeginReadOnlyContext();
     SqlEngine eng(*db);
     eng.SetForceRelationalFallback(true);

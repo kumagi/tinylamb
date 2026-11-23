@@ -28,6 +28,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -139,6 +140,15 @@ TransactionManager::~TransactionManager() {
   if (deadlock_detector_.joinable()) {
     deadlock_detector_.join();
   }
+  // WireDurabilityWaiter() stored a lambda that captures logger_ as a raw
+  // pointer inside PageManager. That lambda must not outlive this manager:
+  // an embedded/test owner may destroy the Logger before the PageManager,
+  // leaving the stored waiter dangling. Clear it here so any later
+  // checkpoint fails closed (WaitForDurableLSN) instead of dereferencing a
+  // freed Logger. Background workers that could call it are already joined.
+  if (page_manager_ != nullptr) {
+    page_manager_->SetDurableWaiter({});
+  }
   // Registered transactions may outlive this manager (a stack Transaction
   // held across a fixture reset, an aborted query unwound after database
   // teardown begins).  Null their manager pointers so the destructor of
@@ -211,7 +221,10 @@ void TransactionManager::AddWaitForEdge(txn_id_t waiter, txn_id_t holder,
     std::scoped_lock lk(wait_for_mu_);
     const auto [it, inserted] = wait_for_edges_.try_emplace(
         waiter, WaitForEdge{.row = row, .holder = holder});
-    it->second = WaitForEdge{.row = row, .holder = holder};
+    // A waiter may move to a different row/holder while already in the graph.
+    // Refresh the fields in place rather than constructing a second edge.
+    it->second.row = row;
+    it->second.holder = holder;
     if (inserted) {
       wait_for_edge_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -237,8 +250,10 @@ void TransactionManager::RemoveWaitForEdge(txn_id_t waiter) {
 void TransactionManager::RemoveWaitForEdgesOf(txn_id_t holder) {
   // Fast path: no waiter anywhere means no edge can mention |holder|.  This
   // runs on EVERY PreCommit/Abort, so the uncontended case must not pay the
-  // graph-mutex acquisition (the count only moves under the same mutex, so
-  // a relaxed zero proves the map empty).
+  // graph-mutex acquisition. The relaxed read is deliberate: a stale nonzero
+  // only costs one unnecessary lock acquisition, and a stale zero can at
+  // worst leave an advisory edge to an already-finished holder until the
+  // next detector pass (which re-checks the registry before wounding).
   if (wait_for_edge_count_.load(std::memory_order_relaxed) == 0) {
     return;
   }
@@ -433,7 +448,8 @@ Transaction TransactionManager::Begin(bool read_only) {
     // stale active_transactions_/active_snapshots_ entries still carrying this
     // id, silently pinning an ancient snapshot in GC forever. SeedNextId only
     // moves the counter forward, so recovery cannot rescue a live process past
-    // this point: fail closed instead of reusing ids.
+    // this point: fail stop (abort the process) rather than reuse ids —
+    // Begin() has no Status channel, so "closed" here means process death.
     fail_stop_.store(true, std::memory_order_release);
     LOG(FATAL) << "Transaction id space exhausted: refusing to wrap around";
   }
@@ -455,7 +471,8 @@ Transaction TransactionManager::Begin(bool read_only) {
     active_transactions_.emplace(new_txn_id, &new_txn);
     active_snapshots_.emplace(new_txn_id, new_txn.snapshot_ts_);
   }
-  assert(!new_txn.IsFinished());
+  // new_txn was just constructed above, so it cannot be finished; no runtime
+  // check (or NDEBUG-sensitive assert) is needed here.
   // If the return move-constructs instead of eliding into the caller,
   // Transaction's move operations repoint active_transactions_ at the new
   // address; the registration never outlives this local.
@@ -479,7 +496,8 @@ Status TransactionManager::PreCommit(Transaction& txn,
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
-  assert(!txn.IsFinished());
+  // txn.IsFinished() is already reported as kRuntimeError above; no second
+  // (NDEBUG-sensitive) assertion is needed on this path.
   // Drop every wait-for edge in which this transaction is the holder: the
   // pending intent is about to be released and any later waiter must not see
   // a stale holder reference. We do this before the WAL barrier so the
@@ -528,6 +546,10 @@ Status TransactionManager::PreCommit(Transaction& txn,
         txn.prev_lsn_ = commit_start;
         // Record this transaction's own COMMIT end, without including bytes
         // a concurrent producer may append before a BufferedLSN() lookup.
+        // AddLog writes the serialized payload verbatim at the returned LSN
+        // (after any segment pre-roll), and the payload already contains its
+        // framing/CRC, so start + payload size is the exact record end. Only
+        // a future logger that adds its own envelope would need this changed.
         commit_end = commit_start +
                      static_cast<lsn_t>(txn.serialization_scratch_.size());
         txn.prev_end_lsn_ = commit_end;
@@ -743,7 +765,15 @@ Status TransactionManager::Abort(Transaction& txn) {
     // hatch while holding a page latch this undo walk needs.
     txn.MarkAbortStarted();
     RemoveWaitForEdgesOf(txn.ID());
-    AbortVersions(txn);
+    try {
+      AbortVersions(txn);
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "AbortVersions threw in fail-stop for transaction "
+                 << txn.ID() << ": " << error.what();
+    } catch (...) {
+      LOG(ERROR) << "AbortVersions threw in fail-stop for transaction "
+                 << txn.ID();
+    }
     txn.SetStatus(TransactionStatus::kAborted);
     ForgetTransaction(txn);
     return StatusError(StatusCode::kIOError,
@@ -1113,6 +1143,7 @@ bool TransactionManager::AcquireWriteIntent(
           }
           txn.RecordIntentWaitFailure(
               Transaction::IntentWaitFailure::kHolderAborting);
+          txn.DebugSetPhase(nullptr);
           return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1145,6 +1176,7 @@ bool TransactionManager::AcquireWriteIntent(
       }
       if (txn.IsWounded()) {
         txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
+        txn.DebugSetPhase(nullptr);
         return false;
       }
       break;
@@ -1202,6 +1234,7 @@ bool TransactionManager::AcquireWriteIntent(
           }
           txn.RecordIntentWaitFailure(
               Transaction::IntentWaitFailure::kHolderAborting);
+          txn.DebugSetPhase(nullptr);
           return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1231,6 +1264,7 @@ bool TransactionManager::AcquireWriteIntent(
       }
       if (txn.IsWounded()) {
         txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
+        txn.DebugSetPhase(nullptr);
         return false;
       }
       break;
@@ -1277,6 +1311,7 @@ bool TransactionManager::AcquireWriteIntent(
           }
           txn.RecordIntentWaitFailure(
               Transaction::IntentWaitFailure::kHolderAborting);
+          txn.DebugSetPhase(nullptr);
           return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1310,6 +1345,7 @@ bool TransactionManager::AcquireWriteIntent(
       RemoveWaitForEdge(txn.ID());
       if (txn.IsWounded()) {
         txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
+        txn.DebugSetPhase(nullptr);
         return false;
       }
       break;
@@ -1365,10 +1401,11 @@ bool TransactionManager::AcquireWriteIntent(
 
 bool TransactionManager::HasForeignWriteIntent(const Transaction& txn,
                                                const RowPosition& rp) const {
-  if (page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
-          std::memory_order_acquire) == 0) {
-    return false;
-  }
+  // This is a correctness check before a unique-index conflict is accepted.
+  // Do not use page_chain_counts_ as a negative fast path here: a chain is
+  // inserted into the authoritative map immediately before its count is
+  // incremented, so a concurrent reader could observe the new pending intent
+  // in neither the map nor the count and incorrectly accept the conflict.
   const VersionShard& shard = version_shards_[VersionShardIndex(rp)];
   std::scoped_lock lock(shard.mutex);
   const auto found = shard.versions.find(rp);
@@ -1485,6 +1522,7 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
       RemoveWaitForEdge(txn.ID());
       txn.RecordIntentWaitFailure(
           Transaction::IntentWaitFailure::kHolderAborting);
+      txn.DebugSetPhase(nullptr);
       return Status::kConflicts;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1740,9 +1778,13 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
   }
   // A TransactionManager can run without a logger (e.g. WAL-less setups or
   // partially initialized instances), so metric reads must not dereference a
-  // null logger_. Report zero WAL stats in that case.
+  // null logger_. Report zero WAL stats in that case. This is intentionally
+  // different from WireDurabilityWaiter, which requires a logger: metrics are
+  // observational and must stay callable, while the durability path fails
+  // closed. Operators distinguish "no WAL configured" from "WAL stalled" by
+  // the manager's construction config, not by these zero gauges alone.
   const Logger::SyncStats sync =
-      logger_ == nullptr ? Logger::SyncStats{0, 0} : logger_->GetSyncStats();
+      logger_ == nullptr ? Logger::SyncStats{.count=0, .nanoseconds=0} : logger_->GetSyncStats();
   const lsn_t buffered_lsn = logger_ == nullptr ? 0 : logger_->BufferedLSN();
   const lsn_t durable_lsn = logger_ == nullptr ? 0 : logger_->DurableLSN();
   return {
@@ -1811,11 +1853,13 @@ StatusOr<std::optional<std::string>> TransactionManager::ReadVersion(
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
-  // Fused chain-free path: the zero shard counter proves no chain exists for
-  // this row (Transaction::ReadVersion normally routes these here only for
-  // direct callers; either way one atomic load replaces the shard lock).
-  if (physical && page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
-                      std::memory_order_acquire) == 0) {
+  // Read-only transactions may serve the pinned physical image when their
+  // page shard is chain-free. Read-write transactions always inspect the
+  // authoritative row chain so a concurrent worker cannot miss the owner's
+  // just-published pending version during the map/count update window.
+  if (txn.IsReadOnly() && physical &&
+      page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
+          std::memory_order_acquire) == 0) {
     return std::optional<std::string>();
   }
   struct SpilledReadRequest {
@@ -1995,6 +2039,8 @@ bool TransactionManager::HasPageVersionChains(page_id_t pid) const {
     return false;
   }
   const PageChainShard& shard = page_chain_shards_[chain_shard_index];
+  // The atomic read above is not a lock. This leaf shard mutex is taken alone
+  // (docs/lock_order.md 6a); no table/shard lock is nested here.
   std::scoped_lock lock(shard.mutex);
   return shard.counts.contains(pid);
 }
@@ -2020,6 +2066,9 @@ void TransactionManager::InvalidatePageVersions(page_id_t pid,
       shard.write_intent_released.notify_all();
     }
   }
+  // Each version shard's mutex is released at the end of its loop iteration;
+  // only the registry lock is held here. No nested acquisition, so no ABBA
+  // inversion with the table-lock -> chain_mu_ path (docs/lock_order.md 6/8).
   {
     std::scoped_lock registry_lock(transaction_table_lock);
     for (const auto& [id, txn] : active_transactions_) {
@@ -2067,6 +2116,9 @@ void TransactionManager::CommitRecycledPageAllocation(Transaction& txn,
       shard.write_intent_released.notify_all();
     }
   }
+  // Shard locks above are per-iteration and already released; taking the
+  // registry lock afterwards is sequential, not nested, so the two locks
+  // cannot form an acquisition cycle (docs/lock_order.md 6/8).
   std::scoped_lock registry_lock(transaction_table_lock);
   for (const auto& [id, active] : active_transactions_) {
     if (active != nullptr) {
@@ -2076,6 +2128,8 @@ void TransactionManager::CommitRecycledPageAllocation(Transaction& txn,
 }
 
 bool TransactionManager::IsActive(txn_id_t id) const {
+  // Registry-only query: this is the sole lock acquired here, so the nearby
+  // shard locks in other functions cannot form an ABBA pair with it.
   std::scoped_lock lk(transaction_table_lock);
   return active_transactions_.contains(id);
 }
@@ -2128,12 +2182,15 @@ void TransactionManager::RegisterVersionWrite(
     // Reaching this function without that reservation is an invariant breach.
     if (!chain.pending.has_value()) {
       LOG(ERROR) << "RegisterVersionWrite without reserved write intent";
-      assert(false);
+      // This function returns void, so fail closed instead of relying on an
+      // assert() that disappears in NDEBUG builds: continuing without the
+      // reservation would let a later publication skip AcquireWriteIntent.
+      fail_stop_.store(true, std::memory_order_release);
       return;
     }
     if (chain.pending->owner != txn.ID()) {
       LOG(ERROR) << "RegisterVersionWrite intent owner mismatch";
-      assert(false);
+      fail_stop_.store(true, std::memory_order_release);
       return;
     }
     AssignInlinePayload(&chain.pending->payload, std::move(after_copy));
@@ -2375,18 +2432,33 @@ TransactionManager::IndexReadGuard::IndexReadGuard(
 TransactionManager::IndexReadGuard&
 TransactionManager::IndexReadGuard::operator=(IndexReadGuard&& other) noexcept {
   if (this != &other) {
-    if (tracked_mutex_ != nullptr) {
-      if (uint32_t* count = FindTlsGateCount(tracked_mutex_);
+    std::shared_mutex* const old_mutex = tracked_mutex_;
+    // A borrowed `other` on the same mutex relies on THIS guard's owned
+    // shared_lock. Adopting it must keep the lock and stay the owner;
+    // otherwise the TLS count still says "held" while no shared_lock
+    // remains and later guards skip acquisition entirely.
+    const bool keep_own_lock = other.borrowed_ && lock_.owns_lock() &&
+                               other.tracked_mutex_ != nullptr &&
+                               other.tracked_mutex_ == old_mutex;
+    if (old_mutex != nullptr) {
+      if (uint32_t* count = FindTlsGateCount(old_mutex);
           count != nullptr && *count > 0) {
         --(*count);
       }
     }
-    if (lock_.owns_lock()) {
-      lock_.unlock();
+    if (keep_own_lock) {
+      borrowed_ = false;
+      other.borrowed_ = false;
+      tracked_mutex_ = old_mutex;
+      other.tracked_mutex_ = nullptr;
+    } else {
+      if (lock_.owns_lock()) {
+        lock_.unlock();
+      }
+      lock_ = std::move(other.lock_);
+      tracked_mutex_ = std::exchange(other.tracked_mutex_, nullptr);
+      borrowed_ = std::exchange(other.borrowed_, false);
     }
-    lock_ = std::move(other.lock_);
-    tracked_mutex_ = std::exchange(other.tracked_mutex_, nullptr);
-    borrowed_ = std::exchange(other.borrowed_, false);
   }
   return *this;
 }
@@ -2570,11 +2642,17 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
         }
       });
   if (iter_status != Status::kSuccess) {
-    // Undo the entries this commit already appended before failing. Dropping
-    // commit_ts via PublishCommit makes later snapshots use timestamps
-    // GREATER than commit_ts, so any committed version left behind with
-    // begin_ts == commit_ts would become visible even though the commit was
-    // never acknowledged (Begin still serves snapshots under fail-stop).
+    // Undo the entries this commit already appended before failing. Publishing
+    // commit_ts lets later snapshots use timestamps at or after commit_ts, so
+    // any committed version left behind with begin_ts == commit_ts would become
+    // visible even though the commit was never acknowledged (Begin still serves
+    // snapshots under fail-stop).
+    // commit_ts comes from AllocatePendingCommit's monotonic counter and is
+    // unique per transaction, so matching begin_ts == commit_ts can only
+    // select this transaction's own versions; the extra commit_lsn check is
+    // defensive and cannot erase another txn's committed version even if two
+    // commits were to share an LSN. Each shard is locked while sweeping, so
+    // no concurrent publication can interleave with the undo.
     for (VersionShard& shard : version_shards_) {
       std::vector<RowPosition> empty_chains;
       {
@@ -2592,10 +2670,19 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
             }
           }
           if (changed && !chain.committed.empty()) {
-            // Restore the predecessor's visibility (CommitVersions had
-            // closed it at commit_ts).
-            chain.committed.back().end_ts =
-                std::numeric_limits<uint64_t>::max();
+            // Restore the predecessor's visibility (CommitVersions closed it
+            // at commit_ts before appending our version). Do not assume it is
+            // still `back()`: the per-entry locks are released as each row is
+            // published, so a later transaction may have appended a newer
+            // version to this chain before the undo sweep acquired the shard.
+            // commit_ts is unique per transaction, so an end_ts equal to it
+            // identifies exactly the predecessor we closed.
+            auto predecessor = std::ranges::find_if(
+                chain.committed,
+                [commit_ts](const auto& v) { return v.end_ts == commit_ts; });
+            if (predecessor != chain.committed.end()) {
+              predecessor->end_ts = std::numeric_limits<uint64_t>::max();
+            }
           }
           if (changed && chain.committed.empty() && !chain.pending) {
             empty_chains.push_back(rp);
@@ -2607,12 +2694,15 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
         }
       }
     }
-    // Drop the timestamp reserved by AllocatePendingCommit. Otherwise it
-    // stays the smallest entry in unpublished_commits_ and permanently caps
-    // every later PublishCommit at commit_ts-1 via the min()-1 rule. The
-    // commit is not acknowledged and the engine is fail-stopped here, so
-    // recovery re-applies the WAL COMMIT record; no live reader may be served
-    // a snapshot pinned to this abandoned timestamp.
+    // Release the timestamp reserved by AllocatePendingCommit. Calling
+    // PublishCommit is intentional: erasing the entry from
+    // unpublished_commits_ without advancing the watermark would pin
+    // stable_timestamp_ at commit_ts-1 (fail-stop means no later commit
+    // arrives to advance it), holding active_snapshots_/GC forever. Advancing
+    // the published watermark to commit_ts is safe here because every version
+    // stamped commit_ts was erased above and no index key was published, so
+    // no snapshot at or after commit_ts can observe this unacknowledged
+    // commit. Recovery re-applies the durable WAL COMMIT record to rebuild it.
     PublishCommit(commit_ts);
     // CommitIndexMutations is deliberately not called on this path: the row
     // versions above were erased, so publishing index keys for them would
@@ -2678,7 +2768,9 @@ void TransactionManager::AbortVersions(Transaction& txn) {
     // those rows would wait on a dead owner (riding the escape hatch each
     // time). Abort must always free its intents, so sweep every shard and drop
     // any pending still owned by this txn. One leaf shard mutex at a time, the
-    // same lock footprint the GC sweep already uses.
+    // same lock footprint the GC sweep already uses. Exactly one shard mutex
+    // is held at a time and no other lock is nested inside it, so the sweep
+    // cannot deadlock against commit publication (docs/lock_order.md 6).
     for (VersionShard& shard : version_shards_) {
       std::scoped_lock lock(shard.mutex);
       bool released = false;
@@ -2912,6 +3004,8 @@ void TransactionManager::SpillColdVersionPayloadsLockedSweep() {
     uint32_t crc32{0};
   };
 
+  std::vector<SpillCandidate> batch;
+  batch.reserve(kMaxBatchItems);
   for (int pass = 0; pass < 2; ++pass) {
     if (version_payload_resident_bytes_.load(std::memory_order_relaxed) <=
         target_bytes) {
@@ -2928,8 +3022,7 @@ void TransactionManager::SpillColdVersionPayloadsLockedSweep() {
       }
       VersionShard& shard =
           version_shards_[(start_shard + i) % kVersionShardCount];
-      std::vector<SpillCandidate> batch;
-      batch.reserve(shard.versions.size());
+      batch.clear();
       size_t batch_bytes = 0;
       {
         std::scoped_lock lock(shard.mutex);
@@ -3018,8 +3111,13 @@ void TransactionManager::SpillColdVersionPayloadsLockedSweep() {
               io_status = seg_or.GetStatus();
               break;
             }
-            active_version_segment_ = std::make_shared<SpilledVersionSegment>(
-                version_spill_store_, seg_or.Value());
+            try {
+              active_version_segment_ = std::make_shared<SpilledVersionSegment>(
+                  version_spill_store_, seg_or.Value());
+            } catch (...) {
+              version_spill_store_->DropSegment(seg_or.Value());
+              throw;
+            }
             active_version_segment_bytes_ = 0;
           }
           const uint64_t offset = active_version_segment_bytes_;
@@ -3196,7 +3294,10 @@ void TransactionManager::ApplyTransactionAbortRecords(Transaction& txn) {
       page_manager_->ApplyTransactionAbortRecord(txn.ID(), record);
     }
     // LSN 0 is a valid first record. The transaction's explicit first LSN,
-    // not a zero predecessor, identifies the end of its chain.
+    // not a zero predecessor, identifies the end of its chain. A corrupt
+    // prev_lsn that points below first (including 0 when first != 0) is
+    // likewise treated as end-of-chain instead of being dereferenced, so a
+    // damaged WAL cannot escalate a safe abort into a fail-stop here.
     if (cur == first || record.prev_lsn >= cur || record.prev_lsn < first) {
       break;
     }
@@ -3303,15 +3404,19 @@ Status TransactionManager::ApplyTransactionCommitRecords(Transaction& txn,
   // including on a corrupt/short WAL scan or a failed apply: otherwise pending
   // destroyed pages never return to free_ids_ and the applied-op count never
   // reaches the compaction callback (the abort path above finishes even after
-  // a read failure).
+  // a read failure). Finish only reconciles state for records that were
+  // actually applied; WAL recycling is governed by the checkpoint's durable
+  // replay watermark, not by this call, and the caller fail-stops on error.
   page_manager_->FinishTransactionCommit(txn.ID(), state);
-  RETURN_IF_FAIL(scan_status);
-  RETURN_IF_FAIL(applied);
+  // Clear staged state on BOTH success and failure: an embedded/test owner
+  // that does not stop on a scan/apply error would otherwise leak the staged
+  // memory charge and leave wal_reread_mode_ set for the next operation.
+  const Status result = scan_status != Status::kSuccess ? scan_status : applied;
   txn.staged_records_.clear();
   txn.staged_charge_.ReleaseAll();
   txn.staged_bytes_ = 0;
   txn.wal_reread_mode_ = false;
-  return Status::kSuccess;
+  return result;
 }
 
 bool TransactionManager::FindPendingLsmWriteViaWal(const Transaction& txn,
@@ -3343,7 +3448,10 @@ bool TransactionManager::FindPendingLsmWriteViaWal(const Transaction& txn,
       return true;
     }
     // LSN 0 is a valid first record. The transaction's explicit first LSN,
-    // not a zero predecessor, identifies the end of its chain.
+    // not a zero predecessor, identifies the end of its chain. A corrupt
+    // prev_lsn that points below first (including 0 when first != 0) is
+    // likewise treated as end-of-chain instead of being dereferenced, so a
+    // damaged WAL cannot escalate a safe abort into a fail-stop here.
     if (cur == first || record.prev_lsn >= cur || record.prev_lsn < first) {
       break;
     }
@@ -3367,7 +3475,7 @@ void TransactionManager::ForEachPendingLsmWriteViaWal(
   if (!has_log) {
     return;
   }
-  (void)WalkWalRecordsForward(
+  const bool walked = WalkWalRecordsForward(
       txn.ID(), cur, end_lsn,
       [&](lsn_t /*rec_lsn*/, LogRecord& record) {
         if (record.pid == root && record.key == key &&
@@ -3377,10 +3485,22 @@ void TransactionManager::ForEachPendingLsmWriteViaWal(
         }
       },
       "WAL re-read pending LSM scan");
+  if (!walked) {
+    // The void callback API has no Status channel, and the abort path has no
+    // way to learn that pending LSM writes went un-undone: finishing the
+    // abort would leave ghost index entries serving wrong results. This is
+    // unrecoverable in-process, so fail stop like the other cannot-continue
+    // states in this file.
+    fail_stop_.store(true, std::memory_order_release);
+    LOG(FATAL) << "WAL re-read pending LSM scan failed for txn " << txn.ID()
+               << "; abort cannot safely undo pending writes";
+  }
 }
 
 void TransactionManager::MoveActiveTransaction(Transaction* from,
                                                Transaction* to) {
+  // Registry-only update: no shard/chain mutex is acquired here, so there is
+  // no second lock to form an acquisition cycle with (docs/lock_order.md 8).
   std::scoped_lock lk(transaction_table_lock);
   if (active_transactions_.empty()) {
     return;
@@ -3415,17 +3535,24 @@ int TransactionManager::ReservationBisectMode() {
   return static_cast<int>(parsed);
 }
 
-void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
-                                               size_t bytes) {
+Status TransactionManager::ReserveIndexUndoBytes(Transaction& txn,
+                                                 page_id_t pid, size_t bytes) {
   const int mode = ReservationBisectMode();
   if (mode == 1) {
-    return;
+    return Status::kSuccess;
   }
   // Record the claim on the transaction first: ForgetTransaction walks this
   // list to release exactly what this transaction reserved, and clearing it
-  // there makes a repeated finish a no-op.
+  // there makes a repeated finish a no-op. Growing the vector can throw; the
+  // Status return keeps allocation failure inside this boundary instead of
+  // unwinding through a caller that may hold a page latch.
   if (mode != 3) {
-    txn.index_undo_reservations_.emplace_back(pid, bytes);
+    try {
+      txn.index_undo_reservations_.emplace_back(pid, bytes);
+    } catch (const std::bad_alloc&) {
+      return StatusError(StatusCode::kMemoryLimitExceeded,
+                         "cannot record index undo reservation");
+    }
   }
   if (mode != 2) {
     IndexReservationShard& shard =
@@ -3438,6 +3565,7 @@ void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
     }
     owner->second += bytes;
   }
+  return Status::kSuccess;
 }
 
 size_t TransactionManager::IndexUndoReservedBytes(page_id_t pid,
@@ -3471,7 +3599,9 @@ Status TransactionManager::WaitForIndexReservationDrain(
       index_reservations_[IndexReservationShardIndex(pid)];
   const auto deadline = std::chrono::steady_clock::now() + limit;
   // |foreign| assumes shard.mutex is already held (the query method re-locks,
-  // which a non-recursive mutex forbids).
+  // which a non-recursive mutex forbids). Only this one shard mutex is held
+  // while waiting on its cv; no transaction-table lock is nested here, so
+  // the wait cannot contribute to an ABBA cycle (docs/lock_order.md 6).
   const auto foreign = [&]() -> size_t {
     const auto found = shard.bytes.find(pid);
     if (found == shard.bytes.end()) {
@@ -3616,6 +3746,9 @@ std::string TransactionManager::DebugDumpAllIndexReservations(
         out += " {page " + std::to_string(pid) + " txn " +
                std::to_string(owner) + " " + std::to_string(bytes) + "B";
         {
+          // Reservation shard mutex -> transaction table lock is the allowed
+          // direction for diagnostics (docs/lock_order.md 6 / "Timeout
+          // diagnostics"); the reverse order is never taken anywhere.
           std::scoped_lock registry_lock(transaction_table_lock);
           const auto active = active_transactions_.find(owner);
           if (active == active_transactions_.end()) {
@@ -3685,6 +3818,9 @@ void TransactionManager::ReleaseIndexUndoReservations(Transaction& txn) {
 
 void TransactionManager::ForgetTransaction(Transaction& txn) {
   ReleaseIndexUndoReservations(txn);
+  // The registry lock here and the gc_mutex_ wake below are separate scoped
+  // sections -- they are never held at the same time, so their order in this
+  // function cannot form a cycle (docs/lock_order.md 6/8).
   {
     std::scoped_lock lk(transaction_table_lock);
     if (!active_transactions_.empty()) {
@@ -3709,7 +3845,9 @@ void TransactionManager::ForgetTransaction(Transaction& txn) {
     const uint64_t pending =
         commits_since_gc_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (pending == kGcCommitThreshold) {
-      // Wake the (notify-driven) GC worker promptly at the threshold.
+      // Wake the (notify-driven) GC worker promptly at the threshold. The
+      // mutex is released before notify_all, so no lock is held across the
+      // wakeup and there is no nested acquisition here.
       {
         std::scoped_lock wake(gc_mutex_);
       }
@@ -3721,6 +3859,9 @@ void TransactionManager::ForgetTransaction(Transaction& txn) {
 void TransactionManager::GarbageCollectVersions() {
   std::optional<uint64_t> oldest_snapshot;
   txn_id_t oldest_snapshot_txn = 0;
+  // The table lock is released before any shard mutex is taken below: the two
+  // are sequential, never nested in the reverse (shard -> table) direction.
+  // This keeps GC out of the ABBA cycle documented in docs/lock_order.md 6.
   {
     std::scoped_lock lock(transaction_table_lock);
     for (const auto& [id, snapshot] : active_snapshots_) {
@@ -3822,8 +3963,14 @@ void TransactionManager::MaybeWarnGcPin(
   if (!oldest_snapshot || total_chains <= chain_limit) {
     return;
   }
-  const uint64_t age =
-      commit_timestamp_.load(std::memory_order_relaxed) - *oldest_snapshot;
+  const uint64_t commit_ts = commit_timestamp_.load(std::memory_order_relaxed);
+  // A snapshot timestamp ahead of the commit frontier (embedded timestamp
+  // seeding, restart edge cases) must not wrap the unsigned subtraction
+  // into a nonsense "commits behind" age.
+  if (*oldest_snapshot > commit_ts) {
+    return;
+  }
+  const uint64_t age = commit_ts - *oldest_snapshot;
   if (age < gc_pin_warn_age_commits_.load(std::memory_order_relaxed)) {
     return;
   }
@@ -3862,7 +4009,13 @@ StatusOr<lsn_t> TransactionManager::AddLog(const LogRecord& lr) {
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
-  return logger_->AddLog(lr.Serialize());
+  // Reuse a per-thread scratch buffer instead of LogRecord::Serialize(): the
+  // WAL append is a hot path and Logger::AddLog copies the payload under its
+  // enqueue latch before returning, so a view of this buffer never escapes.
+  static thread_local std::string serialized;
+  serialized.clear();
+  lr.SerializeTo(&serialized);
+  return logger_->AddLog(serialized);
 }
 
 uint64_t TransactionManager::CommittedLSN() const {

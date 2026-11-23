@@ -123,6 +123,7 @@ struct LogicalExpression {
   std::vector<Row> values{};
   size_t limit_count{0};
   size_t limit_offset{0};
+  size_t prior_limit_offset{0};
   bool with_ties{false};
   uint8_t join_type{0};
   std::shared_ptr<const SelectStatement> relational_statement{};
@@ -167,7 +168,7 @@ struct Group {
   // implementation of this group (D1: the group, not the expression, owns the
   // scan filter so all alternatives filter identically).
   Expression filter{};
-  // Bitset over the memo-wide relation index (D5 join-graph metadata).
+  // Bitset over the memo-wide relation index (join-graph metadata; not design.md D5).
   uint64_t relation_mask{0};
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
@@ -247,10 +248,19 @@ StatusOr<GroupId> Memo::TryBuild(const std::vector<std::string>& relations,
     return StatusError(StatusCode::kInvalidArgument,
                        "join graph is too large for enumeration");
   }
-  relation_index_.clear();
   const std::vector<std::string> normalized = Normalize(relations);
-  for (size_t i = 0; i < normalized.size(); ++i) {
-    relation_index_.emplace(normalized[i], i);
+  if (relation_index_.empty()) {
+    for (size_t i = 0; i < normalized.size(); ++i) {
+      relation_index_.emplace(normalized[i], i);
+    }
+  } else {
+    // Reuse the first build’s bit positions; a known subset is allowed.
+    if (!std::ranges::all_of(normalized, [this](const std::string& r) {
+          return relation_index_.contains(r);
+        })) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "join graph relations differ from the existing memo");
+    }
   }
   conjuncts_.clear();
   conjunct_masks_.clear();
@@ -398,10 +408,10 @@ Expression Memo::JoinConditionFor(const Group& left, const Group& right) const {
       continue;  // テーブルを参照しない定数条件
     }
     if ((mask & ~left.relation_mask) == 0) {
-      continue;  // 左側グループ内部で閉起している述語
+      continue;
     }
     if ((mask & ~right.relation_mask) == 0) {
-      continue;  // 右側グループ内部で閉起している述語
+      continue;
     }
     spanning.push_back(conjuncts_[i]);
   }
@@ -415,10 +425,13 @@ Expression Memo::JoinConditionFor(const Group& left, const Group& right) const {
 新たな結合式を作る際は、`LogicalExpression` を直接組み立てず、ヘルパー関数 `NewJoin` を使います（`plan/cascades.cpp`）。
 
 ```cpp
-LogicalExpression Memo::NewJoin(GroupId left, GroupId right) const {
+LogicalExpression Memo::NewJoin(
+    GroupId left, GroupId right, const Expression& inherited_condition) const {
   LogicalExpression join{.operation = LogicalOperator::kJoin,
                          .children = {left, right}};
-  const Expression condition = JoinConditionFor(Get(left), Get(right));
+  const Expression condition = inherited_condition
+                                   ? CanonicalizeConjuncts(inherited_condition)
+                                   : JoinConditionFor(Get(left), Get(right));
   if (condition) {
     join.predicate = condition;
   }
@@ -459,7 +472,7 @@ graph TD
   c2 -.-> f3
 ```
 
-`t1.a = t2.b` は `{t1}` と `{t2}` の境界をまたぐため、Group#12 の結合述語に
+`t1.a = t2.b` は `{t1}` と `{t2}` の境界をまたぐため、図の Group `{t1, t2}` にある結合述語に
 割り当てられます。根の `{t1, t2}` と `{t3}` の境界では左側だけを参照するため、
 根の結合条件には含まれません。`t3.c > 10` は `{t3}` だけを参照するため、
 スキャン Group の `filter` に配置されます。
@@ -491,7 +504,8 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
     return;
   }
   if (target.relations.size() != 1) {
-    CHECK_MSG(false, "scan filter requires a single-relation group");
+    LOG(WARN) << "MergeScanFilter: expected a single-relation group";
+    return;
   }
   const Expression next = CanonicalizeConjuncts(
       target.filter
@@ -569,7 +583,7 @@ void Memo::MergeScanFilter(GroupId group, const Expression& predicate) {
 - `kJoin`: 左右の子グループが参照する関係集合に共通部分が存在せず（交差が空）、かつ両者の和集合が対象グループの関係集合と完全に一致すること。
 - 単項演算子・集約・ソート等: 述語の有無、射影出力リストの整合性、ソートキーと整列方向の要素数の一致などが確認されます。
 
-これらの検査に抵触した場合、プログラムは `CHECK_MSG` によって停止します。tinylamb では、規則の実装不備をエラーコードによる回復対象とせず、実装上の致命的な不具合として扱います。
+これらの不変条件検査に抵触した場合は `CHECK_MSG` によって停止します。例外として `MergeScanFilter` は想定外のグループ形状を警告して転送をスキップし、元の Selection に述語を残します。
 
 **2. 指紋による重複排除**: 同一の式が既に登録されていないかを判定します。
 

@@ -99,15 +99,8 @@ class ExactSetRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] bool Reject(int64_t key) const override;
   [[nodiscard]] size_t DistinctKeys() const override { return keys_.size(); }
   [[nodiscard]] size_t MemoryBytes() const override {
-    size_t table_slots = table_.size();
-    if (table_slots == 0 && !keys_.empty()) {
-      table_slots = 16;
-      while (table_slots < keys_.size() * 2) {
-        table_slots <<= 1U;
-      }
-    }
-    return sizeof(*this) + (keys_.size() * sizeof(int64_t)) +
-           (table_slots * sizeof(uint32_t));
+    return sizeof(*this) + (keys_.capacity() * sizeof(int64_t)) +
+           (table_.capacity() * sizeof(uint32_t));
   }
   [[nodiscard]] const std::vector<int64_t>& Keys() const { return keys_; }
   // An empty set rejects every key (see Reject()), so it has no min/max.
@@ -427,7 +420,8 @@ class RuntimeFilterBuilder {
 // A filter bound to one scanned column.
 //
 // Rejection rule at the consumer:
-//   * a NULL key is always rejected (an equi-join never matches NULL);
+//   * a NULL key is rejected whenever the filter is enabled (an equi-join
+//     never matches NULL); an unbound filter rejects nothing, including NULL;
 //   * a value whose decoded type differs from `type` is never rejected, so a
 //     filter built over INT64 can never prune a DATE probe column (or an
 //     unexpected type change) by comparing incomparable bit patterns.

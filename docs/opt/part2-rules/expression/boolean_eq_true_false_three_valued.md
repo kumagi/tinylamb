@@ -45,13 +45,13 @@ graph TD
 
 ```cpp
           if (val.value.int_value == 1) {
-            // IS TRUE = 1 -> child (since IS TRUE returns 1/0/NULL)
-            // but we need to preserve: IS TRUE -> (child IS TRUE)
+            // IS predicates always return 1/0 (never NULL), so pred = 1 is
+            // the IS-predicate node itself: IS TRUE -> (child IS TRUE).
             return bindings.at("left");
           }
           if (val.value.int_value != 0) {
             // Only 0/1 can invert a boolean predicate; comparing an
-            // IS-predicate (1/0/NULL) against e.g. 5 must not invert the
+            // IS-predicate (1/0) against e.g. 5 must not invert the
             // predicate.
             return Expression{};
           }
@@ -68,12 +68,22 @@ graph TD
 
 ```cpp
     case UnaryOperation::kIsTrue:
-      return Value(!child.IsNull() && child.Truthy());
     case UnaryOperation::kIsNotTrue:
-      return Value(child.IsNull() || !child.Truthy());
+    case UnaryOperation::kIsFalse:
+    case UnaryOperation::kIsNotFalse: {
+      // ...(省略: 非 BOOL オペランドは StatusError を返す型検査)
+      if (child.IsNull()) {
+        const bool negated = operation == UnaryOperation::kIsNotTrue ||
+                             operation == UnaryOperation::kIsNotFalse;
+        return Value(negated);
+      }
+      const bool truthy_following = operation == UnaryOperation::kIsTrue ||
+                                    operation == UnaryOperation::kIsNotFalse;
+      return Value(truthy_following ? child.Truthy() : !child.Truthy());
+    }
 ```
 
-`kIsTrue` およびその関連述語は、子ノードの評価結果が NULL であるか否かを内部で吸収し、常に真偽値（`Value(true)` または `Value(false)`）を出力します。出力集合が $\{0, 1\}$ に限定され `UNKNOWN` を返さないため、$(\text{pred}) = 0$ という等値比較の結果は $\text{NOT}(\text{pred})$ と完全に一致します。この性質が保証されない一般のブール列 $b$ に対して $b = 0$ を単純置換することは許されず、対象を IS 述語族へ限定する必然性がここにあります。
+`kIsTrue` およびその関連述語は、子ノードの評価結果が NULL であるか否かを内部で吸収し、NULL 子には基本形が `FALSE`、否定形（`IS NOT TRUE` / `IS NOT FALSE`）が `TRUE` を返します。非 NULL 子には `Truthy()` またはその否定を返し、常に真偽値（`Value(true)` または `Value(false)`）を出力します。また `TryEvaluateUnary` は型検査も行い、非 BOOL オペランドには `StatusCode::kInvalidArgument`（`"IS TRUE requires a BOOL operand"` または `"IS FALSE requires a BOOL operand"`）を返します。出力集合が $\{0, 1\}$ に限定され `UNKNOWN` を返さないため、$(\text{pred}) = 0$ という等値比較の結果は $\text{NOT}(\text{pred})$ と完全に一致します。この性質が保証されない一般のブール列 $b$ に対して $b = 0$ を単純置換することは許されず、対象を IS 述語族へ限定する必然性がここにあります。
 
 ### 2. 補数マッピングの正確性と意味論の保存
 $(\text{pred}) = 0$ を反転する際、左辺の述語に応じた正確な補数を割り当てる必要があります。
@@ -132,5 +142,5 @@ $(\text{pred}) = 0$ を反転する際、左辺の述語に応じた正確な補
 
 - 4 種類の IS 述語それぞれに対し、`(i pred) = 0` が正確な補数演算子へ変換されること。
 - 変換後の式木が、元の AST と $i = 0$ および $i = 1$ の双方のタプルにおいて完全に一致する評価結果を返すこと。
-- 0 および 1 以外の定数（例: 定数 5）との比較において、不適切な反転が行われず不発火となること。
+- 0 および 1 の比較で補数への変換と評価一致を確認します。定数 5 に対する不発火はこのテストでは明示的に検証していません。
 - 過去の不具合（`(i IS FALSE) = 0` が `i IS NOT TRUE` に誤変換されていた問題）に対する恒久的な回帰抑止。

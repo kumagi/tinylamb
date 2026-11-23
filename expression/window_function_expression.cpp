@@ -51,6 +51,45 @@ std::string FrameBoundToString(const WindowFrameBound& bound) {
   }
   return "?";
 }
+
+template <typename ResultTypeOf>
+Type WindowResultType(std::string_view function,
+                      const std::vector<Expression>& args,
+                      ResultTypeOf&& result_type_of) {
+  const std::string fn = AsciiToUpper(function);
+  if (fn == "ROW_NUMBER" || fn == "RANK" || fn == "DENSE_RANK" ||
+      fn == "NTILE" || fn == "COUNT" || fn == "COUNTIF") {
+    return {TypeTag::kBigInt};
+  }
+  if (fn == "PERCENT_RANK" || fn == "CUME_DIST" ||
+      fn == "PERCENTILE_CONT" || fn == "AVG" || fn == "STDDEV_SAMP" ||
+      fn == "STDDEV_POP" || fn == "VAR_SAMP" || fn == "VAR_POP" ||
+      fn == "STDDEV" || fn == "VARIANCE" || fn == "COVAR_SAMP" ||
+      fn == "COVAR_POP" || fn == "CORR" ||
+      (fn.starts_with("REGR_") && fn != "REGR_COUNT")) {
+    return {TypeTag::kDouble};
+  }
+  if (fn == "APPROX_COUNT_DISTINCT" || fn == "REGR_COUNT" ||
+      fn == "LOGICAL_AND" || fn == "LOGICAL_OR") {
+    return {TypeTag::kBigInt};
+  }
+  if (fn == "ARRAY_AGG" || fn == "ARRAY_CONCAT_AGG" ||
+      fn == "APPROX_TOP_COUNT" || fn == "APPROX_TOP_SUM" ||
+      fn == "APPROX_QUANTILES" || fn == "ELEMENTWISE_SUM" ||
+      fn == "ELEMENTWISE_AVG") {
+    return {TypeTag::kArray};
+  }
+  if (fn == "LAG" || fn == "LEAD" || fn == "FIRST_VALUE" ||
+      fn == "LAST_VALUE" || fn == "NTH_VALUE" || fn == "MIN" ||
+      fn == "MAX" || fn == "SUM" || fn == "ANY_VALUE" ||
+      fn == "PERCENTILE_DISC" || fn == "MODE" || fn == "BIT_AND" ||
+      fn == "BIT_OR" || fn == "BIT_XOR") {
+    if (!args.empty() && args.front()) {
+      return result_type_of(args.front());
+    }
+  }
+  return {TypeTag::kVarChar};
+}
 }  // namespace
 
 StatusOr<Value> WindowFunctionCallExpression::TryEvaluate(
@@ -72,28 +111,16 @@ Type WindowFunctionCallExpression::ResultType(const Schema& schema) const {
   // (UNION coercion, ORDER BY encoding, server type reporting) must not see a
   // blanket VARCHAR: ROW_NUMBER yields INT64, PERCENT_RANK a DOUBLE, and
   // LAG/FIRST_VALUE carry their argument's type.
-  const std::string fn = AsciiToUpper(function);
-  if (fn == "ROW_NUMBER" || fn == "RANK" || fn == "DENSE_RANK" ||
-      fn == "NTILE" || fn == "COUNT" || fn == "COUNTIF") {
-    return {TypeTag::kBigInt};
-  }
-  if (fn == "PERCENT_RANK" || fn == "CUME_DIST" || fn == "PERCENTILE_CONT" ||
-      fn == "AVG" || fn == "STDDEV_SAMP" || fn == "STDDEV_POP" ||
-      fn == "VAR_SAMP" || fn == "VAR_POP" || fn == "COVAR_SAMP" ||
-      fn == "COVAR_POP" || fn == "CORR") {
-    return {TypeTag::kDouble};
-  }
-  // Navigation functions and value aggregates carry the first argument's
-  // type. STRING_AGG (and unrecognized functions) keep the VARCHAR fallback.
-  if (fn == "LAG" || fn == "LEAD" || fn == "FIRST_VALUE" ||
-      fn == "LAST_VALUE" || fn == "NTH_VALUE" || fn == "MIN" || fn == "MAX" ||
-      fn == "SUM" || fn == "ANY_VALUE" || fn == "PERCENTILE_DISC" ||
-      fn == "ARRAY_AGG") {
-    if (!args.empty() && args.front()) {
-      return args.front()->ResultType(schema);
-    }
-  }
-  return {TypeTag::kVarChar};
+  return WindowResultType(function, args, [&](const Expression& argument) {
+    return argument->ResultType(schema);
+  });
+}
+
+Type WindowFunctionCallExpression::ResultType(const Schema& left,
+                                               const Schema& right) const {
+  return WindowResultType(function, args, [&](const Expression& argument) {
+    return argument->ResultType(left, right);
+  });
 }
 
 std::unordered_set<ColumnName> WindowFunctionCallExpression::TouchedColumns()

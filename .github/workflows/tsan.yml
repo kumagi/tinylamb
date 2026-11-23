@@ -36,6 +36,7 @@ jobs:
   # Lock-order (ABBA) detection needs TSan's deadlock detector, which the job
   # above disables.  Advisory until the baseline reports are triaged.
   lock-order:
+    timeout-minutes: 120
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
@@ -51,11 +52,11 @@ jobs:
             -DTINYLAMB_TSAN_DETECT_DEADLOCKS=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build -j"$(nproc)"
+          # Keep this subset in sync with the concurrency job above: the
+          # missing QueueTable/FullScanMvccFastPath/MemoryBudget/QueryGrant/
+          # QueryParallelismBudget suites take the same latch/budget paths
+          # and must also run under the deadlock detector.
           ctest --test-dir build \
-            # Keep this subset in sync with the concurrency job above: the
-            # missing QueueTable/FullScanMvccFastPath/MemoryBudget/QueryGrant/
-            # QueryParallelismBudget suites take the same latch/budget paths
-            # and must also run under the deadlock detector.
             -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)' \
             -j"$(nproc)" --output-on-failure
 

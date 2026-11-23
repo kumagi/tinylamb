@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "common/constants.hpp"
 
@@ -39,6 +40,10 @@ struct PostgresServerOptions {
   std::chrono::seconds idle_timeout{3600};
 };
 
+// Upper bound on the shared read/DML worker pool regardless of the requested
+// read_worker_threads value.
+inline constexpr size_t kMaxReadWorkers = 16;
+
 class PostgresServer {
  public:
   PostgresServer(PostgresServer&&) = delete;
@@ -49,6 +54,12 @@ class PostgresServer {
 
   PostgresServer(const PostgresServer&) = delete;
   PostgresServer& operator=(const PostgresServer&) = delete;
+
+  // Classifies the statement spellings that populate the thread-local TEMP
+  // object registries. Exposed so the word-boundary handling (including the
+  // seven-word "CREATE OR REPLACE TEMP AGGREGATE TABLE FUNCTION" spelling) has
+  // a direct regression test instead of relying on an end-to-end worker test.
+  static bool RegistersTempObject(std::string_view sql);
 
   bool Listen(std::string* error);
   int Run(std::string* error);

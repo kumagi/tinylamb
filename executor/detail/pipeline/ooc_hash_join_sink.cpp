@@ -179,6 +179,7 @@ ExtractedJoinKey ExtractJoinKey(const Row& row, const std::vector<slot_t>& cols,
 
   byte_out->clear();
   bool saw_non_safe_null = false;
+  bool saw_unmatchable_nan = false;
   for (size_t i = 0; i < cols.size(); ++i) {
     const slot_t c = cols[i];
     const Value& v = (c < row.Count()) ? row[c] : Value();
@@ -193,8 +194,11 @@ ExtractedJoinKey ExtractJoinKey(const Row& row, const std::vector<slot_t>& cols,
       continue;
     }
     if (!safe && ContainsUnmatchableNaN(v)) {
-      res.has_non_safe_null = false;
-      return res;
+      // Keep scanning so a later non-safe NULL still reaches the
+      // null-aware anti-join decision. The NaN makes the key unmatchable,
+      // but it must not erase null information from another key component.
+      saw_unmatchable_nan = true;
+      continue;
     }
     if (saw_non_safe_null) {
       continue;
@@ -212,6 +216,9 @@ ExtractedJoinKey ExtractJoinKey(const Row& row, const std::vector<slot_t>& cols,
   }
   if (saw_non_safe_null) {
     res.has_non_safe_null = true;
+    return res;
+  }
+  if (saw_unmatchable_nan) {
     return res;
   }
   res.valid = true;
@@ -336,18 +343,26 @@ void RenderStreamTree(std::ostream& out, int indent, bool is_dump,
   }
 }
 
-void MarkBit(std::vector<uint8_t>* bits, uint64_t idx) {
+Status MarkBit(std::vector<uint8_t>* bits, uint64_t idx) {
   if (bits == nullptr || bits->empty()) {
-    return;
+    return Status::kSuccess;
   }
-  (*bits)[idx >> 3] |= static_cast<uint8_t>(1U << (idx & 7U));
+  const uint64_t byte = idx >> 3;
+  if (byte >= bits->size()) {
+    return StatusError(StatusCode::kCorrupt,
+                       "spill join probe row exceeds match bitmap");
+  }
+  (*bits)[static_cast<size_t>(byte)] |= static_cast<uint8_t>(1U << (idx & 7U));
+  return Status::kSuccess;
 }
 
 [[nodiscard]] bool TestBit(const std::vector<uint8_t>* bits, uint64_t idx) {
-  if (bits == nullptr || bits->empty()) {
+  const uint64_t byte = idx >> 3;
+  if (bits == nullptr || byte >= bits->size()) {
     return false;
   }
-  return ((*bits)[idx >> 3] & static_cast<uint8_t>(1U << (idx & 7U))) != 0;
+  return ((*bits)[static_cast<size_t>(byte)] &
+          static_cast<uint8_t>(1U << (idx & 7U))) != 0;
 }
 
 Status StepActiveProbeRow(
@@ -375,13 +390,13 @@ Status StepActiveProbeRow(
     if (chunked_skew_mode) {
       if (spec.kind == JoinKind::kSemi) {
         if (!TestBit(probe_matched_bits, state->gidx)) {
-          MarkBit(probe_matched_bits, state->gidx);
+          RETURN_IF_FAIL(MarkBit(probe_matched_bits, state->gidx));
           EmitJoinTuple(spec, state->row, state->pos, brow, out);
         }
         state->next_entry = JoinHashIndex::kNil;
         break;
       }
-      MarkBit(probe_matched_bits, state->gidx);
+      RETURN_IF_FAIL(MarkBit(probe_matched_bits, state->gidx));
     }
     if (IsAntiJoinKind(spec.kind) || IsNullAwareAntiJoinKind(spec.kind)) {
       state->next_entry = JoinHashIndex::kNil;
@@ -438,7 +453,11 @@ size_t GraceWriterBufferBytesFor(size_t budget, size_t fanout,
   if (budget == 0) {
     return fallback;
   }
-  return std::clamp<size_t>(budget / std::max<size_t>(2, fanout * 2), 4096,
+  // GraceWriterBufferBytesFor's upper bound is `fallback`, which can be
+  // smaller than 4096 with a tiny spill I/O buffer; std::clamp requires lo <=
+  // hi, so lower the floor to `fallback` there instead of invoking UB.
+  const size_t lo = std::min<size_t>(4096, fallback);
+  return std::clamp<size_t>(budget / std::max<size_t>(2, fanout * 2), lo,
                             fallback);
 }
 
@@ -484,18 +503,20 @@ Status AppendToGraceBuckets(
     std::vector<uint64_t>& row_counts, std::vector<uint64_t>& est_bytes,
     size_t* total_batch_bytes, size_t batch_cap, size_t total_cap,
     QueryMemoryGrant::LocalBatchCache* grant_cache, size_t bucket, Row&& row,
-    RowPosition pos, size_t rb, std::string* codec_scratch) {
+    RowPosition pos, size_t rb, std::string* codec_scratch,
+    bool already_resident = false) {
   if (total_cap > 0 && *total_batch_bytes + rb > total_cap) {
-    size_t best = 0;
-    for (size_t i = 1; i < batch_bytes.size(); ++i) {
-      if (batch_bytes[i] > batch_bytes[best]) {
-        best = i;
+    // Drain every non-empty bucket, not just the largest one: when the largest
+    // is empty (all buckets empty, i.e. this single row alone exceeds the cap)
+    // skipping the flush left the staging cap as a soft limit. Flushing all
+    // bounds the staged bytes to at most one oversized row, which the grant
+    // check below still accounts for.
+    for (size_t i = 0; i < chunks.size(); ++i) {
+      if (!chunks[i].Empty()) {
+        RETURN_IF_FAIL(FlushGraceBucket(i, writers, chunks, batch_bytes,
+                                        total_batch_bytes, grant_cache,
+                                        codec_scratch));
       }
-    }
-    if (batch_bytes[best] > 0) {
-      RETURN_IF_FAIL(FlushGraceBucket(best, writers, chunks, batch_bytes,
-                                      total_batch_bytes, grant_cache,
-                                      codec_scratch));
     }
   }
   if (grant_cache != nullptr && !grant_cache->Reserve(rb)) {
@@ -510,6 +531,17 @@ Status AppendToGraceBuckets(
     // the grant is exhausted, and appending anyway would hold memory the
     // query grant never accounted for.
     if (!grant_cache->Reserve(rb)) {
+      // During migration the original row is still charged. If there is
+      // no room for staging, encode this row directly and keep no batch.
+      if (already_resident) {
+        DataChunk single;
+        single.Append(std::move(row), pos);
+        RETURN_IF_FAIL(WriteDataChunk(writers[bucket].get(), single,
+                                      codec_scratch, kGraceWriteBatchBytes));
+        ++row_counts[bucket];
+        est_bytes[bucket] += rb;
+        return Status::kSuccess;
+      }
       return StatusError(StatusCode::kMemoryLimitExceeded,
                          "OOC hash join: grace staging grant exhausted");
     }
@@ -545,9 +577,10 @@ OocHashJoinContext::~OocHashJoinContext() {
   reduced_probe_store.reset();
   semi_probe_domain.reset();
   semi_kept_ordinals.clear();
-  // Empty the member before dropping any segment: if one release were to
-  // throw, the remaining buckets are no longer reachable from this context
-  // and cannot be released a second time by a later cleanup path.
+  // Empty the member up front so the context holds no stale segment ids once
+  // destruction finishes. DropSegmentIfAlive is noexcept and this destructor
+  // has no separate cleanup path; the swap is only a cheap way to clear the
+  // member (shrink_to_fit() could allocate), not an exception-safety scheme.
   std::vector<OocBuildSpillBucket> buckets;
   buckets.swap(build_buckets);
   for (const OocBuildSpillBucket& b : buckets) {
@@ -729,21 +762,14 @@ Status OocHashBuildSink::TransitionToSpill(PipelineContext* ctx) {
       GraceWriterBufferBytesFor(active_budget, fanout, join_ctx_->io_buf_bytes);
   const size_t batch_cap = GraceWriteBatchBytesFor(active_budget, fanout);
   const size_t total_cap = GraceTotalStagingCapFor(active_budget);
-  bucket_writers_.resize(fanout);
-  bucket_chunks_.resize(fanout);
-  bucket_batch_bytes_.assign(fanout, 0);
-  bucket_row_counts_.assign(fanout, 0);
-  bucket_est_bytes_.assign(fanout, 0);
-  bucket_total_batch_bytes_ = 0;
-  for (size_t b = 0; b < fanout; ++b) {
-    bucket_writers_[b] =
-        std::make_unique<SpillSegmentWriter>(&ctx->spill_store, wbuf);
-  }
-
-  // Free resident row-build charge before buffering Grace write batches so
-  // staging borrows against the released grant cleanly.
-  if (join_ctx_->resident_grant_cache != nullptr) {
-    join_ctx_->resident_grant_cache->ReleaseAll();
+  std::vector<std::unique_ptr<SpillSegmentWriter>> writers(fanout);
+  std::vector<DataChunk> chunks(fanout);
+  std::vector<size_t> batch_bytes(fanout);
+  std::vector<uint64_t> row_counts(fanout), estimated_bytes(fanout);
+  size_t total_batch_bytes = 0;
+  QueryMemoryGrant::LocalBatchCache staging(&ctx->grant, wbuf);
+  for (auto& writer : writers) {
+    writer = std::make_unique<SpillSegmentWriter>(&ctx->spill_store, wbuf);
   }
 
   const std::vector<slot_t>& build_cols = join_ctx_->spec.build_left
@@ -753,25 +779,29 @@ Status OocHashBuildSink::TransitionToSpill(PipelineContext* ctx) {
       join_ctx_->any_null_safe ? &join_ctx_->spec.key_null_safe : nullptr;
 
   for (size_t i = 0; i < join_ctx_->build_rows.size(); ++i) {
-    Row& row = join_ctx_->build_rows[i];
+    const Row& row = join_ctx_->build_rows[i];
     const RowPosition& pos = join_ctx_->build_positions[i];
     const uint64_t h = PartitionHashForRow(
         row, build_cols, ns, join_ctx_->any_null_safe, &key_scratch_);
     const uint32_t bucket = RecursivePartitioner::RadixBucket(
         h, /*depth=*/0, join_ctx_->root_fanout_bits);
     const size_t rb = EstimateRowMemoryBytes(row) + sizeof(RowPosition);
-    join_ctx_->total_build_bytes += rb;
     RETURN_IF_FAIL(AppendToGraceBuckets(
-        bucket_writers_, bucket_chunks_, bucket_batch_bytes_,
-        bucket_row_counts_, bucket_est_bytes_, &bucket_total_batch_bytes_,
-        batch_cap, total_cap, join_ctx_->resident_grant_cache.get(), bucket,
-        std::move(row), pos, rb, &codec_scratch_));
+        writers, chunks, batch_bytes, row_counts, estimated_bytes,
+        &total_batch_bytes, batch_cap, total_cap, &staging, bucket, Row(row),
+        pos, rb, &codec_scratch_, true));
   }
 
-  join_ctx_->build_rows.clear();
-  join_ctx_->build_rows.shrink_to_fit();
-  join_ctx_->build_positions.clear();
-  join_ctx_->build_positions.shrink_to_fit();
+  bucket_writers_ = std::move(writers);
+  bucket_chunks_ = std::move(chunks);
+  bucket_batch_bytes_ = std::move(batch_bytes);
+  bucket_row_counts_ = std::move(row_counts);
+  bucket_est_bytes_ = std::move(estimated_bytes);
+  bucket_total_batch_bytes_ = total_batch_bytes;
+  std::vector<Row>().swap(join_ctx_->build_rows);
+  std::vector<RowPosition>().swap(join_ctx_->build_positions);
+  *join_ctx_->resident_grant_cache = std::move(staging);
+  join_ctx_->total_build_bytes += mem_bytes_;
   mem_bytes_ = 0;
   spilled_ = true;
   return Status::kSuccess;
@@ -840,7 +870,8 @@ Status OocHashBuildSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
           semi_seen_capped_ = true;
           semi_seen_keys_.reset();
         } else {
-          semi_seen_keys_->Insert(sk.hash, 0, key_scratch_, semi_seen_bytes_);
+          // Membership set. No caller reads the index payload.
+          semi_seen_keys_->Insert(sk.hash, 0, key_scratch_, 0);
           semi_seen_bytes_ += est;
         }
       }
@@ -1184,7 +1215,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
   uint64_t probe_row_count{0};
 
   // Mode 1: Single build hash index (`<= budget_bytes`).
-  // Mode 2: Skew chunked BNL slices (`<= budget_bytes / 2` per build slice).
+  // Mode 2: Skew chunked BNL slices (per-slice cap is
+  // `max(16 KiB, budget_bytes / 2)`, re-checked after each appended chunk).
   std::unique_ptr<SpillSegmentReader> build_slice_reader;
   std::unique_ptr<SpillSegmentReader> probe_reader;
   size_t probe_row_in_chunk{0};
@@ -1206,6 +1238,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
   bool build_has_null_key{false};
   bool chunked_skew_mode{false};
   bool build_eof{false};
+  bool loading_build_slice{false};
+  uint64_t next_build_offset{0};
   JoinHashIndex::KeyMode key_mode{JoinHashIndex::KeyMode::kBytes};
   ValueType int_key_type{ValueType::kInt64};
   bool probe_pass_eof{false};
@@ -1227,7 +1261,6 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
     SpillStore::DropSegmentIfAlive(spill_store, spill_store_alive, probe_seg);
   }
 
-  void MarkProbeMatched(uint64_t idx) { MarkBit(&probe_matched_bits, idx); }
   [[nodiscard]] bool IsProbeMatched(uint64_t idx) const {
     return TestBit(&probe_matched_bits, idx);
   }
@@ -1244,11 +1277,13 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
       build_eof = true;
       return Status::kSuccess;
     }
+    loading_build_slice = true;
     if (!build_slice_reader) {
       build_slice_reader = std::make_unique<SpillSegmentReader>(
           spill_store, build_seg, io_buf_bytes);
-      RETURN_IF_FAIL(build_slice_reader->Open());
     }
+    RETURN_IF_FAIL(build_slice_reader->Seek(next_build_offset));
+    bool reached_eof = false;
     const size_t slice_cap = chunked_skew_mode
                                  ? std::max<size_t>(16384, budget_bytes / 2)
                                  : std::numeric_limits<size_t>::max();
@@ -1259,7 +1294,7 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
           bool, has,
           ReadDataChunk(build_slice_reader.get(), &chunk, &codec_scratch));
       if (!has) {
-        build_eof = true;
+        reached_eof = true;
         break;
       }
       for (size_t r = 0; r < chunk.Size(); ++r) {
@@ -1283,6 +1318,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
     }
 
     if (slice_build_rows.empty()) {
+      build_eof = reached_eof;
+      loading_build_slice = false;
       return Status::kSuccess;
     }
 
@@ -1350,10 +1387,28 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
     probe_state.Reset();
     unmatched_build_cursor = 0;
     draining_unmatched_build = false;
+    next_build_offset = build_slice_reader->Offset();
+    build_eof = reached_eof;
+    loading_build_slice = false;
     return Status::kSuccess;
   }
 
+  StatusOr<bool> ReadProbeFrame() {
+    const auto offset = probe_reader->Offset();
+    auto next =
+        ReadDataChunk(probe_reader.get(), &active_probe_chunk, &codec_scratch);
+    if (!next.HasValue()) {
+      active_probe_chunk.Reset();
+      probe_row_in_chunk = 0;
+      RETURN_IF_FAIL(probe_reader->Seek(offset));
+    }
+    return next;
+  }
+
   Status NextBatch(DataChunk* out, size_t max_rows) {
+    if (loading_build_slice) {
+      RETURN_IF_FAIL(LoadNextBuildSlice());
+    }
     if (finished) {
       return Status::kSuccess;
     }
@@ -1370,10 +1425,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               probe_pass_eof = true;
               break;
             }
-            ASSIGN_OR_RETURN(
-                bool, has,
-                ReadDataChunk(probe_reader.get(), &active_probe_chunk,
-                              &codec_scratch));
+            if (!out->Empty()) { return Status::kSuccess;
+}
+            ASSIGN_OR_RETURN(bool, has, ReadProbeFrame());
             if (!has) {
               probe_pass_eof = true;
               break;
@@ -1383,6 +1437,10 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
           if (probe_pass_eof) {
             finished = true;
             return Status::kSuccess;
+          }
+          if (probe_global_idx >= probe_row_count) {
+            return StatusError(StatusCode::kCorrupt,
+                               "spill join probe row count mismatch");
           }
           const Row prow = active_probe_chunk.RowAt(probe_row_in_chunk);
           const RowPosition ppos =
@@ -1437,6 +1495,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
         // Finished this build slice. Either load next slice or finish
         // partition!
         if (!build_eof) {
+          if (!out->Empty()) { return Status::kSuccess;
+}
           RETURN_IF_FAIL(LoadNextBuildSlice());
           if (!slice_build_rows.empty()) {
             continue;
@@ -1468,10 +1528,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               probe_pass_eof = true;
               break;
             }
-            ASSIGN_OR_RETURN(
-                bool, has,
-                ReadDataChunk(probe_reader.get(), &active_probe_chunk,
-                              &codec_scratch));
+            if (!out->Empty()) { return Status::kSuccess;
+}
+            ASSIGN_OR_RETURN(bool, has, ReadProbeFrame());
             if (!has) {
               probe_pass_eof = true;
               break;
@@ -1484,6 +1543,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               break;
             }
             if (!build_eof) {
+              if (!out->Empty()) { return Status::kSuccess;
+}
               RETURN_IF_FAIL(LoadNextBuildSlice());
               if (!slice_build_rows.empty()) {
                 continue;
@@ -1506,6 +1567,10 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
             return Status::kSuccess;
           }
 
+          if (probe_global_idx >= probe_row_count) {
+            return StatusError(StatusCode::kCorrupt,
+                               "spill join probe row count mismatch");
+          }
           probe_state.row = active_probe_chunk.RowAt(probe_row_in_chunk);
           probe_state.pos = active_probe_chunk.PositionAt(probe_row_in_chunk);
           probe_state.gidx = probe_global_idx++;
@@ -1815,6 +1880,12 @@ Status OocAdaptiveHashProbeSource::PrepareGracePartitions(
   }
 
   const size_t fanout = join_ctx_->build_buckets.size();
+  // OperatorBudgetBytes() already returns a capped per-operator slice (an
+  // unlimited grant gets pool_max / (4 * active consumers), a limited grant
+  // its fair share), never the whole query pool. GraceWriterBufferBytesFor
+  // further divides by fanout before sizing each writer, so the fanout writer
+  // buffers together stay within that slice -- do not substitute a raw pool
+  // total here or N writers would each size off the entire pool.
   const size_t active_budget = ctx->OperatorBudgetBytes();
   const size_t wbuf =
       GraceWriterBufferBytesFor(active_budget, fanout, join_ctx_->io_buf_bytes);
@@ -1941,7 +2012,6 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
   if (fits) {
     auto cur = std::make_unique<GracePartitionCursor>();
     cur->spill_store = &ctx->spill_store;
-    cur->spill_store_alive = ctx->spill_store.LifetimeToken();
     cur->spec = &spec;
     cur->any_null_safe = join_ctx_->any_null_safe;
     cur->build_has_null_key = join_ctx_->build_has_null_key;
@@ -1963,6 +2033,9 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
     } else {
       RETURN_IF_FAIL(cur->LoadNextBuildSlice());
     }
+    // The pending pair owns its segments until the cursor is ready.
+    cur->spill_store_alive = ctx->spill_store.LifetimeToken();
+    pending_pairs_.pop_back();
     active_pair_cursor_ = std::move(cur);
     return Status::kSuccess;
   }
@@ -1977,7 +2050,6 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
     ProcessMemoryBudget::Global().RecordSkewFallback();
     auto cur = std::make_unique<GracePartitionCursor>();
     cur->spill_store = &ctx->spill_store;
-    cur->spill_store_alive = ctx->spill_store.LifetimeToken();
     cur->spec = &spec;
     cur->any_null_safe = join_ctx_->any_null_safe;
     cur->build_has_null_key = join_ctx_->build_has_null_key;
@@ -1991,10 +2063,18 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
     cur->grant_cache = cache_ptr;
     if (ShouldKeepProbeOnlyUnmatched(spec.kind, spec.build_left) ||
         spec.kind == JoinKind::kSemi) {
-      cur->probe_matched_bits.assign(
-          static_cast<size_t>((pair.probe_rows + 7) / 8), 0);
+      const uint64_t match_bytes =
+          (pair.probe_rows / 8) + static_cast<uint64_t>(pair.probe_rows % 8 != 0);
+      if (match_bytes > cur->probe_matched_bits.max_size()) {
+        return StatusError(StatusCode::kTooBigData,
+                           "spill join match bitmap is too large");
+      }
+      cur->probe_matched_bits.assign(static_cast<size_t>(match_bytes), 0);
     }
     RETURN_IF_FAIL(cur->LoadNextBuildSlice());
+    // The pending pair owns its segments until the cursor is ready.
+    cur->spill_store_alive = ctx->spill_store.LifetimeToken();
+    pending_pairs_.pop_back();
     active_pair_cursor_ = std::move(cur);
     return Status::kSuccess;
   }
@@ -2015,58 +2095,64 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
                             std::vector<SpillSegmentId>* out_segs,
                             std::vector<uint64_t>* out_counts,
                             std::vector<uint64_t>* out_bytes) -> Status {
-    out_segs->assign(fanout, kInvalidSpillSegmentId);
-    out_counts->assign(fanout, 0);
-    out_bytes->assign(fanout, 0);
-    if (src_seg == kInvalidSpillSegmentId) {
+    try {
+      out_segs->assign(fanout, kInvalidSpillSegmentId);
+      out_counts->assign(fanout, 0);
+      out_bytes->assign(fanout, 0);
+      if (src_seg == kInvalidSpillSegmentId) {
+        return Status::kSuccess;
+      }
+      std::vector<std::unique_ptr<SpillSegmentWriter>> writers(fanout);
+      std::vector<DataChunk> chunks(fanout);
+      std::vector<size_t> cbytes(fanout, 0);
+      size_t total_cbytes = 0;
+      std::string scratch;
+      for (size_t i = 0; i < fanout; ++i) {
+        writers[i] =
+            std::make_unique<SpillSegmentWriter>(&ctx->spill_store, wbuf);
+      }
+      SpillSegmentReader reader(&ctx->spill_store, src_seg, wbuf);
+      const std::vector<bool>* ns =
+          join_ctx_->any_null_safe ? &spec.key_null_safe : nullptr;
+      DataChunk c;
+      while (true) {
+        ASSIGN_OR_RETURN(bool, has, ReadDataChunk(&reader, &c, &scratch));
+        if (!has) {
+          break;
+        }
+        for (size_t r = 0; r < c.Size(); ++r) {
+          Row row = c.RowAt(r);
+          const RowPosition pos = c.PositionAt(r);
+          const uint64_t h = PartitionHashForRow(
+              row, cols, ns, join_ctx_->any_null_safe, &key_scratch_);
+          const uint32_t bk = RecursivePartitioner::RadixBucketAtOffset(
+              h, pair.bit_offset, fbits);
+          const size_t rb = EstimateRowMemoryBytes(row) + sizeof(RowPosition);
+          RETURN_IF_FAIL(AppendToGraceBuckets(
+              writers, chunks, cbytes, *out_counts, *out_bytes, &total_cbytes,
+              batch_cap, total_cap, cache_ptr, bk, std::move(row), pos, rb,
+              &scratch));
+        }
+      }
+      for (size_t i = 0; i < fanout; ++i) {
+        RETURN_IF_FAIL(FlushGraceBucket(i, writers, chunks, cbytes,
+                                        &total_cbytes, cache_ptr, &scratch));
+        if ((*out_counts)[i] > 0) {
+          ASSIGN_OR_RETURN(SpillSegmentId, sid, writers[i]->Finish(false));
+          (*out_segs)[i] = sid;
+        } else {
+          writers[i]->Abort();
+        }
+      }
+      if (cache_ptr != nullptr) {
+        cache_ptr->ReleaseAll();
+      }
       return Status::kSuccess;
+    } catch (const std::bad_alloc&) {
+      return Status::kMemoryLimitExceeded;
+    } catch (const std::length_error&) {
+      return Status::kTooBigData;
     }
-    std::vector<std::unique_ptr<SpillSegmentWriter>> writers(fanout);
-    std::vector<DataChunk> chunks(fanout);
-    std::vector<size_t> cbytes(fanout, 0);
-    size_t total_cbytes = 0;
-    std::string scratch;
-    for (size_t i = 0; i < fanout; ++i) {
-      writers[i] =
-          std::make_unique<SpillSegmentWriter>(&ctx->spill_store, wbuf);
-    }
-    SpillSegmentReader reader(&ctx->spill_store, src_seg, wbuf);
-    const std::vector<bool>* ns =
-        join_ctx_->any_null_safe ? &spec.key_null_safe : nullptr;
-    DataChunk c;
-    while (true) {
-      ASSIGN_OR_RETURN(bool, has, ReadDataChunk(&reader, &c, &scratch));
-      if (!has) {
-        break;
-      }
-      for (size_t r = 0; r < c.Size(); ++r) {
-        Row row = c.RowAt(r);
-        const RowPosition pos = c.PositionAt(r);
-        const uint64_t h = PartitionHashForRow(
-            row, cols, ns, join_ctx_->any_null_safe, &key_scratch_);
-        const uint32_t bk = RecursivePartitioner::RadixBucketAtOffset(
-            h, pair.bit_offset, fbits);
-        const size_t rb = EstimateRowMemoryBytes(row) + sizeof(RowPosition);
-        RETURN_IF_FAIL(AppendToGraceBuckets(
-            writers, chunks, cbytes, *out_counts, *out_bytes, &total_cbytes,
-            batch_cap, total_cap, cache_ptr, bk, std::move(row), pos, rb,
-            &scratch));
-      }
-    }
-    for (size_t i = 0; i < fanout; ++i) {
-      RETURN_IF_FAIL(FlushGraceBucket(i, writers, chunks, cbytes, &total_cbytes,
-                                      cache_ptr, &scratch));
-      if ((*out_counts)[i] > 0) {
-        ASSIGN_OR_RETURN(SpillSegmentId, sid, writers[i]->Finish(false));
-        (*out_segs)[i] = sid;
-      } else {
-        writers[i]->Abort();
-      }
-    }
-    if (cache_ptr != nullptr) {
-      cache_ptr->ReleaseAll();
-    }
-    return Status::kSuccess;
   };
 
   const std::vector<slot_t>& bcols =
@@ -2076,28 +2162,23 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
 
   std::vector<SpillSegmentId> b_segs, p_segs;
   std::vector<uint64_t> b_cnts, p_cnts, b_bytes, p_bytes;
+  pending_pairs_.reserve(pending_pairs_.size() - 1 + fanout);
   Status st = partition_side(pair.build_seg, bcols, &b_segs, &b_cnts, &b_bytes);
+  if (st == Status::kSuccess) {
+    st = partition_side(pair.probe_seg, pcols, &p_segs, &p_cnts, &p_bytes);
+  }
+  if (st != Status::kSuccess) {
+    for (SpillSegmentId id : b_segs) { ctx->spill_store.DropSegment(id);
+}
+    for (SpillSegmentId id : p_segs) { ctx->spill_store.DropSegment(id);
+}
+    if (cache_ptr != nullptr) { cache_ptr->ReleaseAll();
+}
+    return st;
+  }
+  pending_pairs_.pop_back();
   ctx->spill_store.DropSegment(pair.build_seg);
-  pair.build_seg = kInvalidSpillSegmentId;
-  if (st != Status::kSuccess) {
-    ctx->spill_store.DropSegment(pair.probe_seg);
-    for (SpillSegmentId id : b_segs) {
-      ctx->spill_store.DropSegment(id);
-    }
-    return st;
-  }
-  st = partition_side(pair.probe_seg, pcols, &p_segs, &p_cnts, &p_bytes);
   ctx->spill_store.DropSegment(pair.probe_seg);
-  pair.probe_seg = kInvalidSpillSegmentId;
-  if (st != Status::kSuccess) {
-    for (SpillSegmentId id : b_segs) {
-      ctx->spill_store.DropSegment(id);
-    }
-    for (SpillSegmentId id : p_segs) {
-      ctx->spill_store.DropSegment(id);
-    }
-    return st;
-  }
 
   for (size_t i = fanout; i > 0; --i) {
     const size_t b = i - 1;
@@ -2191,12 +2272,15 @@ StatusOr<bool> OocAdaptiveHashProbeSource::NextBatch(PipelineContext* ctx,
                                                      DataChunk* out,
                                                      size_t max_rows) {
   out->Reset();
-  if (max_rows == 0) {
-    return false;
-  }
+  // Keep the invalid-call guard ahead of the empty-request fast path, like
+  // Open(): a spilled source with no pipeline context is an error even when
+  // the caller asks for zero rows, not a silent EOF.
   if (join_ctx_->spilled && ctx == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "spilled hash join requires a pipeline context");
+  }
+  if (max_rows == 0) {
+    return false;
   }
   if (!opened_) {
     RETURN_IF_FAIL(Open(ctx));
@@ -2210,7 +2294,7 @@ StatusOr<bool> OocAdaptiveHashProbeSource::NextBatch(PipelineContext* ctx,
         if (active_pair_cursor_->finished) {
           active_pair_cursor_.reset();
         }
-        if (out->Size() >= max_rows) {
+        if (!out->Empty()) {
           break;
         }
         continue;
@@ -2218,9 +2302,7 @@ StatusOr<bool> OocAdaptiveHashProbeSource::NextBatch(PipelineContext* ctx,
       if (pending_pairs_.empty()) {
         break;
       }
-      PendingJoinPair pair = pending_pairs_.back();
-      pending_pairs_.pop_back();
-      RETURN_IF_FAIL(OpenNextPartitionPair(ctx, pair));
+      RETURN_IF_FAIL(OpenNextPartitionPair(ctx, pending_pairs_.back()));
     }
     if (out->Empty()) {
       CleanupGracePairs();

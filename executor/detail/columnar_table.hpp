@@ -731,6 +731,14 @@ struct ColumnarColumn {
     strings.push_back(sv);
   }
 
+  // Keep the logical type available to schema consumers while storing each
+  // cell with its own runtime type.
+  void InitFallback(ValueType logical_type, size_t reserve_rows) {
+    Init(logical_type);
+    DemoteToFallback(0);
+    fallback.reserve(reserve_rows);
+  }
+
   void DemoteToFallback(size_t prev_rows) {
     if (encoding != Encoding::kFlat) {
       MaterializeToFlat(prev_rows);
@@ -1143,7 +1151,7 @@ struct ColumnarChunk {
     return dst;
   }
 
-  [[nodiscard]] size_t EstimatedBytes() const noexcept {
+  [[nodiscard]] size_t EstimatedBytes() const {
     size_t bytes = string_arena ? string_arena->allocated_bytes : 0;
     std::array<const ChunkGatherIndex*, 8> inline_gi{};
     size_t inline_count = 0;
@@ -1256,7 +1264,7 @@ struct ColumnarTable {
     }
   }
 
-  [[nodiscard]] size_t EstimatedBytes() const noexcept {
+  [[nodiscard]] size_t EstimatedBytes() const {
     size_t bytes = 0;
     for (const ColumnarChunk& chunk : chunks) {
       bytes += chunk.EstimatedBytes();

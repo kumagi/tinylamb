@@ -421,7 +421,15 @@ TEST_P(SqlSessionRegressionTest, ReplayCommittedRegressionFiles) {
   ReplayCommittedRegressionShard(GetParam(), kRegressionShards);
 }
 
+// Name the instances after the old Shard0..3 tests so ctest -R filters and
+// grep on the previous names still select (rather than silently skip) the
+// regression replay coverage.  The suite prefix changed to
+// RegressionShards/SqlSessionRegressionTest with the parameterized rewrite.
 INSTANTIATE_TEST_SUITE_P(RegressionShards, SqlSessionRegressionTest,
-                         ::testing::Range(size_t{0}, kRegressionShards));
+                         ::testing::Range(size_t{0}, kRegressionShards),
+                         [](const ::testing::TestParamInfo<size_t>& info) {
+                           return "ReplayCommittedRegressionFilesShard" +
+                                  std::to_string(info.param);
+                         });
 
 }  // namespace tinylamb

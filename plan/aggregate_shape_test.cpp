@@ -503,6 +503,34 @@ TEST_F(AggregateShapeTest, ReplacingANotNullColumnWithNullDoesNotRewriteCount) {
   EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
 }
 
+TEST_F(AggregateShapeTest, BareJoinColumnResolvesBeforeInferringEquality) {
+  const Schema left_schema(
+      "l", {Column("i", ValueType::kInt64), Column("j", ValueType::kInt64)});
+  const Schema right_schema("r", {Column("d", ValueType::kDouble)});
+  cascades::Memo memo;
+  memo.SetTableSchemas({{"l", left_schema}, {"r", right_schema}});
+  (void)memo.Build({"l", "r"});
+  const auto input = memo.EnsureDerivedGroup({"l", "r"}, "mixed_rows");
+  ASSERT_TRUE(memo.AddExpression(
+      input,
+      LogicalExpression{.operation = LogicalOperator::kValues,
+                        .values = {Row({Value(1), Value(1), Value(1.0)})},
+                        .output_schema = left_schema + right_schema}));
+  const auto filter = memo.EnsureDerivedGroup({"l", "r"}, "mixed_filter");
+  const Expression mixed = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kEquals, ColumnValueExp("r.d"));
+  const Expression same = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kEquals, ColumnValueExp("l.j"));
+  ASSERT_TRUE(memo.AddExpression(
+      filter, LogicalExpression{.operation = LogicalOperator::kSelection,
+                                .children = {input},
+                                .predicate = BinaryExpressionExp(
+                                    mixed, BinaryOperation::kAnd, same)}));
+  const auto& props = memo.Get(filter).logical_properties;
+  EXPECT_FALSE(props.AreEqual("i", "r.d"));
+  EXPECT_TRUE(props.AreEqual("i", "l.j"));
+}
+
 TEST_F(AggregateShapeTest, JoinFanoutDoesNotPreserveBasePrimaryKeyUniqueness) {
   cascades::Memo memo;
   const Schema left_schema("l", {Column("id", ValueType::kInt64,
@@ -722,6 +750,17 @@ TEST_F(AggregateShapeTest, TheLegacyScalarPayloadKeepsItsHistoricalShape) {
   EXPECT_EQ(stream.StrategyName(), "StreamAggregate");
 }
 
+TEST_F(AggregateShapeTest, NonAggregateDateItemKeepsDateOutputType) {
+  // A DATE-returning non-aggregate SELECT item must get the same schema type
+  // as a MIN/MAX aggregate over a DATE: the old catch-all to kInt64 made the
+  // plan's output schema disagree with the value the executor produced.
+  const std::vector<NamedExpression> aggregates = {
+      NamedExpression("d", ConstantValueExp(Value::Date("2020-01-01")))};
+  const HashAggregatePlan plan(Leaf(), aggregates);
+  ASSERT_EQ(plan.GetSchema().ColumnCount(), 1U);
+  EXPECT_EQ(plan.GetSchema().GetColumn(0).Type(), ValueType::kDate);
+}
+
 TEST_F(AggregateShapeTest, ParameterSlotsCoverKeysAggregatesAndHaving) {
   AggregatePayload payload;
   payload.group_keys.emplace_back(
@@ -799,6 +838,21 @@ TEST_F(AggregateShapeTest, OnlyTheOrderedShapesPromiseAnOrder) {
   EXPECT_FALSE(scalar->IsOrderedBy({K()}, ascending));
   EXPECT_FALSE(scalar->RequiresOrderedInput());
   EXPECT_TRUE(stream->RequiresOrderedInput());
+}
+
+TEST_F(AggregateShapeTest, OrderedShapesRejectAnAmbiguousKeyName) {
+  const auto left = ColumnValueExp(ColumnName("l", "k"));
+  const auto right = ColumnValueExp(ColumnName("r", "k"));
+  AggregatePayload payload{
+      .group_keys = {NamedExpression("k", right), NamedExpression("k", left)}};
+  const SortAggregatePlan sort(Leaf(), payload);
+  const StreamAggregatePlan stream(Leaf(), payload);
+  for (const AggregationPlan* plan :
+       std::vector<const AggregationPlan*>{&sort, &stream}) {
+    EXPECT_FALSE(plan->IsOrderedBy({K()}, {true}));
+    EXPECT_TRUE(plan->IsOrderedBy({right}, {true}));
+    EXPECT_FALSE(plan->IsOrderedBy({left}, {true}));
+  }
 }
 
 TEST_F(AggregateShapeTest, TheStreamShapesOrderIsACollatedOne) {
@@ -936,15 +990,16 @@ TEST_F(AggregateShapeTest, ExplainInfoCarriesTheRuleAndTheDeliveredOrdering) {
     EXPECT_EQ(info.rule_name, "aggregation");
     EXPECT_NE(info.required_properties.find("k ASC"), std::string::npos)
         << info.required_properties;
-    EXPECT_NE(info.provided_properties.find("k ASC"), std::string::npos)
+    const bool promises_order = info.physical_operator != "HashAggregate";
+    EXPECT_EQ(info.provided_properties.find("k ASC") != std::string::npos,
+              promises_order)
         << info.provided_properties;
     // The delivered order is what the shape promises, and only the two ordered
     // shapes promise it: a consumer that needs the group-key order gets it from
     // them for free, while the hash table makes the search pay for a sort.
     const bool ordered =
         alternative.plan->IsOrderedBy({key}, ascending, nulls_first);
-    EXPECT_EQ(ordered, info.physical_operator != "HashAggregate")
-        << info.physical_operator;
+    EXPECT_EQ(ordered, promises_order) << info.physical_operator;
   }
 }
 
@@ -1519,6 +1574,20 @@ TEST(TopNEmitRowCountTest, ZeroLimitWithTiesEstimatesZero) {
   EXPECT_EQ(TopNPlan(input, keys, 3, 0, true).EmitRowCount(), 10U);
   EXPECT_EQ(TopNPlan(input, keys, 3, 0, false).EmitRowCount(), 3U);
   EXPECT_EQ(TopNPlan(input, keys, 0, 4, true).EmitRowCount(), 0U);
+}
+
+TEST(TopNEmitRowCountTest, PriorOffsetIsIncludedInTheEstimate) {
+  const Plan input = LeafWith(std::vector<Row>(10));
+  const Expression key = ColumnValueExp(ColumnName("k"));
+  const std::vector<TopNKey> keys{{key, true, std::nullopt}};
+  // An outer LIMIT consumed 4 rows before this TopN applies its own offset 3.
+  EXPECT_EQ(TopNPlan(input, keys, /*limit=*/2, /*offset=*/3,
+                     /*with_ties=*/false, /*prior_offset=*/4)
+                .EmitRowCount(),
+            2U);
+  EXPECT_EQ(TopNPlan(input, keys, 5, 3, true, 4).EmitRowCount(), 3U);
+  // Total skip past the input must still yield zero.
+  EXPECT_EQ(TopNPlan(input, keys, 5, 8, false, 4).EmitRowCount(), 0U);
 }
 
 // T2668: keys carry NULLS placement into the order contract that

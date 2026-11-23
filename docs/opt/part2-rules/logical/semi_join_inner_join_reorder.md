@@ -40,7 +40,7 @@ if (semi_expr.operation != LogicalOperator::kSemiJoin ||
 1. 外側の式が `LogicalOperator::kJoin` であり、子ノード数が 2 であること。
 2. 左の子グループ（`semi_child`）内に、子ノード数 2 の `LogicalOperator::kSemiJoin` 式 `(R ⋉ S ON p1)` が存在すること。
 3. 外側の結合述語 `p2`（`expression.predicate`）が存在する場合、`p2` が参照する列がすべて `R` または `T` の関係に属すること（`S` の列を参照しないこと）。
-4. 派生グループ（`semi_inner_reorder_rt` タグ）が、探索対象グループ、`R`、`T` のいずれとも一致しないこと（自己参照ループ防止）。
+4. 派生グループ（タグ `"semi_inner_reorder_rt:" + GroupIdsTag({r_id, t_id}) + PredicateTag(expression.predicate)`）が、探索対象グループ、`R`、`T` のいずれとも一致しないこと（自己参照ループ防止）。同じ $(R,T)$ で異なる述語の semi join が混在しても子 ID と述語の指紋で隔離されます（D1 契約）。
 
 ```cpp
           if (expression.operation != LogicalOperator::kJoin ||
@@ -77,7 +77,7 @@ if (semi_expr.operation != LogicalOperator::kSemiJoin ||
 
 `plan/cascades.cpp` における変換処理は、派生グループの生成と多重登録の 2 段階で構成されます。
 
-1. `memo.EnsureDerivedGroup(UnionRelations(r_rels, t_rels), "semi_inner_reorder_rt")` により、`R` と `T` の関係集合を持つ中間グループ `rt_group` を確保します。
+1. `memo.EnsureDerivedGroup(UnionRelations(r_rels, t_rels), "semi_inner_reorder_rt:" + GroupIdsTag({r_id, t_id}) + PredicateTag(expression.predicate))` により、`R` と `T` の関係集合を持つ中間グループ `rt_group` を確保します。タグに子 ID と述語を含めるため、同じ $(R,T)$ への別述語の semi join が 1 つの派生グループに混ざりません。
 2. `rt_group` に対して、子を `{r_id, t_id}`、述語を `expression.predicate`（`p2`）とする `LogicalOperator::kJoin` 式を登録します。
 3. ルートグループ（元の結合グループ）に対して、子を `{rt_group, s_id}`、述語を半結合の述語 `semi_expr.predicate`（`p1`）とする `LogicalOperator::kSemiJoin` 式を登録します。
 4. `target_list` および `output_schema` は元の式から忠実に継承され、グループの出力スキーマ契約を維持します。

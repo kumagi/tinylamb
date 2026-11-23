@@ -27,6 +27,8 @@
 // change which rows a statement returns.  Every SQL case compares against a
 // plain full scan of an identical, index-free twin table, and the direct
 // executor cases compare against the same query over that twin.
+#include "executor/multi_index_covering_scan.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -174,13 +176,13 @@ class MultiIndexCoveringScanTest : public ::testing::Test {
     SqlEngine engine(*database_);
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return prepared.GetStatus();
     }
     *rows = Drain(prepared.Value().get());
     if (prepared.Value()->GetStatus() != Status::kSuccess) {
       const Status status = prepared.Value()->GetStatus();
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return status;
     }
     return context.PreCommit();
@@ -192,14 +194,14 @@ class MultiIndexCoveringScanTest : public ::testing::Test {
     StatusOr<Executor> prepared =
         engine.Prepare(context, "EXPLAIN " + std::string(sql));
     if (!prepared.HasValue()) {
-      context.Abort();
+      EXPECT_SUCCESS(context.Abort());
       return "ERROR: " + engine.LastError();
     }
     std::ostringstream text;
     for (const Row& row : Drain(prepared.Value().get())) {
       text << row[0] << "\n";
     }
-    context.Abort();
+    EXPECT_SUCCESS(context.Abort());
     return text.str();
   }
 
@@ -216,6 +218,24 @@ class MultiIndexCoveringScanTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> database_;
 };
+
+// A zero-key index (an INCLUDE-only index) has no leading key.  The
+// multi-index covering participant scan must skip it instead of calling
+// key_.front() on an empty vector; the bitmap-AND path applies the same guard.
+TEST_F(MultiIndexCoveringScanTest, ZeroKeyIndexIsSkippedAsCoveringParticipant) {
+  TransactionContext ctx = database_->BeginContext();
+  ASSERT_SUCCESS(database_->CreateIndex(
+      ctx, "parts", IndexSchema("IdxNoKey", {}, {2}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  // The predicate plus projection touches all three columns; no single index
+  // covers them, so the multi-index covering path enumerates every index --
+  // including the zero-key one that used to be dereferenced unconditionally.
+  std::vector<Row> rows;
+  ASSERT_SUCCESS(
+      Run("SELECT part, qty, region FROM parts WHERE part > 5", &rows));
+  EXPECT_FALSE(rows.empty());
+}
 
 // The chosen access path: the pair covers the predicate AND the projection,
 // no single index does, and the cost model prefers two index walks over a
@@ -372,8 +392,8 @@ TEST_F(MultiIndexCoveringScanTest, UpdatedRowsAreReadAtTheirNewImage) {
       Run("UPDATE parts_plain SET qty = 7 WHERE part = 100", &affected));
   EXPECT_EQ(SortedText(indexed),
             SortedText(Twin("part, qty, region", kRangePredicate)));
-  // The new value is the one served (part=100, qty=100 is now outside the
-  // qty range, so it must be gone from the answer entirely).
+  // The new value is the one served: qty=7 is outside the range, while the
+  // previous qty=100 was inside, so this row must now be gone from the answer.
   for (const Row& row : indexed) {
     if (row[0].value.int_value == 100) {
       EXPECT_EQ(row[1].value.int_value, 7);
@@ -474,6 +494,38 @@ TEST_F(MultiIndexCoveringScanTest, DirectExecutorMatchesTheFullScan) {
            "part >= 40 AND part < 320 AND region >= 200 "
            "AND region < 260");
   EXPECT_LT(rows.size(), only_part.size());
+}
+
+TEST_F(MultiIndexCoveringScanTest, TwoRangesOnOneIndexKeepBothGuardsLive) {
+  TransactionContext context = database_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, parts, database_->GetTable(context, "parts"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<TableStatistics>, stats,
+                              context.GetStats("parts"));
+
+  // Two participants naming the SAME index root used to receive the same
+  // move-only guard: the first move left the second one empty, although both
+  // IndexScanIterators consult their guard to decide whether the index gate is
+  // held. The factory must hand the duplicate a Borrowed() guard instead.
+  std::vector<BitmapIndexRange> ranges;
+  BitmapIndexRange first;
+  first.index = &parts.GetIndex(0);  // IdxPart
+  first.begin_key.emplace_back(kPartLo);
+  first.end_key.emplace_back(kPartHi);
+  ranges.push_back(std::move(first));
+  BitmapIndexRange second;
+  second.index = &parts.GetIndex(0);  // same root
+  second.begin_key.emplace_back(static_cast<int64_t>(kPartLo + 16));
+  second.end_key.emplace_back(kPartHi);
+  ranges.push_back(std::move(second));
+
+  Expression predicate = ConstantValueExp(Value(true));
+  MultiIndexCoveringScanPlan plan(parts, *stats, ranges, predicate, 64, 128);
+  Executor executor = plan.EmitExecutor(context);
+  auto* scan = dynamic_cast<MultiIndexCoveringScan*>(executor.get());
+  ASSERT_NE(scan, nullptr);
+  EXPECT_TRUE(scan->AllGuardsHoldLocks());
+  EXPECT_FALSE(Drain(executor.get()).empty());
+  ASSERT_SUCCESS(context.PreCommit());
 }
 
 }  // namespace

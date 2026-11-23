@@ -37,7 +37,7 @@ TEST_F(QueryTest, InnerPrefixPullupFiresForSafeUsingJoin) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(1), Value(10), Value(100), Value(100)}));
   EXPECT_EQ(rows[1], Row({Value(2), Value(20), Value(200), Value(100)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, InnerPrefixPullupRefusesUsingColumnReadAcrossSwap) {
@@ -68,7 +68,7 @@ TEST_F(QueryTest, InnerPrefixPullupRefusesUsingColumnReadAcrossSwap) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(10), Value(100), Value(100)}));
   EXPECT_EQ(rows[1], Row({Value(20), Value(200), Value(100)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

@@ -2,9 +2,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -96,6 +98,29 @@ TEST(ChunkCodecTest, RoundTripsTypedNullHeteroPositionsAndLargeStrings) {
   EXPECT_FALSE(has_chunk.Value());
 }
 
+TEST(ChunkCodecTest, HeteroColumnRejectsOutOfRangeCollationBits) {
+  // The collation field is present in every column header, including
+  // heterogeneous frames whose values carry per-value tags; an out-of-range
+  // value (3) must be rejected as corrupt rather than silently ignored.
+  DataChunk chunk;
+  chunk.Append(Row({Value(int64_t{1})}), RowPosition());
+  chunk.Append(Row({Value(int64_t{2})}), RowPosition());
+  chunk.ColumnAt(0).SetAllowHeterogeneous(true);
+  chunk.Append(Row({Value("mixed")}), RowPosition());
+
+  std::string encoded;
+  ASSERT_EQ(EncodeDataChunk(chunk, &encoded), Status::kSuccess);
+  ASSERT_GT(encoded.size(), 10U);
+  // Header: u32 rows + u32 cols + u8 has_positions = 9 bytes; column 0 then
+  // stores raw_type at [9] and flags at [10].
+  encoded[10] = static_cast<char>(encoded[10] | 0x60);  // collation bits = 3
+
+  std::string_view sv(encoded);
+  DataChunk decoded;
+  const Status st = DecodeDataChunk(&sv, &decoded);
+  EXPECT_EQ(st.GetCode(), StatusCode::kCorrupt);
+}
+
 TEST(ChunkCodecTest, NullOnlySliceRetainsColumnCollation) {
   DataChunk source;
   source.Append(Row({Value("Alpha").WithCollation(
@@ -117,6 +142,61 @@ TEST(ChunkCodecTest, NullOnlySliceRetainsColumnCollation) {
   EXPECT_EQ(decoded.ColumnAt(0).Type(), ValueType::kVarChar);
   EXPECT_TRUE(decoded.ColumnAt(0).IsNull(0));
   EXPECT_EQ(decoded.ColumnAt(0).ColumnCollation(), Collation::kCaseInsensitive);
+}
+
+TEST(ChunkCodecTest, DecodeFailureClearsPartialColumnsAndPreservesInput) {
+  DataChunk chunk;
+  chunk.Append(Row({Value(7), Value("truncated string")}));
+  std::string encoded;
+  ASSERT_EQ(EncodeDataChunk(chunk, &encoded), Status::kSuccess);
+  encoded.pop_back();
+  std::string_view payload(encoded);
+  DataChunk output;
+  output.Append(Row({Value(99)}));
+
+  EXPECT_EQ(DecodeDataChunk(&payload, &output), StatusCode::kCorrupt);
+  EXPECT_EQ(payload, std::string_view(encoded));
+  EXPECT_EQ(output.Size(), 0U);
+  EXPECT_EQ(output.ColumnCount(), 0U);
+}
+
+TEST(ChunkCodecTest, EncodeAppendsAndDecodeConsumesExactlyOneChunk) {
+  DataChunk first;
+  first.Append(Row({Value(1)}));
+  DataChunk second;
+  second.Append(Row({Value("two")}));
+  const std::string prefix = "prefix";
+  std::string encoded = prefix;
+  ASSERT_EQ(EncodeDataChunk(first, &encoded), Status::kSuccess);
+  ASSERT_EQ(EncodeDataChunk(second, &encoded), Status::kSuccess);
+  ASSERT_TRUE(encoded.starts_with(prefix));
+
+  std::string_view payload(encoded);
+  payload.remove_prefix(prefix.size());
+  DataChunk output;
+  ASSERT_EQ(DecodeDataChunk(&payload, &output), Status::kSuccess);
+  EXPECT_EQ(output.RowAt(0), first.RowAt(0));
+  ASSERT_EQ(DecodeDataChunk(&payload, &output), Status::kSuccess);
+  EXPECT_EQ(output.RowAt(0), second.RowAt(0));
+  EXPECT_TRUE(payload.empty());
+}
+
+TEST(ChunkCodecTest, RejectsShortVarcharColumnBeforeEstimatingFrameSize) {
+  DataChunk chunk;
+  chunk.Append(Row({Value(1), Value("first")}));
+  chunk.Append(Row({Value(2), Value("second")}));
+  chunk.ColumnAt(1).Reset();
+
+  std::string encoded = "prefix";
+  EXPECT_EQ(EncodeDataChunk(chunk, &encoded), StatusCode::kInvalidArgument);
+  EXPECT_EQ(encoded, "prefix");
+
+  TempDirGuard dir("ooc_chunk_short_column");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  SpillSegmentWriter writer(&store, 4096);
+  EXPECT_EQ(WriteDataChunk(&writer, chunk, nullptr, 4096),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(writer.BytesWritten(), 0U);
 }
 
 TEST(ChunkCodecTest, NullColumnsRoundTripWithoutPositions) {
@@ -201,6 +281,34 @@ TEST(ChunkCodecTest, WriteSplitsOversizedChunkIntoBoundedFrames) {
     }
   }
   EXPECT_EQ(seen, 200U);
+}
+
+TEST(ChunkCodecTest, AppliesTheSameRowLimitWhenEncodingAndDecoding) {
+  constexpr size_t kFrameRows = 1U << 22;
+  DataChunk chunk;
+  chunk.CommitBatchAppend(kFrameRows + 1);
+  std::string encoded = "prefix";
+  EXPECT_EQ(EncodeDataChunk(chunk, &encoded), StatusCode::kTooBigData);
+  EXPECT_EQ(encoded, "prefix");
+
+  TempDirGuard dir("ooc_chunk_row_limit");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  SpillSegmentWriter writer(&store, 4096);
+  ASSERT_EQ(WriteDataChunk(&writer, chunk), Status::kSuccess);
+  const auto segment = writer.Finish();
+  ASSERT_TRUE(segment.HasValue());
+
+  SpillSegmentReader reader(&store, segment.Value(), 4096);
+  DataChunk decoded;
+  auto has_frame = ReadDataChunk(&reader, &decoded);
+  ASSERT_TRUE(has_frame.HasValue() && has_frame.Value());
+  EXPECT_EQ(decoded.Size(), kFrameRows);
+  has_frame = ReadDataChunk(&reader, &decoded);
+  ASSERT_TRUE(has_frame.HasValue() && has_frame.Value());
+  EXPECT_EQ(decoded.Size(), 1U);
+  has_frame = ReadDataChunk(&reader, &decoded);
+  ASSERT_TRUE(has_frame.HasValue());
+  EXPECT_FALSE(has_frame.Value());
 }
 
 TEST(SpillableStoreTest, RowLargerThanBudgetSpillsWithoutFullFrameDup) {
@@ -325,7 +433,9 @@ TEST(SpillableStoreTest, SpillsOverBudgetAndCleansUpOnReset) {
   constexpr size_t kLimit = 64ULL << 20;
   mb.ResetForTest(kLimit, kLimit, kLimit, false);
   QueryMemoryCoordinator coord(&mb);
-  auto grant = coord.AcquireGrant(512ULL << 10, 512ULL << 10).MoveValue();
+  auto grant_or = coord.AcquireGrant(512ULL << 10, 512ULL << 10);
+  ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+  auto grant = grant_or.MoveValue();
 
   {
     SpillableStore sstore(SpillableStore::Options{
@@ -402,9 +512,12 @@ TEST(OocPrimitivesSorterTest, InMemoryFastPathAndTopNBoundedHeap) {
 
   std::vector<Row> out;
   Row r;
-  while (sorter.NextRow(&r).Value()) {
+  StatusOr<bool> next = sorter.NextRow(&r);
+  while (next.HasValue() && next.Value()) {
     out.push_back(r);
+    next = sorter.NextRow(&r);
   }
+  ASSERT_EQ(next.GetStatus(), Status::kSuccess);
   ASSERT_EQ(out.size(), 4U);
   // NULLS FIRST for col 1 puts ("alpha", NULL) before ("Alpha", 2).
   EXPECT_TRUE(out[0][1].IsNull());
@@ -428,9 +541,12 @@ TEST(OocPrimitivesSorterTest, InMemoryFastPathAndTopNBoundedHeap) {
   EXPECT_FALSE(topn.Spilled());
   EXPECT_EQ(store.Stats().open_fds, 0);
   int64_t expected = 1;
-  while (topn.NextRow(&r).Value()) {
+  StatusOr<bool> topn_has = topn.NextRow(&r);
+  while (topn_has.HasValue() && topn_has.Value()) {
     EXPECT_EQ(r[0].AsInt64(), expected++);
+    topn_has = topn.NextRow(&r);
   }
+  ASSERT_EQ(topn_has.GetStatus(), Status::kSuccess);
   EXPECT_EQ(expected, 16);
 }
 
@@ -483,6 +599,44 @@ TEST(OocPrimitivesSorterTest, MultiPassExternalMergeUnderTightBudget) {
 // insertion order and stable-sorted, so a fully-tied input must merge out in
 // original insertion order (global sort stability across runs).  The old
 // binary heap over Rows broke ties by heap sifting, not by run order.
+TEST(OocPrimitivesSorterTest, FinishRetriesAfterAnIntermediateGroupWasMerged) {
+  TempDirGuard dir("ooc_sort_retry");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  bool retried_partial_pass = false;
+  for (unsigned fault = 1; fault < 64 && !retried_partial_pass; ++fault) {
+    ExternalSorter sorter(ExternalSorter::Options{
+        .spill_store = &store, .memory_budget_bytes = 1,
+        .keys = {OocSortKey{.column_index = 0}}, .limit = 8});
+    for (int key = 9; key > 0; --key) {
+      ASSERT_EQ(sorter.AddRow(Row({Value(key)})), Status::kSuccess);
+    }
+    const auto before = sorter.SpilledBytes();
+    auto& budget = ProcessMemoryBudget::Global();
+    budget.SetTestSpillIoFailCountdown(fault);
+    const auto failed = sorter.Finish();
+    budget.SetTestSpillIoFailCountdown(0);
+    if (failed == Status::kSuccess || before == sorter.SpilledBytes()) {
+      continue;
+    }
+    ASSERT_EQ(failed, Status::kIOError);
+    ASSERT_EQ(sorter.Finish(), Status::kSuccess);
+    Row row;
+    for (int expected = 1; expected <= 8; ++expected) {
+      auto next = sorter.NextRow(&row);
+      ASSERT_TRUE(next.HasValue() && next.Value());
+      EXPECT_EQ(row, Row({Value(expected)}));
+    }
+    for (int i = 0; i < 2; ++i) {
+      const auto end = sorter.NextRow(&row);
+      ASSERT_TRUE(end.HasValue());
+      EXPECT_FALSE(end.Value());
+      EXPECT_EQ(store.Stats().live_segments, 0U);
+    }
+    retried_partial_pass = true;
+  }
+  EXPECT_TRUE(retried_partial_pass);
+}
+
 TEST(OocPrimitivesSorterTest, WideRowsRoundTripUnderSmallBudget) {
   TempDirGuard dir("ooc_sorter_wide");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
@@ -498,11 +652,17 @@ TEST(OocPrimitivesSorterTest, WideRowsRoundTripUnderSmallBudget) {
   ASSERT_EQ(sorter.Finish(), Status::kSuccess);
   EXPECT_TRUE(sorter.Spilled());
   Row row;
-  ASSERT_TRUE(sorter.NextRow(&row).Value());
+  auto first = sorter.NextRow(&row);
+  ASSERT_EQ(first.GetStatus(), Status::kSuccess);
+  ASSERT_TRUE(first.Value());
   EXPECT_EQ(row, small);
-  ASSERT_TRUE(sorter.NextRow(&row).Value());
+  auto second = sorter.NextRow(&row);
+  ASSERT_EQ(second.GetStatus(), Status::kSuccess);
+  ASSERT_TRUE(second.Value());
   EXPECT_EQ(row, large);
-  EXPECT_FALSE(sorter.NextRow(&row).Value());
+  auto end = sorter.NextRow(&row);
+  ASSERT_EQ(end.GetStatus(), Status::kSuccess);
+  EXPECT_FALSE(end.Value());
 }
 
 TEST(OocPrimitivesSorterTest, CrossRunTieOrderIsStreamStable) {
@@ -527,12 +687,15 @@ TEST(OocPrimitivesSorterTest, CrossRunTieOrderIsStreamStable) {
   EXPECT_GE(sorter.RunCount(), 4U);
   Row r;
   int64_t next_payload = 0;
-  while (sorter.NextRow(&r).Value()) {
+  StatusOr<bool> has = sorter.NextRow(&r);
+  while (has.HasValue() && has.Value()) {
     const std::string_view payload = r[1].AsStringView();
     const int64_t idx = std::strtoll(std::string(payload).c_str(), nullptr, 10);
     EXPECT_EQ(idx, next_payload++)
         << "row " << next_payload - 1 << " lost run-order stability";
+    has = sorter.NextRow(&r);
   }
+  ASSERT_EQ(has.GetStatus(), Status::kSuccess);
   EXPECT_EQ(next_payload, kRows);
   EXPECT_EQ(store.Stats().live_segments, 0U);
 }
@@ -601,6 +764,16 @@ TEST(OocPrimitivesSorterTest, FaultInjectionAndTempLimitCleanUpAllSegments) {
   }
 }
 
+TEST(RecursivePartitionerTest, WriterBuffersFitSmallOperatorBudgets) {
+  for (size_t budget : {size_t{1}, size_t{8192}, size_t{16384}, size_t{32768},
+                        size_t{524288}}) {
+    size_t writer_bytes = 0;
+    const uint32_t bits =
+        RecursivePartitioner::ComputeFanoutBits(budget, &writer_bytes);
+    EXPECT_LE((size_t{1} << bits) * writer_bytes, budget / 2) << budget;
+  }
+}
+
 TEST(RecursivePartitionerTest, RejectsUseAfterSpillStoreDestruction) {
   auto store = std::make_unique<SpillStore>();
   auto partitioner = std::make_unique<RecursivePartitioner>(
@@ -614,6 +787,37 @@ TEST(RecursivePartitionerTest, RejectsUseAfterSpillStoreDestruction) {
   EXPECT_NE(partitioner->Finalize(&result), Status::kSuccess);
   EXPECT_NE(partitioner->AddRow(Row({Value(2)})), Status::kSuccess);
   partitioner.reset();  // writer cleanup must not access the dead store
+}
+
+TEST(RecursivePartitionerTest, ThrowingHashFunctionSurfacesAsStatus) {
+  auto throwing_hash = [](const Row&) -> uint64_t {
+    throw std::runtime_error("hash boom");
+  };
+  TempDirGuard dir("ooc_part_throw");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+
+  // Spilled AddRow path: hashing runs after TransitionToSpill.
+  {
+    RecursivePartitioner part(
+        RecursivePartitioner::Options{.spill_store = &store,
+                                      .memory_budget_bytes = 64ULL << 10,
+                                      .force_spill = true},
+        throwing_hash);
+    EXPECT_EQ(part.AddRow(Row({Value(1)})).GetCode(),
+              StatusCode::kRuntimeError);
+  }
+  // TransitionToSpill path: rows buffered in memory are hashed during the
+  // spill transition; a throwing hash_fn_ must surface as a Status, not an
+  // exception crossing the Status boundary.
+  {
+    RecursivePartitioner part(
+        RecursivePartitioner::Options{.spill_store = &store,
+                                      .memory_budget_bytes = 4096},
+        throwing_hash);
+    ASSERT_EQ(part.AddRow(Row({Value(1)})), Status::kSuccess);
+    EXPECT_EQ(part.AddRow(Row({Value(std::string(8192, 'x'))})).GetCode(),
+              StatusCode::kRuntimeError);
+  }
 }
 
 TEST(RecursivePartitionerTest, UniformKeysReachDepth3AndReconstructAllRows) {
@@ -818,9 +1022,67 @@ TEST(RecursivePartitionerTest, FaultInjectionDropsPartialBucketsCleanly) {
     mem.SetTestSpillIoFailCountdown(2);
     const Status st = part.Finalize(&leaves);
     EXPECT_EQ(st.GetCode(), StatusCode::kIOError);
+    EXPECT_TRUE(leaves.leaves.empty());
+    part.Reset();
     EXPECT_EQ(store.Stats().live_segments, 0U);
   }
   EXPECT_EQ(store.Stats().current_active_bytes, 0U);
+}
+
+TEST(RecursivePartitionerTest, FinalizeRetriesFailedRootWriteAndSplitRead) {
+  for (uint64_t fail_io : {1, 2}) {
+    SCOPED_TRACE(fail_io);
+    TempDirGuard dir("ooc_part_finalize_retry");
+    SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+    RecursivePartitioner part(
+        RecursivePartitioner::Options{.spill_store = &store,
+                                      .memory_budget_bytes = 16ULL << 10,
+                                      .force_spill = true},
+        [](const Row& row) {
+          const auto id = static_cast<uint64_t>(row[0].AsInt64());
+          return id == 3 ? id << 62 : id << 60;
+        });
+    const std::string payload(static_cast<size_type>(9 * 1024), 'x');
+    for (int64_t id : {0, 1, 3}) {
+      ASSERT_EQ(part.AddRow(Row({Value(id), Value(std::string(payload))})),
+                Status::kSuccess);
+    }
+
+    PartitionLeafSet leaves;
+    leaves.leaves.emplace_back().row_count = 99;
+    auto& budget = ProcessMemoryBudget::Global();
+    struct ResetSpillIoFailure {
+      ProcessMemoryBudget& budget;
+      ~ResetSpillIoFailure() { budget.SetTestSpillIoFailCountdown(0); }
+    } reset_spill_io_failure{budget};
+    // The large bucket is already written. Fail the small bucket's write
+    // or the first read of the large bucket after completing the small leaf.
+    budget.SetTestSpillIoFailCountdown(fail_io);
+    const Status failed = part.Finalize(&leaves);
+    ASSERT_EQ(failed.GetCode(), StatusCode::kIOError);
+    EXPECT_NE(failed.GetMessage().find(fail_io == 1 ? "write" : "read"),
+              std::string::npos);
+    ASSERT_EQ(leaves.leaves.size(), 1U);
+    EXPECT_EQ(leaves.leaves.front().row_count, 99U);
+    EXPECT_EQ(part.AddRow(Row({Value(4)})), StatusCode::kInvalidArgument);
+
+    ASSERT_EQ(part.Finalize(&leaves), Status::kSuccess);
+    std::vector<int64_t> ids;
+    for (const PartitionLeaf& leaf : leaves.leaves) {
+      ASSERT_EQ(RecursivePartitioner::ReadLeafRows(
+                    &store, leaf,
+                    [&](Row&& row) {
+                      EXPECT_EQ(row[1].AsStringView(), payload);
+                      ids.push_back(row[0].AsInt64());
+                      return Status::kSuccess;
+                    }),
+                Status::kSuccess);
+    }
+    std::ranges::sort(ids);
+    EXPECT_EQ(ids, (std::vector<int64_t>{0, 1, 3}));
+    leaves.DropAll();
+    EXPECT_EQ(store.Stats().live_segments, 0U);
+  }
 }
 
 TEST(OocPrimitivesSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
@@ -862,9 +1124,12 @@ TEST(OocPrimitivesSorterTest, ShouldSkipTopKChunkRowRespectsCutoffs) {
   ASSERT_EQ(sorter.Finish(), Status::kSuccess);
   Row out;
   std::vector<int64_t> actual;
-  while (sorter.NextRow(&out).Value()) {
+  StatusOr<bool> has = sorter.NextRow(&out);
+  while (has.HasValue() && has.Value()) {
     actual.push_back(out[0].AsInt64());
+    has = sorter.NextRow(&out);
   }
+  ASSERT_EQ(has.GetStatus(), Status::kSuccess);
   EXPECT_EQ(actual, (std::vector<int64_t>{40, 30, 25}));
 }
 
@@ -881,7 +1146,9 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
   } guard(&mb);
   mb.ResetForTest(64ULL << 20, 64ULL << 20, 64ULL << 20, false);
   QueryMemoryCoordinator coord(&mb);
-  auto grant = coord.AcquireGrant(64ULL << 10, 64ULL << 10).MoveValue();
+  auto grant_or = coord.AcquireGrant(64ULL << 10, 64ULL << 10);
+  ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+  auto grant = grant_or.MoveValue();
 
   // Another concurrent consumer holds almost all of the grant.
   ASSERT_TRUE(grant.TryConsume(60ULL << 10));
@@ -907,13 +1174,45 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
     ASSERT_EQ(sstore.ResetCursor(), Status::kSuccess);
     int64_t count = 0;
     Row out;
-    while (sstore.NextRow(&out).Value()) {
+    StatusOr<bool> has = sstore.NextRow(&out);
+    while (has.HasValue() && has.Value()) {
       ++count;
+      has = sstore.NextRow(&out);
     }
+    ASSERT_EQ(has.GetStatus(), Status::kSuccess);
     EXPECT_EQ(count, 17);
   }
   grant.ReleaseConsumed(60ULL << 10);
   EXPECT_EQ(grant.UsedBytes(), 0U);
+}
+
+TEST(SpillableStoreTest, FailedStagingFlushRetainsChargeAndRows) {
+  TempDirGuard dir("staging_flush_charge");
+  SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
+  auto& budget = ProcessMemoryBudget::Global();
+  QueryMemoryCoordinator coord(&budget);
+  auto acquired = coord.AcquireGrant(256ULL << 10, 256ULL << 10);
+  ASSERT_TRUE(acquired.HasValue());
+  auto grant = acquired.MoveValue();
+  SpillableStore rows({.spill_store = &store, .memory_budget_bytes = 256ULL << 10,
+                       .grant = &grant, .io_buffer_bytes = 0, .force_spill = true});
+  const Row expected({Value(std::string(8192, 'x'))});
+  ASSERT_EQ(rows.AppendRow(expected), Status::kSuccess);
+  const auto before = grant.UsedBytes();
+  ASSERT_GT(before, 0U);
+  budget.SetTestSpillIoFailCountdown(1);
+  const Status st = rows.Seal();
+  budget.SetTestSpillIoFailCountdown(0);
+  ASSERT_EQ(st, Status::kIOError);
+  EXPECT_EQ(grant.UsedBytes(), before);
+  ASSERT_EQ(rows.Seal(), Status::kSuccess);
+  Row row;
+  const auto first = rows.NextRow(&row);
+  ASSERT_TRUE(first.HasValue() && first.Value());
+  EXPECT_EQ(row, expected);
+  const auto end = rows.NextRow(&row);
+  ASSERT_TRUE(end.HasValue());
+  EXPECT_FALSE(end.Value());
 }
 
 TEST(SpillableStoreTest, SpilledRowsChargeGrantOrFlushImmediately) {
@@ -926,7 +1225,9 @@ TEST(SpillableStoreTest, SpilledRowsChargeGrantOrFlushImmediately) {
   } guard{&mb};
   mb.ResetForTest(64ULL << 20, 64ULL << 20, 64ULL << 20, false);
   QueryMemoryCoordinator coord(&mb);
-  auto grant = coord.AcquireGrant(64ULL << 10, 64ULL << 10).MoveValue();
+  auto grant_or = coord.AcquireGrant(64ULL << 10, 64ULL << 10);
+  ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+  auto grant = grant_or.MoveValue();
   {
     SpillableStore sstore(SpillableStore::Options{
         .spill_store = &store,
@@ -946,11 +1247,19 @@ TEST(SpillableStoreTest, SpilledRowsChargeGrantOrFlushImmediately) {
     ASSERT_EQ(sstore.Seal(), Status::kSuccess);
     ASSERT_EQ(sstore.ResetCursor(), Status::kSuccess);
     Row out;
-    ASSERT_TRUE(sstore.NextRow(&out).Value());
-    ASSERT_TRUE(sstore.NextRow(&out).Value());
-    ASSERT_TRUE(sstore.NextRow(&out).Value());
+    auto row1 = sstore.NextRow(&out);
+    ASSERT_EQ(row1.GetStatus(), Status::kSuccess);
+    ASSERT_TRUE(row1.Value());
+    auto row2 = sstore.NextRow(&out);
+    ASSERT_EQ(row2.GetStatus(), Status::kSuccess);
+    ASSERT_TRUE(row2.Value());
+    auto row3 = sstore.NextRow(&out);
+    ASSERT_EQ(row3.GetStatus(), Status::kSuccess);
+    ASSERT_TRUE(row3.Value());
     EXPECT_TRUE(out[0].AsStringView() == large);
-    EXPECT_FALSE(sstore.NextRow(&out).Value());
+    auto end = sstore.NextRow(&out);
+    ASSERT_EQ(end.GetStatus(), Status::kSuccess);
+    EXPECT_FALSE(end.Value());
   }
   EXPECT_EQ(grant.UsedBytes(), 0U);
 }
@@ -982,7 +1291,9 @@ TEST(RecursivePartitionerTest,
   } guard(&mb);
   mb.ResetForTest(64ULL << 20, 64ULL << 20, 64ULL << 20, false);
   QueryMemoryCoordinator coord(&mb);
-  auto grant = coord.AcquireGrant(2ULL << 20, 2ULL << 20).MoveValue();
+  auto grant_or = coord.AcquireGrant(2ULL << 20, 2ULL << 20);
+  ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+  auto grant = grant_or.MoveValue();
 
   PartitionLeafSet leaves;
   RecursivePartitioner part(
@@ -1041,7 +1352,9 @@ TEST(OocPrimitivesSorterTest,
   } guard(&mb);
   mb.ResetForTest(64ULL << 20, 64ULL << 20, 64ULL << 20, false);
   QueryMemoryCoordinator coord(&mb);
-  auto grant = coord.AcquireGrant(256ULL << 10, 256ULL << 10).MoveValue();
+  auto grant_or = coord.AcquireGrant(256ULL << 10, 256ULL << 10);
+  ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+  auto grant = grant_or.MoveValue();
 
   ExternalSorter sorter(ExternalSorter::Options{
       .spill_store = &store,
@@ -1067,11 +1380,17 @@ TEST(OocPrimitivesSorterTest,
 
   ASSERT_EQ(sorter.Finish(), Status::kSuccess);
   Row out;
-  ASSERT_TRUE(sorter.NextRow(&out).Value());
+  auto first = sorter.NextRow(&out);
+  ASSERT_EQ(first.GetStatus(), Status::kSuccess);
+  ASSERT_TRUE(first.Value());
   EXPECT_EQ(out[0].AsInt64(), 1);
-  ASSERT_TRUE(sorter.NextRow(&out).Value());
+  auto second = sorter.NextRow(&out);
+  ASSERT_EQ(second.GetStatus(), Status::kSuccess);
+  ASSERT_TRUE(second.Value());
   EXPECT_EQ(out[0].AsInt64(), 2);
-  EXPECT_FALSE(sorter.NextRow(&out).Value());
+  auto end = sorter.NextRow(&out);
+  ASSERT_EQ(end.GetStatus(), Status::kSuccess);
+  EXPECT_FALSE(end.Value());
 }
 
 }  // namespace

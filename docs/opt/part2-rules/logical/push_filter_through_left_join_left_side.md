@@ -32,22 +32,23 @@ graph TD
 パターンは `Selection(OuterJoin(Any("left"), Any("right"), "join"))` です。
 DSL の `LeftOuterJoin`(型をパターンで固定するヘルパー)ではなく素の
 `OuterJoin` を使っており、**join_type の検査は変換ラムダ側**で行います。
-guard は次の 6 つです。
+guard は次の 7 つです。
 
 1. 述語を持つこと(`!expression.predicate` で早期 return)。
-2. 左子グループのリレーション集合が空でないこと。
-3. 述語が左側リレーション **のみ** を参照すること —
+2. 不動点ガード: join グループのタグが `"left-join-filtered-join:"` で始まるなら、すでに本 Rule が押し込んだ面上なので再帰的な派生を防ぐため早期 return します(cascades.cpp の `memo.Get(bindings.at("join")).tag.starts_with("left-join-filtered-join:")`)。これを外すと同じ Selection が何度もマッチして無限に派生グループが生成されます。
+3. 左子グループのリレーション集合が空でないこと。
+4. 述語が左側リレーション **のみ** を参照すること —
    `ReferencesOnly(pred, left_relations)`。この関数は触れる全列が
    「修飾名であり、かつ指定リレーション集合に含まれる」ことを要求します
    (`expression/rewrite.cpp` の `ReferencesOnly`。述語が空の場合は真を
    返しますが、本 Rule は手順 1 で述語の存在を先に検査しているため、
    実質的に列参照の検査として働きます)。
-4. join グループ内の `kOuterJoin` かつ子 2 個の代替が **すべて**
+5. join グループ内の `kOuterJoin` かつ子 2 個の代替が **すべて**
    `join_type == 0`(LEFT)で、かつ子のリレーション集合が `left` / `right`
    のキャプチャと一致すること。一致しない代替が 1 つでもあれば全体を拒否
    します(下記の D5 的な漏れ防止)。
-5. 上記を満たす LEFT 型の join 代替を集めた `guarded_joins` が空でないこと。
-6. 派生グループ `filtered_left` が左グループ自身でも外側グループでも
+6. 上記を満たす LEFT 型の join 代替を集めた `guarded_joins` が空でないこと。
+7. 派生グループ `filtered_left` が左グループ自身でも外側グループでも
    ないこと(循環防止)。
 
 ```cpp
@@ -83,8 +84,8 @@ guard は次の 6 つです。
   という経路が消えるだけで、最終的な行集合は同じです。逆に RIGHT /
   FULL では左側は NULL を **供給される** 側であり、先に弾くと「マッチ
   しなかった右行を NULL 補完した出力行」そのものを消してしまいます。
-  これが手順 4(join_type == 0 のみを集め、異なる向きの代替が混ざれば全体を
-  拒む)の理由です。コードコメントが述べるとおり、グループが複数の
+  これが手順 5（`join_type == 0` の代替だけを認め、異なる向きの代替が
+  混ざれば全体を拒む）の理由です。コードコメントが述べるとおり、グループが複数の
   outer-join 代替(RIGHT は反転した LEFT に正規化、FULL は分解される)を
   持つ場合、左スキャングループの filter はそれら全てに共有されるため、
   1 つでも向きの違う代替があれば押し込みを諦めます(そうでないと
@@ -103,9 +104,10 @@ guard は次の 6 つです。
 変換は 3 段階です。まず左入力用の派生グループに Selection を置きます。
 
 ```cpp
-          const GroupId filtered_left =
-              memo.EnsureDerivedGroup(memo.Get(bindings.at("left")).relations,
-                                      "left-join-filter:" + pred->ToString());
+          const GroupId filtered_left = memo.EnsureDerivedGroup(
+              memo.Get(bindings.at("left")).relations,
+              "left-join-filter:" + GroupIdsTag({bindings.at("left")}) +
+                  pred->ToString());
           if (filtered_left == bindings.at("left") || filtered_left == group) {
             return;
           }
@@ -118,8 +120,10 @@ guard は次の 6 つです。
 
 派生グループ(左グループそのもの)に追加すると自己参照式になるため、
 必ず派生側に置きます(コメント "adding it into the left group itself would
-be a self-referencing expression")。次に、LEFT 型の join 代替を
-フィルタ済み左入力で組み替えます。
+be a self-referencing expression")。タグには述語文字列に加えて左 Group の ID
+(`GroupIdsTag({bindings.at("left")})`)が入ります。これにより、同じ述語を持つ
+異なる left Group が派生グループを共有して別分岐のフィルタが混入するのを
+防ぎます(D1)。次に、LEFT 型の join 代替をフィルタ済み左入力で組み替えます。
 
 ```cpp
           for (const LogicalExpression& join : guarded_joins) {
@@ -127,7 +131,7 @@ be a self-referencing expression")。次に、LEFT 型の join 代替を
             // condition stays the original one: the Selection predicate is a
             // row filter on the left side, not an ON-clause conjunct.
             memo.AddExpression(
-                bindings.at("join"),
+                filtered_join,
                 LogicalExpression{
                     .operation = LogicalOperator::kOuterJoin,
                     .children = {filtered_left, bindings.at("right")},
@@ -136,7 +140,7 @@ be a self-referencing expression")。次に、LEFT 型の join 代替を
           }
 ```
 
-最後に、元の Selection を外側グループにそのまま足します(コメント
+再構成した OuterJoin は Group ID を含むタグで作った専用の `filtered_join` Group に加えます。最後に、元の Selection を外側グループに足します(コメント
 "Wrap with the original Selection (idempotent, keeps the plan shape stable
 while the join alternative below carries the push)")。押し込んだ述語は
 結合後にもう一度評価されますが冪等なので意味は変わらず、プラン形の
@@ -159,8 +163,7 @@ while the join alternative below carries the push)")。押し込んだ述語は
   (`kJoin`)限定の押し込み。outer join はこちらの専用 Rule が扱います。
 - `outer_to_inner_join_on_null_rejecting_filter`: 述語が NULL を棄却する
   ことを証明できた場合に outer join を inner join に縮む Rule(第2部
-  H 分類)。inner join に変わったあとは `split_selection_over_join` の
-  対象になります。
+  H 分類)。inner join に変わったあとは同 Rule の対象になります。
 
 ## 検証テスト
 

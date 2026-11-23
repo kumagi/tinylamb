@@ -33,7 +33,7 @@ void* operator new(std::size_t bytes) {
 }
 
 void operator delete(void* ptr) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t /*unused*/) noexcept { std::free(ptr); }
 
 namespace tinylamb {
 namespace {

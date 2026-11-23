@@ -45,6 +45,71 @@ PaxChunk AuditSingleColumnChunk(Scheme scheme, uint16_t rows,
   return {std::move(data), std::move(footer)};
 }
 
+TEST(PaxChunkCodecsTest, ForByteRandomAccessHandlesTheLastOffset) {
+  using namespace pax_detail;
+  std::vector<char> region;
+  AppendBE64(region, static_cast<uint64_t>(-20));
+  for (size_t i = 0; i < 6; ++i) {
+    region.push_back(static_cast<char>(0x80));
+    region.push_back(static_cast<char>(0x01));
+  }
+  const char* end = region.data() + region.size();
+  for (uint32_t i : {0U, 5U}) {
+    EXPECT_EQ(Int64AtFast(region.data(), Scheme::kForBp, 2, 6, i, end, nullptr),
+              364);
+    EXPECT_EQ(Int64RegionAt(region.data(), Scheme::kForBp, 2, 6, i, end), 364);
+  }
+  EXPECT_EQ(Int64RegionAt(region.data(), Scheme::kForBp, 2, 6, 5, end - 1), 0);
+}
+
+TEST(PaxChunkCodecsTest, DeltaForBatchDecodesTheLastOffset) {
+  using namespace pax_detail;
+  std::vector<int64_t> expected(kDeltaCheckpointEvery + 13, -25);
+  for (size_t i = 1; i < expected.size(); ++i) {
+    expected[i] = expected[i - 1] + static_cast<int64_t>((i % 7) * 257);
+  }
+  const auto rows = static_cast<uint16_t>(expected.size());
+  auto encoded = EncDeltaForI64(expected);
+  ASSERT_EQ(encoded.scheme, Scheme::kDeltaFor);
+  ASSERT_EQ(encoded.param, 2U);
+  ASSERT_FALSE(encoded.buf.empty());
+  auto truncated = encoded.buf;
+  truncated.pop_back();
+  auto valid =
+      AuditSingleColumnChunk(encoded.scheme, rows, std::move(encoded.buf), 2);
+  auto short_chunk =
+      AuditSingleColumnChunk(encoded.scheme, rows, std::move(truncated), 2);
+  std::vector<int64_t> result(rows, -1);
+  valid.DecodeInt64ColumnRg(0, 0, result.data());
+  EXPECT_EQ(result, expected);
+  short_chunk.DecodeInt64ColumnRg(0, 0, result.data());
+  EXPECT_EQ(result, std::vector<int64_t>(rows, 0));
+}
+
+TEST(PaxChunkCodecsTest, BulkCascadeZerosOutputOnTruncatedInnerRuns) {
+  using namespace pax_detail;
+  constexpr uint32_t kRows = 2;
+  std::vector<char> region;
+  AppendBE64(region, 37);
+  region.push_back(static_cast<char>(Scheme::kRle));
+  AppendBE32(region, 1);
+  AppendBE16(region, 1);
+  region.push_back(static_cast<char>(0x80));  // First row uses the top value.
+  AppendBE32(region, 1);
+  const char* end = region.data() + region.size();
+  std::array<int64_t, kRows> result{4, 5};
+  ASSERT_TRUE(DecodeCascadeI64All(region.data(), Scheme::kFreq, 0, kRows, end,
+                                  result.data()));
+  EXPECT_EQ(result, (std::array<int64_t, kRows>{0, 0}));
+
+  AppendBE64(region, 41);
+  AppendBE32(region, 1);
+  ASSERT_TRUE(DecodeCascadeI64All(region.data(), Scheme::kFreq, 0, kRows,
+                                  region.data() + region.size(),
+                                  result.data()));
+  EXPECT_EQ(result, (std::array<int64_t, kRows>{37, 41}));
+}
+
 TEST(PaxChunkCodecsTest, AuditBuilderRejectsCorruptRowsAndUnsortedKeys) {
   for (bool text_payload : {false, true}) {
     const Schema schema(
@@ -142,7 +207,7 @@ TEST(PaxChunkCodecsTest, ScanAggregateChecksProductsAndPartialSums) {
   auto chunk =
       PaxChunk::BuildFromSortedRun(fuzz::MakeRun(rows, schema), schema);
   ASSERT_TRUE(chunk.HasValue());
-  ASSERT_EQ(chunk.Value().GetFooter().row_group_count, 2u);
+  ASSERT_EQ(chunk.Value().GetFooter().row_group_count, 2U);
   for (const bool parallel : {false, true}) {
     AggPlan plan;
     for (const auto& terms : std::vector<std::vector<AggTerm>>{
@@ -993,17 +1058,26 @@ TEST(PaxChunkCodecsTest, AuditHuffDictCheckpointBitPositionsArePinned) {
   }
   ASSERT_EQ(rows.size(), 200U);
 
-  const char* prev_forced = std::getenv("TINYLAMB_FORCE_SCHEME");
-  const std::string saved_forced =
-      prev_forced != nullptr ? std::string(prev_forced) : std::string();
-  setenv("TINYLAMB_FORCE_SCHEME", "HUFFDICT", 1);
+  struct ScopedForceScheme {
+    ScopedForceScheme() {
+      const char* value = std::getenv("TINYLAMB_FORCE_SCHEME");
+      had_value = value != nullptr;
+      if (had_value) { saved_value = value;
+}
+      setenv("TINYLAMB_FORCE_SCHEME", "HUFFDICT", 1);
+    }
+    ~ScopedForceScheme() {
+      if (had_value) {
+        setenv("TINYLAMB_FORCE_SCHEME", saved_value.c_str(), 1);
+      } else {
+        unsetenv("TINYLAMB_FORCE_SCHEME");
+      }
+    }
+    bool had_value{};
+    std::string saved_value;
+  } force_scheme;
   const auto built =
       PaxChunk::BuildFromSortedRun(fuzz::MakeRun(rows, schema), schema);
-  if (prev_forced != nullptr) {
-    setenv("TINYLAMB_FORCE_SCHEME", saved_forced.c_str(), 1);
-  } else {
-    unsetenv("TINYLAMB_FORCE_SCHEME");
-  }
   ASSERT_TRUE(built.HasValue());
   const PaxChunk& chunk = built.Value();
   ASSERT_FALSE(chunk.GetFooter().encodings.empty());
@@ -1042,6 +1116,18 @@ TEST(PaxChunkCodecsTest, AuditHuffDictCheckpointBitPositionsArePinned) {
     EXPECT_EQ(PaxChunk::ValidateChunkBytes(bad), Status::kCorruption);
     EXPECT_FALSE(PaxChunk::Deserialize(bad).HasValue());
   }
+}
+
+// A footer declaring a VARCHAR column whose region uses an int64-only
+// scheme is structural corruption: legitimate NULLs come from the null
+// bitmap, so VarcharRegionAt's null return means its default arm fired.
+// ReadRowInto must surface kCorruption instead of emitting a silent NULL.
+TEST(PaxChunkCodecsTest, ReadRowIntoRejectsVarcharColumnWithIntScheme) {
+  const Schema schema("t", {Column("v", ValueType::kVarChar)});
+  auto chunk = AuditSingleColumnChunk(Scheme::kDeltaFor, 1,
+                                      std::vector<char>{'x'}, 0);
+  Row row;
+  EXPECT_EQ(chunk.ReadRowInto(0, schema, &row), Status::kCorruption);
 }
 
 }  // namespace

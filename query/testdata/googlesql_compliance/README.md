@@ -4,8 +4,8 @@ Vendored from [google/googlesql](https://github.com/google/googlesql)
 `googlesql/compliance/testdata/*.test` (Apache-2.0).
 
 Pin: `TINYLAMB_GOOGLESQL_VERSION` in CMakeLists.txt (currently `2026.7.2`).
-Currently **277** upstream `*.test` files from that tag, plus locally authored
-`optimizer_*.test` expectation suites (currently 13 files / 272 cases).
+Currently **278** upstream `*.test` files from that tag, plus locally authored
+`optimizer_*.test` expectation suites (currently 14 files / 273 cases).
 
 Re-fetch with:
 
@@ -31,9 +31,10 @@ The harness skips a case only when:
 
 Local optimizer cases can check result rows and stable plan fragments together
 using repeatable `[plan_contains=...]` and `[plan_not_contains=...]` options.
-`[mode=explain]` runs `EXPLAIN`; `[mode=explain_analyze]` runs
-`EXPLAIN ANALYZE` so runtime/adaptive behavior can also be asserted. Fragment
-matching avoids brittle exact goldens for costs and timings.
+When at least one plan assertion is present, `[mode=explain]` selects `EXPLAIN`
+and `[mode=explain_analyze]` selects `EXPLAIN ANALYZE`; without a plan assertion,
+the harness compares the query result and does not execute an explain command.
+Fragment matching avoids brittle exact goldens for costs and timings.
 
 `optimizer_arithmetic_high_expectations.test` ends with a clearly commented
 section of typed-arithmetic cases: sign absorption (`-1 * col -> -col`),

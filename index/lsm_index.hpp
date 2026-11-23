@@ -18,7 +18,6 @@
 #define TINYLAMB_LSM_INDEX_HPP
 
 #include <cstddef>
-#include <deque>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -45,7 +44,13 @@ class LsmIndexIterator {
   LsmIndexIterator(LsmIndexIterator&&) noexcept;
   LsmIndexIterator& operator=(LsmIndexIterator&&) noexcept;
 
-  [[nodiscard]] bool IsValid() const { return valid_; }
+  // A cursor error is sticky: once status_ is set, buffered entries are stale
+  // and Key()/Value() report no key/value. Do not keep advertising the iterator
+  // as valid in that state -- callers that only check IsValid() would decode an
+  // empty key as a real index entry.
+  [[nodiscard]] bool IsValid() const {
+    return valid_ && status_ == Status::kSuccess;
+  }
   [[nodiscard]] Status GetStatus() const { return status_; }
   [[nodiscard]] std::string Key() const;
   [[nodiscard]] std::string Value() const;
@@ -71,6 +76,9 @@ class LsmIndexIterator {
 
   LsmIndexIterator& operator++();
   LsmIndexIterator& operator--();
+  // Reposition an eager descending range cursor to the greatest key strictly
+  // below `key`, without walking intervening entries one by one.
+  [[nodiscard]] bool SeekBefore(std::string_view key);
 
   friend std::ostream& operator<<(std::ostream& o, const LsmIndexIterator& it);
 
@@ -92,11 +100,15 @@ class LsmIndexIterator {
   std::vector<std::pair<std::string, std::string>> entries_;
   // Ascending lazy scans only: entries pulled so far from scan_cursor_.
   // `idx_` remains the absolute position, so operator-- revisits earlier
-  // entries without rewinding the forward-only cursor.
-  std::deque<std::pair<std::string, std::string>> emitted_;
+  // entries without rewinding the forward-only cursor. A vector is append-only
+  // here (no front insertion), which lets the lazy path reserve capacity up
+  // front instead of reallocating on every pull.
+  std::vector<std::pair<std::string, std::string>> emitted_;
   std::unique_ptr<LsmScanCursor> scan_cursor_;
   bool valid_{false};
-  Status status_{Status::kSuccess};
+  // Value() re-reads the live entry and records a read failure here; it is
+  // const because callers reach it through const iterators.
+  mutable Status status_{Status::kSuccess};
 };
 
 // Unbounded LSM-Tree index over PageManager's MemTable + immutable sorted runs.

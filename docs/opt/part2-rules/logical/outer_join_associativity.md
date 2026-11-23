@@ -56,7 +56,7 @@ graph TD
    ```
 
 4. **関係 B に対する NULL 排除性**: 述語 `p2` が関係 `B` の属性に対して NULL 排除的であること（`ExpressionRejectsNullsOnRelations(*expression.predicate, b_rels)` が真）。
-5. **非循環派生グループの確保**: 新規に作成する派生グループ `bc_group`（タグ `"oj_assoc_bc"`）が親グループ自身、または `B`, `C` のグループと一致しないこと。
+5. **非循環派生グループの確保**: 新規に作成する派生グループ `bc_group`（タグ `"oj_assoc_bc:" + GroupIdsTag({b_id, c_id}) + PredicateTag(expression.predicate)`）が親グループ自身、または `B`, `C` のグループと一致しないこと。子 ID と述語をタグに含めることで同じ $(B, C)$ で異なる述語の再結合を隔離します。生成後は `InheritBranchLocal(memo, bc_group, group)` で branch-local 属性が派生グループへ伝播されます(D5 ガードレール)。
 
 ## 意味論的根拠と三値論理・NULLセマンティクス
 
@@ -76,7 +76,10 @@ graph TD
 
 ```cpp
             const GroupId bc_group = memo.EnsureDerivedGroup(
-                UnionRelations(b_rels, c_rels), "oj_assoc_bc");
+                UnionRelations(b_rels, c_rels),
+                "oj_assoc_bc:" + GroupIdsTag({b_id, c_id}) +
+                    PredicateTag(expression.predicate));
+            InheritBranchLocal(memo, bc_group, group);
             if (bc_group == group || bc_group == b_id || bc_group == c_id) {
               continue;
             }
@@ -86,9 +89,7 @@ graph TD
                 LogicalExpression{.operation = LogicalOperator::kOuterJoin,
                                   .children = {b_id, c_id},
                                   .predicate = expression.predicate,
-                                  .target_list = expression.target_list,
-                                  .join_type = 0,
-                                  .output_schema = expression.output_schema});
+                                  .join_type = 0});
 
             memo.AddExpression(
                 group,
@@ -100,7 +101,7 @@ graph TD
                                   .output_schema = expression.output_schema});
 ```
 
-- **派生グループ（Derived Group）の利用**: `EnsureDerivedGroup` を用い、タグ `"oj_assoc_bc"` で中間グループを単離します。これにより、単一表スキャンを持たない中間関係グループが基底の Memo 構造と干渉することを防ぎます。
+- **派生グループ（Derived Group）の利用**: `EnsureDerivedGroup` を用い、タグ `"oj_assoc_bc:" + GroupIdsTag({b_id, c_id}) + PredicateTag(expression.predicate)` で中間グループを単離します。これにより、単一表スキャンを持たない中間関係グループが基底の Memo 構造と干渉することを防ぎます。続く `InheritBranchLocal(memo, bc_group, group)` が元グループの branch-local 属性を派生グループへ受け継がせ、FULL OUTER JOIN 分解由来の分岐をまたいでも正しく隔離します(D5)。
 - **述語の再配置**: 内側の `bc_group` に外側述語 `expression.predicate`（`p2`）を設定し、親グループには内側結合述語 `inner_oj.predicate`（`p1`）を設定します。
 
 ## 最適化効果

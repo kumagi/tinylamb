@@ -75,10 +75,7 @@ class WindowFunctionCallExpression : public ExpressionBase {
                                const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& schema) const override;
   [[nodiscard]] tinylamb::Type ResultType(const Schema& left,
-                                          const Schema& right) const override {  // NOLINT(misc-unused-parameters)
-    (void)right;
-    return ResultType(left);
-  }
+                                          const Schema& right) const override;
   [[nodiscard]] std::unordered_set<ColumnName> TouchedColumns() const override;
   [[nodiscard]] std::string ToString() const override;
   void Dump(std::ostream& o) const override { o << ToString(); }

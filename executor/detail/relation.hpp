@@ -191,7 +191,7 @@ struct Relation {
   // non-const; the const_cast calls below mean a shared spilled Relation must
   // not be traversed concurrently without external synchronization.
   template <typename Fn>
-  Status ForEachRow(Fn&& fn) const {
+  [[nodiscard]] Status ForEachRow(Fn&& fn) const {
     Status first{Status::kSuccess};
     if (HasColumnarOnly()) {
       Row scratch;

@@ -32,18 +32,24 @@ graph TD
 2. 下位の `sel` Group が現在の集約 Group 自身と一致しないこと（循環参照防止）。
 3. `sel` Group 内の各式を走査し、最初に見出された「`kSelection` かつ子を持ち、有効な述語を保持する式」を抽出できること。
 4. Selection の子 Group が現在の親 Group および `sel` Group のいずれとも一致しないこと。
-5. target list 内に 1 つ以上の集約関数（`AggregateExpression`）が存在し、実際に `WhereFilter` の注入変換が行われたこと（`transformed == true`）。集約関数以外の列参照等は無変換で引き継がれます。
+5. target list 内に 1 つ以上の集約関数（`AggregateExpression`）が存在し、実際に `WhereFilter` の注入変換が行われたこと（`transformed == true`）。列参照を伴わない定数式は引き継がれますが、裸の列参照は Selection フィルタを失うため変換を中止します。
 
 ```cpp
-                agg_copy->SetInnerOrderBy(orig.InnerOrderBy());
-                if (orig.HasWhereFilter())
-    agg_copy->SetWhereFilter(BinaryExpressionExp(
-        orig.WhereFilter(), BinaryOperation::kAnd, *sel_expr.predicate));
-  else
-    agg_copy->SetWhereFilter(*sel_expr.predicate);
+                auto agg_copy = CloneAggregate(orig, orig.Distinct());
+                // Conjoin with any existing FILTER instead of silently
+                // overwriting it.
+                if (orig.HasWhereFilter()) {
+                  agg_copy->SetWhereFilter(BinaryExpressionExp(
+                      orig.WhereFilter(), BinaryOperation::kAnd,
+                      *sel_expr.predicate));
+                } else {
+                  agg_copy->SetWhereFilter(*sel_expr.predicate);
+                }
                 new_targets.emplace_back(target.name, agg_copy);
                 transformed = true;
 ```
+
+`CloneAggregate(orig, orig.Distinct())` が `InnerOrderBy` を含む集約式の属性を保持するため、`SetInnerOrderBy` の明示的なコピーはありません。
 
 ## 意味論的根拠と多重度保存・グループ化セマンティクス
 
@@ -64,11 +70,14 @@ graph TD
                   group,
                   LogicalExpression{.operation = LogicalOperator::kAggregation,
                                     .children = {input_id},
+                                    .predicate = expression.predicate,
                                     .target_list = std::move(new_targets),
                                     .output_schema = expression.output_schema,
                                     .partition_by = expression.partition_by,
                                     .grouping_sets = expression.grouping_sets});
 ```
+
+`target_list` には元の target がそのまま残るのではなく、FILTER 句を注入した集約式に置き換えた `new_targets` が設定されます。HAVING 述語（`.predicate`）や `output_schema` / `partition_by` / `grouping_sets` も元の Aggregation から保持されます。
 
 物理実行層（`executor/parallel_aggregation.cpp` 等）では、`WhereFilter` を持つ集約関数は行ごとに述語を評価する汎用実行パスを選択する契約となっており、高速型専用スキャン（Row Count Fast Path 等）の誤適用による過剰カウントを防止する安全機構が組み込まれています。
 

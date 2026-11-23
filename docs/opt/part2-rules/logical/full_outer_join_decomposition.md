@@ -119,4 +119,4 @@ graph TD
 ## 検証テスト
 
 - `plan/cascades_test_part2.cpp`: `CascadesTest.FullOuterJoinDecomposition`
-  - `join_type = 2` の `OuterJoin` 式が、`full_to_left_outer` および `full_to_padded_anti` タグを持つ 2 つの派生 Group を子とする `kUnionAll` 式へと分解されることを検証。
+  - `join_type = 2` の `OuterJoin` から `kUnionAll` と padded projection が生成されることを検証します。テストは派生 Group のタグ文字列を検査しません。

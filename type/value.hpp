@@ -101,6 +101,10 @@ inline size_t EncodeMemcomparableFormatDoubleTo(char* dst, double in) {
   }
   uint64_t bits = 0;
   std::memcpy(&bits, &in, sizeof(bits));
+  // Deliberate canonicalization: `in < 0` is false for -0.0, so both signed
+  // zeros share the +0.0 key image.  Index keys must agree with SQL equality
+  // (where -0.0 = +0.0), and value_test.cpp pins this identity; callers that
+  // need the bit pattern (rather than the numeric value) must keep the Value.
   const uint64_t code = (in < 0) ? ~bits : (bits | (1ULL << 63));
   const uint64_t be = htobe64(code);
   std::memcpy(dst + 1, &be, 8);
@@ -224,7 +228,7 @@ inline std::ostream& operator<<(std::ostream& o, const UnaryOperation& uo) {
 
 class Value {
  public:
-  Value() : type(ValueType::kNull) {}
+  Value()  = default;
   explicit Value(int int_val);
   explicit Value(int64_t int_val);
   explicit Value(std::string&& str_val);
@@ -261,7 +265,7 @@ class Value {
   }
   // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar
   // move may allocate
-  [[gnu::always_inline]] Value(Value&& o) : value(o.value), type(o.type) {
+  [[gnu::always_inline]] Value(Value&& o)  noexcept : value(o.value), type(o.type) {
     if (TINYLAMB_VALUE_SCALAR(type)) [[likely]] {
       collation_ = o.collation_;
       o.type = ValueType::kNull;
@@ -272,7 +276,7 @@ class Value {
 
   template <typename I>
   explicit Value(I val)
-    requires(std::is_integral<I>::value)
+    requires(std::is_integral_v<I>)
       : type(ValueType::kInt64) {
     value.int_value = static_cast<int64_t>(val);
   }
@@ -292,7 +296,7 @@ class Value {
   }
   // NOLINTNEXTLINE(performance-noexcept-move-constructor) out-of-line varchar
   // move may allocate
-  [[gnu::always_inline]] Value& operator=(Value&& o) {
+  [[gnu::always_inline]] Value& operator=(Value&& o)  noexcept {
     if (this == &o) [[unlikely]] {
       return *this;
     }
@@ -309,10 +313,6 @@ class Value {
   }
 #undef TINYLAMB_VALUE_SCALAR
   ~Value() = default;
-  // The default destructor performs member-wise destruction: scalar assigns
-  // above may leave a stale owned_data payload behind (unreachable
-  // behind the type tag, bounded to one old payload per slot), and the default
-  // destructor is what releases it.
 
  private:
   // Cold halves of the quartet (defined out-of-line in value.cpp): keeping
@@ -466,10 +466,15 @@ class Value {
   // `!(a > b)` form made `NaN <= x` true while `NaN < x` and `NaN == x` were
   // both false.
   bool operator<=(const Value& rhs) const {
+    if (type == ValueType::kVarChar && rhs.type == ValueType::kVarChar &&
+        (Collation() != 0 || rhs.Collation() != 0) &&
+        !IsInterval() && !rhs.IsInterval()) {
+      return CompareCollatedString(rhs) <= 0;
+    }
     return operator<(rhs) || operator==(rhs);
   }
   bool operator>=(const Value& rhs) const {
-    return operator>(rhs) || operator==(rhs);
+    return rhs.operator<=(*this);
   }
 
   // Arithmetic and bitwise evaluation with SQL semantics: type mismatches,
@@ -599,15 +604,16 @@ class Value {
   // CompareWithCollation, and LessSlow/operator<) DO fold case when either
   // side carries the case-insensitive tag; explicit call sites (join keys,
   // ORDER BY, set ops via EqualUnderCollation in type/collation.cpp) resolve
-  // the same collation contract themselves. std::hash<Value> only consults
-  // the tag for interval-shaped VARCHARs: an ordinary case-insensitive string
-  // hashes exactly like its binary twin, so don't rely on the tag to split
-  // hash buckets. Carrying it here keeps both comparison paths able to
-  // recover the intent.
+  // the same collation contract themselves. std::hash<Value> consults the tag
+  // for interval-shaped VARCHARs and folds ASCII case for case-insensitive
+  // strings so CI peers share a hash bucket; ordinary binary strings hash by
+  // bytes only. Grouping call sites still canonicalize via
+  // CanonicalDistinctValue before hashing.
   [[nodiscard]] uint8_t Collation() const { return collation_; }
   // Reject unknown serialized tags without changing the existing value.
   bool SetCollation(uint8_t collation) {
-    if (collation > 4) return false;
+    if (collation > 4) { return false;
+}
     collation_ = collation;
     return true;
   }
@@ -617,13 +623,15 @@ class Value {
   // and comparisons distinguish UINT64(2^64-1) from INT64(-1).
   [[nodiscard]] bool IsUnsigned() const {
     // The tag is also restored on NULLs decoded from older spill streams;
-    // require a real payload so a NULL never masquerades as UINT64.
-    return type != ValueType::kNull && collation_ == 3;
+    // require an INT64 payload so another type's tag 3 never masquerades as
+    // UINT64 (and NULL never becomes a tagged number).
+    return type == ValueType::kInt64 && collation_ == 3;
   }
   // Hot path: tag in place (WithUnsigned copies the whole value).
   // NULL has no signedness, so never turn it into a "UINT64 NULL" here.
   void SetUnsigned() {
-    if (type == ValueType::kNull) return;
+    if (type == ValueType::kNull) { return;
+}
     collation_ = 3;
   }
   [[nodiscard]] Value WithUnsigned() const {
@@ -664,6 +672,8 @@ class Value {
   ValueType type{ValueType::kNull};
 
  private:
+  [[nodiscard]] int CompareCollatedString(const Value& rhs) const;
+
   // Pack both tags together instead of adding a trailing alignment word.
   uint8_t collation_{0};
 

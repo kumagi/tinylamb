@@ -86,7 +86,9 @@ Treat those branches as untested-until-built-on-target.
 kTooBigData/kDeleted/kCorrupt…`) and the macro forms above are the vocabulary
 of every layer — learn them first and the rest reads faster.
 
-Test: `./build/log_message_test`, `crc32c_test`, `serdes_test`,
-`runtime_filter_test`, `memory_budget_test`, `query_grant_test`,
+Tests: `./build/log_message_test`, `crc32c_test`, `decoder_test`,
+`serdes_test`, `runtime_filter_test`, `memory_budget_test`, `query_grant_test`,
 `spill_store_test`, `ooc_scale_baseline_test` (label `scale`),
-`sorted_distinct_runs_test`, `parallel_work_test`, `status_or_test`.
+`sorted_distinct_runs_test`, `parallel_work_test`, `status_or_test`,
+`string_util_test`, `util_extra_test`, `regex_guard_test`, and
+`platform_test` (including `range_selection_test` where available).

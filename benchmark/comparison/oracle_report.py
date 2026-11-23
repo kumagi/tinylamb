@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import statistics
 
@@ -23,7 +24,8 @@ def main():
     a = p.parse_args()
     directory = a.directory.resolve()
     env = json.loads((directory / 'environment.json').read_text())
-    assert env.get('finished'), 'incomplete measurement: no finished timestamp'
+    if not env.get('finished'):
+        raise ValueError('incomplete measurement: no finished timestamp')
     args = env['args']
     records = [json.loads(s) for s in (directory / 'results.jsonl').read_text().splitlines()]
     olap = [r for r in records if r['kind'] == 'olap']
@@ -37,10 +39,16 @@ def main():
                      for t in range(args['trials']) for e in ENGINES}
     actual_olap = [(r['suite'], r['rows'], r['workload'], r['engine']) for r in olap]
     actual_oltp = [(r['workload'], r['clients'], r['trial'], r['engine']) for r in oltp]
-    assert set(actual_olap) == expected_olap and len(actual_olap) == len(expected_olap)
-    assert set(actual_oltp) == expected_oltp and len(actual_oltp) == len(expected_oltp)
-    assert all(r['correct'] and r['stable'] and len(r['samples_ms']) == args['repeats'] for r in olap)
-    assert all(r['valid'] and not r['validation_failures'] for r in oltp)
+    if set(actual_olap) != expected_olap or len(actual_olap) != len(expected_olap):
+        raise ValueError('OLAP records contain missing, duplicate or unexpected measurements')
+    if set(actual_oltp) != expected_oltp or len(actual_oltp) != len(expected_oltp):
+        raise ValueError('OLTP records contain missing, duplicate or unexpected measurements')
+    for r in olap:
+        if not r['correct'] or not r['stable'] or len(r['samples_ms']) != args['repeats']:
+            raise ValueError(f"invalid OLAP samples for {r['engine']} {r['workload']}")
+    for r in oltp:
+        if not r['valid'] or r['validation_failures']:
+            raise ValueError(f"invalid OLTP trial for {r['engine']} {r['workload']}")
     errors = {e: dict(measured=sum(r['errors'] for r in oltp if r['engine'] == e),
                       warmup=sum(r['warmup_errors'] for r in oltp if r['engine'] == e)) for e in ENGINES}
     audit = dict(complete=True, correct_olap=len(olap), valid_oltp=len(oltp), errors=errors,
@@ -63,16 +71,24 @@ def main():
         for clients in [1, 16]:
             tps_rows.append([name, clients, *[f"{statistics.median(r['tps'] for r in oltp if r['workload']==name and r['clients']==clients and r['engine']==e):,.1f}" for e in ENGINES]])
     tps_table = markdown(['処理', '接続', *[e + ' 成功TPS' for e in LABELS]], tps_rows)
-    relative = '../benchmark/comparison/results/' + directory.name
+    relative = os.path.relpath(directory, start=a.output.parent.resolve())
     oracle = env['settings']['oracle']
     cache_start = dict(oracle['sga'])['Buffer Cache Size'] / 2**20
-    cache_end = dict(env['oracle_sga_end'])['Buffer Cache Size'] / 2**20
+    cache_end = (f"{dict(env['oracle_sga_end'])['Buffer Cache Size'] / 2**20:,.0f}"
+                 if 'oracle_sga_end' in env else '未取得')
     allocated = sum(row[1] for row in env['oracle_schema_segments_bytes']) / 2**20
     mysql_cache = int(dict(env['settings']['mysql'])['innodb_buffer_pool_size']) / 2**20
     # data_cache_mib is already in MiB (run.py records the CLI value); the
     # report below prints it as MiB too, so no byte-to-MiB conversion here.
     data_cache = float(dict(env['args'])['data_cache_mib']) if 'data_cache_mib' in dict(env.get('args', {})) else 1088.0
     version = oracle['version'][0][0].replace('\n', ' / ')
+    run_args = dict(env.get('args', {}))
+    sizes = list(run_args.get('sizes', []))
+    sizes_text = '／'.join(f'{size:,}' for size in sizes) if sizes else '取得なし'
+    account_size = f'{max(sizes):,}' if sizes else '取得なし'
+    secondary_indexes = bool(run_args.get('secondary_indexes', False))
+    tpch_scale = float(run_args.get('tpch_scale', 0))
+    tpch_text = f'SF={tpch_scale:g}・共通DBGEN入力・binary64' if tpch_scale else 'TPC-H測定なし'
     report = f'''# Oracle Freeを追加した4製品比較（2026-10-31）
 
 Oracle Freeを既存の比較器に追加し、共通2コア枠でOLAP {len(olap)}測定、OLTP／HTAP {len(oltp)}試行を完了した。
@@ -85,12 +101,12 @@ OLAPは全行・値・順序がPGと一致し、全OLTP試行で残高・行数�
 - [Freeの上限](https://docs.oracle.com/en/database/oracle/oracle-database/26/xeinl/licensing-restrictions.html)は2コア・DB RAM 2GB・ユーザーデータ12GB。この結果はEnterprise Editionの性能を表さない。
 - 全4製品を物理コア0／1に対応する論理CPU 0,1へ固定。負荷は製品ごとに順次実行。
 - Tiny／PGはデータバッファ{data_cache:,.0f} MiB。MySQLは同じ{data_cache:,.0f} MiB指定に対し、実測値は{mysql_cache:,.0f} MiB。
-  Oracleの実Buffer Cacheは開始{cache_start:,.0f}／終了{cache_end:,.0f} MiB。
+  Oracleの実Buffer Cacheは開始{cache_start:,.0f}／終了{cache_end} MiB。
   SGA内配分・共有プール・PGA・プロセス全体のメモリは同一ではない。全SGA項目を生データへ保存。
-- 共通二次索引あり。salesは10,000／100,000／1,000,000行、accountsは最大10,000行。
-  各規模19 OLAP、TPC-H由来22問はSF=0.01・共通DBGEN入力・binary64。更新関数や監査を含まない非認証試験。
-- OLAPは最初の実行と、その後9反復の中央値を区別する。cold I/O測定ではない。
-- OLTPは1／4／16接続、0.5秒warmup＋2秒、3試行。表は試行中央値。短窓の初期比較であり、僅差やtailの達成判定には使わない。
+- sales の行数設定: {sizes_text}。accounts は最大 {account_size} 行。
+  二次索引: {'あり' if secondary_indexes else 'なし'}。TPC-H: {tpch_text}。更新関数や監査を含まない非認証試験.
+- OLAPは最初の実行と、その後{args['repeats']}反復の中央値を区別する。cold I/O測定ではない。
+- OLTPは{'／'.join(map(str, args['clients']))}接続、{args['warmup']}秒warmup＋{args['seconds']}秒計測、{args['trials']}試行。表は試行中央値。短窓の初期比較であり、僅差やtailの達成判定には使わない。
   全11種目・min/max・p95/p99・失敗率は別表へ保存。HTAPの1接続はreaderのみ、4／16接続は最後の1接続がreader。
 - OracleはREAD COMMITTED・WAIT／IMMEDIATEの同期commit・FORCE LOGGING YES・NOARCHIVELOG。
   PGはfsync／synchronous_commit有効、MySQLはinnodb_flush_log_at_trx_commit=1・binlog無効、Tinyは同期commit。
@@ -104,7 +120,7 @@ OLAPは全行・値・順序がPGと一致し、全OLTP試行で残高・行数�
 
 ## OLAPの結果
 
-100万行から代表種目を抜粋。全19種目×3規模は[全OLAP表]({relative}/analysis/)に保存。
+{max(sizes) if sizes else 0:,} 行から代表種目を抜粋。全 OLAP 規模は[全OLAP表]({relative}/analysis/)に保存。
 
 {micro_table}
 ![100万行OLAP、4製品の中央値]({relative}/analysis/micro_1m.png)
@@ -114,7 +130,7 @@ TinyのHTAP readerは不変データの前計算・キャッシュ再利用を�
 
 ## TPC-H由来22問
 
-9反復の問別中央値を足した参考値。連続して22問を実行した時間や公式TPC-Hスコアではない。
+{args['repeats']}反復の問別中央値を足した参考値。連続して22問を実行した時間や公式TPC-Hスコアではない。
 全問の値と計画は[問別表]({relative}/analysis/tpch.md)・[全結果]({relative}/query-details/)へ保存。
 
 {tpch_table}

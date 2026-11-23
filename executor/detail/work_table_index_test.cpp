@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,13 @@ namespace tinylamb {
 namespace {
 
 Row MakeRow(std::vector<Value> values) { return Row(std::move(values)); }
+
+// WorkTableIndexStats() is a process singleton; tests taking before/after
+// deltas must not overlap with any other test touching those counters.
+std::mutex& WorkTableStatsMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
 
 }  // namespace
 
@@ -112,6 +120,7 @@ TEST(WorkTableIndexTest, StreamingFoldedHashMatchesMaterializedFold) {
 TEST(WorkTableIndexTest, CountersOnlyPublishWhenEnabled) {
   // Top-level DISTINCT shares the class but must not touch the counters (hot
   // path); only the recursive loop opts in.
+  std::scoped_lock lock(WorkTableStatsMutex());
   relational_detail::WorkTableIndexCounters& counters =
       relational_detail::WorkTableIndexStats();
   const uint64_t inserts_before = counters.inserts.load();
@@ -121,6 +130,7 @@ TEST(WorkTableIndexTest, CountersOnlyPublishWhenEnabled) {
 }
 
 TEST(WorkTableIndexTest, CountersTrackInsertsAndDuplicates) {
+  std::scoped_lock lock(WorkTableStatsMutex());
   relational_detail::WorkTableIndexCounters& counters =
       relational_detail::WorkTableIndexStats();
   const uint64_t inserts_before = counters.inserts.load();

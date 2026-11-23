@@ -33,11 +33,34 @@ TEST(SqlOocFuzzer, NonReproducingVerifyMarkerIsFiltered) {
   // the worker instead of being skipped.
   EXPECT_NE(kOocNonReproducingVerify.find(kFlakyVerifyMarker),
             std::string_view::npos);
-  const std::string fname =
-      "sql_ooc_fuzz-repro-nondet-" + RandomString(6) + ".test";
-  const std::string stem = fname.substr(0, fname.size() - 5);
-  std::filesystem::remove(fname);
-  std::filesystem::remove(stem + ".report.txt");
+  // Never delete a pre-existing file just because its name collides with a
+  // generated one: pick a name that is free for both the .test and its report,
+  // and clean up whatever the emitter actually created on scope exit (the
+  // filter may regress and start writing the pair).
+  std::string fname;
+  std::string stem;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    const std::string candidate =
+        "sql_ooc_fuzz-repro-nondet-" + RandomString(12) + ".test";
+    const std::string candidate_stem =
+        candidate.substr(0, candidate.size() - 5);
+    if (!std::filesystem::exists(candidate) &&
+        !std::filesystem::exists(candidate_stem + ".report.txt")) {
+      fname = candidate;
+      stem = candidate_stem;
+      break;
+    }
+  }
+  ASSERT_FALSE(fname.empty());
+  struct Cleanup {
+    std::string fname;
+    std::string stem;
+    ~Cleanup() {
+      std::error_code ec;
+      std::filesystem::remove(fname, ec);
+      std::filesystem::remove(stem + ".report.txt", ec);
+    }
+  } cleanup{.fname=fname, .stem=stem};
   EmitFuzzFinding("sql_ooc_fuzz", 42, fname, "-- tinylamb-ooc-test v1\n",
                   "non-reproducing failure", kOocNonReproducingVerify);
   EXPECT_FALSE(std::filesystem::exists(fname));
@@ -49,7 +72,9 @@ TEST(OocRngTest, PickHandlesFullWidthAndHighestInt64Intervals) {
   constexpr int64_t high = std::numeric_limits<int64_t>::max();
   OocRng baseline(nullptr, 0, 42);
   OocRng rng(nullptr, 0, 42);
-  EXPECT_EQ(rng.Pick(low, high), low + baseline.Next32());
+  EXPECT_EQ(
+      rng.Pick(low, high),
+      static_cast<int64_t>(static_cast<uint64_t>(low) + baseline.Next64()));
   EXPECT_EQ(rng.Pick(high - 1, high), high - 1 + baseline.Next32() % 2);
 }
 
@@ -64,7 +89,8 @@ TEST(OocRngTest, PadJoinsBoundBothInputsEvenForOneDistinctValue) {
   int found = 0;
   for (int i = 0; i < 10000 && found < 20; ++i) {
     const auto query = GenerateOocQuery(rng, tables, 2000);
-    if (!query.shape.starts_with("join_pad")) continue;
+    if (!query.shape.starts_with("join_pad")) { continue;
+}
     ++found;
     const auto first = query.sql.find(" BETWEEN ");
     ASSERT_NE(first, std::string::npos) << query.sql;
@@ -124,6 +150,43 @@ std::string TracePath(uint64_t seed) {
   return "sql_ooc_fuzz-seed-" + std::to_string(seed) + ".test";
 }
 
+constexpr double kDefaultOpWatchdogTimeout = 45.0;
+
+// Returns the configured watchdog deadline in seconds, or 0 when the watchdog
+// is disabled.  Invalid or negative values fall back to the default; zero is
+// a valid, documented "disabled" value and must not be discarded as if it
+// were a parse failure.
+double ParseOpWatchdogTimeout(const char* env) {
+  if (env == nullptr) {
+    return kDefaultOpWatchdogTimeout;
+  }
+  char* end = nullptr;
+  const double parsed = std::strtod(env, &end);
+  if (end != env && *end == '\0' && std::isfinite(parsed) && parsed >= 0.0) {
+    return parsed;
+  }
+  return kDefaultOpWatchdogTimeout;
+}
+
+TEST(SqlOocFuzzer, ZeroOpTimeoutDisablesWatchdog) {
+  // The docs promise that TINYLAMB_OOC_FUZZ_OP_TIMEOUT=0 turns the watchdog
+  // off.  A `parsed > 0.0` guard used to swallow that value and leave the
+  // 45-second watchdog armed, which failed slow hosts with a spurious hang
+  // report instead of letting the session finish.
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("0"), 0.0);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("0.0"), 0.0);
+  // Positive values and the default still work; invalid input is not
+  // mistaken for a disable request.
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout(nullptr), kDefaultOpWatchdogTimeout);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("7.5"), 7.5);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("45"), 45.0);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("-1"), kDefaultOpWatchdogTimeout);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("nan"), kDefaultOpWatchdogTimeout);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("inf"), kDefaultOpWatchdogTimeout);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("oops"), kDefaultOpWatchdogTimeout);
+  EXPECT_DOUBLE_EQ(ParseOpWatchdogTimeout("3x"), kDefaultOpWatchdogTimeout);
+}
+
 // A session op that never returns would otherwise end as a bare ctest
 // timeout with no trace.  The watchdog keeps the ops executed so far and,
 // when one of them runs past the limit, writes the trace, names the op and
@@ -132,15 +195,8 @@ std::string TracePath(uint64_t seed) {
 class OpWatchdog {
  public:
   explicit OpWatchdog(uint64_t seed) : seed_(seed) {
-    const char* env = std::getenv("TINYLAMB_OOC_FUZZ_OP_TIMEOUT");
-    timeout_ = 45.0;
-    if (env != nullptr) {
-      char* end = nullptr;
-      const double parsed = std::strtod(env, &end);
-      if (end != env && *end == '\0' && std::isfinite(parsed) && parsed > 0.0) {
-        timeout_ = parsed;
-      }
-    }
+    timeout_ =
+        ParseOpWatchdogTimeout(std::getenv("TINYLAMB_OOC_FUZZ_OP_TIMEOUT"));
     if (timeout_ > 0) {
       // Poll well below the deadline; a fixed 100 ms tick is coarser than a
       // short configured timeout and mis-measures the hang boundary.
@@ -170,6 +226,13 @@ class OpWatchdog {
     trace_.ops.push_back(op);
     started_ = std::chrono::steady_clock::now();
     armed_ = true;
+  }
+  // The production watchdog has a Disarm; this test one must too.  Once the
+  // session (including its commit/crash/reopen/full-dump epilogue) is over,
+  // slow report/cleanup work is not a hung op and must not be reported as one.
+  void Disarm() {
+    std::scoped_lock lock(mu_);
+    armed_ = false;
   }
 
  private:
@@ -236,6 +299,7 @@ OocStats RunSeeds(uint64_t first, uint64_t count, OocRunOptions options,
     options.on_op = [&](const std::string& op) { watchdog.Tick(op); };
     const std::string report =
         RunOocSession(nullptr, 0, seed, options, &stats, &trace);
+    watchdog.Disarm();
     if (!report.empty()) {
       {
         std::ofstream out(TracePath(seed));
@@ -438,8 +502,13 @@ TEST(SqlOocFuzzer, MinimizerKeepsOnlyWhatTheFailureNeeds) {
   ASSERT_NE(report.find("selftest threshold reached"), std::string::npos)
       << report;
   std::string final_report;
+  size_t watched_ops = 0;
   const OocTrace minimized =
-      MinimizeOocTrace(trace, report, /*budget_seconds=*/40, &final_report);
+      MinimizeOocTrace(trace, report, /*budget_seconds=*/40, &final_report,
+                       [&](const std::string&) { ++watched_ops; });
+  // The CLI's --op-timeout watchdog hooks into this callback; minimization
+  // replays many candidates, so it must see ops from those replays too.
+  EXPECT_GT(watched_ops, 0U);
   EXPECT_NE(final_report.find("selftest threshold reached"), std::string::npos);
   // create t0, three inserts (30 + 25 + 25 >= 70 needs all of them), selftest.
   EXPECT_EQ(minimized.ops.size(), 5U) << SerializeOocTest(0, minimized, "");

@@ -64,18 +64,26 @@ graph TD
           }
           Plan topn = std::make_shared<TopNPlan>(
               children[0].plan, std::move(keys), logical.limit_count,
-              logical.limit_offset, logical.with_ties);
+              logical.limit_offset, logical.with_ties,
+              logical.prior_limit_offset);
           const double rows = children[0].estimated_rows;
+          const double capacity = std::min(
+              rows, static_cast<double>(logical.limit_count +
+                                        logical.limit_offset));
+          const double tie_factor = logical.with_ties ? 1.05 : 1.0;
           return std::vector<PlanAlternative>{PlanAlternative{
               .plan = std::move(topn),
-              .local_cost = rows * std::log2(std::max(2.0, rows)),
+              .local_cost = rows * std::log2(std::max(2.0, capacity)) *
+                            tie_factor,
               .estimated_rows = LimitOutputRows(rows, logical.limit_count,
                                                 logical.limit_offset)}};
 ```
 
 ### コストと行数見積もり
-- **ローカルコスト**: コストモデル上は安全側の上界として全ソートと同等の $N \log_2 N$ を計上します。TopN の優位性は、子ノードへプッシュされる `limit_hint` によって入力行数（$N$）そのものが削減される点に現れます。
+- **ローカルコスト**: 有界ヒープ容量を `min(rows, limit_count + limit_offset)` として $N \log_2(\max(2, capacity))$ を計上します。WITH TIES には境界同順位の追加処理として 5% の係数を加えます。
 - **出力行数**: `LimitOutputRows` により、OFFSET 減算後の行数と LIMIT 値の最小値が算出されます。
+
+子が要求順序を既に満たす場合は `LimitPlan`（追加ローカルコスト 0）を生成します。キーの prefix だけを満たす場合は `IncrementalSortPlan` の上に `LimitPlan` を置き、全キーを満たさない場合に有界ヒープを使う `TopNPlan` を選択します。
 
 ## 最適化効果
 

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -86,15 +87,40 @@ class SqlFunctionEdgeTest : public ::testing::Test {
 };
 
 TEST_F(SqlFunctionEdgeTest, FormatTimestampUsesDefaultTimeZoneOffset) {
+  // The default zone is process-global and read by timestamp evaluation. Keep
+  // the override window as small as possible and restore it on every exit
+  // path, including a thrown RunSql, so later tests (or a still-running
+  // engine thread) never inherit the override.
   const std::string previous_zone = GetDefaultTimeZone();
+  struct RestoreZone {
+    explicit RestoreZone(std::string  zone) : zone_(std::move(zone)) {}
+    ~RestoreZone() { SetDefaultTimeZone(zone_); }
+    RestoreZone(const RestoreZone&) = delete;
+    RestoreZone& operator=(const RestoreZone&) = delete;
+    std::string zone_;
+  } restore_zone(previous_zone);
   SetDefaultTimeZone("+05:45");
   std::vector<Row> rows;
   EXPECT_NO_THROW(rows = RunSql(engine_.get(), context_.get(),
                                 "SELECT FORMAT_TIMESTAMP('%z %Ez', "
                                 "TIMESTAMP '2026-01-02 03:04:05+00')"));
-  SetDefaultTimeZone(previous_zone);
-  ASSERT_EQ(rows.size(), 1u);
+  ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value("+0545 +05:45"));
+}
+
+TEST_F(SqlFunctionEdgeTest,
+       FractionalLeapSecondKeepsSubsecondInStringConversion) {
+  // ParseCivilTime is the function-evaluator's counterpart of CAST and the
+  // comparison path: all three must fold ":60.5" into the next minute with
+  // the .5 intact. It used to zero the fraction, so STRING() and FORMAT_*
+  // disagreed with CAST on the very same literal.
+  std::vector<Row> rows;
+  EXPECT_NO_THROW(
+      rows =
+          RunSql(engine_.get(), context_.get(),
+                 "SELECT STRING(TIMESTAMP '2000-02-29 23:59:60.5+00', 'UTC')"));
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("2000-03-01 00:00:00.500+00"));
 }
 
 TEST_F(SqlFunctionEdgeTest, FormatTimestampsWithNumericTimeZoneOffsets) {
@@ -105,7 +131,7 @@ TEST_F(SqlFunctionEdgeTest, FormatTimestampsWithNumericTimeZoneOffsets) {
       "'+05:30'), FORMAT_TIMESTAMP('%T %z %Ez', "
       "TIMESTAMP '2026-07-02 12:04:05+00', 'America/Los_Angeles'), "
       "FORMAT_DATETIME('%z %Ez', DATETIME '2026-01-02T03:04:05', '-03:30')");
-  ASSERT_EQ(rows.size(), 1u);
+  ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value("+00:00"));
   EXPECT_EQ(rows[0][1], Value("08:34:05 +0530 +05:30 %z"));
   EXPECT_EQ(rows[0][2], Value("05:04:05 -0700 -07:00"));
@@ -129,8 +155,10 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT FORMAT('%#o', 8)", R"sql("010")sql"},
       {"SELECT FORMAT('%e', 1234.5678)", R"sql("1.234568e+03")sql"},
       {"SELECT FORMAT('%f', 3.14159)", R"sql("3.141590")sql"},
+      {"SELECT FORMAT('%F', 3.14159)", R"sql("3.141590")sql"},
       {"SELECT FORMAT('%.2f', 3.14159)", R"sql("3.14")sql"},
       {"SELECT FORMAT('%g', 0.00001234)", R"sql("1.234e-05")sql"},
+      {"SELECT FORMAT('%G', 0.00001234)", R"sql("1.234E-05")sql"},
       {"SELECT FORMAT('%s', 'abc')", R"sql("abc")sql"},
       {R"sql(SELECT FORMAT('%t', 'a"b\c'))sql", R"("a\"bc")"},
       {"SELECT FORMAT('%t', DATE '2026-01-02')", R"sql("2026-01-02")sql"},

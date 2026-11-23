@@ -1,8 +1,8 @@
 # Storage integrity checks
 
 Individual in-memory `Page` / `RowPage` objects do not carry a persistent
-page checksum. `PagePool`, `Page::SetChecksum`, `Page::IsValid`, `DecodeDisk`
-and the `TYB1` page format belong to the retired page storage implementation.
+page checksum. `PagePool`, `Page::SetChecksum`, `DecodeDisk`
+and the `TYB1` page format belong to the retired page storage implementation. `Page::IsValid` remains part of the current `Page` class.
 They are not interfaces or format requirements of the current engine.
 
 `PageManager::WriteFuzzyCheckpoint` writes a checksum over the complete

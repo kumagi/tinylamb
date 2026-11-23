@@ -23,6 +23,19 @@
 #include "type/row.hpp"
 
 namespace tinylamb {
+namespace {
+template <typename Callback>
+class ScopeExit {
+ public:
+  explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+  ~ScopeExit() { callback_(); }
+
+ private:
+  Callback callback_;
+};
+}  // namespace
 
 ParallelIndexScan::ParallelIndexScan(
     Transaction& txn, const Table& table, const Index& index,
@@ -36,8 +49,8 @@ ParallelIndexScan::ParallelIndexScan(
       schema_(table.GetSchema()),
       index_read_guard_(index_read_guard.HoldsLock()
                             ? std::move(index_read_guard)
-                            : txn.AcquireIndexReadGuard(index.Root())),
-      worker_count_(1) {
+                            : txn.AcquireIndexReadGuard(index.Root()))
+      {
   StatusOr<TableLease> lease = table.AcquireLease(txn.ID());
   if (!lease.HasValue()) {
     worker_status_ = lease.GetStatus();
@@ -143,6 +156,14 @@ bool ParallelIndexScan::KeyEqualsBoundary(
 }
 
 void ParallelIndexScan::RunWorker(size_t batch_size, size_t worker_index) {
+  ScopeExit completion([this] {
+    {
+      std::scoped_lock lock(mutex_);
+      --active_workers_;
+    }
+    ready_cv_.notify_all();
+    space_cv_.notify_all();
+  });
   try {
     // Static rotation: worker w scans morsels w, w+W, w+2W, ... .  Fixed
     // ownership is what makes the ordered handoff deadlock-free: the owner of
@@ -213,12 +234,6 @@ void ParallelIndexScan::RunWorker(size_t batch_size, size_t worker_index) {
     }
     cancelled_.store(true, std::memory_order_release);
   }
-  {
-    std::scoped_lock lock(mutex_);
-    --active_workers_;
-  }
-  ready_cv_.notify_all();
-  space_cv_.notify_all();
 }
 
 bool ParallelIndexScan::Deposit(size_t morsel_index, DataChunk chunk) {
@@ -247,8 +262,24 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
   // Workers use a fixed chunk size; per-consumer max_rows is absorbed by the
   // pending_ split below so the first caller cannot dictate global capacity.
   Start(kDefaultVectorSize);
+  const auto report_worker_failure = [&] {
+    const Status& status =
+        worker_error_ != Status::kSuccess ? worker_error_ : worker_status_;
+    if (status == Status::kSuccess) {
+      return false;
+    }
+    FailWith(status);
+    destination->Reset();
+    return true;
+  };
   while (destination->Size() < max_rows) {
     if (pending_) {
+      {
+        std::scoped_lock lock(mutex_);
+        if (report_worker_failure()) {
+          return 0;
+        }
+      }
       while (pending_offset_ < pending_->Size() &&
              destination->Size() < max_rows) {
         destination->AppendFrom(*pending_, pending_offset_++);
@@ -270,14 +301,7 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
              morsels_done_[next_out_morsel_] ||
              morsel_chunk_[next_out_morsel_].has_value();
     });
-    if (worker_error_ != Status::kSuccess) {
-      // Surface the worker failure as a sticky Status (no-exception
-      // executor contract).
-      FailWith(worker_error_);
-      return 0;
-    }
-    if (worker_status_ != Status::kSuccess) {
-      FailWith(worker_status_);
+    if (report_worker_failure()) {
       return 0;
     }
     if (cancelled_.load(std::memory_order_relaxed)) {

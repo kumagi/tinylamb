@@ -140,7 +140,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   size_t worker_count_;
   bool executed_{false};
   // A failed execution must never degrade into a normal-looking empty
-  // aggregate on a subsequent Next(); the original error is rethrown.
+  // aggregate on a subsequent Next(); the original Status is returned.
   bool errored_{false};
   Status error_{Status::kSuccess};
 };

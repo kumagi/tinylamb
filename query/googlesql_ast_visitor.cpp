@@ -268,9 +268,10 @@ bool IsUnexpandedStar(const Expression& expression) {
 
 // --- SQL UDF support (CREATE [TEMP] [AGGREGATE] FUNCTION) -------------------
 //
-// The visitor keeps a process-wide registry of user-defined SQL functions,
-// mirroring the session-scoped TEMP semantics of the single-connection
-// compliance harness (the same pattern as SetSessionConstant).  Definitions
+// The visitor keeps a thread-local, session-scoped registry of user-defined
+// SQL functions, mirroring the session-scoped TEMP semantics of the
+// single-connection compliance harness (the same pattern as SetSessionConstant).
+// Definitions
 // store the raw body AST; scalar bodies are compiled lazily on first call and
 // served from the expression-layer runtime registry, while aggregate bodies
 // are spliced into every call site so the enclosing statement's aggregation
@@ -723,7 +724,8 @@ void AnalyzeUdfBody(const GoogleSqlAstNode& node,  // NOLINT(misc-no-recursion)
     AnalyzeUdfBody(*child, parameters, counts, simple);
   }
 }
-// ignored; unqualified hints must be recognized by the engine, and none are.
+// Qualified hints (multi-part names) are ignored; unqualified hints must be
+// recognized by the engine, and none are, so reject every unqualified hint.
 Status RejectUnsupportedHints(  // NOLINT(misc-no-recursion)
     const GoogleSqlAstNode& node) {
   if (node.kind == "HintEntry") {
@@ -781,11 +783,30 @@ StatusOr<TableSampleSpec> VisitTableSample(
 
   std::string size_text = UpperCopy(SliceSource(size_node));
   // Comments inside the size expression must not decide the sample unit.
+  // Skip over string literals so a quoted '--' or '/*' is not mistaken for a
+  // comment opener.
   for (size_t i = 0; i + 1 < size_text.size();) {
-    if (size_text[i] == '/' && size_text[i + 1] == '*') {
+    if (size_text[i] == '\'') {
+      const size_t end = size_text.find('\'', i + 1);
+      // Doubled quotes are consumed as two adjacent literals below.
+      if (end == std::string::npos) {
+        break;
+      }
+      i = end + 1;
+    } else if (size_text[i] == '/' && size_text[i + 1] == '*') {
       const size_t end = size_text.find("*/", i + 2);
-      size_text.erase(
-          i, end == std::string::npos ? std::string::npos : end + 2 - i);
+      if (end == std::string::npos) {
+        // Unterminated comment: do not erase from here to the end of the
+        // string, or PERCENT/ROWS (and any other unit keyword after `/*`)
+        // would be swallowed and valid SQL would fail unit detection.
+        break;
+      }
+      size_text.erase(i, end + 2 - i);
+    } else if (size_text[i] == '-' && size_text[i + 1] == '-') {
+      // GoogleSQL line comment: drop up to (but not including) the newline so
+      // a PERCENT/ROWS keyword on the following line still decides the unit.
+      const size_t end = size_text.find('\n', i + 2);
+      size_text.erase(i, end == std::string::npos ? end : end - i);
     } else {
       ++i;
     }
@@ -822,6 +843,12 @@ StatusOr<TableSampleSpec> VisitTableSample(
       return AstError<TableSampleSpec>(
           "PARTITION BY is only valid for RESERVOIR TABLESAMPLE");
     }
+    size_t partition_keys = 0;
+    for (const auto& child : partition->children) {
+      partition_keys += child->kind == "ExpressionList" ? child->children.size()
+                                                        : 1;
+    }
+    sample.partition_by.reserve(partition_keys);
     for (const auto& child : partition->children) {
       if (child->kind == "Location") {
         continue;
@@ -1039,7 +1066,14 @@ StatusOr<SelectSource> VisitTableSource(
     // stays the name used at the reference site.
     const auto& views = ViewRegistry();
     const auto found_view = views.find(Lower(dotted));
-    if (found_view != views.end() && found_view->second.query != nullptr) {
+    if (found_view != views.end()) {
+      if (found_view->second.query == nullptr) {
+        std::string message = "view definition could not be loaded: " + dotted;
+        if (!found_view->second.load_error.empty()) {
+          message += " (" + found_view->second.load_error + ")";
+        }
+        return StatusError(StatusCode::kCorrupt, std::move(message));
+      }
       if (ViewExpansionDepth() >= 16) {
         return AstError<SelectSource>("view expansion too deep: " + dotted);
       }
@@ -1514,6 +1548,10 @@ StatusOr<std::vector<NamedExpression>> VisitPipeSelectList(
     }
     ASSIGN_OR_RETURN(Expression, hvpipe_0, (VisitExpression(*expression_node)));
     Expression expression = std::move(hvpipe_0);
+    if (!expression) {
+      return AstError<std::vector<NamedExpression>>(
+          "GoogleSQL AST: missing pipe SELECT expression");
+    }
     ASSIGN_OR_RETURN(std::string, hvpipe_1, (Alias(*column)));
     std::string name = std::move(hvpipe_1);
     if (name.empty() && expression->Type() == TypeTag::kColumnValue) {
@@ -1757,6 +1795,10 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
           if (sub->kind == "IntLiteral") {
             ASSIGN_OR_RETURN(uint64_t, hvpipe_limit,
                              (ParseUnsignedLiteral(*sub)));
+            if (!std::in_range<size_t>(hvpipe_limit)) {
+              return AstError<std::shared_ptr<SelectStatement>>(
+                  "pipe LIMIT is outside the supported range");
+            }
             limit = static_cast<size_t>(hvpipe_limit);
             break;
           }
@@ -1767,6 +1809,10 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
               const Value& constant = folded->AsConstantValue().GetValue();
               if (constant.type == ValueType::kInt64 && !constant.IsNull() &&
                   constant.value.int_value >= 0) {
+                if (!std::in_range<size_t>(constant.value.int_value)) {
+                  return AstError<std::shared_ptr<SelectStatement>>(
+                      "pipe LIMIT is outside the supported range");
+                }
                 limit = static_cast<size_t>(constant.value.int_value);
                 break;
               }
@@ -1782,66 +1828,75 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
       // a literal OFFSET is never silently ignored. Invalid operands must
       // fail like the non-pipe LIMIT/OFFSET path instead of leaving the
       // offset at 0 and quietly changing the result window.
-      auto validate_pipe_offset = [](const GoogleSqlAstNode& operand)
-          -> StatusOr<std::shared_ptr<SelectStatement>> {
+      const auto parse_pipe_offset = [](const GoogleSqlAstNode& operand)
+          -> StatusOr<uint64_t> {
         if (operand.kind == "NullLiteral") {
-          return AstError<std::shared_ptr<SelectStatement>>(
-              "OFFSET must not be NULL");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "OFFSET must not be NULL");
         }
         if (operand.kind == "UnaryExpression" && operand.detail == "-" &&
             !operand.children.empty() &&
             operand.children.front()->kind == "IntLiteral") {
-          return AstError<std::shared_ptr<SelectStatement>>(
-              "OFFSET must be non-negative");
+          return StatusError(StatusCode::kInvalidArgument,
+                             "OFFSET must be non-negative");
         }
-        return std::shared_ptr<SelectStatement>{};
+        if (operand.kind == "IntLiteral") {
+          return ParseUnsignedLiteral(operand);
+        }
+        const auto folded = VisitExpression(operand);
+        if (folded.HasValue() && folded.Value() &&
+            folded.Value()->Type() == TypeTag::kConstantValue) {
+          const Value& constant = folded.Value()->AsConstantValue().GetValue();
+          if (constant.IsNull()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "OFFSET must not be NULL");
+          }
+          if (constant.type == ValueType::kInt64) {
+            if (!constant.IsUnsigned() && constant.value.int_value < 0) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "OFFSET must be non-negative");
+            }
+            return static_cast<uint64_t>(constant.value.int_value);
+          }
+        }
+        return StatusError(StatusCode::kInvalidArgument,
+                           "OFFSET requires an integer literal in this engine");
       };
+      bool has_offset = false;
       for (const auto& sub : limit_offset->children) {
         if (sub->kind == "Limit" || sub->kind == "Location" ||
             sub->kind == "Hint" || sub->kind == "WithTies") {
           continue;
         }
-        if (auto h_off = validate_pipe_offset(*sub); !h_off.HasValue()) {
-          return h_off.GetStatus();
-        }
-        if (sub->kind == "Offset") {
-          for (const auto& inner : sub->children) {
-            if (inner->kind == "IntLiteral") {
-              ASSIGN_OR_RETURN(uint64_t, hvpipe_offset,
-                               (ParseUnsignedLiteral(*inner)));
-              offset = hvpipe_offset;
-              break;
-            }
-          }
-          continue;
-        }
-        if (sub->kind == "IntLiteral") {
-          ASSIGN_OR_RETURN(uint64_t, hvpipe_offset,
-                           (ParseUnsignedLiteral(*sub)));
-          offset = hvpipe_offset;
-        } else {
-          // Constant expressions such as OFFSET 2+3 fold to a literal,
-          // matching the non-pipe LIMIT path's fold_int contract. Anything
-          // that does not fold to a non-negative integer literal fails
-          // loudly instead of being silently dropped.
-          auto folded_or = VisitExpression(*sub);
-          if (folded_or.HasValue()) {
-            Expression folded = folded_or.MoveValue();
-            if (folded && folded->Type() == TypeTag::kConstantValue) {
-              const Value& constant = folded->AsConstantValue().GetValue();
-              if (constant.type == ValueType::kInt64 && !constant.IsNull()) {
-                if (constant.value.int_value < 0) {
-                  return AstError<std::shared_ptr<SelectStatement>>(
-                      "OFFSET must be non-negative");
-                }
-                offset = static_cast<size_t>(constant.value.int_value);
-                continue;
-              }
-            }
-          }
+        if (has_offset) {
           return AstError<std::shared_ptr<SelectStatement>>(
-              "OFFSET requires an integer literal in this engine");
+              "pipe OFFSET accepts one operand");
         }
+        has_offset = true;
+        const GoogleSqlAstNode* operand = sub.get();
+        if (sub->kind == "Offset") {
+          operand = nullptr;
+          for (const auto& inner : sub->children) {
+            if (inner->kind == "Location" || inner->kind == "Hint") {
+              continue;
+            }
+            if (operand != nullptr) {
+              return AstError<std::shared_ptr<SelectStatement>>(
+                  "pipe OFFSET accepts one operand");
+            }
+            operand = inner.get();
+          }
+        }
+        if (operand == nullptr) {
+          return AstError<std::shared_ptr<SelectStatement>>(
+              "pipe OFFSET requires an operand");
+        }
+        ASSIGN_OR_RETURN(uint64_t, parsed_offset, parse_pipe_offset(*operand));
+        if (std::cmp_greater(parsed_offset, std::numeric_limits<size_t>::max())) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "OFFSET exceeds the supported range");
+        }
+        offset = static_cast<size_t>(parsed_offset);
       }
       if (limit.has_value()) {
         wrapper->SetLimit(limit);
@@ -1894,7 +1949,7 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
       Expression condition;
       std::vector<std::string> using_columns;
       using_columns.reserve(
-          using_clause ? using_clause->Children("Identifier").size() : 0);
+          (using_clause != nullptr) ? using_clause->Children("Identifier").size() : 0);
       if (on != nullptr && !on->children.empty()) {
         // Inside the wrapper the pipe input is only visible under its derived
         // alias: rebind ON qualifiers that name the input's earlier identity
@@ -2166,25 +2221,31 @@ static Status ApplyRecursiveDepthFromAliased(SelectStatement* statement,
   const auto bounds = depth_modifier->Children("IntOrUnbounded");
   bool lower_is_literal = false;
   bool upper_is_literal = false;
-  auto bound_value = [&](size_t index, int64_t fallback, bool* is_literal) {
+  auto bound_value = [&](size_t index, int64_t fallback,
+                         bool* is_literal) -> StatusOr<int64_t> {
     *is_literal = false;
     if (index >= bounds.size()) {
       return fallback;
     }
     for (const auto& child : bounds[index]->children) {
       if (child->kind == "IntLiteral") {
-        auto h_lit = ParseUnsignedLiteral(*child);
-        if (h_lit.HasValue()) {
-          *is_literal = true;
-          return static_cast<int64_t>(h_lit.MoveValue());
+        ASSIGN_OR_RETURN(uint64_t, parsed_bound, ParseUnsignedLiteral(*child));
+        if (!std::in_range<int64_t>(parsed_bound)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "WITH DEPTH bound is outside the supported range");
         }
+        *is_literal = true;
+        return static_cast<int64_t>(parsed_bound);
       }
     }
     return fallback;
   };
-  spec.lower = bound_value(0, 0, &lower_is_literal);
-  spec.upper =
-      bound_value(1, std::numeric_limits<int64_t>::max(), &upper_is_literal);
+  ASSIGN_OR_RETURN(int64_t, lower, bound_value(0, 0, &lower_is_literal));
+  ASSIGN_OR_RETURN(
+      int64_t, upper,
+      bound_value(1, std::numeric_limits<int64_t>::max(), &upper_is_literal));
+  spec.lower = lower;
+  spec.upper = upper;
   spec.lower_is_literal = lower_is_literal;
   spec.upper_is_literal = upper_is_literal;
   statement->SetRecursiveDepth(cte_name, std::move(spec));
@@ -2790,6 +2851,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     ASSIGN_OR_RETURN(Expression, hv190694_0,
                      (VisitExpression(*expression_node)));
     Expression expression = std::move(hv190694_0);
+    if (!expression) {
+      return AstError<std::shared_ptr<SelectStatement>>(
+          "GoogleSQL AST: missing SELECT expression");
+    }
     ASSIGN_OR_RETURN(std::string, hv190757_0, (Alias(*column)));
     std::string name = std::move(hv190757_0);
     if (name.empty() && expression->Type() == TypeTag::kColumnValue) {
@@ -2916,7 +2981,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     if (!type_name.empty()) {
       std::vector<Expression> args;
       args.reserve(1 +
-                   2 * std::min(projections.size(), projection_nodes.size()));
+                   (2 * std::min(projections.size(), projection_nodes.size())));
       args.emplace_back(ConstantValueExp(Value(std::string(type_name))));
       for (size_t i = 0; i < projections.size() && i < projection_nodes.size();
            ++i) {
@@ -3174,6 +3239,14 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
 
   std::vector<Expression> distinct_on_expressions;
   if (const GoogleSqlAstNode* distinct_on = select->Child("DistinctOn")) {
+    size_t distinct_keys = 0;
+    for (const auto& child : distinct_on->children) {
+      distinct_keys += child->kind == "ExpressionList" ||
+                               child->kind == "GroupingItem"
+                           ? child->children.size()
+                           : 1;
+    }
+    distinct_on_expressions.reserve(distinct_keys);
     for (const auto& child : distinct_on->children) {
       if (child->kind == "ExpressionList" || child->kind == "GroupingItem") {
         for (const auto& grandchild : child->children) {
@@ -3192,6 +3265,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     }
   } else if (const GoogleSqlAstNode* distinct_on_clause =
                  select->Child("DistinctOnClause")) {
+    distinct_on_expressions.reserve(distinct_on_clause->children.size());
     for (const auto& child : distinct_on_clause->children) {
       if (child->kind == "SelectColumn" && !child->children.empty()) {
         ASSIGN_OR_RETURN(Expression, hv205056_0,
@@ -3224,10 +3298,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   std::vector<std::vector<Expression>> pending_grouping_sets;
 
   if (const GoogleSqlAstNode* group = select->Child("GroupBy")) {
-    const bool is_group_by_all = group->Child("GroupByAll") != nullptr ||
-                                 group->detail.find("ALL") != std::string::npos;
+    const bool is_group_by_all = group->Child("GroupByAll") != nullptr;
     if (is_group_by_all) {
       std::vector<Expression> expressions;
+      expressions.reserve(statement->SelectList().size());
       const bool has_unexpanded_star = std::ranges::any_of(
           statement->SelectList(), [](const NamedExpression& item) {
             return IsUnexpandedStar(item.expression);
@@ -3258,13 +3332,18 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         if (node.kind == "IntLiteral") {
           ASSIGN_OR_RETURN(uint64_t, ordinal_value,
                            (ParseUnsignedLiteral(node)));
-          const auto ordinal = static_cast<size_t>(ordinal_value);
-          if (ordinal < 1 || ordinal > statement->SelectList().size() ||
-              !statement->SelectList()[ordinal - 1].expression) {
+          if (ordinal_value == 0 ||
+              ordinal_value > statement->SelectList().size()) {
             return AstError<Expression>(
                 "GoogleSQL AST: GROUP BY ordinal out of range");
           }
-          return statement->SelectList()[ordinal - 1].expression;
+          const auto index = static_cast<size_t>(ordinal_value - 1);
+          const Expression& expression = statement->SelectList()[index].expression;
+          if (!expression) {
+            return AstError<Expression>(
+                "GoogleSQL AST: GROUP BY ordinal out of range");
+          }
+          return expression;
         }
         return VisitExpression(node);
       };
@@ -4117,7 +4196,9 @@ void RegisterViewDefinition(std::string_view name,
                             const GoogleSqlAstNode& query,
                             std::string_view source) {
   ViewRegistry()[ast_visitor_detail::Lower(std::string(name))] = {
-      ast_visitor_detail::CloneAstNode(query), std::string(source)};
+      .query = ast_visitor_detail::CloneAstNode(query),
+      .source = std::string(source),
+      .load_error = {}};
 }
 StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode& root, std::string_view source) {
@@ -4226,6 +4307,10 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
         break;
       }
     }
+    if (!pending_entry.has_value()) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: CREATE CONSTANT is missing its value expression");
+    }
     std::vector<NamedExpression> proj;
     proj.emplace_back("constant",
                       ConstantValueExp(Value(std::string(const_name))));
@@ -4307,6 +4392,7 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
           "unsupported CREATE INDEX modifier (OR REPLACE is unavailable)");
     }
     std::vector<std::string> keys, storing;
+    keys.reserve(items->children.size());
     const auto column_name =
         [](const GoogleSqlAstNode* path) -> StatusOr<std::string> {
       if (path == nullptr || path->kind != "PathExpression" ||
@@ -4329,6 +4415,7 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
       keys.push_back(std::move(key));
     }
     if (const auto* includes = root.Child("IndexStoringExpressionList")) {
+      storing.reserve(includes->children.size());
       for (const auto& item : includes->children) {
         ASSIGN_OR_RETURN(std::string, column, column_name(item.get()));
         storing.push_back(std::move(column));

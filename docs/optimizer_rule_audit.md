@@ -7,7 +7,7 @@
 削除した演算子の enum・DSL・専用テスト・旧ルール解説も除去しています。
 既存の未コミット変更とは別に監査開始時のファイルを保存して比較しました。
 
-2026-11-19 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 95、物理 46、式 70 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
+2026-11-23 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 97、物理 46、式 70 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
 
 ## 判定と修正
 
@@ -69,7 +69,7 @@
 `safe_divide_rewrite`、`function_volatility_classification` を撤去しました。
 volatile 関数の定数畳み込み禁止とゼロ除算の扱いは実際の評価・fold の guard に残します。
 同内容で二度登録されていた `abs_of_abs` も一つにしました。
-2026-11-11 の再照合で式ルールは 71 登録です（Cascades 論理・物理の本数とは別）。
+2026-11-19 の再照合で式ルールは 70 登録です（Cascades 論理・物理の本数とは別）。
 既に登録が存在しない `eliminate_identity_projection` /
 `projection_cse_and_pruning` の旧章も削除。恒等射影の除去はスキーマを比較する
 物理 helper `RemoveIdentityProjection` が担当します。
@@ -281,6 +281,8 @@ stack trace を有効にしておらず、発生箇所・原因を特定でき�
 93. `outer_to_anti_join_through_inner_join`
 94. `self_join_agg_to_window`
 95. `eager_distinct_fact_keys_before_join`
+96. `window_halo_topn`
+97. `push_topn_with_ties_through_left_join`
 
 ### 物理
 

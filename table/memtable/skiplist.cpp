@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 #include "common/platform/endian.hpp"
@@ -135,12 +136,8 @@ SkipList::ConstIterator SkipList::Begin() const {
 void SkipList::InitHead() {
   auto* mem = static_cast<char*>(arena_.Allocate(
       sizeof(Node) + (static_cast<size_t>(kMaxLevel) * sizeof(void*))));
-  auto* h = reinterpret_cast<Node*>(mem);
-  new (&h->entry) RowEntry();
-  h->key_len = 0;
-  h->height = kMaxLevel;
-  h->word0 = 0;
-  h->tail9 = 0;
+  auto* h = new (mem) Node{
+      .entry = {}, .word0 = 0, .tail9 = 0, .key_len = 0, .height = kMaxLevel};
   for (int i = 0; i < kMaxLevel; ++i) {
     h->next(i) = nullptr;
     tail_[static_cast<size_t>(i)] = h;
@@ -170,9 +167,12 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
   if (key.size() > std::numeric_limits<uint32_t>::max()) {
     throw std::runtime_error("skiplist key exceeds uint32 range");
   }
-  const size_t bytes =
-      sizeof(Node) + (static_cast<size_t>(height) * sizeof(void*)) + key.size();
-  auto* mem = static_cast<char*>(arena_.Allocate(bytes));
+  const size_t node_bytes =
+      sizeof(Node) + (static_cast<size_t>(height) * sizeof(void*));
+  if (key.size() > std::numeric_limits<size_t>::max() - node_bytes) {
+    throw std::bad_alloc();
+  }
+  auto* mem = static_cast<char*>(arena_.Allocate(node_bytes + key.size()));
   if (mem == nullptr) {
     // Allocate reports an unserviceable size by returning nullptr; placement-
     // new-ing a Node there would crash outside any Status boundary. Upsert's
@@ -180,10 +180,11 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
     // oversized-key guard above.
     throw std::bad_alloc();
   }
-  auto* n = reinterpret_cast<Node*>(mem);
-  new (&n->entry) RowEntry(std::move(entry));
-  n->key_len = static_cast<uint32_t>(key.size());
-  n->height = static_cast<uint16_t>(height);
+  auto* n = new (mem) Node{.entry = std::move(entry),
+                           .word0 = 0,
+                           .tail9 = 0,
+                           .key_len = static_cast<uint32_t>(key.size()),
+                           .height = static_cast<uint16_t>(height)};
   for (int i = 0; i < height; ++i) {
     n->next(i) = nullptr;
   }
@@ -192,9 +193,6 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
     std::memcpy(&word, key.data(), sizeof(word));
     n->word0 = htobe64(word);
     n->tail9 = static_cast<uint8_t>(key[8]);
-  } else {
-    n->word0 = 0;
-    n->tail9 = 0;
   }
   if (!key.empty()) {
     memcpy(const_cast<char*>(n->Key().data()), key.data(), key.size());
@@ -205,17 +203,17 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
 SkipList::SkipList() { InitHead(); }
 
 void SkipList::Clear() {
-  // Run entry destructors before releasing arena memory.
+  // Run node destructors before releasing arena memory.
   ConstIterator it = Begin();
   while (it.Valid()) {
     auto* n = static_cast<Node*>(const_cast<void*>(it.node));
     it.Next();
-    n->entry.~RowEntry();
+    n->~Node();
   }
   // The sentinel was placement-new'd in InitHead like any other node:
   // destroy it too before FreeAll releases its chunk.
   if (head_ != nullptr) {
-    head_->entry.~RowEntry();
+    head_->~Node();
   }
   arena_.FreeAll();
   // A fresh InitHead builds a brand-new sentinel (no destruction needed

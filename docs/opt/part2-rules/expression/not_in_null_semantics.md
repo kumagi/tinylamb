@@ -8,7 +8,7 @@
 
 リスト内に NULL 定数を含む否定包含判定 `x NOT IN (c1, ..., NULL)` を、明示的な三値論理制御フローを持つ CASE 式 `CASE WHEN x IN (c1, ...) THEN FALSE ELSE NULL END` へ展開する式書き換え Rule です。
 
-SQL の三値論理において、NULL を含むリストに対する `NOT IN` 述語は、いずれかの要素と一致した場合は `FALSE`、それ以外の場合は `UNKNOWN`（NULL）を返します。これを二項不等号の連言 $\bigwedge (x \ne c_i)$ に分解すると、非一致時の `UNKNOWN` を偽として扱い、変換前後の真理値が一致しません。本 Rule は明示的な CASE 式へ変換して真理値を保ち、後続の IN 簡約 Rule を適用できる形にします。
+SQL の三値論理において、NULL を含むリストに対する `NOT IN` 述語は、いずれかの要素と一致した場合は `FALSE`、それ以外の場合は `UNKNOWN`（NULL）を返します。二項不等号の連言 $\bigwedge (x \ne c_i)$ も同じ真理値を保ちますが、本 Rule は後続の IN 簡約を適用しやすくするため、明示的な CASE 形式へ変換します。
 
 ## 変換前後の関係
 

@@ -20,26 +20,35 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
+namespace {
+
+size_t EstimateDistinctRowCount(const TableStatistics& stats,
+                                 size_t column_count) {
+  std::vector<size_t> columns;
+  columns.reserve(column_count);
+  for (size_t i = 0; i < column_count; ++i) {
+    columns.push_back(i);
+  }
+  const double rounded = std::ceil(stats.EstimateDistinctRows(columns));
+  if (!std::isfinite(rounded) || rounded <= 0.0) {
+    return 0;
+  }
+  // Near SIZE_MAX, the floating-point representation of the input bound
+  // can round up beyond the range of size_t. Saturate before converting.
+  return rounded >= static_cast<double>(stats.Rows())
+             ? stats.Rows()
+             : static_cast<size_t>(rounded);
+}
+
+}  // namespace
 
 TableStatistics EstimateDistinctPlanStats(const Plan& child) {
   TableStatistics stats = child->GetStats();
-  if (stats.Rows() == 0 || child->GetSchema().ColumnCount() == 0) {
+  const size_t columns = child->GetSchema().ColumnCount();
+  if (stats.Rows() == 0 || columns == 0) {
     return stats;
   }
-  std::vector<size_t> columns;
-  columns.reserve(child->GetSchema().ColumnCount());
-  for (size_t i = 0; i < child->GetSchema().ColumnCount(); ++i) {
-    columns.push_back(i);
-  }
-  const double distinct_rows = stats.EstimateDistinctRows(columns);
-  // A NaN/negative/infinite estimate cannot be rounded to a row count: the
-  // cast would be undefined. Fall back to an empty estimate, like the other
-  // cardinality estimators do when their input is not a positive number.
-  if (!std::isfinite(distinct_rows) || distinct_rows <= 0.0) {
-    return stats.ScaleToRows(0);
-  }
-  const auto output_rows = static_cast<size_t>(std::ceil(distinct_rows));
-  return stats.ScaleToRows(std::min(output_rows, stats.Rows()));
+  return stats.ScaleToRows(EstimateDistinctRowCount(stats, columns));
 }
 
 DistinctPlan::DistinctPlan(Plan child, std::vector<Expression> distinct_on)
@@ -83,12 +92,7 @@ size_t SkipScanDistinctPlan::AccessRowCount() const { return stats_.Rows(); }
 
 size_t SkipScanDistinctPlan::EmitRowCount() const {
   // Estimate DISTINCT over every output column, not only the first one.
-  std::vector<size_t> columns;
-  columns.reserve(select_items_.size());
-  for (size_t i = 0; i < select_items_.size(); ++i) {
-    columns.push_back(i);
-  }
-  return static_cast<size_t>(std::ceil(stats_.EstimateDistinctRows(columns)));
+  return EstimateDistinctRowCount(stats_, select_items_.size());
 }
 
 bool SkipScanDistinctPlan::IsOrderedBy(

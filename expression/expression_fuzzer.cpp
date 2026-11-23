@@ -676,6 +676,7 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
   ExpressionFuzzResult result;
   std::string& violation = result.violation;
   if (size < 4 || size > 4096) {
+    result.ignored = true;
     return result;
   }
 
@@ -697,6 +698,7 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
 
   Expression exp = GenerateExpression(stream, 4);
   if (!exp) {
+    result.ignored = true;
     return result;
   }
 

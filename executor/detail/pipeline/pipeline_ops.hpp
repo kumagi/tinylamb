@@ -143,7 +143,10 @@ class ProjectOp final : public PipelineOperator {
   std::unique_ptr<Projection> projection_;
 };
 
-// Zero-copy metadata pass-through preserving alias boundaries in EXPLAIN trees.
+// Metadata pass-through preserving alias boundaries in EXPLAIN trees.
+// Copies the DataChunk (column buffers and payloads are deep-copied), so it
+// is not zero-copy; the copy is the price of handing downstream stages an
+// independent batch.
 class RenameOp final : public PipelineOperator {
  public:
   RenameOp(std::string physical, std::string relation)

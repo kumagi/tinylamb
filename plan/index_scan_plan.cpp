@@ -85,13 +85,17 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
                   const std::vector<bool>& ascending,
-                  const std::vector<std::optional<bool>>& nulls_first = {}) {
+                  const std::vector<std::optional<bool>>& nulls_first,
+                  std::string_view scan_relation) {
   if (provided.empty() || expressions.empty() ||
       expressions.size() != ascending.size() ||
       expressions.size() > provided.size()) {
     return false;
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
+    if (expressions[i] == nullptr) {
+      return false;
+    }
     // Index keys use memcomparable byte order with NULL encoded smallest, so
     // a forward scan yields NULLS FIRST and a reverse scan NULLS LAST
     // (affine post-projection moves values but not the NULL position).
@@ -104,14 +108,18 @@ bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
     if (expressions[i]->Type() == TypeTag::kColumnValue) {
       const ColumnName& column =
           expressions[i]->AsColumnValue().GetColumnName();
-      // `provided[i]` carries the scanned table's qualifier. A request naming
-      // a different relation's column with the same bare name is *not* in
+      // `provided[i]` names a column of the scanned table; when it is
+      // unqualified the scan's own relation is implied. A request naming a
+      // different relation's column with the same bare name is *not* in
       // index order, even though the names match. An unqualified request is
-      // resolved to the scanned table, so only reject when both sides name a
-      // relation and disagree (the affine branch above compares strictly).
+      // resolved to the scanned table, so only reject when the request names
+      // a relation and it is not the provided (or implied scan) relation.
+      const std::string_view provided_relation =
+          provided[i].schema.empty()
+              ? scan_relation
+              : std::string_view(provided[i].schema);
       if (column.name != provided[i].name ||
-          (!column.schema.empty() && !provided[i].schema.empty() &&
-           column.schema != provided[i].schema) ||
+          (!column.schema.empty() && column.schema != provided_relation) ||
           ascending[i] != scan_ascending) {
         return false;
       }
@@ -362,7 +370,8 @@ bool IndexScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                 const std::vector<bool>& ascending) const {
   // Point ranges are sorted and disjoint before construction, so scanning
   // them in sequence preserves the advertised global key order.
-  return OrderMatches(provided_order_, ascending_, expressions, ascending) &&
+  return OrderMatches(provided_order_, ascending_, expressions, ascending, {},
+                      table_.GetSchema().Name()) &&
          DoubleKeyOrderIsSound();
 }
 
@@ -371,7 +380,7 @@ bool IndexScanPlan::IsOrderedBy(
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending,
-                      nulls_first) &&
+                      nulls_first, table_.GetSchema().Name()) &&
          DoubleKeyOrderIsSound();
 }
 
@@ -587,8 +596,11 @@ ReboundIndexKeys ReboundIndexKeysFromPredicate(const Expression& predicate,
         std::vector<Value> values = points->second;
         std::ranges::sort(values);
         values.erase(std::ranges::unique(values).begin(), values.end());
+        keys.point_ranges.reserve(values.size());
         for (const Value& value : values) {
-          std::vector<Value> key = equality_prefix;
+          std::vector<Value> key;
+          key.reserve(equality_prefix.size() + 1);
+          key.insert(key.end(), equality_prefix.begin(), equality_prefix.end());
           key.push_back(value);
           std::vector<Value> end_key = key;
           keys.point_ranges.emplace_back(std::move(key), std::move(end_key));

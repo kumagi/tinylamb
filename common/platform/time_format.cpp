@@ -79,7 +79,14 @@ void GmTime(int64_t seconds, struct tm* out) {
   int64_t d = 0;
   CivilFromDays(days, &y, &m, &d);
   *out = {};
-  out->tm_year = static_cast<int>(y - 1900);
+  const int64_t tm_year = y - 1900;
+  // struct tm stores years in int even though the epoch API accepts int64
+  // seconds. Leave the result zeroed when the civil year cannot be represented
+  // instead of narrowing it into an unrelated date.
+  if (tm_year < INT_MIN || tm_year > INT_MAX) {
+    return;
+  }
+  out->tm_year = static_cast<int>(tm_year);
   out->tm_mon = static_cast<int>(m - 1);
   out->tm_mday = static_cast<int>(d);
   out->tm_hour = static_cast<int>(rem / 3600);
@@ -107,12 +114,12 @@ int64_t TimeGm(struct tm* tm) {
   return seconds;
 }
 
-void LocalTime(std::time_t seconds, struct tm* out) {
+bool LocalTime(std::time_t seconds, struct tm* out) {
   *out = {};
 #ifdef _WIN32
-  (void)::localtime_s(out, &seconds);
+  return ::localtime_s(out, &seconds) == 0;
 #else
-  (void)::localtime_r(&seconds, out);
+  return ::localtime_r(&seconds, out) != nullptr;
 #endif
 }
 
@@ -191,13 +198,15 @@ const char* ParseOffset(const char* rp, struct tm* tm) {
     value = value * 10 + (*rp++ - '0');
     ++hour_digits;
   }
-  if (hour_digits == 0) return nullptr;
+  // glibc requires exactly two hour digits in every form; "+1:30" is
+  // rejected. Checking this once also keeps a one-digit hour from being
+  // reinterpreted when hours and minutes share the same counter.
+  if (hour_digits != 2) return nullptr;
   int minute_digits = 0;
   if (*rp == ':') {
     ++rp;
-    // A colon needs a fully spelled minute field: "+1:30" is valid, but
-    // "+1:2" is not. Accumulating hours and minutes into one counter used
-    // to reinterpret the latter as "+12:00".
+    // A colon needs a fully spelled minute field: "+01:30" is valid, but
+    // "+01:3" is not.
     while (minute_digits < 2 && IsDigit(*rp)) {
       value = value * 10 + (*rp++ - '0');
       ++minute_digits;
@@ -209,9 +218,7 @@ const char* ParseOffset(const char* rp, struct tm* tm) {
       ++minute_digits;
     }
     if (minute_digits == 0) {
-      // Hour-only form ("+05") needs both hour digits.
-      if (hour_digits != 2) return nullptr;
-      value *= 100;
+      value *= 100;  // Hour-only form ("+05"); width already checked.
     } else if (minute_digits != 2) {
       return nullptr;
     }
@@ -288,6 +295,10 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
   // "%p%I" disagree with Linux ("PM 3" -> 03:00 instead of 15:00).
   bool have_twelve_hour = false;
   int meridiem = -1;  // -1 none, 0 AM, 1 PM
+  // glibc keeps the century parsed by %C as separate state: a following %y
+  // only fills in the low two digits, and %C itself preserves low digits
+  // that an earlier %y supplied. -1 means no century has been parsed.
+  int century = -1;
   for (const char* fp = fmt; *fp != '\0'; ++fp) {
     if (IsSpace(*fp)) {
       while (IsSpace(*rp)) ++rp;
@@ -320,18 +331,26 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
         int y = 0;
         rp = ParseIntField(rp, 2, 0, 99, &y);
         if (rp == nullptr) return nullptr;
-        // POSIX/glibc pivot: 00..68 are 2000..2068, 69..99 are
-        // 1969..1999. tm_year is relative to 1900.
-        tm->tm_year = y <= 68 ? y + 100 : y;
+        // A bare %y uses glibc's POSIX pivot: 00..68 -> 2000..2068 and
+        // 69..99 -> 1969..1999. This intentionally matches glibc strptime
+        // (and therefore Linux) on every platform; the old 2000+yy rule
+        // used on non-glibc builds disagreed with it.
+        // After %C, glibc instead keeps that century and only fills in the
+        // low two digits, e.g. "2084" with "%C%y" is 2084, not 1984.
+        tm->tm_year = century >= 0 ? (century - 19) * 100 + y
+                                   : (y <= 68 ? y + 100 : y);
         break;
       }
       case 'C': {
         int c = 0;
         rp = ParseIntField(rp, 2, 0, 99, &c);
         if (rp == nullptr) return nullptr;
-        // glibc's %C overwrites the year with the century (discarding any
-        // lower digits already in tm_year): tm_year = (century - 19) * 100.
-        tm->tm_year = (c - 19) * 100;
+        // glibc's %C sets the century but preserves low-order year digits
+        // already parsed (so "%y %C" works too), and remembers it so that a
+        // following %y does not reapply the two-digit pivot.
+        century = c;
+        const int low_year = ((tm->tm_year % 100) + 100) % 100;
+        tm->tm_year = (c - 19) * 100 + low_year;
         break;
       }
       case 'm': {
@@ -426,7 +445,9 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
           ++rp;
         }
         const auto t = static_cast<std::time_t>(neg ? -secs : secs);
-        LocalTime(t, tm);
+        if (!LocalTime(t, tm)) {
+          return nullptr;
+        }
         break;
       }
       case 'U':
@@ -558,11 +579,16 @@ const char* ParseTime(const char* input, const char* format, struct tm* tm) {
       ++fp;
       continue;
     }
-    if (fp[1] == 'z' || fp[1] == 'Z') {
+    const char* spec = fp + 1;
+    if ((*spec == 'E' || *spec == 'O') &&
+        (spec[1] == 'z' || spec[1] == 'Z')) {
+      ++spec;
+    }
+    if (*spec == 'z' || *spec == 'Z') {
       if (!flush()) return nullptr;
-      rp = fp[1] == 'z' ? ParseOffset(rp, tm) : SkipZoneName(rp);
+      rp = *spec == 'z' ? ParseOffset(rp, tm) : SkipZoneName(rp);
       if (rp == nullptr) return nullptr;
-      ++fp;
+      fp = spec;
       continue;
     }
     piece.push_back(*fp);

@@ -39,14 +39,18 @@ return JoinAlternatives(memo, logical.children[1], logical.predicate,
                         false, false, JoinAlternativeKind::kAnti);
 ```
 
-`JoinAlternatives` 内部では、少なくとも 1 組の等値結合キー対が存在すること、および残余述語（residual predicate）が存在しないことが必須条件となります。
+`JoinAlternatives` 内部では少なくとも 1 組の等値結合キー対が必要です。semi/anti の残余述語と、外部結合のうち評価不能な残余形状は除外されます。
 
 ```cpp
-// A semi/anti hash join emits only the probe side. A residual predicate
-// mentioning the build side cannot be evaluated after that reduction, so
-// leave such shapes for the existing relational fallback until a
-// residual-aware mark join is available.
-if (kind != JoinAlternativeKind::kInner && residual) {
+// Outer joins can retain residual predicates on the join node so unmatched
+// preserved-side rows still receive NULL padding. Other unsupported shapes
+// fall back to a relational implementation.
+if (kind != JoinAlternativeKind::kInner && residual &&
+    (!allow_outer_residual ||
+     (kind != JoinAlternativeKind::kLeftOuter &&
+      kind != JoinAlternativeKind::kRightOuter &&
+      kind != JoinAlternativeKind::kFullOuter) ||
+     ResidualContainsQuery(residual))) {
   return {};
 }
 ```
@@ -71,16 +75,7 @@ if (kind == JoinAlternativeKind::kSemi) {
   // ...
 ```
 
-コスト計算はハッシュ結合共通のモデル（`l_rows + r_rows`、インメモリ超過時はスピルペナルティを加算）に従います。
-
-推定出力行数は、マッチ判定による行数削減の厳密な予測が不可能なため、保守的な安全上界として常に左側行数 `l_rows` を採用します。
-
-```cpp
-const double estimate =
-    kind == JoinAlternativeKind::kAnti
-        ? l_rows
-        : (kind == JoinAlternativeKind::kLeftOuter || ...
-```
+`JoinAlternatives` は共有の `JoinCardinality` と `EmitRowCount` 経路で出力行数を見積もります。AntiJoin では一致行を除く割合を推定できないため、該当する cardinality model が推定値を選びます。コスト計算もこの共有 helper のハッシュ結合モデルに従います。
 
 ## 最適化効果
 

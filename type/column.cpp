@@ -106,16 +106,20 @@ Encoder& operator<<(Encoder& a, const Column& c) {
 Decoder& operator>>(Decoder& e, Column& c) {
   uint8_t encoded_type = 0;
   e >> c.col_name_ >> encoded_type >> c.constraint_;
-  c.unsigned_ = (encoded_type & 0x80) != 0;
   c.interval_ = (encoded_type & 0x08) != 0;
   const uint8_t raw_type = encoded_type & 0x07;
+  c.unsigned_ = raw_type == static_cast<uint8_t>(ValueType::kInt64) &&
+                (encoded_type & 0x80) != 0;
   const uint8_t width = (encoded_type >> 4) & 0x03;
   const bool is_varchar = raw_type == static_cast<uint8_t>(ValueType::kVarChar);
+  const bool has_unsigned = (encoded_type & 0x80) != 0;
   const bool has_text_domain = (encoded_type & 0x40) != 0;
   c.integer_bits_ =
       width == 0 || has_text_domain ? 64 : static_cast<uint8_t>(4U << width);
   c.text_domain_ = TextDomain::kUnspecified;
   if (raw_type > static_cast<uint8_t>(ValueType::kArray) ||
+      (has_unsigned &&
+       raw_type != static_cast<uint8_t>(ValueType::kInt64)) ||
       (has_text_domain && (!is_varchar || width > 1 || c.interval_)) ||
       (c.interval_ && !is_varchar) ||
       (width != 0 && !has_text_domain &&

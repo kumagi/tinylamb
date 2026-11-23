@@ -1,5 +1,6 @@
 import Std
 import Std.Tactic
+import TinylambOpt.AggJoinDiscovery
 
 /-
 # 検査付き SUM の事前集約を結合前に移せる値域
@@ -568,6 +569,80 @@ theorem sql_checked_eager_sum_sound [DecidableEq K]
   funext k
   obtain ⟨hr,he⟩ := safe_key_totals left (sqlFan right) F P N hFan hp hn hfp hfn hpos hneg k
   exact groupedKey_eq _ _ _ (hr.trans he.symm) ⟨_,hr⟩
+
+/-- General final grouping, including a nullable key taken from the right row.
+    Each stage enumerates the groups present in its own input relation. -/
+def checkedGroups [DecidableEq G] (key : A → G) (v : A → Val) (rows : List A) :
+    Option (List (G × Val)) :=
+  (distinctKeys (rows.map key)).mapM fun k => do
+    let vs := (rows.filter (fun x => key x == k)).map v
+    let s ← checkedSum 0 vs
+    return (k, if vs.any Option.isSome then some s else none)
+
+def GroupBounds [DecidableEq G] (key : A → G) (v : A → Val) (rows : List A) : Prop :=
+  ∀ k, let vs := (rows.filter (fun x => key x == k)).map v
+       sumPos vs ≤ i64Max ∧ i64Min ≤ sumNeg vs
+
+private theorem sum_value (f : A → Val) (rows : List A) :
+    (sqlSum f rows).getD 0 = plainSum (rows.map f) ∧
+    (sqlSum f rows).isSome = (rows.map f).any Option.isSome := by
+  induction rows with
+  | nil => exact ⟨rfl, rfl⟩
+  | cons x xs ih =>
+    cases hx : f x <;> cases hs : sqlSum f xs <;>
+      simp_all [sqlSum_cons, mergeSum, plainSum, vVal] <;> omega
+
+private theorem checkedGroups_safe [DecidableEq G] (key : A → G) (v : A → Val)
+    (rows : List A) (h : GroupBounds key v rows) :
+    checkedGroups key v rows = some (groupBy key (fun _ b => sqlSum v b) rows) := by
+  unfold checkedGroups groupBy
+  induction distinctKeys (rows.map key) with
+  | nil => rfl
+  | cons k ks ih =>
+    let bucket := rows.filter (fun x => key x == k)
+    let vs := bucket.map v
+    obtain ⟨hp, hn⟩ := h k
+    have hs : checkedSum 0 vs = some (plainSum vs) := by
+      simpa using checkedSum_eq_plain_of_invariant vs 0 0 0 (sumPos vs) (sumNeg vs)
+        hp hn (by decide) (by decide) rfl (by simp) (by simp)
+    have hv := sum_value v bucket
+    have val : (if vs.any Option.isSome then some (plainSum vs) else none) = sqlSum v bucket := by
+      change (if (bucket.map v).any Option.isSome then some (plainSum (bucket.map v)) else none) = _
+      rw [← hv.1, ← hv.2]
+      cases sqlSum v bucket <;> rfl
+    simp only [List.mapM_cons, List.map_cons]
+    change (do
+      let head ← (do
+        let s ← checkedSum 0 vs
+        pure (k, if vs.any Option.isSome then some s else none))
+      let tail ← _
+      pure (head :: tail)) = _
+    rw [hs, ih]
+    simpa [bucket] using val
+
+/-- The reference checks every addition after the join. The eager plan checks
+    its partial groups, joins those states with the right bag, then checks all
+    final additions. Bounds apply even to partial groups that find no match. -/
+theorem sql_checked_sum_reaggregation {L R K GL G : Type} [DecidableEq K] [DecidableEq GL] [DecidableEq G]
+    (lk : L → Option K) (rk : R → Option K) (gl : L → GL) (g : GL → R → G)
+    (v : L → Val) (ls : List L) (rs : List R) :
+    let pk := fun x => (gl x, lk x)
+    let clean := ls.filter (fun x => (lk x).isSome)
+    let pre := groupBy pk (fun _ b => sqlSum v b) clean
+    let jk := fun (xy : L × R) => g (gl xy.1) xy.2
+    let fk := fun (py : ((GL × Option K) × Val) × R) => g py.1.1.1 py.2
+    let joinPre := fun ps => equiJoinPairs (fun (p : (GL × Option K) × Val) => p.1.2) rk ps rs
+    GroupBounds pk v clean →
+    GroupBounds jk (fun xy => v xy.1) (equiJoinPairs lk rk ls rs) →
+    GroupBounds fk (fun py => py.1.2) (joinPre pre) →
+    ∃ orig opt, checkedGroups jk (fun xy => v xy.1) (equiJoinPairs lk rk ls rs) = some orig ∧
+      ((checkedGroups pk v clean).bind (fun ps =>
+        checkedGroups fk (fun py => py.1.2) (joinPre ps))) = some opt ∧ BagEq orig opt := by
+  intro pk clean pre jk fk joinPre hp hj hf
+  rw [checkedGroups_safe _ _ _ hj, checkedGroups_safe _ _ _ hp]
+  change ∃ a b, some _ = some a ∧ checkedGroups fk _ (joinPre pre) = some b ∧ BagEq a b
+  rw [checkedGroups_safe _ _ _ hf]
+  exact ⟨_, _, rfl, rfl, eager_group_agg_over_mn_join_sound sumMonoid lk rk gl g v ls rs⟩
 
 theorem sql_sum_null_unmatched_regression :
     let l : List (Row (Option Nat)) := [(none,some 4),(some 1,none),(some 2,some 9)]

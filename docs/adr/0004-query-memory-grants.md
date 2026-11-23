@@ -22,7 +22,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P1/P3 実装済み: `common/qu
 2. 足りなければ待つ。時間切れで `kMemoryLimitExceeded`（[ADR 0012](0012-memory-limit-error-code.md)）。
    これが同時実行数の入場制御になる。
 3. 点検索のように入力を溜めるシンクを持たないクエリは、付与を取らずに走る。待ち行列にも並ばない。
-4. `TINYLAMB_QUERY_MEMORY_BYTES` は 1 クエリの `G_q` の上限として扱う
+4. `TINYLAMB_QUERY_MEMORY_BYTES` は legacy 実行経路では 1 クエリの `G_q` の上限として扱う。Pipeline/OOC 経路ではクエリ grant ではなくプロセスメモリプールを使う
    （`docs/environment_variables.md` の記述「Per-query memory budget」に実装を合わせる）。
 
 ### クエリ内の配分

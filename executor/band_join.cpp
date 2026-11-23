@@ -209,6 +209,17 @@ Status BandJoin::Materialize() {
   if (right_width_ == 0 && !right_rows_.empty()) {
     right_width_ = right_rows_.front().first.values_.size();
   }
+  // When one side is empty its row width cannot be inferred from data. Outer
+  // join output_schema still describes both sides, so recover the missing
+  // width before constructing the NULL-padded row.
+  if (IsOuter(kind_) && output_schema_.ColumnCount() > 0) {
+    const size_t output_width = output_schema_.ColumnCount();
+    if (left_width_ == 0 && right_width_ <= output_width) {
+      left_width_ = output_width - right_width_;
+    } else if (right_width_ == 0 && left_width_ <= output_width) {
+      right_width_ = output_width - left_width_;
+    }
+  }
 
   std::optional<ValueType> key_type;
   const auto validate_key_type = [&](const Row& key_row,

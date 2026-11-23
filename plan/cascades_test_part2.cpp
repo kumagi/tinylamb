@@ -1,4 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include <string_view>
+
 #include "expression/parameter_slot.hpp"
 #include "plan/cascades_test.hpp"
 
@@ -1688,6 +1690,53 @@ TEST(CascadesTest, DynamicFilterPushdownJoinSkipsMultiRelationProbe) {
 // build is shrunk -- dedup, domain restriction and the fallback are all
 // executor decisions -- and it must not leak onto the unannotated groups, or
 // every semi/anti join would look reducible.
+// The probe-key fingerprint must be unambiguous: a plain comma join used to
+// map ["t1.a", "t1.b"] and ["t1.a,t1.b"] onto the same derived group, so the
+// second semi join inherited the first one's probe key set.
+TEST(CascadesTest, SemiReductionProbeKeysFingerprintIsUnambiguous) {
+  Memo memo;
+  (void)memo.Build({"t1", "t2"});
+  const GroupId probe = memo.EnsureGroup({"t1"});
+  const GroupId build = memo.EnsureGroup({"t2"});
+  const GroupId join_group = memo.EnsureDerivedGroup({"t1", "t2"}, "root_semi");
+  const Expression build_id = ColumnValueExp(ColumnName("t2", "id"));
+  const auto eq_on = [&](const std::string& name) {
+    return BinaryExpressionExp(ColumnValueExp(ColumnName("t1", name)),
+                               BinaryOperation::kEquals, build_id);
+  };
+  memo.AddExpression(
+      join_group,
+      LogicalExpression{.operation = LogicalOperator::kSemiJoin,
+                        .children = {probe, build},
+                        .predicate = BinaryExpressionExp(
+                            eq_on("a"), BinaryOperation::kAnd, eq_on("b"))});
+  memo.AddExpression(join_group,
+                     LogicalExpression{.operation = LogicalOperator::kSemiJoin,
+                                       .children = {probe, build},
+                                       .predicate = eq_on("a,t1.b")});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(join_group);
+
+  std::set<std::vector<std::string>> key_sets;
+  for (GroupId id = 0; id < search.GetMemo().GroupCount(); ++id) {
+    const Group& group = search.GetMemo().Get(id);
+    if (group.tag.find("semi_reduce_probe:") == std::string::npos) {
+      continue;
+    }
+    std::vector<std::string> keys;
+    keys.reserve(group.semi_reduction_probe_keys.size());
+for (const ColumnName& key : group.semi_reduction_probe_keys) {
+      keys.push_back(key.ToString());
+    }
+    if (!keys.empty()) {
+      key_sets.insert(std::move(keys));
+    }
+  }
+  EXPECT_EQ(key_sets.size(), 2U)
+      << "two different probe key sets must get two different derived groups";
+}
+
 TEST(CascadesTest, SemiReductionPushdownAnnotatesTheProbeKeys) {
   for (const LogicalOperator operation :
        {LogicalOperator::kSemiJoin, LogicalOperator::kAntiJoin}) {
@@ -3255,7 +3304,8 @@ TEST(CascadesTest, OuterToInnerOnHavingDemotesStrictAggAndRefusesCountStar) {
   EXPECT_FALSE(run_test(/*include_count_star=*/true));
 }
 
-static bool OffersEagerAggregation(AggregationType aggregate) {
+static bool OffersEagerAggregation(AggregationType aggregate,
+                                   std::string_view grouping_column) {
   Memo memo;
   const GroupId join_root = memo.Build(
       {"sales", "dept"}, {{BinaryExpressionExp(ColumnValueExp("sales.dept_id"),
@@ -3264,7 +3314,8 @@ static bool OffersEagerAggregation(AggregationType aggregate) {
                            {"sales", "dept"}}});
   memo.SetTableSchemas(
       {{"sales", Schema("sales", {Column("dept_id", ValueType::kInt64),
-                                  Column("amt", ValueType::kInt64)})},
+                                  Column("amt", ValueType::kInt64),
+                                  Column("region", ValueType::kVarChar)})},
        {"dept", Schema("dept", {Column("id", ValueType::kInt64,
                                        Constraint(Constraint::kPrimaryKey)),
                                 Column("region", ValueType::kVarChar)})}});
@@ -3275,13 +3326,13 @@ static bool OffersEagerAggregation(AggregationType aggregate) {
           .operation = LogicalOperator::kAggregation,
           .children = {join_root},
           .target_list =
-              {NamedExpression("region", ColumnValueExp("dept.region")),
+              {NamedExpression("region", ColumnValueExp(grouping_column)),
                NamedExpression("measure",
                                AggregateExpressionExp(
                                    aggregate, ColumnValueExp("sales.amt"))),
                NamedExpression("n", AggregateExpressionExp(
                                         AggregationType::kCount, nullptr))},
-          .grouping_sets = {ColumnValueExp("dept.region")}});
+          .grouping_sets = {ColumnValueExp(grouping_column)}});
 
   SearchEngine search(std::move(memo), RuleSet::Default());
   search.Explore(agg_group);
@@ -3310,11 +3361,12 @@ static bool OffersEagerAggregation(AggregationType aggregate) {
 }
 
 TEST(CascadesTest, EagerAggregationOverJoinPushesTwoStagePreAgg) {
-  EXPECT_TRUE(OffersEagerAggregation(AggregationType::kMax));
+  EXPECT_TRUE(OffersEagerAggregation(AggregationType::kMax, "sales.region"));
+  EXPECT_FALSE(OffersEagerAggregation(AggregationType::kMax, "dept.region"));
 }
 
 TEST(CascadesTest, EagerAggregationSkipsSumEvenWithUniqueJoinPartner) {
-  EXPECT_FALSE(OffersEagerAggregation(AggregationType::kSum));
+  EXPECT_FALSE(OffersEagerAggregation(AggregationType::kSum, "sales.region"));
 }
 
 TEST(CascadesTest, OuterJoinRightSelfEqualityDoesNotCertifyLeftCandidateKey) {
@@ -4266,6 +4318,13 @@ TEST(CascadesTest,
   {
     Memo memo;
     (void)memo.Build({"sales_1", "sales_2"});
+    // The rewrite proves same-table through the catalog-published schemas:
+    // both aliases resolve to the physical table `sales`.
+    const Schema sales_schema("sales", {Column("g", ValueType::kInt64),
+                                        Column("v", ValueType::kInt64),
+                                        Column("id", ValueType::kInt64)});
+    memo.SetTableSchemas(
+        {{"sales_1", sales_schema}, {"sales_2", sales_schema}});
     const GroupId gs = memo.EnsureGroup({"sales_1"});
     const GroupId gb_scan = memo.EnsureGroup({"sales_2"});
     const GroupId gb_agg = memo.EnsureDerivedGroup({"sales_2"}, "b_agg");
@@ -4324,6 +4383,79 @@ TEST(CascadesTest,
       }
     }
     EXPECT_TRUE(found_win_alt);
+  }
+
+  // 2b) `self_join_agg_to_window` must NOT fire for distinct real tables
+  //     whose names differ only by an "_N" suffix: the catalog proof (not
+  //     alias-stripping) is what decides same-table, and firing would both
+  //     misread `orders_1` rows as `orders` and violate the group's
+  //     relation set.
+  {
+    Memo memo;
+    (void)memo.Build({"orders", "orders_1"});
+    const Schema orders_schema("orders", {Column("g", ValueType::kInt64),
+                                          Column("v", ValueType::kInt64),
+                                          Column("id", ValueType::kInt64)});
+    const Schema orders1_schema("orders_1", {Column("g", ValueType::kInt64),
+                                             Column("v", ValueType::kInt64),
+                                             Column("id", ValueType::kInt64)});
+    memo.SetTableSchemas(
+        {{"orders", orders_schema}, {"orders_1", orders1_schema}});
+    const GroupId gs = memo.EnsureGroup({"orders"});
+    const GroupId gb_scan = memo.EnsureGroup({"orders_1"});
+    const GroupId gb_agg = memo.EnsureDerivedGroup({"orders_1"}, "b_agg");
+    memo.AddExpression(
+        gb_agg,
+        LogicalExpression{
+            .operation = LogicalOperator::kAggregation,
+            .children = {gb_scan},
+            .target_list = {NamedExpression("g", ColumnValueExp(ColumnName(
+                                                     "orders_1", "g"))),
+                            NamedExpression(
+                                "avg_v",
+                                AggregateExpressionExp(
+                                    AggregationType::kAvg,
+                                    ColumnValueExp(ColumnName("orders_1", "v")),
+                                    false))},
+            .grouping_sets = {ColumnValueExp(ColumnName("orders_1", "g"))}});
+    const GroupId j =
+        memo.EnsureDerivedGroup({"orders", "orders_1"}, "distinct_selfjoin");
+    memo.AddExpression(
+        j, LogicalExpression{.operation = LogicalOperator::kJoin,
+                             .children = {gs, gb_agg},
+                             .predicate = BinaryExpressionExp(
+                                 ColumnValueExp(ColumnName("orders", "g")),
+                                 BinaryOperation::kEquals,
+                                 ColumnValueExp(ColumnName("orders_1", "g")))});
+    const GroupId sel = memo.EnsureDerivedGroup({"orders", "orders_1"},
+                                                "distinct_selfjoin_sel");
+    memo.AddExpression(
+        sel, LogicalExpression{.operation = LogicalOperator::kSelection,
+                               .children = {j},
+                               .predicate = BinaryExpressionExp(
+                                   ColumnValueExp(ColumnName("orders", "v")),
+                                   BinaryOperation::kGreaterThan,
+                                   ColumnValueExp(ColumnName("", "avg_v")))});
+    const GroupId proj = memo.EnsureDerivedGroup({"orders", "orders_1"},
+                                                 "distinct_selfjoin_proj");
+    memo.AddExpression(
+        proj, LogicalExpression{
+                  .operation = LogicalOperator::kProjection,
+                  .children = {sel},
+                  .target_list = {NamedExpression(
+                      "id", ColumnValueExp(ColumnName("orders", "id")))}});
+
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(proj);  // must not abort and must not add the rewrite
+    for (const auto& pe : search.GetMemo().Get(proj).expressions) {
+      if (pe.operation == LogicalOperator::kProjection &&
+          pe.children.size() == 1) {
+        EXPECT_FALSE(search.GetMemo()
+                         .Get(pe.children[0])
+                         .tag.starts_with("self_join_win_sel:"))
+            << "distinct real tables must not collapse into a window scan";
+      }
+    }
   }
 
   // 3) `eager_distinct_fact_keys_before_join`:

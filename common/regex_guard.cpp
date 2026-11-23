@@ -2,11 +2,14 @@
 #include "common/regex_guard.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 #include "common/string_util.hpp"
@@ -26,13 +29,27 @@ std::string Utf8RegexPattern(std::string_view pattern) {
   constexpr std::string_view dot =
       R"((?:[\x00-\x09\x0B\x0C\x0E-\x7F]|[\xC2-\xDF][\x80-\xBF]|[\xE0-\xEF][\x80-\xBF]{2}|[\xF0-\xF4][\x80-\xBF]{3}))";
   std::string converted;
-  // Only unescaped, out-of-class '.' expands to `dot` (~74 bytes). Reserving
-  // dot.size() for every character over-allocates 74x for literal patterns.
-  // Counting '.' occurrences is a cheap upper bound; geometric growth then
-  // handles the rest.
-  const size_t dots =
-      static_cast<size_t>(std::count(pattern.begin(), pattern.end(), '.'));
-  converted.reserve(pattern.size() + (dots * dot.size()));
+  // Count only the unescaped dots outside character classes that will expand.
+  size_t dots = 0;
+  bool counting_in_class = false;
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    const char ch = pattern[i];
+    if (ch == '\\' && i + 1 < pattern.size()) {
+      ++i;  // the escaped character is copied verbatim below
+    } else if (ch == '.' && !counting_in_class) {
+      ++dots;
+    } else if (ch == '[') {
+      counting_in_class = true;
+    } else if (ch == ']') {
+      counting_in_class = false;
+    }
+  }
+  constexpr size_t growth = dot.size() - 1;
+  if (pattern.size() > converted.max_size() ||
+      dots > (converted.max_size() - pattern.size()) / growth) {
+    throw std::length_error("expanded regex is too large");
+  }
+  converted.reserve(pattern.size() + (dots * growth));
   bool in_class = false;
   for (size_t i = 0; i < pattern.size(); ++i) {
     const char ch = pattern[i];
@@ -184,7 +201,7 @@ class LinearPrefixVM {
         run.kind != StepKind::kCharClassPlus || run.excluded_byte < 0 ||
         close.kind != StepKind::kCaptureEnd || close.capture_id != capture ||
         stop.kind != StepKind::kLiteral || stop.literal.size() != 1 ||
-        static_cast<uint8_t>(stop.literal.front()) != run.excluded_byte) {
+        std::cmp_not_equal(stop.literal.front(), run.excluded_byte)) {
       return std::nullopt;
     }
     DelimitedRegexCapture description{
@@ -554,12 +571,21 @@ class LinearPrefixVM {
           break;
         }
         case StepKind::kCaptureStart: {
+          if (step.capture_id >= cap_starts.size()) {
+            return false;
+          }
           cap_starts[step.capture_id] = pos;
           ++step_idx;
           break;
         }
         case StepKind::kCaptureEnd: {
+          if (step.capture_id >= cap_starts.size()) {
+            return false;
+          }
           const size_t start = cap_starts[step.capture_id];
+          if (start > pos || pos > n) {
+            return false;
+          }
           captures[step.capture_id] = input.substr(start, pos - start);
           ++step_idx;
           break;
@@ -685,14 +711,19 @@ struct ReplacementProgram {
 #endif
 };
 
-void ApplyRewritePieces(const std::vector<RewritePiece>& pieces,
-                        const std::array<std::string_view, 10>& captures,
-                        std::string* out) {
+Status ApplyRewritePieces(const std::vector<RewritePiece>& pieces,
+                          const std::array<std::string_view, 10>& captures,
+                          std::string* out) {
   out->clear();
   size_t total = 0;
   for (const RewritePiece& piece : pieces) {
-    total += piece.is_capture ? captures[piece.capture_index].size()
-                              : piece.literal.size();
+    const size_t bytes = piece.is_capture ? captures[piece.capture_index].size()
+                                          : piece.literal.size();
+    if (bytes > out->max_size() - total) {
+      return StatusError(StatusCode::kTooBigData,
+                         "regular expression replacement is too large");
+    }
+    total += bytes;
   }
   out->reserve(total);
   for (const RewritePiece& piece : pieces) {
@@ -702,6 +733,7 @@ void ApplyRewritePieces(const std::vector<RewritePiece>& pieces,
       out->append(piece.literal);
     }
   }
+  return Status::kSuccess;
 }
 
 StatusOr<ReplacementProgram> CompileReplacement(std::string_view pattern,
@@ -710,7 +742,9 @@ StatusOr<ReplacementProgram> CompileReplacement(std::string_view pattern,
                    CompileCheckedRegex(std::string(pattern)));
   const size_t mark_count = compiled.mark_count();
   std::string format;
-  format.reserve(replacement.size());
+  // Each capture reference grows by one backslash and one brace; reserving
+  // twice the input avoids repeated reallocations for replacement-heavy work.
+  format.reserve(replacement.size() * 2);
   std::vector<RewritePiece> rewrite_pieces;
   rewrite_pieces.reserve(replacement.size());
   uint8_t nsubmatch = 0;
@@ -865,7 +899,859 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
   }
   return &temporary->emplace(std::move(compiled));
 }
+
+// Conservative regex AST + bitset Thompson NFA for REGEXP_CONTAINS.
+// Lean proofs:
+//   - lean/TinylambOpt/RegexMandatoryLiteral.lean (mandatory_search_sound)
+//   - lean/TinylambOpt/RegexBitsetNfa.lean +
+//     lean/TinylambOpt/ThompsonSearch.lean (compiled_search_iff)
+struct FastRegexAstNode {
+  enum class Kind {
+    kEmpty,
+    kAnchor,
+    kLiteral,  // non-empty pure literal string
+    kCharSet,  // single 7-bit ASCII byte class
+    kConcat,
+    kAlt,
+    kRepeat,  // min_rep..max_rep (max_rep == -1 => unbounded)
+  };
+  Kind kind{Kind::kEmpty};
+  std::string literal;
+  std::array<uint64_t, 2> charset{};  // bits 0..127
+  int min_rep{1};
+  int max_rep{1};
+  std::vector<FastRegexAstNode> children;
+};
+
+struct FastRegexParser {
+  std::string_view pat;
+  size_t pos{0};
+  bool aborted{false};
+
+  static void SetAsciiBit(std::array<uint64_t, 2>& cs, uint8_t b) noexcept {
+    if (b < 64) {
+      cs[0] |= uint64_t{1} << b;
+    } else {
+      cs[1] |= uint64_t{1} << (b - 64);
+    }
+  }
+
+  static void SetAsciiRange(std::array<uint64_t, 2>& cs, uint8_t lo,
+                            uint8_t hi) noexcept {
+    for (unsigned c = lo; c <= hi && c < 128; ++c) {
+      SetAsciiBit(cs, static_cast<uint8_t>(c));
+    }
+  }
+
+  [[nodiscard]] bool Parse(FastRegexAstNode* out) {
+    *out = ParseAlt();
+    return !(aborted || pos != pat.size());
+  }
+
+  FastRegexAstNode ParseAlt() {
+    std::vector<FastRegexAstNode> branches;
+    branches.push_back(ParseConcat());
+    while (!aborted && pos < pat.size() && pat[pos] == '|') {
+      ++pos;
+      branches.push_back(ParseConcat());
+    }
+    if (branches.size() == 1) {
+      return std::move(branches[0]);
+    }
+    FastRegexAstNode node;
+    node.kind = FastRegexAstNode::Kind::kAlt;
+    node.children = std::move(branches);
+    return node;
+  }
+
+  FastRegexAstNode ParseConcat() {
+    std::vector<FastRegexAstNode> items;
+    while (!aborted && pos < pat.size() && pat[pos] != '|' && pat[pos] != ')') {
+      FastRegexAstNode piece = ParsePiece();
+      if (aborted) {
+        return {};
+      }
+      if (piece.kind == FastRegexAstNode::Kind::kEmpty) {
+        continue;
+      }
+      if (!items.empty() &&
+          items.back().kind == FastRegexAstNode::Kind::kLiteral &&
+          piece.kind == FastRegexAstNode::Kind::kLiteral) {
+        items.back().literal += piece.literal;
+      } else {
+        items.push_back(std::move(piece));
+      }
+    }
+    if (items.empty()) {
+      FastRegexAstNode empty;
+      empty.kind = FastRegexAstNode::Kind::kEmpty;
+      return empty;
+    }
+    if (items.size() == 1) {
+      return std::move(items[0]);
+    }
+    FastRegexAstNode node;
+    node.kind = FastRegexAstNode::Kind::kConcat;
+    node.children = std::move(items);
+    return node;
+  }
+
+  static bool ParseDecimalInt(std::string_view sv, size_t* p, int* out) {
+    if (*p >= sv.size() || sv[*p] < '0' || sv[*p] > '9') {
+      return false;
+    }
+    int64_t val = 0;
+    while (*p < sv.size() && sv[*p] >= '0' && sv[*p] <= '9') {
+      val = (val * 10) + (sv[*p] - '0');
+      if (val > 1000) {
+        return false;
+      }
+      ++(*p);
+    }
+    *out = static_cast<int>(val);
+    return true;
+  }
+
+  FastRegexAstNode ParsePiece() {
+    FastRegexAstNode atom = ParseAtom();
+    if (aborted) {
+      return {};
+    }
+    if (pos < pat.size()) {
+      const char q = pat[pos];
+      if (q == '*' || q == '+' || q == '?') {
+        if (atom.kind == FastRegexAstNode::Kind::kAnchor) {
+          aborted = true;
+          return {};
+        }
+        ++pos;
+        if (pos < pat.size() && pat[pos] == '?') {
+          ++pos;  // lazy modifier preserves REGEXP_CONTAINS existence
+        }
+        if (pos < pat.size() && (pat[pos] == '*' || pat[pos] == '+' ||
+                                 pat[pos] == '?' || pat[pos] == '{')) {
+          aborted = true;  // stacked quantifier edge case
+          return {};
+        }
+        FastRegexAstNode rep;
+        rep.kind = FastRegexAstNode::Kind::kRepeat;
+        rep.min_rep = (q == '+') ? 1 : 0;
+        rep.max_rep = (q == '?') ? 1 : -1;
+        rep.children.push_back(std::move(atom));
+        return rep;
+      }
+      if (q == '{') {
+        if (atom.kind == FastRegexAstNode::Kind::kAnchor) {
+          aborted = true;
+          return {};
+        }
+        size_t p = pos + 1;
+        int lo = 0;
+        if (!ParseDecimalInt(pat, &p, &lo)) {
+          aborted = true;
+          return {};
+        }
+        int hi = lo;
+        if (p < pat.size() && pat[p] == ',') {
+          ++p;
+          if (p < pat.size() && pat[p] == '}') {
+            hi = -1;
+          } else if (!ParseDecimalInt(pat, &p, &hi)) {
+            aborted = true;
+            return {};
+          }
+        }
+        if (p >= pat.size() || pat[p] != '}' || (hi != -1 && hi < lo)) {
+          aborted = true;
+          return {};
+        }
+        pos = p + 1;
+        if (pos < pat.size() && pat[pos] == '?') {
+          ++pos;
+        }
+        FastRegexAstNode rep;
+        rep.kind = FastRegexAstNode::Kind::kRepeat;
+        rep.min_rep = lo;
+        rep.max_rep = hi;
+        rep.children.push_back(std::move(atom));
+        return rep;
+      }
+    }
+    return atom;
+  }
+
+  static bool IsPunctEscape(char e) noexcept {
+    switch (e) {
+      case '\\':
+      case '.':
+      case '-':
+      case '/':
+      case '_':
+      case '+':
+      case '*':
+      case '?':
+      case '(':
+      case ')':
+      case '[':
+      case ']':
+      case '{':
+      case '}':
+      case '^':
+      case '$':
+      case '|':
+      case ':':
+      case ';':
+      case ',':
+      case '<':
+      case '>':
+      case '\'':
+      case '"':
+      case '!':
+      case '@':
+      case '#':
+      case '%':
+      case '&':
+      case '=':
+      case '~':
+      case '`':
+      case ' ':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static bool ParseEscapeAtom(char esc, FastRegexAstNode* out) {
+    if (esc == 'n' || esc == 'r' || esc == 't' || esc == 'f' || esc == 'v' ||
+        IsPunctEscape(esc)) {
+      char ch = esc;
+      if (esc == 'n') { ch = '\n';
+}
+      if (esc == 'r') { ch = '\r';
+}
+      if (esc == 't') { ch = '\t';
+}
+      if (esc == 'f') { ch = '\f';
+}
+      if (esc == 'v') { ch = '\v';
+}
+      out->kind = FastRegexAstNode::Kind::kLiteral;
+      out->literal.assign(1, ch);
+      return true;
+    }
+    std::array<uint64_t, 2> cs{};
+    switch (esc) {
+      case 'd':
+        SetAsciiRange(cs, '0', '9');
+        break;
+      case 'D':
+        SetAsciiRange(cs, 0, 127);
+        cs[0] &= ~((uint64_t{1} << ('9' + 1)) - (uint64_t{1} << '0'));
+        break;
+      case 'w':
+        SetAsciiRange(cs, '0', '9');
+        SetAsciiRange(cs, 'A', 'Z');
+        SetAsciiBit(cs, '_');
+        SetAsciiRange(cs, 'a', 'z');
+        break;
+      case 'W': {
+        std::array<uint64_t, 2> w{};
+        SetAsciiRange(w, '0', '9');
+        SetAsciiRange(w, 'A', 'Z');
+        SetAsciiBit(w, '_');
+        SetAsciiRange(w, 'a', 'z');
+        cs[0] = ~w[0];
+        cs[1] = ~w[1];
+        break;
+      }
+      case 's':
+        for (char c : {' ', '\t', '\n', '\v', '\f', '\r'}) {
+          SetAsciiBit(cs, static_cast<uint8_t>(c));
+        }
+        break;
+      case 'S': {
+        std::array<uint64_t, 2> s{};
+        for (char c : {' ', '\t', '\n', '\v', '\f', '\r'}) {
+          SetAsciiBit(s, static_cast<uint8_t>(c));
+        }
+        cs[0] = ~s[0];
+        cs[1] = ~s[1];
+        break;
+      }
+      default:
+        return false;
+    }
+    out->kind = FastRegexAstNode::Kind::kCharSet;
+    out->charset = cs;
+    return true;
+  }
+
+  FastRegexAstNode ParseAtom() {
+    if (pos >= pat.size()) {
+      aborted = true;
+      return {};
+    }
+    const char c = pat[pos];
+    if (static_cast<unsigned char>(c) >= 128U) {
+      aborted = true;
+      return {};
+    }
+    if (c == '(') {
+      ++pos;
+      if (pos < pat.size() && pat[pos] == '?') {
+        if (pos + 1 < pat.size() && pat[pos + 1] == ':') {
+          pos += 2;
+        } else {
+          aborted = true;  // flags or lookaround
+          return {};
+        }
+      }
+      FastRegexAstNode inner = ParseAlt();
+      if (aborted || pos >= pat.size() || pat[pos] != ')') {
+        aborted = true;
+        return {};
+      }
+      ++pos;
+      return inner;
+    }
+    if (c == '[') {
+      ++pos;
+      bool negated = false;
+      if (pos < pat.size() && pat[pos] == '^') {
+        negated = true;
+        ++pos;
+      }
+      std::array<uint64_t, 2> cs{};
+      bool first = true;
+      while (pos < pat.size() && (pat[pos] != ']' || first)) {
+        first = false;
+        const auto uc = static_cast<unsigned char>(pat[pos]);
+        if (uc >= 128U) {
+          aborted = true;
+          return {};
+        }
+        if (pat[pos] == '[' && pos + 1 < pat.size() &&
+            (pat[pos + 1] == ':' || pat[pos + 1] == '.' ||
+             pat[pos + 1] == '=')) {
+          aborted = true;
+          return {};
+        }
+        bool single_char = false;
+        uint8_t ch_val = 0;
+        if (pat[pos] == '\\') {
+          ++pos;
+          if (pos >= pat.size()) {
+            aborted = true;
+            return {};
+          }
+          const char esc = pat[pos++];
+          FastRegexAstNode tmp;
+          if (!ParseEscapeAtom(esc, &tmp)) {
+            aborted = true;
+            return {};
+          }
+          if (tmp.kind == FastRegexAstNode::Kind::kLiteral) {
+            single_char = true;
+            ch_val = static_cast<uint8_t>(tmp.literal[0]);
+          } else {
+            cs[0] |= tmp.charset[0];
+            cs[1] |= tmp.charset[1];
+          }
+        } else {
+          single_char = true;
+          ch_val = static_cast<uint8_t>(pat[pos++]);
+        }
+        if (single_char) {
+          if (pos + 1 < pat.size() && pat[pos] == '-' && pat[pos + 1] != ']') {
+            ++pos;  // consume '-'
+            uint8_t end_val = 0;
+            if (pat[pos] == '\\') {
+              ++pos;
+              if (pos >= pat.size()) {
+                aborted = true;
+                return {};
+              }
+              FastRegexAstNode tmp;
+              if (!ParseEscapeAtom(pat[pos++], &tmp) ||
+                  tmp.kind != FastRegexAstNode::Kind::kLiteral) {
+                aborted = true;
+                return {};
+              }
+              end_val = static_cast<uint8_t>(tmp.literal[0]);
+            } else {
+              const auto end_uc =
+                  static_cast<unsigned char>(pat[pos++]);
+              if (end_uc >= 128U) {
+                aborted = true;
+                return {};
+              }
+              end_val = end_uc;
+            }
+            if (ch_val > end_val) {
+              aborted = true;
+              return {};
+            }
+            SetAsciiRange(cs, ch_val, end_val);
+          } else {
+            SetAsciiBit(cs, ch_val);
+          }
+        }
+      }
+      if (pos >= pat.size() || pat[pos] != ']') {
+        aborted = true;
+        return {};
+      }
+      ++pos;
+      if (negated) {
+        cs[0] = ~cs[0];
+        cs[1] = ~cs[1];
+      }
+      FastRegexAstNode node;
+      node.kind = FastRegexAstNode::Kind::kCharSet;
+      node.charset = cs;
+      return node;
+    }
+    if (c == '.') {
+      ++pos;
+      FastRegexAstNode node;
+      node.kind = FastRegexAstNode::Kind::kCharSet;
+      node.charset[0] = ~((uint64_t{1} << '\n') | (uint64_t{1} << '\r'));
+      node.charset[1] = ~uint64_t{0};
+      return node;
+    }
+    if (c == '^' || c == '$') {
+      ++pos;
+      FastRegexAstNode anchor;
+      anchor.kind = FastRegexAstNode::Kind::kAnchor;
+      return anchor;
+    }
+    if (c == '\\') {
+      ++pos;
+      if (pos >= pat.size()) {
+        aborted = true;
+        return {};
+      }
+      const char esc = pat[pos++];
+      FastRegexAstNode node;
+      if (!ParseEscapeAtom(esc, &node)) {
+        aborted = true;
+        return {};
+      }
+      return node;
+    }
+    if (c == '*' || c == '+' || c == '?' || c == '{' || c == '}' || c == ']') {
+      aborted = true;
+      return {};
+    }
+    ++pos;
+    FastRegexAstNode node;
+    node.kind = FastRegexAstNode::Kind::kLiteral;
+    node.literal.assign(1, c);
+    return node;
+  }
+};
+
+std::vector<std::string> ExtractMandatoryLiterals(
+    const FastRegexAstNode& node) {
+  switch (node.kind) {
+    case FastRegexAstNode::Kind::kEmpty:
+    case FastRegexAstNode::Kind::kAnchor:
+    case FastRegexAstNode::Kind::kCharSet:
+      return {};
+    case FastRegexAstNode::Kind::kLiteral:
+      return node.literal.empty() ? std::vector<std::string>{}
+                                  : std::vector<std::string>{node.literal};
+    case FastRegexAstNode::Kind::kConcat: {
+      std::vector<std::string> res;
+      for (const FastRegexAstNode& ch : node.children) {
+        auto sub = ExtractMandatoryLiterals(ch);
+        res.insert(res.end(), std::make_move_iterator(sub.begin()),
+                   std::make_move_iterator(sub.end()));
+      }
+      return res;
+    }
+    case FastRegexAstNode::Kind::kAlt: {
+      if (node.children.empty()) {
+        return {};
+      }
+      std::vector<std::string> res = ExtractMandatoryLiterals(node.children[0]);
+      for (size_t i = 1; i < node.children.size() && !res.empty(); ++i) {
+        const std::vector<std::string> rhs =
+            ExtractMandatoryLiterals(node.children[i]);
+        std::erase_if(res, [&](const std::string& lit) {
+          return std::ranges::find(rhs, lit) == rhs.end();
+        });
+      }
+      return res;
+    }
+    case FastRegexAstNode::Kind::kRepeat:
+      if (node.min_rep >= 1 && !node.children.empty()) {
+        return ExtractMandatoryLiterals(node.children[0]);
+      }
+      return {};
+  }
+  return {};
+}
+
+struct BitsetThompsonNfa {
+  static constexpr size_t kMaxStates = 64;
+  uint64_t start_mask{0};
+  uint64_t accept_mask{0};
+  bool start_can_accept{false};
+  std::array<uint64_t, 128> byte_consume_mask{};
+  std::array<uint64_t, kMaxStates> after_consume{};
+
+  [[nodiscard]] bool ContainsAscii(std::string_view input) const noexcept {
+    if (start_can_accept) {
+      return true;
+    }
+    uint64_t active = start_mask;
+    for (const char ch : input) {
+      const auto b = static_cast<uint8_t>(ch);
+      uint64_t matched = active & byte_consume_mask[b];
+      // Inject start_mask at every byte boundary (`ThompsonSearch.lean`).
+      uint64_t next = start_mask;
+      while (matched != 0) {
+        const auto s = static_cast<unsigned>(std::countr_zero(matched));
+        next |= after_consume[s];
+        matched &= (matched - 1);
+      }
+      if ((next & accept_mask) != 0) {
+        return true;
+      }
+      active = next;
+    }
+    return false;
+  }
+};
+
+struct NfaCompiler {
+  size_t num_states{0};
+  std::array<uint64_t, 64> eps_adj{};
+  std::array<uint8_t, 64> consume_target{};
+  std::array<uint64_t, 128> byte_consume_mask{};
+
+  struct Frag {
+    uint8_t entry{0};
+    uint8_t exit{0};
+    bool ok{false};
+  };
+
+  std::optional<uint8_t> NewState() noexcept {
+    if (num_states >= 64) {
+      return std::nullopt;
+    }
+    return static_cast<uint8_t>(num_states++);
+  }
+
+  Frag Compile(const FastRegexAstNode& node) {
+    switch (node.kind) {
+      case FastRegexAstNode::Kind::kAnchor:
+        return {};  // anchors cannot be checked unanchored
+      case FastRegexAstNode::Kind::kEmpty: {
+        auto s = NewState();
+        if (!s) { return {};
+}
+        return {.entry = *s, .exit = *s, .ok = true};
+      }
+      case FastRegexAstNode::Kind::kLiteral: {
+        if (node.literal.empty()) {
+          auto s = NewState();
+          if (!s) { return {};
+}
+          return {.entry = *s, .exit = *s, .ok = true};
+        }
+        auto first = NewState();
+        if (!first) { return {};
+}
+        uint8_t cur = *first;
+        for (const char ch : node.literal) {
+          auto next = NewState();
+          if (!next) { return {};
+}
+          byte_consume_mask[static_cast<uint8_t>(ch)] |= uint64_t{1} << cur;
+          consume_target[cur] = *next;
+          cur = *next;
+        }
+        return {.entry = *first, .exit = cur, .ok = true};
+      }
+      case FastRegexAstNode::Kind::kCharSet: {
+        auto u = NewState();
+        auto v = NewState();
+        if (!u || !v) { return {};
+}
+        const uint64_t bit = uint64_t{1} << *u;
+        for (size_t b = 0; b < 64; ++b) {
+          if ((node.charset[0] & (uint64_t{1} << b)) != 0) {
+            byte_consume_mask[b] |= bit;
+          }
+          if ((node.charset[1] & (uint64_t{1} << b)) != 0) {
+            byte_consume_mask[b + 64] |= bit;
+          }
+        }
+        consume_target[*u] = *v;
+        return {.entry = *u, .exit = *v, .ok = true};
+      }
+      case FastRegexAstNode::Kind::kConcat: {
+        if (node.children.empty()) {
+          auto s = NewState();
+          if (!s) { return {};
+}
+          return {.entry = *s, .exit = *s, .ok = true};
+        }
+        Frag acc = Compile(node.children[0]);
+        if (!acc.ok) { return {};
+}
+        for (size_t i = 1; i < node.children.size(); ++i) {
+          Frag rhs = Compile(node.children[i]);
+          if (!rhs.ok) { return {};
+}
+          eps_adj[acc.exit] |= uint64_t{1} << rhs.entry;
+          acc.exit = rhs.exit;
+        }
+        return acc;
+      }
+      case FastRegexAstNode::Kind::kAlt: {
+        auto entry = NewState();
+        auto exit = NewState();
+        if (!entry || !exit) { return {};
+}
+        for (const FastRegexAstNode& ch : node.children) {
+          Frag sub = Compile(ch);
+          if (!sub.ok) { return {};
+}
+          eps_adj[*entry] |= uint64_t{1} << sub.entry;
+          eps_adj[sub.exit] |= uint64_t{1} << *exit;
+        }
+        return {.entry = *entry, .exit = *exit, .ok = true};
+      }
+      case FastRegexAstNode::Kind::kRepeat: {
+        if (node.children.empty()) {
+          return {};
+        }
+        const FastRegexAstNode& child = node.children[0];
+        if (node.min_rep == 0 && node.max_rep == -1) {
+          // Star: child*
+          auto entry = NewState();
+          auto exit = NewState();
+          if (!entry || !exit) { return {};
+}
+          Frag sub = Compile(child);
+          if (!sub.ok) { return {};
+}
+          eps_adj[*entry] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *exit);
+          eps_adj[sub.exit] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *exit);
+          return {.entry = *entry, .exit = *exit, .ok = true};
+        }
+        if (node.min_rep == 1 && node.max_rep == -1) {
+          // Plus: child+
+          auto exit = NewState();
+          if (!exit) { return {};
+}
+          Frag sub = Compile(child);
+          if (!sub.ok) { return {};
+}
+          eps_adj[sub.exit] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *exit);
+          return {.entry = sub.entry, .exit = *exit, .ok = true};
+        }
+        if (node.min_rep == 0 && node.max_rep == 1) {
+          // Opt: child?
+          auto entry = NewState();
+          auto exit = NewState();
+          if (!entry || !exit) { return {};
+}
+          Frag sub = Compile(child);
+          if (!sub.ok) { return {};
+}
+          eps_adj[*entry] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *exit);
+          eps_adj[sub.exit] |= uint64_t{1} << *exit;
+          return {.entry = *entry, .exit = *exit, .ok = true};
+        }
+        // Bounded {m, n} / {m,}: expand up to a modest count while < 64 states.
+        const int bound = (node.max_rep >= 0) ? node.max_rep : node.min_rep + 1;
+        if (bound > 8) {
+          return {};
+        }
+        auto start = NewState();
+        if (!start) { return {};
+}
+        Frag cur{.entry = *start, .exit = *start, .ok = true};
+        for (int i = 0; i < node.min_rep; ++i) {
+          Frag copy = Compile(child);
+          if (!copy.ok) { return {};
+}
+          eps_adj[cur.exit] |= uint64_t{1} << copy.entry;
+          cur.exit = copy.exit;
+        }
+        if (node.max_rep < 0) {
+          // Remaining is child*
+          auto star_entry = NewState();
+          auto star_exit = NewState();
+          if (!star_entry || !star_exit) { return {};
+}
+          Frag sub = Compile(child);
+          if (!sub.ok) { return {};
+}
+          eps_adj[*star_entry] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *star_exit);
+          eps_adj[sub.exit] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *star_exit);
+          eps_adj[cur.exit] |= uint64_t{1} << *star_entry;
+          cur.exit = *star_exit;
+          return cur;
+        }
+        for (int i = node.min_rep; i < node.max_rep; ++i) {
+          auto opt_entry = NewState();
+          auto opt_exit = NewState();
+          if (!opt_entry || !opt_exit) { return {};
+}
+          Frag sub = Compile(child);
+          if (!sub.ok) { return {};
+}
+          eps_adj[*opt_entry] |=
+              (uint64_t{1} << sub.entry) | (uint64_t{1} << *opt_exit);
+          eps_adj[sub.exit] |= uint64_t{1} << *opt_exit;
+          eps_adj[cur.exit] |= uint64_t{1} << *opt_entry;
+          cur.exit = *opt_exit;
+        }
+        return cur;
+      }
+    }
+    return {};
+  }
+
+  std::optional<BitsetThompsonNfa> Build(const FastRegexAstNode& root) {
+    Frag frag = Compile(root);
+    if (!frag.ok) {
+      return std::nullopt;
+    }
+    std::array<uint64_t, 64> closure{};
+    for (size_t s = 0; s < num_states; ++s) {
+      uint64_t reached = uint64_t{1} << s;
+      uint64_t frontier = reached;
+      while (frontier != 0) {
+        const auto u = static_cast<unsigned>(std::countr_zero(frontier));
+        frontier &= (frontier - 1);
+        const uint64_t next = eps_adj[u] & ~reached;
+        reached |= next;
+        frontier |= next;
+      }
+      closure[s] = reached;
+    }
+    BitsetThompsonNfa nfa;
+    nfa.start_mask = closure[frag.entry];
+    nfa.accept_mask = uint64_t{1} << frag.exit;
+    nfa.start_can_accept = (nfa.start_mask & nfa.accept_mask) != 0;
+    nfa.byte_consume_mask = byte_consume_mask;
+    for (size_t s = 0; s < num_states; ++s) {
+      const uint8_t tgt = consume_target[s];
+      if (tgt < num_states) {
+        nfa.after_consume[s] = closure[tgt];
+      }
+    }
+    return nfa;
+  }
+};
+
+struct ContainsProgram {
+  std::string pattern;
+  std::regex regex;
+  std::string mandatory_literal;
+  std::optional<BitsetThompsonNfa> nfa;
+  uint64_t stamp{0};
+};
+
+bool IsAllAscii(std::string_view input) noexcept {
+  uint8_t acc = 0;
+  for (const char ch : input) {
+    acc |= static_cast<uint8_t>(ch);
+  }
+  return (acc & 0x80U) == 0;
+}
+
+ContainsProgram BuildContainsProgram(std::string_view pattern,
+                                     std::regex compiled_regex) {
+  ContainsProgram prog{
+      .pattern = std::string(pattern),
+      .regex = std::move(compiled_regex),
+      .mandatory_literal = {},
+      .nfa = std::nullopt,
+      .stamp = 0,
+  };
+  FastRegexParser parser{.pat = pattern, .pos = 0, .aborted = false};
+  FastRegexAstNode root;
+  if (parser.Parse(&root)) {
+    std::vector<std::string> mand = ExtractMandatoryLiterals(root);
+    for (std::string& lit : mand) {
+      if (lit.size() > prog.mandatory_literal.size()) {
+        prog.mandatory_literal = std::move(lit);
+      }
+    }
+    NfaCompiler compiler;
+    prog.nfa = compiler.Build(root);
+  }
+  return prog;
+}
+
+bool ExecuteContainsProgram(const ContainsProgram& prog,
+                            std::string_view input) {
+  if (!prog.mandatory_literal.empty() &&
+      input.find(prog.mandatory_literal) == std::string_view::npos) {
+    return false;
+  }
+  if (prog.nfa.has_value() && IsAllAscii(input)) {
+    return prog.nfa->ContainsAscii(input);
+  }
+  return std::regex_search(input.begin(), input.end(), prog.regex);
+}
+
 }  // namespace
+
+StatusOr<bool> CheckedRegexContains(std::string_view input,
+                                    std::string_view pattern) try {
+  if (FastRegexDisabledFlag().load(std::memory_order_relaxed)) {
+    ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(std::string(pattern)));
+    return std::regex_search(input.begin(), input.end(), re);
+  }
+
+  static thread_local std::array<std::optional<ContainsProgram>, 16> cache;
+  static thread_local uint64_t clock = 0;
+  for (std::optional<ContainsProgram>& slot : cache) {
+    if (slot.has_value() && slot->pattern == pattern) {
+      slot->stamp = ++clock;
+      return ExecuteContainsProgram(*slot, input);
+    }
+  }
+
+  ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(std::string(pattern)));
+  ContainsProgram built = BuildContainsProgram(pattern, std::move(re));
+  if (pattern.size() <= 4096) {
+    size_t victim = 0;
+    for (size_t i = 0; i < cache.size(); ++i) {
+      if (!cache[i].has_value()) {
+        victim = i;
+        break;
+      }
+      if (cache[i]->stamp < cache[victim]->stamp) {
+        victim = i;
+      }
+    }
+    built.stamp = ++clock;
+    cache[victim] = std::move(built);
+    return ExecuteContainsProgram(*cache[victim], input);
+  }
+  return ExecuteContainsProgram(built, input);
+} catch (const std::bad_alloc&) {
+  return StatusError(StatusCode::kMemoryLimitExceeded,
+                     "REGEXP_CONTAINS ran out of memory");
+} catch (...) {
+  return StatusError(StatusCode::kRuntimeError,
+                     "regular expression evaluation failed unexpectedly");
+}
 
 StatusOr<int64_t> CheckedRegexPosition(std::string_view input,
                                        std::string_view pattern,
@@ -978,7 +1864,7 @@ StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
     if (program->single_capture.has_value()) {
       return captures[*program->single_capture];
     }
-    ApplyRewritePieces(program->rewrite_pieces, captures, scratch);
+    RETURN_IF_FAIL(ApplyRewritePieces(program->rewrite_pieces, captures, scratch));
     return std::string_view(*scratch);
   }
 
@@ -1003,7 +1889,7 @@ StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
         captures[i] = sub.empty() ? std::string_view("", 0)
                                   : std::string_view(sub.data(), sub.size());
       }
-      ApplyRewritePieces(program->rewrite_pieces, captures, scratch);
+      RETURN_IF_FAIL(ApplyRewritePieces(program->rewrite_pieces, captures, scratch));
       return std::string_view(*scratch);
     }
     scratch->assign(input.data(), input.size());
@@ -1026,8 +1912,8 @@ StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
   return StatusError(StatusCode::kMemoryLimitExceeded,
                      "regular expression replacement ran out of memory");
 } catch (...) {
-  return StatusError(StatusCode::kInvalidArgument,
-                     "regular expression replacement failed");
+  return StatusError(StatusCode::kRuntimeError,
+                     "regular expression replacement failed unexpectedly");
 }
 
 StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
@@ -1047,8 +1933,8 @@ StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
   return StatusError(StatusCode::kMemoryLimitExceeded,
                      "regular expression replacement ran out of memory");
 } catch (...) {
-  return StatusError(StatusCode::kInvalidArgument,
-                     "regular expression replacement failed");
+  return StatusError(StatusCode::kRuntimeError,
+                     "regular expression replacement failed unexpectedly");
 }
 
 // P464 test hook: number of full replacement-program compiles (cache misses)

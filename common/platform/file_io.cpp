@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -150,6 +151,21 @@ int CloseFile(int fd) {
 #endif
 }
 
+void ReleaseFile(int fd) {
+  if (fd < 0) {
+    return;
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  // _open_osfhandle transfers ownership to the CRT descriptor. _close owns
+  // releasing the OS handle too; calling CloseHandle on _get_osfhandle's
+  // borrowed value after a failed close can double-close a reused handle.
+  (void)CloseFile(fd);
+#else
+  while (CloseFile(fd) != 0 && errno == EINTR) {
+  }
+#endif
+}
+
 int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
   std::filesystem::path target_dir = dir;
   if (target_dir.empty()) {
@@ -162,21 +178,32 @@ int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
 #ifdef TINYLAMB_OS_WINDOWS
   static std::atomic<uint64_t> counter{0};
   const DWORD pid = ::GetCurrentProcessId();
-  const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
-  const std::filesystem::path tmp_path =
-      target_dir / ("tinylamb_tmp_" + std::to_string(pid) + "_" +
-                    std::to_string(seq) + ".tmp");
-  SECURITY_ATTRIBUTES sa{};
-  sa.nLength = sizeof(sa);
-  sa.lpSecurityDescriptor = nullptr;
-  sa.bInheritHandle = FALSE;
-  HANDLE h = ::CreateFileW(
-      tmp_path.c_str(), GENERIC_READ | GENERIC_WRITE,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_NEW,
-      FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-  if (h == INVALID_HANDLE_VALUE) {
-    errno = MapWin32ErrorToErrno(::GetLastError());
-    return -1;
+  // CREATE_NEW fails with ERROR_FILE_EXISTS when a crashed predecessor left
+  // a DELETE_ON_CLOSE file behind and the PID/seq pair repeats. mkstemp
+  // randomizes and retries on POSIX; mirror that with a bounded retry.
+  HANDLE h = INVALID_HANDLE_VALUE;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+    const std::filesystem::path tmp_path =
+        target_dir / ("tinylamb_tmp_" + std::to_string(pid) + "_" +
+                      std::to_string(seq) + ".tmp");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = FALSE;
+    h = ::CreateFileW(
+        tmp_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      break;
+    }
+    const DWORD err = ::GetLastError();
+    if (err != ERROR_FILE_EXISTS || attempt == 63) {
+      errno = MapWin32ErrorToErrno(err);
+      return -1;
+    }
   }
   const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(h),
                                    _O_BINARY | _O_NOINHERIT);
@@ -212,7 +239,8 @@ int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
   // T2623: the header promises a non-inheritable descriptor (the O_TMPFILE
   // path passes O_CLOEXEC, Windows passes _O_NOINHERIT); a failed
   // F_SETFD must fail the call, not leak an inheritable temp fd.
-  if (::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+  const int fd_flags = ::fcntl(fd, F_GETFD);
+  if (fd_flags < 0 || ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
     const int saved = errno;
     (void)::close(fd);
     ::remove(tmpl.c_str());  // NOLINT(cert-err33-c)
@@ -222,10 +250,8 @@ int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
   if (::unlink(tmpl.c_str()) != 0) {
     const int saved = errno;
     (void)::close(fd);
-    // T2620: the contract is "no name survives" -- on unlink failure the
-    // mkstemp file would linger forever (tmpl dies with this frame, so no
-    // one else can remove it). Best-effort remove before reporting.
-    ::remove(tmpl.c_str());  // NOLINT(cert-err33-c)
+    // The directory may have changed since unlink ran. A second removal by
+    // name could delete a different entry.
     errno = saved != 0 ? saved : EIO;
     return -1;
   }
@@ -235,6 +261,7 @@ int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
 
 std::FILE* FdOpenStream(int fd, const char* mode) {
   if (fd < 0) {
+    errno = EBADF;
     return nullptr;
   }
 #ifdef TINYLAMB_OS_WINDOWS
@@ -244,7 +271,7 @@ std::FILE* FdOpenStream(int fd, const char* mode) {
 #endif
   if (file == nullptr) {
     const int saved = errno;
-    (void)CloseFile(fd);
+    ReleaseFile(fd);
     errno = saved;
   }
   return file;
@@ -285,7 +312,15 @@ ssize_t Write(int fd, const void* buf, size_t count) {
       return written == 0 ? -1 : static_cast<ssize_t>(written);
     }
     if (r == 0) {
-      break;  // No progress: avoid spinning forever on a short write.
+      // No progress: avoid spinning forever on a short write. POSIX
+      // ::write never returns 0 for count > 0, so callers do not guard a
+      // bare 0 return — report partial progress when there is any, else
+      // fail with EIO instead of returning 0 with a stale errno.
+      if (written > 0) {
+        break;
+      }
+      errno = EIO;
+      return -1;
     }
     written += static_cast<size_t>(r);
   }
@@ -500,45 +535,22 @@ int DataSync(int fd) {
   if (!::FlushFileBuffers(reinterpret_cast<HANDLE>(raw))) {
     const DWORD err = ::GetLastError();
     if (err == ERROR_ACCESS_DENIED) {
-      // Windows cannot FlushFileBuffers through a read-only handle. Recover
-      // the file's full path and flush via a writable handle so callers still
-      // get a real durability barrier (matching POSIX fdatasync on O_RDONLY).
-      // GetFinalPathNameByHandleW returns a DOS path including the drive
-      // letter; FILE_NAME_INFO's volume-relative name resolves against the
-      // current drive and would target the wrong file (or fail) when the DB
-      // lives on a different drive than the CWD.
-      const HANDLE handle = reinterpret_cast<HANDLE>(raw);
-      std::wstring path;
-      const DWORD path_chars = ::GetFinalPathNameByHandleW(
-          handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-      if (path_chars > 0) {
-        path.resize(path_chars);
-        const DWORD written =
-            ::GetFinalPathNameByHandleW(handle, path.data(), path_chars,
-                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-        if (written > 0 && written < path_chars) {
-          path.resize(written);
-        } else {
-          path.clear();
-        }
+      // FlushFileBuffers needs write access. Reopen the same file object so
+      // a path change cannot redirect the durability barrier.
+      const HANDLE writable = ::ReOpenFile(
+          reinterpret_cast<HANDLE>(raw), GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+      if (writable == INVALID_HANDLE_VALUE) {
+        errno = MapWin32ErrorToErrno(::GetLastError());
+        return -1;
       }
-      if (!path.empty()) {
-        HANDLE writable = ::CreateFileW(
-            path.c_str(), GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (writable != INVALID_HANDLE_VALUE) {
-          const BOOL flushed = ::FlushFileBuffers(writable);
-          const DWORD flush_err = flushed ? 0 : ::GetLastError();
-          ::CloseHandle(writable);
-          if (flushed) {
-            return 0;
-          }
-          errno = MapWin32ErrorToErrno(flush_err);
-          return -1;
-        }
+      const BOOL flushed = ::FlushFileBuffers(writable);
+      const DWORD flush_err = flushed ? 0 : ::GetLastError();
+      ::CloseHandle(writable);
+      if (flushed) {
+        return 0;
       }
-      errno = EACCES;
+      errno = MapWin32ErrorToErrno(flush_err);
       return -1;
     }
     errno = MapWin32ErrorToErrno(err);
@@ -581,9 +593,12 @@ void AdviseDontNeed(int fd, int64_t offset, int64_t length) {
 int Preallocate(int fd, int64_t size) {
 #ifdef __linux__
   int allocated = 0;
-  do {
+  for (int retries = 0; retries < 8; ++retries) {
     allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
-  } while (allocated == EINTR);
+    if (allocated != EINTR) {
+      break;
+    }
+  }
   // Only "filesystem does not support fallocate" is benign. EINVAL means an
   // invalid size/offset request and must surface as an error.
   if (allocated != 0 && allocated != EOPNOTSUPP && allocated != ENOSYS) {
@@ -611,10 +626,12 @@ void AdviseMemoryRange(const uint8_t* base, size_t map_size, size_t offset,
     return;
   }
   const size_t clamped_len = std::min(length, map_size - offset);
-  const long raw_page = ::sysconf(_SC_PAGESIZE);
-  const size_t page_size =
-      raw_page > 0 ? static_cast<size_t>(raw_page) : static_cast<size_t>(4096);
-  const size_t aligned_offset = offset & ~(page_size - 1);
+  static const size_t page_size = [] {
+    const long raw_page = ::sysconf(_SC_PAGESIZE);
+    return raw_page > 0 ? static_cast<size_t>(raw_page)
+                        : static_cast<size_t>(4096);
+  }();
+  const size_t aligned_offset = offset - (offset % page_size);
   // clamped_len already ends at or before map_size, so extending the start
   // down to the page boundary keeps the advised range inside the mapping:
   // aligned_offset + aligned_len == offset + clamped_len <= map_size.

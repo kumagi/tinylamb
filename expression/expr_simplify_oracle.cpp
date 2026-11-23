@@ -28,6 +28,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -835,8 +836,13 @@ TypedExpr GenTyped(Gen& g, GenType want, int depth,
 
 std::string QuoteString(const std::string& s) {
   std::string out = "'";
+  out.reserve(s.size() + 2);
   for (char c : s) {
-    out += (c == '\'') ? "''" : std::string(1, c);
+    if (c == '\'') {
+      out += "''";
+    } else {
+      out += c;
+    }
   }
   out += "'";
   return out;
@@ -1135,6 +1141,11 @@ std::string ConstantSql(const Value& v, GenType type) {
   if (v.IsNull()) {
     return NullSql(type);
   }
+  // Bools are stored as INT64 0/1, so inspect the generated type before the
+  // generic INT64 formatter below.
+  if (type == GenType::kBool) {
+    return v.value.int_value != 0 ? "TRUE" : "FALSE";
+  }
   if (v.type == ValueType::kInt64) {
     // P668/5037 harness fidelity: an unsigned-tagged (collation tag 3) leaf
     // must round-trip through SQL text, otherwise the engine path evaluates
@@ -1171,11 +1182,13 @@ std::string ConstantSql(const Value& v, GenType type) {
     return text;
   }
   if (v.type == ValueType::kVarChar) {
-    return SqlQuoteString(std::string(v.value.varchar_value));
-  }
-  // Bools are stored as INT64 0/1.
-  if (type == GenType::kBool) {
-    return v.value.int_value != 0 ? "TRUE" : "FALSE";
+    const std::string text =
+        SqlQuoteString(std::string(v.value.varchar_value));
+    const std::string_view collation = CollationName(CollationOf(v));
+    if (collation.empty()) {
+      return text;
+    }
+    return "COLLATE(" + text + ", '" + std::string(collation) + "')";
   }
   return std::to_string(v.value.int_value);
 }

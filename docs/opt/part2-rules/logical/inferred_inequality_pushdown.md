@@ -114,7 +114,7 @@ graph TD
 
 - `infer_join_predicates`: 等式条件を対象とする推論 Rule です。同一のアーキテクチャを共有します。
 - `join_predicate_transitivity`: 結合述語の等式鎖を拡張する Rule です。等式ペアが増加することで、本 Rule の推論路が拡張されます。
-- `extract_year_sargable` / `cast_pushdown_on_comparison`: スキャンフィルタに登録された不等号述語を、SARG可能な形式へ変形する後続の式書き換え Rule です。
+- `extract_year_sargable` / `cast_pushdown_on_comparison`: スキャンフィルタに登録された不等号述語を SARG 可能な形式へ変形する後続の Cascades 論理 Rule です。
 
 ## 検証テスト
 

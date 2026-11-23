@@ -27,16 +27,45 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
-size_t Constraint::Size() const {
-  switch (ctype) {
-    case kDefault:
-    case kForeign:
-    case kCheck:
-      return sizeof(ctype) + sizeof(ValueType) + value.Size();
-
+namespace {
+// Byte count produced by `Encoder& operator<<(Encoder&, const Value&)`:
+// one tag byte followed by the type payload. This deliberately does not
+// reuse Value::Size(), which measures the row-block (serdes) layout -- the
+// two agree on scalar payloads but differ for kNull (serdes writes a payload
+// byte the encoder omits) and kArray (U32 element count plus per-element
+// presence/type bytes vs. a U64 count plus tag-only elements).
+size_t EncoderValueSize(const Value& v) {
+  switch (v.type) {
+    case ValueType::kNull:
+      return sizeof(uint8_t);
+    case ValueType::kInt64:
+    case ValueType::kDate:
+    case ValueType::kDouble:
+      return sizeof(uint8_t) + sizeof(int64_t);
+    case ValueType::kVarChar:
+      // Encoder string_view layout: bin_size_t length prefix + bytes.
+      return sizeof(uint8_t) + sizeof(bin_size_t) + v.AsStringView().size();
+    case ValueType::kArray: {
+      // Encoder layout: element SQL type as string_view, then the element
+      // vector as a uint64 count followed by recursively encoded Values.
+      size_t bytes = sizeof(uint8_t) + sizeof(bin_size_t) +
+                     v.ArrayElementSqlType().size() + sizeof(uint64_t);
+      for (const Value& element : v.ArrayElements()) {
+        bytes += EncoderValueSize(element);
+      }
+      return bytes;
+    }
     default:
-      return sizeof(ctype);
+      // Encoder writes only the tag byte for an out-of-range type.
+      return sizeof(uint8_t);
   }
+}
+}  // namespace
+
+size_t Constraint::Size() const {
+  // operator<< always emits the uint8_t kind tag followed by `value`, even
+  // for kinds that carry no payload (their value stays a default kNull).
+  return sizeof(uint8_t) + EncoderValueSize(value);
 }
 
 bool Constraint::operator==(const Constraint& rhs) const {

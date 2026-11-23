@@ -73,9 +73,19 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
       table_(&table),
       projection_(std::move(projection)),
       peek_compares_(std::move(peek_compares)),
-      ordered_(ordered),
-      worker_count_(1),
-      max_ready_chunks_(2) {
+      ordered_(ordered)
+      {
+  if (projection_) {
+    const size_t width = table_->GetSchema().ColumnCount();
+    for (size_t i = 0; i < projection_->size(); ++i) {
+      if ((*projection_)[i] >= width ||
+          (i > 0 && (*projection_)[i - 1] >= (*projection_)[i])) {
+        worker_status_ = StatusError(StatusCode::kInvalidArgument,
+                                    "scan projection must be ascending and in range");
+        return;
+      }
+    }
+  }
   StatusOr<TableLease> lease = table_->AcquireLease(txn_->ID());
   if (!lease.HasValue()) {
     worker_status_ = lease.GetStatus();
@@ -619,6 +629,33 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
         if (!blk.MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
           continue;
         }
+        bool kleene_all_pass = !row_filter_conjuncts_.empty();
+        if (!row_filter_conjuncts_.empty()) {
+          const char* disable_kleene =
+              std::getenv("TINYLAMB_DISABLE_BLOCK_KLEENE");
+          if (disable_kleene == nullptr || disable_kleene[0] != '1') {
+            // Lean proof: lean/TinylambOpt/BlockKleene.lean
+            //   (aeval_contains_ceval, block_kleene_sound,
+            //   block_all_pass_sound)
+            bool kleene_skip = false;
+            for (const Expression& conj : row_filter_conjuncts_) {
+              const KleeneMask m =
+                  EvaluateBlockKleene(conj, table_->GetSchema(), blk);
+              if (BlockKleeneCanSkip(m)) {
+                kleene_skip = true;
+                break;
+              }
+              if (!BlockKleeneAllPass(m)) {
+                kleene_all_pass = false;
+              }
+            }
+            if (kleene_skip) {
+              continue;
+            }
+          } else {
+            kleene_all_pass = false;
+          }
+        }
         bool all_rows_pass = true;
         if (peek_ptr != nullptr) {
           for (const IntegerPeekCompare& pred : *peek_ptr) {
@@ -638,7 +675,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             }
           }
         }
-        if (can_inline_simple) {
+        if (can_inline_simple && !kleene_all_pass) {
           bool zone_rejected = false;
           for (const auto& pred : row_filter_->simple) {
             const LSTableColumnBlock& col = blk.columns[pred.column];
@@ -781,6 +818,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           }
           continue;
         }
+        (void)kleene_all_pass;
         // No shared clear(): the compaction fast path below overwrites every
         // slot it keeps and truncates the tail, while the generic path
         // clears before push_back (avoiding a full zero-fill per block).
@@ -878,7 +916,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
               continue;
             }
           }
-          if (can_inline_simple) {
+          if (can_inline_simple && !kleene_all_pass) {
             bool simple_ok = true;
             for (const auto& pred : row_filter_->simple) {
               const LSTableColumnBlock& col = blk.columns[pred.column];
@@ -1065,12 +1103,18 @@ void ParallelScan::Start(size_t batch_size) {
       workers_.emplace_back(
           [this, batch_size, worker] { RunWorker(batch_size, worker); });
     } catch (...) {
-      // Thread creation can fail (e.g. resource_unavailable). Wake the
-      // consumer via worker_error_ so it can stop waiting for results.
+      // Thread creation can fail (e.g. resource_unavailable). Static
+      // rotation gives worker w sole ownership of morsels w, w+W, ...; a
+      // worker that never started leaves those morsels unread, and the
+      // survivors would keep decoding into a queue nobody drains. Stop the
+      // launched workers as well and surface the sticky error before any
+      // row is handed out (mirrors ParallelIndexScan::Start).
       if (worker_error_ == Status::kSuccess) {
         worker_error_ =
             StatusFromCurrentException("parallel scan worker failed");
       }
+      cancelled_.store(true, std::memory_order_release);
+      space_cv_.notify_all();
       break;
     }
   }
@@ -1078,6 +1122,18 @@ void ParallelScan::Start(size_t batch_size) {
 }
 
 void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
+  const auto report_missing_column = [this] {
+    {
+      std::scoped_lock lock(mutex_);
+      if (worker_error_ == Status::kSuccess) {
+        worker_error_ = StatusError(StatusCode::kCorrupt,
+                                    "LSTable block lacks a filter column");
+      }
+      cancelled_.store(true, std::memory_order_release);
+    }
+    ready_cv_.notify_all();
+    space_cv_.notify_all();
+  };
   try {
     // The projection layout never changes during the scan, so build the type
     // vector once and reuse it for every chunk refill.
@@ -1180,11 +1236,42 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
           if (!blk->MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
             continue;
           }
-          if (can_inline_simple) {
+          bool kleene_all_pass = !row_filter_conjuncts_.empty();
+          if (!row_filter_conjuncts_.empty()) {
+            const char* disable_kleene =
+                std::getenv("TINYLAMB_DISABLE_BLOCK_KLEENE");
+            if (disable_kleene == nullptr || disable_kleene[0] != '1') {
+              // Lean proof: lean/TinylambOpt/BlockKleene.lean
+              //   (aeval_contains_ceval, block_kleene_sound,
+              //    block_all_pass_sound)
+              bool kleene_skip = false;
+              for (const Expression& conj : row_filter_conjuncts_) {
+                const KleeneMask m =
+                    EvaluateBlockKleene(conj, table_->GetSchema(), *blk);
+                if (BlockKleeneCanSkip(m)) {
+                  kleene_skip = true;
+                  break;
+                }
+                if (!BlockKleeneAllPass(m)) {
+                  kleene_all_pass = false;
+                }
+              }
+              if (kleene_skip) {
+                continue;
+              }
+            } else {
+              kleene_all_pass = false;
+            }
+          }
+          if (can_inline_simple && !kleene_all_pass) {
             bool zone_rejected = false;
             for (const auto& pred : row_filter_->simple) {
-              if (pred.column_payload || pred.column >= blk->columns.size()) {
+              if (pred.column_payload) {
                 continue;
+              }
+              if (pred.column >= blk->columns.size()) {
+                report_missing_column();
+                return;
               }
               const LSTableColumnBlock& col = blk->columns[pred.column];
               const bool is_double_cmp =
@@ -1309,11 +1396,15 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
                 continue;
               }
             }
-            if (can_inline_simple) {
+            if (can_inline_simple && !kleene_all_pass) {
               bool simple_ok = true;
               for (const auto& pred : row_filter_->simple) {
-                if (pred.column_payload || pred.column >= blk->columns.size()) {
+                if (pred.column_payload) {
                   continue;
+                }
+                if (pred.column >= blk->columns.size()) {
+                  report_missing_column();
+                  return;
                 }
                 const LSTableColumnBlock& col = blk->columns[pred.column];
                 const bool is_double_cmp =
@@ -1410,7 +1501,8 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
               }
             }
             const RowPosition position(pid, blk->SlotAt(r));
-            if (row_filter_ != nullptr && !skip_worker_filter) {
+            if (row_filter_ != nullptr && !skip_worker_filter &&
+                !kleene_all_pass) {
               const int decision = relational_detail::MatchScanFilterWorker(
                   row_scratch, table_->GetSchema(), *row_filter_,
                   *row_filter_programs_);
@@ -1584,8 +1676,24 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
   // Workers use a fixed chunk size; per-consumer max_rows is absorbed by the
   // pending_ split below so the first caller cannot dictate global capacity.
   Start(kDefaultVectorSize);
+  const auto report_worker_failure = [&] {
+    const Status& status =
+        worker_error_ != Status::kSuccess ? worker_error_ : worker_status_;
+    if (status == Status::kSuccess) {
+      return false;
+    }
+    FailWith(status);
+    destination->Reset();
+    return true;
+  };
   while (destination->Size() < max_rows) {
     if (pending_) {
+      {
+        std::scoped_lock lock(mutex_);
+        if (report_worker_failure()) {
+          return 0;
+        }
+      }
       while (pending_offset_ < pending_->Size() &&
              destination->Size() < max_rows) {
         destination->AppendFrom(*pending_, pending_offset_++);
@@ -1609,14 +1717,7 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
                return it != inflight_.end() && !it->second.empty();
              }();
     });
-    if (worker_error_ != Status::kSuccess) {
-      // Surface the worker failure as a sticky Status (no-exception
-      // executor contract).
-      FailWith(worker_error_);
-      return 0;
-    }
-    if (worker_status_ != Status::kSuccess) {
-      FailWith(worker_status_);
+    if (report_worker_failure()) {
       return 0;
     }
     if (cancelled_.load(std::memory_order_relaxed)) {
@@ -1628,6 +1729,9 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
       // filter (programs raised) are re-checked here before reporting
       // end-of-scan, so their survivors are not silently dropped.
       DrainDeferred(destination, max_rows);
+      if (GetStatus() != Status::kSuccess) {
+        destination->Reset();
+      }
       return destination->Size();
     }
     std::deque<DataChunk>& queue = inflight_[next_out_morsel_];

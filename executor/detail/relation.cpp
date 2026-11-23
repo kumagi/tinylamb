@@ -230,7 +230,6 @@ void Relation::EnsureSpill() {
     if (SealSpillTail() != Status::kSuccess) {
       return;
     }
-    NoteRelationSpill(runtime_);
     auto generation = std::make_shared<SpillFile>();
     Status st = Status::kSuccess;
     for (const Row& row : rows) {
@@ -249,6 +248,7 @@ void Relation::EnsureSpill() {
       return;
     }
     // These rows follow the earlier files and the tail just sealed above.
+    // relation_spills counts relations that spill, not spill-file generations.
     extra_spills.push_back(std::move(generation));
     spilled_rows_ += rows.size();
     ClearRelationRows(rows);
@@ -639,7 +639,7 @@ Status Relation::SealSpillTail() {
   if (!spill_tail_) {
     return Status::kSuccess;
   }
-  const Status status = spill_tail_->FinishWriting();
+  Status status = spill_tail_->FinishWriting();
   if (status != Status::kSuccess) {
     if (spill_error_ == Status::kSuccess) {
       spill_error_ = status;

@@ -22,9 +22,9 @@ class Statement;
 // otherwise.  Shared by TIMESTAMP literals, typed array elements, and the
 // SQL-template binder (which must reproduce the literal normalization when
 // re-binding a cached template).  Returns nullopt for literals the visitor
-// rejects (unparseable text, named zones, impossible dates, second >= 60,
-// fractional seconds without digits) so the template scanner can decline to
-// cache them.
+// rejects (unparsable text, unknown named zones, impossible dates, second >=
+// 60, fractional seconds without digits) so the template scanner can decline
+// to cache them.
 std::optional<std::string> NormalizeTimestampText(const std::string& text);
 
 // Decodes the backslash escape sequences inside an already quote-stripped,
@@ -39,6 +39,10 @@ StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
 struct StoredViewDefinition {
   std::shared_ptr<GoogleSqlAstNode> query;
   std::string source;
+  // Set when catalog discovery found the view but could not load/parse its
+  // definition; surfaced in the kCorrupt error at FROM resolution so the
+  // underlying cause is not lost.
+  std::string load_error;
 };
 
 // Session-scoped (thread-local) view registry.

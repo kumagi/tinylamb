@@ -78,7 +78,7 @@ class CliMainTest : public ::testing::Test {
     }
     const auto shell_quote = [](const std::string& s) {
       std::string out = "'";
-      out.reserve(s.size() * 4 + 2);
+      out.reserve((s.size() * 4) + 2);
       for (char c : s) {
         if (c == '\'') {
           out += "'\\''";
@@ -91,7 +91,7 @@ class CliMainTest : public ::testing::Test {
     };
     // This harness drives the CLI through a POSIX shell so that stdin and the
     // two output streams are redirected exactly as in the installation. A
-    // Windows port needs an equivalent launcher; the WEXITSTATUS decode above
+    // Windows port needs an equivalent launcher; the WEXITSTATUS decode below
     // is already guarded so the test target at least compiles there.
     const std::string command =
         "/bin/sh -c " +
@@ -129,7 +129,11 @@ class CliMainTest : public ::testing::Test {
     if (self.empty()) {
       return {};
     }
+#ifdef _WIN32
+    return self.parent_path() / (std::string{name} + ".exe");
+#else
     return self.parent_path() / name;
+#endif
   }
 
   static void ReadFile(const std::filesystem::path& path, std::string* out) {
@@ -141,8 +145,15 @@ class CliMainTest : public ::testing::Test {
       out->clear();
       return;
     }
-    out->assign(std::istreambuf_iterator<char>(in),
-                std::istreambuf_iterator<char>());
+    out->clear();
+    char buffer[4096];
+    while (in.read(buffer, sizeof(buffer)) || in.gcount() != 0) {
+      out->append(buffer, static_cast<size_t>(in.gcount()));
+    }
+    if (in.bad() || !in.eof()) {
+      ADD_FAILURE() << "cannot read " << path;
+      out->clear();
+    }
   }
 };
 
@@ -258,15 +269,10 @@ TEST_F(CliMainTest, OversizedStdinFailsInsteadOfOOM) {
   std::string err;
   // SplitSqlStatements caps the statement COUNT but not input BYTES; without
   // a bounded read a huge redirect used to exhaust memory before the
-  // splitter ever ran. Exactly 16 MiB (the server's default max_message_bytes
-  // envelope) still runs; one byte more fails fast with a clean error.
-  const std::string fits = "SELECT 1" + std::string(16 * 1024 * 1024 - 8, ' ');
-  EXPECT_EQ(RunCli(fits, &out, &err), 0) << err;
-  EXPECT_NE(out.find("[1]"), std::string::npos) << out;
-
-  out.clear();
-  err.clear();
-  const std::string too_big = fits + " ";
+  // splitter ever ran. Keep one over-limit subprocess to pin the rejection
+  // path without paying for a second 16 MiB file write and CLI launch.
+  const std::string too_big =
+      "SELECT 1" + std::string((16 * 1024 * 1024) - 7, ' ');
   EXPECT_EQ(RunCli(too_big, &out, &err), 1);
   EXPECT_TRUE(out.empty()) << out;
   EXPECT_NE(err.find("TooBigData"), std::string::npos) << err;

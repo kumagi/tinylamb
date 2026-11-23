@@ -62,6 +62,25 @@ TEST(ColumnTest, DeclaredTextDomainsSurviveSchemaEncoding) {
   }
 }
 
+TEST(ColumnTest, ChangingTypeClearsIncompatibleMetadata) {
+  Column column("v", ValueType::kInt64);
+  column.SetIntegerBits(16);
+  column.SetUnsigned(true);
+  column.SetType(ValueType::kVarChar);
+  column.SetIntegerBits(32);
+  column.SetUnsigned(true);
+  column.SetTextDomain(TextDomain::kTimestamp);
+  EXPECT_FALSE(column.IsUnsigned());
+  EXPECT_EQ(column.IntegerBits(), 64);
+  EXPECT_EQ(column.GetTextDomain(), TextDomain::kTimestamp);
+  SerializeDeserializeTest(column);
+
+  column.SetInterval(true);
+  column.SetType(ValueType::kInt64);
+  EXPECT_FALSE(column.IsInterval());
+  SerializeDeserializeTest(column);
+}
+
 TEST(ColumnTest, AuditIntegerWidthsSurviveSerializationAndEnforceBounds) {
   for (const uint8_t bits :
        {uint8_t{8}, uint8_t{16}, uint8_t{32}, uint8_t{64}}) {
@@ -143,12 +162,14 @@ TEST(ColumnTest,
   ASSERT_EQ(h1, h5);
   Column unsigned_column = c1;
   unsigned_column.SetUnsigned(true);
-  Column interval_column = c1;
+  Column plain_text = c1;
+  plain_text.SetType(ValueType::kVarChar);
+  Column interval_column = plain_text;
   interval_column.SetInterval(true);
   Column narrower_column = c1;
   narrower_column.SetIntegerBits(32);
   EXPECT_NE(hasher(unsigned_column), h1);
-  EXPECT_NE(hasher(interval_column), h1);
+  EXPECT_NE(hasher(interval_column), hasher(plain_text));
   EXPECT_NE(hasher(narrower_column), h1);
   EXPECT_NE(hasher(unsigned_column), hasher(interval_column));
 }

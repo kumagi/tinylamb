@@ -154,7 +154,16 @@ std::string& OwnedValuePayload::Mutable() {
 
 void OwnedValuePayload::assign(std::string_view text) {
   // Copy before releasing shared storage: text can refer to our old buffer,
-  // including a string nested inside an array being overwritten.
+  // including a string nested inside an array being overwritten. An empty
+  // result owns no StringPayload at all (the ctor only allocates for
+  // non-empty text), so route it through the fresh-payload path too —
+  // otherwise a formerly-long string keeps its heap buffer and
+  // EstimateValueMemoryBytes undercounts the OOC budget.
+  if (text.empty()) {
+    OwnedValuePayload next{std::string(text)};
+    *this = std::move(next);
+    return;
+  }
   if (payload_ != nullptr && !payload_->is_array &&
       payload_->references.load(std::memory_order_acquire) == 1) {
     auto* string = static_cast<StringPayload*>(
@@ -687,8 +696,7 @@ Status Value::CheckSerializableWithDepth(size_t depth) const {
       }
       return Status::kSuccess;
   }
-  CHECK_MSG(false, "undefined type");
-  return Status::kSuccess;
+  return StatusError(StatusCode::kCorrupt, "invalid value type tag");
 }
 
 // The recursive array path mirrors the depth guard in
@@ -723,7 +731,10 @@ size_t Value::Serialize(char* dst) const {
       return static_cast<size_t>(cursor - dst);
     }
   }
-  CHECK_MSG(false, "undefined type");
+  // Callers must validate with CheckSerializable() at the Status boundary.
+  // If they violate that precondition, fail-stop rather than write a truncated
+  // row image after an invalid value silently contributes zero bytes.
+  CHECK_MSG(false, "cannot serialize an invalid value type tag");
   return 0;
 }
 
@@ -733,6 +744,10 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
   // ValueType installed makes a later Size()/CheckSerializable() CHECK-fail.
   if (static_cast<uint8_t>(as_type) > static_cast<uint8_t>(ValueType::kArray)) {
     *out_status = StatusError(StatusCode::kCorrupt, "corrupt value type tag");
+    // Drop any payload from a previous decode into this slot.  Leaving a
+    // large VARCHAR/ARRAY buffer alive behind a kNull tag keeps it pinned
+    // across row-slot reuse, defeating the "one bounded payload" contract.
+    owned_data.clear();
     type = ValueType::kNull;
     collation_ = 0;
     return 0;
@@ -741,6 +756,7 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
   collation_ = 0;
   switch (as_type) {
     case ValueType::kNull:
+      owned_data.clear();
       *out_status = StatusError(StatusCode::kInvalidArgument,
                                 "Cannot parse without type.");
       return 0;
@@ -784,7 +800,12 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
       std::string_view sql_type;
       cursor += DeserializeStringView(cursor, &sql_type);
       std::vector<Value> elements;
-      elements.reserve(count);
+      // DeserializeInto is bounds-agnostic (Row::TryDeserialize passes no
+      // end pointer), so a corrupt count cannot be checked against the
+      // remaining image here.  Cap the *reservation* instead: a valid array
+      // still grows to `count`, but a forged 1<<20 count no longer forces a
+      // multi-megabyte allocation up front for every nested corrupt frame.
+      elements.reserve(std::min<uint32_t>(count, 1024));
       for (uint32_t i = 0; i < count; ++i) {
         const bool present = *cursor++ != 0;
         if (!present) {
@@ -800,7 +821,10 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
         Value& element = elements.emplace_back();
         const size_t consumed =
             element.DeserializeInto(cursor, elem_type, out_status);
-        element.SetCollation(encoded_type >> 3);
+        if (!element.SetCollation(encoded_type >> 3)) {
+          *out_status = Status::kCorrupt;
+          return 0;
+        }
         if (*out_status != Status::kSuccess) {
           return 0;
         }
@@ -1014,9 +1038,9 @@ uint64_t HashStringView(std::string_view text) {
   h ^= h >> 33;
   // Zero is the "hash not computed" sentinel in StringPayload, so it must
   // never escape as a cached hash. Remap it to a high, well-mixed pattern
-  // instead of 1, which would make a zero-hash string share a bucket (and a
-  // cached hash) with a string whose genuine hash is 1.
-  return h == 0 ? 0x9E3779B97F4A7C15ULL : h;
+  // that is also distinct from the kNull hash (0x9e3779b97f4a7c15ULL); the
+  // old remap collided with NULL even though the two values are never equal.
+  return h == 0 ? 0xD1B54A32D192ED03ULL : h;
 }
 
 // Canonical element-type spelling for array comparison. Documented SQL
@@ -1373,29 +1397,6 @@ size_t EncodeMemcomparableFormatVarcharTo(char* dst, std::string_view in) {
   }
 }
 
-size_t VarcharMemcomparableLength(const char* src, size_t avail) {
-  const char* p = src;
-  size_t left = avail;
-  for (;;) {
-    if (left < 9) {
-      throw std::runtime_error("truncated varchar group");
-    }
-    const auto cnt = static_cast<uint8_t>(p[8]);
-    if (cnt == 0 || cnt > 9) {
-      throw std::runtime_error("broken varchar group count");
-    }
-    if (cnt < 8 &&
-        !std::all_of(p + cnt, p + 8, [](char c) { return c == '\0'; })) {
-      throw std::runtime_error("corrupt memcomparable varchar padding");
-    }
-    left -= 9;
-    p += 9;
-    if (cnt != 9) {
-      break;
-    }
-  }
-  return static_cast<size_t>(p - src);
-}
 }  // namespace
 
 size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
@@ -1446,58 +1447,35 @@ size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
 }
 
 size_t Value::DecodeMemcomparableFormatBounded(const char* src, size_t avail) {
-  if (avail < 1) {
-    throw std::runtime_error("truncated tag");
-  }
-  const auto raw_tag = static_cast<uint8_t>(src[0]);
-  if (raw_tag == static_cast<uint8_t>(ValueType::kNull)) {
-    return 1;
-  }
-  if (raw_tag == kMemcomparableInterval) {
-    if (avail < 25) {
-      throw std::runtime_error("truncated interval key");
-    }
-    return 25;
-  }
-  if (raw_tag == kMemcomparableUint64) {
-    if (avail < 1 + 8) {
-      throw std::runtime_error("truncated numeric");
-    }
-    return 1 + 8;
-  }
-  const auto tag = static_cast<ValueType>(raw_tag);
-  switch (tag) {
-    case ValueType::kInt64:
-    case ValueType::kDate:
-    case ValueType::kDouble:
-      if (avail < 1 + 8) {
-        throw std::runtime_error("truncated numeric");
-      }
-      return 1 + 8;
-    case ValueType::kVarChar: {
-      const bool empty =
-          (avail >= 10) &&
-          std::all_of(src + 1, src + 10, [](char c) { return c == '\0'; });
-      if (empty) {
-        return 10;
-      }
-      return 1 + VarcharMemcomparableLength(src + 1, avail - 1);
-    }
-    case ValueType::kArray: {
-      Value tmp;
-      const StatusOr<size_t> res =
-          tmp.TryDecodeMemcomparableFormat(std::string_view(src, avail));
-      if (!res.HasValue()) {
-        throw std::runtime_error(res.GetStatus().GetMessage());
-      }
-      return res.Value();
-    }
-    default:
-      throw std::runtime_error("unknown memcomparable tag");
-  }
+  // Legacy throwing entry point: every malformed-key condition is detected
+  // by the Status-returning decoder and converted at this one boundary via
+  // the exc shim.  Keeping the ad-hoc throw sites here had let errors escape
+  // as raw exceptions instead of the engine's Status vocabulary.
+  return ExcShimUnwrap<size_t>(
+      Value().TryDecodeMemcomparableFormat(std::string_view(src, avail)),
+      "Value::DecodeMemcomparableFormatBounded");
 }
 
 StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
+  // A StatusOr API must not leave its output half-written on failure. Several
+  // branches set type/collation before decoding the payload; snapshot the
+  // value and restore it unless a successful return marks the decode committed.
+  const Value saved = *this;
+  bool committed = false;
+  struct RestoreOnFailure {
+    Value& target;
+    const Value& saved;
+    const bool& committed;
+    ~RestoreOnFailure() {
+      if (!committed) { target = saved;
+}
+    }
+  } restore{.target=*this, .saved=saved, .committed=committed};
+  const auto publish = [&committed](size_t bytes) -> StatusOr<size_t> {
+    committed = true;
+    return bytes;
+  };
+
   const char* cursor = src.data();
   const char* const end = src.data() + src.size();
   if (cursor == end) {
@@ -1512,13 +1490,13 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       // NULL component decodes back to a NULL value consuming exactly one
       // byte (key-only reads never dereference `value` further).
       *this = Value();
-      return 1;
+      return publish(1);
     case static_cast<uint8_t>(ValueType::kInt64): {
       type = ValueType::kInt64;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
-      return len + 1;
+      return publish(len + 1);
     }
     case kMemcomparableInterval: {
       IntervalValue interval;
@@ -1530,7 +1508,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       }
       ASSIGN_OR_RETURN(std::string, text, interval.TryToString());
       *this = Value(std::move(text)).WithInterval();
-      return static_cast<size_t>(cursor - src.data());
+      return publish(static_cast<size_t>(cursor - src.data()));
     }
     case kMemcomparableUint64: {
       type = ValueType::kInt64;
@@ -1542,14 +1520,14 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       uint64_t loaded = 0;
       ::memcpy(&loaded, cursor, sizeof(loaded));
       value.int_value = static_cast<int64_t>(be64toh(loaded));
-      return sizeof(uint64_t) + 1;
+      return publish(sizeof(uint64_t) + 1);
     }
     case static_cast<uint8_t>(ValueType::kDate): {
       type = ValueType::kDate;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
-      return len + 1;
+      return publish(len + 1);
     }
     case static_cast<uint8_t>(ValueType::kVarChar): {
       type = ValueType::kVarChar;
@@ -1557,14 +1535,14 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
           size_t, len,
           DecodeMemcomparableFormatVarchar(cursor, end, &owned_data.Mutable()));
       value.varchar_value = owned_data;
-      return len + 1;
+      return publish(len + 1);
     }
     case static_cast<uint8_t>(ValueType::kDouble): {
       type = ValueType::kDouble;
       ASSIGN_OR_RETURN(
           size_t, len,
           DecodeMemcomparableFormatDouble(cursor, end, &value.double_value));
-      return len + 1;
+      return publish(len + 1);
     }
     case static_cast<uint8_t>(ValueType::kArray): {
       static thread_local size_t memcmp_decode_depth = 0;
@@ -1649,7 +1627,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       owned_data.SetArray(std::make_unique<ArrayPayload>());
       owned_data.Array()->element_sql_type = std::move(sql_type);
       owned_data.Array()->elements = std::move(elements);
-      return static_cast<size_t>(p - cursor) + 1;
+      return publish(static_cast<size_t>(p - cursor) + 1);
     }
     default:
       break;
@@ -1659,6 +1637,10 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
 
 bool Value::LessSlow(const Value& rhs) const {
   return ExcShimUnwrap(TryLess(rhs), "Value::operator<");
+}
+
+int Value::CompareCollatedString(const Value& rhs) const {
+  return CompareWithCollation(*this, rhs);
 }
 
 StatusOr<bool> Value::TryLess(const Value& rhs) const {
@@ -2238,6 +2220,9 @@ Decoder& operator>>(Decoder& e, Value& v) {
   }
   switch (v.type) {
     case tinylamb::ValueType::kNull:
+      // Keep the stream's tag: the Encoder writes Collation()<<3 for every
+      // type and the spill codec preserves it on NULL as well, so all decode
+      // paths agree. IsUnsigned()/CollationOf() already ignore tags on NULL.
       break;
     case tinylamb::ValueType::kInt64:
     case tinylamb::ValueType::kDate:
@@ -2259,7 +2244,9 @@ Decoder& operator>>(Decoder& e, Value& v) {
       // through Encoder/Decoder without losing its collation.
       const uint8_t collation = v.collation_;
       v = Value::Array(std::move(elements), std::move(sql_type));
-      v.SetCollation(collation);
+      if (!v.SetCollation(collation)) {
+        e.Fail();
+      }
       break;
     }
     default:
@@ -2291,6 +2278,14 @@ uint64_t std::hash<tinylamb::Value>::operator()(
                  (std::hash<int64_t>()(iv.days) * 0x9e3779b97f4a7c15ULL) ^
                  (std::hash<int64_t>()(iv.months) << 1);
         }
+      }
+      if (v.IsCaseInsensitive()) {
+        // EqualUnderCollation folds ASCII case, so two CI-tagged strings that
+        // differ only in case are peers.  Fold before hashing as well: a
+        // caller that hashes tagged Values directly (without the explicit
+        // CanonicalDistinctValue step used by grouping) then lands them in
+        // the same bucket.  Unequal strings may collide; that is harmless.
+        return tinylamb::HashFoldedForCollation(v.value.varchar_value);
       }
       return v.owned_data.StringHash(v.value.varchar_value);
     case tinylamb::ValueType::kDouble: {

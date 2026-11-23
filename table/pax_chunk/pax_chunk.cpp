@@ -83,6 +83,8 @@ struct StrPredicate {
 // rest dropped. "abc" -> "abd", "ab\xff" -> "ac". Returns false when the
 // needle is all 0xFF -- then the prefix set runs to the end of the order
 // and has no finite upper bound.
+// Lean proof: lean/TinylambOpt/ResearchProofs/DictPrefixMonotonicRange.lean
+//   (sound)
 bool PrefixUpperBound(const std::string& needle, std::string* out) {
   size_t i = needle.size();
   while (i > 0 && static_cast<uint8_t>(needle[i - 1]) == 0xFFU) {
@@ -708,7 +710,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         // (one row group), so a fixed 16-word mask covers it; the tail bits
         // past nconf are masked off before the popcount (a partial row
         // group leaves them stale otherwise).
-        std::array<uint64_t, (PaxChunk::kRowGroupSize + 63) / 64> mask;
+        std::array<uint64_t, (PaxChunk::kRowGroupSize + 63) / 64> mask{};
         mask.fill(~UINT64_C(0));
         thread_local std::vector<int64_t> col;
         if (col.size() < t.nconf) {
@@ -1068,6 +1070,20 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
             out->push_back(static_cast<uint32_t>(i));
           }
           return true;
+        }
+        case StrScanOp::kPrefix: {
+          a = seek(p.needle, false);
+          if (a < 0) {
+            return false;
+          }
+          std::string upper;
+          if (PrefixUpperBound(p.needle, &upper)) {
+            b = seek(upper, false);
+            if (b < 0) {
+              return false;
+            }
+          }
+          break;
         }
         default: {  // kGe
           a = seek(p.needle, false);

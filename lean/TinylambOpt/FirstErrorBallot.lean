@@ -149,4 +149,81 @@ theorem op_first_is_wrong :
                   else if i = 1 && j = 0 then some ErrKind.divZero else none) := by
   decide
 
+def guardedCtz (x : BitVec w) : Option Nat :=
+  if x = 0 then none else some x.ctz.toNat
+
+theorem first_bit_ctz (x : BitVec w) :
+    (List.range w).find? x.getLsbD = guardedCtz x := by
+  unfold guardedCtz
+  split
+  · rename_i hz
+    simp [hz, List.find?_range_eq_none]
+  · rename_i hn
+    have set := BitVec.getLsbD_true_ctz_of_ne_zero hn
+    apply List.find?_range_eq_some.mpr
+    exact ⟨set, List.mem_range.mpr (BitVec.lt_of_getLsbD set),
+      fun i hi => by simp [BitVec.getLsbD_false_of_lt_ctz hi]⟩
+
+/-- Pack active row failures into an actual word and use guarded ctz for the
+    row selection; the op and error kind are recovered at that same lane. -/
+theorem packed_error_ballot (base w m : Nat) (live : Nat → Nat → Bool)
+    (err : Nat → Nat → Option ErrKind) :
+    let mask := fun i j => live (base+i) j && (err (base+i) j).isSome
+    let pred := ballotGuard base m mask err
+    let word := BitVec.ofBoolListLE ((List.range w).map pred)
+    seqFirst base w m live err = (guardedCtz word).bind (ballotFound base m mask err) := by
+  intro mask pred word
+  rw [first_error_ballot_sound base w m live err mask (fun _ _ => rfl)]
+  unfold ballot firstOf
+  rw [← first_bit_ctz]
+  have same : (List.range w).find? pred =
+      (List.range ((List.range w).map pred).length).find? word.getLsbD := by
+    simp only [List.length_map, List.length_range]
+    simp only [List.find?_eq_findSome?_guard]
+    apply findSome_congr
+    intro i hi
+    have lt := List.mem_range.mp hi
+    have eq : word.getLsbD i = pred i := by
+      unfold word
+      rw [BitVec.getLsbD_ofBoolListLE, List.getD_eq_getElem?_getD]
+      simp [List.getElem?_eq_getElem, lt]
+    simp only [Option.guard, eq]
+  rw [← same]
+  cases (List.range w).find? pred <;> rfl
+
+/-- A second AND operand runs after TRUE or UNKNOWN. Speculation uses a
+    total classification (errors are data) so dead lanes can safely be masked. -/
+inductive LeftResult where
+  | pass | reject | unknown | fail (e : ErrKind)
+  deriving DecidableEq
+
+def leftFailure : LeftResult → Option ErrKind
+  | .fail e => some e
+  | _ => none
+
+def needsRight : LeftResult → Bool
+  | .pass | .unknown => true
+  | _ => false
+
+def sequentialAnd (left : LeftResult) (right : Option ErrKind) : Option (Nat × ErrKind) :=
+  match left with
+  | .fail e => some (0,e)
+  | .reject => none
+  | _ => right.map (fun e => (1,e))
+
+theorem and_active_error_ballot (base w : Nat) (left : Nat → LeftResult)
+    (right : Nat → Option ErrKind) :
+    let live := fun row op => op == 0 || (op == 1 && needsRight (left row))
+    let errs := fun row op => if op = 0 then leftFailure (left row) else right row
+    let mask := fun i j => live (base+i) j && (errs (base+i) j).isSome
+    (List.range w).findSome? (fun i => (sequentialAnd (left (base+i)) (right (base+i))).map
+      fun je => Found.mk (base+i) je.1 je.2) = ballot base w 2 mask errs := by
+  intro live errs mask
+  rw [← first_error_ballot_sound base w 2 live errs mask (fun _ _ => rfl)]
+  unfold seqFirst
+  apply findSome_congr
+  intro i _
+  cases h : left (base+i) <;> cases h' : right (base+i) <;>
+    simp [rowFirst, sequentialAnd,live,errs,h,h',leftFailure,needsRight,List.range_succ]
+
 end TinylambOpt.FirstErrorBallot

@@ -95,14 +95,16 @@ class RecursivePartitioner {
   [[nodiscard]] static uint32_t RadixBucket(uint64_t hash, uint32_t depth,
                                             uint32_t fanout_bits) noexcept;
   [[nodiscard]] static uint32_t RadixBucketAtOffset(
-      uint64_t hash, uint32_t bit_offset, uint32_t fanout_bits) noexcept;
+      uint64_t hash, uint64_t bit_offset, uint32_t fanout_bits) noexcept;
 
   [[nodiscard]] Status AddRow(const Row& row);
   [[nodiscard]] Status AddRow(Row&& row);
   [[nodiscard]] Status AddChunk(const DataChunk& chunk);
 
   // Completes partitioning and recursively splits any bucket larger than
-  // `memory_budget_bytes` (unless skew fallback applies).
+  // `memory_budget_bytes` (unless skew fallback applies). An error leaves
+  // result_out unchanged and allows retrying Finalize or calling Reset.
+  // Input is closed once finalization starts.
   [[nodiscard]] Status Finalize(PartitionLeafSet* result_out);
 
   // Reads all rows from a single leaf (either in-memory or spilled segment)
@@ -150,6 +152,9 @@ class RecursivePartitioner {
                                                size_t est_bytes);
   [[nodiscard]] static Status FlushBucket(BucketWriter* bucket);
   [[nodiscard]] Status TransitionToSpill();
+  // hash_fn_ is a caller-supplied std::function and may throw; the Status
+  // boundary requires translating any exception instead of letting it escape.
+  [[nodiscard]] StatusOr<uint64_t> HashRow(const Row& row);
   [[nodiscard]] Status SplitOversizedPartition(
       const PendingPartition& part, uint32_t fanout_bits, size_t writer_buf,
       std::vector<PendingPartition>* children_out);
@@ -168,9 +173,12 @@ class RecursivePartitioner {
   uint64_t total_rows_{0};
 
   std::vector<BucketWriter> root_writers_;
+  std::vector<PendingPartition> pending_partitions_;
+  PartitionLeafSet completed_leaves_;
   uint32_t max_observed_depth_{0};
   uint32_t skew_fallback_count_{0};
   bool spilled_{false};
+  bool finalization_started_{false};
   bool finalized_{false};
 };
 

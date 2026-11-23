@@ -215,6 +215,10 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       full_line.push_back('\n');
       full_line.append(next_line);
     }
+    if (LabelContinues(full_line)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "malformed AST dump: unterminated continued line");
+    }
 
     size_t spaces = 0;
     while (spaces < full_line.size() && full_line[spaces] == ' ') {

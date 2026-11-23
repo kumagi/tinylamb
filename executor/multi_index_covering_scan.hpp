@@ -53,6 +53,11 @@ class MultiIndexCoveringScan : public ExecutorBase {
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
+  // Diagnostic: every participant must enter the scan with a live index gate.
+  // Participants that share an index root use a Borrowed() guard pointing at
+  // the single real guard, so this stays true for all of them.
+  [[nodiscard]] bool AllGuardsHoldLocks() const;
+
  private:
   struct Participant {
     const Index* index{nullptr};

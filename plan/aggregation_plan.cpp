@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/string_util.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/collation.hpp"
 #include "expression/column_value.hpp"
@@ -70,27 +71,29 @@ ValueType KeyValueType(const Expression& expression, const Schema& input) {
   }
 }
 
-// Order-key identity for the ordered aggregate shapes. Besides pointer
-// identity and the rendered spelling, two ColumnValues naming the same column
-// through different spellings (`t.x` vs `x`) describe the same order. This is
-// the same qualifier-tolerant normalization LogicalProperties::AreEqual uses
-// in cascades_search.cpp; without it a redundant Sort survives the memo.
-bool SameOrderKey(const ExpressionBase& lhs, const ExpressionBase& rhs) {
-  if (&lhs == &rhs) {
+bool SameOrderKey(const Expression& key, const Expression& requested,
+                  const Schema& output_schema, size_t key_slot) {
+  if (requested->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = requested->AsColumnValue().GetColumnName();
+    const int resolved = output_schema.Offset(column);
+    if (resolved < 0 || std::cmp_not_equal(resolved, key_slot)) {
+      return false;
+    }
+    if (column.schema.empty()) {
+      // Offset returns the first match for an unqualified name. It cannot
+      // establish key identity when the output exposes that name twice.
+      for (size_t slot = 0; slot < output_schema.ColumnCount(); ++slot) {
+        const ColumnName& candidate = output_schema.GetColumn(slot).Name();
+        if (slot != key_slot && IdentifierEquals(candidate.name, column.name)) {
+          return false;
+        }
+      }
+    }
     return true;
   }
-  if (lhs.ToString() == rhs.ToString()) {
-    return true;
-  }
-  if (lhs.Type() != TypeTag::kColumnValue ||
-      rhs.Type() != TypeTag::kColumnValue) {
-    return false;
-  }
-  const ColumnName& left = lhs.AsColumnValue().GetColumnName();
-  const ColumnName& right = rhs.AsColumnValue().GetColumnName();
-  return left.name == right.name &&
-         (left.schema.empty() || right.schema.empty() ||
-          left.schema == right.schema);
+  return key == requested ||
+         (key->ToString() == requested->ToString() &&
+          CollationOfExpression(key) == CollationOfExpression(requested));
 }
 
 // The group-key order both ordered shapes deliver: ascending with NULLs first,
@@ -98,7 +101,7 @@ bool SameOrderKey(const ExpressionBase& lhs, const ExpressionBase& rhs) {
 // only when it asks for exactly that, and only for a prefix of the key list —
 // an ordered output also delivers any shorter prefix of its own order.
 bool DeliversAscendingNullsFirst(
-    const std::vector<NamedExpression>& keys,
+    const std::vector<NamedExpression>& keys, const Schema& output_schema,
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>* nulls_first) {
@@ -108,7 +111,7 @@ bool DeliversAscendingNullsFirst(
   }
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (!ascending[i] || !keys[i].expression || !expressions[i] ||
-        !SameOrderKey(*keys[i].expression, *expressions[i])) {
+        !SameOrderKey(keys[i].expression, expressions[i], output_schema, i)) {
       return false;
     }
     if (nulls_first != nullptr && i < nulls_first->size() &&
@@ -179,7 +182,10 @@ TableStatistics AggregationPlan::GenerateOutputStats() const {
         input_rows == 0
             ? estimated_groups_
             : std::min(estimated_groups_, static_cast<double>(input_rows));
-    rows = static_cast<size_t>(capped);
+    // estimated_groups_ may be +inf (unmeasured stats); casting a non-finite
+    // double to size_t is UB, so saturate like RowEstimate does.
+    rows = std::isfinite(capped) ? static_cast<size_t>(capped)
+                                 : std::numeric_limits<size_t>::max();
   }
   if (rows == 0 && group_keys_.empty()) {
     rows = 1;
@@ -265,12 +271,22 @@ Schema AggregationPlan::GenerateSchema() const {
       ValueType type = ValueType::kInt64;
       try {
         const Type result = agg.expression->ResultType(child_->GetSchema());
-        if (result.GetType() == TypeTag::kDouble) {
-          type = ValueType::kDouble;
-        } else if (result.GetType() == TypeTag::kVarChar) {
-          type = ValueType::kVarChar;
-        } else {
-          type = ValueType::kInt64;
+        switch (result.GetType()) {
+          case TypeTag::kDouble:
+            type = ValueType::kDouble;
+            break;
+          case TypeTag::kVarChar:
+            type = ValueType::kVarChar;
+            break;
+          case TypeTag::kDate:
+            // A non-aggregate SELECT item can return DATE just as a MIN/MAX
+            // aggregate can; declaring it INT64 desynchronises the plan's
+            // output schema from the value the executor produces.
+            type = ValueType::kDate;
+            break;
+          default:
+            type = ValueType::kInt64;
+            break;
         }
       } catch (...) {
         type = ValueType::kInt64;
@@ -382,16 +398,16 @@ std::string SortAggregatePlan::MemorySuffix() const {
 
 bool SortAggregatePlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                     const std::vector<bool>& ascending) const {
-  return DeliversAscendingNullsFirst(GroupKeys(), expressions, ascending,
-                                     nullptr);
+  return DeliversAscendingNullsFirst(GroupKeys(), GetSchema(), expressions,
+                                     ascending, nullptr);
 }
 
 bool SortAggregatePlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
-  return DeliversAscendingNullsFirst(GroupKeys(), expressions, ascending,
-                                     &nulls_first);
+  return DeliversAscendingNullsFirst(GroupKeys(), GetSchema(), expressions,
+                                     ascending, &nulls_first);
 }
 
 // ---------------------------------------------------------- stream shape ---
@@ -404,16 +420,16 @@ std::string StreamAggregatePlan::MemorySuffix() const {
 bool StreamAggregatePlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending) const {
-  return DeliversAscendingNullsFirst(GroupKeys(), expressions, ascending,
-                                     nullptr);
+  return DeliversAscendingNullsFirst(GroupKeys(), GetSchema(), expressions,
+                                     ascending, nullptr);
 }
 
 bool StreamAggregatePlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
-  return DeliversAscendingNullsFirst(GroupKeys(), expressions, ascending,
-                                     &nulls_first);
+  return DeliversAscendingNullsFirst(GroupKeys(), GetSchema(), expressions,
+                                     ascending, &nulls_first);
 }
 
 }  // namespace tinylamb

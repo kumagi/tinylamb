@@ -26,17 +26,26 @@ class TpccMySqlSession final : public TpccSqlSession {
   }
 
   Status Connect(int port) {
-    if (mysql_thread_init() != 0) return Status::kIOError;
-    thread_initialized_ = true;
+    if (connection_ != nullptr) {
+      mysql_close(connection_);
+      connection_ = nullptr;
+    }
+    if (!thread_initialized_) {
+      if (mysql_thread_init() != 0) return Status::kIOError;
+      thread_initialized_ = true;
+    }
     connection_ = mysql_init(nullptr);
     if (!connection_) return Status::kIOError;
     unsigned int timeout = 15;
-    mysql_options(connection_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
-    mysql_options(connection_, MYSQL_OPT_READ_TIMEOUT, &timeout);
-    mysql_options(connection_, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
-    enum mysql_ssl_mode ssl_mode = SSL_MODE_DISABLED;
-    mysql_options(connection_, MYSQL_OPT_SSL_MODE, &ssl_mode);
-    mysql_options(connection_, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    const enum mysql_ssl_mode ssl_mode = SSL_MODE_DISABLED;
+    if (mysql_options(connection_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout) != 0 ||
+        mysql_options(connection_, MYSQL_OPT_READ_TIMEOUT, &timeout) != 0 ||
+        mysql_options(connection_, MYSQL_OPT_WRITE_TIMEOUT, &timeout) != 0 ||
+        mysql_options(connection_, MYSQL_OPT_SSL_MODE, &ssl_mode) != 0 ||
+        mysql_options(connection_, MYSQL_SET_CHARSET_NAME, "utf8mb4") != 0) {
+      error_ = mysql_error(connection_);
+      return StatusError(StatusCode::kIOError, "MySQL client option failed");
+    }
     if (!mysql_real_connect(connection_, "127.0.0.1", "root", "", "bench",
                             static_cast<unsigned int>(port), nullptr, 0)) {
       error_ = mysql_error(connection_);
@@ -46,9 +55,10 @@ class TpccMySqlSession final : public TpccSqlSession {
     return Execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
                    &ignored);
   }
-  Status Begin(bool /*read_only*/) override {
+  Status Begin(bool read_only) override {
     std::vector<Row> ignored;
-    return Execute("BEGIN", &ignored);
+    return Execute(read_only ? "START TRANSACTION READ ONLY" : "BEGIN",
+                   &ignored);
   }
   Status Commit() override {
     std::vector<Row> ignored;
@@ -56,18 +66,34 @@ class TpccMySqlSession final : public TpccSqlSession {
   }
   void Abort() override {
     std::vector<Row> ignored;
-    (void)Execute("ROLLBACK", &ignored);
+    const Status rollback_status = Execute("ROLLBACK", &ignored);
+    if (!rollback_status.ok()) {
+      const std::string detail = error_;
+      error_ = "ROLLBACK failed: " +
+               std::string(ToString(rollback_status)) +
+               (detail.empty() ? std::string() : ": " + detail);
+      rollback_failed_ = true;
+    }
   }
   std::string_view LastError() const override { return error_; }
 
   Status Execute(std::string_view sql, std::vector<Row>* rows) override {
     rows->clear();
+    if (rollback_failed_) {
+      return StatusError(StatusCode::kIOError, error_);
+    }
     error_.clear();
     if (mysql_real_query(connection_, sql.data(),
                          static_cast<unsigned long>(sql.size())) != 0) {
-      error_ = std::to_string(mysql_errno(connection_)) + ": " +
-               mysql_error(connection_);
-      return Status::kConflicts;
+      const unsigned int code = mysql_errno(connection_);
+      error_ = std::to_string(code) + ": " + mysql_error(connection_);
+      // Only transactional lock failures are retryable conflicts. Syntax,
+      // permission, connection, and other server errors must not be reported
+      // as conflicts to the shared TPC-C harness.
+      if (code == ER_LOCK_DEADLOCK || code == ER_LOCK_WAIT_TIMEOUT) {
+        return Status::kConflicts;
+      }
+      return StatusError(StatusCode::kRuntimeError, error_);
     }
     std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> result(
         mysql_store_result(connection_), mysql_free_result);
@@ -144,6 +170,7 @@ class TpccMySqlSession final : public TpccSqlSession {
  private:
   MYSQL* connection_{nullptr};
   bool thread_initialized_{false};
+  bool rollback_failed_{false};
   std::string error_;
 };
 }  // namespace tinylamb

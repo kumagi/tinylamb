@@ -11,14 +11,21 @@
 #include <string_view>
 #include <vector>
 
+#include "query/fuzz_flaky_marker.hpp"
+
 namespace tinylamb {
 
 // Verify marker for a finding whose serialized trace replays clean. It must
-// contain the "flaky" substring recognized by EmitFuzzFinding
-// (fuzz_scoped_db.hpp), otherwise a non-reproducing failure is persisted as a
-// permanently green regression and aborts the fuzzer worker.
+// embed the dedicated sentinel recognized by EmitFuzzFinding
+// (kFlakyVerifyMarker in fuzz_flaky_marker.hpp), otherwise a non-reproducing
+// failure is persisted as a permanently green regression and aborts the fuzzer
+// worker.
 inline constexpr std::string_view kOocNonReproducingVerify =
-    "note: replay of the serialized trace held (flaky / nondeterministic)";
+    "note: replay of the serialized trace held (flaky / nondeterministic) "
+    "[tinylamb-fuzz-replay-held-flaky]";
+static_assert(kOocNonReproducingVerify.find(kFlakyVerifyMarker) !=
+                  std::string_view::npos,
+              "kOocNonReproducingVerify must embed kFlakyVerifyMarker");
 
 // Larger-than-memory session fuzzing (ooca-v2.md G2/G3/G4/G6 as a fuzzer).
 //
@@ -136,6 +143,10 @@ struct OocRunOptions {
   // gone because a trace minimizer removed an earlier op) are skipped instead
   // of reported as malformed.
   bool lenient{false};
+  // Minimization replays hundreds of already-validated candidate traces; the
+  // serialize+digest+parse consistency gate adds O(trace bytes) per candidate
+  // and is redundant there. Committed-trace replays keep it enabled.
+  bool skip_consistency_check{false};
   // Called once with the profile before the database opens, and with every
   // op right before it executes.  A driver that appends them to a file keeps
   // a reproducible trace even when the process crashes or hangs.
@@ -171,7 +182,8 @@ std::string OocFailureSignature(std::string_view report);
 // signature as `report`.  Crashes and hangs need the out-of-process
 // minimizer (scripts/ooc_fuzz.py minimize).
 OocTrace MinimizeOocTrace(const OocTrace& trace, std::string_view report,
-                          double budget_seconds, std::string* final_report);
+                          double budget_seconds, std::string* final_report,
+                          std::function<void(const std::string&)> on_op = {});
 
 std::vector<std::string> OocFlavorNames();
 
@@ -183,8 +195,9 @@ bool ParseOocTest(std::string_view text, uint64_t* seed, OocTrace* trace,
 // Header-only prefix of the text format (for incremental trace files).
 std::string SerializeOocHeader(uint64_t seed, const OocProfile& profile);
 
-// libFuzzer harness.  On failure writes sql_ooc_fuzz-repro-<seed>.test
-// (verified by a replay first) and aborts unless TINYLAMB_FUZZ_CONTINUE=1.
+// libFuzzer harness. A failure emits a reproducer after minimization and
+// replay verification; non-reproducing or resource-skipped cases are marked
+// unverified. TINYLAMB_FUZZ_CONTINUE=1 suppresses the final abort.
 void OocFuzzTry(const uint8_t* data, size_t size, bool verbose);
 
 }  // namespace tinylamb

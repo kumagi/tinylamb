@@ -26,8 +26,8 @@ Status ErrnoToSpillStatus(int err, const char* context) {
                      std::string(context) + ": errno=" + std::to_string(err));
 }
 
-Status PwriteAll(int fd, const uint8_t* data, size_t len, int64_t offset) {
-  size_t done = 0;
+Status PwriteAll(int fd, const uint8_t* data, size_t len, int64_t offset,
+                 size_t& done) {
   while (done < len) {
     const ssize_t rc = platform::Pwrite(fd, data + done, len - done,
                                         offset + static_cast<int64_t>(done));
@@ -100,12 +100,11 @@ SpillStore::~SpillStore() {
   active_blocks_ = 0;
   current_active_bytes_ = 0;
   if (fd_ >= 0) {
-    // A failed close on an unlinked temp file leaks the descriptor; retry on
-    // EINTR. Other failures are intentionally ignored here: the file is
-    // unlinked and a destructor has no caller to report an error to, so there
-    // is no useful recovery or diagnostic to emit at this point.
-    while (platform::CloseFile(fd_) != 0 && errno == EINTR) {
-    }
+    // A failed close on an unlinked temp file can leak the descriptor (notably
+    // Windows' _close() may leave the underlying OS handle open on failure).
+    // Use the platform's best-effort release helper so the handle is freed even
+    // on a non-EINTR failure; a destructor has no caller to report an error to.
+    platform::ReleaseFile(fd_);
     fd_ = -1;
   }
 }
@@ -257,14 +256,14 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
             ? 0
             : (kBlockSize - intra);
     const size_t remaining_after_tail = len > tail_free ? (len - tail_free) : 0;
-    const size_t needed_blocks =
-        (remaining_after_tail + kBlockSize - 1) / kBlockSize;
+    const size_t needed_blocks = (remaining_after_tail / kBlockSize) +
+                                 static_cast<size_t>(remaining_after_tail % kBlockSize != 0);
 
     const size_t limit_bytes = EffectiveTempLimitBytes();
     if (limit_bytes > 0) {
-      const uint64_t post_blocks = active_blocks_ + needed_blocks;
-      if (post_blocks > std::numeric_limits<uint64_t>::max() / kBlockSize ||
-          post_blocks * kBlockSize > limit_bytes) {
+      const uint64_t limit_blocks = limit_bytes / kBlockSize;
+      if (active_blocks_ > limit_blocks ||
+          needed_blocks > limit_blocks - active_blocks_) {
         return StatusError(StatusCode::kNoSpace,
                            "spill store temporary space limit exceeded");
       }
@@ -275,10 +274,17 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
     // succeed even when the high-water mark is near UINT32_MAX.
     const size_t fresh_blocks =
         needed_blocks - std::min(needed_blocks, free_blocks_.size());
-    if (static_cast<uint64_t>(next_block_index_) + fresh_blocks >
-        std::numeric_limits<uint32_t>::max()) {
+    if (fresh_blocks >
+        std::numeric_limits<uint32_t>::max() - next_block_index_) {
       return StatusError(StatusCode::kNoSpace,
                          "spill store maximum addressable blocks reached");
+    }
+
+    if (needed_blocks > newly_reserved.max_size() ||
+        needed_blocks >= plan.max_size() ||
+        needed_blocks > seg.blocks.max_size() - seg.blocks.size()) {
+      return StatusError(StatusCode::kTooBigData,
+                         "spill store append plan is too large");
     }
 
     RETURN_IF_FAIL(EnsureFileOpenLocked());
@@ -311,9 +317,6 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
     active_blocks_ += needed_blocks;
     current_active_bytes_ = active_blocks_ * kBlockSize;
     peak_active_bytes_ = std::max(peak_active_bytes_, current_active_bytes_);
-    const uint64_t phys = static_cast<uint64_t>(next_block_index_) * kBlockSize;
-    physical_file_bytes_ = phys;
-    peak_physical_file_bytes_ = std::max(peak_physical_file_bytes_, phys);
     seg.write_in_progress = true;
 
     size_t src_off = 0;
@@ -344,9 +347,9 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
   // Execute Pwrite I/O outside `mu_` so independent segments/readers proceed
   // without lock contention.
   Status io_status = Status::kSuccess;
+  uint64_t written_extent = 0;
   const auto* bytes = static_cast<const uint8_t*>(data);
-  for (size_t idx = 0; idx < plan.size();
-       ++idx) {  // NOLINT(modernize-loop-convert)
+  for (const auto & s : plan) {  // NOLINT(modernize-loop-convert)
     // T37: consume once per physical Pwrite so "fail the N-th spill I/O
     // call" (docs/ooc_fuzzing.md) counts the same events the loop emits;
     // previously only the SECOND+ block of one Append consulted the
@@ -356,10 +359,15 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
                               "injected spill I/O failure during write");
       break;
     }
-    const WriteSlice& s = plan[idx];
     const auto file_off = static_cast<int64_t>(
         (static_cast<uint64_t>(s.block_idx) * kBlockSize) + s.offset_in_block);
-    io_status = PwriteAll(fd, bytes + s.src_offset, s.chunk_len, file_off);
+    size_t written = 0;
+    io_status =
+        PwriteAll(fd, bytes + s.src_offset, s.chunk_len, file_off, written);
+    if (written != 0) {
+      written_extent =
+          std::max(written_extent, static_cast<uint64_t>(file_off) + written);
+    }
     if (io_status != Status::kSuccess) {
       break;
     }
@@ -379,6 +387,9 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
 
   {
     std::scoped_lock lk(mu_);
+    physical_file_bytes_ = std::max(physical_file_bytes_, written_extent);
+    peak_physical_file_bytes_ =
+        std::max(peak_physical_file_bytes_, physical_file_bytes_);
     auto it = segments_.find(id);
     if (io_status != Status::kSuccess || it == segments_.end() ||
         it->second.pending_drop) {
@@ -488,14 +499,6 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
       dst_off += take;
       rem -= take;
     }
-    // T37-style: a rejected Read (missing/dropped segment, out-of-range
-    // offset, corrupt block index, no backing fd) never issues I/O, so it
-    // must not burn a scheduled injection slot. Consume only after all
-    // validation above has passed.
-    if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
-      return StatusError(StatusCode::kIOError,
-                         "injected spill I/O failure during read");
-    }
     // Pin the segment's blocks against DropSegment/Clear block reuse and
     // file truncation while PreadAll runs outside mu_. The store-wide count
     // also lets ~SpillStore wait for this read before destroying mu_/fd_.
@@ -505,13 +508,45 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
 
   auto* out = static_cast<uint8_t*>(dst);
   Status io_status = Status::kSuccess;
-  for (const ReadSlice& s : plan) {
-    const auto file_off = static_cast<int64_t>(
-        (static_cast<uint64_t>(s.block_idx) * kBlockSize) + s.offset_in_block);
-    io_status = PreadAll(fd, out + s.dst_offset, s.chunk_len, file_off);
-    if (io_status != Status::kSuccess) {
-      break;
+  try {
+    for (const ReadSlice& s : plan) {
+      // T37: consume once per physical Pread, mirroring Append's per-Pwrite
+      // consumption, so "fail the N-th spill I/O" counts the same events the
+      // loop emits. All validation already passed above, so a rejected Read
+      // never burns a slot; the injection now fires outside mu_.
+      if (ProcessMemoryBudget::Global().ConsumeInjectedSpillIoFailure()) {
+        io_status = StatusError(StatusCode::kIOError,
+                                "injected spill I/O failure during read");
+        break;
+      }
+      const auto file_off = static_cast<int64_t>(
+          (static_cast<uint64_t>(s.block_idx) * kBlockSize) +
+          s.offset_in_block);
+      io_status = PreadAll(fd, out + s.dst_offset, s.chunk_len, file_off);
+      if (io_status != Status::kSuccess) {
+        break;
+      }
     }
+  } catch (...) {
+    // An exception escaping the unlocked section (e.g. a StatusError
+    // allocation failure) must still release the active-read pins, or
+    // ~SpillStore would wait forever on reads_done_cv_.
+    std::scoped_lock lk(mu_);
+    auto& self = const_cast<SpillStore&>(*this);
+    auto it = self.segments_.find(id);
+    if (it != self.segments_.end()) {
+      SegmentState& seg = it->second;
+      --seg.active_reads;
+      if (seg.pending_drop && !seg.write_in_progress && seg.active_reads == 0) {
+        self.ReturnBlocksLocked(seg.blocks);
+        self.segments_.erase(it);
+        self.MaybeTruncateWhenEmptyLocked();
+      }
+    }
+    if (--self.active_reads_total_ == 0) {
+      self.reads_done_cv_.notify_all();
+    }
+    throw;
   }
 
   {
@@ -550,6 +585,7 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
     return;
   }
   int fd = -1;
+  auto& self = const_cast<SpillStore&>(*this);
   // The newly completed blocks are almost always a single block (one 64 KiB
   // boundary per refill); keep that case allocation- and lock-time free.
   std::array<uint32_t, 64> stack_blocks{};
@@ -566,8 +602,8 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
       return;
     }
     const SegmentState& seg = it->second;
-    const size_t completed_blocks = std::min<size_t>(
-        static_cast<size_t>(up_to_offset / kBlockSize), seg.blocks.size());
+    const size_t completed_blocks = static_cast<size_t>(
+        std::min<uint64_t>(up_to_offset / kBlockSize, seg.blocks.size()));
     if (completed_blocks <= seg.advised_blocks) {
       return;
     }
@@ -589,15 +625,46 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
     // completed_blocks and only advises the newer blocks, so each block is
     // handed to AdviseDontNeed at most once per segment lifetime.
     seg.advised_blocks = completed_blocks;
+    // Pin the block numbers just like Read() does. Otherwise Clear()/
+    // DropSegment() could return these physical blocks to the free list and a
+    // new segment could reuse them while the advisory syscalls below are
+    // outside mu_, aiming MADV_DONTNEED at another segment's live pages.
+    ++seg.active_reads;
+    ++self.active_reads_total_;
   }
-  for (size_t i = 0; i < count; ++i) {
-    advise_calls_.fetch_add(1, std::memory_order_relaxed);
-    platform::AdviseDontNeed(
-        fd,
-        static_cast<int64_t>(static_cast<uint64_t>(pending_blocks[i]) *
-                             kBlockSize),
-        static_cast<int64_t>(kBlockSize));
+  // Always release the active_reads pins, even if an advisory syscall starts
+  // throwing: ~SpillStore waits for active_reads_total_ == 0, so an exception
+  // escaping this loop would hang destruction.
+  const auto release_pins = [&]() {
+    std::scoped_lock lk(mu_);
+    auto it = self.segments_.find(id);
+    if (it != self.segments_.end()) {
+      SegmentState& seg = it->second;
+      --seg.active_reads;
+      if (seg.pending_drop && !seg.write_in_progress && seg.active_reads == 0) {
+        self.ReturnBlocksLocked(seg.blocks);
+        self.segments_.erase(it);
+        self.MaybeTruncateWhenEmptyLocked();
+      }
+    }
+    if (--self.active_reads_total_ == 0) {
+      self.reads_done_cv_.notify_all();
+    }
+  };
+  try {
+    for (size_t i = 0; i < count; ++i) {
+      advise_calls_.fetch_add(1, std::memory_order_relaxed);
+      platform::AdviseDontNeed(
+          fd,
+          static_cast<int64_t>(static_cast<uint64_t>(pending_blocks[i]) *
+                               kBlockSize),
+          static_cast<int64_t>(kBlockSize));
+    }
+  } catch (...) {
+    release_pins();
+    throw;
   }
+  release_pins();
 }
 
 StatusOr<uint64_t> SpillStore::SegmentSize(SpillSegmentId id) const {
@@ -713,6 +780,9 @@ Status SpillSegmentWriter::Write(const void* data, size_t len) {
   if (finished_) {
     return StatusError(StatusCode::kInvalidArgument,
                        "write to finished SpillSegmentWriter");
+  }
+  if (data == nullptr && len != 0) {
+    return StatusError(StatusCode::kInvalidArgument, "null spill write buffer");
   }
   RETURN_IF_FAIL(EnsureOpen());
   if (len == 0) {
@@ -866,7 +936,15 @@ Status SpillSegmentReader::Refill() {
   }
   const size_t to_read = static_cast<size_t>(
       std::min<uint64_t>(buffer_capacity_, total_size_ - cursor_));
-  buffer_.resize(to_read);
+  try {
+    buffer_.resize(to_read);
+  } catch (const std::bad_alloc&) {
+    // Refill returns Status: a read-ahead buffer reallocation failure must not
+    // escape into the OOC caller's Status boundary (the write path already
+    // guards its buffer_.insert the same way).
+    return StatusError(StatusCode::kMemoryLimitExceeded,
+                       "spill read buffer allocation failed");
+  }
   RETURN_IF_FAIL(store_->Read(id_, cursor_, buffer_.data(), to_read));
   // Advise the OS we no longer need completed blocks prior to `cursor_`.
   const uint64_t completed_boundary =

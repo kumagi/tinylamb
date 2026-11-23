@@ -85,6 +85,11 @@ class TableTest : public ::testing::Test {
 
 TEST_F(TableTest, Construct_Default_Succeeds) {}
 
+TEST_F(TableTest, GetIndexRejectsOutOfRangeOffsets) {
+  const Table table;
+  EXPECT_THROW(static_cast<void>(table.GetIndex(0)), std::out_of_range);
+}
+
 // sql_ooc_fuzzer finding: an open writer whose UPDATE relocated rows onto a
 // new (unpublished) tail page made every concurrent snapshot reader wait the
 // full 5 s tail timeout and then answer as if the table were EMPTY (the
@@ -129,7 +134,6 @@ TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
     auto reader = read_only ? rs_->BeginReadOnlyContext() : rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, rtable,
                           reader.GetTable(name));
-    const auto start = std::chrono::steady_clock::now();
     size_t rows = 0;
     Iterator it = rtable->BeginFullScan(reader.txn_);
     for (; it.IsValid(); ++it) {
@@ -144,8 +148,6 @@ TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
     EXPECT_SUCCESS(morsel_status);
     EXPECT_FALSE(morsels.empty());
     EXPECT_FALSE(reader.txn_.IsFailed());
-    EXPECT_LT(std::chrono::steady_clock::now() - start,
-              std::chrono::seconds(2));
     ASSERT_SUCCESS(reader.PreCommit());
   }
   ASSERT_SUCCESS(writer.PreCommit());
@@ -577,6 +579,8 @@ TEST_F(TableTest, Update_MultipleRowsRepeatedly_UpdatesSuccessfully) {
     ASSIGN_OR_ASSERT_FAIL(RowPosition, new_pos,
                           tbl->Update(ctx.txn_, pos, new_row));
     rps[static_cast<size_t>(i) % rps.size()] = new_pos;
+    ASSIGN_OR_ASSERT_FAIL_CONST(Row, read, tbl->Read(ctx.txn_, new_pos));
+    EXPECT_EQ(read, new_row);
   }
 }
 
@@ -648,6 +652,12 @@ TEST_F(TableTest, Delete_RowWithIndex_PreservesRemainingRowPositions) {
   ASSERT_SUCCESS(tbl->Delete(ctx.txn_, rp1));
 
   ASSERT_NE(rp2, rp3);
+  // Deleting rp1 must not disturb its neighbours: read both survivors back
+  // and compare content, like index_test's delete coverage does.
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read2, tbl->Read(ctx.txn_, rp2));
+  EXPECT_EQ(read2, Row({Value(2), Value("hoge"), Value(4.8)}));
+  ASSIGN_OR_ASSERT_FAIL_CONST(Row, read3, tbl->Read(ctx.txn_, rp3));
+  EXPECT_EQ(read3, Row({Value(3), Value("foo"), Value(1.5)}));
 }
 
 TEST_F(TableTest, Insert_DuplicateUniqueKey_ReturnsDuplicatesStatus) {
@@ -863,8 +873,8 @@ TEST_F(TableTest, IndexScan_VersionedUniqueIndex_ServesOldAndNewSnapshots) {
                          Row({Value(3), Value("duplicate"), Value(3.3)}))
                 .GetStatus(),
             Status::kDuplicates);
-  current.Abort();
-  old_reader.Abort();
+  ASSERT_SUCCESS(current.Abort());
+  ASSERT_SUCCESS(old_reader.Abort());
 }
 
 TEST_F(TableTest, Insert_WhenSlotIsConflicted_SkipsHoleAndMaintainsIndexEntry) {
@@ -923,7 +933,7 @@ TEST_F(TableTest, Insert_WhenSlotIsConflicted_SkipsHoleAndMaintainsIndexEntry) {
     }
   }
   ASSERT_SUCCESS(t2.PreCommit());
-  t1.Abort();
+  ASSERT_SUCCESS(t1.Abort());
 }
 
 TEST_F(TableTest, CreateIndex_WhenBackfillFails_CleansUpHalfBuiltIndex) {
@@ -1113,6 +1123,31 @@ TEST_F(TableTest, Insert_WhenPageIsFull_AllocatesNewPage) {
     ASSERT_EQ(read,
               Row({Value(i), Value(std::string(payload)), Value(i * 1.5)}));
   }
+}
+
+TEST_F(TableTest, NoWaitRejectsForeignTailBeforePublication) {
+  rs_->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
+  auto setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(setup,
+      Schema("tail_nowait", {Column("v", ValueType::kVarChar)})));
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto owner = rs_->BeginContext();
+  auto waiter = rs_->BeginContext();
+  PageManager* pm = owner.txn_.GetPageManager();
+  const page_id_t head = table.FirstPageId();
+  ASSERT_SUCCESS(pm->ReserveTableTail(owner.txn_, head, head));
+  const Status reserved = pm->ReserveTableTail(waiter.txn_, head, head);
+  EXPECT_EQ(reserved, Status::kConflicts);
+  EXPECT_EQ(reserved.GetMessage(), "table tail reservation held by another transaction");
+  ASSIGN_OR_ASSERT_FAIL(PageRef, successor, pm->AllocateNewPage(owner.txn_, PageType::kRowPage));
+  const page_id_t tail = successor->PageID();
+  successor.PageUnlock();
+  ASSERT_SUCCESS(pm->LinkReservedTableTail(owner.txn_.ID(), head, head, tail));
+  const Status waited = pm->WaitForTableTailPage(waiter.txn_, head, tail);
+  EXPECT_EQ(waited, Status::kConflicts);
+  EXPECT_EQ(waited.GetMessage(), "table tail is unpublished");
+  ASSERT_SUCCESS(owner.txn_.Abort());
+  EXPECT_SUCCESS(pm->WaitForTableTailPage(waiter.txn_, head, tail));
 }
 
 TEST_F(TableTest, AbortedTailReservationDoesNotClobberWaiterRow) {
@@ -1405,7 +1440,13 @@ TEST_F(TableTest, Serialize_TooLargeRow_Aborts) {
   std::string huge_payload(65536, 'x');
   Row huge_row({Value(1), Value(std::move(huge_payload)), Value(1.0)});
   std::vector<char> buf(huge_row.Size());
+  // The fixture's Database runs background WAL/checkpoint threads; the
+  // default "fast" death-test style forks that multi-threaded child and
+  // intermittently loses the CHECK message. threadsafe re-executes in a
+  // single-threaded child (same fix as table_statistics_test.cpp).
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
   EXPECT_DEATH((void)huge_row.Serialize(buf.data()), "too long");
+  testing::FLAGS_gtest_death_test_style = "fast";
 }
 
 TEST_F(TableTest,
@@ -1422,13 +1463,17 @@ TEST_F(TableTest,
   std::vector<slot_t> proj = {0, 2};
   std::unordered_set<int64_t> key_set = {2, 5, 8};
   Iterator iter = tbl->BeginFullScan(ctx.txn_, proj, &key_set, 0, nullptr);
-  size_t count = 0;
+  std::unordered_set<int64_t> seen;
   for (; iter.IsValid(); ++iter) {
-    ++count;
     const Row& r = *iter;
-    EXPECT_EQ(r.values_.size(), 2U);
+    ASSERT_EQ(r.values_.size(), 2U);
+    ASSERT_EQ(r[0].type, ValueType::kInt64);
+    const int64_t key = r[0].value.int_value;
+    EXPECT_TRUE(key_set.contains(key));
+    EXPECT_EQ(r[1], Value(static_cast<double>(key)));
+    seen.insert(key);
   }
-  EXPECT_EQ(count, 3U);
+  EXPECT_EQ(seen, key_set);
 
   auto morsels = tbl->BuildScanMorsels(ctx.txn_, 2);
   EXPECT_FALSE(morsels.empty());

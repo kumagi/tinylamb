@@ -47,7 +47,7 @@ RowPage& PageRef::GetRowPage() {
   return page_->body.row_page;
 }
 
-void PageRef::PageUnlock() {
+void PageRef::PageReleaseLatch() {
   if (exclusive_page_lock_.owns_lock()) {
     if (page_ != nullptr) {
       page_->ClearExclusiveOwner();
@@ -57,6 +57,10 @@ void PageRef::PageUnlock() {
   if (shared_page_lock_.owns_lock()) {
     shared_page_lock_.unlock();
   }
+}
+
+void PageRef::PageUnlock() {
+  PageReleaseLatch();
   page_ = nullptr;
   owner_.reset();
 }

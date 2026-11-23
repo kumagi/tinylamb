@@ -1,4 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+// Covers ordering, inclusive/strict integer and date bounds, outer/semi
+// behavior, batching, error propagation, planning, and unsupported shapes.
 #include "executor/band_join.hpp"
 
 #include <gtest/gtest.h>
@@ -107,6 +109,10 @@ class ErrorExpression final : public ExpressionBase {
 TEST(BandJoinTest, RefusesOverBudgetMaterializationAndReleasesCharge) {
   auto& budget = QueryMemoryBudget::Global();
   const auto prior = budget.Limit();
+  struct RestoreBudget {
+    size_t limit;
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore{prior};
   budget.ResetForTest(1024);
   const auto inputs = std::vector<Row>(32, Row({Value(1)}));
   auto schema = IntSchema("l", "x") + IntSchema("r", "x");
@@ -116,7 +122,6 @@ TEST(BandJoinTest, RefusesOverBudgetMaterializationAndReleasesCharge) {
   EXPECT_TRUE(Drain(&join).empty());
   EXPECT_EQ(join.GetStatus().GetCode(), StatusCode::kMemoryLimitExceeded);
   EXPECT_EQ(budget.Used(), 0U);
-  budget.ResetForTest(prior);
 }
 
 TEST(BandJoinTest, Int64LessThanKeepsLeftMajorOrderDuplicatesAndNulls) {

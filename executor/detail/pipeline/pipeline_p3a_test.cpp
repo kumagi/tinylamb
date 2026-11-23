@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -18,6 +20,7 @@
 #include "common/platform/process.hpp"
 #include "common/query_grant.hpp"
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/pipeline/ooc_sinks.hpp"
@@ -35,6 +38,7 @@
 #include "plan/projection_plan.hpp"
 #include "plan/selection_plan.hpp"
 #include "plan/values_plan.hpp"
+#include "type/row_block_codec.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -304,6 +308,33 @@ TEST(PipelineP3aTest, OocSortSinkSizesComputedKeysFromChunkNotEmptySchema) {
   EXPECT_EQ(out[0][0].AsInt64(), 9);
   EXPECT_EQ(out[1][0].AsInt64(), 8);
   EXPECT_EQ(out[2][0].AsInt64(), 7);
+}
+
+TEST(PipelineP3aTest, OocSortSinkValidatesSlotsAndWidthsAgainstChunks) {
+  PipelineContext ctx(nullptr, QueryMemoryGrant{});
+  OocSortSink sink({{.expression = ColumnValueExp("k"), .column_slot = 0}},
+                   Schema{});
+  ASSERT_SUCCESS(sink.Init(&ctx, 1));
+
+  DataChunk input;
+  input.Append(Row({Value(2)}));
+  input.Append(Row({Value(1)}));
+  ASSERT_SUCCESS(sink.Consume(&ctx, 0, input));
+
+  DataChunk wrong_width;
+  wrong_width.Append(Row({Value(3), Value(4)}));
+  EXPECT_EQ(sink.Consume(&ctx, 0, wrong_width), Status::kInvalidArgument);
+
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<PipelineSource>, source,
+                        sink.Finalize(&ctx));
+  ASSERT_SUCCESS(source->Open(&ctx));
+  DataChunk output;
+  auto produced = source->NextBatch(&ctx, &output, 10);
+  ASSERT_TRUE(produced.HasValue());
+  ASSERT_TRUE(produced.Value());
+  ASSERT_EQ(output.Size(), 2U);
+  EXPECT_EQ(output.RowAt(0), Row({Value(1)}));
+  EXPECT_EQ(output.RowAt(1), Row({Value(2)}));
 }
 
 TEST(PipelineP3aTest, OocGroupAggSinkSpillsCombinableDistinctAndHandlesSkew) {
@@ -786,7 +817,9 @@ TEST(PipelineP3aTest,
   // (B1).
   {
     QueryMemoryCoordinator coord(&mb);
-    auto grant = coord.AcquireGrant(4ULL << 20, 4ULL << 20).MoveValue();
+    auto grant_or = coord.AcquireGrant(4ULL << 20, 4ULL << 20);
+    ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+    auto grant = grant_or.MoveValue();
     PipelineContext pctx(nullptr, std::move(grant), 1);
 
     OocHashJoinSpec spec;
@@ -845,7 +878,9 @@ TEST(PipelineP3aTest,
   //    (C3, C4, C11, B13).
   {
     QueryMemoryCoordinator coord(&mb);
-    auto grant = coord.AcquireGrant(2ULL << 20, 2ULL << 20).MoveValue();
+    auto grant_or = coord.AcquireGrant(2ULL << 20, 2ULL << 20);
+    ASSERT_TRUE(grant_or.HasValue()) << grant_or.GetStatus();
+    auto grant = grant_or.MoveValue();
     PipelineContext pctx(nullptr, std::move(grant), 1);
 
     auto cnt_star = std::make_shared<AggregateExpression>(
@@ -940,7 +975,7 @@ TEST(PipelineP3aTest, GrantRequestFollowsTheConfiguredQueryBudget) {
   EXPECT_EQ(PipelineGrantRequestBytes(est), size_t{16} << 20);
 }
 
-TEST(PipelineP3aTest, UnlimitedGrantOperatorBudgetUsesFullQueryPool) {
+TEST(PipelineP3aTest, UnlimitedGrantOperatorBudgetStaysAQueryPoolSlice) {
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
   struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions)
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
@@ -953,13 +988,51 @@ TEST(PipelineP3aTest, UnlimitedGrantOperatorBudgetUsesFullQueryPool) {
   const size_t pool_max = mb.EffectivePoolMaxBytes(MemoryPoolKind::kQuery);
   ASSERT_GT(pool_max, 0U);
 
-  // A default-constructed grant is Unlimited. The operator budget must not be
-  // silently reduced to a quarter of the pool (nor divided by consumers).
+  // An unlimited grant must not hand a single operator the whole pool: ADR
+  // 0004 #5 requires the pool to be shared among buffering sinks (and across
+  // concurrent queries). A default-constructed grant has zero active
+  // consumers, so the slice is pool_max / (4 * max(1, 0)) = pool_max / 4.
   PipelineContext ctx(nullptr, QueryMemoryGrant{}, /*dop_in=*/4);
   ASSERT_TRUE(ctx.grant.Unlimited());
-  EXPECT_EQ(ctx.OperatorBudgetBytes(), pool_max);
+  EXPECT_EQ(ctx.grant.ActiveConsumerCount(), 0U);
+  EXPECT_EQ(ctx.OperatorBudgetBytes(), pool_max / 4);
   EXPECT_EQ(ctx.OperatorBudgetBytes(size_t{1} << 20),
-            std::max(pool_max, size_t{1} << 20));
+            std::max(pool_max / 4, size_t{1} << 20));
+}
+
+TEST(PipelineP3aTest, ZeroRowRequestsPreserveUnreadSourceRows) {
+  PipelineContext ctx(nullptr, QueryMemoryGrant{});
+  const Row first({Value(11)});
+  const Row second({Value(12)});
+  RowVectorSource rows({first, second});
+  DataChunk chunk;
+  chunk.Append(first);
+  chunk.Append(second);
+  ChunkVectorSource chunks({chunk}, "chunks");
+  auto store = std::make_unique<SpillableStore>(SpillableStore::Options{
+      .spill_store = &ctx.spill_store, .force_spill = true});
+  ASSERT_SUCCESS(store->AppendChunk(chunk));
+  SpillableStoreSource spilled(std::move(store));
+
+  for (PipelineSource* source : {static_cast<PipelineSource*>(&rows),
+                                 static_cast<PipelineSource*>(&chunks),
+                                 static_cast<PipelineSource*>(&spilled)}) {
+    ASSERT_SUCCESS(source->Open(&ctx));
+    DataChunk output;
+    ASSERT_SUCCESS_AND_EQ(source->NextBatch(&ctx, &output, 0), false);
+    EXPECT_TRUE(output.Empty());
+    ASSERT_SUCCESS_AND_EQ(source->NextBatch(&ctx, &output, 1), true);
+    ASSERT_EQ(output.Size(), 1U);
+    EXPECT_EQ(output.RowAt(0), first);
+    ASSERT_SUCCESS_AND_EQ(source->NextBatch(&ctx, &output, 0), false);
+    EXPECT_TRUE(output.Empty());
+    ASSERT_SUCCESS_AND_EQ(source->NextBatch(&ctx, &output,
+                                          std::numeric_limits<size_t>::max()),
+                          true);
+    ASSERT_EQ(output.Size(), 1U);
+    EXPECT_EQ(output.RowAt(0), second);
+    ASSERT_SUCCESS_AND_EQ(source->NextBatch(&ctx, &output, 1), false);
+  }
 }
 
 TEST(PipelineP3aTest, ChunkVectorSourcePartialPathPreservesColumnMetadata) {
@@ -1000,6 +1073,107 @@ TEST(PipelineP3aTest, ChunkVectorSourcePartialPathPreservesColumnMetadata) {
   EXPECT_EQ(total, 3U);
 }
 
+TEST(PipelineP3aTest, FailedHashBuildTransitionRetainsRowsAndByteCount) {
+  OpBudgetOverrideGuard guard(4ULL << 20);
+  PipelineContext ctx(nullptr, QueryMemoryGrant{});
+  const Schema schema(
+      "t", {Column("k", ValueType::kInt64), Column("v", ValueType::kVarChar)});
+  OocHashJoinSpec spec;
+  spec.build_left = true;
+  spec.left_schema = spec.right_schema = schema;
+  spec.left_cols = spec.right_cols = {0};
+  auto join = std::make_shared<OocHashJoinContext>(spec);
+  OocHashBuildSink build(join);
+  ASSERT_EQ(build.Init(&ctx, 1), Status::kSuccess);
+  DataChunk resident, incoming;
+  size_t expected_bytes = 0;
+  for (int i = 0; i < 5; ++i) {
+    Row row({Value(i), Value(std::string(180000, 'x'))});
+    expected_bytes += EstimateRowMemoryBytes(row) + sizeof(RowPosition);
+    (i < 4 ? resident : incoming).Append(row);
+  }
+  ASSERT_EQ(build.Consume(&ctx, 0, resident), Status::kSuccess);
+  auto& budget = ProcessMemoryBudget::Global();
+  budget.SetTestAlwaysSpill(true);
+  budget.SetTestSpillIoFailCountdown(2);
+  const Status io_error = build.Consume(&ctx, 0, incoming);
+  budget.SetTestSpillIoFailCountdown(0);
+  ASSERT_EQ(io_error, Status::kIOError);
+  EXPECT_EQ(ctx.spill_store.Stats().live_segments, 0U);
+  EXPECT_EQ(join->total_build_bytes, 0U);
+  ASSERT_EQ(join->build_rows.size(), 4U);
+  for (size_t i = 0; i < 4; ++i) {
+    EXPECT_EQ(join->build_rows[i], resident.RowAt(i));
+  }
+  ASSERT_EQ(build.Consume(&ctx, 0, incoming), Status::kSuccess);
+  ASSERT_TRUE(build.Finalize(&ctx).HasValue());
+  EXPECT_EQ(join->build_total_rows, 5U);
+  EXPECT_EQ(join->total_build_bytes, expected_bytes);
+}
+
+TEST(PipelineP3aTest, GraceProbeRetriesPartitionAndSliceReads) {
+  OpBudgetOverrideGuard guard(64ULL << 10);
+  auto& budget = ProcessMemoryBudget::Global();
+  budget.SetTestAlwaysSpill(true);
+  Schema schema(
+      "t", {Column("k", ValueType::kInt64), Column("v", ValueType::kVarChar)});
+  OocHashJoinSpec spec;
+  spec.kind = JoinKind::kInner;
+  spec.build_left = true;
+  spec.left_schema = spec.right_schema = schema;
+  spec.left_cols = spec.right_cols = {0};
+  constexpr int count = 25;
+  for (const int fault : {1, 3, 7, 12, 18, 30, 50, 70}) {
+    SCOPED_TRACE(fault);
+    PipelineContext ctx(nullptr, QueryMemoryGrant{});
+    auto join = std::make_shared<OocHashJoinContext>(spec);
+    OocHashBuildSink build(join);
+    ASSERT_EQ(build.Init(&ctx, 1), Status::kSuccess);
+    DataChunk chunk;
+    std::vector<Row> expected;
+    for (int i = 0; i < count; ++i) {
+      Row row(
+          {Value(i % 2), Value(std::to_string(i) + std::string(6000, 'x'))});
+      expected.push_back(row);
+      chunk.Append(row);
+    }
+    ASSERT_EQ(build.Consume(&ctx, 0, chunk), Status::kSuccess);
+    ASSERT_TRUE(build.Finalize(&ctx).HasValue());
+    auto probe_rows = std::make_shared<RowVectorSource>(std::vector<Row>{
+        Row({Value(0), Value("p")}), Row({Value(1), Value("q")})});
+    OocAdaptiveHashProbeSource source(join, probe_rows, {});
+    ASSERT_EQ(source.Open(&ctx), Status::kSuccess);
+    budget.SetTestSpillIoFailCountdown(fault);
+    std::vector<std::string> found;
+    bool saw_error = false;
+    for (;;) {
+      DataChunk out;
+      auto next = source.NextBatch(&ctx, &out, 4);
+      if (!next.HasValue()) {
+        ASSERT_EQ(next.GetStatus(), Status::kIOError);
+        ASSERT_FALSE(saw_error);
+        saw_error = true;
+        budget.SetTestSpillIoFailCountdown(0);
+        continue;
+      }
+      if (!next.Value()) { break;
+}
+      for (size_t i = 0; i < out.Size(); ++i) {
+        const Row row = out.RowAt(i);
+        ASSERT_EQ(row.Count(), 4U);
+        EXPECT_EQ(row[0], row[2]);
+        found.emplace_back(row[1].AsStringView());
+      }
+    }
+    budget.SetTestSpillIoFailCountdown(0);
+    ASSERT_EQ(found.size(), expected.size());
+    for (const auto& row : expected) {
+      EXPECT_EQ(std::ranges::count(found, row[1].AsStringView()), 1);
+    }
+    EXPECT_EQ(ctx.spill_store.Stats().live_segments, 0U);
+  }
+}
+
 TEST(PipelineP3aTest, SpilledHashProbeRejectsMissingContext) {
   auto join = std::make_shared<OocHashJoinContext>(OocHashJoinSpec{});
   join->spilled = true;
@@ -1009,6 +1183,27 @@ TEST(PipelineP3aTest, SpilledHashProbeRejectsMissingContext) {
   const auto next = source.NextBatch(nullptr, &out, 1);
   ASSERT_FALSE(next.HasValue());
   EXPECT_EQ(next.GetStatus().GetCode(), StatusCode::kInvalidArgument);
+}
+
+TEST(PipelineP3aTest, DumpAndExplainShareLazyPlanText) {
+  std::atomic<int> renders{0};
+  PipelineGraph graph;
+  graph.plan_explain_producer = [&] {
+    ++renders;
+    return std::string("Lazy test plan");
+  };
+  const PipelineExecutor executor(nullptr, std::move(graph));
+  EXPECT_EQ(renders.load(), 0);
+  auto dump = std::async(std::launch::async, [&] {
+    std::ostringstream out;
+    executor.Dump(out, 0);
+    return out.str();
+  });
+  std::ostringstream explained;
+  executor.Explain(explained, 0);
+  EXPECT_EQ(explained.str(), "Lazy test plan");
+  EXPECT_TRUE(dump.get().starts_with("Lazy test plan\n"));
+  EXPECT_EQ(renders.load(), 1);
 }
 
 }  // namespace

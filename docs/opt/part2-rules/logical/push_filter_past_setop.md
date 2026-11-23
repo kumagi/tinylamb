@@ -48,16 +48,21 @@ guard の列挙は次のとおりです。
   持つこと。
 - **分岐解決 gate**(D5 監査表は「only when the predicate resolves in
   every branch」と要約): 述語が触れるすべての列が、**すべての分岐**で
-  解決できること。修飾付き列は分岐の `relations` への所属、修飾なし列は
-  カタログ公開スキーマでの名前解決で判定します。
+  解決できること。修飾付き列は qualifier が分岐の `relations` に属することに加え、その分岐スキーマに列名が存在し、一意に解決できることを確認します。
+  修飾なし列は「その分岐のリレーションのうち、**ちょうど 1 つ**だけが
+  その列を公開している」場合にだけ解決とみなします。2 リレーションの
+  JOIN 分岐 `{a, b}` で `a.x` だけを参照する述語は、`b` が `x` を持たなく
+  ても押し込めます。複数が公開していれば曖昧なため不発です。
 
 ```cpp
             // Gate: every column in the predicate must resolve in every
             // branch; otherwise pushing would filter on a non-existent or
             // wrong relation.  Qualified columns resolve through the branch
-            // relation lists; an unqualified column is only pushable when it
-            // resolves by name in EVERY branch's catalog-published schema —
-            // when the schemas are unavailable the push must refuse.
+            // relation lists; an unqualified column is pushable only when it
+            // resolves *unambiguously* by name in that branch — exactly one
+            // of its relations publishes it (a JOIN branch need not have the
+            // column in all of its relations).  When the schemas are
+            // unavailable the push must refuse.
 ```
 
 - **サイクル gate**: 分岐 ID と述語を組み合わせたタグ
@@ -78,9 +83,11 @@ guard の列挙は次のとおりです。
    elimination」がこの根拠で、ALL 変種（重複を保持する）では自明に可換です。
 2. **集合演算の出力は位置揃えの契約**。しかし述語が分岐の誰かが持って
    いない列に触れるとき、押し込んだ先でその列は解決できません。
-   修飾付き `t1.a > 0` を `t1` を持たない分岐へ押し込むのは誤りであり、
-   修飾なし列でも「どの分岐でも名前解決できる」ことが証明できない限り
-   発火してはいけません。schemas が利用できないときは明示的に拒否します。
+   修飾付き `t1.a > 0` を `t1` を持たない分岐へ押し込むのは誤りです。
+   修飾なし列は各分岐で「列を公開するリレーションがちょうど 1 つ」
+   （`matches == 1`）であることを要求します。分岐内の全リレーションが
+   列を持つ必要はありませんが、複数が持つとどの列か曖昧になるため不発
+   です。schemas が利用できないときも明示的に拒否します。
 
 D5 反例テストがこの 2 面を固定します。
 
@@ -93,26 +100,40 @@ D5 反例テストがこの 2 面を固定します。
 
 ## 実装の詳細
 
-分岐解決 gate の本体は次のとおりです。修飾ありは `relations` の所属、
-修飾なしは全リレーションでの `Offset(...) >= 0` を要求します。
+分岐解決 gate の本体は次のとおりです。修飾ありは `relations` の所属と当該分岐スキーマでの列名解決、
+修飾なしはカタログから各リレーションのスキーマを引き当て、
+`Offset(...) >= 0` のリレーション数を数えて `matches == 1` を要求します。
 
 ```cpp
+            const auto touched = (*expression.predicate)->TouchedColumns();
+            const auto& schemas = memo.GetTableSchemas();
             auto resolves_in_branch = [&](const Group& branch,
                                           const ColumnName& column) {
               if (!column.schema.empty()) {
-                return std::ranges::find(branch.relations, column.schema) !=
-                       branch.relations.end();
+                if (std::ranges::find(branch.relations, column.schema) ==
+                    branch.relations.end()) {
+                  return false;
+                }
+                const Schema* schema = schema_for(column.schema);
+                return schema != nullptr &&
+                       schema->Offset(ColumnName("", column.name)) >= 0;
               }
               if (schemas.empty()) {
                 return false;
               }
-              return std::ranges::all_of(
-                  branch.relations, [&](const auto& rel) {
-                    const auto found = schemas.find(rel);
-                    return found != schemas.end() &&
-                           found->second.Offset(ColumnName("", column.name)) >=
-                               0;
-                  });
+              // Count publishing relations rather than requiring all_of:
+              // in a two-relation branch {a,b} a predicate touching only a.x
+              // must still be pushable when b has no x. Accepting more than
+              // one match would be ambiguous, so refuse that case.
+              size_t matches = 0;
+              for (const auto& rel : branch.relations) {
+                const auto found = schemas.find(rel);
+                if (found != schemas.end() &&
+                    found->second.Offset(ColumnName("", column.name)) >= 0) {
+                  ++matches;
+                }
+              }
+              return matches == 1;
             };
 ```
 

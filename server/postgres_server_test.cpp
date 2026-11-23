@@ -544,6 +544,19 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     EXPECT_NE(unsupported.find('Z'), std::string::npos);
     EXPECT_NE(unsupported.find("not supported"), std::string::npos);
 
+    // Positions refer to the full Query message, including earlier SQL,
+    // UTF-8 characters, CRLFs and leading whitespace removed by the splitter.
+    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT '雪';\r\n \tSELECT\n\t)")));
+    const std::string multiline = ErrorPayloads(ReadUntilReady(client));
+    EXPECT_NE(multiline.find(std::string("P24\0", 4)), std::string::npos)
+        << multiline;
+
+    // EXPLAIN sends only its wrapped query to the parser.
+    ASSERT_TRUE(SendAll(client, QueryMessage(" \tEXPLAIN SELECT '雪', )")));
+    const std::string explain = ErrorPayloads(ReadUntilReady(client));
+    EXPECT_NE(explain.find(std::string("P23\0", 4)), std::string::npos)
+        << explain;
+
     // Act -- send a simple query whose payload lacks the terminating NUL
     ASSERT_TRUE(SendAll(client, std::string("Q\0\0\0\6", 5) + "SEL"));
     const std::string unterminated = ReadUntilReady(client);
@@ -1237,13 +1250,23 @@ TEST(PostgresServerTest, ServerDestructorClosesLiveClients) {
   // Assert -- the destructor closed the still-registered client socket
   // (the server reaches the connection and the peer observes EOF).
   ASSERT_GE(client, 0);
-  pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
-  const int readable = poll(&descriptor, 1, 5000);
-  std::array<char, 64> buffer{};
-  const ssize_t received =
-      readable > 0 ? recv(client, buffer.data(), buffer.size(), 0) : -1;
+  // POLLIN only proves the socket is readable; the peer may have queued reply
+  // bytes before closing, so drain until recv reports the EOF itself (0)
+  // instead of treating the first chunk as the whole story.
+  ssize_t received = -1;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    pollfd descriptor{.fd = client, .events = POLLIN, .revents = 0};
+    if (poll(&descriptor, 1, 5000) <= 0) {
+      break;
+    }
+    std::array<char, 4096> buffer{};
+    received = recv(client, buffer.data(), buffer.size(), 0);
+    if (received <= 0) {
+      break;
+    }
+  }
   close(client);
-  ASSERT_GT(readable, 0);
+  ASSERT_NE(received, -1);
   EXPECT_EQ(received, 0);
   {
     auto database_holder = Database::Create(path).MoveValue();
@@ -2332,6 +2355,47 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
   CHECK(database_holder != nullptr);
   Database& database = *database_holder;
   database.DeleteAll();
+}
+
+TEST(PostgresServerTest, OnlyDdlOwnerCanWriteWhileItsBlockIsOpen) {
+  const std::string path = "postgres_ddl_owner-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string error;
+    ASSERT_TRUE(server.Listen(&error)) << error;
+    std::jthread worker([&] { server.Run(&error); });
+    StopGuard stop_guard{&server};
+    const int owner = ConnectClient(server.BoundPort());
+    const int other = ConnectClient(server.BoundPort());
+    ASSERT_GE(owner, 0);
+    ASSERT_GE(other, 0);
+    const auto query = [&](int fd, const std::string& sql) {
+      EXPECT_TRUE(SendAll(fd, QueryMessage(sql)));
+      return ReadUntilReady(fd);
+    };
+    ASSERT_NE(
+        query(owner, "CREATE TABLE ddl_target (k INT64)").find("CREATE TABLE"),
+        std::string::npos);
+    ASSERT_NE(query(owner, "BEGIN; CREATE INDEX ddl_idx ON ddl_target(k)")
+                  .find("CREATE INDEX"),
+              std::string::npos);
+    EXPECT_NE(
+        query(owner, "INSERT INTO ddl_target VALUES (1)").find("INSERT 0 1"),
+        std::string::npos);
+    ASSERT_NE(query(other, "BEGIN").find("BEGIN"), std::string::npos);
+    EXPECT_NE(query(other, "INSERT INTO ddl_target VALUES (2)").find("55006"),
+              std::string::npos);
+    EXPECT_NE(query(other, "ROLLBACK").find("ROLLBACK"), std::string::npos);
+    EXPECT_NE(query(owner, "COMMIT").find("COMMIT"), std::string::npos);
+    EXPECT_NE(
+        query(other, "INSERT INTO ddl_target VALUES (2)").find("INSERT 0 1"),
+        std::string::npos);
+    close(owner);
+    close(other);
+  }
+  Database::Create(path).MoveValue()->DeleteAll();
 }
 
 TEST(PostgresServerTest, DisconnectReleasesOpenDdlBlock) {
@@ -3639,7 +3703,7 @@ TEST(PostgresServerTest, ProtocolViolationAbortsExplicitBlock) {
     ASSERT_TRUE(SendAll(client, QueryMessage("ROLLBACK;")));
     EXPECT_NE(ReadUntilReady(client).find("ROLLBACK"), std::string::npos);
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT 7;")));
-    EXPECT_NE(ReadUntilReady(client).find("7"),
+    EXPECT_NE(ReadUntilReady(client).find('7'),
               std::string::npos);  // NOLINT(performance-faster-string-find)
 
     close(client);

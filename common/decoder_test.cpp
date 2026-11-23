@@ -196,6 +196,34 @@ TEST(DecoderTest, EncoderSnapshotsAliasedStringViewBeforeGrowth) {
   EXPECT_EQ(decoded.Value(), original);
 }
 
+TEST(DecoderTest, TryEncodeChecksStringLengthWithoutTruncation) {
+  constexpr size_t limit = std::numeric_limits<bin_size_t>::max();
+  const std::string supported(limit, 'a');
+  const auto encoded = TryEncode(supported);
+  ASSERT_TRUE(encoded.HasValue());
+  const auto decoded = Decode<std::string>(encoded.Value());
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_EQ(decoded.Value(), supported);
+  const std::string oversized(limit + 1, 'a');
+  EXPECT_EQ(TryEncode(oversized).GetStatus().GetCode(), StatusCode::kTooBigData);
+}
+
+TEST(DecoderTest, EncodedVectorLengthMatchesDecoderLimit) {
+  std::vector<uint8_t> values(kMaxSerializedVectorElements, uint8_t{7});
+  const auto encoded = TryEncode(values);
+  ASSERT_TRUE(encoded.HasValue());
+  const auto decoded = Decode<std::vector<uint8_t>>(encoded.Value());
+  ASSERT_TRUE(decoded.HasValue());
+  EXPECT_EQ(decoded.Value(), values);
+
+  values.push_back(7);
+  std::string bytes;
+  Encoder encoder(bytes);
+  encoder << values << uint8_t{1};
+  EXPECT_EQ(encoder.GetStatus().GetCode(), StatusCode::kTooBigData);
+  EXPECT_TRUE(bytes.empty());
+}
+
 TEST(DecoderTest, DecodeRoundTripsOverStringViewStorage) {
   std::string payload;
   {

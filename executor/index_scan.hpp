@@ -133,12 +133,15 @@ class IndexSkipScanExecutor final : public ExecutorBase {
   IndexSkipScanExecutor& operator=(IndexSkipScanExecutor&&) = delete;
   ~IndexSkipScanExecutor() override = default;
 
-  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override {
     return inner_->NextBatch(destination, max_rows);
   }
   void Dump(std::ostream& o, int indent) const override;
   void Explain(std::ostream& o, int indent) const override { Dump(o, indent); }
-  Status GetStatus() const override { return inner_->GetStatus(); }
+  [[nodiscard]] Status GetStatus() const override {
+    return inner_->GetStatus();
+  }
 
  private:
   Executor inner_;

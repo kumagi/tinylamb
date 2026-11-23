@@ -355,9 +355,8 @@ class Crc32c final {
 
   void Update(const void* data, size_t len) {
     // No bytes means the register is still the unfinished 0xffffffff seed.
-    // Passing an empty span (e.g. from an empty vector's data()) through
-    // Crc32CExtend would fold it to 0, breaking the PAX wire-format
-    // convention that Crc32cOf(empty) == 0xffffffff.
+    // Skipping the extend keeps Crc32cOf(empty) == 0xffffffff per the PAX
+    // wire-format convention.
     if (len == 0) {
       return;
     }

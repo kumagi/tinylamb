@@ -72,22 +72,37 @@ StatusOr<Value> TryCoerceArrayElement(Value value, std::string_view sql_type) {
     return Value::TryDate(value.value.varchar_value);
   }
   if (type.starts_with("ARRAY<") && value.IsArray()) {
-    // An ARRAY<ARRAY<T>> literal must hold arrays (and vice versa); the
-    // outer shape check alone used to accept a nested declaration with
-    // scalar elements, leaving a wrong inner element_sql_type tag.
+    // Recursively validate and coerce nested arrays. In particular, an empty
+    // array has no values to expose a wrong element type, so its declared tag
+    // must be checked and an untyped empty array must inherit this context.
     const size_t close = type.rfind('>');
     if (close != std::string::npos && close > 6) {
       const std::string inner = type.substr(6, close - 6);
-      const bool inner_is_array = inner.starts_with("ARRAY<");
-      for (const Value& elem : value.ArrayElements()) {
-        if (!elem.IsNull() && inner_is_array != elem.IsArray()) {
+      if (inner.starts_with("ARRAY<")) {
+        const size_t inner_close = inner.rfind('>');
+        if (inner_close == std::string::npos || inner_close <= 6) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid nested array element type");
+        }
+        const std::string nested_element_type =
+            inner.substr(6, inner_close - 6);
+        const std::string actual_element_type =
+            Upper(value.ArrayElementSqlType());
+        if (!actual_element_type.empty() &&
+            actual_element_type != Upper(nested_element_type)) {
           return StatusError(
               StatusCode::kInvalidArgument,
               "array element type does not match the declared element type");
         }
       }
+      std::vector<Value> coerced_elements;
+      coerced_elements.reserve(value.ArrayElements().size());
+      for (const Value& elem : value.ArrayElements()) {
+        ASSIGN_OR_RETURN(Value, coerced, TryCoerceArrayElement(elem, inner));
+        coerced_elements.push_back(std::move(coerced));
+      }
+      return Value::Array(std::move(coerced_elements), inner);
     }
-    return value;
   }
   // The inferred/declared element type must actually hold: silently keeping
   // a mismatched storage type would diverge the array's element_sql_type tag
@@ -209,7 +224,7 @@ std::string ArrayExpression::ToString() const {
     if (i != 0) {
       out << ", ";
     }
-    out << elements_[i]->ToString();
+    out << (elements_[i] ? elements_[i]->ToString() : std::string("<null>"));
   }
   out << "]";
   return out.str();
@@ -220,6 +235,9 @@ void ArrayExpression::Dump(std::ostream& o) const { o << ToString(); }
 std::unordered_set<ColumnName> ArrayExpression::TouchedColumns() const {
   std::unordered_set<ColumnName> columns;
   for (const Expression& element : elements_) {
+    if (!element) {
+      continue;
+    }
     auto touched = element->TouchedColumns();
     columns.insert(touched.begin(), touched.end());
   }

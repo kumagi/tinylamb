@@ -17,15 +17,11 @@
 #include "encoder.hpp"
 
 #include <array>
-#include <cassert>
 #include <cstdint>
-#include <cstdlib>
 #include <functional>
-#include <ios>
 #include <limits>
 #include <string_view>
 
-#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 #include "constants.hpp"
 #include "type/value_type.hpp"
@@ -33,20 +29,23 @@
 namespace tinylamb {
 
 Encoder& Encoder::operator<<(std::string_view sv) {
-  // bin_size_t cannot represent longer strings; truncating silently would
-  // corrupt the stream (the length prefix would no longer match the payload).
-  // Callers guarantee sizes upstream (page-size / kTooBigData checks), so an
-  // oversize string here is an invariant violation, not a runtime error.
-  if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
-    LOG(FATAL) << "string too long to encode: " << sv.size();
+  if (format_error_ != nullptr) {
+    return *this;
   }
-  // The length prefix can reallocate the destination before we read sv.
-  // Snapshot aliased input first; std::less gives a total pointer order even
-  // when the source belongs to an unrelated allocation.
+  if (sv.size() > std::numeric_limits<bin_size_t>::max()) {
+    format_error_ = "string too long to encode";
+    return *this;
+  }
+  // The length prefix (and the payload append) can reallocate the destination
+  // before we read sv. A view into *any* part of the destination allocation is
+  // aliased, including the reserved-but-unused tail past size(): append() may
+  // reuse that capacity in place or replace it. Snapshot aliased input first;
+  // std::less gives a total pointer order even when the source belongs to an
+  // unrelated allocation.
   std::string snapshot;
   if (bytes_ != nullptr && !sv.empty()) {
     const char* begin = bytes_->data();
-    const char* end = begin + bytes_->size();
+    const char* end = begin + bytes_->capacity();
     const std::less<> less;
     if (!less(sv.data(), begin) && less(sv.data(), end)) {
       snapshot.assign(sv);

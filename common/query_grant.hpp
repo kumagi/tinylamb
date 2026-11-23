@@ -51,8 +51,8 @@ class QueryMemoryGrant {
     std::weak_ptr<const bool> alive_;
   };
 
-  // Worker-local chunk reservation cache. Typical refills range from 64 KiB
-  // to kDefaultRefillBytes (256 KiB) to avoid per-row atomic traffic. Callers
+  // Worker-local chunk reservation cache. A refill is at least refill_bytes_
+  // (kDefaultRefillBytes = 256 KiB) to avoid per-row atomic traffic. Callers
   // can request a smaller refill for a tight budget.
   class LocalBatchCache {
    public:
@@ -190,7 +190,8 @@ class QueryMemoryCoordinator {
   // Admits a query requesting between [min_bytes, preferred_bytes]. A zero
   // minimum allows any positive grant; pass an explicit minimum to require
   // enough space to run without immediate spill.
-  // `preferred_bytes == 0 && min_bytes == 0` admits immediately without consuming pool quota.
+  // `preferred_bytes == 0 && min_bytes == 0` admits immediately without
+  // consuming pool quota.
   [[nodiscard]] StatusOr<QueryMemoryGrant> AcquireGrant(
       size_t preferred_bytes, size_t min_bytes = 0,
       std::optional<uint64_t> wait_timeout_ms = std::nullopt);

@@ -98,6 +98,6 @@ SQL の三値論理において、$x = \text{NULL}$ はすべての行におい�
 本 Rule は以下のテストケースにより動作が保証されています。
 
 - `expression/rewrite_test.cpp` の `ExpressionRewriteTest.NullComparisonFoldsToUnknownNotIsNull`:
-  `i = NULL` および `i != NULL` が `x IS NULL` ではなく正確な NULL 定数（`UNKNOWN`）へと畳まれること、ならびに $x=5$ および $x=\text{NULL}$ のタプルで元の AST と一致することを検証します。
+  `i = NULL` および `i != NULL` が `x IS NULL` ではなく正確な NULL 定数（`UNKNOWN`）へと畳まれること、ならびに $i=5$ および $i=\text{NULL}$ のタプルで元の AST と一致することを検証します。
 - `query/expr_oracle_fuzzer_test.cpp` の `ExprOracleFuzzer.ReplayPinnedNullEqCastThrowRegression`:
-  ファザーが検出した反例 `CAST(Inf AS INT64) = NULL`（シード `0x83e4e3d5`）において、例外が消失せず安全に維持されることをピン留め検証します。
+  ファザーが検出したシード `0x83e4e3d5` のトレースで、`CAST(Inf AS INT64)` を含む比較・IN/NULLIF 式の評価例外が書き換えで消失しないことをピン留め検証します。

@@ -19,6 +19,7 @@ $$\gamma_{G,\, \text{AGG}(S.x)}(L \bowtie_{L.jk = R.jk} R) \equiv \gamma_{G,\, \
 3. 入力に `SUM` がある場合は適用しません。結合で消えるキーを先に集約すると、元のクエリでは発生しないオーバーフローが起こります。反対側のキーが一意でも起こります。
 4. **無益な事前集約の抑止**: 事前集約キーが既に $S$ の候補キー（主キー・UNIQUE）を被覆している場合は行数が減らないため発火をスキップします。
 5. 結合キーが `NOT NULL` と証明されていない場合は、事前集約の前に `IS NOT NULL` 選択を挿入して結合不能な `NULL` バケットを早期除去します。
+6. **不動点ガード**: 現在の Group のタグが `eager_pre_agg:` で始まる、または入力 Group のタグが `eager_agg_join:` で始まる場合は再適用しません（`plan/cascades.cpp` の `memo.Get(group).tag.starts_with("eager_pre_agg:") || memo.Get(input_id).tag.starts_with("eager_agg_join:")`）。既に事前集約済みの Group に本 Rule を再適用すると集約のネストが無限に生成されるためです。
 
 ## 検証テスト
 

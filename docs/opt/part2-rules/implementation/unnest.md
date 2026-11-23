@@ -64,7 +64,7 @@ UNNEST ノードの上流に結合や集約が配置される場合、入力行�
                               .estimated_rows = rows}};
 ```
 
-- **局所コスト（`local_cost`）**: 子ノードの入力行数に 1.0 を乗じた値（`children[0].estimated_rows * 10.0`）。入力ストリームを 1 パス走査してコレクションを展開・送出する処理コストを表します。
+- **局所コスト（`local_cost`）**: 子ノードの入力行数に 10.0 を乗じた値（`children[0].estimated_rows * 10.0`）。入力ストリームを 1 パス走査してコレクションを展開・送出する処理コストを表します。
 - **推定出力行数（`estimated_rows`）**: 入力行数の 10 倍（`children[0].estimated_rows * 10.0`）。
 
 実行時には `UnnestPlan::EmitExecutor`（`executor/relational_factory.cpp`）が `UnnestExecutor` をインスタンス化し、行ごとのイテレーション処理を行います。

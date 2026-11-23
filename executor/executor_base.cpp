@@ -40,6 +40,9 @@ size_t ExecutorBase::NextBatchDraining(DataChunk* destination,
   // would append behind the previous batch's tail while the caller re-read
   // the stale prefix, re-emitting the same rows.
   destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
   while (produced < max_rows && row_buffer_pos_ < row_buffer_.Size()) {
     destination->AppendFrom(row_buffer_, row_buffer_pos_);
     ++row_buffer_pos_;

@@ -6,17 +6,17 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "common/parallel_work.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
@@ -40,6 +40,9 @@ uint64_t Fnv1aHash(std::string_view bytes) {
 }  // namespace
 
 void ConcurrentJoinHashTable::EnableIntKeys(size_t key_parts) {
+  if (Size() != 0) {
+    return;
+  }
   // Refuse instead of clamping. An int-key entry holds at most
   // kMaxIntKeyParts parts, so a clamped width would make both sides compare
   // only the leading four columns and report (1,1,1,1,1) == (1,1,1,1,2).
@@ -425,52 +428,8 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
     }
   };
 
-  if (num_threads <= 1) {
-    build_worker(0);
-  } else {
-    std::vector<std::jthread> workers;
-    workers.reserve(num_threads);
-    std::mutex error_mutex;
-    Status build_error{Status::kSuccess};
-    for (size_t i = 0; i < num_threads; ++i) {
-      try {
-        workers.emplace_back([&, i] {
-          try {
-            build_worker(i);
-          } catch (const std::exception& error) {
-            // An exception escaping a raw thread terminates the process;
-            // capture it as a Status and surface it on the joining thread.
-            std::scoped_lock lock(error_mutex);
-            if (build_error.ok()) {
-              build_error =
-                  StatusError(StatusCode::kRuntimeError, error.what());
-            }
-          } catch (...) {
-            std::scoped_lock lock(error_mutex);
-            if (build_error.ok()) {
-              build_error = StatusError(StatusCode::kRuntimeError,
-                                        "parallel build worker failed");
-            }
-          }
-        });
-      } catch (const std::exception& error) {
-        std::scoped_lock lock(error_mutex);
-        build_error = StatusError(StatusCode::kRuntimeError, error.what());
-        break;
-      } catch (...) {
-        std::scoped_lock lock(error_mutex);
-        build_error = StatusError(StatusCode::kRuntimeError,
-                                  "failed to start parallel build worker");
-        break;
-      }
-    }
-    for (auto& w : workers) {
-      w.join();
-    }
-    if (!build_error.ok()) {
-      return build_error;
-    }
-  }
+  RETURN_IF_FAIL(RunParallelTasks(num_threads, build_worker));
+
   return Status::kSuccess;
 }
 
@@ -642,52 +601,7 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
     }
   };
 
-  if (num_threads <= 1) {
-    probe_worker(0);
-  } else {
-    std::vector<std::jthread> workers;
-    workers.reserve(num_threads);
-    std::mutex error_mutex;
-    Status probe_error{Status::kSuccess};
-    for (size_t i = 0; i < num_threads; ++i) {
-      try {
-        workers.emplace_back([&, i] {
-          try {
-            probe_worker(i);
-          } catch (const std::exception& error) {
-            // An exception escaping a raw thread terminates the process;
-            // capture it as a Status and surface it on the joining thread.
-            std::scoped_lock lock(error_mutex);
-            if (probe_error.ok()) {
-              probe_error =
-                  StatusError(StatusCode::kRuntimeError, error.what());
-            }
-          } catch (...) {
-            std::scoped_lock lock(error_mutex);
-            if (probe_error.ok()) {
-              probe_error = StatusError(StatusCode::kRuntimeError,
-                                        "parallel probe worker failed");
-            }
-          }
-        });
-      } catch (const std::exception& error) {
-        std::scoped_lock lock(error_mutex);
-        probe_error = StatusError(StatusCode::kRuntimeError, error.what());
-        break;
-      } catch (...) {
-        std::scoped_lock lock(error_mutex);
-        probe_error = StatusError(StatusCode::kRuntimeError,
-                                  "failed to start parallel probe worker");
-        break;
-      }
-    }
-    for (auto& w : workers) {
-      w.join();
-    }
-    if (!probe_error.ok()) {
-      return probe_error;
-    }
-  }
+  RETURN_IF_FAIL(RunParallelTasks(num_threads, probe_worker));
 
   size_t total_out = 0;
   for (const auto& out : thread_outputs) {
@@ -697,8 +611,18 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
   // point that reserves against the global budget (and may trigger spill /
   // eviction): with the charge after reserve(), a build*probe blow-up could
   // allocate the whole contiguous buffer before the budget ever sees it.
-  const size_t bytes = total_out * (sizeof(RowPosition) + sizeof(Row)) +
-                       shared_hash_table_.EstimatedBytes();
+  // Saturate instead of wrapping: a build*probe blow-up can push total_out
+  // past SIZE_MAX / stride, and a wrapped (tiny) charge would let
+  // output_.reserve(total_out) bypass the global memory budget entirely.
+  constexpr size_t kRowStride = sizeof(RowPosition) + sizeof(Row);
+  constexpr size_t kMaxSize = std::numeric_limits<size_t>::max();
+  size_t bytes = kMaxSize;
+  if (total_out <= kMaxSize / kRowStride) {
+    const size_t rows_bytes = total_out * kRowStride;
+    const size_t table_bytes = shared_hash_table_.EstimatedBytes();
+    bytes = table_bytes > kMaxSize - rows_bytes ? kMaxSize
+                                                : rows_bytes + table_bytes;
+  }
   charge_.Add(bytes);
   output_.reserve(total_out);
   for (auto& out : thread_outputs) {

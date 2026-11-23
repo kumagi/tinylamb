@@ -65,15 +65,17 @@ FSM コマンドの検証を 2 段に分ける。これが `distributed_raft.md`
 1. [operator] D のノード登録 + 制御プレーンへ AddVoter(D) を提案
 2. [leader] D を learner として構成エントリ e1(C + learner D)を追記
    (R-2: 未コミット構成エントリが無いことを確認してから)
-3. [leader] D への複製が進み、match_index[D] ≥ commit_index - 8 が
-   30 秒以内に成立 → 構成エントリ e2(voters={A,B,C,D}, learner なし)を追記
-   追いつかない場合は 60 秒で断念し、e2 の代わりに D 解除の e1' を追記して戻す
+3. [leader] `match_index[D] ≥ commit_index - 8` が連続 30 秒成立した時点で、
+   構成エントリ e2(voters={A,B,C,D}, learner なし)を追記する。learner 化から
+   60 秒以内に連続 30 秒の条件を満たせなければ断念し、e2 の代わりに D 解除の
+   e1' を追記して戻す
 4. [leader] e2 がコミット(過半は新構成 {A,B,C,D} の 3/4)で確定。
    以後の過半計算は全ノードが R-1 により新構成で行う
 ```
 
 削除は逆順に 1 エントリで行う。安全性の根拠は単純で、**1 ノード増減では任意の
-新旧過半は必ず 1 ノード以上を共有する**(n と n+1 の過半 ⌈n/2⌉+⌈(n+1)/2⌉ > n)。
+新旧過半は必ず 1 ノード以上を共有する**(過半数を q(k)=⌊k/2⌋+1 とすると、
+q(n)+q(n+1)>n)。
 共有ノードは両方の構成をログ上持つため、二重コミットが起きない。
 
 制約:
@@ -123,14 +125,15 @@ C_old={A,B,C} から C_new={A,D,E,F} への原子移行:
 `QuorumOf(config, acks)` の 1 関数に集約し、単体テストで
 {single, joint}×{選挙, 複製承認} の 4 系統を網羅すること。
 
-### 4.3 learner(追加入の追従者)
+### 4.3 L1 learner(制御プレーンの追従者)
 
 - learner は AppendEntries を受信し match_index を更新するが、選挙権も
   過半数カウントも持たない。構成エントリ上は `learners` リストに載る。
-- promote 判定(提案時検査): `match_index ≥ commit_index - 8` が 30 秒継続。
+- promote 判定(提案時検査): `match_index ≥ commit_index - 8` が連続 30 秒成立。
 - learner は ReadIndex の確認相手にもしない(読み取り線形化性に寄与しない)。
-- 制御プレーンとシャード(L2)の両方で同じ役割名を使うが、実体は別物
-  (L2 の learner は WAL 受信側。§6.2)。
+- 制御プレーンの追従者は **L1 learner**、シャード複製セットの追従者は
+  **L2 learner** と呼び分ける。L1 learner は Raft の構成要素、L2 learner は
+  WAL 受信側であり、両者の状態や昇格手順は別物(§6.2)。
 
 ## 5. L2 のコマンド体系(改訂 MetaCmdType)
 
@@ -168,13 +171,15 @@ struct ShardConfig {
 適用時検査(決定的、違反は fatal):
 - M-1 `voters.size() ∈ [1,5]`、奇数を推奨(運用規約、強制しない)
 - M-2 `primary ∈ voters`、`voters ∩ learners = ∅`
-- M-3 `view` は同一シャードで単調 +1(kSealEpoch/kAddLearner/kSetDurability は
-  view を動かさない — それらは fencing を必要としない)
-- M-4 構成変更系コマンドは view を必ず +1 する
+- M-3 `view` は同一シャードで単調 +1。投票者セットまたは primary が変わる
+  コマンドでのみ進める
+- M-4 投票者セット／primary の変更(kPromoteToVoter、投票者の
+  kRemoveReplica、kSetPrimary)は `view` を必ず +1 する。learner の追加・削除、
+  kSealEpoch、kSetDurability は `view` を動かさない
 - M-5 kSealEpoch は `(shard, epoch)` について単調増加かつ
   全 stream watermark が既存値以上
 
-### 6.2 レプリカ追加(kAddLearner → kPromoteToVoter)
+### 6.2 L2 learner の追加(kAddLearner → kPromoteToVoter)
 
 ```
 1. [operator] kAddLearner{shard, node} を提案 → FSM に反映
@@ -249,7 +254,9 @@ d. remove-replica --shard 0 n2 / control-remove-voter n2(移譲後)
 e. deregister-node n2。n2 のディスクは消去
 ```
 
-n2 が生きていても dock してよい(§6.3)。quorum は常時 3 を保つ。
+n2 が生きていても dock してよい(§6.3)。n6 の promote 後から n2 の除去までは
+voters=4 で quorum=3、除去後は voters=3 で quorum=2 となる。交換後は 3 voter の
+うち 1 台までの停止に耐えるが、除去後の quorum は 2 台の同意が必要である。
 
 ### 7.3 制御プレーンの縮退運転(voters=3 で 1 台長期停止)
 
@@ -324,7 +331,7 @@ admin は任意の制御ノードに接続し、非リーダーなら leader に
 | シナリオ | 期待 |
 |---|---|
 | single-server 追加中の leader クラッシュ | 構成整合・複製継続(R-1/R-3) |
-| learner が永遠に追いつかない | 60 秒で断念、状態が元に戻る、集群への影響なし |
+| learner が永遠に追いつかない | 60 秒で断念、状態が元に戻る、クラスタへの影響なし |
 | リーダー直接削除(禁止操作)の拒否 | admin が拒否。移譲を案内 |
 | joint 移行中の leader クラッシュ ×3 箇所 | §4.2 の継続規則通り再開、分岐なし |
 | promote 直後の即 failover | 新 voter が候補になり得る(quorum 計算の即時反映) |

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -18,8 +19,10 @@
 #include "common/join_kind.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
+#include "common/test_util.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/batch_nested_loop_join.hpp"
+#include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -31,11 +34,14 @@
 #include "executor/parallel_hash_join.hpp"
 #include "executor/pdqsort.hpp"
 #include "executor/projection.hpp"
+#include "executor/selection.hpp"
 #include "executor/sort.hpp"
 #include "executor/topn.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
@@ -47,6 +53,50 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(ConstantRowsTest, MixedSignednessSurvivesOneRowBatches) {
+  const std::vector<Row> rows{Row({Value(int64_t{1}).WithUnsigned()}),
+                              Row({Value(int64_t{-1})}),
+                              Row({Value(int64_t{-1}).WithUnsigned()})};
+  const Executor sources[] = {std::make_shared<ConstantExecutor>(rows),
+                              std::make_shared<ValuesExecutor>(rows)};
+  for (const auto& source : sources) {
+    DataChunk batch;
+    for (const Row& row : rows) {
+      ASSERT_EQ(source->NextBatch(&batch, 1), 1U);
+      const Value actual = batch.RowAt(0)[0];
+      EXPECT_EQ(actual.IsUnsigned(), row[0].IsUnsigned());
+      EXPECT_EQ(actual.AsString(), row[0].AsString());
+    }
+    EXPECT_EQ(source->NextBatch(&batch, 1), 0U);
+    ASSERT_EQ(batch.ColumnCount(), 1U);
+    EXPECT_EQ(batch.ColumnAt(0).Type(), ValueType::kInt64);
+  }
+}
+
+TEST(ConcurrentJoinHashTableTest, KeyModeCannotChangeAfterInsertion) {
+  ConcurrentJoinHashTable byte_keys;
+  byte_keys.Insert(42, "key", Row({Value(1)}), RowPosition{});
+  byte_keys.EnableIntKeys(1);
+  EXPECT_FALSE(byte_keys.IntKeyMode());
+  EXPECT_EQ(byte_keys.IntKeyParts(), 0U);
+  const int64_t key = 10;
+  byte_keys.FindIntMatches(42, &key, [](const Row&, RowPosition) {
+    ADD_FAILURE() << "byte key was matched by an integer probe";
+  });
+
+  ConcurrentJoinHashTable int_keys;
+  int_keys.EnableIntKeys(1);
+  int_keys.InsertInt(42, &key, Row({Value(2)}), RowPosition{});
+  int_keys.EnableIntKeys(2);
+  ASSERT_EQ(int_keys.IntKeyParts(), 1U);
+  size_t found = 0;
+  int_keys.FindIntMatches(42, &key, [&](const Row& row, RowPosition) {
+    ++found;
+    EXPECT_EQ(row[0], Value(2));
+  });
+  EXPECT_EQ(found, 1U);
+}
 
 TEST(JoinHashIndexTest, ByteSpanRetainsOffsetsAboveFourGiB) {
   if (sizeof(size_t) <= sizeof(uint32_t)) {
@@ -104,13 +154,26 @@ TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
   EXPECT_FALSE(empty.Next(&result, nullptr));
 }
 
+TEST(MinMaxIndexExecutorTest, MissingValueSlotReturnsError) {
+  auto source = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(int64_t{42})})});
+  MinMaxIndexExecutor executor(std::move(source), 1);
+
+  DataChunk output;
+  EXPECT_EQ(executor.NextBatch(&output), 0U);
+  EXPECT_TRUE(output.Empty());
+  EXPECT_EQ(executor.GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(executor.NextBatch(&output), 0U);
+}
+
 TEST(MinMaxIndexExecutorTest,
      NullPrefixSpanningMultipleBatchesFindsFirstNonNull) {
   // T3767: the source is pulled in kDefaultVectorSize-sized batches now; a
   // NULL run crossing a batch boundary must keep the scan going instead of
   // stopping at the first all-NULL batch.
   std::vector<Row> rows;
-  for (size_t i = 0; i < 2 * kDefaultVectorSize + 5;
+  rows.reserve(2 * kDefaultVectorSize + 5);
+for (size_t i = 0; i < (2 * kDefaultVectorSize) + 5;
        ++i) {  // NOLINT(readability-math-missing-parentheses)
     rows.emplace_back(std::vector<Value>{
         Value()});  // NOLINT(performance-inefficient-vector-operation)
@@ -297,6 +360,34 @@ TEST(ScanFilterExecutorTest, UnsignedComparisonsMatchGroundTruth) {
   Row tagged = row;
   tagged[0] = tagged[0].WithUnsigned();
   EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
+}
+
+TEST(SelectionExecutorTest, RuntimeColumnTypesControlPruning) {
+  const Schema schema("t", {Column("id", ValueType::kInt64)});
+  const Value max_uint = Value(int64_t{-1}).WithUnsigned();
+  const Expression greater = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("t", "id")), BinaryOperation::kGreaterThan,
+      ConstantValueExp(Value(10)));
+  for (const std::vector<Row>& rows :
+       {std::vector<Row>{Row({max_uint})},
+        std::vector<Row>{Row({Value(0)}), Row({max_uint})}}) {
+    auto source = std::make_shared<ValuesExecutor>(rows);
+    Selection selection(greater, schema, std::move(source));
+    DataChunk output;
+    ASSERT_EQ(selection.NextBatch(&output), 1U);
+    EXPECT_EQ(selection.GetStatus(), Status::kSuccess);
+    EXPECT_TRUE(output.RowAt(0)[0].IsUnsigned());
+    EXPECT_EQ(output.RowAt(0)[0], max_uint);
+  }
+
+  auto mixed_source = std::make_shared<ValuesExecutor>(std::vector<Row>{
+      Row({Value(100)}), Row({Value(200.0)}), Row({Value(0)})});
+  Selection mixed(greater, schema, std::move(mixed_source));
+  DataChunk output;
+  ASSERT_EQ(mixed.NextBatch(&output), 2U);
+  EXPECT_EQ(mixed.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(output.RowAt(0)[0], Value(100));
+  EXPECT_EQ(output.RowAt(1)[0], Value(200.0));
 }
 
 TEST(ScanFilterExecutorTest,
@@ -555,6 +646,112 @@ TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
       ColumnValueExp(ColumnName("r", "b")));
   BatchNestedLoopJoin join(std::move(left), left_schema, std::move(right),
                            right_schema, predicate, JoinKind::kAnti, 16);
+  Row row;
+  RowPosition rp;
+  while (join.Next(&row, &rp)) {
+  }
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+}
+
+TEST(BatchNestedLoopJoinTest,
+     OuterOrBranchesPreservesOverlapThreeValuedNullAndUnmatched) {
+  ScopedEnvVar or_branches_env("TINYLAMB_DISABLE_OUTER_OR_BRANCHES", nullptr);
+  const Schema left_schema(
+      "l", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+            Column("c", ValueType::kInt64)});
+  const Schema right_schema(
+      "r", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
+            Column("d", ValueType::kInt64)});
+  const std::vector<Row> left_rows{
+      // Both branches match r[0] -> must emit only ONCE (not duplicated)!
+      Row({Value(1), Value(10), Value(1)}),
+      // 3VL NULL trap: l.a IS NULL (branch 0 UNKNOWN), l.b = 20 (branch 1 TRUE)
+      Row({Value(), Value(20), Value(1)}),
+      // Unmatched left row -> NULL-padded in LEFT OUTER JOIN
+      Row({Value(99), Value(99), Value(1)}),
+      // Residual rejects l.a=1 pair because c <= 0, falls through to b=30 match
+      Row({Value(2), Value(30), Value(-5)}),
+  };
+  const std::vector<Row> right_rows{
+      Row({Value(1), Value(10), Value(1)}),
+      // Duplicate right row matching branch 1 (20) -> preserves multiplicity 2
+      Row({Value(50), Value(20), Value(1)}),
+      Row({Value(50), Value(20), Value(2)}),
+      Row({Value(2), Value(30), Value(3)}),
+  };
+  // Predicate: (l.a = r.a AND l.c > 0) OR (l.b = r.b AND r.d < 5)
+  Expression b0 = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "a")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("r", "a"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "c")),
+                          BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0}))));
+  Expression b1 = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "b")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("r", "b"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("r", "d")),
+                          BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(int64_t{5}))));
+  Expression pred = BinaryExpressionExp(b0, BinaryOperation::kOr, b1);
+
+  auto run_join = [&](JoinKind kind, bool disable_opt) -> std::vector<Row> {
+    or_branches_env.Set(disable_opt ? "1" : nullptr);
+    Executor left = std::make_shared<ValuesExecutor>(left_rows);
+    Executor right = std::make_shared<ValuesExecutor>(right_rows);
+    BatchNestedLoopJoin join(std::move(left), left_schema, std::move(right),
+                             right_schema, pred, kind, 16);
+    std::vector<Row> out;
+    Row row;
+    RowPosition rp;
+    while (join.Next(&row, &rp)) {
+      out.push_back(row);
+    }
+    EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+    std::ranges::sort(out, [](const Row& x, const Row& y) {
+      return x.ToString() < y.ToString();
+    });
+    return out;
+  };
+
+  const std::vector<Row> on_left = run_join(JoinKind::kLeftOuter, false);
+  const std::vector<Row> off_left = run_join(JoinKind::kLeftOuter, true);
+  EXPECT_EQ(on_left, off_left);
+  EXPECT_EQ(on_left.size(), 5U);  // 1 (r0) + 2 (r1,r2) + 1 (NULL pad) + 1 (r3)
+
+  const std::vector<Row> on_inner = run_join(JoinKind::kInner, false);
+  const std::vector<Row> off_inner = run_join(JoinKind::kInner, true);
+  EXPECT_EQ(on_inner, off_inner);
+  EXPECT_EQ(on_inner.size(), 4U);
+}
+
+TEST(BatchNestedLoopJoinTest,
+     OuterOrBranchesPropagatesErrorsOnNonMatchingRows) {
+  ScopedEnvVar or_branches_env("TINYLAMB_DISABLE_OUTER_OR_BRANCHES", nullptr);
+  const Schema left_schema(
+      "l", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Schema right_schema(
+      "r", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  // l.a != r.a AND l.b != r.b, yet branch 1 has 1 / 0 = 1 -> must NOT skip!
+  Executor left = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(1), Value(2)})});
+  Executor right = std::make_shared<ValuesExecutor>(
+      std::vector<Row>{Row({Value(9), Value(0)})});
+  Expression pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "a")),
+                          BinaryOperation::kEquals,
+                          ColumnValueExp(ColumnName("r", "a"))),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(
+          BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
+                              BinaryOperation::kDivide,
+                              ColumnValueExp(ColumnName("r", "b"))),
+          BinaryOperation::kEquals, ColumnValueExp(ColumnName("l", "b"))));
+  BatchNestedLoopJoin join(std::move(left), left_schema, std::move(right),
+                           right_schema, pred, JoinKind::kLeftOuter, 16);
   Row row;
   RowPosition rp;
   while (join.Next(&row, &rp)) {
@@ -849,6 +1046,37 @@ TEST(StatAggregateTest, VarianceAndStddevAcrossPaths) {
   }
 }
 
+TEST(StatAggregateTest, VarianceOnUnsignedInt64MatchesSerialPath) {
+  // ColumnVector stores UINT64 bit patterns in int64_t cells. The parallel
+  // stat fast path used to cast them to ExtendedFloat as signed, so values
+  // above 2^63 drove every sum negative. Compare against the serial
+  // (ground-truth) accumulator with values large enough that the sign flip
+  // is unmistakable on every ExtendedFloat implementation.
+  const Schema schema("t", {Column("u", ValueType::kInt64)});
+  // Mixing small and huge UINT64s is the failing shape: a uniform shift
+  // would leave variance unchanged, but a signed cast turns only the huge
+  // values negative and collapses the spread.
+  const std::vector<Row> rows = {
+      Row({Value(int64_t{1}).WithUnsigned()}),
+      Row({Value(int64_t{2}).WithUnsigned()}),
+      Row({Value(int64_t{-1}).WithUnsigned()})};  // UINT64_MAX
+  const std::vector<NamedExpression> aggregates = {
+      NamedExpression("var_samp",
+                      AggregateExpressionExp(AggregationType::kVarSamp,
+                                             ColumnValueExp("u"))),
+      NamedExpression("var_pop",
+                      AggregateExpressionExp(AggregationType::kVarPop,
+                                             ColumnValueExp("u")))};
+  const auto results = RunStatAggregation(schema, rows, aggregates);
+  ASSERT_EQ(results.size(), 2U);
+  ASSERT_FALSE(results[0][0].IsNull());
+  ASSERT_FALSE(results[1][0].IsNull());
+  // VAR_SAMP([0, d, 2d]) = 3d^2 / 2, well above zero.
+  EXPECT_GT(results[0][0].value.double_value, 1.0e20);
+  EXPECT_EQ(results[0][0].value.double_value, results[1][0].value.double_value);
+  EXPECT_EQ(results[0][1].value.double_value, results[1][1].value.double_value);
+}
+
 TEST(StatAggregateTest, ParallelGenericPathHandlesExpressionArguments) {
   // COVAR over expressions (not bare columns) exercises the parallel
   // executor's per-row statistical path, including paired NULL skipping.
@@ -1024,6 +1252,26 @@ TEST(PdqSortTest, KeyEvaluationFailureAbortsBeforeSorting) {
   EXPECT_EQ(rows[0][0].value.int_value, 3);
   EXPECT_EQ(rows[1][0].value.int_value, 1);
   EXPECT_EQ(rows[2][0].value.int_value, 2);
+}
+
+// The no-error-pointer overload used to skip validation and let the key
+// comparator read past the end of a partially materialized key vector.
+TEST(PdqSortTest, FailedKeyWithoutErrorPointerDoesNotReadPastShortVector) {
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  std::vector<Row> rows;
+  rows.emplace_back(Row({Value(int64_t{3}), Value(int64_t{1})}));
+  rows.emplace_back(Row({Value(int64_t{1}), Value(int64_t{0})}));  // div by 0
+  rows.emplace_back(Row({Value(int64_t{2}), Value(int64_t{2})}));
+  const std::vector<Row> original = rows;
+  PdqSort::Sort(
+      rows, schema,
+      {SortExecutor::Key{.expression = BinaryExpressionExp(
+                             ColumnValueExp("a"), BinaryOperation::kDivide,
+                             ColumnValueExp("b")),
+                         .ascending = true}});
+  // With no failure reported the sort must simply leave the input untouched.
+  EXPECT_EQ(rows, original);
 }
 
 // A child executor that fails the drain after a bounded number of rows, so
@@ -1348,6 +1596,64 @@ TEST(JoinAuditTest, HashJoinConvertsExceptionsToStickyStatus) {
   EXPECT_EQ(join.GetStatus(), Status::kRuntimeError);
   EXPECT_NO_THROW(EXPECT_EQ(join.NextBatch(&output), 0U));
   EXPECT_EQ(join.GetStatus(), Status::kRuntimeError);
+}
+
+TEST(TopNExecutorTest,
+     StreamingWithTiesMatchesFullSortAcrossNullsOffsetAndEvictions) {
+  ScopedEnvVar fetch_ties_env("TINYLAMB_DISABLE_OUTER_FETCH_TIES", nullptr);
+  const Schema schema("t", {Column("score", ValueType::kInt64),
+                            Column("id", ValueType::kInt64)});
+  // Mix boundary ties, later strictly better rows evicting prior boundary ties,
+  // repeated ties at final boundary, and NULL scores.
+  const std::vector<Row> rows{
+      Row({Value(int64_t{50}), Value(int64_t{1})}),
+      Row({Value(int64_t{30}), Value(int64_t{2})}),
+      Row({Value(int64_t{30}), Value(int64_t{3})}),
+      Row({Value(int64_t{30}), Value(int64_t{4})}),
+      Row({Value(int64_t{40}), Value(int64_t{5})}),  // evicts some 30s
+      Row({Value(int64_t{30}), Value(int64_t{6})}),  // evicted/outside capacity
+      Row({Value(), Value(int64_t{7})}),
+      Row({Value(int64_t{40}), Value(int64_t{8})}),
+      Row({Value(int64_t{20}), Value(int64_t{9})}),
+      Row({Value(int64_t{40}), Value(int64_t{10})}),
+      Row({Value(), Value(int64_t{11})}),
+      Row({Value(int64_t{35}), Value(int64_t{12})}),
+  };
+
+  auto run_case = [&](bool disable, bool ascending, size_t limit, size_t offset,
+                      bool expr_key) -> std::vector<Row> {
+    fetch_ties_env.Set(disable ? "1" : nullptr);
+    Expression key_expr =
+        expr_key ? BinaryExpressionExp(ColumnValueExp(ColumnName("t", "score")),
+                                       BinaryOperation::kAdd,
+                                       ConstantValueExp(Value(int64_t{0})))
+                 : ColumnValueExp(ColumnName("t", "score"));
+    TopNExecutor topn(std::make_shared<ValuesExecutor>(rows), schema,
+                      {TopNExecutor::Key{.expression = std::move(key_expr),
+                                         .ascending = ascending,
+                                         .nulls_first = std::nullopt}},
+                      limit, offset, /*with_ties=*/true);
+    std::vector<Row> out;
+    Row row;
+    while (topn.Next(&row, nullptr)) {
+      out.push_back(std::move(row));
+    }
+    EXPECT_EQ(topn.GetStatus(), Status::kSuccess);
+    return out;
+  };
+
+  for (const bool asc : {false, true}) {
+    for (const bool expr_key : {false, true}) {
+      for (const size_t limit : {size_t{1}, size_t{2}, size_t{3}, size_t{4}}) {
+        for (const size_t offset : {size_t{0}, size_t{1}, size_t{2}}) {
+          const auto actual = run_case(false, asc, limit, offset, expr_key);
+          const auto ref = run_case(true, asc, limit, offset, expr_key);
+          EXPECT_EQ(actual, ref) << "asc=" << asc << " expr=" << expr_key
+                                 << " limit=" << limit << " offset=" << offset;
+        }
+      }
+    }
+  }
 }
 
 }  // namespace tinylamb

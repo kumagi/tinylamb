@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
+#include <stdexcept>
 
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
@@ -53,8 +54,8 @@ size_t QueryMemoryBudget::LimitFromEnv() {
 }
 
 QueryMemoryBudget::QueryMemoryBudget(size_t limit_bytes)
-    : limit_(limit_bytes),
-      soft_(limit_bytes / kSoftFractionDen * kSoftFractionNum) {}
+    : limit_(limit_bytes)
+      {}
 
 QueryMemoryBudget& QueryMemoryBudget::Global() {
   static QueryMemoryBudget instance(LimitFromEnv());
@@ -202,6 +203,9 @@ void QueryMemoryCharge::Add(size_t bytes) {
   if (bytes == 0) {
     return;
   }
+  if (bytes > std::numeric_limits<size_t>::max() - bytes_) {
+    throw std::overflow_error("query memory charge size overflow");
+  }
   QueryMemoryBudget::Global().ReserveForced(bytes);
   bytes_ += bytes;
 }
@@ -210,7 +214,8 @@ bool QueryMemoryCharge::TryAdd(size_t bytes) {
   if (bytes == 0) {
     return true;
   }
-  if (!QueryMemoryBudget::Global().TryReserve(bytes)) {
+  if (bytes > std::numeric_limits<size_t>::max() - bytes_ ||
+      !QueryMemoryBudget::Global().TryReserve(bytes)) {
     return false;
   }
   bytes_ += bytes;

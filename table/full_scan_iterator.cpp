@@ -167,6 +167,9 @@ FullScanIterator::FullScanIterator(
     return;
   }
   table_lease_ = lease.MoveValue();
+  if (!pos_.IsValid()) {
+    return;
+  }
   if (TryInitLSTableScan()) {
     return;
   }
@@ -255,6 +258,7 @@ IteratorBase& FullScanIterator::operator++() {
   ++pos_.slot;
   if (page_ == nullptr && !PinPage(pos_.page_id)) {
     pos_.page_id = ~0ULL;
+    current_row_.Clear();
     return *this;
   }
   SeekVisibleRow();
@@ -329,11 +333,12 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
   return {.kind = PeekOutcome::Kind::kValue, .value = key};
 }
 
-StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
+StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) {
   if (peek_compares_ == nullptr || peek_compares_->empty()) {
     return true;
   }
   if (!peek_plan_built_) {
+    peek_plan_.reserve(peek_compares_->size());
     for (const IntegerPeekCompare& pred : *peek_compares_) {
       peek_plan_.push_back(BuildPeek(pred.column));
     }
@@ -385,8 +390,26 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
         }
       }
     }
-    if (!has_cached_value ||
-        !MatchIntegerCompare(cached_value, pred.op, pred.constant)) {
+    const bool is_unsigned =
+        pred.column < table_->GetSchema().ColumnCount() &&
+        table_->GetSchema().GetColumn(pred.column).IsUnsigned();
+    if (!has_cached_value || !MatchIntegerCompare(cached_value, pred.op,
+                                                 pred.constant, is_unsigned)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+StatusOr<bool> FullScanIterator::PassesExtraRuntimeFilters(
+    std::string_view row) {
+  for (const ExtraRuntimeFilter& filter : extra_runtime_filters_) {
+    ASSIGN_OR_RETURN(
+        std::optional<int64_t>, value,
+        Row::TryPeekInteger(
+            row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+            table_->GetSchema(), filter.column));
+    if (!value || filter.group->Reject(*value)) {
       return false;
     }
   }
@@ -594,6 +617,10 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
           }
         }
         auto passed = PassesPeekFilters(*row);
+        if (passed.HasValue() && passed.Value() &&
+            !extra_runtime_filters_.empty()) {
+          passed = PassesExtraRuntimeFilters(*row);
+        }
         if (!passed.HasValue()) {
           status_ = passed.GetStatus();
           txn_->MarkFailed();
@@ -969,6 +996,10 @@ void FullScanIterator::BuildTypedDecodePlan() {
 
 size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
                                               size_t max_rows) {
+  batch->Reset();
+  if (!pos_.IsValid() || max_rows == 0) {
+    return 0;
+  }
   if (typed_keep_slots_.empty() && typed_slot_types_.empty()) {
     BuildTypedDecodePlan();
     if (typed_keep_slots_.empty()) {
@@ -982,7 +1013,17 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
     batch->Configure(typed_slot_types_.size(), typed_slot_types_,
                      typed_slot_unsigned_);
   }
-  batch->Reset();
+  const size_t max_cells =
+      std::min(batch->cells.max_size(), batch->nulls.max_size());
+  if ((batch->stride != 0 && max_rows > max_cells / batch->stride) ||
+      (!batch->varchar_ends.empty() &&
+       max_rows > batch->varchar_ends.front().max_size())) {
+    status_ = StatusError(StatusCode::kTooBigData,
+                          "typed scan batch dimensions exceed capacity");
+    pos_.page_id = ~0ULL;
+    current_row_.Clear();
+    return 0;
+  }
   // Sticky full-batch sizing: cells/nulls stay at max_rows*stride across
   // calls so the per-row append below writes in place instead of paying a
   // value-initializing resize per row.  Cells under a NULL or VARCHAR slot
@@ -996,11 +1037,8 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
       batch->nulls.resize(needed);
     }
     for (auto& ends : batch->varchar_ends) {
-      ends.reserve(max_rows + 1);
+      ends.reserve(max_rows);
     }
-  }
-  if (!pos_.IsValid()) {
-    return 0;
   }
   if (lstable_store_ != nullptr) {
     return DecodeNextTypedBatchFromLSTable(batch, max_rows);
@@ -1102,7 +1140,7 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
           if (has_rf) {
             uint64_t kbits = 0;
             std::memcpy(&kbits, row_base + rf_byte_off, sizeof(uint64_t));
-            const int64_t key = static_cast<int64_t>(TINYLAMB_BSWAP64(kbits));
+            const auto key = static_cast<int64_t>(TINYLAMB_BSWAP64(kbits));
             if (rf_dense) {
               const uint64_t off = static_cast<uint64_t>(key) - rf_lo_u;
               if (off > rf_span_u ||
@@ -1123,10 +1161,10 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
                   (sizeof(uint64_t) * static_cast<size_t>(erf.column));
               uint64_t ebits = 0;
               std::memcpy(&ebits, row_base + e_off, sizeof(uint64_t));
-              const int64_t ekey =
+              const auto ekey =
                   static_cast<int64_t>(TINYLAMB_BSWAP64(ebits));
               if (erf.group->has_dense_bits()) {
-                const uint64_t lo_u = static_cast<uint64_t>(erf.group->Lo());
+                const auto lo_u = static_cast<uint64_t>(erf.group->Lo());
                 const uint64_t span_u =
                     static_cast<uint64_t>(erf.group->Hi()) - lo_u;
                 const uint64_t off = static_cast<uint64_t>(ekey) - lo_u;
@@ -1398,11 +1436,15 @@ void FullScanIterator::AddExtraRuntimeFilter(const RuntimeFilterGroup* group,
                                              slot_t column, ValueType type) {
   const RuntimeFilterGroup* accepted =
       AcceptsColumn(group, std::optional<slot_t>(column), type);
-  if (accepted == nullptr || extra_runtime_filters_.size() >= 4) {
+  // The producer (BuildInput's scoped_extra_table_rfs binding) can hand over
+  // up to 7 extra filters. Keeping a smaller consumer-side cap silently
+  // dropped the 5th..7th filters, so match the producer's bound here.
+  if (accepted == nullptr || extra_runtime_filters_.size() >= 7) {
     return;
   }
   extra_runtime_filters_.push_back(
       ExtraRuntimeFilter{.group = accepted, .column = column});
+  ReseekWithRuntimeFilters();
 }
 
 void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
@@ -1421,7 +1463,13 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
     key_filter_ = nullptr;
     key_peek_built_ = false;
   }
-  if (runtime_filter_ == nullptr || !pos_.IsValid()) {
+  if (runtime_filter_ != nullptr) {
+    ReseekWithRuntimeFilters();
+  }
+}
+
+void FullScanIterator::ReseekWithRuntimeFilters() {
+  if (!pos_.IsValid()) {
     return;
   }
   if (lstable_store_ != nullptr) {
@@ -1436,12 +1484,9 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
     SeekVisibleRow();
     return;
   }
-  // The constructor already seeked to the first visible row, which is exactly
-  // the row a filter installed later would have rejected. Re-seek from the
-  // current position so the filter sees it too; the contract is that nothing
-  // has consumed a row yet, so no row is ever skipped unfiltered. A writable
-  // transaction's iterator drops its page latch after every row, so the page
-  // has to be re-pinned before the re-seek (AdvancePage needs it too).
+  // Start with the current row so it also sees the newly attached filter.
+  // A writable transaction's iterator drops its page latch after every row,
+  // so the page has to be re-pinned before the re-seek.
   //
   // A failed re-pin leaves `pos_` invalid on purpose: PinPage latched the
   // failure into `status_`, and an iterator that still claims to be valid would
@@ -1539,6 +1584,17 @@ bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
       return false;
     }
   }
+  for (const ExtraRuntimeFilter& filter : extra_runtime_filters_) {
+    if (filter.column >= blk.columns.size()) {
+      return false;
+    }
+    const LSTableColumnBlock& col = blk.columns[filter.column];
+    if (col.IsNull(row) ||
+        (col.type != ValueType::kInt64 && col.type != ValueType::kDate) ||
+        filter.group->Reject(col.IntAt(row))) {
+      return false;
+    }
+  }
   if (peek_compares_ != nullptr && !peek_compares_->empty()) {
     for (const IntegerPeekCompare& pred : *peek_compares_) {
       if (pred.column >= blk.columns.size()) {
@@ -1549,7 +1605,8 @@ bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
           (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
         return false;
       }
-      if (!MatchIntegerCompare(col.IntAt(row), pred.op, pred.constant)) {
+      if (!MatchIntegerCompare(col.IntAt(row), pred.op, pred.constant,
+                               col.is_unsigned)) {
         return false;
       }
     }
@@ -1559,8 +1616,9 @@ bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
 
 bool FullScanIterator::LSTableBlockAllRowsMatch(
     const LSTablePageBlock& blk) const noexcept {
-  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
-      key_column_.has_value()) {
+  if (!extra_runtime_filters_.empty() ||
+      ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+       key_column_.has_value())) {
     return false;
   }
   if (peek_compares_ == nullptr || peek_compares_->empty()) {
@@ -1571,7 +1629,7 @@ bool FullScanIterator::LSTableBlockAllRowsMatch(
       return false;
     }
     const LSTableColumnBlock& col = blk.columns[cmp.column];
-    if (col.has_null || !col.has_min_max ||
+    if (col.is_unsigned || col.has_null || !col.has_min_max ||
         (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
       return false;
     }
@@ -1765,7 +1823,8 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
             out_ends[r] = dst_base + static_cast<uint32_t>(r + 1);
           }
         } else if (col.dict != nullptr &&
-                   (col.dict->active || col.dict->wide_code_bytes != 0)) {
+                   (col.dict->active || col.dict->packed_code_bits != 0 ||
+                    col.dict->wide_code_bytes != 0)) {
           auto& dst_bytes = batch->varchar_bytes[vslot];
           auto& dst_ends = batch->varchar_ends[vslot];
           for (size_t r = 0; r < take; ++r) {
@@ -2049,8 +2108,9 @@ bool FullScanIterator::AdvanceFromStubPage() {
 
 bool FullScanIterator::StubBlockAllRowsMatch(
     const TlcsFile& tlcs, uint32_t block_idx) const noexcept {
-  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
-      key_column_.has_value()) {
+  if (!extra_runtime_filters_.empty() ||
+      ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+       key_column_.has_value())) {
     return false;
   }
   if (peek_compares_ == nullptr || peek_compares_->empty()) {
@@ -2064,12 +2124,18 @@ void FullScanIterator::GatherStubFilterCols(bool include_keep_cols,
   out->clear();
   const Schema& schema = table_->GetSchema();
   const slot_t ncols = schema.ColumnCount();
+  out->reserve((include_keep_cols ? typed_keep_slots_.size() : 0) + 1 +
+               extra_runtime_filters_.size() +
+               (peek_compares_ != nullptr ? peek_compares_->size() : 0));
   if (include_keep_cols) {
     out->insert(out->end(), typed_keep_slots_.begin(), typed_keep_slots_.end());
   }
   if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
       key_column_.has_value() && *key_column_ < ncols) {
     out->push_back(*key_column_);
+  }
+  for (const ExtraRuntimeFilter& filter : extra_runtime_filters_) {
+    out->push_back(filter.column);
   }
   if (peek_compares_ != nullptr) {
     for (const IntegerPeekCompare& pred : *peek_compares_) {
@@ -2167,7 +2233,7 @@ bool FullScanIterator::EnsureStubBlockColumns(
 
 // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
 //   (filterColumnAtATime_eq_row_at_a_time)
-void FullScanIterator::ComputeStubBlockMatches() noexcept {
+void FullScanIterator::ComputeStubBlockMatches() {
   stub_match_rows_.clear();
   stub_match_cursor_ = 0;
   stub_matches_computed_ = true;
@@ -2201,12 +2267,8 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
     }
   };
 
-  auto run_runtime_filter = [&]() -> bool {
-    if ((runtime_filter_ == nullptr && key_filter_ == nullptr) ||
-        !key_column_.has_value()) {
-      return true;
-    }
-    const slot_t col_idx = *key_column_;
+  auto run_runtime_filter = [&](slot_t col_idx, const RuntimeFilterGroup* rf,
+                                const std::unordered_set<int64_t>* kf) {
     if (col_idx >= stub_cache_->col_chunk_idx.size()) {
       stub_match_rows_.clear();
       return false;
@@ -2224,10 +2286,10 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
     }
     const int64_t* cells = col.int_cells.data();
     const bool no_null = !col.has_null;
-    if (runtime_filter_ != nullptr && runtime_filter_->has_dense_bits()) {
-      const auto lo_u = static_cast<uint64_t>(runtime_filter_->Lo());
-      const auto span_u = static_cast<uint64_t>(runtime_filter_->Hi()) - lo_u;
-      const uint64_t* bits = runtime_filter_->dense_bits_data();
+    if (rf != nullptr && rf->has_dense_bits()) {
+      const auto lo_u = static_cast<uint64_t>(rf->Lo());
+      const auto span_u = static_cast<uint64_t>(rf->Hi()) - lo_u;
+      const uint64_t* bits = rf->dense_bits_data();
       if (no_null) {
         apply_pred([cells, lo_u, span_u, bits](uint32_t r) noexcept {
           const uint64_t off = static_cast<uint64_t>(cells[r]) - lo_u;
@@ -2244,8 +2306,7 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
                  ((bits[off >> 6] >> (off & 63)) & uint64_t{1}) != 0;
         });
       }
-    } else if (runtime_filter_ != nullptr) {
-      const RuntimeFilterGroup* rf = runtime_filter_;
+    } else if (rf != nullptr) {
       if (no_null) {
         apply_pred(
             [cells, rf](uint32_t r) noexcept { return !rf->Reject(cells[r]); });
@@ -2255,7 +2316,6 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
         });
       }
     } else {
-      const auto* kf = key_filter_;
       if (no_null) {
         apply_pred([cells, kf](uint32_t r) noexcept {
           return kf->contains(cells[r]);
@@ -2267,6 +2327,11 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
       }
     }
     return !stub_match_rows_.empty();
+  };
+  const auto run_primary_filter = [&] {
+    return !key_column_.has_value() ||
+           (runtime_filter_ == nullptr && key_filter_ == nullptr) ||
+           run_runtime_filter(*key_column_, runtime_filter_, key_filter_);
   };
 
   auto run_peek_compares = [&]() -> bool {
@@ -2318,31 +2383,10 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
           });
         }
       };
-      switch (pred.op) {
-        case BinaryOperation::kEquals:
-          run_op([c](int64_t v) noexcept { return v == c; });
-          break;
-        case BinaryOperation::kNotEquals:
-          run_op([c](int64_t v) noexcept { return v != c; });
-          break;
-        case BinaryOperation::kLessThan:
-          run_op([c](int64_t v) noexcept { return v < c; });
-          break;
-        case BinaryOperation::kLessThanEquals:
-          run_op([c](int64_t v) noexcept { return v <= c; });
-          break;
-        case BinaryOperation::kGreaterThan:
-          run_op([c](int64_t v) noexcept { return v > c; });
-          break;
-        case BinaryOperation::kGreaterThanEquals:
-          run_op([c](int64_t v) noexcept { return v >= c; });
-          break;
-        default:
-          run_op([op = pred.op, c](int64_t v) noexcept {
-            return MatchIntegerCompare(v, op, c);
-          });
-          break;
-      }
+      run_op([op = pred.op, c, is_unsigned = col.is_unsigned](
+                 int64_t v) noexcept {
+        return MatchIntegerCompare(v, op, c, is_unsigned);
+      });
       if (stub_match_rows_.empty()) {
         return false;
       }
@@ -2354,11 +2398,16 @@ void FullScanIterator::ComputeStubBlockMatches() noexcept {
   // selective on fact->dim joins) before peek_compares_.
   if (runtime_filter_ != nullptr && runtime_filter_->has_dense_bits() &&
       key_column_.has_value()) {
-    if (!run_runtime_filter() || !run_peek_compares()) {
+    if (!run_primary_filter() || !run_peek_compares()) {
       return;
     }
   } else {
-    if (!run_peek_compares() || !run_runtime_filter()) {
+    if (!run_peek_compares() || !run_primary_filter()) {
+      return;
+    }
+  }
+  for (const ExtraRuntimeFilter& filter : extra_runtime_filters_) {
+    if (!run_runtime_filter(filter.column, filter.group, nullptr)) {
       return;
     }
   }
@@ -2399,6 +2448,21 @@ bool FullScanIterator::StubRowMatches(uint32_t row) const noexcept {
       return false;
     }
   }
+  for (const ExtraRuntimeFilter& filter : extra_runtime_filters_) {
+    if (filter.column >= stub_cache_->col_chunk_idx.size()) {
+      return false;
+    }
+    const slot_t chunk_idx = stub_cache_->col_chunk_idx[filter.column];
+    if (chunk_idx >= stub_cache_->block.columns.size()) {
+      return false;
+    }
+    const auto& col = stub_cache_->block.columns[chunk_idx];
+    if (col.IsNull(row) ||
+        (col.type != ValueType::kInt64 && col.type != ValueType::kDate) ||
+        filter.group->Reject(col.int_cells[row])) {
+      return false;
+    }
+  }
   if (peek_compares_ != nullptr && !peek_compares_->empty()) {
     for (const IntegerPeekCompare& pred : *peek_compares_) {
       if (pred.column >= stub_cache_->col_chunk_idx.size()) {
@@ -2414,7 +2478,8 @@ bool FullScanIterator::StubRowMatches(uint32_t row) const noexcept {
           (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
         return false;
       }
-      if (!MatchIntegerCompare(col.int_cells[row], pred.op, pred.constant)) {
+      if (!MatchIntegerCompare(col.int_cells[row], pred.op, pred.constant,
+                               col.is_unsigned)) {
         return false;
       }
     }

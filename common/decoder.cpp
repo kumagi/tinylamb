@@ -51,6 +51,9 @@ Decoder& Decoder::operator>>(std::string& str) {
 
 Decoder& Decoder::operator>>(uint8_t& u8) {
   is_->read(reinterpret_cast<char*>(&u8), sizeof(u8));
+  if (is_->gcount() != static_cast<std::streamsize>(sizeof(u8))) {
+    u8 = 0;
+  }
   return *this;
 }
 

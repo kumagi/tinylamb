@@ -227,8 +227,12 @@ class AlterTableStatement : public Statement {
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_ << " action="
       << (action_.kind == AlterTableAction::Kind::kRenameTo ? "rename-to "
-                                                            : "rename-column ")
-      << action_.new_name;
+                                                            : "rename-column ");
+    if (action_.kind == AlterTableAction::Kind::kRenameColumn &&
+        !action_.old_column.empty()) {
+      o << action_.old_column << " to ";
+    }
+    o << action_.new_name;
   }
 
  private:
@@ -259,6 +263,24 @@ class CreateIndexStatement : public Statement {
   [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
   void Dump(std::ostream& o) const override {
     o << "name=" << name_ << " table=" << table_ << " unique=" << unique_;
+    if (if_not_exists_) {
+      o << " if_not_exists=true";
+    }
+    o << " keys=[";
+    for (size_t i = 0; i < keys_.size(); ++i) {
+      if (i != 0U) {
+        o << ", ";
+      }
+      o << keys_[i];
+    }
+    o << "] storing=[";
+    for (size_t i = 0; i < storing_.size(); ++i) {
+      if (i != 0U) {
+        o << ", ";
+      }
+      o << storing_[i];
+    }
+    o << "]";
   }
 
  private:
@@ -407,7 +429,7 @@ class CreateMaterializedViewStatement : public Statement {
 
 // CREATE VIEW: the defining query persists as text (Database view records)
 // and expands at FROM-reference time through the session ViewRegistry.  The
-// the DDL executor registers the parsed query on execution so same-transaction
+// DDL executor registers the parsed query on execution so same-transaction
 // references resolve; execution persists the definition for later sessions.
 class CreateViewStatement : public Statement {
  public:
@@ -430,6 +452,7 @@ class CreateViewStatement : public Statement {
   [[nodiscard]] const std::string& QueryText() const { return query_text_; }
   void Dump(std::ostream& o) const override {
     o << "view=" << view_name_ << (or_replace_ ? " or_replace" : "")
+      << (if_not_exists_ ? " if_not_exists" : "")
       << (is_temp_ ? " temp" : "") << " AS " << query_text_;
   }
 
@@ -484,7 +507,16 @@ class CreateObjectStatement : public Statement {
     return result_projection_;
   }
   void Dump(std::ostream& o) const override {
-    o << "create_object=" << StatementTypeName(Type());
+    o << "create_object=" << StatementTypeName(Type())
+      << " has_side_effect=" << static_cast<bool>(side_effect_)
+      << " result=[";
+    for (size_t i = 0; i < result_projection_.size(); ++i) {
+      if (i != 0U) {
+        o << ", ";
+      }
+      o << result_projection_[i];
+    }
+    o << "]";
   }
 
  private:
@@ -543,14 +575,16 @@ class SelectStatement : public Statement {
   SelectStatement() : Statement(StatementType::kSelect) {}
   SelectStatement(std::vector<NamedExpression> select_list,
                   std::vector<std::string> from_clause, Expression where_clause,
-                  std::vector<OrderByTerm> order_by = {}, size_t limit = 0,
+                  std::vector<OrderByTerm> order_by = {},
+                  std::optional<size_t> limit = std::nullopt,
                   size_t offset = 0, bool distinct = false)
       : Statement(StatementType::kSelect),
         select_list_(std::move(select_list)),
         from_clause_(std::move(from_clause)),
         where_clause_(std::move(where_clause)),
         order_by_(std::move(order_by)),
-        limit_(limit),
+        limit_(limit.value_or(0)),
+        has_limit_(limit.has_value()),
         offset_(offset),
         distinct_(distinct) {
     for (const std::string& table : from_clause_) {
@@ -634,7 +668,7 @@ class SelectStatement : public Statement {
     return aliases_;
   }
   void AddAlias(std::string alias, std::string table) {
-    aliases_.emplace(std::move(alias), std::move(table));
+    aliases_.insert_or_assign(std::move(alias), std::move(table));
     runtime_id_.Bump();
   }
   void SetSources(std::vector<SelectSource> sources) {
@@ -688,6 +722,10 @@ class SelectStatement : public Statement {
     with_queries_.clear();
     with_query_order_.clear();
     recursive_with_queries_.clear();
+    // Depth specs are keyed by CTE name like the declarations they describe;
+    // leaving them would let a same-named non-recursive re-registration
+    // inherit a stale WITH RECURSIVE depth bound.
+    recursive_depth_specs_.clear();
     runtime_id_.Bump();
   }
   [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
@@ -992,7 +1030,8 @@ class SelectStatement : public Statement {
       stream << ';';
     }
     stream << "union_flags;" << union_distinct_ << ':' << union_by_name_
-           << ";struct;" << as_struct_ << ";complex;" << complex_ << ";tree;"
+           << ";struct;" << as_struct_ << ";complex;" << complex_
+           << ";forupdate;" << for_update_ << ";tree;"
            << static_cast<const void*>(set_operation_tree_.get()) << ';';
     return stream.str();
   }
@@ -1026,6 +1065,91 @@ class SelectStatement : public Statement {
       }
       o << " sample=";
       source.sample->Dump(o);
+    }
+    if (distinct_) {
+      o << " distinct=true";
+    }
+    if (!distinct_on_.empty()) {
+      o << " distinct_on=[";
+      for (size_t i = 0; i < distinct_on_.size(); ++i) {
+        if (i != 0U) {
+          o << ", ";
+        }
+        if (distinct_on_[i]) {
+          o << *distinct_on_[i];
+        } else {
+          o << "<null>";
+        }
+      }
+      o << "]";
+    }
+    if (group_all_ || !group_by_.empty()) {
+      o << " group_by=[";
+      if (group_all_) {
+        o << "ALL";
+      }
+      for (size_t i = 0; i < group_by_.size(); ++i) {
+        if (i != 0U) {
+          o << ", ";
+        }
+        if (group_by_[i]) {
+          o << *group_by_[i];
+        } else {
+          o << "<null>";
+        }
+      }
+      o << "]";
+    }
+    if (having_) {
+      o << " having=" << *having_;
+    }
+    if (qualify_) {
+      o << " qualify=" << *qualify_;
+    }
+    if (!order_by_.empty()) {
+      o << " order_by=[";
+      for (size_t i = 0; i < order_by_.size(); ++i) {
+        if (i != 0U) {
+          o << ", ";
+        }
+        if (order_by_[i].expression) {
+          o << *order_by_[i].expression;
+        } else {
+          o << "<null>";
+        }
+        o << (order_by_[i].ascending ? " ASC" : " DESC");
+      }
+      o << "]";
+    }
+    if (has_limit_) {
+      o << " limit=" << limit_;
+    }
+    if (offset_ != 0) {
+      o << " offset=" << offset_;
+    }
+    if (!with_queries_.empty()) {
+      o << " with=[";
+      bool first_with = true;
+      for (const auto& entry : with_queries_) {
+        if (!first_with) {
+          o << ", ";
+        }
+        first_with = false;
+        o << entry.first;
+        if (recursive_with_queries_.contains(entry.first)) {
+          o << " RECURSIVE";
+        }
+      }
+      o << "]";
+    }
+    if (!union_all_.empty()) {
+      o << " union_branches=" << union_all_.size();
+      if (union_distinct_) {
+        o << " distinct";
+      }
+      if (union_by_name_) {
+        o << " by_name";
+      }
     }
   }
 
@@ -1139,7 +1263,34 @@ class InsertStatement : public Statement {
   }
   [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
-    o << "table=" << table_name_ << " values=[";
+    o << "table=" << table_name_ << " mode=";
+    switch (mode_) {
+      case InsertMode::kDefault:
+        o << "default";
+        break;
+      case InsertMode::kIgnore:
+        o << "ignore";
+        break;
+      case InsertMode::kUpdate:
+        o << "update";
+        break;
+      case InsertMode::kReplace:
+        o << "replace";
+        break;
+    }
+    if (!columns_.empty()) {
+      o << " columns=[";
+      for (size_t i = 0; i < columns_.size(); ++i) {
+        if (i != 0U) { o << ", ";
+}
+        o << columns_[i];
+      }
+      o << "]";
+    }
+    if (assert_rows_modified_ >= 0) {
+      o << " assert_rows_modified=" << assert_rows_modified_;
+    }
+    o << " values=[";
     for (size_t i = 0; i < values_.size(); i++) {
       if (i != 0U) {
         o << "; ";
@@ -1149,7 +1300,11 @@ class InsertStatement : public Statement {
         if (j != 0U) {
           o << ", ";
         }
-        o << *values_[i][j];
+        if (values_[i][j]) {
+          o << *values_[i][j];
+        } else {
+          o << "<null>";
+        }
       }
       o << ")";
     }
@@ -1228,18 +1383,40 @@ class UpdateStatement : public Statement {
   }
   [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
-    o << "table=" << table_name_ << " set=[";
+    o << "table=" << table_name_;
+    if (!alias_.empty()) {
+      o << " as=" << alias_;
+    }
+    o << " set=[";
     for (size_t i = 0; i < set_clause_.size(); i++) {
       if (i != 0U) {
         o << ", ";
       }
-      o << set_clause_[i].first << " = " << *set_clause_[i].second;
+      o << set_clause_[i].first << " = ";
+      if (set_clause_[i].second) {
+        o << *set_clause_[i].second;
+      } else {
+        o << "<null>";
+      }
     }
     o << "] where=";
     if (where_clause_) {
       o << *where_clause_;
     } else {
       o << "(null)";
+    }
+    if (assert_rows_modified_ >= 0) {
+      o << " assert_rows_modified=" << assert_rows_modified_;
+    }
+    if (!nested_items_.empty()) {
+      o << " nested_dml=" << nested_items_.size();
+      for (const NestedDmlItem& item : nested_items_) {
+        o << " [" << static_cast<int>(item.kind) << ":" << item.target_path;
+        if (item.assert_rows_modified >= 0) {
+          o << " assert_rows_modified=" << item.assert_rows_modified;
+        }
+        o << "]";
+      }
     }
   }
 
@@ -1293,6 +1470,8 @@ class MergeStatement : public Statement {
         on_condition_(std::move(on_condition)) {}
 
   [[nodiscard]] const std::string& TargetTable() const { return target_table_; }
+  [[nodiscard]] const std::string& TargetAlias() const { return target_alias_; }
+  void SetTargetAlias(std::string alias) { target_alias_ = std::move(alias); }
   [[nodiscard]] const std::shared_ptr<SelectStatement>& Source() const {
     return source_;
   }
@@ -1313,13 +1492,21 @@ class MergeStatement : public Statement {
     clauses_ = std::move(clauses);
   }
   void Dump(std::ostream& o) const override {
-    o << "target=" << target_table_ << " using=" << source_alias_
+    o << "target=" << target_table_;
+    if (!target_alias_.empty()) {
+      o << " as=" << target_alias_;
+    }
+    o << " using=" << source_alias_
       << " on=" << (on_condition_ ? on_condition_->ToString() : "(null)")
       << " clauses=" << clauses_.size();
+    if (desugared_from_update_) {
+      o << " desugared_from_update=true";
+    }
   }
 
  private:
   std::string target_table_;
+  std::string target_alias_;
   std::shared_ptr<SelectStatement> source_;
   std::string source_alias_;
   Expression on_condition_;
@@ -1346,7 +1533,11 @@ class DeleteStatement : public Statement {
   }
   [[nodiscard]] bool HasAssert() const { return assert_rows_modified_ >= 0; }
   void Dump(std::ostream& o) const override {
-    o << "table=" << table_name_ << " where=";
+    o << "table=" << table_name_;
+    if (!alias_.empty()) {
+      o << " as=" << alias_;
+    }
+    o << " where=";
     if (where_clause_) {
       o << *where_clause_;
     } else {

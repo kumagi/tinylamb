@@ -151,4 +151,22 @@ theorem dfa_block_summary_sound (d : DFA) (chunks : List (List UInt8)) (start : 
   rw [hfold, summary_scan, scan_accept, acceptingPrefix_eq, Bool.or_comm]
   cases d.accept start <;> simp
 
+/-- Explicit row boundaries can change automaton state without consuming a
+    byte. The end transition sees the final state, even on an empty row. -/
+def rowAccept (d : DFA) (enter leave : Nat → Nat) (initial : Nat)
+    (run : Nat → Nat × Bool) : Bool :=
+  let q := enter initial
+  let (last, seen) := run q
+  d.accept q || seen || d.accept (leave last)
+
+theorem chunked_rows_reset (d : DFA) (enter leave : Nat → Nat) (initial : Nat)
+    (rows : List (List (List UInt8))) :
+    rows.map (fun cs => rowAccept d enter leave initial
+      ((cs.map (summaryOf d)).foldl compose idSummary)) =
+    rows.map (fun cs => rowAccept d enter leave initial (fun q => scan d q cs.flatten)) := by
+  apply List.map_congr_left
+  intro cs _
+  rw [fold_summaries_acc, id_compose_left]
+  simp [rowAccept, summary_scan]
+
 end TinylambOpt.DfaBlockSummary

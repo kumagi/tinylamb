@@ -5,9 +5,13 @@ max_rows = kDefaultVectorSize = 1024) = 0` (`executor_base.hpp`;
 `Executor = shared_ptr<ExecutorBase>`), with `lstable::Fragment` WASM/native
 pushdown over `lstable::PaxChunk` (`FullScan::ExecuteLSTableFragment` /
 `LSTableStore::ExecuteFragment`). A non-virtual `bool Next(Row*, RowPosition*)`
-sink adapter on `ExecutorBase` delegates to `NextBatch(&chunk, 1)` for outermost
-row-consumer boundaries only; internal operators pull batches exclusively via
-`NextBatch`. Morsel-driven parallel scans/joins/aggregations with disk spilling.
+sink adapter on `ExecutorBase` buffers up to `kDefaultVectorSize` (1024) rows
+via `NextBatch(&row_buffer_, kDefaultVectorSize)` for outermost row-consumer
+boundaries only; internal operators pull batches exclusively via `NextBatch`.
+Callers that mix row-at-a-time and batch fetching on one executor must use
+`NextBatchDraining()`, which drains the `Next()` buffer first so buffered rows
+are never skipped. Morsel-driven parallel scans/joins/aggregations with disk
+spilling.
 CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
 `query/query_data.cpp` — cross-include inside that set is build-free, but
 `check_layering.py` still ranks them.
@@ -171,7 +175,7 @@ CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
 
 1. Add the `Plan` node in `plan/` (logical info only) + implementation rule.
 2. Implement the executor + wire `EmitExecutor` in `relational_factory.cpp`.
-3. Pure batch execution: implement `NextBatch(DataChunk*, size_t)` only (`Next` is a non-virtual sink adapter on `ExecutorBase` and must not be overridden or called between operators).
+3. Pure batch execution: implement `NextBatch(DataChunk*, size_t)` only (`Next` is a non-virtual row-at-a-time sink adapter on `ExecutorBase` and must not be overridden or called between operators; code that must mix `Next()` and `NextBatch()` uses `NextBatchDraining()`).
 4. `executor/{apply,recursive_cte,unnest}.cpp + relational.cpp ->
    query/statement.hpp` is V3' debt — read-only, do not widen.
 

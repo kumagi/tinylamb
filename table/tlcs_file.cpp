@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
@@ -46,6 +52,7 @@
 #include "common/query_parallelism.hpp"
 #include "common/runtime_filter.hpp"
 #include "common/serdes.hpp"
+#include "common/unwind_guard.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
@@ -62,26 +69,33 @@ namespace tinylamb {
 namespace {
 
 // The trailing "0001" is a historical label; the authoritative format
-// version is kFormatVersion (currently 2) in the serialized header.
+// version is TlcsFile::kFormatVersion in the serialized header.
 constexpr std::string_view kTlcsMagic = "TLCS0001";
 constexpr size_t kTlcsHeaderBytes = 72;
 constexpr size_t kWriteBufferCap = size_t{1} << 20;  // 1 MiB
 constexpr page_id_t kMaxFlatPageId = 16'777'216ULL;
 
-uint64_t ReadResidentMmapLimitBytes() noexcept {
-  if (const char* env = std::getenv("TINYLAMB_TLCS_MMAP_LIMIT_BYTES");
-      env != nullptr && *env != '\0') {
-    if (*env == '-' || *env == '+') {
-      return TlcsFile::kDefaultResidentMmapLimitBytes;
-    }
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long val = std::strtoull(env, &end, 10);
-    if (errno == 0 && end != env && *end == '\0') {
-      return static_cast<uint64_t>(val);
-    }
+std::optional<uint64_t> ReadResidentMmapLimitBytes() noexcept {
+  const char* env = std::getenv("TINYLAMB_TLCS_MMAP_LIMIT_BYTES");
+  if (env == nullptr) {
+    return std::nullopt;
   }
-  return TlcsFile::kDefaultResidentMmapLimitBytes;
+  std::string_view text(env);
+  const size_t start = text.find_first_not_of(" \t\n\r\v\f");
+  if (start == std::string_view::npos) {
+    return std::nullopt;
+  }
+  text.remove_prefix(start);
+  if (text.starts_with('+')) {
+    text.remove_prefix(1);
+  }
+  uint64_t value = 0;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size()) {
+    return std::nullopt;
+  }
+  return value;
 }
 
 size_t EffectiveColumnarPoolMaxBytes() noexcept {
@@ -94,6 +108,31 @@ size_t PointReadCacheLimitBytes() noexcept {
   const size_t pool_share =
       std::max<size_t>(size_t{4} << 20, EffectiveColumnarPoolMaxBytes() / 8);
   return std::min<size_t>(size_t{64} << 20, pool_share);
+}
+
+void AdviseHugePages(void* ptr, size_t bytes) noexcept {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  constexpr size_t kMinHugePageHintBytes = size_t{4} << 20;
+  if (ptr == nullptr || bytes < kMinHugePageHintBytes) {
+    return;
+  }
+  const long sys_page = ::sysconf(_SC_PAGESIZE);
+  const size_t page_size =
+      sys_page > 0 ? static_cast<size_t>(sys_page) : size_t{4096};
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  const uintptr_t aligned = (addr + page_size - 1) & ~(page_size - 1);
+  if (aligned >= addr + bytes) {
+    return;
+  }
+  const size_t aligned_len = ((addr + bytes) - aligned) & ~(page_size - 1);
+  if (aligned_len >= page_size) {
+    (void)::madvise(reinterpret_cast<void*>(aligned), aligned_len,
+                    MADV_HUGEPAGE);
+  }
+#else
+  (void)ptr;
+  (void)bytes;
+#endif
 }
 
 // #1111 instrumentation: one count per block-column decode execution, so a
@@ -890,7 +929,9 @@ struct BlockStaging {
       bitmap = cursor;
       cursor += bitmap_bytes;
     }
-    stats->BeginRow();
+    if (stats != nullptr) {
+      stats->BeginRow();
+    }
     for (slot_t c = 0; c < ncol; ++c) {
       Col& col = cols[c];
       const bool is_null =
@@ -910,8 +951,12 @@ struct BlockStaging {
         } else {
           col.ints.push_back(0);
         }
-        stats->AddNull(c);
-        (*synopses)[c].AddNull();
+        if (stats != nullptr) {
+          stats->AddNull(c);
+        }
+        if (synopses != nullptr && c < synopses->size()) {
+          (*synopses)[c].AddNull();
+        }
         continue;
       }
       if (col.has_null) {
@@ -932,8 +977,12 @@ struct BlockStaging {
             col.min_int = std::min(col.min_int, iv);
             col.max_int = std::max(col.max_int, iv);
           }
-          stats->AddInt(c, iv, col.is_unsigned);
-          (*synopses)[c].AddInt(iv);
+          if (stats != nullptr) {
+            stats->AddInt(c, iv, col.is_unsigned);
+          }
+          if (synopses != nullptr && c < synopses->size()) {
+            (*synopses)[c].AddInt(iv);
+          }
           break;
         }
         case ValueType::kDouble: {
@@ -953,7 +1002,9 @@ struct BlockStaging {
             col.min_double = std::min(col.min_double, dv);
             col.max_double = std::max(col.max_double, dv);
           }
-          stats->AddDouble(c, dv);
+          if (stats != nullptr) {
+            stats->AddDouble(c, dv);
+          }
           break;
         }
         case ValueType::kVarChar: {
@@ -982,7 +1033,9 @@ struct BlockStaging {
               reinterpret_cast<const uint8_t*>(sv.data()),
               reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
           col.varchar_ends.push_back(static_cast<uint32_t>(next_end));
-          stats->AddVarChar(c, sv);
+          if (stats != nullptr) {
+            stats->AddVarChar(c, sv);
+          }
           break;
         }
         default:
@@ -1498,6 +1551,12 @@ void Int64BufferToLe64(const int64_t* __restrict src, uint32_t n,
 
 void Le64BufferToInt64(const uint8_t* __restrict src, uint32_t n,
                        int64_t* __restrict dst) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    if (n > 0) {
+      std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(int64_t));
+    }
+    return;
+  }
   for (uint32_t r = 0; r < n; ++r) {
     uint64_t v = 0;
     std::memcpy(&v, src + (static_cast<size_t>(r) * 8), sizeof(v));
@@ -1617,6 +1676,9 @@ void ComputeZeroColumnBitsetUniqueness(
     const int64_t* __restrict cells = blocks[bi].int_cells.data();
     for (uint32_t r = 0; r < n; ++r) {
       const uint64_t off = static_cast<uint64_t>(cells[r]) - base_u;
+      if (off > span) {
+        return;
+      }
       const uint64_t mask = uint64_t{1} << (off & 63U);
       uint64_t& word = seen_bits[static_cast<size_t>(off >> 6U)];
       if ((word & mask) != 0) {
@@ -1699,9 +1761,9 @@ bool DecodeColumnBlockFromFile(
     const TlcsFile::BlockDirEntry& src_b, const TlcsFile::ColumnMeta& sm,
     const LSTableColumnDictionary& ro_dict, TlcsDictKind dict_kind,
     bool zero_copy_64, LSTableColumnDictionary* active_dict_mut,
-    int64_t* dst_ints_base, LSTableColumnBlock* dc_out,
-    std::vector<uint8_t>* raw_tmp, std::vector<int64_t>* dict_counts,
-    std::vector<uint64_t>* dict_first_row) {
+    uint8_t* dst_narrow_codes_base, int64_t* dst_ints_base,
+    LSTableColumnBlock* dc_out, std::vector<uint8_t>* raw_tmp,
+    std::vector<int64_t>* dict_counts, std::vector<uint64_t>* dict_first_row) {
   LSTableColumnBlock& dc = *dc_out;
   dc.type = sm.type;
   dc.is_unsigned = sm.is_unsigned;
@@ -1710,6 +1772,8 @@ bool DecodeColumnBlockFromFile(
   dc.has_double_min_max = sm.has_double_min_max;
   dc.has_nan = sm.has_nan;
   dc.all_single_byte_varchar = sm.all_single_byte_varchar;
+  dc.for_width = sm.for_width;
+  dc.for_base = sm.for_base;
   dc.min_int = sm.min_int;
   dc.max_int = sm.max_int;
   dc.min_double = sm.min_double;
@@ -1737,7 +1801,11 @@ bool DecodeColumnBlockFromFile(
 
   if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
       dict_kind == TlcsDictKind::kCompleteNarrow) {
-    uint8_t* dst_codes = active_dict_mut->narrow_codes.data() + row_base;
+    uint8_t* const base_codes = dst_narrow_codes_base != nullptr
+                                    ? dst_narrow_codes_base
+                                    : active_dict_mut->narrow_codes.data();
+    uint8_t* dst_codes =
+        base_codes != nullptr ? base_codes + row_base : nullptr;
     if (using_mmap) {
       if (sm.data_size > 0) {
         std::memcpy(dst_codes, base + sm.data_offset, sm.data_size);
@@ -1772,7 +1840,8 @@ bool DecodeColumnBlockFromFile(
     dc.wide_code_begin = row_base;
     dc.wide_code_count = src_b.row_count;
     if (sm.type != ValueType::kVarChar) {
-      int64_t* dst_ints = dst_ints_base + row_base;
+      int64_t* dst_ints =
+          dst_ints_base != nullptr ? dst_ints_base + row_base : nullptr;
       MaterializeDictInts(sm, *active_dict_mut, dc.dict_codes, src_b.row_count,
                           dst_ints);
       dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
@@ -1807,7 +1876,8 @@ bool DecodeColumnBlockFromFile(
         dc.varchar_ends[r] = static_cast<uint32_t>(dc.varchar_bytes.size());
       }
     } else {
-      int64_t* dst_ints = dst_ints_base + row_base;
+      int64_t* dst_ints =
+          dst_ints_base != nullptr ? dst_ints_base + row_base : nullptr;
       MaterializeDictInts(sm, ro_dict, *raw_tmp, src_b.row_count, dst_ints);
       dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
     }
@@ -1818,16 +1888,21 @@ bool DecodeColumnBlockFromFile(
     if (using_mmap) {
       dc.varchar_bytes_view =
           std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
-      if constexpr (std::endian::native == std::endian::little) {
+      const uint8_t* ends = base + sm.aux_offset;
+      if (std::endian::native == std::endian::little &&
+          sm.aux_offset % alignof(uint32_t) == 0) {
         dc.varchar_ends_view = std::span<const uint32_t>(
-            reinterpret_cast<const uint32_t*>(base + sm.aux_offset),
-            src_b.row_count);
+            reinterpret_cast<const uint32_t*>(ends), src_b.row_count);
       } else {
         dc.varchar_ends.resize(src_b.row_count);
-        const auto* raw_ends =
-            reinterpret_cast<const uint32_t*>(base + sm.aux_offset);
-        for (size_t r = 0; r < src_b.row_count; ++r) {
-          dc.varchar_ends[r] = le32toh(raw_ends[r]);
+        if (src_b.row_count != 0) {
+          std::memcpy(dc.varchar_ends.data(), ends,
+                      src_b.row_count * sizeof(uint32_t));
+        }
+        if constexpr (std::endian::native != std::endian::little) {
+          for (uint32_t& end : dc.varchar_ends) {
+            end = le32toh(end);
+          }
         }
       }
     } else {
@@ -1853,7 +1928,8 @@ bool DecodeColumnBlockFromFile(
         reinterpret_cast<const int64_t*>(base + sm.data_offset),
         src_b.row_count);
   } else {
-    int64_t* dst_ints = dst_ints_base + row_base;
+    int64_t* dst_ints =
+        dst_ints_base != nullptr ? dst_ints_base + row_base : nullptr;
     if (sm.encoding == TlcsColumnEncoding::kFor) {
       if (sm.for_width == 0) {
         UnpackForToInt64(sm, {}, src_b.row_count, dst_ints);
@@ -1871,20 +1947,169 @@ bool DecodeColumnBlockFromFile(
         UnpackForToInt64(sm, *raw_tmp, src_b.row_count, dst_ints);
       }
     } else if (sm.encoding == TlcsColumnEncoding::kRawDouble) {
-      raw_tmp->resize(sm.data_size);
-      if (using_mmap) {
+      if (using_mmap && std::endian::native == std::endian::little) {
         if (sm.data_size > 0) {
-          std::memcpy(raw_tmp->data(), base + sm.data_offset, sm.data_size);
+          std::memcpy(dst_ints, base + sm.data_offset, sm.data_size);
         }
-      } else if (sm.data_size > 0 &&
-                 PreadAllFd(fd, raw_tmp->data(), sm.data_size,
-                            sm.data_offset) != Status::kSuccess) {
-        return false;
+      } else if (!using_mmap && std::endian::native == std::endian::little) {
+        if (sm.data_size > 0 &&
+            PreadAllFd(fd, dst_ints, sm.data_size, sm.data_offset) !=
+                Status::kSuccess) {
+          return false;
+        }
+      } else {
+        raw_tmp->resize(sm.data_size);
+        if (using_mmap) {
+          if (sm.data_size > 0) {
+            std::memcpy(raw_tmp->data(), base + sm.data_offset, sm.data_size);
+          }
+        } else if (sm.data_size > 0 &&
+                   PreadAllFd(fd, raw_tmp->data(), sm.data_size,
+                              sm.data_offset) != Status::kSuccess) {
+          return false;
+        }
+        Le64BufferToInt64(raw_tmp->data(), src_b.row_count, dst_ints);
       }
-      Le64BufferToInt64(raw_tmp->data(), src_b.row_count, dst_ints);
+    } else if (sm.encoding == TlcsColumnEncoding::kConstNull) {
+      if (src_b.row_count > 0 && dst_ints != nullptr) {
+        std::memset(dst_ints, 0,
+                    static_cast<size_t>(src_b.row_count) * sizeof(int64_t));
+      }
     }
     dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
   }
+  return true;
+}
+
+void CopyBlockColumnMeta(const TlcsFile::ColumnMeta& sm,
+                         LSTableColumnBlock* dc_out) noexcept {
+  LSTableColumnBlock& dc = *dc_out;
+  dc.type = sm.type;
+  dc.is_unsigned = sm.is_unsigned;
+  dc.has_null = sm.has_null;
+  dc.has_min_max = sm.has_min_max;
+  dc.has_double_min_max = sm.has_double_min_max;
+  dc.has_nan = sm.has_nan;
+  dc.all_single_byte_varchar = sm.all_single_byte_varchar;
+  dc.for_width = sm.for_width;
+  dc.for_base = sm.for_base;
+  dc.min_int = sm.min_int;
+  dc.max_int = sm.max_int;
+  dc.min_double = sm.min_double;
+  dc.max_double = sm.max_double;
+  dc.is_const_code = sm.is_const_code;
+  dc.has_code_min_max = sm.has_code_min_max;
+  dc.const_code = sm.const_code;
+  dc.min_code = sm.min_code;
+  dc.max_code = sm.max_code;
+  dc.dict_mask = sm.dict_mask;
+}
+
+bool ReuseLazyDecodedBlock(
+    size_t row_base, const TlcsFile::BlockDirEntry& src_b,
+    const TlcsFile::ColumnMeta& sm, TlcsDictKind dict_kind, bool using_mmap,
+    const uint8_t* base, const LSTableColumnBlock& cached,
+    LSTableColumnDictionary* active_dict_mut, uint8_t* dst_narrow_codes_base,
+    int64_t* dst_ints_base, LSTableColumnBlock* dc_out,
+    std::vector<int64_t>* dict_counts, std::vector<uint64_t>* dict_first_row) {
+  CopyBlockColumnMeta(sm, dc_out);
+  LSTableColumnBlock& dc = *dc_out;
+  if (sm.has_null) {
+    if (using_mmap) {
+      dc.nulls_view =
+          std::span<const uint8_t>(base + sm.nulls_offset, sm.nulls_size);
+    } else if (sm.nulls_size > 0) {
+      const auto ns = cached.Nulls();
+      if (ns.size() < sm.nulls_size) {
+        return false;
+      }
+      dc.nulls.assign(ns.begin(), ns.begin() + sm.nulls_size);
+    }
+  }
+  if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+      dict_kind == TlcsDictKind::kCompleteNarrow) {
+    uint8_t* const base_codes = dst_narrow_codes_base != nullptr
+                                    ? dst_narrow_codes_base
+                                    : active_dict_mut->narrow_codes.data();
+    uint8_t* dst_codes =
+        base_codes != nullptr ? base_codes + row_base : nullptr;
+    if (src_b.row_count > 0) {
+      if (cached.dict_codes.size() < src_b.row_count || dst_codes == nullptr) {
+        return false;
+      }
+      std::memcpy(dst_codes, cached.dict_codes.data(), src_b.row_count);
+      if (dict_counts != nullptr && !dict_counts->empty()) {
+        const size_t null_slot = dict_counts->size() - 1;
+        if (!dc.has_null && dc.is_const_code && dc.const_code < null_slot) {
+          (*dict_counts)[dc.const_code] +=
+              static_cast<int64_t>(src_b.row_count);
+          (*dict_first_row)[dc.const_code] =
+              std::min<uint64_t>((*dict_first_row)[dc.const_code], row_base);
+        } else {
+          for (uint32_t r = 0; r < src_b.row_count; ++r) {
+            const uint8_t raw = dst_codes[r];
+            const size_t slot =
+                (raw == LSTableColumnDictionary::kNullCode || raw >= null_slot)
+                    ? null_slot
+                    : raw;
+            ++(*dict_counts)[slot];
+            (*dict_first_row)[slot] =
+                std::min<uint64_t>((*dict_first_row)[slot], row_base + r);
+          }
+        }
+      }
+    }
+    dc.dict = active_dict_mut;
+    dc.dict_codes = std::span<const uint8_t>(dst_codes, src_b.row_count);
+    dc.wide_code_begin = row_base;
+    dc.wide_code_count = src_b.row_count;
+    if (sm.type != ValueType::kVarChar) {
+      int64_t* dst_ints =
+          dst_ints_base != nullptr ? dst_ints_base + row_base : nullptr;
+      if (src_b.row_count > 0) {
+        if (cached.int_cells.size() < src_b.row_count || dst_ints == nullptr) {
+          return false;
+        }
+        std::memcpy(dst_ints, cached.int_cells.data(),
+                    static_cast<size_t>(src_b.row_count) * sizeof(int64_t));
+      }
+      dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
+    }
+    return true;
+  }
+  if (sm.type == ValueType::kVarChar) {
+    if (sm.encoding == TlcsColumnEncoding::kConstNull) {
+      return true;
+    }
+    if (using_mmap && sm.encoding == TlcsColumnEncoding::kVarChar &&
+        std::endian::native == std::endian::little &&
+        sm.aux_offset % alignof(uint32_t) == 0) {
+      dc.varchar_bytes_view =
+          std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
+      dc.varchar_ends_view = std::span<const uint32_t>(
+          reinterpret_cast<const uint32_t*>(base + sm.aux_offset),
+          src_b.row_count);
+      return true;
+    }
+    const auto vb = cached.VarcharBytes();
+    const auto ve = cached.VarcharEnds();
+    if (ve.size() < src_b.row_count) {
+      return false;
+    }
+    dc.varchar_bytes.assign(vb.begin(), vb.end());
+    dc.varchar_ends.assign(ve.begin(), ve.begin() + src_b.row_count);
+    return true;
+  }
+  int64_t* dst_ints =
+      dst_ints_base != nullptr ? dst_ints_base + row_base : nullptr;
+  if (src_b.row_count > 0) {
+    if (cached.int_cells.size() < src_b.row_count || dst_ints == nullptr) {
+      return false;
+    }
+    std::memcpy(dst_ints, cached.int_cells.data(),
+                static_cast<size_t>(src_b.row_count) * sizeof(int64_t));
+  }
+  dc.int_cells = std::span<const int64_t>(dst_ints, src_b.row_count);
   return true;
 }
 
@@ -2385,16 +2610,17 @@ uint32_t TlcsFile::FindBlockIndex(page_id_t pid) const noexcept {
   // repeated point lookups are O(1) instead of re-parsing whole dir groups.
   if (TryBuildPidIndex()) {
     std::scoped_lock lk(dir_cache_mu_);
-    if (pid < flat_page_to_block_.size()) {
-      return flat_page_to_block_[pid];
+    if (!flat_page_to_block_.empty() || !page_to_block_.empty()) {
+      if (pid < flat_page_to_block_.size()) {
+        return flat_page_to_block_[pid];
+      }
+      const auto it = page_to_block_.find(pid);
+      return it != page_to_block_.end() ? it->second
+                                        : LSTableStore::kInvalidBlockIndex;
     }
-    const auto it = page_to_block_.find(pid);
-    return it != page_to_block_.end() ? it->second
-                                      : LSTableStore::kInvalidBlockIndex;
   }
-  // Budget exhausted: fall back to a per-group scan, but read only pid spans
-  // instead of parsing the full group (no ~195 KB ColumnMeta body, no 128
-  // heap allocations per candidate group).
+  // The index may be unavailable or reclaimed before we reacquire the lock.
+  // Read only pid spans instead of parsing each candidate's full group.
   std::vector<page_id_t> pids;
   for (uint32_t gidx = 0; gidx < dir_groups_.size(); ++gidx) {
     const DirGroupMeta& gm = dir_groups_[gidx];
@@ -2809,14 +3035,16 @@ TlcsFile::GetOrComputeVarcharBlockBounds(slot_t col_idx,
                                                 reserve_bytes)) {
     return std::shared_ptr<const std::vector<VarcharBlockBound>>{};
   }
+  UnwindGuard release_reservation([reserve_bytes] {
+    ProcessMemoryBudget::Global().Release(MemoryPoolKind::kColumnar,
+                                          reserve_bytes);
+  });
   const uint32_t dg_count = DirGroupCount();
   const uint32_t dg_size = DirGroupSize();
   std::vector<std::shared_ptr<const DirGroup>> dir_groups(dg_count);
   for (uint32_t g = 0; g < dg_count; ++g) {
     auto grp_or = GetDirGroup(g);
     if (!grp_or.HasValue()) {
-      ProcessMemoryBudget::Global().Release(MemoryPoolKind::kColumnar,
-                                            reserve_bytes);
       return grp_or.GetStatus();
     }
     dir_groups[g] = grp_or.MoveValue();
@@ -3020,17 +3248,9 @@ TlcsFile::GetOrComputeVarcharBlockBounds(slot_t col_idx,
                  out.has_null, any_non_null, all_canonical);
     }
   };
-  if (workers == 1) {
-    worker_fn(0);
-  } else {
-    RunParallelTasks(workers, worker_fn);
-  }
+  RETURN_IF_FAIL(RunParallelTasks(workers, worker_fn));
   for (const Status& st : worker_status) {
-    if (st != Status::kSuccess) {
-      ProcessMemoryBudget::Global().Release(MemoryPoolKind::kColumnar,
-                                            reserve_bytes);
-      return st;
-    }
+    RETURN_IF_FAIL(st);
   }
   std::shared_ptr<const std::vector<VarcharBlockBound>> published = bounds;
   {
@@ -3039,9 +3259,8 @@ TlcsFile::GetOrComputeVarcharBlockBounds(slot_t col_idx,
         varchar_bounds_cache_.emplace(col_idx, std::move(bounds));
     if (inserted) {
       varchar_bounds_bytes_ += reserve_bytes;
+      release_reservation.Disarm();
     } else {
-      ProcessMemoryBudget::Global().Release(MemoryPoolKind::kColumnar,
-                                            reserve_bytes);
       published = it->second;
     }
   }
@@ -3092,6 +3311,13 @@ bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
   }
   const auto& blk = grp->blocks[lidx];
   const uint32_t n = blk.row_count;
+  // Every gather below indexes the block's null/data arrays with rows[j], so
+  // a stale or corrupt row position must be rejected before any mmap read.
+  for (const uint32_t row : rows) {
+    if (row >= n) {
+      return false;
+    }
+  }
   // Validate all requested columns are fixed-width random-access encodings.
   for (const slot_t cid : column_ids) {
     if (cid >= schema.ColumnCount() || cid >= blk.columns.size()) {
@@ -3502,14 +3728,13 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
           }
           // Pack selected strings in row order and make the unselected
           // ranges empty. Lean: sparse_varchar_projection.
+          const std::vector<uint32_t> source_ends = chunk.varchar_ends;
           chunk.varchar_bytes.clear();
           uint32_t next_row = 0;
-          uint32_t source_prev_end = 0;
           for (const uint32_t row : varchar_rows) {
-            const uint32_t begin =
-                row == next_row ? source_prev_end : chunk.varchar_ends[row - 1];
-            source_prev_end = chunk.varchar_ends[row];
-            const uint32_t len = source_prev_end - begin;
+            const uint32_t begin = row == 0 ? 0 : source_ends[row - 1];
+            const uint32_t end = source_ends[row];
+            const uint32_t len = end - begin;
             const size_t packed = chunk.varchar_bytes.size();
             std::fill_n(chunk.varchar_ends.begin() + next_row, row - next_row,
                         static_cast<uint32_t>(packed));
@@ -4013,28 +4238,12 @@ TlcsFile::ColumnDecodePlan TlcsFile::PlanColumnDecode(
       (static_cast<uint64_t>(block_count_) * sizeof(LSTableColumnBlock));
   const ValueType vt = col_types_[c];
   if (vt != ValueType::kVarChar) {
-    bool all_raw64 = using_mmap;
-    for (const auto& grp : groups) {
-      if (!all_raw64) {
-        break;
-      }
-      for (const BlockDirEntry& b : grp->blocks) {
-        const ColumnMeta& m = b.columns[c];
-        const bool is_raw64 =
-            (m.encoding == TlcsColumnEncoding::kFor && m.for_width == 8) ||
-            m.encoding == TlcsColumnEncoding::kRawDouble;
-        if (!is_raw64 || (m.data_offset % alignof(int64_t)) != 0) {
-          all_raw64 = false;
-          break;
-        }
-      }
-    }
-    if (all_raw64 && htole64(1ULL) == 1ULL) {
-      plan.zero_copy_64 = true;
-    } else {
-      plan.need_int_vec = true;
-      plan.heap_bytes += total_rows_ * sizeof(int64_t);
-    }
+    // Always materialize a contiguous integer_column for per-column cache
+    // entries so numeric fast paths (IntegerRuns/IntegerRunBounds and direct
+    // scans) see one dense vector instead of strided mmap slices.
+    plan.zero_copy_64 = false;
+    plan.need_int_vec = true;
+    plan.heap_bytes += total_rows_ * sizeof(int64_t);
   }
   if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
     plan.heap_bytes += total_rows_;
@@ -4043,19 +4252,69 @@ TlcsFile::ColumnDecodePlan TlcsFile::PlanColumnDecode(
     for (const BlockDirEntry& b : grp->blocks) {
       const ColumnMeta& m = b.columns[c];
       if (!using_mmap) {
-        plan.heap_bytes += m.nulls_size + m.data_size + m.aux_size;
+        plan.heap_bytes += m.nulls_size;
+        if (vt == ValueType::kVarChar) {
+          if (m.encoding == TlcsColumnEncoding::kVarChar) {
+            plan.heap_bytes += m.data_size + m.aux_size;
+          } else if (m.encoding == TlcsColumnEncoding::kNarrowDict &&
+                     dict_kinds_[c] == TlcsDictKind::kPartialFrozen) {
+            plan.heap_bytes +=
+                m.data_size +
+                (static_cast<uint64_t>(b.row_count) * sizeof(uint32_t));
+          }
+        }
       } else {
         plan.mapped_bytes += m.nulls_size;
         if (vt == ValueType::kVarChar &&
             m.encoding == TlcsColumnEncoding::kVarChar) {
           plan.mapped_bytes += m.data_size + m.aux_size;
-        } else if (plan.zero_copy_64) {
-          plan.mapped_bytes += m.data_size;
         }
       }
     }
   }
   return plan;
+}
+
+std::shared_ptr<const platform::MemoryMap> TlcsFile::EnsureResidentMmap()
+    const {
+  {
+    std::scoped_lock lk(resident_mu_);
+    if (resident_mmap_ != nullptr && resident_mmap_->IsValid()) {
+      return resident_mmap_;
+    }
+  }
+  const auto& budget = ProcessMemoryBudget::Global();
+  if (budget.AlwaysSpillEnabled() || budget.UnderMemoryPressure() ||
+      file_size_ == 0) {
+    return nullptr;
+  }
+  const size_t effective_col_max = EffectiveColumnarPoolMaxBytes();
+  const uint64_t pool_half = effective_col_max / 2;
+  const auto env_limit = ReadResidentMmapLimitBytes();
+  const uint64_t mmap_cap = std::min(
+      pool_half, env_limit.value_or(kDefaultResidentMmapLimitBytes));
+  const bool env_override = env_limit.has_value();
+  const uint64_t map_only_cap =
+      env_override
+          ? mmap_cap
+          : (budget.Limit() == 0
+                 ? kEagerResidentFileBytes
+                 : std::min<uint64_t>(
+                       kEagerResidentFileBytes,
+                       std::max<uint64_t>(mmap_cap, budget.Limit() / 2)));
+  if (mmap_cap == 0 || file_size_ > map_only_cap) {
+    return nullptr;
+  }
+  auto mmap = std::make_shared<platform::MemoryMap>();
+  if (mmap->Open(path_) != 0 || !mmap->IsValid()) {
+    return nullptr;
+  }
+  std::scoped_lock lk(resident_mu_);
+  if (resident_mmap_ != nullptr && resident_mmap_->IsValid()) {
+    return resident_mmap_;
+  }
+  resident_mmap_ = std::move(mmap);
+  return resident_mmap_;
 }
 
 size_t TlcsFile::EstimateColumnsCacheBytes(
@@ -4097,11 +4356,7 @@ std::shared_ptr<const LSTableBlockLayout> TlcsFile::BuildBlockLayout(
   if (!LoadAllDirGroups(&groups)) {
     return nullptr;
   }
-  std::shared_ptr<const platform::MemoryMap> mmap_copy;
-  {
-    std::scoped_lock lk(resident_mu_);
-    mmap_copy = resident_mmap_;
-  }
+  std::shared_ptr<const platform::MemoryMap> mmap_copy = EnsureResidentMmap();
   const uint8_t* base = mmap_copy != nullptr && mmap_copy->IsValid()
                             ? mmap_copy->Data()
                             : nullptr;
@@ -4175,10 +4430,12 @@ std::shared_ptr<const LSTableBlockLayout> TlcsFile::BuildBlockLayout(
 }
 
 std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
-TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
-                                  const std::vector<slot_t>& columns,
-                                  uint64_t effective_max_bytes,
-                                  std::vector<slot_t>* rejected_cols) const {
+TlcsFile::BuildColumnCacheEntries(
+    const Schema& schema, uint64_t generation,
+    const std::vector<slot_t>& columns, uint64_t effective_max_bytes,
+    std::vector<slot_t>* rejected_cols,
+    const std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>*
+        existing_lazy) const {
   std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> result(
       columns.size());
   if (columns.empty()) {
@@ -4197,11 +4454,7 @@ TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
   if (!LoadAllDirGroups(&groups)) {
     return result;
   }
-  std::shared_ptr<const platform::MemoryMap> mmap_copy;
-  {
-    std::scoped_lock lk(resident_mu_);
-    mmap_copy = resident_mmap_;
-  }
+  std::shared_ptr<const platform::MemoryMap> mmap_copy = EnsureResidentMmap();
   const uint8_t* base = mmap_copy != nullptr && mmap_copy->IsValid()
                             ? mmap_copy->Data()
                             : nullptr;
@@ -4263,12 +4516,31 @@ TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
       continue;
     }
     entry->blocks.resize(blk_ptrs.size());
-    if (plan.need_int_vec) {
-      entry->integer_column.resize(total_rows_);
+    if (plan.need_int_vec && total_rows_ > 0) {
+      if (total_rows_ >= 65536) {
+        entry->integer_column_raw =
+            std::make_unique_for_overwrite<int64_t[]>(total_rows_);
+        entry->integer_column_raw_size = total_rows_;
+        AdviseHugePages(entry->integer_column_raw.get(),
+                        total_rows_ * sizeof(int64_t));
+      } else {
+        entry->integer_column.resize(total_rows_);
+      }
     }
     if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
       entry->dictionary = dicts_[c];
-      entry->dictionary.narrow_codes.resize(total_rows_);
+      if (total_rows_ > 0) {
+        if (total_rows_ >= 65536) {
+          entry->narrow_codes_raw =
+              std::make_unique_for_overwrite<uint8_t[]>(total_rows_);
+          entry->narrow_codes_raw_size = total_rows_;
+          AdviseHugePages(entry->narrow_codes_raw.get(), total_rows_);
+          entry->dictionary.narrow_codes_view = {entry->narrow_codes_raw.get(),
+                                                 total_rows_};
+        } else {
+          entry->dictionary.narrow_codes.resize(total_rows_);
+        }
+      }
       if (total_rows_ <= static_cast<uint64_t>(INT64_MAX)) {
         auto& dict = entry->dictionary;
         const size_t entry_count = dict.value_type == ValueType::kVarChar
@@ -4343,16 +4615,42 @@ TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
         LSTableColumnDictionary* active_dict =
             dict_kinds_[c] == TlcsDictKind::kCompleteNarrow ? &entry.dictionary
                                                             : nullptr;
-        int64_t* dst_ints = entry.integer_column.empty()
-                                ? nullptr
-                                : entry.integer_column.data();
+        uint8_t* dst_codes = entry.narrow_codes_raw.get();
+        int64_t* dst_ints =
+            entry.integer_column_raw != nullptr
+                ? entry.integer_column_raw.get()
+                : (entry.integer_column.empty() ? nullptr
+                                                : entry.integer_column.data());
         WorkerSummary& ws = worker_summaries[w][ai];
+        std::vector<int64_t>* d_counts =
+            ws.counts.empty() ? nullptr : &ws.counts;
+        std::vector<uint64_t>* d_first =
+            ws.first_row.empty() ? nullptr : &ws.first_row;
+        const LSTableColumnCacheEntry* lazy_src =
+            (existing_lazy != nullptr && idx < existing_lazy->size() &&
+             (*existing_lazy)[idx] != nullptr &&
+             (*existing_lazy)[idx]->is_block_lazy &&
+             (*existing_lazy)[idx]->lazy_state != nullptr &&
+             (*existing_lazy)[idx]->lazy_state->lazy_blocks != nullptr &&
+             bi < (*existing_lazy)[idx]->blocks.size())
+                ? (*existing_lazy)[idx].get()
+                : nullptr;
+        const LSTableColumnBlock* lazy_blk =
+            lazy_src != nullptr ? lazy_src->lazy_state->lazy_blocks[bi].load(
+                                      std::memory_order_acquire)
+                                : nullptr;
+        if (lazy_blk != nullptr &&
+            ReuseLazyDecodedBlock(row_base, src_b, src_b.columns[c],
+                                  dict_kinds_[c], using_mmap, base, *lazy_blk,
+                                  active_dict, dst_codes, dst_ints,
+                                  &entry.blocks[bi], d_counts, d_first)) {
+          continue;
+        }
         if (!DecodeColumnBlockFromFile(
                 fd_, base, using_mmap, row_base, src_b, src_b.columns[c],
                 dicts_[c], dict_kinds_[c], plans[idx].zero_copy_64, active_dict,
-                dst_ints, &entry.blocks[bi], &raw_tmp,
-                ws.counts.empty() ? nullptr : &ws.counts,
-                ws.first_row.empty() ? nullptr : &ws.first_row)) {
+                dst_codes, dst_ints, &entry.blocks[bi], &raw_tmp, d_counts,
+                d_first)) {
           io_failed.store(true, std::memory_order_relaxed);
           return Status::kIOError;
         }
@@ -4402,6 +4700,453 @@ TlcsFile::BuildColumnCacheEntries(const Schema& schema, uint64_t generation,
     result[idx] = std::move(mutable_entries[idx]);
   }
   return result;
+}
+
+std::vector<std::shared_ptr<const LSTableColumnCacheEntry>>
+TlcsFile::BuildLazyColumnCacheEntries(
+    const Schema& schema, uint64_t generation,
+    const std::vector<slot_t>& columns) const {
+  std::vector<std::shared_ptr<const LSTableColumnCacheEntry>> result(
+      columns.size());
+  if (columns.empty()) {
+    return result;
+  }
+  if (schema.ColumnCount() != column_count_ ||
+      !LSTableStore::SupportsSchema(schema)) {
+    return result;
+  }
+  for (const slot_t c : columns) {
+    if (c >= column_count_) {
+      return result;
+    }
+  }
+  std::vector<std::shared_ptr<const DirGroup>> groups;
+  if (!LoadAllDirGroups(&groups)) {
+    return result;
+  }
+  std::shared_ptr<const platform::MemoryMap> mmap_copy = EnsureResidentMmap();
+  const uint8_t* base = mmap_copy != nullptr && mmap_copy->IsValid()
+                            ? mmap_copy->Data()
+                            : nullptr;
+  const bool using_mmap = base != nullptr;
+
+  std::vector<const BlockDirEntry*> blk_ptrs;
+  blk_ptrs.reserve(block_count_);
+  for (const auto& grp : groups) {
+    for (const BlockDirEntry& src_b : grp->blocks) {
+      blk_ptrs.push_back(&src_b);
+    }
+  }
+  const size_t nblocks = blk_ptrs.size();
+  const size_t meta_bytes =
+      sizeof(LSTableColumnCacheEntry) + sizeof(LSTableLazyColumnState) +
+      (nblocks * (sizeof(LSTableColumnBlock) + sizeof(LSTableLazyBlockMeta) +
+                  (sizeof(void*) * 2)));
+  std::shared_ptr<const TlcsFile> self_tlcs = shared_from_this();
+
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const slot_t c = columns[i];
+    auto entry = std::make_shared<LSTableColumnCacheEntry>();
+    entry->generation = generation;
+    entry->col_index = c;
+    entry->type = col_types_[c];
+    entry->is_unsigned = col_unsigned_[c] != 0;
+    entry->is_block_lazy = true;
+    entry->backing_mmap = using_mmap ? mmap_copy : nullptr;
+    entry->memory_charge =
+        std::make_shared<ProcessMemoryCharge>(MemoryPoolKind::kColumnar);
+    if (!entry->memory_charge->TryAddWithReclaim(meta_bytes)) {
+      continue;
+    }
+    auto lazy = std::make_shared<LSTableLazyColumnState>();
+    lazy->backing_tlcs = self_tlcs;
+    lazy->lazy_bytes_used = std::make_shared<std::atomic<size_t>>(0);
+    lazy->lazy_blocks =
+        std::make_unique<std::atomic<const LSTableColumnBlock*>[]>(nblocks);
+    lazy->lazy_owners.resize(nblocks);
+    lazy->block_meta.resize(nblocks);
+    if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
+      entry->dictionary = dicts_[c];
+    }
+    entry->blocks.resize(nblocks);
+    bool meta_complete = true;
+    bool syn_has_null = false;
+    int64_t syn_min = std::numeric_limits<int64_t>::max();
+    int64_t syn_max = std::numeric_limits<int64_t>::min();
+    for (size_t bi = 0; bi < nblocks; ++bi) {
+      const BlockDirEntry& src_b = *blk_ptrs[bi];
+      const ColumnMeta& sm = src_b.columns[c];
+      LSTableColumnBlock& dc = entry->blocks[bi];
+      CopyBlockColumnMeta(sm, &dc);
+      if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+          dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
+        dc.dict = &entry->dictionary;
+      }
+      if (sm.data_size <= std::numeric_limits<uint32_t>::max() &&
+          sm.aux_size <= std::numeric_limits<uint32_t>::max() &&
+          sm.nulls_size <= std::numeric_limits<uint32_t>::max()) {
+        LSTableLazyBlockMeta& bm = lazy->block_meta[bi];
+        bm.data_offset = sm.data_offset;
+        bm.aux_offset = sm.aux_offset;
+        bm.nulls_offset = sm.nulls_offset;
+        bm.data_size = static_cast<uint32_t>(sm.data_size);
+        bm.aux_size = static_cast<uint32_t>(sm.aux_size);
+        bm.nulls_size = static_cast<uint32_t>(sm.nulls_size);
+        bm.row_count = src_b.row_count;
+        bm.for_base = sm.for_base;
+        bm.encoding = static_cast<uint8_t>(sm.encoding);
+        bm.for_width = sm.for_width;
+        bm.has_null = sm.has_null;
+      } else {
+        meta_complete = false;
+      }
+      syn_has_null |= dc.has_null;
+      if (dc.has_min_max) {
+        syn_min = std::min(syn_min, dc.min_int);
+        syn_max = std::max(syn_max, dc.max_int);
+      }
+    }
+    if (!meta_complete) {
+      lazy->block_meta.clear();
+    }
+    entry->lazy_state = std::move(lazy);
+    if (has_col_synopses_ && c < col_synopses_.size()) {
+      const ColumnSynopsis& syn = col_synopses_[c];
+      entry->has_null = syn.has_null;
+      entry->is_monotonic = syn.is_monotonic;
+      entry->is_unique_nonnull = syn.is_unique_nonnull;
+      entry->is_identity_1_to_n = syn.is_identity_1_to_n;
+      entry->min_int = syn.min_int;
+      entry->max_int = syn.max_int;
+    } else {
+      entry->has_null = syn_has_null;
+      entry->is_monotonic = false;
+      entry->is_unique_nonnull = false;
+      entry->is_identity_1_to_n = false;
+      entry->min_int = syn_min;
+      entry->max_int = syn_max;
+    }
+    entry->estimated_bytes = meta_bytes;
+    result[i] = std::move(entry);
+  }
+  return result;
+}
+
+bool TlcsFile::DecodeSingleColumnBlockForCache(
+    uint32_t block_idx, slot_t col, const LSTableColumnCacheEntry& entry,
+    std::unique_ptr<LSTableLazyDecodedBlock>* out) const {
+  if (out == nullptr || block_idx >= block_count_ || col >= column_count_ ||
+      block_idx >= entry.blocks.size()) {
+    return false;
+  }
+  ColumnMeta local_sm;
+  const ColumnMeta* sm_ptr = nullptr;
+  uint32_t n = 0;
+  std::shared_ptr<const DirGroup> grp_guard;
+  if (entry.lazy_state != nullptr &&
+      block_idx < entry.lazy_state->block_meta.size()) {
+    const LSTableLazyBlockMeta& bm = entry.lazy_state->block_meta[block_idx];
+    local_sm.type = entry.type;
+    local_sm.is_unsigned = entry.is_unsigned;
+    local_sm.encoding = static_cast<TlcsColumnEncoding>(bm.encoding);
+    local_sm.for_width = bm.for_width;
+    local_sm.has_null = bm.has_null;
+    local_sm.for_base = bm.for_base;
+    local_sm.data_offset = bm.data_offset;
+    local_sm.data_size = bm.data_size;
+    local_sm.aux_offset = bm.aux_offset;
+    local_sm.aux_size = bm.aux_size;
+    local_sm.nulls_offset = bm.nulls_offset;
+    local_sm.nulls_size = bm.nulls_size;
+    sm_ptr = &local_sm;
+    n = bm.row_count;
+  } else {
+    if (dir_group_size_ == 0) {
+      return false;
+    }
+    const uint32_t grp_idx = block_idx / dir_group_size_;
+    const uint32_t local_idx = block_idx % dir_group_size_;
+    StatusOr<std::shared_ptr<const DirGroup>> grp_or = GetDirGroup(grp_idx);
+    if (!grp_or.HasValue() || grp_or.Value() == nullptr ||
+        local_idx >= grp_or.Value()->blocks.size()) {
+      return false;
+    }
+    grp_guard = std::move(grp_or.Value());
+    const BlockDirEntry& src_b = grp_guard->blocks[local_idx];
+    if (col >= src_b.columns.size()) {
+      return false;
+    }
+    sm_ptr = &src_b.columns[col];
+    n = src_b.row_count;
+  }
+  const ColumnMeta& sm = *sm_ptr;
+  // File-controlled metadata: every consumer below trusts these sizes
+  // against the row count, so reject payloads that cannot hold n rows of the
+  // declared encoding before any span, Pread or memcpy touches them.
+  const auto row_bytes = static_cast<size_t>(n);
+  switch (sm.encoding) {
+    case TlcsColumnEncoding::kNarrowDict:
+      if (sm.data_size < row_bytes) {
+        return false;
+      }
+      break;
+    case TlcsColumnEncoding::kFor:
+      if (sm.for_width > 0 && sm.data_size != row_bytes * sm.for_width) {
+        return false;
+      }
+      break;
+    case TlcsColumnEncoding::kRawDouble:
+      if (sm.data_size != row_bytes * sizeof(int64_t)) {
+        return false;
+      }
+      break;
+    default:
+      break;
+  }
+  const uint8_t* base =
+      (entry.backing_mmap != nullptr && entry.backing_mmap->IsValid())
+          ? entry.backing_mmap->Data()
+          : nullptr;
+  const bool using_mmap = base != nullptr;
+  alignas(8) uint8_t stack_buf[8192];
+  std::vector<uint8_t> heap_tmp;
+  auto read_data_span = [&](std::span<const uint8_t>* span_out) -> bool {
+    if (sm.data_size == 0) {
+      *span_out = {};
+      return true;
+    }
+    if (using_mmap) {
+      *span_out = std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
+      return true;
+    }
+    uint8_t* dst = stack_buf;
+    if (sm.data_size > sizeof(stack_buf)) {
+      heap_tmp.resize(sm.data_size);
+      dst = heap_tmp.data();
+    }
+    if (PreadAllFd(fd_, dst, sm.data_size, sm.data_offset) !=
+        Status::kSuccess) {
+      return false;
+    }
+    *span_out = std::span<const uint8_t>(dst, sm.data_size);
+    return true;
+  };
+
+  auto decoded = std::make_unique<LSTableLazyDecodedBlock>();
+  if (using_mmap) {
+    decoded->backing_mmap = entry.backing_mmap;
+  }
+  decoded->block = entry.blocks[block_idx];
+  LSTableColumnBlock& dc = decoded->block;
+  size_t bytes = sizeof(LSTableLazyDecodedBlock);
+
+  if (sm.has_null) {
+    if (using_mmap) {
+      dc.nulls_view =
+          std::span<const uint8_t>(base + sm.nulls_offset, sm.nulls_size);
+    } else if (sm.nulls_size > 0) {
+      decoded->owned_nulls =
+          std::make_unique_for_overwrite<uint8_t[]>(sm.nulls_size);
+      if (PreadAllFd(fd_, decoded->owned_nulls.get(), sm.nulls_size,
+                     sm.nulls_offset) != Status::kSuccess) {
+        return false;
+      }
+      dc.nulls_view = {decoded->owned_nulls.get(), sm.nulls_size};
+      bytes += sm.nulls_size;
+    }
+  }
+
+  if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+      dict_kinds_[col] == TlcsDictKind::kCompleteNarrow) {
+    if (using_mmap) {
+      dc.dict_codes =
+          std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
+    } else if (sm.data_size > 0) {
+      decoded->owned_dict_codes =
+          std::make_unique_for_overwrite<uint8_t[]>(sm.data_size);
+      if (PreadAllFd(fd_, decoded->owned_dict_codes.get(), sm.data_size,
+                     sm.data_offset) != Status::kSuccess) {
+        return false;
+      }
+      dc.dict_codes = {decoded->owned_dict_codes.get(), sm.data_size};
+      bytes += sm.data_size;
+    }
+    dc.dict = &entry.dictionary;
+    dc.wide_code_begin = 0;
+    dc.wide_code_count = n;
+    if (sm.type != ValueType::kVarChar && n > 0) {
+      decoded->owned_ints = std::make_unique_for_overwrite<int64_t[]>(n);
+      MaterializeDictInts(sm, entry.dictionary, dc.dict_codes, n,
+                          decoded->owned_ints.get());
+      dc.int_cells = {decoded->owned_ints.get(), n};
+      bytes += static_cast<size_t>(n) * sizeof(int64_t);
+    }
+  } else if (sm.encoding == TlcsColumnEncoding::kNarrowDict &&
+             dict_kinds_[col] == TlcsDictKind::kPartialFrozen) {
+    std::span<const uint8_t> raw_codes;
+    if (!read_data_span(&raw_codes)) {
+      return false;
+    }
+    if (sm.type == ValueType::kVarChar) {
+      decoded->owned_varchar_ends.resize(n);
+      const auto& ro_dict = dicts_[col];
+      for (uint32_t r = 0; r < n; ++r) {
+        const uint8_t code = raw_codes[r];
+        if (code != LSTableColumnDictionary::kNullCode &&
+            code < ro_dict.entries.size()) {
+          const std::string_view sv = ro_dict.entries[code];
+          decoded->owned_varchar_bytes.insert(
+              decoded->owned_varchar_bytes.end(),
+              reinterpret_cast<const uint8_t*>(sv.data()),
+              reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
+        }
+        decoded->owned_varchar_ends[r] =
+            static_cast<uint32_t>(decoded->owned_varchar_bytes.size());
+      }
+      dc.varchar_bytes_view = decoded->owned_varchar_bytes;
+      dc.varchar_ends_view = decoded->owned_varchar_ends;
+      bytes += decoded->owned_varchar_bytes.size() +
+               (decoded->owned_varchar_ends.size() * sizeof(uint32_t));
+    } else if (n > 0) {
+      decoded->owned_ints = std::make_unique_for_overwrite<int64_t[]>(n);
+      MaterializeDictInts(sm, dicts_[col], raw_codes, n,
+                          decoded->owned_ints.get());
+      dc.int_cells = {decoded->owned_ints.get(), n};
+      bytes += static_cast<size_t>(n) * sizeof(int64_t);
+    }
+  } else if (sm.encoding == TlcsColumnEncoding::kConstNull &&
+             sm.type == ValueType::kVarChar) {
+    // Const-null VARCHAR blocks carry nulls_view only and zero variable bytes.
+  } else if (sm.encoding == TlcsColumnEncoding::kVarChar) {
+    if (sm.aux_size != row_bytes * sizeof(uint32_t)) {
+      return false;
+    }
+    const uint8_t* aux_ptr = using_mmap ? (base + sm.aux_offset) : nullptr;
+    const bool mmap_aligned32 =
+        aux_ptr != nullptr &&
+        (reinterpret_cast<uintptr_t>(aux_ptr) & (alignof(uint32_t) - 1)) == 0;
+    if (using_mmap) {
+      dc.varchar_bytes_view =
+          std::span<const uint8_t>(base + sm.data_offset, sm.data_size);
+      if constexpr (std::endian::native == std::endian::little) {
+        if (mmap_aligned32) {
+          dc.varchar_ends_view = std::span<const uint32_t>(
+              reinterpret_cast<const uint32_t*>(aux_ptr), n);
+        } else {
+          decoded->owned_varchar_ends.resize(n);
+          if (n > 0) {
+            std::memcpy(decoded->owned_varchar_ends.data(), aux_ptr,
+                        static_cast<size_t>(n) * sizeof(uint32_t));
+          }
+          dc.varchar_ends_view = decoded->owned_varchar_ends;
+          bytes += static_cast<size_t>(n) * sizeof(uint32_t);
+        }
+      } else {
+        decoded->owned_varchar_ends.resize(n);
+        for (uint32_t r = 0; r < n; ++r) {
+          uint32_t raw_end = 0;
+          std::memcpy(&raw_end, aux_ptr + (static_cast<size_t>(r) * 4), 4);
+          decoded->owned_varchar_ends[r] = le32toh(raw_end);
+        }
+        dc.varchar_ends_view = decoded->owned_varchar_ends;
+        bytes += static_cast<size_t>(n) * sizeof(uint32_t);
+      }
+    } else {
+      decoded->owned_varchar_bytes.resize(sm.data_size);
+      if (sm.data_size > 0 &&
+          PreadAllFd(fd_, decoded->owned_varchar_bytes.data(), sm.data_size,
+                     sm.data_offset) != Status::kSuccess) {
+        return false;
+      }
+      if (sm.aux_size != row_bytes * sizeof(uint32_t)) {
+        return false;
+      }
+      decoded->owned_varchar_ends.resize(n);
+      if (sm.aux_size > 0 &&
+          PreadAllFd(fd_, decoded->owned_varchar_ends.data(), sm.aux_size,
+                     sm.aux_offset) != Status::kSuccess) {
+        return false;
+      }
+      if constexpr (std::endian::native != std::endian::little) {
+        for (uint32_t& end : decoded->owned_varchar_ends) {
+          end = le32toh(end);
+        }
+      }
+      dc.varchar_bytes_view = decoded->owned_varchar_bytes;
+      dc.varchar_ends_view = decoded->owned_varchar_ends;
+      bytes += decoded->owned_varchar_bytes.size() +
+               (decoded->owned_varchar_ends.size() * sizeof(uint32_t));
+    }
+  } else if (n > 0) {
+    const uint8_t* mmap_src = using_mmap ? (base + sm.data_offset) : nullptr;
+    const bool mmap_aligned64 =
+        mmap_src != nullptr &&
+        (reinterpret_cast<uintptr_t>(mmap_src) & (alignof(int64_t) - 1)) == 0;
+    if constexpr (std::endian::native == std::endian::little) {
+      if (mmap_aligned64 &&
+          ((sm.encoding == TlcsColumnEncoding::kFor && sm.for_width == 8) ||
+           sm.encoding == TlcsColumnEncoding::kRawDouble) &&
+          sm.data_size == static_cast<uint64_t>(n) * sizeof(int64_t)) {
+        dc.int_cells = {reinterpret_cast<const int64_t*>(mmap_src), n};
+      }
+    }
+    if (dc.int_cells.empty()) {
+      decoded->owned_ints = std::make_unique_for_overwrite<int64_t[]>(n);
+      int64_t* dst_ints = decoded->owned_ints.get();
+      if (sm.encoding == TlcsColumnEncoding::kFor) {
+        if (sm.for_width == 0) {
+          UnpackForToInt64(sm, {}, n, dst_ints);
+        } else if (using_mmap) {
+          if (sm.for_width == 8) {
+            Le64BufferToInt64(mmap_src, n, dst_ints);
+          } else {
+            UnpackForToInt64(sm,
+                             std::span<const uint8_t>(mmap_src, sm.data_size),
+                             n, dst_ints);
+          }
+        } else if (sm.for_width == 8 &&
+                   std::endian::native == std::endian::little) {
+          if (sm.data_size > 0 &&
+              PreadAllFd(fd_, dst_ints, sm.data_size, sm.data_offset) !=
+                  Status::kSuccess) {
+            return false;
+          }
+        } else {
+          std::span<const uint8_t> raw_span;
+          if (!read_data_span(&raw_span)) {
+            return false;
+          }
+          UnpackForToInt64(sm, raw_span, n, dst_ints);
+        }
+      } else if (sm.encoding == TlcsColumnEncoding::kRawDouble) {
+        if (using_mmap && std::endian::native == std::endian::little) {
+          if (sm.data_size > 0) {
+            std::memcpy(dst_ints, mmap_src, sm.data_size);
+          }
+        } else if (!using_mmap && std::endian::native == std::endian::little) {
+          if (sm.data_size > 0 &&
+              PreadAllFd(fd_, dst_ints, sm.data_size, sm.data_offset) !=
+                  Status::kSuccess) {
+            return false;
+          }
+        } else {
+          std::span<const uint8_t> raw_span;
+          if (!read_data_span(&raw_span)) {
+            return false;
+          }
+          Le64BufferToInt64(raw_span.data(), n, dst_ints);
+        }
+      } else if (sm.encoding == TlcsColumnEncoding::kConstNull) {
+        std::memset(dst_ints, 0, static_cast<size_t>(n) * sizeof(int64_t));
+      }
+      dc.int_cells = {dst_ints, n};
+      bytes += static_cast<size_t>(n) * sizeof(int64_t);
+    }
+  }
+
+  decoded->charged_bytes = bytes;
+  *out = std::move(decoded);
+  return true;
 }
 
 std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
@@ -4459,30 +5204,12 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
     }
     const ValueType vt = col_types_[c];
     if (vt != ValueType::kVarChar) {
-      bool all_raw64 = using_mmap;
-      for (const auto& grp : groups) {
-        if (!all_raw64) {
-          break;
-        }
-        for (const BlockDirEntry& b : grp->blocks) {
-          const ColumnMeta& m = b.columns[c];
-          const bool is_raw64 =
-              (m.encoding == TlcsColumnEncoding::kFor && m.for_width == 8) ||
-              m.encoding == TlcsColumnEncoding::kRawDouble;
-          if (!is_raw64 || (m.data_offset % alignof(int64_t)) != 0) {
-            all_raw64 = false;
-            break;
-          }
-        }
-      }
-      // Persisted 8-byte payloads are little-endian; a native int64_t view is
-      // only byte-compatible with that on a little-endian host.
-      if (all_raw64 && htole64(1ULL) == 1ULL) {
-        zero_copy_64[c] = true;
-      } else {
-        need_int_vec[c] = true;
-        alloc_bytes += total_rows_ * sizeof(int64_t);
-      }
+      // Materialize a contiguous integer_column for numeric columns even on
+      // small resident tables so IntegerRuns/IntegerRunBounds and direct
+      // scans see one dense vector instead of strided mmap slices.
+      zero_copy_64[c] = false;
+      need_int_vec[c] = true;
+      alloc_bytes += total_rows_ * sizeof(int64_t);
     }
     if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
       alloc_bytes += total_rows_;
@@ -4614,10 +5341,10 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
             active_dict != nullptr && !active_dict->code_first_row.empty()
                 ? &active_dict->code_first_row
                 : nullptr;
-        if (!DecodeColumnBlockFromFile(fd_, base, using_mmap, row_base, src_b,
-                                       sm, dicts_[c], dict_kinds_[c],
-                                       zero_copy_64[c], active_dict, dst_ints,
-                                       &dc, &raw_tmp, d_counts, d_first)) {
+        if (!DecodeColumnBlockFromFile(
+                fd_, base, using_mmap, row_base, src_b, sm, dicts_[c],
+                dict_kinds_[c], zero_copy_64[c], active_dict, nullptr, dst_ints,
+                &dc, &raw_tmp, d_counts, d_first)) {
           return nullptr;
         }
       }
@@ -4694,6 +5421,10 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
             const int64_t* __restrict cells = blk.columns[c].int_cells.data();
             for (uint32_t r = 0; r < blk.row_count; ++r) {
               const uint64_t off = static_cast<uint64_t>(cells[r]) - base_u;
+              if (off > span) {
+                all_unique = false;
+                break;
+              }
               const uint64_t mask = uint64_t{1} << (off & 63U);
               uint64_t& word = seen_bits[static_cast<size_t>(off >> 6U)];
               if ((word & mask) != 0) {
@@ -4779,6 +5510,10 @@ std::shared_ptr<LSTableStore> TlcsFile::BuildResidentStoreInternal(
           const int64_t* __restrict cells = blk.columns[c].int_cells.data();
           for (uint32_t r = 0; r < blk.row_count; ++r) {
             const uint64_t off = static_cast<uint64_t>(cells[r]) - base_u;
+            if (off > span) {
+              all_unique = false;
+              break;
+            }
             const uint64_t mask = uint64_t{1} << (off & 63U);
             uint64_t& word = seen_bits[static_cast<size_t>(off >> 6U)];
             if ((word & mask) != 0) {
@@ -4916,10 +5651,12 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
   }
   const uint32_t computed_hdr_crc = Crc32C(hdr.data(), kTlcsHeaderBytes - 4);
   if (computed_hdr_crc != hdr_crc ||
-      (version != 2 && version != kFormatVersion) ||
+      version != kFormatVersion ||
       (expected_schema != nullptr &&
-       column_count != expected_schema->ColumnCount()) ||
-      column_count == 0 || dir_offset > fsize ||
+       (!expected_schema->HasSupportedColumnCount() ||
+        column_count != expected_schema->ColumnCount())) ||
+      column_count == 0 || column_count > Schema::kMaxColumns ||
+      dir_offset > fsize ||
       dir_length > fsize - dir_offset) {
     return StatusError(StatusCode::kCorrupt, "tlcs header validation failed");
   }
@@ -5139,6 +5876,10 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
       };
     }
     file->has_col_synopses_ = true;
+    if (dpos != dir_buf.size()) {
+      return StatusError(StatusCode::kCorrupt,
+                         "tlcs column synopsis trailer length mismatch");
+    }
   }
 
   const size_t meta_bytes = dir_length + (group_count * sizeof(DirGroupMeta));
@@ -5166,7 +5907,8 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
   file->cache_reclaim_bridge_->self = file.get();
   std::weak_ptr<CacheReclaimBridge> weak = file->cache_reclaim_bridge_;
   file->cache_reclaim_hook_ = ScopedReclaimHook(
-      ReclaimStage::kColumnar, [weak = std::move(weak)](size_t target) {
+      ReclaimStage::kColumnar,
+      [weak = std::move(weak)](size_t target) {
         if (auto b = weak.lock()) {
           std::unique_lock<std::mutex> lk(b->mu, std::try_to_lock);
           if (lk.owns_lock() && b->self != nullptr) {
@@ -5174,7 +5916,9 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
           }
         }
         return size_t{0};
-      });
+      },
+      std::make_shared<std::atomic<uint64_t>>(
+          std::numeric_limits<uint64_t>::max() - 1));
 
   // Load full BlockDirEntry tables eagerly only when tiny (`<= min(4 MiB, 1/32
   // pool)` and `!AlwaysSpillEnabled()`); large tables keep `O(blocks / 128)`
@@ -5239,7 +5983,10 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
     for (const auto& grp : file->eager_dir_groups_) {
       for (const page_id_t pid : grp->pids) {
         if (pid < file->flat_page_to_block_.size()) {
-          file->flat_page_to_block_[pid] = bidx;
+          auto& index = file->flat_page_to_block_[pid];
+          if (index == LSTableStore::kInvalidBlockIndex) {
+            index = bidx;
+          }
         } else {
           file->page_to_block_.emplace(pid, bidx);
         }
@@ -5257,23 +6004,29 @@ StatusOr<std::shared_ptr<TlcsFile>> TlcsFile::OpenInternal(
   // files past `RssWarnLimit()`. Explicit `TINYLAMB_TLCS_MMAP_LIMIT_BYTES`
   // caps both.
   const uint64_t pool_half = effective_col_max / 2;
-  const uint64_t env_limit = ReadResidentMmapLimitBytes();
-  const uint64_t mmap_cap = std::min<uint64_t>(pool_half, env_limit);
-  const char* env_mmap = std::getenv("TINYLAMB_TLCS_MMAP_LIMIT_BYTES");
-  const bool env_override = env_mmap != nullptr && *env_mmap != '\0';
-  const uint64_t map_only_cap =
+  const auto env_limit = ReadResidentMmapLimitBytes();
+  const uint64_t mmap_cap = std::min(
+      pool_half, env_limit.value_or(kDefaultResidentMmapLimitBytes));
+  const bool env_override = env_limit.has_value();
+  const uint64_t resident_cap =
       env_override ? mmap_cap
-                   : (budget.Limit() == 0
-                          ? std::numeric_limits<uint64_t>::max()
-                          : std::max<uint64_t>(mmap_cap, budget.Limit() / 2));
+                   : std::min<uint64_t>(mmap_cap, kEagerResidentFileBytes);
+  const uint64_t map_only_cap =
+      env_override
+          ? mmap_cap
+          : (budget.Limit() == 0
+                 ? kEagerResidentFileBytes
+                 : std::min<uint64_t>(
+                       kEagerResidentFileBytes,
+                       std::max<uint64_t>(mmap_cap, budget.Limit() / 2)));
   if (expected_schema != nullptr && !budget.AlwaysSpillEnabled() &&
       mmap_cap > 0 && fsize > 0 && fsize <= map_only_cap) {
     auto mmap = std::make_shared<platform::MemoryMap>();
     if (mmap->Open(path) == 0 && mmap->IsValid()) {
       std::shared_ptr<LSTableStore> res_store;
-      if (fsize <= mmap_cap) {
+      if (fsize <= resident_cap) {
         res_store = file->BuildResidentStoreInternal(*expected_schema, nullptr,
-                                                     mmap_cap, mmap);
+                                                     resident_cap, mmap);
       }
       std::scoped_lock rlk(file->resident_mu_);
       file->resident_mmap_ = std::move(mmap);
@@ -5349,6 +6102,9 @@ StatusOr<PendingTlcsCommit> WriteTlcsTempFile(Transaction& txn,
     return Status::kConflicts;
   }
   const Schema& schema = table.GetSchema();
+  if (!schema.HasSupportedColumnCount()) {
+    return StatusError(StatusCode::kTooBigData, "too many columns in TLCS file");
+  }
   if (!LSTableStore::SupportsSchema(schema)) {
     return Status::kNotImplemented;
   }
@@ -5510,7 +6266,10 @@ StatusOr<PendingTlcsCommit> WriteTlcsTempFile(Transaction& txn,
               scratch_row.TryDeserialize(
                   raw.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                   schema));
-          (void)consumed;
+          if (consumed != raw.size()) {
+            return StatusError(StatusCode::kCorrupt,
+                               "tlcs row image has trailing bytes");
+          }
           stats_collector.AddRow(scratch_row);
           RETURN_IF_FAIL(staging.AppendRow(scratch_row, &streaming_synopses));
         }

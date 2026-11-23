@@ -42,6 +42,13 @@
 namespace tinylamb {
 namespace {
 
+// The trace flag is fixed for the lifetime of a benchmark process. Reading the
+// environment once keeps it out of the timed SQL path.
+bool SqlTraceEnabled() {
+  static const bool enabled = std::getenv("TPCC_SQL_TRACE") != nullptr;
+  return enabled;
+}
+
 #ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 constexpr std::array<std::string_view, 9> kTpccTables = {
     "warehouse", "district", "customer",  "history",   "item",
@@ -110,8 +117,7 @@ constexpr std::array<std::string_view, 10> kLastNameSyllables = {
     "BAR", "OUGHT", "ABLE",  "PRI",   "PRES",
     "ESE", "ANTI",  "CALLY", "ATION", "EING"};
 
-int ComputeNURand(int a, int x, int y, int c, int rand_a, int rand_xy) {
-  (void)a;
+int ComputeNURand(int x, int y, int c, int rand_a, int rand_xy) {
   // TPC-C callers keep x <= y (fixed ranges or populated scale factors);
   // x == y is reachable for a one-customer district, giving a range of 1.
   // The analyzer's "empty range" path already trips UB in Random(x, y) first.
@@ -561,8 +567,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
         const int last_name_n =
             customer_id <= 1000
                 ? customer_id - 1
-                : ComputeNURand(255, 0, 999, nurand.c_last_load,
-                                load_random(0, 255), load_random(0, 999));
+                : ComputeNURand(0, 999, nurand.c_last_load, load_random(0, 255),
+                                load_random(0, 999));
         status = insert(
             2, Row({Value(warehouse_id), Value(district_id), Value(customer_id),
                     Value("First#" + std::to_string(customer_id)), Value("OE"),
@@ -653,7 +659,7 @@ int TpccWorkload::Random(int lower, int upper) {
 }
 
 int TpccWorkload::NURand(int a, int x, int y, int c) {
-  return ComputeNURand(a, x, y, c, Random(0, a), Random(x, y));
+  return ComputeNURand(x, y, c, Random(0, a), Random(x, y));
 }
 
 int TpccWorkload::PickCustomerId() {
@@ -720,7 +726,7 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
                     " [" + std::string(sql) + "]";
     return query_result.GetStatus();
   }
-  if (std::getenv("TPCC_SQL_TRACE") != nullptr) {
+  if (SqlTraceEnabled()) {
     if (sql.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
       fprintf(stderr, "[tpcc-sql][%d] %.*s\n", static_cast<int>(result->type),
               static_cast<int>(sql.size()), sql.empty() ? "" : sql.data());
@@ -734,7 +740,12 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
   } catch (const std::exception& ex) {
     result->error = std::string(ToString(result->type)) + ": " + ex.what() +
                     " [" + std::string(sql) + "]";
-    return Status::kConflicts;
+    return Status::kRuntimeError;
+  } catch (...) {
+    result->error = std::string(ToString(result->type)) +
+                    ": unexpected SQL result exception [" +
+                    std::string(sql) + "]";
+    return Status::kRuntimeError;
   }
   Status stream_status = query_result.Value().GetStatus();
   if (stream_status != Status::kSuccess) {
@@ -754,7 +765,7 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
   if (!rows.empty() && rows.front().IsValid()) {
     return true;
   }
-  if (getenv("TPCC_SQL_TRACE") != nullptr) {
+  if (SqlTraceEnabled()) {
     if (operation.size() <=
         static_cast<size_t>(std::numeric_limits<int>::max())) {
       fprintf(stderr, "[tpcc-empty] %.*s\n", static_cast<int>(operation.size()),
@@ -1282,6 +1293,10 @@ TpccTransactionResult TpccWorkload::Delivery() {
       }
       if (rows.empty()) {
         continue;
+      }
+      if (!rows.front().IsValid()) {
+        result.error = "delivery queue query returned an invalid row";
+        return fail();
       }
       const int order_id = static_cast<int>(IntValue(rows.front()[0]));
       rows.clear();

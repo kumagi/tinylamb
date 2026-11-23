@@ -70,7 +70,8 @@ def summarize(output):
             raise ValueError(f'{path}: expected 18 verified samples')
         for mode in MODES:
             rows = [r for r in data if r['mode'] == mode and not r['warmup']]
-            assert len(rows) == 5
+            if len(rows) != 5:
+                raise ValueError(f'{path}: expected 5 measured {mode} samples, got {len(rows)}')
             record = dict(case=case['name'], threads=case['threads'], mode=mode)
             for key in rows[0]:
                 if isinstance(rows[0][key], (int, float)) and not isinstance(rows[0][key], bool):
@@ -140,14 +141,16 @@ def main():
                         note='Excluded setup and validation; no SQL execution; per-case settings in cases[].command')
         if opts.q67_input:
             manifest['q67_sha256'] = digest(opts.q67_input)
-        (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-        (output / 'lscpu.txt').write_text(subprocess.check_output(['lscpu'], text=True))
-        for i, case in enumerate(run_cases):
+        for case in run_cases:
             command = [str(opts.binary.resolve()), '--threads', str(case['threads']), '--cpus',
                        ','.join(map(str, case['cpus'])), '--repeats', '5', *case['args']]
             if case['reverse']:
                 command.append('--reverse')
             case['command'] = command
+        (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        (output / 'lscpu.txt').write_text(subprocess.check_output(['lscpu'], text=True))
+        for i, case in enumerate(run_cases):
+            command = case['command']
             print(f"[{i+1}/{len(run_cases)}] {case['name']} t{case['threads']}", flush=True)
             with (output / f"{case['name']}_t{case['threads']}.jsonl").open('w') as out:
                 subprocess.run(command, stdout=out, check=True, timeout=600)

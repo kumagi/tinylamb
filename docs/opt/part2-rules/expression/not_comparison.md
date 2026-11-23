@@ -136,4 +136,4 @@ BinaryOperation NegateComparison(BinaryOperation operation) {
     $\neg(x < y) \to x \ge y$ および $\neg(x = y) \to x \ne y$ の基本的な反転を検証します。
 - `expression/differential_test.cpp`:
   - `DifferentialTest.Evaluate_ComparisonMatrix_MatchesAcrossPaths`:
-    AST 評価器、バイトコードエンジン、JIT 間で、IEEE NaN を含む比較式に対する否定の評価結果が完全一致することを全型マトリクスで検証します。
+    比較式の評価経路を AST／バイトコード／JIT で照合します。このテストは not_comparison の書き換え適用を含まず、JIT 対応の書き換え前後の同値性は別途検証されていません。

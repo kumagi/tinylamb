@@ -20,12 +20,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -52,38 +55,6 @@
 namespace tinylamb {
 namespace {
 
-class ScopedEnvVar {
- public:
-  ScopedEnvVar(const char* key, const char* value) : key_(key) {
-    const char* prev = std::getenv(key);
-    if (prev != nullptr) {
-      had_prev_ = true;
-      prev_ = prev;
-    }
-    if (value != nullptr) {
-      ::setenv(key, value, 1);
-    } else {
-      ::unsetenv(key);
-    }
-  }
-  ScopedEnvVar(const ScopedEnvVar&) = delete;
-  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-  ScopedEnvVar(ScopedEnvVar&&) = delete;
-  ScopedEnvVar& operator=(ScopedEnvVar&&) = delete;
-  ~ScopedEnvVar() {
-    if (had_prev_) {
-      ::setenv(key_.c_str(), prev_.c_str(), 1);
-    } else {
-      ::unsetenv(key_.c_str());
-    }
-  }
-
- private:
-  std::string key_;
-  bool had_prev_{false};
-  std::string prev_;
-};
-
 std::vector<Row> ScanAllRows(Transaction& txn, const Table& table) {
   std::vector<Row> out;
   Iterator iter = table.BeginFullScan(txn);
@@ -92,6 +63,39 @@ std::vector<Row> ScanAllRows(Transaction& txn, const Table& table) {
     ++iter;
   }
   return out;
+}
+
+TEST(TlcsFileTest, MaterializeIntSliceAcceptsUnalignedOffsets) {
+  const auto check = []<typename Offset>(const std::array<Offset, 3>& offsets) {
+    alignas(Offset) std::array<uint8_t, 1 + (3 * sizeof(Offset))> bytes{};
+    std::memcpy(bytes.data() + 1, offsets.data(), 3 * sizeof(Offset));
+    LSTableColumnBlock block;
+    block.for_width = sizeof(Offset);
+    block.for_base = -42;
+    block.for_bytes = std::span(bytes).subspan(1);
+    std::array<int64_t, 2> result{};
+    block.MaterializeIntSlice(1, result.size(), result.data());
+    EXPECT_EQ(result[0], block.IntAt(1));
+    EXPECT_EQ(result[1], block.IntAt(2));
+  };
+  check(std::array<uint16_t, 3>{0, 257, 65535});
+  check(std::array<uint32_t, 3>{0, 65537, 4294967295U});
+}
+
+TEST(TlcsFileTest, DictionaryAccessChecksCodesAndStringOffsets) {
+  LSTableColumnDictionary dictionary;
+  dictionary.int_entries = {7, 42};
+  EXPECT_EQ(dictionary.IntEntryAt(1), 42);
+  EXPECT_EQ(dictionary.IntEntryAt(2), 0);
+
+  const std::array<uint64_t, 5> offsets{0, 2, 1, 5, 9};
+  const std::string bytes = "abc";
+  dictionary.flat_str_offsets = offsets;
+  dictionary.flat_str_bytes = bytes;
+  EXPECT_EQ(dictionary.StringEntryAt(0), "ab");
+  for (size_t code : {size_t{1}, size_t{2}, size_t{3}, size_t{4}, SIZE_MAX}) {
+    EXPECT_TRUE(dictionary.StringEntryAt(code).empty()) << code;
+  }
 }
 
 TEST(TlcsFileTest, MultiBlockResidentCompactionZoneMapsAndProjection) {
@@ -649,6 +653,34 @@ TEST(TlcsFileTest, PagedStubBatchDecodeZoneMapsProjectionRuntimeFilterAndTail) {
     }
     EXPECT_EQ(seen_ids, rf_keys);
 
+    const std::vector<int64_t> date_keys = {19009, 19011, 19268};
+    const auto dates = RuntimeFilterBuilder::FromKeys(date_keys);
+    ASSERT_NE(dates, nullptr);
+    for (const bool capture_positions : {false, true}) {
+      Iterator extra = tbl.BeginFullScan(ctx.txn_, opts);
+      extra.SetRuntimeFilter(rf.get(), 0, ValueType::kInt64);
+      ASSERT_TRUE(extra.IsValid());
+      ASSERT_EQ((*extra)[0].value.int_value, 32750);
+      ++extra;
+      ASSERT_TRUE(extra.IsValid());
+      ASSERT_EQ((*extra)[0].value.int_value, 32767);
+
+      // The date column should participate in filtering even though it is
+      // absent from the projection and the iterator has already read rows.
+      extra.AddExtraRuntimeFilter(dates.get(), 3, ValueType::kDate);
+      ASSERT_TRUE(extra.IsValid());
+      ASSERT_EQ((*extra)[0].value.int_value, 32768);
+      batch.capture_positions = capture_positions;
+      std::vector<int64_t> matching_ids;
+      while (const size_t n = extra.DecodeNextTypedBatch(&batch, 2)) {
+        for (size_t row = 0; row < n; ++row) {
+          matching_ids.push_back(batch.cells[2 * row]);
+        }
+      }
+      ASSERT_SUCCESS(extra.GetStatus());
+      EXPECT_EQ(matching_ids, (std::vector<int64_t>{32768, 33011, 33509}));
+    }
+
     // 2. Row-by-row operator* scan with zone map skipping block 0 completely.
     const std::vector<IntegerPeekCompare> peek_hi = {
         {.column = 0,
@@ -1189,6 +1221,8 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(out.is_open());
   out.write(reinterpret_cast<const char*>(f.data()), f.size());
+  out.close();
+  ASSERT_TRUE(out.good());
 }
 
 TEST(TlcsFileTest, StoredSchemaRejectsColumnCountExceedingDirectory) {
@@ -1209,7 +1243,7 @@ TEST(TlcsFileTest, StoredSchemaRejectsColumnCountExceedingDirectory) {
   const auto opened = TlcsFile::OpenWithStoredSchema(path, &schema);
   ASSERT_FALSE(opened.HasValue());
   EXPECT_EQ(opened.GetStatus(), Status::kCorrupt);
-  std::filesystem::remove(path);
+  EXPECT_TRUE(std::filesystem::remove(path));
 }
 
 TEST(TlcsFileTest, FindBlockIndexWithOverlappingPidRanges) {
@@ -1569,6 +1603,8 @@ TEST(TlcsFileTest, VarcharBlockBoundsFromOrderedDictionary) {
                         TlcsFile::Open(tlcs_path, schema));
   ASSERT_EQ(tlcs->BlockCount(), 2U);
   EXPECT_EQ(tlcs->DictionaryKind(1), TlcsDictKind::kCompleteNarrow);
+  EXPECT_EQ(tlcs->DictionaryKind(2), TlcsDictKind::kNone);
+  EXPECT_FALSE(tlcs->Dictionary(2).active);
   EXPECT_TRUE(tlcs->Dicts()[1].codes_follow_string_order);
 
   ASSIGN_OR_ASSERT_FAIL(
@@ -1930,9 +1966,9 @@ TEST(TlcsFileTest, EvictReclaimDropsResidentMmapAndSkipsOversizedMap) {
     EXPECT_EQ(pread_blk.columns[1].int_cells[500], (500 * 7) ^ 0x5555);
   }
 
-  // Explicit TINYLAMB_TLCS_MMAP_LIMIT_BYTES=0 also skips resident_mmap_.
-  {
-    ScopedEnvVar no_mmap("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", "0");
+  // Both spellings of a zero limit skip resident_mmap_.
+  for (const char* limit : {"0", "+0"}) {
+    ScopedEnvVar no_mmap("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", limit);
     budget.ResetForTest(size_t{1} << 30, size_t{256} << 20, size_t{512} << 20,
                         /*check_rss_pressure=*/false);
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
@@ -2143,6 +2179,360 @@ TEST(TlcsFileTest,
     ASSERT_SUCCESS(ctx.PreCommit());
   }
   reopened->DeleteAll();
+}
+
+TEST(TlcsFileTest,
+     BuildColumnCacheEntriesMaterializesIntVecForRawDoubleWithMmap) {
+  const std::string prefix = "tlcs_rawdbl_intvec_" + RandomString();
+  Schema schema("rawdbl_tbl", {Column("id", ValueType::kInt64),
+                               Column("dval", ValueType::kDouble)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 512;
+  page_id_t first_pid = 0;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    first_pid = tbl.FirstPageId();
+    for (int64_t i = 0; i < kRows; ++i) {
+      const double dv = (static_cast<double>(i) * 1.125) + 0.03125;
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_, Row({Value(i), Value(dv)})).GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "rawdbl_tbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db->EmulateCrash();
+  db.reset();
+
+  const std::string tlcs_path =
+      prefix + ".db.tlcs." + std::to_string(first_pid);
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                        TlcsFile::Open(tlcs_path, schema));
+  const std::vector<slot_t> cols = {0, 1};
+  auto entries = tlcs->BuildColumnCacheEntries(
+      schema, tlcs->LayoutGeneration(), cols, LSTableStore::kBuildByteLimit);
+  ASSERT_EQ(entries.size(), 2U);
+  ASSERT_NE(entries[0], nullptr);
+  ASSERT_NE(entries[1], nullptr);
+  EXPECT_EQ(entries[0]->integer_column.size(), static_cast<size_t>(kRows));
+  EXPECT_EQ(entries[1]->integer_column.size(), static_cast<size_t>(kRows));
+  for (int64_t i = 0; i < kRows; ++i) {
+    EXPECT_EQ(entries[0]->integer_column[static_cast<size_t>(i)], i);
+    double got = 0.0;
+    const int64_t bits = entries[1]->integer_column[static_cast<size_t>(i)];
+    std::memcpy(&got, &bits, sizeof(got));
+    EXPECT_DOUBLE_EQ(got, (static_cast<double>(i) * 1.125) + 0.03125);
+  }
+  tlcs.reset();
+  std::unique_ptr<Database> cleanup_db = Database::Create(prefix).MoveValue();
+  cleanup_db->DeleteAll();
+}
+
+TEST(TlcsFileTest, PreadColumnCachePlanDoesNotDoubleChargeAndSynopsesSurvive) {
+  const std::string prefix = "tlcs_pread_syn_" + RandomString();
+  Schema schema("syn_plan_tbl", {Column("id", ValueType::kInt64),
+                                 Column("dval", ValueType::kDouble)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 512;
+  page_id_t first_pid = 0;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    first_pid = tbl.FirstPageId();
+    for (int64_t i = 0; i < kRows; ++i) {
+      const double dv = (static_cast<double>(i) * 1.125) + 0.03125;
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_, Row({Value(i + 1), Value(dv)})).GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "syn_plan_tbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db->EmulateCrash();
+  db.reset();
+
+  const std::string tlcs_path =
+      prefix + ".db.tlcs." + std::to_string(first_pid);
+  {
+    ScopedEnvVar no_mmap("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", "0");
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
+                          TlcsFile::Open(tlcs_path, schema));
+    EXPECT_TRUE(tlcs->IsPaged());
+    const size_t dval_est = tlcs->EstimateColumnsCacheBytes(schema, {1});
+    EXPECT_GE(dval_est, static_cast<size_t>(kRows) * sizeof(int64_t));
+    EXPECT_LT(dval_est, (static_cast<size_t>(kRows) * sizeof(int64_t) * 3) / 2);
+
+    EXPECT_TRUE(tlcs->HasColumnSynopses());
+    ASSERT_EQ(tlcs->ColumnSynopses().size(), 2U);
+    EXPECT_TRUE(tlcs->ColumnSynopses()[0].is_unique_nonnull);
+    EXPECT_TRUE(tlcs->ColumnSynopses()[0].is_identity_1_to_n);
+    EXPECT_EQ(tlcs->ColumnSynopses()[0].min_int, 1);
+    EXPECT_EQ(tlcs->ColumnSynopses()[0].max_int, kRows);
+
+    (void)tlcs->EvictDecodedCacheForTest(size_t{1} << 40);
+    EXPECT_TRUE(tlcs->HasColumnSynopses());
+    EXPECT_TRUE(tlcs->ColumnSynopses()[0].is_unique_nonnull);
+  }
+  std::unique_ptr<Database> cleanup_db = Database::Create(prefix).MoveValue();
+  cleanup_db->DeleteAll();
+}
+
+TEST(
+    TlcsFileTest,
+    BuildLazyColumnCacheEntriesPopulatesZoneMapsAndDecodesOnlyRequestedBlocks) {
+  const std::string prefix = "tlcs_lazy_blocks_" + RandomString();
+  Schema schema(
+      "lazy_tbl",
+      {Column("id", ValueType::kInt64), Column("tag", ValueType::kVarChar),
+       Column("txt", ValueType::kVarChar), Column("dbl", ValueType::kDouble)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 100000;
+  page_id_t first_pid = 0;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    first_pid = tbl.FirstPageId();
+    for (int64_t i = 0; i < kRows; ++i) {
+      Value tag = (i % 7 == 0) ? Value() : Value("t_" + std::to_string(i % 5));
+      Value txt = Value("payload_" + std::to_string(i));
+      Value dbl =
+          (i % 13 == 0) ? Value() : Value(static_cast<double>(i) * 0.25);
+      ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(i), std::move(tag),
+                                               std::move(txt), std::move(dbl)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "lazy_tbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db.reset();
+  db = Database::Create(prefix).MoveValue();
+
+  {
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "lazy_tbl"));
+    tbl.SetLSTableStore(nullptr);
+    ASSERT_NE(tbl.GetBackingTlcsStore(), nullptr);
+    (void)tbl.GetBackingTlcsStore()->EvictDecodedCacheForTest(size_t{1} << 40);
+    (void)tbl.EvictIdleColumnarHeadroom(size_t{1} << 40);
+
+    std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
+        ctx.txn_, tbl, /*allow_lazy_build=*/true, /*projection=*/nullptr,
+        /*allow_block_lazy=*/true);
+    ASSERT_NE(store, nullptr);
+    EXPECT_TRUE(store->is_block_lazy);
+    ASSERT_EQ(store->blocks.size(), 4U);
+    ASSERT_EQ(first_pid, tbl.FirstPageId());
+
+    for (slot_t c = 0; c < 4; ++c) {
+      ASSERT_NE(store->column_owners[c], nullptr);
+      EXPECT_TRUE(store->column_owners[c]->is_block_lazy);
+      EXPECT_EQ(store->column_owners[c]->LazyDecodedBlockCount(), 0U);
+      EXPECT_TRUE(store->blocks[3].columns[c].int_cells.empty());
+    }
+    EXPECT_TRUE(store->blocks[3].columns[0].has_min_max);
+    EXPECT_EQ(store->blocks[3].columns[0].min_int, 98304);
+    EXPECT_EQ(store->blocks[3].columns[0].max_int, kRows - 1);
+    EXPECT_TRUE(store->blocks[0].columns[1].has_null);
+
+    LSTableStore::LazyBlockScratch scratch;
+    const LSTablePageBlock* mat3 = store->MaterializeBlockView(3, &scratch);
+    ASSERT_NE(mat3, nullptr);
+    for (slot_t c = 0; c < 4; ++c) {
+      EXPECT_EQ(store->column_owners[c]->LazyDecodedBlockCount(), 1U);
+    }
+    const size_t row_base3 = 98304;
+    ASSERT_EQ(mat3->row_count, static_cast<uint32_t>(kRows - row_base3));
+    for (uint32_t r = 0; r < mat3->row_count; ++r) {
+      const auto g = static_cast<int64_t>(row_base3 + r);
+      EXPECT_FALSE(mat3->columns[0].IsNull(r));
+      EXPECT_EQ(mat3->columns[0].IntAt(r), g);
+      if (g % 7 == 0) {
+        EXPECT_TRUE(mat3->columns[1].IsNull(r));
+      } else {
+        EXPECT_FALSE(mat3->columns[1].IsNull(r));
+        EXPECT_EQ(mat3->columns[1].VarcharAt(r), "t_" + std::to_string(g % 5));
+      }
+      EXPECT_FALSE(mat3->columns[2].IsNull(r));
+      EXPECT_EQ(mat3->columns[2].VarcharAt(r), "payload_" + std::to_string(g));
+      if (g % 13 == 0) {
+        EXPECT_TRUE(mat3->columns[3].IsNull(r));
+      } else {
+        EXPECT_FALSE(mat3->columns[3].IsNull(r));
+        EXPECT_DOUBLE_EQ(std::bit_cast<double>(mat3->columns[3].int_cells[r]),
+                         static_cast<double>(g) * 0.25);
+      }
+    }
+
+    const std::array<slot_t, 2> only_02{0, 2};
+    const LSTablePageBlock* mat1 =
+        store->MaterializeBlockView(1, &scratch, only_02);
+    ASSERT_NE(mat1, nullptr);
+    EXPECT_EQ(store->column_owners[0]->LazyDecodedBlockCount(), 2U);
+    EXPECT_EQ(store->column_owners[1]->LazyDecodedBlockCount(), 1U);
+    EXPECT_EQ(store->column_owners[2]->LazyDecodedBlockCount(), 2U);
+    EXPECT_EQ(store->column_owners[3]->LazyDecodedBlockCount(), 1U);
+    EXPECT_EQ(mat1->columns[0].IntAt(5), 32768 + 5);
+    EXPECT_EQ(mat1->columns[2].VarcharAt(5),
+              "payload_" + std::to_string(32768 + 5));
+  }
+  db->DeleteAll();
+}
+
+TEST(TlcsFileTest, DenseGetOrBuildUpgradesLazyCachedColumnsAndReusesBlocks) {
+  const std::string prefix = "tlcs_lazy_upgrade_" + RandomString();
+  Schema schema(
+      "up_tbl",
+      {Column("id", ValueType::kInt64), Column("dt", ValueType::kDate),
+       Column("tag", ValueType::kVarChar), Column("txt", ValueType::kVarChar)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 70000;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    for (int64_t i = 0; i < kRows; ++i) {
+      Value dt =
+          (i % 11 == 0) ? Value() : Value::DateFromDays(18000 + (i % 500));
+      Value tag = (i % 5 == 0) ? Value() : Value("d_" + std::to_string(i % 4));
+      Value txt = Value("s_" + std::to_string(i));
+      ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(i), std::move(dt),
+                                               std::move(tag), std::move(txt)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "up_tbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db.reset();
+  db = Database::Create(prefix).MoveValue();
+
+  {
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "up_tbl"));
+    tbl.SetLSTableStore(nullptr);
+    if (tbl.GetBackingTlcsStore() != nullptr) {
+      (void)tbl.GetBackingTlcsStore()->EvictDecodedCacheForTest(size_t{1}
+                                                                << 40);
+    }
+    (void)tbl.EvictIdleColumnarHeadroom(size_t{1} << 40);
+
+    std::shared_ptr<const LSTableStore> lazy_store = GetOrBuildLSTableStore(
+        ctx.txn_, tbl, /*allow_lazy_build=*/true, /*projection=*/nullptr,
+        /*allow_block_lazy=*/true);
+    ASSERT_NE(lazy_store, nullptr);
+    EXPECT_TRUE(lazy_store->is_block_lazy);
+    ASSERT_EQ(lazy_store->blocks.size(), 3U);
+
+    LSTableStore::LazyBlockScratch scratch;
+    ASSERT_NE(lazy_store->MaterializeBlockView(1, &scratch), nullptr);
+    for (slot_t c = 0; c < 4; ++c) {
+      EXPECT_EQ(lazy_store->column_owners[c]->LazyDecodedBlockCount(), 1U);
+    }
+
+    std::shared_ptr<const LSTableStore> dense_store = GetOrBuildLSTableStore(
+        ctx.txn_, tbl, /*allow_lazy_build=*/true, /*projection=*/nullptr,
+        /*allow_block_lazy=*/false);
+    ASSERT_NE(dense_store, nullptr);
+    EXPECT_FALSE(dense_store->is_block_lazy);
+    EXPECT_EQ(dense_store->IntegerColumn(0).size(), static_cast<size_t>(kRows));
+    EXPECT_EQ(dense_store->IntegerColumn(1).size(), static_cast<size_t>(kRows));
+
+    size_t row_base = 0;
+    for (const auto & blk : dense_store->blocks) {
+      for (uint32_t r = 0; r < blk.row_count; r += 137) {
+        const auto g = static_cast<int64_t>(row_base + r);
+        EXPECT_EQ(blk.columns[0].int_cells[r], g);
+        if (g % 11 == 0) {
+          EXPECT_TRUE(blk.columns[1].IsNull(r));
+        } else {
+          EXPECT_FALSE(blk.columns[1].IsNull(r));
+          EXPECT_EQ(blk.columns[1].int_cells[r], 18000 + (g % 500));
+        }
+        if (g % 5 == 0) {
+          EXPECT_TRUE(blk.columns[2].IsNull(r));
+        } else {
+          EXPECT_FALSE(blk.columns[2].IsNull(r));
+          EXPECT_EQ(blk.columns[2].VarcharAt(r), "d_" + std::to_string(g % 4));
+        }
+        EXPECT_EQ(blk.columns[3].VarcharAt(r), "s_" + std::to_string(g));
+      }
+      row_base += blk.row_count;
+    }
+    EXPECT_EQ(row_base, static_cast<size_t>(kRows));
+  }
+  db->DeleteAll();
+}
+
+TEST(TlcsFileTest,
+     LazyBlockDecodeFallsBackToTransientUnderTightColumnarBudget) {
+  TlcsBudgetResetGuard budget_guard;
+  const std::string prefix = "tlcs_lazy_transient_" + RandomString();
+  Schema schema("trans_tbl", {Column("id", ValueType::kInt64),
+                              Column("txt", ValueType::kVarChar)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  constexpr int64_t kRows = 70000;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->CreateTable(ctx, schema));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          tbl.Insert(ctx.txn_,
+                     Row({Value(i), Value("row_" + std::to_string(i))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_SUCCESS(db->CompactTableToTlcs(ctx, "trans_tbl"));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db.reset();
+
+  ScopedEnvVar no_mmap("TINYLAMB_TLCS_MMAP_LIMIT_BYTES", "0");
+  db = Database::Create(prefix).MoveValue();
+  {
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, tbl, db->GetTable(ctx, "trans_tbl"));
+    tbl.SetLSTableStore(nullptr);
+    (void)tbl.EvictIdleColumnarHeadroom(size_t{1} << 40);
+
+    std::shared_ptr<const LSTableStore> lazy_store = GetOrBuildLSTableStore(
+        ctx.txn_, tbl, /*allow_lazy_build=*/true, /*projection=*/nullptr,
+        /*allow_block_lazy=*/true);
+    ASSERT_NE(lazy_store, nullptr);
+    EXPECT_TRUE(lazy_store->is_block_lazy);
+
+    auto& budget = ProcessMemoryBudget::Global();
+    budget.SetColumnarPoolLimitForTest(budget.ColumnarUsed() + 64);
+
+    LSTableStore::LazyBlockScratch scratch;
+    const LSTablePageBlock* mat0 =
+        lazy_store->MaterializeBlockView(0, &scratch);
+    ASSERT_NE(mat0, nullptr);
+    EXPECT_FALSE(scratch.transient.empty());
+    EXPECT_EQ(lazy_store->column_owners[0]->LazyDecodedBlockCount(), 0U);
+    EXPECT_EQ(lazy_store->column_owners[1]->LazyDecodedBlockCount(), 0U);
+    ASSERT_EQ(mat0->row_count, 32768U);
+    EXPECT_EQ(mat0->columns[0].IntAt(0), 0);
+    EXPECT_EQ(mat0->columns[0].IntAt(12345), 12345);
+    EXPECT_EQ(mat0->columns[1].VarcharAt(12345), "row_12345");
+    scratch.transient.clear();
+  }
+  db->DeleteAll();
 }
 
 }  // namespace

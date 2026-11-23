@@ -6,7 +6,7 @@ Read before designing, cite when changing behavior. Most binding first:
 - `recovery_invariants.md`, `wal_format.md` — committed-snapshot recovery invariants +
   on-disk WAL layout. The current `LogRecord::kCurrentVersion` is defined in
   `wal_format.md` and `recovery/log_record.hpp`; don't duplicate the number here.
-- `page_format.md`, `page_checksum.md`, `value_storage.md` — on-disk formats (`<db>.db` snapshot v4, `.blocks.<gen>`, `.lsm.<gen>`, TLCS v2).
+- `page_format.md`, `page_checksum.md`, `value_storage.md` — on-disk formats (`<db>.db` snapshot v4, `.blocks.<gen>`, `.lsm.<gen>`, TLCS v3).
 - `expression_evaluation.md` — AST/Bytecode/JIT equivalence contract.
 - `cascades_optimizer.md`, `optimizer_improvements.md`, `optimizer_rule_audit.md` —
   optimizer design, rule registry, and historical work.

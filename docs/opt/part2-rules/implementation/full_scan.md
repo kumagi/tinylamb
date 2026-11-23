@@ -56,19 +56,40 @@ graph TD
 ### 2. LIMIT 条件の安全な押し込み判定
 順序保証を伴わない単純な LIMIT は、スキャンの反復上限（`scan_limit`）として下位へ沈めることが可能です。ただし、以下のケースではスキャン上限を設定すると誤った結果を生じるため、`CanPushLimitIntoFullScan` により厳格に排除されます。
 - 述語（`filter`）が存在する場合（フィルタ通過前の行数で打ち切る誤りを防止）。
-- `DISTINCT`、`ORDER BY`、または集約関数を含む場合（全タプルを走査しなければ最終結果が確定しないため）。
+- `DISTINCT`、`ORDER BY`、`GROUP BY`（`grouping_keys_` が非空）、または集約関数を含む場合（全タプルを走査しなければ最終結果が確定しないため）。
+- `TABLESAMPLE` を含む場合（`context.query->samples_` が空でない場合）。標本抽出はスキャンの**後**に適用されるため、入力を切ると標本の母集合そのものが変わってしまいます（#670 の誤結果修正）。文レベルの `LimitPlan` が標本抽出後の出力へ LIMIT を適用します。
+- `SELECT` リストに窓関数を含む場合。既定のフレームはパーティション全体であり、`UNBOUNDED FOLLOWING` / `LEAD` / `NTILE` / `CUME_DIST` などは LIMIT で切られた先の行を読みます。
+- `QUALIFY` に集約関数または窓関数を含む場合（上と同じく、入力全体を必要とするため）。
 
 ```cpp
   if (filter || context.query == nullptr || context.query->limit_count_ == 0 ||
-      context.query->distinct_ || !context.query->order_expressions_.empty() ||
+      context.query->distinct_ || !context.query->grouping_keys_.empty() ||
+      !context.query->order_expressions_.empty() ||
+      // TABLESAMPLE is applied AFTER the scan, so truncating the scan input
+      // changes which rows are even eligible for sampling (REPEATABLE draws
+      // from a different population). The statement-level LimitPlan applies
+      // LIMIT to the sampled output instead.
+      !context.query->samples_.empty() ||
       required.limit_hint == std::numeric_limits<size_t>::max() ||
       required.limit_hint == 0) {
     return false;
   }
-  return !std::ranges::any_of(context.query->select_, [](const auto& output) {
-    return ContainsAggregateExpression(output.expression);
-  });
+  // Aggregation must see every input row even when its result has a LIMIT.
+  // Window functions are equally input-holistic: the default frame is the
+  // whole partition, and any frame reaching past the current row
+  // (UNBOUNDED FOLLOWING, LEAD, NTILE, CUME_DIST, ...) reads rows the
+  // limit prefix would truncate away.
+  return !std::ranges::any_of(
+             context.query->select_,
+             [](const auto& output) {
+               return ContainsAggregateExpression(output.expression) ||
+                      ContainsWindowFunctionExpression(output.expression);
+             }) &&
+         !ContainsAggregateExpression(context.query->qualify_) &&
+         !ContainsWindowFunctionExpression(context.query->qualify_);
 ```
+
+上記は現行 `plan/implementation_rules.cpp` の `CanPushLimitIntoFullScan` の抜粋です（2026-11-23 にガード列挙と引用を同期）。
 
 ## 実装の詳細
 
@@ -101,7 +122,7 @@ graph TD
 
 順序は**測定**であって保証ではないため、コスト計算とは切り離します。`PlanBase::OrderIsMeasured()` がその区別を表し、構造的な順序（索引・スート）と違い、全チェーンを読んだ代償が残ります。したがって direct path の「順序付き候補を優先」段も `ApplyLimitHint` の LIMIT 早期打ち切り割引も、測定された順序には適用しません。適用せずにいると `ORDER BY pk LIMIT 1` が全表読みを「1行読み」として評価し、索引アクセスを追い越してしまいます。
 
-さらに、この順序は次の行変異で失効しうるため、`sql_engine.cpp` はこの文脈で解決済みテーブルに順序主張がある間、その文の plan をコンパイル済み plan キャッシュへ入れません。キャッシュされた plan には「ソート助教 = 上限の折畳み / クラスタ prefix の IncrementalSort」のように順序依存の構造が焼き込まれており、別の snapshot で再生すると壊れるためです。
+さらに、この順序は次の行変異で失効しうるため、`sql_engine.cpp` はこの文脈で解決済みテーブルに順序主張がある間、その文の plan をコンパイル済み plan キャッシュへ入れません。キャッシュされた plan には「ソート補助 = 上限の折畳み / クラスタ prefix の IncrementalSort」のように順序依存の構造が焼き込まれており、別の snapshot で再生すると壊れるためです。
 
 ## 最適化効果
 

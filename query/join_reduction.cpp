@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/log_message.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -87,7 +88,16 @@ bool IsStrictOnQualifiers(const Expression& expression,
       const InExpression& in = expression->AsInExpression();
       // `NULL IN ()` evaluates to FALSE in SQL, not NULL, so an empty IN list
       // is NOT NULL-strict (`(r.a IN ()) IS FALSE` is TRUE on padded rows).
-      return !in.list_.empty() && IsStrictOnQualifiers(in.child_, qualifiers);
+      // `x IN (padded.y)` is NULL on padded rows too: when every list element
+      // is NULL the comparison set cannot produce a TRUE, so the list side
+      // proves NULL-strictness just as the child side does.
+      if (in.list_.empty()) {
+        return false;
+      }
+      return IsStrictOnQualifiers(in.child_, qualifiers) ||
+             std::ranges::all_of(in.list_, [&](const Expression& item) {
+               return IsStrictOnQualifiers(item, qualifiers);
+             });
     }
     case TypeTag::kFunctionCallExp: {
       const auto& function = expression->AsFunctionCallExpression();
@@ -200,8 +210,13 @@ bool RejectsNulls(const Expression& expression,
       const InExpression& in = expression->AsInExpression();
       if (!in.list_.empty()) {
         // `padded_col IN (1, 2)` is NULL for padded rows when the operand
-        // rejects; the value list cannot resurrect a NULL operand.
-        return IsStrictOnQualifiers(in.child_, qualifiers);
+        // rejects; the value list cannot resurrect a NULL operand. The dual
+        // case `real_col IN (padded_col)` is also NULL-rejecting: every list
+        // element becomes NULL, so no comparison can evaluate TRUE.
+        return IsStrictOnQualifiers(in.child_, qualifiers) ||
+               std::ranges::all_of(in.list_, [&](const Expression& item) {
+                 return IsStrictOnQualifiers(item, qualifiers);
+               });
       }
       return false;
     }
@@ -348,8 +363,16 @@ bool QualifyExpressionWithCatalog(  // NOLINT(misc-no-recursion)
     if (!agg.Child()) {
       return true;
     }
+    // NeedsGroupContext() already rejects every aggregate carrying a HAVING
+    // modifier, an inner ORDER BY / LIMIT, a secondary argument or trailing
+    // arguments, so the copy below only ever handles a plain per-row fold.
+    // Keep the check explicit: copying only Child/Distinct/IgnoreNulls/
+    // ArrayElementSqlType would silently drop the group-context state if this
+    // guard were ever relaxed.
     if (agg.NeedsGroupContext() || agg.HasWhereFilter() ||
-        !agg.InnerGroupBy().empty()) {
+        !agg.InnerGroupBy().empty() || agg.Having() != AggregateHavingModifier::kNone ||
+        !agg.InnerOrderBy().empty() || agg.InnerLimit().has_value() ||
+        agg.SecondaryArg() || !agg.TrailingArgs().empty()) {
       return false;
     }
     Expression child = agg.Child();
@@ -465,9 +488,18 @@ bool HavingRejectsNullsOnPaddedSide(
   std::unordered_map<std::string, Expression> aliases;
   for (const NamedExpression& item : statement.SelectList()) {
     if (!item.name.empty() && item.expression) {
-      aliases.emplace(item.name, item.expression);
+      // A duplicate output name is invalid SQL and the executor's alias
+      // resolution falls back rather than picking one; prove nothing here
+      // instead of rewriting HAVING with an arbitrarily chosen first match.
+      if (!aliases.emplace(item.name, item.expression).second) {
+        return false;
+      }
     }
   }
+  // Aliases may reference other aliases (`SELECT SUM(x) AS s, s + 1 AS t ...
+  // HAVING t > 5`), so expand them transitively. The active set breaks cycles
+  // such as `SELECT x AS x` instead of recursing forever.
+  std::unordered_set<std::string> expanding_aliases;
   const std::function<Expression(const Expression&)> substitute_aliases =
       [&](const Expression& expr) -> Expression {
     if (!expr) {
@@ -477,8 +509,11 @@ bool HavingRejectsNullsOnPaddedSide(
       const ColumnName& col = expr->AsColumnValue().GetColumnName();
       if (col.schema.empty()) {
         const auto found = aliases.find(col.name);
-        if (found != aliases.end()) {
-          return found->second;
+        if (found != aliases.end() &&
+            expanding_aliases.insert(col.name).second) {
+          Expression expanded = substitute_aliases(found->second);
+          expanding_aliases.erase(col.name);
+          return expanded;
         }
       }
       return expr;
@@ -517,6 +552,7 @@ bool HavingRejectsNullsOnPaddedSide(
 
   bool ok = true;
   std::vector<const AggregateExpression*> aggs;
+  aggs.reserve(statement.SelectList().size());
   const std::function<void(const Expression&)> inspect_expr =
       [&](const Expression& expr) {
         if (!expr || !ok) {
@@ -663,6 +699,13 @@ bool ReduceOuterJoins(SelectStatement* statement, TransactionContext* ctx) {
       }
       StatusOr<std::shared_ptr<Table>> tbl = ctx->GetTable(src.table);
       if (!tbl.HasValue()) {
+        // This rewrite is best-effort (bool result), so it cannot fail the
+        // statement. Do not swallow the diagnostic, though: a corrupt catalog
+        // or an I/O error is a real failure that the later planning path must
+        // report, and the log gives the operator a reason for the fallback.
+        LOG(WARN) << "ReduceOuterJoins: GetTable(" << src.table << ") failed: "
+                  << ToString(tbl.GetStatus()) << " ("
+                  << tbl.GetStatus().GetMessage() << ")";
         catalog_complete = false;
         break;
       }

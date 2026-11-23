@@ -57,6 +57,12 @@ def olap_table(records, suite, scale):
     return markdown(["クエリ", *[f"{e} ms" for e in LABELS]], rows), grouped
 
 
+def _median_role_tps(records, role):
+    values = [record.get("role_tps", {}).get(role) for record in records]
+    available = [value for value in values if value is not None]
+    return f"{statistics.median(available):,.1f}" if available else "n/a"
+
+
 def oltp_tables(records):
     groups = defaultdict(lambda: defaultdict(list))
     for record in records:
@@ -98,8 +104,8 @@ def oltp_tables(records):
             latency_values.append(latency)
             if name == "htap":
                 htap_rows.append([engine, clients,
-                                  f"{statistics.median(t['role_tps'].get('transaction', 0) for t in valid):,.1f}",
-                                  f"{statistics.median(t['role_tps'].get('reader', 0) for t in valid):,.1f}", f"{rate:.2f}%"])
+                                  _median_role_tps(valid, "transaction"),
+                                  _median_role_tps(valid, "reader"), f"{rate:.2f}%"])
         tps_rows.append([name, clients, *tps_values])
         latency_rows.append([name, clients, *latency_values])
     return (markdown(["処理", "接続数", *[f"{e} 成功TPS [最小–最大]; 失敗率" for e in LABELS]], tps_rows),
@@ -123,6 +129,13 @@ def draw(records, output, micro, tpch, oltp):
     def horizontal(grouped, filename, title):
         fig, ax = plt.subplots(figsize=(11, max(6, len(grouped) * .40)))
         y = np.arange(len(grouped))
+        if not ENGINES:
+            ax.text(.5, .5, "No supported engines in input", transform=ax.transAxes,
+                    ha="center", va="center")
+            ax.set_axis_off()
+            save(fig, filename)
+            plt.close(fig)
+            return
         step = .72 / len(ENGINES)
         for index, (engine, label, color) in enumerate(zip(ENGINES, LABELS, COLORS)):
             offset = (index - (len(ENGINES) - 1) / 2) * step
@@ -238,8 +251,13 @@ def main():
                      if baseline in engines and "tinylamb" in engines
                      and engines[baseline]["correct"] and engines["tinylamb"]["correct"]]
             if pairs:
-                ratios[f"{suite}_vs_{baseline}"] = {"n": len(pairs), "tinylamb_faster": sum(a > b for a, b in pairs),
-                                                    "geomean_baseline_over_tinylamb": math.exp(statistics.mean(math.log(a / b) for a, b in pairs))}
+                positive_pairs = [(a, b) for a, b in pairs if a > 0 and b > 0]
+                ratio = {"n": len(pairs), "tinylamb_faster": sum(a > b for a, b in pairs),
+                         "geomean_n": len(positive_pairs)}
+                if positive_pairs:
+                    ratio["geomean_baseline_over_tinylamb"] = math.exp(
+                        statistics.mean(math.log(a / b) for a, b in positive_pairs))
+                ratios[f"{suite}_vs_{baseline}"] = ratio
     (output / "ratios.json").write_text(json.dumps(ratios, indent=2))
     if not args.no_plots:
         draw(records, output, micro, tpch, oltp)

@@ -2,8 +2,8 @@
 
 // Compiled into every gtest binary (see add_simple_test in CMakeLists.txt).
 // Tests open throwaway databases through relative paths, so the engine
-// creates <name>.db / <name>.log / <name>.last_checkpoint in the CURRENT
-// WORKING DIRECTORY.  When a test skips its DeleteAll() cleanup, those
+// creates <name>.db / <name>.log plus WAL segment and companion files in the
+// CURRENT WORKING DIRECTORY.  When a test skips its DeleteAll() cleanup, those
 // files pile up next to the binary (hundreds per ctest sweep, and manual
 // `./build/foo_test` runs pollute the project root).  Database::Create()
 // registers every opened base name; this environment unlinks exactly the
@@ -13,8 +13,12 @@
 // TINYLAMB_KEEP_TEST_DATABASES=1 disables the sweep for debugging.
 
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <unordered_set>
 
 #include "database/database.hpp"
 #include "gtest/gtest.h"
@@ -24,6 +28,32 @@ namespace {
 class TestDatabaseCleanup : public ::testing::Environment {
  public:
   void SetUp() override {
+    // Record existing database bases before tests run. Database::Create also
+    // sees reopen operations, so its process-local registration alone cannot
+    // distinguish a test-created path from a user's pre-existing database.
+    std::error_code ec;
+    std::filesystem::directory_iterator it(".", ec);
+    const std::filesystem::directory_iterator end;
+    if (ec) {
+      snapshot_complete_ = false;
+    } else {
+      for (; it != end; it.increment(ec)) {
+        if (ec) {
+          snapshot_complete_ = false;
+          break;
+        }
+        const std::string filename = it->path().filename().string();
+        constexpr std::string_view kDatabaseSuffix = ".db";
+        if (filename.size() > kDatabaseSuffix.size() &&
+            filename.ends_with(kDatabaseSuffix)) {
+          preexisting_database_bases_.insert(
+              filename.substr(0, filename.size() - kDatabaseSuffix.size()));
+        }
+      }
+      if (ec) {
+        snapshot_complete_ = false;
+      }
+    }
     const char* keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
     const std::string_view value = keep == nullptr ? "" : keep;
     keep_artifacts_ = value == "1" || value == "true" || value == "yes" ||
@@ -33,13 +63,16 @@ class TestDatabaseCleanup : public ::testing::Environment {
   // gtest's Environment::TearDown is a non-const virtual, so the const
   // transformation the checker suggests would silently drop the override.
   void TearDown() override {  // NOLINT(readability-make-member-function-const)
-    if (!keep_artifacts_) {
-      tinylamb::Database::RemoveCreatedDatabaseFiles();
+    if (!keep_artifacts_ && snapshot_complete_) {
+      tinylamb::Database::RemoveCreatedDatabaseFiles(
+          preexisting_database_bases_);
     }
   }
 
  private:
   bool keep_artifacts_{false};
+  bool snapshot_complete_{true};
+  std::unordered_set<std::string> preexisting_database_bases_;
 };
 
 // AddGlobalTestEnvironment must run before RUN_ALL_TESTS; a static

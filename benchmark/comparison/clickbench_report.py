@@ -30,9 +30,15 @@ def read_run(directory, reference):
 def report(duck, click, output):
     dm, dr = read_run(duck, 'duckdb')
     cm, cr = read_run(click, 'clickhouse')
-    for field in ('binary_sha256', 'threads', 'cpus', 'warmups', 'repeats'):
-        if dm[field] != cm[field]:
+    for field in ('binary_sha256', 'threads', 'cpus', 'warmups', 'repeats',
+                  'reverse', 'reference_session'):
+        # Both runs must have followed the same query order: --reverse swaps
+        # which engine runs first on odd/even queries, which is exactly the
+        # cache/warm-up bias this report is supposed to control for.
+        if dm.get(field) != cm.get(field):
             raise ValueError('comparison conditions differ: ' + field)
+    if dm.get('reference_session_timezone') != cm.get('reference_session_timezone'):
+        raise ValueError('comparison conditions differ: reference_session_timezone')
     for field in ('rows', 'sources', 'query_sha256', 'timezone', 'upstream_commit'):
         if dm['dataset'][field] != cm['dataset'][field]:
             raise ValueError('datasets differ: ' + field)

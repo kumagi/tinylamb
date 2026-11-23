@@ -105,15 +105,10 @@ class WindowPlan final : public PlanBase {
   ~WindowPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
-  [[nodiscard]] bool ContainsParameterSlots() const override {
-    return child_ != nullptr && child_->ContainsParameterSlots();
-  }
+  [[nodiscard]] bool ContainsParameterSlots() const override;
   bool InstallParameterSlots(const std::vector<Value>& parameters,
                              size_t* cursor,
-                             std::vector<Expression>* slots) override {
-    return child_ == nullptr ||
-           child_->InstallParameterSlots(parameters, cursor, slots);
-  }
+                             std::vector<Expression>* slots) override;
 
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
   [[nodiscard]] const TableStatistics& GetStats() const override {

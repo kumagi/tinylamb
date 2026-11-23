@@ -1317,7 +1317,8 @@ bool TryBuildDirectColumnarScanSpec(
       break;
     }
     if (const auto* lim = dynamic_cast<const LimitPlan*>(cur)) {
-      if (seen_limit || seen_sort || seen_selection || need_limit) {
+      if (seen_limit || seen_sort || seen_selection || need_limit ||
+          lim->PriorOffset() != 0) {
         return dbg_bail("limit position or need_limit");
       }
       seen_limit = true;
@@ -1328,7 +1329,7 @@ bool TryBuildDirectColumnarScanSpec(
     if (const auto* topn = dynamic_cast<const TopNPlan*>(cur)) {
       if (seen_limit || seen_sort || seen_selection || need_sort ||
           topn->WithTies() || !has_limit || topn->Limit() != limit ||
-          topn->Offset() != offset) {
+          topn->Offset() != offset || topn->PriorOffset() != 0) {
         return dbg_bail("topn position/params mismatch");
       }
       seen_limit = true;
@@ -1407,7 +1408,7 @@ bool TryBuildDirectColumnarScanSpec(
   for (size_t idx = chain.size(); idx > 0; --idx) {
     if (chain[idx - 1].kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(
+          dynamic_cast<const RelationRenamePlan*>(
               chain[idx - 1]
                   .node)  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
               ->RelationName();
@@ -1429,26 +1430,26 @@ bool TryBuildDirectColumnarScanSpec(
     for (const Frame& f : chain) {
       if (f.kind == Frame::Kind::kSelection) {
         probe_expr(
-            static_cast<const SelectionPlan*>(f.node)
+            dynamic_cast<const SelectionPlan*>(f.node)
                 ->Predicate());  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       } else if (f.kind == Frame::Kind::kProjection) {
         for (
             const auto& item :
-            static_cast<const ProjectionPlan*>(f.node)
+            dynamic_cast<const ProjectionPlan*>(f.node)
                 ->Columns()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(item.expression);
         }
       } else if (f.kind == Frame::Kind::kTopN) {
         for (
             const auto& k :
-            static_cast<const TopNPlan*>(f.node)
+            dynamic_cast<const TopNPlan*>(f.node)
                 ->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
       } else if (f.kind == Frame::Kind::kSort) {
         for (
             const auto& k :
-            static_cast<const SortPlan*>(f.node)
+            dynamic_cast<const SortPlan*>(f.node)
                 ->Keys()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           probe_expr(k.expression);
         }
@@ -1463,10 +1464,10 @@ bool TryBuildDirectColumnarScanSpec(
     const Frame& frame = chain[idx - 1];
     if (frame.kind == Frame::Kind::kRename) {
       cur_qualifier =
-          static_cast<const RelationRenamePlan*>(frame.node)
+          dynamic_cast<const RelationRenamePlan*>(frame.node)
               ->RelationName();  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     } else if (frame.kind == Frame::Kind::kSelection) {
-      const auto* sel = static_cast<const SelectionPlan*>(
+      const auto* sel = dynamic_cast<const SelectionPlan*>(
           frame
               .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       std::vector<Expression> conjuncts = SplitConjuncts(sel->Predicate());
@@ -1498,7 +1499,7 @@ bool TryBuildDirectColumnarScanSpec(
                            sub.inlists.end());
       preds.nulls.insert(preds.nulls.end(), sub.nulls.begin(), sub.nulls.end());
     } else if (frame.kind == Frame::Kind::kProjection) {
-      const auto* proj = static_cast<const ProjectionPlan*>(
+      const auto* proj = dynamic_cast<const ProjectionPlan*>(
           frame
               .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       const Schema child_schema =
@@ -1519,14 +1520,14 @@ bool TryBuildDirectColumnarScanSpec(
       }
       cur_to_full = std::move(next_to_full);
     } else if (frame.kind == Frame::Kind::kTopN) {
-      embedded_topn = static_cast<const TopNPlan*>(
+      embedded_topn = dynamic_cast<const TopNPlan*>(
           frame
               .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       topn_to_full = cur_to_full;
       topn_schema =
           EnsureQualified(embedded_topn->Child()->GetSchema(), cur_qualifier);
     } else if (frame.kind == Frame::Kind::kSort) {
-      embedded_sort = static_cast<const SortPlan*>(
+      embedded_sort = dynamic_cast<const SortPlan*>(
           frame
               .node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
       sort_to_full = cur_to_full;

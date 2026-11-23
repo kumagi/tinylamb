@@ -344,6 +344,14 @@ class OocSetOpOutputSource final : public PipelineSource {
         }
       }
       {
+        // Same T4854 bound as the incremental-sort keys: a wider set row
+        // would wrap OocSortKey::column_index (slot_t) and make a sorter key
+        // alias another column, corrupting EXCEPT/INTERSECT emit decisions.
+        if (width_ > static_cast<size_t>(std::numeric_limits<slot_t>::max()) +
+                         1) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "set operation sorter key column out of range");
+        }
         std::vector<OocSortKey> keys;
         keys.reserve(width_ + 1);
         for (size_t c = 0; c < width_; ++c) {
@@ -436,6 +444,22 @@ class OocSetOpOutputSource final : public PipelineSource {
     return left > sub ? (left - sub) : 0;
   }
 
+  StatusOr<size_t> RemoveSourceTag(Row* tagged) const {
+    if (tagged->Count() == 0 || tagged->Count() - 1 != width_) {
+      return StatusError(StatusCode::kCorrupt,
+                         "set operation spill row width mismatch");
+    }
+    const Value& tag = tagged->values_.back();
+    if (tag.type != ValueType::kInt64 || tag.value.int_value < 0 ||
+        std::cmp_greater_equal(tag.value.int_value, num_sources_)) {
+      return StatusError(StatusCode::kCorrupt,
+                         "set operation spill row has an invalid source tag");
+    }
+    const auto source = static_cast<size_t>(tag.value.int_value);
+    tagged->values_.pop_back();
+    return source;
+  }
+
   Status PumpSkewSorter() {
     if (skew_lookahead_.has_value()) {
       skew_current_row_ = std::move(*skew_lookahead_);
@@ -468,11 +492,7 @@ class OocSetOpOutputSource final : public PipelineSource {
         }
         return Status::kSuccess;
       }
-      const size_t src_idx =
-          tagged.Count() > width_
-              ? static_cast<size_t>(tagged[width_].value.int_value)
-              : 0U;
-      tagged.values_.resize(width_);
+      ASSIGN_OR_RETURN(size_t, src_idx, RemoveSourceTag(&tagged));
       if (!skew_has_row_) {
         skew_current_row_ = std::move(tagged);
         std::fill(skew_counts_.begin(), skew_counts_.end(), 0);
@@ -522,16 +542,18 @@ class OocSetOpOutputSource final : public PipelineSource {
                        SetRowPrefixEq>
         counts(16, hasher, eq);
     std::vector<Row> ordered_keys;
+    const auto discard_leaf_containers = [&] {
+      decltype(counts) empty_counts(0, hasher, eq);
+      counts.swap(empty_counts);
+      std::vector<Row> empty_keys;
+      ordered_keys.swap(empty_keys);
+    };
     size_t leaf_reserved = 0;
     bool grant_exhausted = false;
 
     Status read_st = RecursivePartitioner::ReadLeafRows(
         store_, leaf, [&](Row&& tagged) -> Status {
-          const size_t src_idx =
-              tagged.Count() > width_
-                  ? static_cast<size_t>(tagged[width_].value.int_value)
-                  : 0U;
-          tagged.values_.resize(width_);
+          ASSIGN_OR_RETURN(size_t, src_idx, RemoveSourceTag(&tagged));
           if (!common_types_.empty()) {
             RETURN_IF_FAIL(CoerceRowToTypes(&tagged, common_types_));
           }
@@ -560,24 +582,28 @@ class OocSetOpOutputSource final : public PipelineSource {
         });
 
     if (grant_exhausted) {
-      counts.clear();
-      ordered_keys.clear();
-      ordered_keys.shrink_to_fit();
+      discard_leaf_containers();
       if (grant_cache_.has_value()) {
         grant_cache_->ReleaseAll();
       }
       *fell_back_to_skew = true;
       return Status::kSuccess;
     }
-    RETURN_IF_FAIL(read_st);
+    if (!read_st.ok()) {
+      discard_leaf_containers();
+      if (grant_cache_.has_value()) {
+        grant_cache_->ReleaseAll();
+      }
+      return read_st;
+    }
 
     ready_rows_.clear();
     ready_cursor_ = 0;
     size_t ready_bytes = 0;
-    // leaf_reserved already covers the distinct keys. Charge only the exact
-    // deficit when duplicate output rows push the resident bytes past it, so
-    // the grant ledger tracks the real resident size instead of adding
-    // key_bytes per row on top of the leaf reservation.
+    // leaf_reserved covers `counts` + `ordered_keys`; `ready_rows_` is a third
+    // copy, so it must be charged *on top of* leaf_reserved while all three
+    // coexist. Destroy the leaf containers before returning their reservation
+    // below, leaving only `ready_rows_` resident.
     size_t charged_bytes = leaf_reserved;
     for (Row& key : ordered_keys) {
       auto it = counts.find(key);
@@ -587,14 +613,12 @@ class OocSetOpOutputSource final : public PipelineSource {
       const uint64_t emit_n = ComputeEmitCount(it->second);
       const size_t key_bytes = EstimateRowMemoryBytes(key) + 16;
       for (uint64_t i = 0; i < emit_n; ++i) {
-        if (ready_bytes + key_bytes > charged_bytes &&
-            grant_cache_.has_value()) {
-          const size_t deficit = ready_bytes + key_bytes - charged_bytes;
+        const size_t needed = leaf_reserved + ready_bytes + key_bytes;
+        if (needed > charged_bytes && grant_cache_.has_value()) {
+          const size_t deficit = needed - charged_bytes;
           if (!grant_cache_->Reserve(deficit)) {
-            ready_rows_.clear();
-            ready_rows_.shrink_to_fit();
-            counts.clear();
-            ordered_keys.clear();
+            std::vector<Row>().swap(ready_rows_);
+            discard_leaf_containers();
             grant_cache_->ReleaseAll();
             *fell_back_to_skew = true;
             return Status::kSuccess;
@@ -605,6 +629,7 @@ class OocSetOpOutputSource final : public PipelineSource {
         ready_rows_.push_back(key);
       }
     }
+    discard_leaf_containers();
     if (grant_cache_.has_value() && charged_bytes > ready_bytes) {
       grant_cache_->Release(charged_bytes - ready_bytes);
     }
@@ -636,32 +661,27 @@ class OocSetOpOutputSource final : public PipelineSource {
   size_t skew_lookahead_src_{0};
 };
 
-std::vector<ValueType> InferCommonTypes(
-    const std::vector<OocSetOpInputStream>& inputs,
-    const std::vector<ValueType>& explicit_types) {
-  if (!explicit_types.empty() || inputs.empty()) {
-    return explicit_types;
+template <typename SchemaAt>
+Status InferCommonTypes(size_t input_count, const SchemaAt& schema_at,
+                        std::vector<ValueType>* types) {
+  if (!types->empty() || input_count == 0) {
+    return Status::kSuccess;
   }
-  const size_t cols = inputs[0].schema.ColumnCount();
-  std::vector<ValueType> types(cols, ValueType::kNull);
+  const size_t cols = schema_at(0).ColumnCount();
+  types->resize(cols, ValueType::kNull);
   for (size_t c = 0; c < cols; ++c) {
-    ValueType cur = inputs[0].schema.GetColumn(c).Type();
-    for (size_t s = 1; s < inputs.size(); ++s) {
-      if (c < inputs[s].schema.ColumnCount()) {
-        StatusOr<ValueType> unified =
-            CommonSetValueType(cur, inputs[s].schema.GetColumn(c).Type());
-        if (!unified.HasValue()) {
-          // Carry the failure as an invalid type; Open() reports it instead
-          // of silently coercing every branch to the first branch's type.
-          cur = ValueType::kNull;
-          break;
-        }
-        cur = unified.Value();
+    ValueType cur = schema_at(0).GetColumn(c).Type();
+    for (size_t s = 1; s < input_count; ++s) {
+      const Schema& schema = schema_at(s);
+      if (c < schema.ColumnCount()) {
+        ASSIGN_OR_RETURN(ValueType, unified,
+                         CommonSetValueType(cur, schema.GetColumn(c).Type()));
+        cur = unified;
       }
     }
-    types[c] = cur;
+    (*types)[c] = cur;
   }
-  return types;
+  return Status::kSuccess;
 }
 
 }  // namespace
@@ -673,15 +693,14 @@ OocConcatSource::OocConcatSource(std::vector<OocSetOpInputStream> inputs,
                                  const std::vector<ValueType>& common_types)
     : inputs_(std::move(inputs)),
       output_schema_(std::move(output_schema)),
-      common_types_(InferCommonTypes(inputs_, common_types)) {}
+      common_types_(common_types) {
+  common_type_status_ = InferCommonTypes(
+      inputs_.size(), [&](size_t i) -> const Schema& { return inputs_[i].schema; },
+      &common_types_);
+}
 
 Status OocConcatSource::Open(PipelineContext* ctx) {
-  for (const ValueType type : common_types_) {
-    if (type == ValueType::kNull) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "set operation inputs have incompatible types");
-    }
-  }
+  RETURN_IF_FAIL(common_type_status_);
   opened_ = true;
   active_idx_ = 0;
   if (!inputs_.empty()) {
@@ -749,7 +768,10 @@ OocMergeAppendSource::OocMergeAppendSource(
     const std::vector<ValueType>& common_types)
     : order_keys_(std::move(order_keys)),
       output_schema_(std::move(output_schema)),
-      common_types_(InferCommonTypes(inputs, common_types)) {
+      common_types_(common_types) {
+  common_type_status_ = InferCommonTypes(
+      inputs.size(), [&](size_t i) -> const Schema& { return inputs[i].schema; },
+      &common_types_);
   cursors_.reserve(inputs.size());
   for (OocSetOpInputStream& in : inputs) {
     Cursor cur;
@@ -763,6 +785,7 @@ OocMergeAppendSource::OocMergeAppendSource(
 }
 
 Status OocMergeAppendSource::Open(PipelineContext* ctx) {
+  RETURN_IF_FAIL(common_type_status_);
   auto pull_cursor = [&](size_t idx) -> Status {
     Cursor& c = cursors_[idx];
     if (c.stream.source != nullptr) {
@@ -790,6 +813,7 @@ Status OocMergeAppendSource::Open(PipelineContext* ctx) {
                        EvalRowExpression(k.expression, output_schema_, r));
       c.cached_keys.push_back(std::move(kv));
     }
+    RETURN_IF_FAIL(ObserveSortKeys(key_orders_, c.cached_keys));
     return Status::kSuccess;
   };
   for (size_t i = 0; i < cursors_.size(); ++i) {
@@ -856,6 +880,7 @@ StatusOr<bool> OocMergeAppendSource::NextBatch(PipelineContext* ctx,
                        EvalRowExpression(k.expression, output_schema_, r));
       c.cached_keys.push_back(std::move(kv));
     }
+    RETURN_IF_FAIL(ObserveSortKeys(key_orders_, c.cached_keys));
   }
   return !out->Empty();
 }
@@ -883,24 +908,11 @@ OocSetOpCoordinator::OocSetOpCoordinator(SetOperationKind operation,
       num_sources_(child_schemas.size()),
       in_mem_rows_(child_schemas.size()) {
   if (!child_schemas.empty()) {
-    const size_t cols = child_schemas[0].ColumnCount();
-    common_types_.resize(cols, ValueType::kNull);
-    for (size_t c = 0; c < cols; ++c) {
-      ValueType cur = child_schemas[0].GetColumn(c).Type();
-      for (size_t s = 1; s < child_schemas.size(); ++s) {
-        if (c < child_schemas[s].ColumnCount()) {
-          StatusOr<ValueType> unified =
-              CommonSetValueType(cur, child_schemas[s].GetColumn(c).Type());
-          if (!unified.HasValue()) {
-            cur = ValueType::kNull;
-            break;
-          }
-          cur = unified.Value();
-        }
-      }
-      common_types_[c] = cur;
-    }
-    width_ = cols;
+    width_ = child_schemas[0].ColumnCount();
+    common_type_status_ = InferCommonTypes(
+        child_schemas.size(),
+        [&](size_t i) -> const Schema& { return child_schemas[i]; },
+        &common_types_);
   }
 }
 
@@ -931,17 +943,19 @@ Status OocSetOpCoordinator::TransitionToSpill(PipelineContext* ctx) {
   opts.memory_budget_bytes = budget_bytes_;
   opts.grant = &ctx->grant;
   SetRowPrefixHash hasher{w};
-  partitioner_ = std::make_unique<RecursivePartitioner>(
+  auto candidate = std::make_unique<RecursivePartitioner>(
       opts, [hasher](const Row& r) -> uint64_t { return hasher(r); });
 
   for (size_t s = 0; s < in_mem_rows_.size(); ++s) {
-    for (Row& r : in_mem_rows_[s]) {
+    for (Row r : in_mem_rows_[s]) {
       RETURN_IF_FAIL(CoerceRowToTypes(&r, common_types_));
       r.values_.emplace_back(static_cast<int64_t>(s));
-      RETURN_IF_FAIL(partitioner_->AddRow(std::move(r)));
+      RETURN_IF_FAIL(candidate->AddRow(std::move(r)));
     }
-    in_mem_rows_[s].clear();
-    in_mem_rows_[s].shrink_to_fit();
+  }
+  partitioner_ = std::move(candidate);
+  for (auto& rows : in_mem_rows_) {
+    std::vector<Row>().swap(rows);
   }
   mem_bytes_ = 0;
   if (grant_cache_.has_value()) {
@@ -954,12 +968,7 @@ Status OocSetOpCoordinator::TransitionToSpill(PipelineContext* ctx) {
 Status OocSetOpCoordinator::ConsumeFromSource(PipelineContext* ctx,
                                               size_t source_idx,
                                               const DataChunk& input) {
-  for (const ValueType type : common_types_) {
-    if (type == ValueType::kNull) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "set operation inputs have incompatible types");
-    }
-  }
+  RETURN_IF_FAIL(common_type_status_);
   if (!initialized_) {
     initialized_ = true;
     consumer_guard_.emplace(&ctx->grant);
@@ -1024,6 +1033,7 @@ Status OocSetOpCoordinator::ConsumeFromSource(PipelineContext* ctx,
 
 StatusOr<std::shared_ptr<PipelineSource>> OocSetOpCoordinator::Finalize(
     PipelineContext* ctx) {
+  RETURN_IF_FAIL(common_type_status_);
   if (!initialized_) {
     budget_bytes_ = ctx->OperatorBudgetBytes();
   }
@@ -1074,6 +1084,13 @@ StatusOr<std::shared_ptr<PipelineSource>> OocSetOpCoordinator::Finalize(
       } else {
         uint64_t sub = 0;
         for (size_t s = 1; s < cs.size(); ++s) {
+          // Same saturation as ComputeEmitCount on the spilled path: a wrap
+          // would make `cs[0] > sub` true again and resurrect already
+          // subtracted rows, i.e. change the answer based on spilling.
+          if (cs[s] > std::numeric_limits<uint64_t>::max() - sub) {
+            sub = std::numeric_limits<uint64_t>::max();
+            break;
+          }
           sub += cs[s];
         }
         emit_n = (operation_ == SetOperationKind::kExcept)
@@ -1090,9 +1107,14 @@ StatusOr<std::shared_ptr<PipelineSource>> OocSetOpCoordinator::Finalize(
       if (mem_bytes_ > ready_bytes) {
         grant_cache_->Release(mem_bytes_ - ready_bytes);
       } else if (ready_bytes > mem_bytes_) {
+        // The output rows are already resident; a failed Reserve must not be
+        // ignored, otherwise the ledger under-reports resident bytes and a
+        // later stage over-admits against the same grant. There is no spill
+        // path to fall back to at this point (the input was never spilled),
+        // so surface the budget failure instead of silently overdrafting.
         if (!grant_cache_->Reserve(ready_bytes - mem_bytes_)) {
-          // Best-effort adjustment: if budget shrunk, release and let spill
-          // handle any larger outputs on spilled path.
+          return StatusError(StatusCode::kMemoryLimitExceeded,
+                             "set operation finalize output exceeds grant");
         }
       }
     }
@@ -1199,7 +1221,12 @@ IncrementalSortSource::IncrementalSortSource(
       upstream_ops_(std::move(ops)),
       schema_(std::move(schema)),
       prefix_keys_(std::move(prefix_keys)),
-      suffix_keys_(std::move(suffix_keys)) {}
+      suffix_keys_(std::move(suffix_keys)) {
+  for (const auto& key : prefix_keys_) { prefix_orders_.push_back(MakeSortKeyOrder(key));
+}
+  for (const auto& key : suffix_keys_) { suffix_orders_.push_back(MakeSortKeyOrder(key));
+}
+}
 
 Status IncrementalSortSource::Open(PipelineContext* ctx) {
   consumer_guard_.emplace(&ctx->grant);
@@ -1214,19 +1241,53 @@ Status IncrementalSortSource::Open(PipelineContext* ctx) {
   return Status::kSuccess;
 }
 
-StatusOr<Row> IncrementalSortSource::ExtractPrefix(const Row& row) const {
+StatusOr<Row> IncrementalSortSource::ExtractPrefix(const Row& row) {
   std::vector<Value> vals;
   vals.reserve(prefix_keys_.size());
   for (const auto& k : prefix_keys_) {
     ASSIGN_OR_RETURN(Value, kv, EvalRowExpression(k.expression, schema_, row));
     vals.push_back(std::move(kv));
   }
+  RETURN_IF_FAIL(ObserveSortKeys(prefix_orders_, vals));
   return Row(std::move(vals));
 }
 
 Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
   group_sorter_.reset();
   singleton_row_.reset();
+
+  std::vector<OocSortKey> sort_keys;
+  sort_keys.reserve(suffix_keys_.size());
+  std::vector<size_t> computed_indices;
+  const size_t base_cols = schema_.ColumnCount();
+  const size_t max_slot = std::numeric_limits<slot_t>::max();
+  for (size_t i = 0; i < suffix_keys_.size(); ++i) {
+    int off = -1;
+    if (suffix_keys_[i].expression &&
+        suffix_keys_[i].expression->Type() == TypeTag::kColumnValue) {
+      off = schema_.Offset(
+          suffix_keys_[i].expression->AsColumnValue().GetColumnName());
+    }
+    size_t slot = 0;
+    if (off < 0) {
+      if (base_cols > max_slot || computed_indices.size() > max_slot - base_cols) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column index out of range");
+      }
+      slot = base_cols + computed_indices.size();
+      computed_indices.push_back(i);
+    } else {
+      slot = static_cast<size_t>(off);
+      if (slot > max_slot) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "sort key column index out of range");
+      }
+    }
+    sort_keys.push_back(OocSortKey{.column_index = static_cast<slot_t>(slot),
+                                   .ascending = suffix_keys_[i].ascending,
+                                   .nulls_first = suffix_keys_[i].nulls_first,
+                                   .collation = suffix_keys_[i].collation});
+  }
 
   auto next_upstream_row = [&](Row* out_row) -> StatusOr<bool> {
     while (in_idx_ >= in_chunk_.Size()) {
@@ -1245,6 +1306,15 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
       }
     }
     *out_row = in_chunk_.RowAt(in_idx_++);
+    if (!computed_indices.empty()) { out_row->values_.resize(base_cols);
+}
+    for (size_t ci : computed_indices) {
+      ASSIGN_OR_RETURN(Value, kv, EvalRowExpression(suffix_keys_[ci].expression, schema_, *out_row));
+      out_row->values_.push_back(std::move(kv));
+    }
+    for (size_t i = 0; i < sort_keys.size(); ++i) {
+      RETURN_IF_FAIL(suffix_orders_[i].Observe((*out_row)[sort_keys[i].column_index]));
+    }
     return true;
   };
 
@@ -1274,12 +1344,20 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
     return Status::kSuccess;
   }
   ASSIGN_OR_RETURN(Row, sp, ExtractPrefix(second_row));
-  auto prefix_equal = [](const Row& a, const Row& b) {
-    if (a.Count() != b.Count()) {
+  // The upstream prefix sort uses each prefix key's own collation (see the
+  // OocSortKey built from prefix_keys_), so peer equality for run boundaries
+  // must resolve the same collation. EqualUnderCollation alone only looks at
+  // the operands' tags: a COLLATE('und:ci') key's static collation is not
+  // visible there, which can split ci-equivalent prefixes into separate runs
+  // and sort their suffixes independently.
+  auto prefix_equal = [this](const Row& a, const Row& b) {
+    if (a.Count() != b.Count() || a.Count() != prefix_keys_.size()) {
       return false;
     }
     for (size_t i = 0; i < a.Count(); ++i) {
-      if (!EqualUnderCollation(a[i], b[i])) {
+      const SortKeyOrder order{true, std::nullopt,
+                               prefix_keys_[i].collation};
+      if (order.Compare(a[i], b[i]) != 0) {
         return false;
       }
     }
@@ -1295,67 +1373,16 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
   }
 
   // Group has >= 2 rows: sort suffix inside bounded ExternalSorter.
-  std::vector<OocSortKey> sort_keys;
-  std::vector<std::optional<slot_t>> direct_slots(suffix_keys_.size());
-  std::vector<size_t> computed_indices;
-  const size_t base_cols = schema_.ColumnCount();
-  // T4854: computed suffix columns are addressed at base_cols + extra_idx
-  // inside OocSortKey::column_index (uint16); reject the wrap instead of
-  // letting a suffix key silently alias a real input column. Direct slots
-  // are schema offsets and therefore below base_cols, covered by the same
-  // bound.
-  if (base_cols + suffix_keys_.size() > std::numeric_limits<slot_t>::max()) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "sort key column index out of range");
-  }
-  size_t extra_idx = 0;
-  for (size_t i = 0; i < suffix_keys_.size(); ++i) {
-    slot_t slot = 0;
-    if (suffix_keys_[i].expression &&
-        suffix_keys_[i].expression->Type() == TypeTag::kColumnValue) {
-      const int off = schema_.Offset(
-          suffix_keys_[i].expression->AsColumnValue().GetColumnName());
-      if (off >= 0) {
-        direct_slots[i] = static_cast<slot_t>(off);
-        slot = static_cast<slot_t>(off);
-      } else {
-        computed_indices.push_back(i);
-        slot = static_cast<slot_t>(base_cols + extra_idx++);
-      }
-    } else {
-      computed_indices.push_back(i);
-      slot = static_cast<slot_t>(base_cols + extra_idx++);
-    }
-    sort_keys.push_back(OocSortKey{.column_index = slot,
-                                   .ascending = suffix_keys_[i].ascending,
-                                   .nulls_first = suffix_keys_[i].nulls_first,
-                                   .collation = suffix_keys_[i].collation});
-  }
-
   ExternalSorter::Options opts;
   opts.spill_store = &ctx->spill_store;
   opts.memory_budget_bytes = budget_bytes_;
   opts.grant = &ctx->grant;
-  opts.keys = std::move(sort_keys);
+  opts.keys = sort_keys;
   opts.force_spill = ProcessMemoryBudget::Global().AlwaysSpillEnabled();
   auto sorter = std::make_unique<ExternalSorter>(std::move(opts));
 
-  auto add_to_sorter = [&](Row&& r) -> Status {
-    if (computed_indices.empty()) {
-      return sorter->AddRow(std::move(r));
-    }
-    r.values_.resize(base_cols);
-    for (size_t ci : computed_indices) {
-      ASSIGN_OR_RETURN(
-          Value, kv,
-          EvalRowExpression(suffix_keys_[ci].expression, schema_, r));
-      r.values_.push_back(std::move(kv));
-    }
-    return sorter->AddRow(std::move(r));
-  };
-
-  RETURN_IF_FAIL(add_to_sorter(std::move(first_row)));
-  RETURN_IF_FAIL(add_to_sorter(std::move(second_row)));
+  RETURN_IF_FAIL(sorter->AddRow(std::move(first_row)));
+  RETURN_IF_FAIL(sorter->AddRow(std::move(second_row)));
 
   while (true) {
     Row nxt;
@@ -1370,7 +1397,7 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
       has_lookahead_ = true;
       break;
     }
-    RETURN_IF_FAIL(add_to_sorter(std::move(nxt)));
+    RETURN_IF_FAIL(sorter->AddRow(std::move(nxt)));
   }
 
   RETURN_IF_FAIL(sorter->Finish());
@@ -1385,6 +1412,7 @@ StatusOr<bool> IncrementalSortSource::NextBatch(PipelineContext* ctx,
   out->Reset(schema_, max_rows);
   while (out->Size() < max_rows) {
     if (singleton_row_.has_value()) {
+      singleton_row_->values_.resize(base_cols);
       out->Append(std::move(*singleton_row_), RowPosition());
       singleton_row_.reset();
       continue;
@@ -1538,11 +1566,35 @@ Row EncodeRowPositionKey(RowPosition pos) {
               Value(static_cast<int64_t>(pos.slot))});
 }
 
-RowPosition DecodeRowPositionKey(const Row& r) {
-  const auto hi = static_cast<uint64_t>(r[0].value.int_value);
-  const auto lo = static_cast<uint64_t>(r[1].value.int_value);
-  const auto slot = static_cast<slot_t>(r[2].value.int_value);
-  return RowPosition{(hi << 32) | lo, slot};
+// Spilled position keys come back from ExternalSorter/SpillStore; a torn or
+// mistyped row must surface as kCorrupt instead of reading an arbitrary int
+// payload (possibly a VARCHAR pointer) as a RowPosition.
+StatusOr<RowPosition> TryDecodeRowPositionKey(const Row& r) {
+  if (r.Count() < 3) {
+    return StatusError(StatusCode::kCorrupt, "truncated row-position key");
+  }
+  for (size_t i = 0; i < 3; ++i) {
+    if (r[i].IsNull() || r[i].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kCorrupt, "invalid row-position key");
+    }
+  }
+  constexpr auto kPageIdHalfMax =
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+  const int64_t hi_value = r[0].value.int_value;
+  const int64_t lo_value = r[1].value.int_value;
+  const int64_t slot_value = r[2].value.int_value;
+  if (hi_value < 0 || hi_value > kPageIdHalfMax || lo_value < 0 ||
+      lo_value > kPageIdHalfMax || slot_value < 0 ||
+      std::cmp_greater_equal(slot_value,std::numeric_limits<slot_t>::max()))) {
+    return StatusError(StatusCode::kCorrupt, "out-of-range row-position key");
+  }
+  const RowPosition pos{(static_cast<uint64_t>(hi_value) << 32) |
+                            static_cast<uint64_t>(lo_value),
+                        static_cast<slot_t>(slot_value)};
+  if (!pos.IsValid()) {
+    return StatusError(StatusCode::kCorrupt, "invalid row-position key");
+  }
+  return pos;
 }
 
 bool PosBefore(const RowPosition& a, const RowPosition& b) noexcept {
@@ -1575,7 +1627,7 @@ Status OocBitmapScanSource::AdvanceCursor(SortedPosCursor* c) {
       c->valid = false;
       return Status::kSuccess;
     }
-    const RowPosition pos = DecodeRowPositionKey(r);
+    ASSIGN_OR_RETURN(RowPosition, pos, TryDecodeRowPositionKey(r));
     if (c->valid && pos == c->cur) {
       continue;  // Deduplicate repeated index keys on non-unique index.
     }
@@ -1598,13 +1650,20 @@ Status OocBitmapScanSource::Open(PipelineContext* ctx) {
                        "invalid BitmapScan state");
   }
 
+  std::vector<std::pair<page_id_t, TransactionManager::IndexReadGuard>> held;
   auto setup_fallback = [&]() -> Status {
+    held.clear();
+    cursors_.clear();
     fallback_full_scan_ = true;
     if (!fallback_factory_) {
       return StatusError(StatusCode::kInvalidArgument,
                          "BitmapScan stale fallback factory unavailable");
     }
     fallback_source_ = fallback_factory_(ctx);
+    if (fallback_source_ == nullptr) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BitmapScan fallback factory returned no source");
+    }
     return fallback_source_->Open(ctx);
   };
 
@@ -1620,17 +1679,16 @@ Status OocBitmapScanSource::Open(PipelineContext* ctx) {
   std::ranges::sort(roots);
   roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
 
-  std::vector<std::pair<page_id_t, TransactionManager::IndexReadGuard>> held;
   held.reserve(roots.size());
   for (const page_id_t root : roots) {
     if (txn_->txn_.IndexKeysMayBeStale(root)) {
       return setup_fallback();
     }
     auto guard = txn_->txn_.AcquireIndexReadGuard(root);
+    held.emplace_back(root, std::move(guard));
     if (txn_->txn_.IndexKeysMayBeStale(root)) {
       return setup_fallback();
     }
-    held.emplace_back(root, std::move(guard));
   }
 
   const size_t total_budget = ctx->OperatorBudgetBytes();
@@ -1643,6 +1701,9 @@ Status OocBitmapScanSource::Open(PipelineContext* ctx) {
         held, [root = range.index->Root()](const auto& entry) {
           return entry.first == root;
         });
+    if (found == held.end()) {
+      return setup_fallback();
+    }
     ExternalSorter::Options opts;
     opts.spill_store = &ctx->spill_store;
     opts.memory_budget_bytes = per_sorter_budget;
@@ -1668,7 +1729,9 @@ Status OocBitmapScanSource::Open(PipelineContext* ctx) {
     Row first_row;
     ASSIGN_OR_RETURN(bool, first_ok, cur.sorter->NextRow(&first_row));
     if (first_ok) {
-      cur.cur = DecodeRowPositionKey(first_row);
+      ASSIGN_OR_RETURN(RowPosition, first_pos,
+                       TryDecodeRowPositionKey(first_row));
+      cur.cur = first_pos;
       cur.valid = true;
     }
     cursors_.push_back(std::move(cur));
@@ -1849,7 +1912,7 @@ Status OocMultiIndexCoveringSource::AdvanceParticipant(ParticipantState* p) {
       p->valid = false;
       return Status::kSuccess;
     }
-    const RowPosition pos = DecodeRowPositionKey(r);
+    ASSIGN_OR_RETURN(RowPosition, pos, TryDecodeRowPositionKey(r));
     if (p->valid && pos == p->cur_pos) {
       continue;  // Deduplicate repeated index keys on non-unique index.
     }
@@ -1902,6 +1965,11 @@ Status OocMultiIndexCoveringSource::Open(PipelineContext* ctx) {
         held, [root = ps.range.index->Root()](const auto& entry) {
           return entry.first == root;
         });
+    if (found == held.end()) {
+      held.clear();
+      RETURN_IF_FAIL(BuildFallbackScan(ctx));
+      return fallback_source_->Open(ctx);
+    }
     ExternalSorter::Options opts;
     opts.spill_store = &ctx->spill_store;
     opts.memory_budget_bytes = per_budget;

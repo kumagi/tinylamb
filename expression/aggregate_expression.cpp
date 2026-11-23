@@ -140,7 +140,7 @@ std::string AggregateExpression::ToString() const {
     std::string delim = secondary_arg_->ToString();
     if (secondary_arg_->Type() == TypeTag::kConstantValue) {
       std::string quoted = "\"";
-      quoted.reserve(delim.size() * 2 + 2);
+      quoted.reserve((delim.size() * 2) + 2);
       for (char c : delim) {
         if (c == '"' || c == '\\') {
           quoted += '\\';  // NOLINT(readability-braces-around-statements)
@@ -158,10 +158,8 @@ std::string AggregateExpression::ToString() const {
   if (where_filter_) {
     out += " WHERE " + where_filter_->ToString();
   }
-  // Both checks are required: a kNone modifier renders nothing, and a
-  // hand-built tree can carry a non-kNone modifier with a null condition.
-  // Without the having_cond_ guard we would emit an incomplete " HAVING MAX "
-  // (TouchedColumns already treats the condition as optional).
+  // A hand-built tree may carry a modifier before its condition is attached.
+  // Do not emit a dangling HAVING clause for that incomplete node.
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "
                                                     : " HAVING MIN ";
@@ -176,8 +174,9 @@ std::string AggregateExpression::ToString() const {
   // include it. Rendered before ORDER BY, matching GoogleSQL syntax.
   // TouchedColumns treats a null inner GROUP BY / ORDER BY expression as a
   // valid (optional) state (#2484). ToString walks the same vectors, so it
-  // must guard the deref too -- otherwise hand-built trees (or EXPLAIN /
-  // rewrite-key rendering of them) crash here while TouchedColumns succeeds.
+  // must guard the deref too. Render a placeholder for null items instead of
+  // skipping them: ToString is the dedup/rewrite key, so "[nullptr, col]" must
+  // not collapse onto the same text as a single-item "[col]".
   const bool has_group_by =
       std::any_of(inner_group_by_.begin(), inner_group_by_.end(),
                   [](const Expression& key) { return static_cast<bool>(key); });
@@ -185,13 +184,10 @@ std::string AggregateExpression::ToString() const {
     out += " GROUP BY ";
     bool first = true;
     for (const Expression& key : inner_group_by_) {
-      if (!key) {
-        continue;
-      }
       if (!first) {
         out += ", ";
       }
-      out += key->ToString();
+      out += key ? key->ToString() : "<null>";
       first = false;
     }
   }
@@ -204,21 +200,20 @@ std::string AggregateExpression::ToString() const {
     out += " ORDER BY ";
     bool first = true;
     for (const WindowOrderTerm& term : inner_order_by_) {
-      if (!term.expression) {
-        continue;
-      }
       if (!first) {
         out += ", ";
       }
-      out += term.expression->ToString();
-      if (!term.ascending) {
-        out += " DESC";
-      }
-      if (term.nulls_first.has_value()) {
-        out +=
-            term.nulls_first.value()
-                ? " NULLS FIRST"  // NOLINT(bugprone-unchecked-optional-access)
-                : " NULLS LAST";
+      out += term.expression ? term.expression->ToString() : "<null>";
+      if (term.expression) {
+        if (!term.ascending) {
+          out += " DESC";
+        }
+        if (term.nulls_first.has_value()) {
+          out +=
+              term.nulls_first.value()
+                  ? " NULLS FIRST"  // NOLINT(bugprone-unchecked-optional-access)
+                  : " NULLS LAST";
+        }
       }
       first = false;
     }

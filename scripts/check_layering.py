@@ -84,12 +84,14 @@ PRODUCTION_FUZZERS = frozenset({
     "query/sql_plan_cache_fuzzer.cpp",
     "query/sql_session_fuzzer.cpp",
 })
-IGNORED_PREFIXES = ("scripts/", "docs/", ".git/", "build")
+# These top-level trees are not production sources. Generated build*/
+# directories are filtered by path component in scan_tree below.
+IGNORED_PREFIXES = ("scripts/", "docs/", ".git/")
 INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.MULTILINE)
 
 # Edges the target architecture bans outright (expression→database の逆転など).  They are
-# violations even where the rank order would tolerate them; today they survive
-# via the allowlist until the dependency gets inverted.
+# violations even where the rank order would tolerate them, and can never be
+# suppressed by DEFAULT_ALLOWLIST or --allowlist.
 FORBIDDEN_PATTERNS = (
     "expression/* -> database/*",
 )
@@ -272,25 +274,35 @@ def layer_of(rel_path):
     return best
 
 
-def source_files(root):
+def scan_tree(root):
+    """Single walk of the tree yielding both source files and header index.
+
+    Walking the tree twice (once for sources, once for headers) doubles the
+    filesystem work on large checkouts for no benefit: both passes apply the
+    same ignore rules and look at the same .hpp/.cpp files.
+    """
+    sources = []
+    index = {}
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
         if not path.is_file() or path.suffix not in (".hpp", ".cpp"):
             continue
-        if rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel:
+        if (rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel or
+                any(part.startswith("build") for part in Path(rel).parts[:-1])):
             continue
-        yield rel
+        sources.append(rel)
+        if path.suffix == ".hpp":
+            index.setdefault(path.name, []).append(rel)
+    return sources, index
+
+
+def source_files(root):
+    return scan_tree(root)[0]
 
 
 def header_index(root):
     """Map basename -> list of repo-relative header paths (for bare includes)."""
-    index = {}
-    for path in sorted(root.rglob("*.hpp")):
-        rel = path.relative_to(root).as_posix()
-        if rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel:
-            continue
-        index.setdefault(path.name, []).append(rel)
-    return index
+    return scan_tree(root)[1]
 
 
 def resolve_include(src, include, root, index):
@@ -318,10 +330,27 @@ def resolve_include(src, include, root, index):
         def in_src_dir(c):
             return c.startswith(src_dir + "/") if src_dir else ("/" not in c)
 
+        def shared_components(c):
+            # How many leading directories the candidate shares with the
+            # including file; a larger value is the closer / more plausible
+            # include and avoids picking an arbitrary dictionary-first path.
+            a = src_dir.split("/") if src_dir else []
+            b = c.rpartition("/")[0].split("/")
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
         layers = {layer_of(c) for c in candidates}
         if len(layers) == 1:
             same = [c for c in candidates if in_src_dir(c)]
-            return same[0] if len(same) == 1 else candidates[0]
+            pool = same if same else candidates
+            if len(pool) == 1:
+                return pool[0]
+            # Deterministic: closest path first, lexicographic tiebreak.
+            return min(pool, key=lambda c: (-shared_components(c), c))
         same = [c for c in candidates if in_src_dir(c)]
         if len(same) == 1:
             return same[0]
@@ -332,9 +361,14 @@ def allowed(edge, extra):
     return any(fnmatch.fnmatchcase(edge, pattern) for pattern in chain(DEFAULT_ALLOWLIST, extra))
 
 
+def is_forbidden(edge):
+    """Unconditionally banned edge: rank and allowlist cannot excuse it."""
+    return any(fnmatch.fnmatchcase(edge, p) for p in FORBIDDEN_PATTERNS)
+
+
 def is_violation(src, src_layer, include, dst_layer):
     edge = f"{src} -> {include}"
-    if any(fnmatch.fnmatchcase(edge, p) for p in FORBIDDEN_PATTERNS):
+    if is_forbidden(edge):
         return True
     return RANK[dst_layer] > RANK[src_layer]
 
@@ -348,14 +382,17 @@ def main():
 
     extra = []
     for file_name in args.allowlist:
-        text = Path(file_name).read_text(encoding="utf-8")
+        try:
+            text = Path(file_name).read_text(encoding="utf-8")
+        except OSError as exc:
+            parser.error(f"cannot read allowlist {file_name!r}: {exc}")
         extra += [line.strip() for line in text.splitlines()
                   if line.strip() and not line.lstrip().startswith("#")]
 
     violations = []
-    index = header_index(Path(args.root))
     root = Path(args.root)
-    for src in source_files(Path(args.root)):
+    sources, index = scan_tree(root)
+    for src in sources:
         src_layer = layer_of(src)
         if src_layer is None or src_layer == "top":
             continue
@@ -371,7 +408,12 @@ def main():
                 continue
             violations.append((src, src_layer, resolved, dst_layer))
 
-    unallowed = [v for v in violations if not allowed(f"{v[0]} -> {v[2]}", extra)]
+    # A FORBIDDEN_PATTERNS edge is reported regardless of any allowlist entry;
+    # filtering all violations through allowed() would silently excuse it.
+    unallowed = [
+        v for v in violations
+        if is_forbidden(f"{v[0]} -> {v[2]}") or not allowed(f"{v[0]} -> {v[2]}", extra)
+    ]
     for src, src_layer, include, dst_layer in sorted(unallowed):
         print(f"VIOLATION {src} [{src_layer}] -> {include} [{dst_layer}]")
 

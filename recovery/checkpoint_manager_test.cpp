@@ -17,9 +17,13 @@
 #include "recovery/checkpoint_manager.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -59,7 +63,7 @@ class CheckpointManagerTest : public ::testing::Test {
     rm_->SetLogger(logger_.get());
     tm_ = std::make_unique<TransactionManager>(pm_.get(), logger_.get(),
                                                rm_.get());
-    cm_ = std::make_unique<CheckpointManager>(prefix_ + ".last_checkpoint",
+    cm_ = std::make_unique<CheckpointManager>(prefix_,
                                               tm_.get(), pm_->GetPool(), 0);
     ASSERT_SUCCESS(rm_->RecoverFrom(checkpoint_lsn, tm_.get()));
   }
@@ -166,10 +170,209 @@ TEST_F(CheckpointManagerTest,
   page.PageUnlock();
 
   LsmIndex idx(lsm_root);
-  EXPECT_EQ(idx.Read(check, "k1").MoveValue(), "v1");
-  EXPECT_EQ(idx.Read(check, "k_inflight_win").MoveValue(), "v_win");
-  EXPECT_EQ(idx.Read(check, "k_post").MoveValue(), "v_post");
+  const auto k1 = idx.Read(check, "k1");
+  ASSERT_TRUE(k1.HasValue()) << k1.GetStatus();
+  EXPECT_EQ(k1.Value(), "v1");
+  const auto k_inflight_win = idx.Read(check, "k_inflight_win");
+  ASSERT_TRUE(k_inflight_win.HasValue()) << k_inflight_win.GetStatus();
+  EXPECT_EQ(k_inflight_win.Value(), "v_win");
+  const auto k_post = idx.Read(check, "k_post");
+  ASSERT_TRUE(k_post.HasValue()) << k_post.GetStatus();
+  EXPECT_EQ(k_post.Value(), "v_post");
   EXPECT_EQ(idx.Read(check, "k_inflight_lose").GetStatus(), Status::kNotExists);
+  ASSERT_SUCCESS(check.PreCommit());
+}
+
+// Before-sync gate for the flush worker: once armed, the next fdatasync parks
+// until released. The worker holds segment_mu_ while parked, so records
+// appended in the meantime stay in the ring buffer and never reach the WAL
+// file -- what a power loss at that moment would leave behind.
+struct SyncGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool armed = false;
+  bool entered = false;
+  bool released = false;
+};
+
+void CopyDatabaseFiles(const std::string& from, const std::string& to) {
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+    const std::string fname = entry.path().filename().string();
+    if (fname.starts_with(from + ".")) {
+      std::filesystem::copy_file(
+          entry.path(), to + fname.substr(from.size()),
+          std::filesystem::copy_options::overwrite_existing, ec);
+    }
+  }
+}
+
+void RemoveDatabaseFiles(const std::string& prefix) {
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+    if (entry.path().filename().string().starts_with(prefix + ".")) {
+      std::filesystem::remove(entry.path(), ec);
+    }
+  }
+}
+
+// tlaplus/TxSpill.tla (cfg/current_harm.cfg): a commit reflected into a page
+// after the checkpoint's replay anchor was taken must not reach the snapshot
+// before its kCommit is durable. Blocks-file writes wait only for the page's
+// max slot LSN, i.e. the update record's LSN, not the commit's. If the
+// snapshot is published and the WAL tail holding the kCommit is lost, restart
+// has no undo phase and the never-committed value stays visible.
+TEST_F(CheckpointManagerTest,
+       SnapshotDoesNotPersistCommitWhoseCommitRecordIsNotDurable) {
+  page_id_t pid = 0;
+  slot_t slot = 0;
+  {
+    Transaction t = tm_->Begin();
+    ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                          pm_->AllocateNewPage(t, PageType::kRowPage));
+    pid = page->PageID();
+    ASSIGN_OR_ASSERT_FAIL(slot_t, s, page->Insert(t, "old"));
+    slot = s;
+    page.PageUnlock();
+    ASSERT_SUCCESS(t.PreCommit());
+  }
+
+  // T1 updates the row before the checkpoint and commits after its anchor.
+  Transaction t1 = tm_->Begin();
+  {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, page, pm_->GetPage(pid));
+    ASSERT_SUCCESS(page->Update(t1, slot, "new"));
+  }
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  // CheckpointManager::WriteCheckpoint would pick the same anchor: T1 is the
+  // oldest registered transaction that has logged.
+  const lsn_t anchor = t1.FirstLSN();
+  ASSERT_GT(anchor, 0U);
+
+  auto gate = std::make_shared<SyncGate>();
+  Logger::SetBeforeSyncHookForTest([gate](int) {
+    std::unique_lock lk(gate->mu);
+    if (!gate->armed || gate->released) {
+      return 0;
+    }
+    gate->entered = true;
+    gate->cv.notify_all();
+    gate->cv.wait(lk, [&] { return gate->released; });
+    return 0;
+  });
+  std::thread committer;
+  std::thread checkpointer;
+  auto release = [&] {
+    {
+      std::scoped_lock lk(gate->mu);
+      gate->released = true;
+    }
+    gate->cv.notify_all();
+  };
+  struct Finally {
+    std::function<void()> f;
+    ~Finally() { f(); }
+  } finally{[&] {
+    release();
+    if (checkpointer.joinable()) {
+      checkpointer.join();
+    }
+    if (committer.joinable()) {
+      committer.join();
+    }
+    Logger::SetBeforeSyncHookForTest({});
+  }};
+
+  {
+    std::scoped_lock lk(gate->mu);
+    gate->armed = true;
+  }
+  // An unrelated uncommitted write: the worker writes it, then parks in the
+  // gated fdatasync.
+  Transaction t0 = tm_->Begin();
+  {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, page, pm_->GetPage(pid));
+    ASSIGN_OR_ASSERT_FAIL(slot_t, unrelated, page->Insert(t0, "unrelated"));
+    (void)unrelated;
+  }
+  {
+    std::unique_lock lk(gate->mu);
+    ASSERT_TRUE(gate->cv.wait_for(lk, std::chrono::seconds(10),
+                                  [&] { return gate->entered; }));
+  }
+
+  // T1's kCommit goes to the ring buffer only. Without the WAL-before-data
+  // gate on reflected commits, the commit is reflected into the page and
+  // published while PreCommit parks in WaitForDurable. With the gate, an
+  // eviction inside the reflection already waits for that kCommit, so
+  // publication does not happen while the WAL is held; that is fine too.
+  const lsn_t buffered_before_t1_commit = logger_->BufferedLSN();
+  Status commit_status = Status::kSuccess;
+  committer = std::thread([&] { commit_status = t1.PreCommit(); });
+  // Wait until T1's commit record has actually entered the WAL buffer. The
+  // unrelated write above already made BufferedLSN nonzero, so checking only
+  // DurableLSN < BufferedLSN would not establish that this commit is pending.
+  const auto commit_record_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(10);
+  while (logger_->BufferedLSN() <= buffered_before_t1_commit &&
+         std::chrono::steady_clock::now() < commit_record_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(logger_->BufferedLSN(), buffered_before_t1_commit);
+  bool published = false;
+  for (int i = 0; i < 100 && !published; ++i) {
+    Transaction check = tm_->Begin();
+    {
+      ASSIGN_OR_ASSERT_FAIL(PageRef, page, pm_->GetPage(pid));
+      ASSIGN_OR_ASSERT_FAIL(std::string_view, row, page->Read(check, slot));
+      published = row == "new";
+    }
+    ASSERT_SUCCESS(check.Abort());
+    if (!published) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  ASSERT_LT(logger_->DurableLSN(), logger_->BufferedLSN());
+
+  // The fuzzy checkpoint body. A correct implementation either refuses to
+  // publish this image yet (and blocks until the kCommit is durable) or
+  // publishes a snapshot without T1's value; both are fine.
+  std::promise<Status> ckpt_promise;
+  std::future<Status> ckpt_future = ckpt_promise.get_future();
+  checkpointer = std::thread(
+      [&] { ckpt_promise.set_value(pm_->WriteFuzzyCheckpoint(anchor)); });
+  const bool ckpt_published = ckpt_future.wait_for(std::chrono::seconds(2)) ==
+                              std::future_status::ready;
+
+  // Power loss here: only what reached the files survives. T1's kCommit is
+  // the last record appended, so a written end below the buffered end means
+  // it is not in the WAL file.
+  ASSERT_LT(logger_->CommittedLSN(), logger_->BufferedLSN());
+  const std::string crash_prefix = prefix_ + "-crash";
+  CopyDatabaseFiles(prefix_, crash_prefix);
+
+  release();
+  checkpointer.join();
+  committer.join();
+  ASSERT_SUCCESS(ckpt_future.get());
+  ASSERT_SUCCESS(commit_status);
+  ASSERT_SUCCESS(t0.Abort());
+  t0 = Transaction();
+  t1 = Transaction();
+
+  const std::string original = prefix_;
+  prefix_ = crash_prefix;
+  Open(0);
+  RemoveDatabaseFiles(original);
+
+  Transaction check = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(PageRef, page, pm_->GetPage(pid));
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, row, page->Read(check, slot));
+  EXPECT_EQ(std::string(row), "old")
+      << "T1's kCommit never reached the WAL, but "
+      << (ckpt_published ? "the published snapshot already holds T1"
+                         : "restart still shows T1");
+  page.PageUnlock();
   ASSERT_SUCCESS(check.PreCommit());
 }
 

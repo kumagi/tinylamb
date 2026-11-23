@@ -73,7 +73,9 @@ ValidityBitmap ValidityBitmap::BitwiseAnd(const ValidityBitmap& other) const {
   const size_t min_size = std::min(size_, other.size_);
   const size_t word_count = (min_size + 63) / 64;
   std::vector<uint64_t> result(word_count);
-  for (size_t i = 0; i < word_count; ++i) {
+  const size_t available_words = std::min(
+      {word_count, words_.size(), other.words_.size()});
+  for (size_t i = 0; i < available_words; ++i) {
     result[i] = words_[i] & other.words_[i];
   }
   ValidityBitmap res(std::move(result), min_size);

@@ -219,8 +219,9 @@ bool FullScanPlan::IsOrderedBy(
   return IsOrderedBy(expressions, ascending);
 }
 
-void FullScanPlan::Dump(std::ostream& o, int /*indent*/) const {
-  o << "FullScan: " << table_.GetSchema().Name()
+void FullScanPlan::Dump(std::ostream& o, int indent) const {
+  o << Indent(static_cast<size_t>(std::max(indent, 0)))
+    << "FullScan: " << table_.GetSchema().Name()
     << "(estimated rows: " << AccessRowCount();
   if (projection_.has_value()) {
     o << ", columns=" << projection_->size() << "/"

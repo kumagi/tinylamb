@@ -44,6 +44,7 @@ Scan をコピーする場合は元 Group の filter も移します。コピー
             if (child.operation == LogicalOperator::kProjection &&
                 child.children.size() == 1 && child.children[0] != group) {
               properties = &memo.Get(child.children[0]).logical_properties;
+              columns.reserve(child.target_list.size());
               for (const auto& target : child.target_list) {
                 if (target.expression &&
                     target.expression->Type() == TypeTag::kColumnValue) {
@@ -57,16 +58,20 @@ Scan をコピーする場合は元 Group の filter も移します。コピー
               if (child.operation == LogicalOperator::kScan &&
                   schema->ColumnCount() == 0) {
                 const auto found = memo.GetTableSchemas().find(child.table);
-                if (found != memo.GetTableSchemas().end())
+                if (found != memo.GetTableSchemas().end()) {
                   schema = &found->second;
+                }
               }
-              for (size_t i = 0; i < schema->ColumnCount(); ++i)
+              columns.reserve(schema->ColumnCount());
+              for (size_t i = 0; i < schema->ColumnCount(); ++i) {
                 columns.insert(schema->GetColumn(i).Name().ToString());
+              }
             }
             if (!columns.empty() && properties->IsUniqueOn(columns)) {
               if (child.operation == LogicalOperator::kScan &&
-                  input_group.filter)
+                  input_group.filter) {
                 memo.MergeScanFilter(group, input_group.filter);
+              }
               memo.AddExpression(group, child);
             }
           }

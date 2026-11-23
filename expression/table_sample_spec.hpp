@@ -52,7 +52,7 @@ struct TableSampleSpec {
     }
     o << ' ' << TableSampleUnitName(unit);
     if (!partition_by.empty()) {
-      o << " PARTITION BY (";
+      o << " PARTITION BY ";
       for (size_t i = 0; i < partition_by.size(); ++i) {
         if (i != 0U) {
           o << ", ";
@@ -61,7 +61,6 @@ struct TableSampleSpec {
           o << partition_by[i]->ToString();
         }
       }
-      o << ')';
     }
     if (repeatable_seed && *repeatable_seed) {
       o << " REPEATABLE(" << (*repeatable_seed)->ToString() << ')';

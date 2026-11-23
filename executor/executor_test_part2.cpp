@@ -975,14 +975,14 @@ TEST_F(ExecutorTest,
     engine.SetForceRelationalFallback(force_relational);
     StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
     if (!prepared.HasValue()) {
-      ctx.Abort();
+      EXPECT_SUCCESS(ctx.Abort());
       return prepared.GetStatus();
     }
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
     }
     const Status st = prepared.Value()->GetStatus();
-    ctx.Abort();
+    EXPECT_SUCCESS(ctx.Abort());
     return st;
   };
 

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstddef>
+
 #include "query/query_test.hpp"
 
 namespace tinylamb {
@@ -53,7 +55,7 @@ TEST_F(QueryTest, ConstantConjunctsDecidedAtScanFilterCompile) {
              "SELECT x FROM cc WHERE CURRENT_TIMESTAMP IS NOT NULL AND x > 1 "
              "ORDER BY x;"),
       (std::vector<Row>{Row({Value(5)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, AndOfOrPredicatesKeepConjunctionInScanFilter) {
@@ -95,7 +97,7 @@ TEST_F(QueryTest, AndOfOrPredicatesKeepConjunctionInScanFilter) {
   ASSERT_EQ(grouped.size(), 2U);
   EXPECT_EQ(grouped[0][0], Value(int64_t{1}));
   EXPECT_EQ(grouped[0][1], Value(int64_t{1}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineUnnestDistinctOrderByOffsetAndUnionAll) {
@@ -133,7 +135,7 @@ TEST_F(QueryTest, SqlEngineUnnestDistinctOrderByOffsetAndUnionAll) {
                    "SELECT x FROM UNNEST([1]) x UNION ALL "
                    "SELECT x FROM UNNEST([2]) x;"),
             (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineArrayGeneratorsFeedUnnest) {
@@ -159,7 +161,7 @@ TEST_F(QueryTest, SqlEngineArrayGeneratorsFeedUnnest) {
             (std::vector<Row>{Row({Value::Date("2020-01-01")}),
                               Row({Value::Date("2020-01-03")}),
                               Row({Value::Date("2020-01-05")})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, BuiltinTableFunctionBecomesRowSource) {
@@ -254,7 +256,7 @@ TEST_F(QueryTest, BuiltinTableFunctionBecomesRowSource) {
   expect_prepare_error(
       "SELECT * FROM GENERATE_SERIES(1, 3) TABLESAMPLE SYSTEM (10 PERCENT);",
       "TABLESAMPLE");
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, UnnestAnonymousOrderByKeyRidesAHiddenColumn) {
@@ -277,7 +279,7 @@ TEST_F(QueryTest, UnnestAnonymousOrderByKeyRidesAHiddenColumn) {
                    "SELECT value * 10 FROM GENERATE_SERIES(3, 1, -1) "
                    "ORDER BY 1 LIMIT 2;"),
             (std::vector<Row>{Row({Value(10)}), Row({Value(20)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
@@ -336,7 +338,7 @@ TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
                 Row({Value(1), Value(10)}), Row({Value(1), Value(20)}),
                 Row({Value(2), Value(10)}), Row({Value(2), Value(20)})}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineInsertSelectCopiesAndMapsRows) {
@@ -375,7 +377,7 @@ TEST_F(QueryTest, SqlEngineUnionAllAppliesLimitAfterConcatenation) {
   const std::vector<Row> rows =
       RunSql(ctx, *db_, "SELECT v FROM ul UNION ALL SELECT v FROM ul LIMIT 3;");
   EXPECT_EQ(rows.size(), 3U);
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSingleTableAlias) {
@@ -391,7 +393,7 @@ TEST_F(QueryTest, SqlEngineSingleTableAlias) {
   EXPECT_EQ(rows[0][0], Value(20));
   EXPECT_EQ(rows[1][0], Value(30));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelfJoinEquiJoin) {
@@ -409,7 +411,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinEquiJoin) {
   EXPECT_EQ(rows[0][0], Value(20));
   EXPECT_EQ(rows[1][0], Value(30));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelfJoinCommaWithWhere) {
@@ -426,7 +428,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinCommaWithWhere) {
   EXPECT_EQ(rows[0][0], Value(10));
   EXPECT_EQ(rows[1][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSelfJoinResidualCondition) {
@@ -444,7 +446,7 @@ TEST_F(QueryTest, SqlEngineSelfJoinResidualCondition) {
   EXPECT_EQ(rows[1][0], Value(3));
   EXPECT_EQ(rows[2][0], Value(3));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineLeftJoinStaysCorrect) {
@@ -464,7 +466,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinStaysCorrect) {
   EXPECT_EQ(rows[0][0], Value(10));
   EXPECT_EQ(rows[1][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineRightAndFullJoinPreserveUnmatchedRows) {
@@ -497,7 +499,7 @@ TEST_F(QueryTest, SqlEngineRightAndFullJoinPreserveUnmatchedRows) {
     return row == Row({Value(), Value(300)});
   }));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineLeftJoinReducesToInnerOnNullRejectingWhere) {
@@ -523,7 +525,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinReducesToInnerOnNullRejectingWhere) {
   ASSERT_EQ(matched.size(), 1U);
   EXPECT_EQ(matched[0][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A WHERE conjunct over the preserved (left) side filters rows before the
@@ -543,7 +545,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinPushesLeftSideFilter) {
   EXPECT_EQ(rows[0][0], Value(10));
   EXPECT_EQ(rows[1][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M6: a plain LEFT JOIN plans through the Cascades memo (outer hash/merge
@@ -581,7 +583,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinCascadesPlansOuterJoin) {
   EXPECT_EQ(rows[0], Row({Value(10), Value()}));
   EXPECT_EQ(rows[1], Row({Value(20), Value(200)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M6 ON-vs-WHERE contract: ON decides the match (before padding), WHERE
@@ -634,7 +636,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinOnVsWhereSemantics) {
   ASSERT_EQ(where_null.size(), 1U);
   EXPECT_EQ(where_null[0][0], Value(10));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M6: an empty build side pads every preserved row (no match is still a row).
@@ -652,7 +654,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinEmptyInnerSidePadsAll) {
   EXPECT_EQ(rows[0], Row({Value(10), Value()}));
   EXPECT_EQ(rows[1], Row({Value(20), Value()}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M6: ORDER BY + LIMIT compose above the outer join through the engine's
@@ -672,7 +674,7 @@ TEST_F(QueryTest, SqlEngineLeftJoinWithOrderAndLimit) {
   EXPECT_EQ(rows[0], Row({Value(30), Value()}));
   EXPECT_EQ(rows[1], Row({Value(20), Value(200)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-union: UNION ALL branches over one table with disjoint equality
@@ -705,7 +707,7 @@ TEST_F(QueryTest, SqlEngineUnionAllDisjointMergesToSingleScan) {
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[1][0], Value(2));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-union: UNION DISTINCT merges regardless of overlap (dedup absorbs it).
@@ -722,7 +724,7 @@ TEST_F(QueryTest, SqlEngineUnionDistinctMergesToSingleScan) {
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[2][0], Value(3));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-union negative shapes keep the branch-wise path: overlapping UNION ALL
@@ -750,7 +752,7 @@ TEST_F(QueryTest, SqlEngineUnionOverlappingAndGroupedStayCorrect) {
       "ORDER BY k;");
   ASSERT_EQ(grouped.size(), 6U);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5: a single-table uncorrelated FROM-subquery flattens into the outer
@@ -788,7 +790,7 @@ TEST_F(QueryTest, SqlEngineDerivedTableFlattensToCascades) {
   EXPECT_EQ(rows[0], Row({Value(20), Value(200)}));
   EXPECT_EQ(rows[1], Row({Value(30), Value(300)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5: computed (immutable) derived outputs rebind wherever the outer query
@@ -806,7 +808,7 @@ TEST_F(QueryTest, SqlEngineDerivedTableComputedOutputs) {
   EXPECT_EQ(rows[0][0], Value(21));
   EXPECT_EQ(rows[1][0], Value(31));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // ORDER BY a SELECT-list alias routes the ordering to the post-plan
@@ -844,7 +846,7 @@ TEST_F(QueryTest, SqlEngineOrderByAliasKeepsLimitAboveTheSort) {
   EXPECT_EQ(rows[0][0], Value(1));
   EXPECT_EQ(rows[2][0], Value(3));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5: an inner `*` expands over the base schema before flattening. (A star
@@ -862,7 +864,7 @@ TEST_F(QueryTest, SqlEngineDerivedTableInnerStarExpansion) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(2), Value(2)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5: an inner WHERE under a LEFT JOIN rides the ON condition, so rows the
@@ -882,7 +884,7 @@ TEST_F(QueryTest, SqlEngineDerivedTableUnderLeftJoinKeepsPadding) {
   EXPECT_EQ(rows[0], Row({Value(10), Value(100)}));
   EXPECT_EQ(rows[1], Row({Value(20), Value()}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5 negative shapes stay correct on the relational path: aggregation
@@ -907,7 +909,7 @@ TEST_F(QueryTest, SqlEngineDerivedTableFallbackShapesStayCorrect) {
   ASSERT_EQ(correlated.size(), 3U);
   EXPECT_EQ(correlated[0][0], Value(10));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 follow-up: a CTE that stays shared cannot take one consumer's filter --
@@ -1041,7 +1043,7 @@ TEST_F(QueryTest, SqlEnginePushesSharedCteRestrictionsDisjunctively) {
   EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U) << unfiltered;
   EXPECT_NE(unfiltered.find("rows_evaluated=64"), std::string::npos)
       << unfiltered;
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4: a singly-referenced non-recursive CTE inlines into a derived source
@@ -1079,7 +1081,7 @@ TEST_F(QueryTest, SqlEngineSingleUseCteInlinesToCascades) {
   EXPECT_EQ(rows[0], Row({Value(20), Value(200)}));
   EXPECT_EQ(rows[1], Row({Value(30), Value(300)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4: chained CTEs inline inside-out (c1 into c2, then c2 into the outer
@@ -1097,7 +1099,7 @@ TEST_F(QueryTest, SqlEngineChainedCteInlinesInsideOut) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(30));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4/M5: a derived output used as a nested-field scope (`st.y` where `st`
@@ -1130,7 +1132,7 @@ TEST_F(QueryTest, SqlEngineDerivedOutputAsScopeStaysCorrect) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 negative shapes keep the materialized path with identical rows: a
@@ -1157,7 +1159,7 @@ TEST_F(QueryTest, SqlEngineMultiUseAndRecursiveCteStayCorrect) {
   EXPECT_EQ(rec[0][0], Value(1));
   EXPECT_EQ(rec[2][0], Value(3));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 materialization: a multiply-referenced small CTE lifts into one shared
@@ -1191,7 +1193,7 @@ TEST_F(QueryTest, SqlEngineMultiUseCteMaterializesOnceToCascades) {
   EXPECT_EQ(rows[0], Row({Value(10), Value(10)}));
   EXPECT_EQ(rows[1], Row({Value(20), Value(20)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, LargeCteAvoidsDiscardedSpeculativeExecution) {
@@ -1224,7 +1226,7 @@ TEST_F(QueryTest, LargeCteAvoidsDiscardedSpeculativeExecution) {
     EXPECT_EQ(count, bounded ? 3U : 2048U);
     ASSERT_SUCCESS(prepared->GetStatus());
   }
-  ctx.Abort();
+  EXPECT_EQ(ctx.Abort(), Status::kSuccess);
 }
 
 // M4 CTE predicate pushdown : the shared cell is narrowed
@@ -1270,7 +1272,7 @@ TEST_F(QueryTest, SqlEngineMultiSiteCtePushesWeakenedFilter) {
   ASSERT_EQ(eq_rows.size(), 1U);
   EXPECT_EQ(eq_rows[0][0], Value(20));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // Multi-site CTE narrowing must weaken to the WEAKEST bound per direction
@@ -1314,7 +1316,7 @@ TEST_F(QueryTest, SqlEngineMultiSiteCteUpperBoundStaysWeakest) {
   EXPECT_EQ(swapped[2][0], Value(20));
   EXPECT_EQ(swapped[2][1], Value(28));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 shared-cell safety: a multiply-referenced CTE never takes a
@@ -1333,7 +1335,7 @@ TEST_F(QueryTest, SqlEngineMultiUseCteCellIgnoresSiteSpecificFilter) {
   EXPECT_EQ(rows[0], Row({Value(20), Value(20)}));
   EXPECT_EQ(rows[1], Row({Value(30), Value(30)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 pushdown boundary: grouped bodies keep their groups (a filter on an
@@ -1351,7 +1353,7 @@ TEST_F(QueryTest, SqlEngineGroupedCteBodyKeepsGroupsUnderFilter) {
   EXPECT_EQ(rows[0], Row({Value(20), Value(2)}));
   EXPECT_EQ(rows[1], Row({Value(30), Value(1)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 pushdown firing proof: without narrowing, the 2000-row body would
@@ -1362,7 +1364,7 @@ TEST_F(QueryTest, SqlEngineWeakenedCteFilterFitsCellBudget) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE big (k INT64, v INT64);");
   std::string insert = "INSERT INTO big VALUES ";
-  insert.reserve(2000 * 8);
+  insert.reserve(static_cast<size_type>(2000 * 8));
   for (int i = 0; i < 2000; ++i) {
     insert += (i == 0 ? "(" : ",(") + std::to_string(i) + "," +
               std::to_string(i) + ")";
@@ -1395,7 +1397,7 @@ TEST_F(QueryTest, SqlEngineWeakenedCteFilterFitsCellBudget) {
     EXPECT_EQ(rows[static_cast<size_t>(i)][0], Value(1990 + i));
   }
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M5+ LATERAL decorrelation : a single-table equality
@@ -1435,7 +1437,7 @@ TEST_F(QueryTest, SqlEngineSingleTableLateralDecorrelatesToJoin) {
   EXPECT_EQ(rows[1], Row({Value(10), Value(101)}));
   EXPECT_EQ(rows[2], Row({Value(20), Value(200)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // LEFT LATERAL keeps unmatched outer rows null-padded through decorrelation.
@@ -1458,7 +1460,7 @@ TEST_F(QueryTest, SqlEngineLeftLateralDecorrelatesWithNullPadding) {
   EXPECT_EQ(rows[2], Row({Value(20), Value(200)}));
   EXPECT_EQ(rows[3], Row({Value(30), Value()}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, LateralSelectStarAndCrossTypeJoinPreserveExactSemantics) {
@@ -1502,7 +1504,7 @@ TEST_F(QueryTest, LateralSelectStarAndCrossTypeJoinPreserveExactSemantics) {
   ASSERT_EQ(cross_eq.size(), 1U);
   EXPECT_EQ(cross_eq[0], Row({Value(int64_t{9007199254740993LL})}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // Non-equality correlations and aggregate bodies stay on the lateral path
@@ -1531,7 +1533,7 @@ TEST_F(QueryTest, SqlEngineNonEquiAndAggregateLateralStayCorrect) {
   EXPECT_EQ(agg_rows[0], Row({Value(10), Value(1)}));
   EXPECT_EQ(agg_rows[1], Row({Value(20), Value(1)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // An UNCORRELATED LATERAL query yields the same element set for every
@@ -1578,7 +1580,7 @@ TEST_F(QueryTest, SqlEngineUncorrelatedLateralRightFullJoinEmitsOnce) {
   EXPECT_EQ(corr_rows[0], Row({Value(), Value(10)}));
   EXPECT_EQ(corr_rows[1], Row({Value(), Value(20)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 materialization boundary: an over-budget CTE keeps the map-scoped
@@ -1588,9 +1590,9 @@ TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {
   RunSql(ctx, *db_, "CREATE TABLE t1 (k INT64);");
   RunSql(ctx, *db_, "CREATE TABLE t2 (k INT64);");
   std::string insert1 = "INSERT INTO t1 VALUES ";
-  insert1.reserve(40 * 6);
+  insert1.reserve(static_cast<size_type>(40 * 6));
   std::string insert2 = "INSERT INTO t2 VALUES ";
-  insert2.reserve(30 * 6);
+  insert2.reserve(static_cast<size_type>(30 * 6));
   for (int i = 0; i < 40; ++i) {
     insert1 += (i == 0 ? "(" : ",(") + std::to_string(i) + ")";
     if (i < 30) {
@@ -1622,7 +1624,7 @@ TEST_F(QueryTest, SqlEngineOverBudgetCteKeepsRescanPath) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(1200));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineSetOperationCteKeepsMapScopedPath) {
@@ -1652,7 +1654,7 @@ TEST_F(QueryTest, SqlEngineSetOperationCteKeepsMapScopedPath) {
              "SELECT a.k + b.k FROM c a, c b WHERE a.k = 1 AND b.k = 2;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(3));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M4 recursive leaf: a singly-referenced recursive CTE plans its outer
@@ -1690,7 +1692,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCtePlansOuterThroughCascades) {
   EXPECT_EQ(rows[0], Row({Value(2), Value(102)}));
   EXPECT_EQ(rows[1], Row({Value(3), Value(103)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // ORDER BY over an unnamed computed projection sorts by the projected
@@ -1722,7 +1724,7 @@ TEST_F(QueryTest, SqlEngineOrderByUnnamedComputedSortsOutput) {
   EXPECT_EQ(joined[0], Row({Value(11), Value(200)}));
   EXPECT_EQ(joined[2], Row({Value(31), Value(100)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-window: ranking functions plan through the Cascades memo (kWindow +
@@ -1758,7 +1760,7 @@ TEST_F(QueryTest, SqlEngineWindowRankingPlansThroughCascades) {
   EXPECT_EQ(rows[2], Row({Value(2), Value(2)}));
   EXPECT_EQ(rows[3], Row({Value(3), Value(1)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-window: frame aggregation (cumulative SUM) and multi-spec chaining
@@ -1778,7 +1780,7 @@ TEST_F(QueryTest, SqlEngineWindowFramesAndChainedSpecs) {
   EXPECT_EQ(rows[1], Row({Value(1), Value(30), Value(2)}));
   EXPECT_EQ(rows[2], Row({Value(2), Value(30), Value(3)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // M-window: QUALIFY filters windowed rows above the kWindow nodes.
@@ -1795,7 +1797,7 @@ TEST_F(QueryTest, SqlEngineWindowQualifyFiltersWindowedRows) {
   EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
   EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // RANGE `1 FOLLOWING .. 2 FOLLOWING` under DESC ordering must open the frame
@@ -1818,7 +1820,7 @@ TEST_F(QueryTest, SqlEngineRangeDescendingFollowingStartBound) {
   EXPECT_EQ(rows[3], Row({Value(4), Value(5)}));
   EXPECT_EQ(rows[4], Row({Value(5), Value()}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // RANGE `0 PRECEDING` is defined as CURRENT ROW, so the end bound is the last
@@ -1838,7 +1840,7 @@ TEST_F(QueryTest, SqlEngineRangeZeroPrecedingEndsAtPeer) {
   EXPECT_EQ(rows[0], Row({Value(10), Value(10)}));
   EXPECT_EQ(rows[1], Row({Value(10), Value(10)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // MERGE of UNION ALL branches must not fold window calls into one shared scan:
@@ -1857,7 +1859,7 @@ TEST_F(QueryTest, SqlEngineUnionMergeKeepsWindowPartitions) {
   EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
   EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A merged UNION ALL still honors an integer ORDER BY ordinal.
@@ -1873,7 +1875,7 @@ TEST_F(QueryTest, SqlEngineUnionMergeKeepsOrderByOrdinal) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(2)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A derived table on the right of an inner join must have its own ON
@@ -1894,7 +1896,7 @@ TEST_F(QueryTest, SqlEngineDerivedJoinOnRebindsOutputs) {
   EXPECT_EQ(rows[1], Row({Value(2), Value(200)}));
   EXPECT_EQ(rows[2], Row({Value(3), Value(300)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // An inner WHERE of a derived table placed on the NULL-supplying left of a
@@ -1915,7 +1917,7 @@ TEST_F(QueryTest, SqlEngineDerivedLeftOfRightJoinKeepsPaddedRows) {
   EXPECT_EQ(rows[1], Row({Value(2), Value(200)}));
   EXPECT_EQ(rows[2], Row({Value(3), Value(300)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // Two window calls differing only in the aggregate WHERE filter are distinct
@@ -1934,7 +1936,7 @@ TEST_F(QueryTest, SqlEngineWindowWhereFilterNotDeduplicated) {
     EXPECT_EQ(row, Row({Value(40), Value(60)}));
   }
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A filter on the NULL-supplying side of a RIGHT/FULL join must not leak into
@@ -1960,7 +1962,7 @@ TEST_F(QueryTest, SqlEngineNullSupplyingFilterNotPushed) {
   ASSERT_EQ(full.size(), 1U);
   EXPECT_EQ(full[0], Row({Value(), Value(4)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineOuterNonRejectingFilterContract) {
@@ -2129,7 +2131,7 @@ TEST_F(QueryTest, SqlEngineOuterNonRejectingFilterContract) {
     return rows;
   };
   EXPECT_EQ(run_fallback(false), run_fallback(true));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A unique index on a nullable column stores NULL-bearing keys in the
@@ -2149,7 +2151,7 @@ TEST_F(QueryTest, DistinctKeepsNullableUniqueKey) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_TRUE(rows[0][0].IsNull());
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineWindowOverLeftJoinWithAliasOrder) {
@@ -2167,7 +2169,7 @@ TEST_F(QueryTest, SqlEngineWindowOverLeftJoinWithAliasOrder) {
   EXPECT_EQ(rows[0], Row({Value(10), Value(1)}));
   EXPECT_EQ(rows[2], Row({Value(30), Value(3)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // WITH RECURSIVE: the relational engine evaluates recursive CTEs with a
@@ -2205,7 +2207,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteTransitiveClosureWithUnionDistinct) {
   ASSERT_EQ(rows.size(), 1U);
   // Closure edges reachable from node 1: (1,2), (2,2), (2,3), (3,4).
   EXPECT_EQ(rows[0][0], Value(4));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // UNION (DISTINCT) recursion drops a row any earlier round already produced.
@@ -2266,7 +2268,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteDedupesThroughWorkTableIndex) {
       "SELECT COUNT(*) FROM t;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(320001));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 TEST_F(QueryTest, SqlEngineRecursiveCteMixedWithPlainCte) {
@@ -2278,7 +2280,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteMixedWithPlainCte) {
              "SELECT x + (SELECT MAX(n) FROM t) FROM plain;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(105));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // UNION DISTINCT BY NAME inside a recursive body aligns each round's output
@@ -2292,7 +2294,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteByNameUnionDedupesAlignedRows) {
              "UNION DISTINCT BY NAME SELECT b, a FROM t) SELECT * FROM t;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0], Row({Value(1), Value(2)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // Every name-matched union mode binds a recursive term's values by column
@@ -2334,7 +2336,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingAlignsEveryUnionMode) {
              "SELECT 5 AS b, 6 AS a FROM t WHERE a = 1) "
              "SELECT * FROM t ORDER BY a, b;"),
       (std::vector<Row>{Row({Value(1), Value(2)}), Row({Value(6), Value(5)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // The working shape stays the anchor's even when a term is name matched, so
@@ -2350,7 +2352,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingKeepsDepthLast) {
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], Row({Value(1), Value(2), Value(int64_t{0})}));
   EXPECT_EQ(rows[1], Row({Value(101), Value(12), Value(int64_t{1})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // JOIN USING merges its key into one column, and that merged name is what a
@@ -2374,7 +2376,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteJoinUsingFeedsNameMatching) {
             Row({Value(int64_t{10}), Value(int64_t{2}), Value(int64_t{10})}));
   EXPECT_EQ(rows[2],
             Row({Value(int64_t{100}), Value(int64_t{3}), Value(int64_t{10})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A recursive CTE fixes its shape from the anchor, so name matching never
@@ -2428,7 +2430,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns) {
       "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL BY NAME "
       "SELECT * FROM (SELECT 2 AS a, 3 AS c)) SELECT * FROM t;",
       "produces column c that the working table does not name");
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // CTE entries live in an unordered map, so the WITH list is resolved in
@@ -2450,7 +2452,7 @@ TEST_F(QueryTest, SqlEngineCteDependencyOrderFollowsNestedReferences) {
                    "WITH b AS (SELECT * FROM a UNION ALL SELECT * FROM a), "
                    "a AS (SELECT 1 AS x) SELECT * FROM b ORDER BY x;"),
             (std::vector<Row>{Row({Value(1)}), Row({Value(1)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A recursive body that reads a sibling CTE keeps the dependency-ordered
@@ -2471,7 +2473,7 @@ TEST_F(QueryTest, SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder) {
                    "UNION ALL SELECT n + 1 FROM a WHERE n < 3), "
                    "b AS (SELECT 1 AS n) SELECT SUM(n) FROM a;"),
             (std::vector<Row>{Row({Value(6)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 // A mutual reference among WITH entries has no evaluation order at all, so
@@ -2527,7 +2529,7 @@ TEST_F(QueryTest, SqlEngineCyclicCteReferenceRejected) {
     }
     EXPECT_NE(message.find("not found"), std::string::npos) << message;
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(ctx.txn_.Abort(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

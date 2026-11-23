@@ -47,6 +47,7 @@ inductive Matches : Regex → List UInt8 → Prop where
   | starCons {r s t} : Matches r s → Matches (.star r) t →
       Matches (.star r) (s ++ t)
   | repZero {r} : Matches (.repeatMin r 0) []
+  | repStar {r s} : Matches (.star r) s → Matches (.repeatMin r 0) s
   | repOne {r s t} : Matches r s → Matches (.star r) t →
       Matches (.repeatMin r 1) (s ++ t)
   | repSucc {r n s t} : Matches r s → Matches (.repeatMin r n) t →
@@ -108,6 +109,7 @@ theorem mandatory_sound {r : Regex} {s : List UInt8} (h : Matches r s) :
   | starNil => intro l hl; simp [mandatory] at hl
   | starCons h₁ h₂ ih₁ ih₂ => intro l hl; simp [mandatory] at hl
   | repZero => intro l hl; simp [mandatory] at hl
+  | repStar _ _ => intro l hl; simp [mandatory] at hl
   | repOne h₁ h₂ ih₁ ih₂ =>
       intro l hl
       simp [mandatory] at hl
@@ -232,5 +234,23 @@ theorem regex_mandatory_literal_sound (r : Regex) (rows : List (List UInt8))
       (allMandatory_eq _ _).2 (mandatory_sound hacc)
     simp [hacc, hkeep]
   · simp [hacc]
+
+def SearchMatch (r : Regex) (row : List UInt8) : Prop :=
+  ∃ mid, IsSubstring mid row ∧ Matches r mid
+
+theorem mandatory_search_sound (r : Regex) (rows : List (List UInt8))
+    [DecidablePred (SearchMatch r)] :
+    (keepCandidates r rows).filter (SearchMatch r) = rows.filter (SearchMatch r) := by
+  rw [keepCandidates, List.filter_filter]
+  apply List.filter_congr
+  intro row _
+  by_cases h : SearchMatch r row
+  · obtain ⟨mid, ⟨pre, post, rfl⟩, hm⟩ := h
+    have hk : allMandatory (mandatory r) (pre ++ mid ++ post) = true := by
+      apply (allMandatory_eq ..).2
+      intro lit hl
+      exact substring_append_left (substring_append_right (mandatory_sound hm lit hl))
+    simp only [hk, Bool.and_true]
+  · simp [h]
 
 end TinylambOpt.RegexMandatoryLiteral

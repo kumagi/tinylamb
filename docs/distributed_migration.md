@@ -11,8 +11,8 @@ tinylamb を停止時間最小(計画停止は再起動のみ、データ移行�
 **M5(durability 切替)までの間、データの安全性は常に単一ノード時代と同等以上**、
 がこの計画の設計原則である。
 
-対応フェーズ: M1=Phase 0、M2=Phase 1、M3=Phase 2/3、M5=Phase 3 完了、
-M6=Phase 4(distributed.md §11 改訂版)。
+対応フェーズ: M1=Phase 0、M2=Phase 1、M3=Phase 2/3、M4=Phase 3 の計測ゲート、
+M5=Phase 3 完了、M6=Phase 4(distributed.md §11 改訂版)。
 
 ## 0. 前提条件チェックリスト(M0 で確認)
 
@@ -23,7 +23,7 @@ M6=Phase 4(distributed.md §11 改訂版)。
 | ノード | 既存 1 台(n1)+ 新規 2 台(n2, n3)。制御プレーン 3 プロセスは n1〜n3 に同居可(初期)。本格運用では別ホスト推奨 |
 | 容量 | 各レプリカ: 現行 db+wal サイズ ×1.2 以上。base backup 中は n2/n3 側に一時 ×2 |
 | ネットワーク | ノード間で 9100/tcp(制御)、9200/tcp(データ配送)が開いていること。NFS 上の datadir は禁止(fsync の意味が消える) |
-| fsync の実効性 | 仮想化/コンテナ環境で fdatasync が恒久化されること(`tinylamb_admin` の fsync 自己診断、または既知の virtio 設定確認) |
+| fsync の実効性 | 仮想化/コンテナ環境で fdatasync が恒久化されること。現行ツリーに `tinylamb_admin` の自己診断コマンドはないため、実装されるまでは既知の virtio 設定確認など外部の手段を記録する |
 
 ### 時計
 
@@ -130,8 +130,11 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 5. [n2] 追従基準(全 stream で durable ≥ primary の shipped - 32KiB が 60 秒)
    を満たしたら control へ報告
 6. [operator] promote --shard 0 n2 (view+1, voters={n1,n2})
-   同様に n3 も promote (view+1, voters={n1,n2,n3}, quorum=3)
+   同様に n3 も promote (view+1, voters={n1,n2,n3}, quorum=2)
 ```
+
+`quorum = floor(voters.size()/2) + 1` に従う。n2 を加えた 2 voter の間は
+quorum=2(全員の同意が必要)であり、n3 を加えた後の 3 voter では quorum=2 となる。
 
 - **base backup の成立条件**（M0 で実装・検証する要件）:
   - 公開済みチェックポイントの同一世代のスナップショットと付随ファイルを確保し、コピー完了までその世代を保持する。
@@ -147,12 +150,20 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 - **手順**: 現状(voters=3, durability=kLocal)のまま **72 時間**運転し、
   レプリケーション基盤の健全性を計測する。ack 経路はまだ local fsync。
 - **計測項目とゲート**:
-  - shipper lag(durable_lsn 差) p99 < 50ms
-  - FlushAck RTT p99 < 5ms
-  - receiver の REDO 適用遅延 p99 < 100ms
-  - prefix 規則違反(I-4)0 件、バッチ CRC 不一致 0 件
-  - 制御プレーン term 変動 < 1 回/日(頻発なら election timeout チューニング)
-- **検証**: ゲート全項目 green。
+  - shipper lag は各バッチの末尾 LSN を receiver の `durable_lsn` が初めて覆った時刻
+    から ship 時刻を引いた値で p99 < 50ms
+  - FlushAck RTT はバッチ送信から対応する ACK 受信までの単調時計時間で p99 < 5ms
+  - receiver の REDO 適用遅延はバッチ受信から適用完了までの単調時計時間で p99 < 100ms
+  - prefix 規則違反(I-4)とバッチ CRC 不一致はイベントカウンタで各 0 件
+  - 制御プレーン term 変動は term の変更イベントをノードごとに数え、合計 < 1 回/日
+    (頻発なら election timeout チューニング)
+- **検証**: 各ノードが単調時計時刻、stream、バッチ末尾 LSN、送信/FlushAck/REDO
+  適用時刻、CRC/prefix エラー累計、term を記録した CSV を 72 時間保存する。同梱の
+  集計スクリプトで上記 3 レイテンシの p99、日ごとの term 変更数、エラーカウンタの
+  差分を算出し、CSV と集計結果を添付する。必要な shipper/receiver/term メトリクス
+  出力と集計ツールは未実装なので、現状はこのゲートを測定・green 判定できない。
+  Phase 3 で観測手段を実装し、再現可能な集計結果が得られるまで M4 は未完了として
+  M5 に進まない。
 - **ロールバック**: M3 のロールバックに同じ。
 
 ## 7. M5: durability 切替(唯一の重要な境目)
@@ -188,7 +199,7 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 - ノード交換・レプリカ数変更: `distributed_membership.md` §7 の playbook
 - バックアップ: base backup(M3 手順)を learner から取得(primary 負荷なし)
 - アラート最低セット: seal レイテンシ p99 > 50ms、制御プレーン leader 不在
-  > 2 秒、heartbeat staleness > 100ms、shipper lag > 1GB(§10 参照)、
+  > 2 秒、heartbeat staleness > 100ms、shipper backlog > 1GB(§10 参照)、
   制御プレーン disk > 80%
 - 四半期ドリル: failover 訓練、force-single 手順のリハーサル
   (`distributed_membership.md` §8)

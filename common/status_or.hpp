@@ -32,6 +32,12 @@
 
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
+// gtest-free counterpart of ASSERT_EQ for the assertion macros below. This
+// production header is included by servers/benchmarks that do not link gtest,
+// and gtest's ASSERT_EQ also cannot be used from non-void callers.
+#define TINYLAMB_STATUS_OR_ASSERT_EQ(a, b) \
+  ::tinylamb::detail::StatusOrAssertEq((a), (b), #a, #b)
+
 // NOTE: Unlike COERCE/ASSERT_SUCCESS_AND_EQ, the ASSIGN_OR_* family is
 // deliberately *not* `do { ... } while (0)`: each macro declares `value` in
 // the caller's scope so it can be used by the following statements, and a
@@ -39,6 +45,9 @@
 // statements -- always brace them when used as an if/else/for/while body
 // (`if (c) { ASSIGN_OR_RETURN(...); }`), otherwise the caller's `else` no
 // longer matches its `if` and compilation fails instead of silently rebinding.
+// For the same reason `value##_tmp` lives in the caller's scope: do not reuse
+// the same `value` name twice in one scope (e.g. two calls in a loop body) --
+// pick a distinct name, or open a nested scope, for the second call.
 #define ASSIGN_OR_RETURN(type, value, expr)          \
   StatusOr<type> value##_tmp = expr;                 \
   if (value##_tmp.GetStatus() != Status::kSuccess) { \
@@ -46,9 +55,9 @@
   }                                                  \
   type value(value##_tmp.MoveValue())
 
-#define ASSIGN_OR_ASSERT_FAIL(type, value, expr)        \
-  StatusOr<type> value##_tmp = expr;                    \
-  ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
+#define ASSIGN_OR_ASSERT_FAIL(type, value, expr)                           \
+  StatusOr<type> value##_tmp = expr;                                       \
+  TINYLAMB_STATUS_OR_ASSERT_EQ(value##_tmp.GetStatus(), Status::kSuccess); \
   type value(value##_tmp.MoveValue())
 
 // Like ASSIGN_OR_ASSERT_FAIL, but binds `value` as a const reference into the
@@ -56,7 +65,8 @@
 // not copied. Use only when `value` is never mutated afterwards.
 #define ASSIGN_OR_ASSERT_FAIL_CONST(type, value, expr)        \
   auto value##_const_tmp = expr;                              \
-  ASSERT_EQ(value##_const_tmp.GetStatus(), Status::kSuccess); \
+  TINYLAMB_STATUS_OR_ASSERT_EQ(value##_const_tmp.GetStatus(), \
+                               Status::kSuccess);             \
   const type& value(value##_const_tmp.Value())
 
 #define COERCE(x)                                              \
@@ -68,11 +78,11 @@
     }                                                          \
   }
 
-#define ASSERT_SUCCESS_AND_EQ(expr, expected)     \
-  {                                               \
-    const auto& tmp = expr;                       \
-    ASSERT_EQ(tmp.GetStatus(), Status::kSuccess); \
-    ASSERT_EQ(tmp.Value(), expected);             \
+#define ASSERT_SUCCESS_AND_EQ(expr, expected)                        \
+  {                                                                  \
+    const auto& tmp = expr;                                          \
+    TINYLAMB_STATUS_OR_ASSERT_EQ(tmp.GetStatus(), Status::kSuccess); \
+    TINYLAMB_STATUS_OR_ASSERT_EQ(tmp.Value(), expected);             \
   }
 
 #define ASSIGN_OR_CRASH(type, value, expr)                     \
@@ -81,7 +91,7 @@
     LOG(FATAL) << "Crashed: " << value##_tmp.GetStatus();      \
     abort();                                                   \
   }                                                            \
-  type value = value##_tmp.Value()
+  type value = value##_tmp.MoveValue()
 
 // Like ASSIGN_OR_CRASH, but binds `value` as a const reference into the
 // temporary StatusOr so the value is not copied. Use only when `value` is
@@ -102,9 +112,23 @@ namespace detail {
 // Value()/MoveValue() stays one predictable branch that inlines everywhere;
 // the LOG(FATAL) machinery would otherwise keep the whole accessor out of
 // line on the row-decode hot path.
-inline __attribute__((noreturn)) void StatusOrNoValue(const Status& status) {
+[[noreturn]] inline void StatusOrNoValue(const Status& status) {
   LOG(FATAL) << "StatusOr has no value: " << status;
   std::abort();
+}
+
+// Self-contained assertion for the ASSERT_* convenience macros. Unlike the
+// gtest ASSERT_EQ it used to expand to, this works in binaries that do not
+// link gtest and is not restricted to void return contexts. Unlike assert()
+// it stays active in NDEBUG builds. It does not print the values, so no
+// operator<< is required from the compared types.
+template <typename A, typename B>
+inline void StatusOrAssertEq(const A& a, const B& b, const char* lhs,
+                             const char* rhs) {
+  if (UNLIKELY(!(a == b))) {
+    LOG(FATAL) << "Assertion failed: " << lhs << " == " << rhs;
+    std::abort();
+  }
 }
 }  // namespace detail
 
@@ -129,6 +153,16 @@ class StatusOr {
   StatusOr(U&& v)  // NOLINT
       : status_(Status::kSuccess), value_(std::in_place, std::forward<U>(v)) {}
 
+  // Copy/move propagate consumed_ like any other member, so a consumed
+  // StatusOr never becomes readable again through a copy: the optional still
+  // holds the moved-from payload, and only the consumed_ flag keeps Value()
+  // and HasValue() honest. Declaring all four explicitly documents that
+  // invariant (and keeps the move operations alive despite the copy ones).
+  StatusOr(const StatusOr&) = default;
+  StatusOr(StatusOr&&) = default;
+  StatusOr& operator=(const StatusOr&) = default;
+  StatusOr& operator=(StatusOr&&) = default;
+
   [[nodiscard]] bool HasValue() const {
     // A success Status with no payload (e.g. `StatusOr<T> x =
     // Status::kSuccess`) must not claim a value: Value()/MoveValue() would
@@ -137,7 +171,7 @@ class StatusOr {
   }
   // Callers must check HasValue() first: accessing the value of a failed
   // StatusOr is a contract violation and aborts (no exceptions).
-  T& Value() {
+  [[nodiscard]] T& Value() {
     if (UNLIKELY(consumed_ || status_ != Status::kSuccess ||
                  !value_.has_value())) {
       detail::StatusOrNoValue(ConsumedStatus());
@@ -149,7 +183,7 @@ class StatusOr {
   // status_ so GetStatus() keeps the original error (e.g. kCorrupt) instead
   // of overwriting it with kUnknown, which is indistinguishable from a
   // genuine failure.
-  T&& MoveValue() {
+  [[nodiscard]] T&& MoveValue() {
     if (UNLIKELY(consumed_ || status_ != Status::kSuccess ||
                  !value_.has_value())) {
       detail::StatusOrNoValue(ConsumedStatus());
@@ -170,6 +204,8 @@ class StatusOr {
   friend std::ostream& operator<<(std::ostream& o, const StatusOr<T>& so) {
     if (so.HasValue()) {
       o << so.Value();
+    } else if (so.GetStatus() == Status::kSuccess) {
+      o << "<empty>";
     } else {
       o << "<error: " << so.GetStatus() << ">";
     }

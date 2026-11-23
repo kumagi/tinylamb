@@ -271,4 +271,26 @@ theorem restart_from_batch_head_unsound :
     resumeScalar rows out = none := by
   decide
 
+/-- A JIT-specific guard may reject a row even when checked scalar addition
+    succeeds. Undo speculative writes before re-evaluating the unconsumed row. -/
+def runGuarded (guard : State → Option Int → Bool) : List (Option Int) → State → Option State
+  | [], st => some st
+  | row :: rest, st =>
+    let part := (stepRaw st row).1
+    if guard st row && (stepRaw st row).2 then runGuarded guard rest part
+    else refRun (row :: rest) (restore part (save st))
+
+theorem arbitrary_guard_resume (guard : State → Option Int → Bool)
+    (rows : List (Option Int)) (st : State) : runGuarded guard rows st = refRun rows st := by
+  induction rows generalizing st with
+  | nil => rfl
+  | cons row rest ih =>
+    simp only [runGuarded, restore_discards_partial_write]
+    split
+    · rename_i h
+      simp only [Bool.and_eq_true] at h
+      rw [refRun, step_eq, if_pos h.2]
+      apply ih
+    · rfl
+
 end TinylambOpt.DeoptResume

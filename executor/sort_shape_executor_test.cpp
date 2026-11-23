@@ -17,6 +17,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -494,9 +496,9 @@ TEST(SortShapeExecutorTest, MixedSignednessSingleKeyMatchesCanonicalOrder) {
       {Value(int64_t{-2}), "i_minus_2"},
       {Value(int64_t{2}), "i_2"},
   };
-  const std::vector<std::string> expected{
-      "i_minus_2", "i_minus_1", "i_0",      "i_1",
-      "i_2",       "u_2pow63",  "u_high_1", "u_max"};
+  const std::vector<std::string> expected{"i_minus_2", "i_minus_1", "i_0",
+                                          "i_1",       "i_2",       "u_2pow63",
+                                          "u_high_1",  "u_max"};
   for (const bool ascending : {true, false}) {
     std::vector<Row> rows;
     rows.reserve(input.size());
@@ -505,16 +507,17 @@ TEST(SortShapeExecutorTest, MixedSignednessSingleKeyMatchesCanonicalOrder) {
     }
     auto sort = std::make_shared<SortExecutor>(
         std::make_shared<PositionedRows>(std::move(rows)), SyntheticSchema(),
-        std::vector<SortExecutor::Key>{SortExecutor::Key{
-            .expression = Key(), .ascending = ascending,
-            .nulls_first = std::nullopt}},
+        std::vector<SortExecutor::Key>{
+            SortExecutor::Key{.expression = Key(),
+                              .ascending = ascending,
+                              .nulls_first = std::nullopt}},
         1, Buffered(1UL << 20));
     const Collected out = Collect(sort);
     ASSERT_EQ(out.status, Status::kSuccess);
     ASSERT_EQ(out.rows.size(), expected.size());
     std::vector<std::string> got;
     got.reserve(out.rows.size());
-for (const Row& row : out.rows) {
+    for (const Row& row : out.rows) {
       got.emplace_back(row.values_[1].value.varchar_value);
     }
     if (ascending) {
@@ -522,6 +525,125 @@ for (const Row& row : out.rows) {
     } else {
       EXPECT_EQ(got,
                 std::vector<std::string>(expected.rbegin(), expected.rend()));
+    }
+  }
+}
+
+// Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
+TEST(SortShapeExecutorTest,
+     PackedTwoKeyInt64MatchesFallbackAcrossNullOrdersAndOverflow) {
+  struct ScopedEnv {
+    const char* name;
+    std::string prev;
+    bool had_prev{false};
+    ScopedEnv(const char* n, const char* val) : name(n) {
+      if (const char* cur = std::getenv(name)) {
+        prev = cur;
+        had_prev = true;
+      }
+      if (val != nullptr) {
+        ::setenv(name, val, 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+    ~ScopedEnv() {
+      if (had_prev) {
+        ::setenv(name, prev.c_str(), 1);
+      } else {
+        ::unsetenv(name);
+      }
+    }
+  };
+
+  const Schema schema("pair_sort", {Column("a", ValueType::kInt64),
+                                    Column("b", ValueType::kInt64),
+                                    Column("tag", ValueType::kVarChar)});
+  const auto build_rows = [](bool include_overflow) {
+    std::vector<Row> rows;
+    const std::vector<int64_t> a_vals{
+        -(int64_t{1} << 30), -100, -1, 0, 1, 100, (int64_t{1} << 30) - 1};
+    const std::vector<int64_t> b_vals{-(int64_t{1} << 30), -5, 0, 5,
+                                      (int64_t{1} << 30) - 1};
+    size_t seq = 0;
+    // Duplicate and NULL combinations in non-trivial input order so ties and
+    // NULL placement are thoroughly exercised.
+    for (int rep = 0; rep < 2; ++rep) {
+      rows.emplace_back(std::vector<Value>{
+          Value(), Value(), Value("nn_" + std::to_string(seq++))});
+      rows.emplace_back(std::vector<Value>{
+          Value(), Value(int64_t{-3}), Value("nv_" + std::to_string(seq++))});
+      rows.emplace_back(std::vector<Value>{
+          Value(int64_t{7}), Value(), Value("vn_" + std::to_string(seq++))});
+    }
+    for (size_t ia = 0; ia < a_vals.size(); ++ia) {
+      for (size_t ib = 0; ib < b_vals.size(); ++ib) {
+        const int64_t a = a_vals[(ia * 3 + ib) % a_vals.size()];
+        const int64_t b = b_vals[(ib * 2 + ia) % b_vals.size()];
+        rows.emplace_back(std::vector<Value>{
+            Value(a), Value(b), Value("p_" + std::to_string(seq++))});
+      }
+    }
+    // Identical keys to pin sort stability.
+    for (int rep = 0; rep < 4; ++rep) {
+      rows.emplace_back(std::vector<Value>{
+          Value(int64_t{42}), Value(int64_t{-42}),
+          Value("tie_" + std::to_string(rep) + "_" + std::to_string(seq++))});
+    }
+    if (include_overflow) {
+      rows.emplace_back(std::vector<Value>{
+          Value(std::numeric_limits<int64_t>::max()), Value(int64_t{0}),
+          Value("ov_max_" + std::to_string(seq++))});
+      rows.emplace_back(std::vector<Value>{
+          Value(std::numeric_limits<int64_t>::min()), Value(int64_t{-1}),
+          Value("ov_min_" + std::to_string(seq++))});
+      rows.emplace_back(
+          std::vector<Value>{Value(int64_t{0}), Value(-(int64_t{1} << 30) - 1),
+                             Value("ov_b_lo_" + std::to_string(seq++))});
+      rows.emplace_back(
+          std::vector<Value>{Value(int64_t{0}), Value(int64_t{1} << 30),
+                             Value("ov_b_hi_" + std::to_string(seq++))});
+    }
+    return rows;
+  };
+
+  for (const bool include_overflow : {false, true}) {
+    for (const bool asc_a : {true, false}) {
+      for (const bool asc_b : {true, false}) {
+        for (const std::optional<bool> nf_a :
+             {std::optional<bool>{}, std::optional<bool>{true},
+              std::optional<bool>{false}}) {
+          for (const std::optional<bool> nf_b :
+               {std::optional<bool>{}, std::optional<bool>{true},
+                std::optional<bool>{false}}) {
+            const std::vector<SortExecutor::Key> keys{
+                {.expression = ColumnValueExp("a"),
+                 .ascending = asc_a,
+                 .nulls_first = nf_a},
+                {.expression = ColumnValueExp("b"),
+                 .ascending = asc_b,
+                 .nulls_first = nf_b}};
+            auto run = [&](const char* env_val) {
+              ScopedEnv guard("TINYLAMB_DISABLE_PACKED_ORDER_KEY", env_val);
+              auto sort = std::make_shared<SortExecutor>(
+                  std::make_shared<PositionedRows>(
+                      build_rows(include_overflow)),
+                  schema, keys, 1, Buffered(1UL << 20));
+              return Collect(sort);
+            };
+            const Collected on = run(nullptr);
+            const Collected off = run("1");
+            ASSERT_EQ(on.status, Status::kSuccess);
+            ASSERT_EQ(off.status, Status::kSuccess);
+            ASSERT_EQ(on.rows.size(), off.rows.size());
+            for (size_t i = 0; i < on.rows.size(); ++i) {
+              EXPECT_EQ(on.rows[i], off.rows[i])
+                  << "ov=" << include_overflow << " asc=(" << asc_a << ","
+                  << asc_b << ") row=" << i;
+            }
+          }
+        }
+      }
     }
   }
 }

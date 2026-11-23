@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -73,20 +75,14 @@ class TableIncarnation {
     if (state_ != State::kLive) {
       return false;
     }
-    ++active_leases_;
     ++owner_leases_[owner];
+    ++active_leases_;
     return true;
   }
 
   void Release(txn_id_t owner) {
     std::scoped_lock lock(mutex_);
     if (active_leases_ == 0) {
-      return;
-    }
-    if (active_leases_ == 1) {
-      active_leases_ = 0;
-      owner_leases_.clear();
-      quiescent_.notify_all();
       return;
     }
     auto found = owner_leases_.find(owner);
@@ -131,26 +127,56 @@ class TableIncarnation {
     // callers already treat false as a retryable conflict. The bound is
     // configurable so a workload with legitimately long readers (or a test
     // exercising the timeout path) need not be pinned to an arbitrary 60s.
+    using Clock = std::chrono::steady_clock;
+    using Milliseconds = std::chrono::milliseconds;
     static const auto timeout = [] {
-      constexpr auto kDefault = std::chrono::milliseconds(60000);
+      constexpr auto kDefault =
+          std::chrono::duration_cast<Clock::duration>(Milliseconds(60000));
+      constexpr auto kMaxMillis = static_cast<unsigned long long>(
+          std::chrono::duration_cast<Milliseconds>(Clock::duration::max())
+              .count());
       const char* env = std::getenv("TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS");
       if (env == nullptr || *env == '\0') {
         return kDefault;
       }
+      const auto is_space = [](char c) {
+        return std::isspace(static_cast<unsigned char>(c)) != 0;
+      };
+      const char* begin = env;
+      while (*begin != '\0' && is_space(*begin)) {
+        ++begin;
+      }
+      const char* end = begin;
+      while (*end != '\0') {
+        ++end;
+      }
+      while (end > begin && is_space(end[-1])) {
+        --end;
+      }
+      if (begin < end && *begin == '+') {
+        ++begin;
+      }
+      if (begin == end) {
+        return kDefault;
+      }
       unsigned long long ms = 0;
-      for (const char* p = env; *p != '\0'; ++p) {
+      for (const char* p = begin; p != end; ++p) {
         if (*p < '0' || *p > '9') {
           return kDefault;
         }
-        ms = (ms * 10) + static_cast<unsigned long>(*p - '0');
+        const auto digit = static_cast<unsigned>(*p - '0');
+        if (ms > (kMaxMillis - digit) / 10) {
+          return kDefault;
+        }
+        ms = (ms * 10) + digit;
       }
-      return std::chrono::milliseconds(ms);
+      return std::chrono::duration_cast<Clock::duration>(Milliseconds(ms));
     }();
-    if (!quiescent_.wait_for(lock, timeout,
-                             [&] { return active_leases_ == 0; })) {
-      return false;
-    }
-    return true;
+    const auto now = Clock::now();
+    const auto max = Clock::time_point::max();
+    const auto deadline = now > max - timeout ? max : now + timeout;
+    return quiescent_.wait_until(lock, deadline,
+                                 [&] { return active_leases_ == 0; });
   }
 
   void CommitDrop() {
@@ -303,8 +329,10 @@ class TableIncarnation {
     it->second.last_used = columnar_cache_->touch_clock;
     return it->second.entry;
   }
-  void PutCachedColumnRaw(uint32_t col, uint64_t generation, size_t bytes,
-                          std::shared_ptr<const void> entry) {
+  void PutCachedColumnRaw(
+      uint32_t col, uint64_t generation, size_t bytes,
+      std::shared_ptr<const void> entry,
+      std::shared_ptr<const std::atomic<size_t>> dynamic_bytes = nullptr) {
     std::shared_ptr<const void> old;
     {
       std::scoped_lock lock(columnar_cache_->mu);
@@ -320,14 +348,21 @@ class TableIncarnation {
       }
       if (it == columnar_cache_->columns.end()) {
         columnar_cache_->columns.emplace(
-            col, ColumnarCacheState::CachedColumnSlot{generation, tick, bytes,
-                                                      std::move(entry)});
+            col, ColumnarCacheState::CachedColumnSlot{
+                     .generation=generation, .last_used=tick, .bytes=bytes, .entry=std::move(entry),
+                     .dynamic_bytes=std::move(dynamic_bytes)});
       } else {
         old = std::move(it->second.entry);
         it->second.generation = generation;
         it->second.last_used = tick;
         it->second.bytes = bytes;
         it->second.entry = std::move(entry);
+        // A caller that does not supply a dynamic-byte counter must not clear
+        // the one a previous put installed: ReclaimCandidate would then charge
+        // only the static slot bytes and undercount live columnar memory.
+        if (dynamic_bytes != nullptr) {
+          it->second.dynamic_bytes = std::move(dynamic_bytes);
+        }
       }
     }
   }
@@ -419,7 +454,7 @@ class TableIncarnation {
         columnar_cache_->views.pop_back();
       }
       columnar_cache_->views.push_back(ColumnarCacheState::CachedViewSlot{
-          generation, tick, std::move(projection), std::move(store)});
+          .generation=generation, .last_used=tick, .projection=std::move(projection), .store=std::move(store)});
     }
   }
   [[nodiscard]] std::shared_ptr<const void> GetBlockLayoutRaw(
@@ -444,7 +479,7 @@ class TableIncarnation {
   [[nodiscard]] bool ColumnRejected(uint32_t col, uint64_t generation) const {
     std::scoped_lock lock(columnar_cache_->mu);
     return columnar_cache_->rejected_columns_generation == generation &&
-           columnar_cache_->rejected_columns.count(col) != 0;
+           columnar_cache_->rejected_columns.contains(col);
   }
   void RejectColumn(uint32_t col, uint64_t generation) {
     std::scoped_lock lock(columnar_cache_->mu);
@@ -514,11 +549,17 @@ class TableIncarnation {
   }
 
  private:
+  static uint64_t NextGlobalColumnarTouch() noexcept {
+    static std::atomic<uint64_t> global_clock{1};
+    return global_clock.fetch_add(1, std::memory_order_relaxed);
+  }
   void TouchColumnarCache() const noexcept {
-    // Callers hold columnar_cache_->mu, so a per-cache plain counter suffices;
-    // a process-global atomic would serialize unrelated tables on one line.
-    columnar_cache_->recency->store(++columnar_cache_->touch_clock,
-                                    std::memory_order_relaxed);
+    // Callers hold columnar_cache_->mu; advancing from a global clock
+    // maintains strict LRU order both within one table and across tables in
+    // ProcessMemoryBudget::InvokeReclaimHooks.
+    const uint64_t tick = NextGlobalColumnarTouch();
+    columnar_cache_->touch_clock = tick;
+    columnar_cache_->recency->store(tick, std::memory_order_relaxed);
   }
 
   struct ColumnarCacheState {
@@ -527,6 +568,7 @@ class TableIncarnation {
       uint64_t last_used{0};
       size_t bytes{0};
       std::shared_ptr<const void> entry;
+      std::shared_ptr<const std::atomic<size_t>> dynamic_bytes;
     };
     struct CachedViewSlot {
       uint64_t generation{0};
@@ -621,7 +663,12 @@ class TableIncarnation {
         candidates.reserve(state.columns.size());
         for (const auto& [col, slot] : state.columns) {
           if (!slot.entry || slot.entry.use_count() == 1) {
-            candidates.push_back(Candidate{col, slot.last_used, slot.bytes});
+            const size_t entry_bytes =
+                slot.bytes +
+                (slot.dynamic_bytes
+                     ? slot.dynamic_bytes->load(std::memory_order_relaxed)
+                     : 0);
+            candidates.push_back(Candidate{.col=col, .last_used=slot.last_used, .bytes=entry_bytes});
           }
         }
         if (candidates.empty()) {

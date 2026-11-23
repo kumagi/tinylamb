@@ -19,6 +19,7 @@
 
 #include <iosfwd>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 
@@ -44,7 +45,8 @@ class ExecutorBase {
   bool Next(Row* dst, RowPosition* rp = nullptr);
   // Batch consumption that first drains rows buffered by Next(); callers
   // that may mix row-at-a-time and batch fetching on the same executor
-  // must go through this so buffered rows are never skipped.
+  // must go through this so buffered rows are never skipped. The sticky
+  // status remains available via GetStatus(), as on NextBatch().
   size_t NextBatchDraining(DataChunk* destination,
                            size_t max_rows = kDefaultVectorSize);
   virtual void Dump(std::ostream& o, int indent) const = 0;
@@ -62,8 +64,13 @@ class ExecutorBase {
   //
   // Returns false when the executor cannot prune (the default, and for any
   // executor whose output is not the probed table); the join then applies the
-  // filter itself.  Contract: called exactly once, before the executor has
-  // produced its first row.
+  // filter itself.  Caller obligation: attach at most once, before the
+  // executor has produced its first row. This base implementation is a no-op
+  // and does not police the contract; concrete executors that can prune
+  // enforce the "before first row" half themselves (e.g. FullScan refuses
+  // once started_), while a duplicate attachment before that point may
+  // replace the filter. Callers must therefore attach exactly once; a late
+  // attachment is ignored rather than corrupting a running probe.
   virtual bool AttachRuntimeFilter(
       const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
       ValueType type) {
@@ -86,13 +93,20 @@ class ExecutorBase {
   // Virtual: transparent decorators (RetainedExecutor, IndexSkipScanExecutor)
   // forward to the wrapped executor so a child's error is not reported as a
   // successful exhaustion by the outermost cursor.
-  [[nodiscard]] virtual Status GetStatus() const { return status_; }
+  [[nodiscard]] virtual Status GetStatus() const {
+    std::scoped_lock lock(status_mu_);
+    return status_;
+  }
   [[nodiscard]] bool ok() const { return GetStatus() == Status::kSuccess; }
 
  protected:
   // Records the first error; returns false so callers can write
   // `return FailWith(...)` inside Next().
   bool FailWith(Status status) const {
+    // Workers of a shared executor may record failures concurrently. Guard
+    // both the check and the write so "first error wins" is atomic and the
+    // Status message's shared_ptr refcount is not raced.
+    std::scoped_lock lock(status_mu_);
     if (status_ == Status::kSuccess) {
       status_ = std::move(status);
     }
@@ -112,6 +126,7 @@ class ExecutorBase {
   }
 
  private:
+  mutable std::mutex status_mu_;  // guards status_ (and its message refcount)
   mutable Status status_{Status::kSuccess};
   // T4494: row-at-a-time fetch buffer backing Next().
   DataChunk row_buffer_;

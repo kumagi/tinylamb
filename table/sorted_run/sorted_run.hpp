@@ -75,9 +75,19 @@ class SortedRun final {
     Iterator(const Iterator&) = default;
     Iterator& operator=(Iterator&&) = default;
     Iterator& operator=(const Iterator&) = default;
+    // Key()/Value() require IsValid(): reading an exhausted/default iterator
+    // is a caller error and CHECK-fails. They never return an "end" sentinel;
+    // an empty key or row is data at a valid position, so callers must use
+    // IsValid() (not the returned value) as the loop/termination condition.
     [[nodiscard]] std::string Key() const;
     [[nodiscard]] Row Value() const;
-    [[nodiscard]] Entry GetEntry() const { return parent_->GetEntry(offset_); }
+    [[nodiscard]] Entry GetEntry() const {
+      // Same precondition as Key()/Value(): an exhausted or parentless
+      // iterator is a caller error; fail loudly instead of dereferencing
+      // parent_ or letting SortedRun::GetEntry's out_of_range escape.
+      CHECK_MSG(IsValid(), "SortedRun::Iterator::GetEntry on invalid iterator");
+      return parent_->GetEntry(offset_);
+    }
     [[nodiscard]] bool IsValid() const {
       return parent_ != nullptr && offset_ < parent_->Size();
     }

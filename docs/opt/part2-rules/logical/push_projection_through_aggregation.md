@@ -36,7 +36,12 @@ graph TD
 3. 集約 Group が自分自身でないこと（`agg_id != group`）。
 4. 集約 Group 内の `kAggregation` 式が子を持ち、その子が集約 Group や
    `group` 自身でないこと（循環防止）。
-5. 作る派生グループ `proj_below` / `new_agg` が特定の既存グループと
+5. 集約の入力 Group が本 Rule が生成した剪定射影でないこと（不動点
+   ガード）。実装は
+   `if (memo.Get(agg_child).tag.starts_with("proj_below_agg:")) { continue; }`
+   で判定します。これがないと、既に剪定済みの集約入力を再び剪定して
+   Projection をネストし、同じ変換が延々と適用されます。
+6. 作る派生グループ `proj_below` / `new_agg` が特定の既存グループと
    一致しないこと（`proj_below != agg_child && proj_below != group &&
    new_agg != agg_id && new_agg != group`）。
 
@@ -113,8 +118,8 @@ HAVING にしか現れない列も落とせません。派生グループのタ�
 1. `proj_below` グループに `Projection(agg_child, below_targets)`
    — 必要列だけの前倒し射影。
 2. `new_agg` グループに `Aggregation(proj_below)` — 集約の target list、
-   `output_schema`、`partition_by`、`grouping_sets` を元の集約から
-   そのまま引き継ぐ。
+   `output_schema`、`grouping_sets` を元の集約から引き継ぐ。`partition_by`
+   は `grouping_sets` が空の場合のみ引き継ぎ、非空の場合は空にする。
 3. `group` に `Projection(new_agg, expression.target_list)` —
    外側の射影を維持。
 

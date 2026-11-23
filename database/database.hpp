@@ -25,8 +25,8 @@
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -57,16 +57,24 @@ class Database final : public CatalogReader {
       std::string_view dbname, size_t wal_sync_ms = 1,
       bool preallocate_new_wal = false);
 
-  // Filesystem bookkeeping: every successful Create() records the database's
-  // base name for this process; RemoveCreatedDatabaseFiles() unlinks the
-  // <name>.db/.log/.last_checkpoint/.last_checkpoint.tmp artifacts of every
-  // recorded name (missing files are ignored). The test-workspace cleanup
-  // environment calls it at binary exit so throwaway databases never outlive
-  // the run; benchmarks and servers keep files unless they call it
+  // Filesystem bookkeeping: Create() records the database's base name after
+  // successful initialization; a failed Create() must not leave a name that
+  // could make a later process's same-named files eligible for this sweep.
+  // RemoveCreatedDatabaseFiles() unlinks <name>.db (plus companion block/tlcs
+  // files), the WAL segment series, and legacy .last_checkpoint side-cars.
+  // The checkpoint state itself is aggregated into the <name>.db snapshot;
+  // the side-cars are only removed to clean up files from older versions
+  // (see recovery/AGENTS.md). Missing files are ignored. The test-workspace
+  // cleanup environment calls it at binary exit so throwaway databases never
+  // outlive the run; benchmarks and servers keep files unless they call it
   // themselves.
   // Names are never unregistered: a reopen cycle (EmulateCrash + Create)
   // keeps the same base name and stays covered.
   static void RemoveCreatedDatabaseFiles();
+  // Test cleanup variant: bases present before the test binary started must
+  // survive even if the process reopened them through Create().
+  static void RemoveCreatedDatabaseFiles(
+      const std::unordered_set<std::string>& preserve_bases);
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
   Database(Database&&) = delete;
@@ -183,6 +191,7 @@ class Database final : public CatalogReader {
   Status RefreshStatistics(TransactionContext& ctx,
                            std::string_view schema_name);
 
+  StatusOr<bool> TableExists(TransactionContext& ctx, std::string_view name) override;
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name) override;
 
@@ -205,7 +214,7 @@ class Database final : public CatalogReader {
   // is far too slow to matter in a test/fuzz iteration).  No page latch may be
   // held on this thread.  Returns the begin-checkpoint LSN recovery will resume
   // from.
-  StatusOr<lsn_t> WriteCheckpoint();
+  StatusOr<lsn_t> WriteCheckpoint(bool allow_auto_compaction = true);
 
   // Compacts `schema_name`'s committed RowPage chain into an immutable `.tlcs`
   // columnar file alongside `<db>.db` and replaces the in-memory pages with
@@ -241,24 +250,11 @@ class Database final : public CatalogReader {
   friend class TransactionContext;
 
   // Process-global epoch base so every Database instance owns a disjoint
-  // epoch range (see schema_epoch_ below).
-  static uint64_t next_database_epoch_base() noexcept {
-    static std::atomic<uint64_t> base{0};
-    constexpr uint64_t kStride = uint64_t{1} << 32;
-    uint64_t current = base.load(std::memory_order_relaxed);
-    while (true) {
-      // 2^32 instances exhaust the 64-bit epoch space. Wrapping would reuse a
-      // predecessor's range and revive its stale plans, so fail fast instead.
-      if (current > std::numeric_limits<uint64_t>::max() - kStride) {
-        std::abort();
-      }
-      if (base.compare_exchange_weak(current, current + kStride,
-                                     std::memory_order_acq_rel,
-                                     std::memory_order_relaxed)) {
-        return current + 1;
-      }
-    }
-  }
+  // epoch range (see schema_epoch_ below). Exhausting the 64-bit space is a
+  // recoverable Status now: aborting here would kill the embedding process
+  // from a library constructor boundary. Called by Create() before the
+  // database is published to the caller.
+  [[nodiscard]] static StatusOr<uint64_t> TryNextDatabaseEpochBase();
 
   // Persistent { Name => Table } storage.
   BPlusTree catalog_;
@@ -293,6 +289,7 @@ class Database final : public CatalogReader {
   mutable std::mutex tlcs_attach_mu_;
   std::unordered_set<page_id_t> tlcs_probed_pids_;
 
+  StatusOr<std::string> ReadTableCatalogEntry(TransactionContext& ctx, std::string_view name);
   void MaybeAttachBackingTlcs(Table& table);
 
   // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().
@@ -300,7 +297,9 @@ class Database final : public CatalogReader {
   // share an epoch: plan caches stamp entries with the epoch and a fresh
   // database starting at 0 would otherwise replay artifacts that reference
   // the destroyed predecessor's tables.
-  std::atomic<uint64_t> schema_epoch_{next_database_epoch_base()};
+  // Assigned by Create() from TryNextDatabaseEpochBase(); a default-constructed
+  // Database never observes an uninitialized epoch.
+  std::atomic<uint64_t> schema_epoch_{0};
   std::atomic<bool> auto_tlcs_in_progress_{false};
 
   bool TryAutoCompactTable(TransactionContext& ctx,

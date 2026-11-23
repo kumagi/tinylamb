@@ -5,7 +5,9 @@
 // ~RelationalExecutor) was reported by `postgres_session_fuzzer` with these
 // exact script bytes.  Replaying them must stay clean.
 
+#include <array>
 #include <cstdint>
+#include <future>
 #include <string>
 
 #include "gtest/gtest.h"
@@ -50,6 +52,17 @@ TEST(PostgresSessionFuzzerReplay, FailStatementOrderingCrash2) {
   EXPECT_TRUE(TryPostgresSession(reinterpret_cast<const uint8_t*>(input.data()),
                                  input.size(), false))
       << "replay observed an illegal state without crashing";
+}
+
+TEST(PostgresSessionFuzzerReplay, ConcurrentWriteRaceReplaysAreIsolated) {
+  constexpr std::array<uint8_t, 2> input{0, 0};
+  const auto run = [&] {
+    return TryPostgresSession(input.data(), input.size(), false);
+  };
+  auto first = std::async(std::launch::async, run);
+  auto second = std::async(std::launch::async, run);
+  EXPECT_TRUE(first.get());
+  EXPECT_TRUE(second.get());
 }
 
 }  // namespace

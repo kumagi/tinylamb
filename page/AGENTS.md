@@ -23,7 +23,9 @@ Unbounded row blocks + LSM-Tree engines (`tinylamb_page`, shared with
   cursor over `TLRB` SSTable blocks), and `MergeLsmSourcesToFd` (streaming K-way
   merge). See ADRs 0007 and 0009/0010.
 - `page_ref.{hpp,cpp}` — move-only RAII: latches `Page` on construct and
-  unlocks on destroy/`PageUnlock`.
+  unlocks on destroy/`PageUnlock`. `PageReleaseLatch` drops only the latch
+  while keeping the owning `shared_ptr` alive, for callees that receive the
+  raw `Page*` after the latch is released.
 - `row_page.{hpp,cpp}` — unbounded row block (`std::vector<std::string> slots_`
   + `committed_slots_` + `committed_lsns_`, up to `kMaxSlotsPerBlock = 4096`
   slots per block; dynamic strings with a byte admission budget for new writes).

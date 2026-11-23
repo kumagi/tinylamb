@@ -391,9 +391,12 @@ class RelationalFunctionSweepTest : public ::testing::Test {
   }
 
   // Evaluates one function call through the relational evaluator.  Returns
-  // nullopt when the call failed (Status or boundary exception).
+  // nullopt when the call failed (Status or boundary exception); `leaked`
+  // reports the exception case separately so expect<=0 cases cannot mask an
+  // EXC-SHIM boundary leak as a legitimate failure.
   std::optional<Value> Evaluate(const std::string& name,
-                                const std::vector<Value>& args) {
+                                const std::vector<Value>& args,
+                                bool* leaked = nullptr) {
     std::vector<Expression> children;
     children.reserve(args.size());
     for (const Value& value : args) {
@@ -412,6 +415,9 @@ class RelationalFunctionSweepTest : public ::testing::Test {
       }
       return result.MoveValue();
     } catch (const std::exception&) {
+      if (leaked != nullptr) {
+        *leaked = true;
+      }
       return std::nullopt;  // EXC-SHIM boundary leak counts as failure.
     }
   }
@@ -426,7 +432,9 @@ TEST_F(RelationalFunctionSweepTest, EveryDispatchedFunctionReturnsCleanly) {
   for (const Case& c : cases) {
     SCOPED_TRACE(testing::Message()
                  << c.name << "/" << c.args.size() << " args");
-    const std::optional<Value> result = Evaluate(c.name, c.args);
+    bool leaked = false;
+    const std::optional<Value> result = Evaluate(c.name, c.args, &leaked);
+    EXPECT_FALSE(leaked) << "exception crossed the Status boundary: " << c.name;
     if (c.expect == 1) {
       ASSERT_TRUE(result.has_value()) << "expected success: " << c.name
                                       << " with " << c.args.size() << " args";
@@ -1060,7 +1068,7 @@ TEST_F(RelationalFunctionSweepTest, CivilFunctionsEvaluateOperandsOnce) {
         : IntervalExpression(1, "DAY"),
           date(std::move(value)),
           calls(evaluations) {}
-    StatusOr<Value> TryEvaluate(const Row&, const Schema&) const override {
+    [[nodiscard]] StatusOr<Value> TryEvaluate(const Row& /*unused*/, const Schema& /*unused*/) const override {
       ++calls;
       return date;
     }

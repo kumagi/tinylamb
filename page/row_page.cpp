@@ -63,6 +63,9 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
   const size_t fit_margin = free_bytes - record.size();
   size_t locked_hole_bytes = 0;
   const PackedSlots& live = LivePacked();
+  if (live.size() > kMaxColumnarRows) {
+    return Status::kCorrupt;
+  }
   const auto row_max = static_cast<slot_t>(live.size());
   slot_t hole_slot = row_max;
   if (row_count_ < row_max || !hole_sizes_.empty()) {
@@ -363,7 +366,9 @@ void RowPage::RestoreLiveSlot(slot_t slot, std::string_view image) {
   if (!occupied && !image.empty()) {
     ++row_count_;
   } else if (occupied && image.empty()) {
-    --row_count_;
+    if (row_count_ > 0) {
+      --row_count_;
+    }
   }
   if (slot < hole_sizes_.size()) {
     hole_sizes_[slot] = 0;

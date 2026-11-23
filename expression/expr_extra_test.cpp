@@ -2,7 +2,8 @@
 // Semantic pins for the AST evaluator (the ground truth every other
 // evaluation path mirrors): INT64 division promotes to double, modulo by
 // zero fails rather than crashing, NULL propagates through arithmetic and
-// three-valued comparisons, and string ordering follows byte order.
+// three-valued comparisons, and string ordering follows the resolved
+// collation (byte order when no COLLATE tag is present).
 #include <gtest/gtest.h>
 
 #include <cstdint>
