@@ -2,7 +2,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -1042,7 +1041,7 @@ TEST(RecursivePartitionerTest, FinalizeRetriesFailedRootWriteAndSplitRead) {
           const auto id = static_cast<uint64_t>(row[0].AsInt64());
           return id == 3 ? id << 62 : id << 60;
         });
-    const std::string payload(static_cast<size_type>(9 * 1024), 'x');
+    const std::string payload(9 * 1024, 'x');
     for (int64_t id : {0, 1, 3}) {
       ASSERT_EQ(part.AddRow(Row({Value(id), Value(std::string(payload))})),
                 Status::kSuccess);
@@ -1199,7 +1198,7 @@ TEST(SpillableStoreTest, FailedStagingFlushRetainsChargeAndRows) {
   const Row expected({Value(std::string(8192, 'x'))});
   ASSERT_EQ(rows.AppendRow(expected), Status::kSuccess);
   const auto before = grant.UsedBytes();
-  ASSERT_GT(before, 0U);
+  ASSERT_GT(before, 0u);
   budget.SetTestSpillIoFailCountdown(1);
   const Status st = rows.Seal();
   budget.SetTestSpillIoFailCountdown(0);

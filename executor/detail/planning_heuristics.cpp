@@ -570,8 +570,7 @@ StatusOr<bool> HasCollatedJoinColumn(const Relation& relation, size_t column) {
       const auto& values = chunk.columns[column];
       for (size_t row = 0; row < chunk.rows; ++row) {
         values.WriteValueInto(row, &cell);
-        if (!cell.IsNull() &&
-            (cell.IsCaseInsensitive() || cell.IsInterval())) {
+        if (!cell.IsNull() && cell.IsCaseInsensitive()) {
           return true;
         }
       }
@@ -580,7 +579,7 @@ StatusOr<bool> HasCollatedJoinColumn(const Relation& relation, size_t column) {
   }
   const auto collated = [column](const Row& row) {
     return column < row.Count() && !row[column].IsNull() &&
-           (row[column].IsCaseInsensitive() || row[column].IsInterval());
+           row[column].IsCaseInsensitive();
   };
   if (!relation.HasSpill()) {
     return std::ranges::any_of(relation.rows, collated);
@@ -715,14 +714,9 @@ bool HasMixedKeySignednessOrType(const Relation& left, const Relation& right,
   return check_side(left, true, keys) || check_side(right, false, keys);
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/BinaryCollationStringEquiJoinElision.lean (sound)
 std::vector<Expression> ResidualJoinPredicates(
     const Schema& left, const Schema& right,
-    const std::vector<Expression>& predicates, bool allow_binary_varchar) {
-  static const bool varchar_elision_disabled =
-      std::getenv("TINYLAMB_DISABLE_VARCHAR_KEY_ELISION") != nullptr;
-  const bool elide_binary_varchar =
-      allow_binary_varchar && !varchar_elision_disabled;
+    const std::vector<Expression>& predicates) {
   const std::vector<EqualityKey> keys = EqualityKeys(left, right, predicates);
   const bool can_elide_exact =
       !keys.empty() && keys.size() <= 4 &&
@@ -734,15 +728,9 @@ std::vector<Expression> ResidualJoinPredicates(
         }
         const Column& lc = left.GetColumn(key.left);
         const Column& rc = right.GetColumn(key.right);
-        if (lc.Type() != rc.Type() || lc.IsUnsigned() || rc.IsUnsigned()) {
-          return false;
-        }
-        if (lc.Type() == ValueType::kInt64 || lc.Type() == ValueType::kDate) {
-          return true;
-        }
-        return elide_binary_varchar && lc.Type() == ValueType::kVarChar &&
-               !lc.IsInterval() && !rc.IsInterval() &&
-               lc.GetTextDomain() == rc.GetTextDomain();
+        return lc.Type() == rc.Type() && !lc.IsUnsigned() && !rc.IsUnsigned() &&
+               (lc.Type() == ValueType::kInt64 ||
+                lc.Type() == ValueType::kDate);
       });
   std::vector<Expression> residual;
   residual.reserve(predicates.size());
@@ -3621,8 +3609,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           bop == BinaryOperation::kLessThanEquals ||
           bop == BinaryOperation::kGreaterThan ||
           bop == BinaryOperation::kGreaterThanEquals) {
-        auto unwrap_double_cast = [](const Expressio {n& e) -> Expre
-}ssion {
+        auto unwrap_double_cast = [](const Expression& e) -> Expression {
           if (e && e->Type() == TypeTag::kCastExp &&
               e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
               e->AsCastExpression().Child() != nullptr) {
@@ -3641,17 +3628,14 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           const auto off = LocalColumnOffset(
               result_schema, e->AsColumnValue().GetColumnName());
           if (!off.has_value() || *off >= result_schema.ColumnCount()) {
-          {   return fals
-}e;
-          }
-          const Column& c = result_schema.GetColumn(*off);
-          if { (c.IsUnsigned
-}() || c.Type() != ValueType::kDouble) {
             return false;
           }
-          if (*off < l {eft_width) {
- 
-}           out->on_probe = !flip;
+          const Column& c = result_schema.GetColumn(*off);
+          if (c.IsUnsigned() || c.Type() != ValueType::kDouble) {
+            return false;
+          }
+          if (*off < left_width) {
+            out->on_probe = !flip;
             out->col = *off;
           } else {
             out->on_probe = flip;
@@ -3887,7 +3871,8 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           const uint64_t packed =
               (static_cast<uint64_t>(
                    static_cast<uint32_t>(static_cast<int32_t>(v0)))
-               << worker_items.data()    static_cast<uint64_t>(
+               << 32) |
+              static_cast<uint64_t>(
                   static_cast<uint32_t>(static_cast<int32_t>(v1)));
           out->push_back({packed, base + p + i});
         }
@@ -4017,7 +4002,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                 for (const PartItem& it : bucket) {
                   if (packed_has_bloom) {
                     const auto w0 = static_cast<size_t>((it.h >> 6U) &
-                                      auto            packed_bloom_word_mask);
+                                                        packed_bloom_word_mask);
                     const auto w1 = static_cast<size_t>((it.h >> 30U) &
                                                         packed_bloom_word_mask);
                     const uint64_t m0 = uint64_t{1} << (it.h & 63U);
@@ -5115,7 +5100,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           *out_n = any_null ? dst_n : nullptr;
           return any_null;
         };
-        for (uint32_t r0 = task.rautoin; r0 < task.row_end; r0 += 4096) {
+        for (uint32_t r0 = task.row_begin; r0 < task.row_end; r0 += 4096) {
           const uint32_t cnt = std::min<uint32_t>(4096, task.row_end - r0);
           const int64_t* in_k0 = nullptr;
           const uint8_t* in_n0 = nullptr;
@@ -5149,7 +5134,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                                        ? AddJoinKeyBias(in_k0[i], pb0)
                                        : in_k0[i];
                 const int64_t v1 = has_bias && pb1 != 0
-                                       ? AddautoyBias(in_k1[i], pb1)
+                                       ? AddJoinKeyBias(in_k1[i], pb1)
                                        : in_k1[i];
                 if (static_cast<int64_t>(static_cast<int32_t>(v0)) == v0 &&
                     static_cast<int64_t>(static_cast<int32_t>(v1)) == v1) {
@@ -5610,9 +5595,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   }
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, ordinary_predicates);
-  const size_t raw_key_count = equality_keys.size();
   RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
-  const bool allow_varchar_elision = equality_keys.size() == raw_key_count;
   struct UsingJoinKey {
     std::vector<size_t> left_columns;
     std::vector<size_t> right_columns;
@@ -5636,9 +5619,9 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
         (right.using_columns == nullptr ||
          !ContainsIdentifier(*right.using_columns, name))) {
       return StatusError(StatusCode::kAmbiguousQuery,
-                         "am.left=biguous USING column: .right=" + name);
+                         "ambiguous USING column: " + name);
     }
-    //.null_safe= USING columns with the same ValueType but different unsigned tags do
+    // USING columns with the same ValueType but different unsigned tags do
     // NOT compare equal under the canonical `=` (-1 INT64 vs UINT64_MAX).
     // Only fold into a raw equality key when both sides share the tag;
     // otherwise keep a residual that rechecks with TryEvaluateBinary.
@@ -5664,7 +5647,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       HasMixedKeySignednessOrType(left, right, equality_keys)
           ? ordinary_predicates
           : ResidualJoinPredicates(left.schema, right.schema,
-                                   ordinary_predicates, allow_varchar_elision);
+                                   ordinary_predicates);
   const auto compiled_residuals =
       outer == nullptr && using_residuals.empty()
           ? CompileProbeResiduals(residual, result.schema)
@@ -6364,14 +6347,11 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
   std::vector<EqualityKey> equality_keys =
       EqualityKeys(left.schema, right.schema, predicates);
-  const size_t raw_key_count = equality_keys.size();
   RETURN_IF_FAIL(DisableRawCollatedKeys(left, right, &equality_keys));
-  const bool allow_varchar_elision = equality_keys.size() == raw_key_count;
   const std::vector<Expression> residual =
       HasMixedKeySignednessOrType(left, right, equality_keys)
           ? predicates
-          : ResidualJoinPredicates(left.schema, right.schema, predicates,
-                                   allow_varchar_elision);
+          : ResidualJoinPredicates(left.schema, right.schema, predicates);
 
   const auto compiled_residuals =
       outer == nullptr ? CompileProbeResiduals(residual, result.schema)

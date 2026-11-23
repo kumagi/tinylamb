@@ -16,7 +16,6 @@
 
 #include "recovery/recovery_manager.hpp"
 
-#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -232,7 +231,7 @@ TEST_F(RecoveryManagerTest, ReadsRecordLargerThanLoggerRing) {
   RecoveryManager reader(path, pm_->GetPool(), logger->SegmentSize());
   reader.SetLogger(logger.get());
   const auto original = LogRecord::LsmPutLogRecord(
-      0, 10, 3, "key", std::string(static_cast<size_type>(128 * 1024), 'x'), "", false);
+      0, 10, 3, "key", std::string(128 * 1024, 'x'), "", false);
   const auto position = logger->AddLog(original.Serialize());
   ASSERT_TRUE(position.HasValue());
   LogRecord decoded;
@@ -255,7 +254,7 @@ TEST_F(RecoveryManagerTest, RejectsCorruptFooterOnCurrentSegment) {
   ASSERT_NE(logger, nullptr);
   ASSERT_TRUE(logger->FixedSizeSegments());
 
-  const std::string payload(static_cast<size_type>(128 * 1024), 'x');
+  const std::string payload(128 * 1024, 'x');
   const auto record =
       LogRecord::LsmPutLogRecord(0, 10, 3, "key", payload, "", false);
   const auto pos = logger->AddLog(record.Serialize());
@@ -341,7 +340,7 @@ TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
 
   // Inflate damaged's total_len past the end of the file so ReadLogDetailed
   // reports kShort at its offset even though `committed` follows it.
-  const auto inflated = static_cast<uint32_t>(
+  const uint32_t inflated = static_cast<uint32_t>(
       first.size() + damaged.size() + committed.size() + 4096);
   ASSERT_GE(inflated, 30U);
   ASSERT_LE(inflated, Logger::kMaxRecordSize);

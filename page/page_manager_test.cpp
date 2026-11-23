@@ -19,7 +19,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -256,7 +255,7 @@ TEST_F(PageManagerTest, CheckpointRejectsUnrepresentableBlockGeneration) {
   const size_t magic = bytes.find(kMagic);
   ASSERT_NE(magic, std::string::npos);
   const size_t block_generation =
-      magic + kMagic.size() + (2 * sizeof(uint32_t)) + (2 * sizeof(uint64_t));
+      magic + kMagic.size() + 2 * sizeof(uint32_t) + 2 * sizeof(uint64_t);
   ASSERT_GE(bytes.size(), block_generation + sizeof(uint64_t) + sizeof(uint32_t));
   constexpr uint64_t kUnrepresentable = uint64_t{1} << 32;
   std::memcpy(bytes.data() + block_generation, &kUnrepresentable,
@@ -428,9 +427,9 @@ TEST_F(PageManagerTest, CheckpointLsmRotationSerializesWithConcurrentFlushes) {
   // write-buffer limit and flush/compaction streams actually run.
   pm_->SetBufferPoolLimitBytesForTest(1U << 20);
   std::vector<std::string> keys;
-  keys.reserve(static_cast<size_type>(kChunks * kPerChunk));
+  keys.reserve(kChunks * kPerChunk);
   std::vector<std::string> values;
-  values.reserve(static_cast<size_type>(kChunks * kPerChunk));
+  values.reserve(kChunks * kPerChunk);
   for (int i = 0; i < kChunks * kPerChunk; ++i) {
     // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
     char buf[16];

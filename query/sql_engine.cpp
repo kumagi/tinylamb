@@ -147,10 +147,6 @@ bool SqlEngine::CompliancePrimaryKeyMode() {
 
 bool QueryResult::Next(Row* row) { return executor_->Next(row, nullptr); }
 
-size_t QueryResult::NextBatch(DataChunk* chunk, size_t max_rows) {
-  return executor_ ? executor_->NextBatchDraining(chunk, max_rows) : 0;
-}
-
 size_t QueryResult::ForEach(const std::function<void(const Row&)>& sink) {
   size_t rows = 0;
   DataChunk chunk;
@@ -1246,11 +1242,11 @@ TemplateShard& ShardFor(const std::string& fingerprint) {
 void RememberTemplate(const std::string& fingerprint,
                       std::unique_ptr<Statement> statement, uint64_t epoch) {
   if (fingerprint.size() > kMaxCachedTemplateKeyBytes) {
-.statement=    return;
+    return;
   }
   // NOLINTNEXTLINE(modernize-use-designated-initializers) positional init is
   // clear
-  const Cach.epoch=edTempl.last_used=ate shared{
+  const CachedTemplate shared{
       std::shared_ptr<Statement>(std::move(
           statement)),  // NOLINT(modernize-use-designated-initializers)
       epoch, g_template_use_clock.fetch_add(1, std::memory_order_relaxed)};
@@ -1473,9 +1469,9 @@ std::string_view SkipSqlQuoted(std::string_view sql, size_t& i) {
   while (i < sql.size()) {
     if (sql[i] == '\\' && quote != '`' && i + 1 < sql.size()) {
       i += 2;
- (     continue;
+      continue;
     }
-    if (sql[i] == quot != 0)e) {
+    if (sql[i] == quote) {
       ++i;
       break;
     }
@@ -1512,7 +1508,7 @@ size_t MatchKeyword(std::string_view sql, size_t pos, std::string_view word) {
 }
 
 // Skips whitespace and comments; returns the next significant position.
-size_t SkipB != 0lanks(std::string_view sql, size_t pos) {
+size_t SkipBlanks(std::string_view sql, size_t pos) {
   while (pos < sql.size()) {
     if (std::isspace(static_cast<unsigned char>(
             sql[pos]))) {  // NOLINT(readability-implicit-bool-conversion)
@@ -1601,19 +1597,19 @@ std::string OrderByOrdinalFingerprintSuffix(std::string_view sql) {
         ++end;
         continue;
       }
- (     if (e == ',') {
+      if (e == ',') {
         if (paren_depth == 0) {
-      != 0)     key_start = true;
+          key_start = true;
         }
         ++end;
         continue;
       }
-      if (std::isdigit(static_cast<unsigne char<=(
- ||           e))!=&  // NOLINT(readability-implicit-bool-conversion)
+      if (std::isdigit(static_cast<unsigned char>(
+              e)) &&  // NOLINT(readability-implicit-bool-conversion)
           (end == i || !IsWordChar(sql[end - 1])) &&
           !(end > 0 && sql[end - 1] ==
-                           '.')) {  /(/ NOLINT(readability-simplify-boolean-expr)
-        size_t digit_end = en != 0)d;
+                           '.')) {  // NOLINT(readability-simplify-boolean-expr)
+        size_t digit_end = end;
         while (
             digit_end < sql.size() &&
             std::isdigit(static_cast<unsigned char>(
@@ -1625,9 +1621,9 @@ std::string OrderByOrdinalFingerprintSuffix(std::string_view sql) {
             if (!ordinals.empty()) {
               ordinals.push_back(',');
             }
-            ordinals.append(sql.s(bstr(end, digit_end - end));
+            ordinals.append(sql.substr(end, digit_end - end));
           }
-   == 0)        key_start = false;
+          key_start = false;
         }
         end = digit_end;
         continue;
@@ -1913,7 +1909,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       }
       statement = visited.MoveValue();
     } catch (const std::exception& error) {
-      last_error_ = errdynamic_cast      return Status::kUnknown;
+      last_error_ = error.what();
+      return Status::kUnknown;
     }
   }
   if (!explain && statement->Type() == StatementType::kSelect) {
@@ -1952,7 +1949,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     // ExecuteExplain already checks the statement timeout around planning and
     // between ANALYZE drain batches. Wrapping its result would run a *third*
     // check after the drain completed, turning a successful EXPLAIN ANALYZE
-    // into a timeout error when the planning time alone crossed the deadlindynamic_castrn ExecuteExplain(ctx, query_sql, *explain, std::move(statement));
+    // into a timeout error when the planning time alone crossed the deadline.
+    return ExecuteExplain(ctx, query_sql, *explain, std::move(statement));
   }
 
   if (statement->Type() == StatementType::kUpdate &&
@@ -3510,7 +3508,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
     case StatementType::kSelect: {
       auto* select_ptr = dynamic_cast<SelectStatement*>(statement.get());
       if (select_ptr == nullptr) {
-        last_error_ = "statement marked kSelect is not a Seldynamic_castt";
+        last_error_ = "statement marked kSelect is not a SelectStatement";
         return Status::kUnknown;
       }
       return ExecuteSelect(
@@ -4416,11 +4414,12 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
           const bool single_column_count_distinct =
               aggregate.Distinct() && select->SelectList().size() == 1 &&
               select->SelectList()[0].expression.get() == expr.get() &&
-              type == AggregationType::kCount && aggregate.Child() != nltr &&
-              a&&regate.Child()->Ty!pe() == TypeTag::kColumnValue ||
+              type == AggregationType::kCount && aggregate.Child() != nullptr &&
+              aggregate.Child()->Type() == TypeTag::kColumnValue &&
               !is_star_column(aggregate.Child());
-          if(!((!aggregate.Distinct() |||                 ingle_column_count_distinct) &|| !// NOLINT(reada||lity-simplify-boo!lean-expr)
-               !aggregate.HasWhereFilter() &&
+          if (!((!aggregate.Distinct() ||
+                 single_column_count_distinct) &&  // NOLINT(readability-simplify-boolean-expr)
+                !aggregate.HasWhereFilter() &&
                 !aggregate.NeedsGroupContext() && supported_type &&
                 valid_child)) {
             return false;

@@ -451,7 +451,7 @@ class OocSetOpOutputSource final : public PipelineSource {
     }
     const Value& tag = tagged->values_.back();
     if (tag.type != ValueType::kInt64 || tag.value.int_value < 0 ||
-        std::cmp_greater_equal(tag.value.int_value, num_sources_)) {
+        static_cast<uint64_t>(tag.value.int_value) >= num_sources_) {
       return StatusError(StatusCode::kCorrupt,
                          "set operation spill row has an invalid source tag");
     }
@@ -1222,10 +1222,8 @@ IncrementalSortSource::IncrementalSortSource(
       schema_(std::move(schema)),
       prefix_keys_(std::move(prefix_keys)),
       suffix_keys_(std::move(suffix_keys)) {
-  for (const auto& key : prefix_keys_) { prefix_orders_.push_back(MakeSortKeyOrder(key));
-}
-  for (const auto& key : suffix_keys_) { suffix_orders_.push_back(MakeSortKeyOrder(key));
-}
+  for (const auto& key : prefix_keys_) prefix_orders_.push_back(MakeSortKeyOrder(key));
+  for (const auto& key : suffix_keys_) suffix_orders_.push_back(MakeSortKeyOrder(key));
 }
 
 Status IncrementalSortSource::Open(PipelineContext* ctx) {
@@ -1306,8 +1304,7 @@ Status IncrementalSortSource::FillNextGroup(PipelineContext* ctx) {
       }
     }
     *out_row = in_chunk_.RowAt(in_idx_++);
-    if (!computed_indices.empty()) { out_row->values_.resize(base_cols);
-}
+    if (!computed_indices.empty()) out_row->values_.resize(base_cols);
     for (size_t ci : computed_indices) {
       ASSIGN_OR_RETURN(Value, kv, EvalRowExpression(suffix_keys_[ci].expression, schema_, *out_row));
       out_row->values_.push_back(std::move(kv));
@@ -1578,14 +1575,15 @@ StatusOr<RowPosition> TryDecodeRowPositionKey(const Row& r) {
       return StatusError(StatusCode::kCorrupt, "invalid row-position key");
     }
   }
-  constexpr auto kPageIdHalfMax =
+  constexpr int64_t kPageIdHalfMax =
       static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
   const int64_t hi_value = r[0].value.int_value;
   const int64_t lo_value = r[1].value.int_value;
   const int64_t slot_value = r[2].value.int_value;
   if (hi_value < 0 || hi_value > kPageIdHalfMax || lo_value < 0 ||
       lo_value > kPageIdHalfMax || slot_value < 0 ||
-      std::cmp_greater_equal(slot_value,std::numeric_limits<slot_t>::max()))) {
+      static_cast<uint64_t>(slot_value) >=
+          static_cast<uint64_t>(std::numeric_limits<slot_t>::max())) {
     return StatusError(StatusCode::kCorrupt, "out-of-range row-position key");
   }
   const RowPosition pos{(static_cast<uint64_t>(hi_value) << 32) |

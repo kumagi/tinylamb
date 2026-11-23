@@ -999,7 +999,7 @@ TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
       VisitSqlOrThrow("CREATE TABLE FUNCTION my_func(x INT64) AS SELECT x;");
   ASSERT_EQ(create->Type(), StatementType::kCreateFunction);
   EXPECT_EQ(
-      dynamic_cast<const CreateObjectStatement*>(
+      static_cast<const CreateObjectStatement*>(
           create
               .get())  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
           ->RunSideEffect(),
@@ -1078,7 +1078,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
     GTEST_SKIP() << "skipped";
   }
   std::string sql = "SELECT 1";
-  sql.reserve(sql.size() + (static_cast<size_type>(600 * 2)) + 1);
+  sql.reserve(sql.size() + 600 * 2 + 1);
   for (int i = 0; i < 600; ++i) {
     sql += "+1";
   }
@@ -1246,7 +1246,7 @@ TEST(GoogleSqlAstTest, RejectsMultipleUnnestArraysWithoutDroppingOperands) {
       VisitSql("SELECT item, i FROM UNNEST([1, 2]) AS item WITH OFFSET AS i");
   const auto* select = dynamic_cast<const SelectStatement*>(single.get());
   ASSERT_NE(select, nullptr);
-  ASSERT_EQ(select->Sources().size(), 1U);
+  ASSERT_EQ(select->Sources().size(), 1u);
   EXPECT_EQ(select->Sources()[0].alias, "item");
   EXPECT_EQ(select->Sources()[0].offset_alias, "i");
   EXPECT_TRUE(select->Sources()[0].unnest);

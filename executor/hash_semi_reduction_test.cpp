@@ -769,7 +769,7 @@ TEST_F(HashSemiReductionExecutorTest, DuplicateAndUnmatchedBuildKeysArePruned) {
   // domain is {1, 2, 7}, so 197 keys are out of domain and the 3 surviving keys
   // keep one row each (six duplicates dropped).
   std::vector<Row> build;
-  build.reserve(static_cast<size_type>(200 * 3));
+  build.reserve(200 * 3);
   for (int64_t key = 0; key < 200; ++key) {
     for (int64_t copy = 0; copy < 3; ++copy) {
       build.push_back(Row({Value(key)}));

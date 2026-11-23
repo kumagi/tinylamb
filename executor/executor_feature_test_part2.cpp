@@ -1,6 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include <cstddef>
 #include <limits>
 
 #include "common/serdes.hpp"
@@ -262,7 +261,7 @@ namespace {
 class ThrowingResidual final : public ExpressionBase {
  public:
   [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
-  [[nodiscard]] Value Evaluate(const Row& /*row*/, const Schema& /*schema*/) const override {
+  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override {
     throw std::runtime_error("residual exploded");
   }
   [[nodiscard]] StatusOr<Value> TryEvaluate(
@@ -991,7 +990,7 @@ TEST_F(SkipScanDistinctTest, DistinctOverIndexedColumnSkipsDuplicates) {
   const Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar)});
   std::vector<Row> rows;
-  rows.reserve(static_cast<size_type>(3 * 20));
+  rows.reserve(3 * 20);
   for (int64_t round = 0; round < 3; ++round) {
     for (int64_t k = 1; k <= 20; ++k) {
       rows.push_back(Row({Value(k), Value("v" + std::to_string(k))}));
@@ -1057,7 +1056,7 @@ TEST_F(SkipScanDistinctTest, PrefixDistinctJumpsCompoundIndexGroups) {
   const Schema schema(
       "pt", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
   std::vector<Row> rows;
-  rows.reserve(static_cast<size_type>(5 * 4));
+  rows.reserve(5 * 4);
   for (int64_t a = 1; a <= 5; ++a) {
     for (int64_t b = 1; b <= 4; ++b) {
       rows.push_back(Row({Value(a), Value(b)}));

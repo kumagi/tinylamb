@@ -7,7 +7,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -411,7 +410,7 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   for (int base = 0; base < 4100; base += 820) {
     std::string insert = "INSERT INTO m17 VALUES ";
     // Each tuple contains a UINT64 literal plus punctuation and spacing.
-    insert.reserve(insert.size() + (static_cast<size_type>(24 * 820)));
+    insert.reserve(insert.size() + 24 * 820);
     for (int k = 0; k < 820; ++k) {
       const uint64_t value =
           18446744073709551615ULL - static_cast<uint64_t>(base + k);

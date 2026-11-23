@@ -4,7 +4,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <memory>
 #include <ranges>
 #include <sstream>
@@ -143,7 +142,7 @@ TEST_F(LateMaterializationPlanTest, RulePublishesLogicalPlanForWideSmallBuild) {
     actual.emplace_back(row[0].value.int_value, row[1].value.int_value);
   }
   std::vector<std::pair<int64_t, int64_t>> expected;
-  expected.reserve(static_cast<size_type>(40 * 4));
+  expected.reserve(40 * 4);
   for (int64_t i = 0; i < 40; ++i) {
     for (int64_t key = 1; key <= 4; ++key) {
       if (i % 10 == key) {
