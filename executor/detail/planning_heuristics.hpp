@@ -108,9 +108,10 @@ bool IsColumnEqualityPredicate(const Expression& predicate);
 bool MapsToEqualityKey(const Schema& left, const Schema& right,
                        const Expression& predicate);
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/BinaryCollationStringEquiJoinElision.lean (sound)
-// `allow_binary_varchar` may be true only after runtime validation proved no
-// key carries a non-binary collation or mixed signedness/type.
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/BinaryCollationStringEquiJoinElision.lean
+// (sound) `allow_binary_varchar` may be true only after runtime validation
+// proved no key carries a non-binary collation or mixed signedness/type.
 std::vector<Expression> ResidualJoinPredicates(
     const Schema& left, const Schema& right,
     const std::vector<Expression>& predicates,

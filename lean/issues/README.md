@@ -1,4 +1,10 @@
-# 最適化の未証明問題 — すべて解決済み
+# SQL 最適化の証明課題
+
+[第八波の未証明命題 33 件](research/analytics-workloads/README.md) を、JOB・STATS-CEB・H2O・LDBC-SNB・BigBench の全 26 クエリに対応づけました。
+
+[第七波の未証明命題 100 件](research/execution-strategies/README.md) には、提出型と各最適化の狙いを分野別にまとめています。
+
+## 初回 30 件の検証結果
 
 このディレクトリに置かれていた 30 件の未証明問題について、個別の証明または反例を
 Lean 4 で登録しました。対応する結果とモデル前提は [RESULTS.md](RESULTS.md) を参照してください。

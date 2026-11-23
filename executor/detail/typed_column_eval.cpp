@@ -973,7 +973,7 @@ Value EvaluateTypedCoalesceDoubleOnRow(const TypedCoalesceDoubleInput& coalesce,
   return value;
 }
 
-static ValueType ValueTypeFromTypeTag(TypeTag tag) {
+ValueType ValueTypeFromTypeTag(TypeTag tag) {
   switch (tag) {
     case TypeTag::kInteger:
     case TypeTag::kBigInt:

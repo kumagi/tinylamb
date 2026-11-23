@@ -3253,7 +3253,7 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
     base_rows.reserve(60);
     for (int i = 60; i >= 1; --i) {  // intentionally unsorted input
       base_rows.push_back(Row(
-          {Value(int64_t{i}), (i % 7 == 0) ? Value() : Value(int64_t{static_cast<int64_t>(i * 3)})}));
+          {Value(int64_t{i}), (i % 7 == 0) ? Value() : Value(static_cast<int64_t>(i * 3))}));
     }
 
     auto run_apply = [&](bool disable) -> std::vector<Row> {

@@ -33,6 +33,7 @@
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/detail/columnar_tlcs_internal.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -5915,27 +5916,44 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const bool force_partitioned = (!is_group_all && plan_any_distinct) ||
                                    !grouped_admitted || computed_unadmitted ||
                                    high_key_multi;
+    const PartitionedColumnarAggRequest part_req{
+        .stmt = stmt,
+        .tlcs = tlcs,
+        .qualified_schema = qualified_schema,
+        .table_schema = table_schema,
+        .preds = preds,
+        .candidate_blocks = candidate_blocks,
+        .key_specs = key_specs,
+        .agg_specs = plan_agg_specs,
+        .positional_having = plan_having,
+        .emit_bindings = plan_emit,
+        .order_bindings = plan_order,
+        .runtime = plan_runtime,
+        .publish_lstable_marker = plan_publish_marker,
+        .fold_cache_key = fold_cache_key,
+        .scan_begin = scan_begin,
+        .dir_ms = dir_ms,
+        .any_scalar_distinct = plan_any_distinct,
+    };
     if (force_partitioned) {
-      PartitionedColumnarAggRequest part_req{
-          .stmt = stmt,
-          .tlcs = tlcs,
-          .qualified_schema = qualified_schema,
-          .table_schema = table_schema,
-          .preds = preds,
-          .candidate_blocks = candidate_blocks,
-          .key_specs = key_specs,
-          .agg_specs = plan_agg_specs,
-          .positional_having = plan_having,
-          .emit_bindings = plan_emit,
-          .order_bindings = plan_order,
-          .runtime = plan_runtime,
-          .publish_lstable_marker = plan_publish_marker,
-          .fold_cache_key = fold_cache_key,
-          .scan_begin = scan_begin,
-          .dir_ms = dir_ms,
-          .any_scalar_distinct = plan_any_distinct,
-      };
       return TryRunPartitionedColumnarTlcsAggregate(part_req);
+    }
+    if (!is_group_all && !plan_any_distinct) {
+      if (key_specs.size() == 2) {
+        ASSIGN_OR_RETURN(std::optional<Relation>, two_key_res,
+                         TryRunDirectTwoKeyBoundedIntAggregate(part_req));
+        if (two_key_res) {
+          return two_key_res;
+        }
+      }
+      if (key_specs.size() == 1 &&
+          key_specs[0].kind == ColKeyKind::kColVarChar) {
+        ASSIGN_OR_RETURN(std::optional<Relation>, local_dict_res,
+                         TryRunSingleVarCharLocalDictAggregate(part_req));
+        if (local_dict_res) {
+          return local_dict_res;
+        }
+      }
     }
 
     const size_t ncols = table_schema.ColumnCount();
@@ -6682,7 +6700,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               break;
             }
             tuples *= kch->dict->StringEntryCount() + 1;  // + NULL
-            if (tuples > 4096) {
+            if (tuples > 65536) {
               dict_keys = false;
               break;
             }
@@ -7733,6 +7751,20 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             survivors.begin(),
             survivors.begin() + static_cast<std::ptrdiff_t>(emit_count),
             survivors.end(), cmp_rows);
+      } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+                 !bounded_topk &&
+                 fast_order_kind == FastSingleOrderKind::kInt &&
+                 plan_order.size() == 1 && survivors.size() >= 1024 &&
+                 // Lean proof:
+                 // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+                 // (sound)
+                 TryStableRadixSortNullableInt64(
+                     survivors, plan_order[0].order.Ascending(),
+                     plan_order[0].order.NullsFirst(),
+                     [](const FinalGroupRow& r) noexcept { return r.num_null; },
+                     [](const FinalGroupRow& r) noexcept {
+                       return r.num_int;
+                     })) {
       } else {
         std::sort(survivors.begin(), survivors.end(), cmp_rows);
       }

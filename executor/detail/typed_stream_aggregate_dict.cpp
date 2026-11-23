@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/typed_stream_aggregate_internal.hpp"
 
 namespace tinylamb::relational_detail {
@@ -1498,8 +1499,9 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
         }
       }
     }));
-    for (const auto& error : errors) { RETURN_IF_FAIL(error);
-}
+    for (const auto& error : errors) {
+      RETURN_IF_FAIL(error);
+    }
   }
   const auto dependent_value = [&](size_t code, size_t key) {
     return code == null_code
@@ -1585,9 +1587,47 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                               ? statement.Offset() + statement.Limit()
                               : groups.size();
   const size_t retained = std::min(capacity, groups.size());
-  std::partial_sort(groups.begin(),
-                    groups.begin() + static_cast<std::ptrdiff_t>(retained),
-                    groups.end(), precedes);
+  bool sorted_with_radix = false;
+  if (retained < groups.size() && retained * 2 < groups.size()) {
+    std::partial_sort(groups.begin(),
+                      groups.begin() + static_cast<std::ptrdiff_t>(retained),
+                      groups.end(), precedes);
+    sorted_with_radix = true;
+  } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+             groups.size() >= 1024 && plan.order_items.size() == 1) {
+    const auto& item = plan.order_items[0];
+    if (!item.constant && !item.is_key && !item.dependent_key &&
+        !key_arguments[item.index]) {
+      const bool asc = plan.order_ascending[0];
+      const bool is_count = (numeric_slots[item.index] == SIZE_MAX);
+      const bool is_int_sum =
+          !is_count && plan.aggregates[item.index].aggregate->GetType() ==
+                           AggregationType::kSum;
+      if (is_count || is_int_sum) {
+        // Lean proof:
+        // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+        // (sound)
+        const size_t nslot = numeric_slots[item.index];
+        RadixSortIndicesByUint64Key(
+            groups,
+            [&](size_t g) noexcept -> uint64_t {
+              if (is_count) {
+                const uint64_t c = aggregate_count(item.index, g);
+                return asc ? c : ~c;
+              }
+              return EncodeSignedInt64ForRadix(
+                  merged.sums[(nslot * domain) + g], asc);
+            },
+            [&](size_t a, size_t b) noexcept {
+              return merged.slots[a].first < merged.slots[b].first;
+            });
+        sorted_with_radix = true;
+      }
+    }
+  }
+  if (!sorted_with_radix) {
+    std::sort(groups.begin(), groups.end(), precedes);
+  }
   if (runtime != nullptr) {
     runtime->scan_rows += store.total_rows;
     runtime->scan_output_rows += input_rows;
@@ -2342,9 +2382,51 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
                                 ? statement.Offset() + statement.Limit()
                                 : order.size();
     const size_t retained = std::min(capacity, order.size());
-    std::partial_sort(order.begin(),
-                      order.begin() + static_cast<std::ptrdiff_t>(retained),
-                      order.end(), precedes);
+    bool sorted_with_radix = false;
+    if (retained < order.size() && retained * 2 < order.size()) {
+      std::partial_sort(order.begin(),
+                        order.begin() + static_cast<std::ptrdiff_t>(retained),
+                        order.end(), precedes);
+      sorted_with_radix = true;
+    } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+               order.size() >= 1024 && plan.order_items.size() == 1) {
+      const auto& item = plan.order_items[0];
+      if (!item.constant && !item.is_key && !item.dependent_key) {
+        const bool asc = plan.order_ascending[0];
+        const bool is_count =
+            (!Numeric || numeric_slots[item.index] == SIZE_MAX);
+        const bool is_int_sum =
+            Numeric && numeric_slots[item.index] != SIZE_MAX &&
+            plan.aggregates[item.index].aggregate->GetType() ==
+                AggregationType::kSum;
+        if (is_count || is_int_sum) {
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+          // (sound)
+          const size_t nslot = numeric_slots[item.index];
+          RadixSortIndicesByUint64Key(
+              order,
+              [&](size_t g) noexcept -> uint64_t {
+                if (is_count) {
+                  const uint64_t c = merged.values[g].count;
+                  return asc ? c : ~c;
+                }
+                if constexpr (Numeric) {
+                  return EncodeSignedInt64ForRadix(
+                      merged.sums[(g * numeric_inputs.size()) + nslot], asc);
+                }
+                return 0;
+              },
+              [&](size_t a, size_t b) noexcept {
+                return merged.values[a].first < merged.values[b].first;
+              });
+          sorted_with_radix = true;
+        }
+      }
+    }
+    if (!sorted_with_radix) {
+      std::sort(order.begin(), order.end(), precedes);
+    }
     if (runtime != nullptr) {
       runtime->scan_rows += rows;
       runtime->scan_output_rows += input_rows;
@@ -3128,8 +3210,9 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
         observe(i);
       }
     }));
-    for (const auto& error : errors) { RETURN_IF_FAIL(error);
-}
+    for (const auto& error : errors) {
+      RETURN_IF_FAIL(error);
+    }
     if (too_large.load(std::memory_order_relaxed)) {
       return false;
     }
@@ -3264,12 +3347,12 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
           case AggregationType::kMin:
             if (group->min != SIZE_MAX) {
               RETURN_IF_FAIL(state.Add(cell(group->min)));
-}
+            }
             break;
           case AggregationType::kMax:
             if (group->max != SIZE_MAX) {
               RETURN_IF_FAIL(state.Add(cell(group->max)));
-}
+            }
             break;
           default:
             return Status::kRuntimeError;

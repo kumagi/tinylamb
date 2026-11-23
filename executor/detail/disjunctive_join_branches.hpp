@@ -207,7 +207,7 @@ inline bool PlainHashableVarChar(const Value& v) noexcept {
     }
   }
   const size_t first = s.find_first_not_of(" \t\r\n");
-  return !(first != std::string_view::npos && s[first] == '{');
+  return first == std::string_view::npos || s[first] != '{';
 }
 
 }  // namespace disjunctive_detail

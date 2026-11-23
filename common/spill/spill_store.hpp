@@ -231,6 +231,8 @@ class SpillSegmentWriter {
   [[nodiscard]] StatusOr<SpillSegmentId> Finish(bool keep_empty = true);
 
   // Explicit cleanup discarding buffered data and dropping any opened segment.
+  // Returns void by design: abort is best-effort teardown with no failure
+  // channel — callers must not look for a Status to check.
   void Abort() noexcept;
 
   [[nodiscard]] SpillSegmentId SegmentId() const noexcept { return id_; }

@@ -1011,7 +1011,7 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
       int64_t max_k = std::numeric_limits<int64_t>::min();
       bool has_any_nonnull = false;
       for (size_t w = 0; w < workers; ++w) {
-        if (w_has[w] != 0u) {
+        if (w_has[w] != 0U) {
           if (!has_any_nonnull) {
             min_k = w_min[w];
             max_k = w_max[w];

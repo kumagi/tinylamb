@@ -1187,8 +1187,8 @@ class PostgresServer::
     // bytes and nothing reads past it, so the 8 KiB zero-fill per {}call
     // would just be hot-path memset.
     std::array<char, 8192>
-        buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-                 // only bytes read are used
+        buffer{};  // NOLINT(cppcoreguidelines-pro-type-member-init)
+                   // only bytes read are used
     bool eof_seen = false;
     bool read_blocked = false;
     size_t cached_packets = 0;
@@ -1738,15 +1738,14 @@ class PostgresServer::
       const bool touches_catalog = std::ranges::any_of(
           statements, [](const pgwire::SqlStatement& statement) {
             const std::string command = UppercaseCommand(statement.text);
-            return IsCatalogCommand(command) ||
-                   command == "INSERT" || command == "UPDATE" ||
-                   command == "DELETE" || command == "MERGE" ||
+            return IsCatalogCommand(command) || command == "INSERT" ||
+                   command == "UPDATE" || command == "DELETE" ||
+                   command == "MERGE" ||
                    // COPY ... FROM and TRUNCATE rewrite user tables just as
                    // surely as DML; leaving them out let a foreign DDL
                    // session publish an index over a moving table image.
                    (command == "COPY" && IsCopyFrom(statement.text)) ||
-                   command == "TRUNCATE" ||
-                   command == "REPLACE";
+                   command == "TRUNCATE" || command == "REPLACE";
           });
       if (touches_catalog) {
         if (client.transaction) {
@@ -1995,10 +1994,9 @@ class PostgresServer::
         // command tag, keeping the aborted state. An ErrorResponse here
         // would inflate psql/JDBC error counters and drive their recovery
         // logic down a non-PG branch.
-        Queue(client,
-              pgwire::NoticeResponse(
-                  "there is already a transaction in progress", "25001",
-                  "WARNING"));
+        Queue(client, pgwire::NoticeResponse(
+                          "there is already a transaction in progress", "25001",
+                          "WARNING"));
         Queue(client, pgwire::CommandComplete("BEGIN"));
         return true;
       }
@@ -2016,10 +2014,9 @@ class PostgresServer::
         // P1693: a nested BEGIN inside an open block is a no-op that PG
         // warns about (25001); psql VERBOSITY and JDBC NoticeListeners
         // expect the NoticeResponse frame.
-        Queue(client,
-              pgwire::NoticeResponse(
-                  "there is already a transaction in progress", "25001",
-                  "WARNING"));
+        Queue(client, pgwire::NoticeResponse(
+                          "there is already a transaction in progress", "25001",
+                          "WARNING"));
       }
       client.transaction_status = 'T';
       Queue(client, pgwire::CommandComplete("BEGIN"));
@@ -2040,9 +2037,9 @@ class PostgresServer::
       EndOpenBlockDdl(client);
       client.transaction_status = 'I';
       if (no_open_block) {
-        Queue(client, pgwire::NoticeResponse(
-                          "there is no transaction in progress", "25P01",
-                          "WARNING"));
+        Queue(client,
+              pgwire::NoticeResponse("there is no transaction in progress",
+                                     "25P01", "WARNING"));
       }
       Queue(client, pgwire::CommandComplete("ROLLBACK"));
       return true;
@@ -2097,9 +2094,9 @@ class PostgresServer::
       EndOpenBlockDdl(client);
       client.transaction_status = 'I';
       if (no_open_block) {
-        Queue(client, pgwire::NoticeResponse(
-                          "there is no transaction in progress", "25P01",
-                          "WARNING"));
+        Queue(client,
+              pgwire::NoticeResponse("there is no transaction in progress",
+                                     "25P01", "WARNING"));
       }
       Queue(client, pgwire::CommandComplete("COMMIT"));
       return true;
@@ -2355,7 +2352,9 @@ class PostgresServer::
     static const bool disable_chunked_wire =
         std::getenv("TINYLAMB_DISABLE_CHUNKED_PGWIRE") != nullptr;
     if (!disable_chunked_wire) {
-      // Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+      // Lean proof:
+      // lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
+      // (sound)
       if (max_bytes > 0) {
         wire_out->reserve(std::min<size_t>(max_bytes + 4096, 262144));
       }
@@ -2842,8 +2841,7 @@ class PostgresServer::
             }
             std::string response =
                 pgwire::ErrorResponse("no read workers available", "53000");
-            response +=
-                pgwire::ReadyForQuery(stray->second.transaction_status);
+            response += pgwire::ReadyForQuery(stray->second.transaction_status);
             Queue(stray->second, response);
           }
         }
@@ -3306,7 +3304,8 @@ class PostgresServer::
       std::scoped_lock lock(read_completion_mutex_);
       if (!stopping_.load()) {
         if (completion.reply_socket && !completion.active_stream &&
-            !completion.response.empty() && completion.response.size() <= 4096 &&
+            !completion.response.empty() &&
+            completion.response.size() <= 4096 &&
             completion.literal_constant_sql.empty() &&
             (!completion.session || !completion.session->output_overflow)) {
           int failure = 0;
@@ -3317,8 +3316,7 @@ class PostgresServer::
             if (completion.response.empty()) {
               direct_reply_count_.fetch_add(1, std::memory_order_relaxed);
             }
-          } else if (sent < 0 && failure != EAGAIN &&
-                     failure != EWOULDBLOCK) {
+          } else if (sent < 0 && failure != EAGAIN && failure != EWOULDBLOCK) {
             completion.reply_send_failed = true;
           }
         }
@@ -3824,7 +3822,7 @@ class PostgresServer::
   // Without it an explicit block survived a refused message at status 'T'
   // and could still COMMIT; PostgreSQL tears the whole connection down
   // (FATAL), so an aborted block is the closest in-session equivalent.
-  void AbortTransactionForProtocolViolation(
+  static void AbortTransactionForProtocolViolation(
       Client&
           client) {  // NOLINT(readability-convert-member-functions-to-static)
     if (client.transaction_status == 'T') {

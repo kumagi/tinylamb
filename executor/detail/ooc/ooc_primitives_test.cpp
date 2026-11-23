@@ -1198,7 +1198,7 @@ TEST(SpillableStoreTest, FailedStagingFlushRetainsChargeAndRows) {
   const Row expected({Value(std::string(8192, 'x'))});
   ASSERT_EQ(rows.AppendRow(expected), Status::kSuccess);
   const auto before = grant.UsedBytes();
-  ASSERT_GT(before, 0u);
+  ASSERT_GT(before, 0U);
   budget.SetTestSpillIoFailCountdown(1);
   const Status st = rows.Seal();
   budget.SetTestSpillIoFailCountdown(0);

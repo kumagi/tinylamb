@@ -340,7 +340,7 @@ TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
 
   // Inflate damaged's total_len past the end of the file so ReadLogDetailed
   // reports kShort at its offset even though `committed` follows it.
-  const uint32_t inflated = static_cast<uint32_t>(
+  const auto inflated = static_cast<uint32_t>(
       first.size() + damaged.size() + committed.size() + 4096);
   ASSERT_GE(inflated, 30U);
   ASSERT_LE(inflated, Logger::kMaxRecordSize);

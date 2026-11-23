@@ -147,6 +147,10 @@ bool SqlEngine::CompliancePrimaryKeyMode() {
 
 bool QueryResult::Next(Row* row) { return executor_->Next(row, nullptr); }
 
+size_t QueryResult::NextBatch(DataChunk* chunk, size_t max_rows) {
+  return executor_ ? executor_->NextBatchDraining(chunk, max_rows) : 0;
+}
+
 size_t QueryResult::ForEach(const std::function<void(const Row&)>& sink) {
   size_t rows = 0;
   DataChunk chunk;
@@ -1247,9 +1251,11 @@ void RememberTemplate(const std::string& fingerprint,
   // NOLINTNEXTLINE(modernize-use-designated-initializers) positional init is
   // clear
   const CachedTemplate shared{
-      std::shared_ptr<Statement>(std::move(
+      .statement = std::shared_ptr<Statement>(std::move(
           statement)),  // NOLINT(modernize-use-designated-initializers)
-      epoch, g_template_use_clock.fetch_add(1, std::memory_order_relaxed)};
+      .epoch = epoch,
+      .last_used =
+          g_template_use_clock.fetch_add(1, std::memory_order_relaxed)};
   RememberLocalTemplate(fingerprint, shared);
   TemplateShard& shard = ShardFor(fingerprint);
   std::scoped_lock lock(shard.mutex);
@@ -1481,7 +1487,7 @@ std::string_view SkipSqlQuoted(std::string_view sql, size_t& i) {
 }
 
 bool IsWordChar(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) ||
+  return (std::isalnum(static_cast<unsigned char>(c)) != 0) ||
          c == '_';  // NOLINT(readability-implicit-bool-conversion)
 }
 
@@ -1510,8 +1516,8 @@ size_t MatchKeyword(std::string_view sql, size_t pos, std::string_view word) {
 // Skips whitespace and comments; returns the next significant position.
 size_t SkipBlanks(std::string_view sql, size_t pos) {
   while (pos < sql.size()) {
-    if (std::isspace(static_cast<unsigned char>(
-            sql[pos]))) {  // NOLINT(readability-implicit-bool-conversion)
+    if (std::isspace(static_cast<unsigned char>(sql[pos])) !=
+        0) {  // NOLINT(readability-implicit-bool-conversion)
       ++pos;
     } else if (sql.compare(pos, 2, "--") == 0) {
       pos = sql.find_first_of("\r\n", pos);
@@ -1604,16 +1610,15 @@ std::string OrderByOrdinalFingerprintSuffix(std::string_view sql) {
         ++end;
         continue;
       }
-      if (std::isdigit(static_cast<unsigned char>(
-              e)) &&  // NOLINT(readability-implicit-bool-conversion)
+      if ((std::isdigit(static_cast<unsigned char>(e)) !=
+           0) &&  // NOLINT(readability-implicit-bool-conversion)
           (end == i || !IsWordChar(sql[end - 1])) &&
-          !(end > 0 && sql[end - 1] ==
-                           '.')) {  // NOLINT(readability-simplify-boolean-expr)
+          (end <= 0 ||
+           sql[end - 1] != '.')) {  // NOLINT(readability-simplify-boolean-expr)
         size_t digit_end = end;
-        while (
-            digit_end < sql.size() &&
-            std::isdigit(static_cast<unsigned char>(
-                sql[digit_end]))) {  // NOLINT(readability-implicit-bool-conversion)
+        while (digit_end < sql.size() &&
+               (std::isdigit(static_cast<unsigned char>(sql[digit_end])) !=
+                0)) {  // NOLINT(readability-implicit-bool-conversion)
           ++digit_end;
         }
         if (digit_end == sql.size() || !IsWordChar(sql[digit_end])) {
@@ -1628,7 +1633,8 @@ std::string OrderByOrdinalFingerprintSuffix(std::string_view sql) {
         end = digit_end;
         continue;
       }
-      if (!std::isspace(static_cast<unsigned char>(e)) && end >= after_by) {
+      if ((std::isspace(static_cast<unsigned char>(e)) == 0) &&
+          end >= after_by) {
         key_start = false;
       }
       ++end;
@@ -1914,7 +1920,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     }
   }
   if (!explain && statement->Type() == StatementType::kSelect) {
-    const auto& select = static_cast<const SelectStatement&>(
+    const auto& select = dynamic_cast<const SelectStatement&>(
         *statement);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto literal = [&](const auto& self,
                              const Expression& expression) -> bool {
@@ -1954,7 +1960,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
 
   if (statement->Type() == StatementType::kUpdate &&
-      static_cast<const UpdateStatement&>(*statement)
+      dynamic_cast<const UpdateStatement&>(*statement)
           .HasNestedDml()) {  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     // BindStatementLiterals walks SET/WHERE/NestedItems structurally while
     // Templatize extracts literals in text order: rebinding a nested-DML
@@ -3513,7 +3519,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       return ExecuteSelect(
           ctx,
-          std::unique_ptr<SelectStatement>(static_cast<SelectStatement*>(
+          std::unique_ptr<SelectStatement>(dynamic_cast<SelectStatement*>(
               statement
                   .release())));  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
     }
@@ -4417,11 +4423,11 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
               type == AggregationType::kCount && aggregate.Child() != nullptr &&
               aggregate.Child()->Type() == TypeTag::kColumnValue &&
               !is_star_column(aggregate.Child());
-          if (!((!aggregate.Distinct() ||
-                 single_column_count_distinct) &&  // NOLINT(readability-simplify-boolean-expr)
-                !aggregate.HasWhereFilter() &&
-                !aggregate.NeedsGroupContext() && supported_type &&
-                valid_child)) {
+          if ((aggregate.Distinct() &&
+               !single_column_count_distinct) ||  // NOLINT(readability-simplify-boolean-expr)
+              aggregate.HasWhereFilter() ||
+              aggregate.NeedsGroupContext() || !supported_type ||
+              !valid_child) {
             return false;
           }
           scalar_aggs.push_back(&aggregate);

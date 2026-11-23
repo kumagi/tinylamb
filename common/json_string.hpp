@@ -73,6 +73,10 @@ inline std::string EncodeJsonString(std::string_view text) {
         break;
     }
     if (bytes > capacity - encoded_size) {
+      // Defensive tripwire, effectively unreachable: max_size() is ~2^63, so
+      // no real input reaches it. The explicit check just turns a reserve()
+      // length_error into the same exception type with a clearer message.
+      // This header has no Status context; do not "fix" it into one.
       throw std::length_error("encoded JSON string is too large");
     }
     encoded_size += bytes;

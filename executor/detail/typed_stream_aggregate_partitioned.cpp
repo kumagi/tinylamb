@@ -29,12 +29,14 @@
 #include "common/query_parallelism.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
+#include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/charged_vector.hpp"
 #include "executor/detail/columnar_tlcs_fast_path.hpp"
 #include "executor/detail/columnar_tlcs_internal.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/query_memory.hpp"
+#include "expression/collation.hpp"
 #include "table/tlcs_file.hpp"
 #include "type/collation.hpp"
 #include "type/value.hpp"
@@ -637,6 +639,18 @@ Relation FinalizePartitionedRelation(
           survivors.begin(),
           survivors.begin() + static_cast<std::ptrdiff_t>(emit_count),
           survivors.end(), cmp_rows);
+    } else if (
+        std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+        fast_order_kind == PartOrderKind::kInt &&
+        req.order_bindings.size() == 1 && survivors.size() >= 1024 &&
+        // Lean proof:
+        // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+        // (sound)
+        TryStableRadixSortNullableInt64(
+            survivors, req.order_bindings[0].order.Ascending(),
+            req.order_bindings[0].order.NullsFirst(),
+            [](const SurvivorGroupRow& r) noexcept { return r.num_null; },
+            [](const SurvivorGroupRow& r) noexcept { return r.num_int; })) {
     } else {
       std::sort(survivors.begin(), survivors.end(), cmp_rows);
     }
@@ -2142,8 +2156,7 @@ struct NumericAggCell {
 
 inline Status MergeNumericRawValue(const ColAggSpec& spec, bool val_is_null,
                                    int64_t val_i, double val_d,
-                                   int64_t multiplicity,
-                                   NumericAggCell& st) {
+                                   int64_t multiplicity, NumericAggCell& st) {
   if (spec.kind == ColAggKind::kCountStar ||
       ((spec.kind == ColAggKind::kCountCol ||
         spec.kind == ColAggKind::kCountByteLen) &&
@@ -5035,7 +5048,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   constexpr size_t kSelectionBudget = size_t{64} << 20;
   if (near_unique && !req.preds.Empty() &&
       selection_charge.TryAdd(kSelectionBudget + (req.candidate_blocks.size() *
-                                                     sizeof(SavedSelection)))) {
+                                                  sizeof(SavedSelection)))) {
     selections.resize(req.candidate_blocks.size());
   }
   const auto scan_keys =
@@ -5839,7 +5852,1247 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   return finish(tables, rest_max_bucket, "quotient-heavy-topk");
 }
 
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean (sound)
+bool CanFoldAggsInParallel(
+    const PartitionedColumnarAggRequest& req,
+    const std::vector<std::shared_ptr<const TlcsFile::DirGroup>>& dir_groups) {
+  const uint32_t dg_size = req.tlcs->DirGroupSize();
+  for (const ColAggSpec& spec : req.agg_specs) {
+    if (spec.kind != ColAggKind::kSumInt64) {
+      continue;
+    }
+    __int128 max_pos_sum = 0;
+    __int128 min_neg_sum = 0;
+    for (const uint32_t bidx : req.candidate_blocks) {
+      const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
+      const auto& meta = blk.columns[spec.full_col];
+      if (meta.encoding == TlcsColumnEncoding::kConstNull ||
+          blk.row_count == 0) {
+        continue;
+      }
+      if (!meta.has_min_max) {
+        return false;
+      }
+      if (meta.max_int > 0) {
+        max_pos_sum += static_cast<__int128>(meta.max_int) *
+                       static_cast<__int128>(blk.row_count);
+        if (max_pos_sum >
+            static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+          return false;
+        }
+      }
+      if (meta.min_int < 0) {
+        min_neg_sum += static_cast<__int128>(meta.min_int) *
+                       static_cast<__int128>(blk.row_count);
+        if (min_neg_sum <
+            static_cast<__int128>(std::numeric_limits<int64_t>::min())) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+Status BuildSurvivorRowFromStates(const PartitionedColumnarAggRequest& req,
+                                  PartOrderKind fast_order_kind,
+                                  const RuntimeKeyCell* full_keys,
+                                  const RuntimeAggState* agg_states,
+                                  std::vector<Value>* finished_aggs,
+                                  std::vector<Value>* cached_keys,
+                                  SurvivorGroupRow* row_out) {
+  row_out->order_keys.clear();
+  row_out->emit_vals.clear();
+  if (fast_order_kind != PartOrderKind::kNone) {
+    const auto& ob0 = req.order_bindings[0].binding;
+    RETURN_IF_FAIL(EvaluateNumericOrderValue(
+        ob0,
+        ob0.kind == OutputSlotBinding::Kind::kAgg ? &req.agg_specs[ob0.index]
+                                                  : nullptr,
+        ob0.kind == OutputSlotBinding::Kind::kKey ? &req.key_specs[ob0.index]
+                                                  : nullptr,
+        ob0.kind == OutputSlotBinding::Kind::kAgg ? &agg_states[ob0.index]
+                                                  : nullptr,
+        ob0.kind == OutputSlotBinding::Kind::kKey ? &full_keys[ob0.index]
+                                                  : nullptr,
+        &row_out->num_null, &row_out->num_int, &row_out->num_double));
+  }
+  for (size_t a = 0; a < req.agg_specs.size(); ++a) {
+    ASSIGN_OR_RETURN(Value, fv,
+                     FinishAggState(req.agg_specs[a], agg_states[a]));
+    (*finished_aggs)[a] = std::move(fv);
+  }
+  std::fill(cached_keys->begin(), cached_keys->end(), Value());
+  if (fast_order_kind == PartOrderKind::kNone && !req.order_bindings.empty()) {
+    row_out->order_keys.resize(req.order_bindings.size());
+    for (size_t k = 0; k < req.order_bindings.size(); ++k) {
+      ASSIGN_OR_RETURN(
+          Value, ov,
+          EvaluateBindingValue(req.order_bindings[k].binding, req.key_specs,
+                               full_keys, *finished_aggs, cached_keys));
+      row_out->order_keys[k] = std::move(ov);
+    }
+  }
+  row_out->emit_vals.reserve(req.emit_bindings.size());
+  for (const auto& eb : req.emit_bindings) {
+    ASSIGN_OR_RETURN(Value, ev,
+                     EvaluateBindingValue(eb, req.key_specs, full_keys,
+                                          *finished_aggs, cached_keys));
+    row_out->emit_vals.push_back(std::move(ev));
+  }
+  return Status::kSuccess;
+}
+
+struct TransparentStringViewHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view sv) const noexcept {
+    return static_cast<size_t>(HashView64(sv));
+  }
+};
+
+struct VarCharLocalGroupTable {
+  QueryMemoryCharge charge;
+  PagedStringArena arena{&charge};
+  bool has_null{false};
+  std::vector<RuntimeAggState> null_aggs;
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/EmptyStringKeyPartitionSplit.lean (sound)
+  // Dedicated O(1) slot for empty string "" bypassing hash/pack7 lookups.
+  bool has_empty{false};
+  uint32_t empty_gid{0};
+  FlatIntKeyMap<uint32_t> short_map;
+  std::unordered_map<std::string_view, uint32_t, TransparentStringViewHash,
+                     std::equal_to<>>
+      long_map;
+  std::vector<std::string_view> keys;
+  std::vector<uint64_t> hashes;
+  std::vector<RuntimeAggState> aggs;
+  size_t max_groups{65536};
+  bool bail{false};
+
+  RuntimeAggState* GetOrCreateNull(size_t naggs) {
+    if (!has_null) {
+      const size_t need = naggs * sizeof(RuntimeAggState) + 64;
+      if (!charge.TryAdd(need)) {
+        bail = true;
+        return nullptr;
+      }
+      null_aggs.clear();
+      null_aggs.resize(naggs);
+      has_null = true;
+    }
+    return null_aggs.data();
+  }
+
+  std::optional<uint32_t> FindOrInsertKey(std::string_view sv, size_t naggs) {
+    if (sv.empty()) {
+      if (has_empty) {
+        return empty_gid;
+      }
+      const size_t new_gid = keys.size();
+      if (new_gid >= max_groups) {
+        bail = true;
+        return std::nullopt;
+      }
+      const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
+                               naggs * sizeof(RuntimeAggState) + 48;
+      if (!charge.TryAdd(row_bytes)) {
+        bail = true;
+        return std::nullopt;
+      }
+      empty_gid = static_cast<uint32_t>(new_gid);
+      has_empty = true;
+      keys.emplace_back();
+      hashes.push_back(HashView64(std::string_view{}));
+      if (naggs > 0) {
+        aggs.resize((new_gid + 1) * naggs);
+      }
+      return empty_gid;
+    }
+    if (const auto packed = PackShortString7(sv)) {
+      const auto key = static_cast<int64_t>(*packed);
+      if (const uint32_t* found = short_map.Find(key)) {
+        return *found;
+      }
+      const size_t new_gid = keys.size();
+      if (new_gid >= max_groups) {
+        bail = true;
+        return std::nullopt;
+      }
+      const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
+                               naggs * sizeof(RuntimeAggState) + 48;
+      if (!charge.TryAdd(row_bytes)) {
+        bail = true;
+        return std::nullopt;
+      }
+      auto interned = arena.Intern(sv);
+      if (!interned.HasValue()) {
+        bail = true;
+        return std::nullopt;
+      }
+      bool inserted = false;
+      uint32_t* slot = short_map.TryEmplace(key, &inserted);
+      *slot = static_cast<uint32_t>(new_gid);
+      keys.push_back(interned.Value());
+      hashes.push_back(GroupKeySliceHasher::HashSingleVarChar(sv));
+      aggs.resize((new_gid + 1) * naggs);
+      return static_cast<uint32_t>(new_gid);
+    }
+
+    auto it = long_map.find(sv);
+    if (it != long_map.end()) {
+      return it->second;
+    }
+    const size_t new_gid = keys.size();
+    if (new_gid >= max_groups) {
+      bail = true;
+      return std::nullopt;
+    }
+    const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
+                             naggs * sizeof(RuntimeAggState) + 64;
+    if (!charge.TryAdd(row_bytes)) {
+      bail = true;
+      return std::nullopt;
+    }
+    auto interned = arena.Intern(sv);
+    if (!interned.HasValue()) {
+      bail = true;
+      return std::nullopt;
+    }
+    const std::string_view perm = interned.Value();
+    long_map.emplace(perm, static_cast<uint32_t>(new_gid));
+    keys.push_back(perm);
+    hashes.push_back(GroupKeySliceHasher::HashSingleVarChar(sv));
+    aggs.resize((new_gid + 1) * naggs);
+    return static_cast<uint32_t>(new_gid);
+  }
+
+  RuntimeAggState* GetOrCreate(std::string_view sv, size_t naggs) {
+    const auto gid = FindOrInsertKey(sv, naggs);
+    return gid ? (aggs.data() + static_cast<size_t>(*gid) * naggs) : nullptr;
+  }
+};
+
 }  // namespace
+
+StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
+    const PartitionedColumnarAggRequest& req,
+    const KeyProjectionMap* precomputed_km) {
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
+  // (sound)
+  if (std::getenv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
+      req.candidate_blocks.empty() || req.key_specs.size() != 2 ||
+      req.stmt.Distinct() || req.any_scalar_distinct) {
+    return std::optional<Relation>{};
+  }
+  const auto valid_int_key = [&](const ColGroupKeySpec& ks) {
+    return (ks.kind == ColKeyKind::kColInt64 ||
+            ks.kind == ColKeyKind::kColDate) &&
+           ks.full_col < req.table_schema.ColumnCount() &&
+           !req.table_schema.GetColumn(ks.full_col).IsUnsigned();
+  };
+  if (!valid_int_key(req.key_specs[0]) || !valid_int_key(req.key_specs[1])) {
+    return std::optional<Relation>{};
+  }
+  for (const ColAggSpec& as : req.agg_specs) {
+    if (IsDistinctAggKind(as.kind) || as.double_arith != nullptr) {
+      return std::optional<Relation>{};
+    }
+  }
+  std::optional<KeyProjectionMap> owned_km;
+  if (precomputed_km == nullptr) {
+    ASSIGN_OR_RETURN(
+        KeyProjectionMap, built_km,
+        BuildKeyProjectionMap(*req.tlcs, req.candidate_blocks, req.key_specs));
+    owned_km = std::move(built_km);
+  }
+  const KeyProjectionMap& km =
+      precomputed_km != nullptr ? *precomputed_km : *owned_km;
+  if (km.phys_specs.size() != 2) {
+    return std::optional<Relation>{};
+  }
+
+  const uint32_t dg_count = req.tlcs->DirGroupCount();
+  const uint32_t dg_size = req.tlcs->DirGroupSize();
+  std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(dg_count);
+  for (uint32_t g = 0; g < dg_count; ++g) {
+    ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
+                     req.tlcs->GetDirGroup(g));
+    dir_groups[g] = std::move(grp);
+  }
+
+  const slot_t col0 = req.key_specs[0].full_col;
+  const slot_t col1 = req.key_specs[1].full_col;
+  int64_t min0 = std::numeric_limits<int64_t>::max();
+  int64_t max0 = std::numeric_limits<int64_t>::min();
+  bool nullable0 = false;
+  bool saw_val0 = false;
+  int64_t min1 = std::numeric_limits<int64_t>::max();
+  int64_t max1 = std::numeric_limits<int64_t>::min();
+  bool nullable1 = false;
+  bool saw_val1 = false;
+
+  for (const uint32_t bidx : req.candidate_blocks) {
+    const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
+    if (blk.row_count == 0) {
+      continue;
+    }
+    const auto& m0 = blk.columns[col0];
+    if (m0.encoding == TlcsColumnEncoding::kConstNull) {
+      nullable0 = true;
+    } else if (!m0.has_min_max) {
+      return std::optional<Relation>{};
+    } else {
+      if (m0.has_null) {
+        nullable0 = true;
+      }
+      min0 = std::min(min0, m0.min_int);
+      max0 = std::max(max0, m0.max_int);
+      saw_val0 = true;
+    }
+    const auto& m1 = blk.columns[col1];
+    if (m1.encoding == TlcsColumnEncoding::kConstNull) {
+      nullable1 = true;
+    } else if (!m1.has_min_max) {
+      return std::optional<Relation>{};
+    } else {
+      if (m1.has_null) {
+        nullable1 = true;
+      }
+      min1 = std::min(min1, m1.min_int);
+      max1 = std::max(max1, m1.max_int);
+      saw_val1 = true;
+    }
+  }
+  constexpr size_t kMaxTwoKeySlots = 262144;
+  if (saw_val0 && (static_cast<uint64_t>(max0) - static_cast<uint64_t>(min0)) >=
+                      kMaxTwoKeySlots) {
+    return std::optional<Relation>{};
+  }
+  if (saw_val1 && (static_cast<uint64_t>(max1) - static_cast<uint64_t>(min1)) >=
+                      kMaxTwoKeySlots) {
+    return std::optional<Relation>{};
+  }
+  const size_t nval0 = saw_val0
+                           ? static_cast<size_t>((static_cast<uint64_t>(max0) -
+                                                  static_cast<uint64_t>(min0)) +
+                                                 1ULL)
+                           : 0;
+  const size_t nval1 = saw_val1
+                           ? static_cast<size_t>((static_cast<uint64_t>(max1) -
+                                                  static_cast<uint64_t>(min1)) +
+                                                 1ULL)
+                           : 0;
+  const size_t s0 = nval0 + (nullable0 ? 1 : 0);
+  const size_t s1 = nval1 + (nullable1 ? 1 : 0);
+  if (s0 == 0 || s1 == 0 || s0 > kMaxTwoKeySlots || s1 > kMaxTwoKeySlots / s0) {
+    return std::optional<Relation>{};
+  }
+  const size_t total_slots = s0 * s1;
+  const size_t naggs = req.agg_specs.size();
+  // Lean proofs:
+  //   - lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (EpochAverage_sound)
+  //   - lean/TinylambOpt/ResearchProofs/TwoLevelPartitionedAggMerge.lean
+  //     (sound)
+  // For single-agg COUNT(*) / AVG / SUM(double) over bounded 2-key integer
+  // grids (H2, H4), use a reusable 24-byte generation-stamped slot buffer per
+  // worker (zero per-query memset, ~8x smaller footprint -> full parallelism)
+  // merged across disjoint slot stripes in parallel.
+  const bool use_compact_epoch =
+      naggs == 1 &&
+      (req.agg_specs[0].kind == ColAggKind::kCountStar ||
+       req.agg_specs[0].kind == ColAggKind::kAvgDouble ||
+       req.agg_specs[0].kind == ColAggKind::kSumDouble) &&
+      std::getenv("TINYLAMB_DISABLE_EPOCH_TWO_KEY_AGG") == nullptr;
+
+  struct CompactEpochSlot {
+    uint32_t stamp{0};
+    uint64_t count{0};
+    double sum{0.0};
+  };
+  struct CompactEpochBuffer {
+    uint32_t epoch{0};
+    std::vector<CompactEpochSlot> slots;
+  };
+  static std::mutex epoch_pool_mu;
+  static std::vector<std::unique_ptr<CompactEpochBuffer>> epoch_pool;
+
+  const size_t bytes_per_worker =
+      use_compact_epoch
+          ? total_slots * sizeof(CompactEpochSlot)
+          : total_slots * (sizeof(uint8_t) + naggs * sizeof(RuntimeAggState));
+  const bool parallel_ok = CanFoldAggsInParallel(req, dir_groups);
+  const size_t max_hw =
+      QueryParallelWorkerLimit(std::thread::hardware_concurrency());
+  const size_t mem_capped_workers = std::max<size_t>(
+      1, (size_t{32} << 20) / std::max<size_t>(1, bytes_per_worker));
+  const size_t workers_used =
+      parallel_ok
+          ? std::max<size_t>(
+                1, std::min<size_t>({max_hw, req.candidate_blocks.size(),
+                                     mem_capped_workers, size_t{16}}))
+          : 1;
+
+  struct alignas(64) TwoKeyWorkerState {
+    QueryMemoryCharge charge;
+    PagedStringArena arena{&charge};
+    std::vector<uint8_t> present;
+    std::vector<RuntimeAggState> aggs;
+    std::unique_ptr<CompactEpochBuffer> epoch_buf;
+    bool epoch_active{false};
+    uint64_t scanned{0};
+    uint64_t matching{0};
+    Status err{Status::kSuccess};
+  };
+  std::vector<TwoKeyWorkerState> states(workers_used);
+  struct EpochPoolReturnGuard {
+    std::vector<TwoKeyWorkerState>* states_ptr{nullptr};
+    ~EpochPoolReturnGuard() {
+      if (states_ptr == nullptr) return;
+      std::lock_guard<std::mutex> lock(epoch_pool_mu);
+      for (auto& st : *states_ptr) {
+        if (st.epoch_buf && epoch_pool.size() < 16) {
+          epoch_pool.push_back(std::move(st.epoch_buf));
+        }
+      }
+    }
+  } epoch_return_guard{use_compact_epoch ? &states : nullptr};
+  if (use_compact_epoch) {
+    std::lock_guard<std::mutex> lock(epoch_pool_mu);
+    for (size_t w = 0; w < workers_used; ++w) {
+      if (!epoch_pool.empty()) {
+        states[w].epoch_buf = std::move(epoch_pool.back());
+        epoch_pool.pop_back();
+      } else {
+        states[w].epoch_buf = std::make_unique<CompactEpochBuffer>();
+      }
+    }
+  }
+  std::atomic<size_t> next_blk{0};
+  std::atomic<bool> budget_fallback{false};
+
+  const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
+      req.table_schema, req.preds, req.key_specs, req.agg_specs);
+  const size_t ncols = req.table_schema.ColumnCount();
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    TwoKeyWorkerState& wst = states[w];
+    BlockDecodeScratch scratch;
+    std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
+    std::vector<uint32_t> cand_rows;
+
+    for (;;) {
+      if (budget_fallback.load(std::memory_order_relaxed)) {
+        return;
+      }
+      const size_t bi = next_blk.fetch_add(1, std::memory_order_relaxed);
+      if (bi >= req.candidate_blocks.size()) {
+        return;
+      }
+      const uint32_t bidx = req.candidate_blocks[bi];
+      uint64_t bscanned = 0;
+      auto pass_or = DecodeAndFilterBlock(*req.tlcs, bidx, req.table_schema,
+                                          req.preds, sched, &scratch, &col_ptrs,
+                                          &cand_rows, &bscanned);
+      wst.scanned += bscanned;
+      if (!pass_or.HasValue()) {
+        wst.err = pass_or.GetStatus();
+        return;
+      }
+      if (!pass_or.Value() || cand_rows.empty()) {
+        continue;
+      }
+      if (use_compact_epoch) {
+        if (!wst.epoch_active) {
+          if (!wst.charge.TryAdd(bytes_per_worker)) {
+            budget_fallback.store(true, std::memory_order_relaxed);
+            return;
+          }
+          CompactEpochBuffer& eb = *wst.epoch_buf;
+          if (eb.slots.size() < total_slots ||
+              eb.epoch == std::numeric_limits<uint32_t>::max()) {
+            eb.slots.assign(total_slots, CompactEpochSlot{});
+            eb.epoch = 1;
+          } else {
+            ++eb.epoch;
+          }
+          wst.epoch_active = true;
+        }
+        wst.matching += cand_rows.size();
+        const auto* kch0 = col_ptrs[col0];
+        const auto* kch1 = col_ptrs[col1];
+        CompactEpochSlot* __restrict__ eslots = wst.epoch_buf->slots.data();
+        const uint32_t ep = wst.epoch_buf->epoch;
+        const ColAggKind ak = req.agg_specs[0].kind;
+        if (ak == ColAggKind::kCountStar) {
+          if (!kch0->has_null && !kch1->has_null) {
+            const int64_t* __restrict__ c0 = kch0->int_cells.data();
+            const int64_t* __restrict__ c1 = kch1->int_cells.data();
+            for (const uint32_t r : cand_rows) {
+              const size_t gi =
+                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                      static_cast<uint64_t>(min0)) *
+                      s1 +
+                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                      static_cast<uint64_t>(min1));
+              CompactEpochSlot& sl = eslots[gi];
+              if (sl.stamp != ep) {
+                sl.stamp = ep;
+                sl.count = 1;
+              } else {
+                ++sl.count;
+              }
+            }
+          } else {
+            for (const uint32_t r : cand_rows) {
+              const size_t idx0 =
+                  kch0->IsNull(r)
+                      ? nval0
+                      : static_cast<size_t>(
+                            static_cast<uint64_t>(kch0->int_cells[r]) -
+                            static_cast<uint64_t>(min0));
+              const size_t idx1 =
+                  kch1->IsNull(r)
+                      ? nval1
+                      : static_cast<size_t>(
+                            static_cast<uint64_t>(kch1->int_cells[r]) -
+                            static_cast<uint64_t>(min1));
+              CompactEpochSlot& sl = eslots[idx0 * s1 + idx1];
+              if (sl.stamp != ep) {
+                sl.stamp = ep;
+                sl.count = 1;
+              } else {
+                ++sl.count;
+              }
+            }
+          }
+          continue;
+        }
+        const auto* vch = col_ptrs[req.agg_specs[0].full_col];
+        if (vch == nullptr || (vch->type != ValueType::kInt64 &&
+                               vch->type != ValueType::kDouble)) {
+          budget_fallback.store(true, std::memory_order_relaxed);
+          return;
+        }
+        const bool is_int_v = (vch->type == ValueType::kInt64);
+        if (!kch0->has_null && !kch1->has_null && !vch->has_null) {
+          const int64_t* __restrict__ c0 = kch0->int_cells.data();
+          const int64_t* __restrict__ c1 = kch1->int_cells.data();
+          if (is_int_v) {
+            const int64_t* __restrict__ vals = vch->int_cells.data();
+            for (const uint32_t r : cand_rows) {
+              const size_t gi =
+                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                      static_cast<uint64_t>(min0)) *
+                      s1 +
+                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                      static_cast<uint64_t>(min1));
+              CompactEpochSlot& sl = eslots[gi];
+              if (sl.stamp != ep) {
+                sl.stamp = ep;
+                sl.count = 1;
+                sl.sum = static_cast<double>(vals[r]);
+              } else {
+                ++sl.count;
+                sl.sum += static_cast<double>(vals[r]);
+              }
+            }
+          } else {
+            const int64_t* __restrict__ raw_vals = vch->int_cells.data();
+            for (const uint32_t r : cand_rows) {
+              const size_t gi =
+                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                      static_cast<uint64_t>(min0)) *
+                      s1 +
+                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                      static_cast<uint64_t>(min1));
+              const double dv = std::bit_cast<double>(raw_vals[r]);
+              CompactEpochSlot& sl = eslots[gi];
+              if (sl.stamp != ep) {
+                sl.stamp = ep;
+                sl.count = 1;
+                sl.sum = dv;
+              } else {
+                ++sl.count;
+                sl.sum += dv;
+              }
+            }
+          }
+        } else {
+          for (const uint32_t r : cand_rows) {
+            const size_t idx0 =
+                kch0->IsNull(r)
+                    ? nval0
+                    : static_cast<size_t>(
+                          static_cast<uint64_t>(kch0->int_cells[r]) -
+                          static_cast<uint64_t>(min0));
+            const size_t idx1 =
+                kch1->IsNull(r)
+                    ? nval1
+                    : static_cast<size_t>(
+                          static_cast<uint64_t>(kch1->int_cells[r]) -
+                          static_cast<uint64_t>(min1));
+            CompactEpochSlot& sl = eslots[idx0 * s1 + idx1];
+            if (sl.stamp != ep) {
+              sl.stamp = ep;
+              sl.count = 0;
+              sl.sum = 0.0;
+            }
+            if (!vch->IsNull(r)) {
+              ++sl.count;
+              sl.sum += is_int_v ? static_cast<double>(vch->int_cells[r])
+                                 : std::bit_cast<double>(vch->int_cells[r]);
+            }
+          }
+        }
+        continue;
+      }
+      if (wst.present.empty()) {
+        if (!wst.charge.TryAdd(bytes_per_worker)) {
+          budget_fallback.store(true, std::memory_order_relaxed);
+          return;
+        }
+        wst.present.assign(total_slots, 0);
+        if (naggs > 0) {
+          wst.aggs.clear();
+          wst.aggs.resize(total_slots * naggs);
+        }
+      }
+      wst.matching += cand_rows.size();
+      const auto* kch0 = col_ptrs[col0];
+      const auto* kch1 = col_ptrs[col1];
+      uint8_t* __restrict__ pres = wst.present.data();
+      RuntimeAggState* __restrict__ aggs = wst.aggs.data();
+
+      if (!kch0->has_null && !kch1->has_null && naggs == 1 &&
+          req.agg_specs[0].kind == ColAggKind::kCountStar) {
+        const int64_t* __restrict__ c0 = kch0->int_cells.data();
+        const int64_t* __restrict__ c1 = kch1->int_cells.data();
+        for (const uint32_t r : cand_rows) {
+          const size_t gi = static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                                static_cast<uint64_t>(min0)) *
+                                s1 +
+                            static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                                static_cast<uint64_t>(min1));
+          pres[gi] = 1;
+          ++aggs[gi].count;
+          aggs[gi].has_value = true;
+        }
+        continue;
+      }
+      if (!kch0->has_null && !kch1->has_null && naggs == 1 &&
+          (req.agg_specs[0].kind == ColAggKind::kAvgDouble ||
+           req.agg_specs[0].kind == ColAggKind::kSumDouble)) {
+        const auto* vch = col_ptrs[req.agg_specs[0].full_col];
+        if (vch != nullptr && vch->type == ValueType::kInt64 &&
+            !vch->has_null) {
+          const int64_t* __restrict__ c0 = kch0->int_cells.data();
+          const int64_t* __restrict__ c1 = kch1->int_cells.data();
+          const int64_t* __restrict__ vals = vch->int_cells.data();
+          for (const uint32_t r : cand_rows) {
+            const size_t gi = static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                                  static_cast<uint64_t>(min0)) *
+                                  s1 +
+                              static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                                  static_cast<uint64_t>(min1));
+            pres[gi] = 1;
+            ++aggs[gi].count;
+            aggs[gi].double_val += static_cast<double>(vals[r]);
+            aggs[gi].has_value = true;
+          }
+          continue;
+        }
+      }
+
+      for (const uint32_t r : cand_rows) {
+        const size_t idx0 =
+            kch0->IsNull(r) ? nval0
+                            : static_cast<size_t>(
+                                  static_cast<uint64_t>(kch0->int_cells[r]) -
+                                  static_cast<uint64_t>(min0));
+        const size_t idx1 =
+            kch1->IsNull(r) ? nval1
+                            : static_cast<size_t>(
+                                  static_cast<uint64_t>(kch1->int_cells[r]) -
+                                  static_cast<uint64_t>(min1));
+        const size_t gi = idx0 * s1 + idx1;
+        pres[gi] = 1;
+        for (size_t a = 0; a < naggs; ++a) {
+          Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
+                                           aggs[gi * naggs + a], wst.arena);
+          if (fst != Status::kSuccess) {
+            if (fst == StatusCode::kMemoryLimitExceeded) {
+              budget_fallback.store(true, std::memory_order_relaxed);
+              return;
+            }
+            wst.err = std::move(fst);
+            return;
+          }
+        }
+      }
+    }
+  }));
+
+  if (budget_fallback.load(std::memory_order_relaxed)) {
+    return std::optional<Relation>{};
+  }
+  uint64_t total_scanned = 0;
+  uint64_t total_matching = 0;
+  std::vector<size_t> active_workers;
+  for (size_t w = 0; w < workers_used; ++w) {
+    RETURN_IF_FAIL(states[w].err);
+    total_scanned += states[w].scanned;
+    total_matching += states[w].matching;
+    if (use_compact_epoch ? states[w].epoch_active
+                          : !states[w].present.empty()) {
+      active_workers.push_back(w);
+    }
+  }
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  const PartOrderKind fast_order_kind =
+      ClassifyPartOrderKind(req.order_bindings, req.key_specs, req.agg_specs);
+  const size_t emit_shards =
+      (active_workers.empty() || total_slots < 2048 || max_hw <= 1)
+          ? 1
+          : std::min<size_t>(max_hw, 16);
+  std::vector<std::vector<SurvivorGroupRow>> shard_survivors(emit_shards);
+  std::vector<std::unique_ptr<QueryMemoryCharge>> surv_charges(emit_shards);
+  std::vector<Status> emit_status(emit_shards, Status::kSuccess);
+  std::atomic<size_t> total_groups{0};
+  std::atomic<bool> merge_budget_fallback{false};
+
+  RETURN_IF_FAIL(RunParallelTasks(emit_shards, [&](size_t s) {
+    if (active_workers.empty()) {
+      return;
+    }
+    const size_t idx_begin = (total_slots * s) / emit_shards;
+    const size_t idx_end = (total_slots * (s + 1)) / emit_shards;
+    QueryMemoryCharge merge_charge;
+    PagedStringArena merge_arena(&merge_charge);
+    QueryMemoryCharge& surv_charge = SurvivorChargeFor(surv_charges, s);
+    ChunkedCharge surv_batch(&surv_charge);
+    auto& out_vec = shard_survivors[s];
+    std::vector<RuntimeAggState> merged_aggs(naggs);
+    std::vector<Value> having_scratch(naggs);
+    std::vector<Value> finished_aggs(naggs);
+    std::vector<Value> cached_keys(2);
+    std::array<RuntimeKeyCell, 2> full_keys{};
+    size_t local_groups = 0;
+
+    for (size_t idx = idx_begin; idx < idx_end; ++idx) {
+      if (use_compact_epoch) {
+        bool any = false;
+        uint64_t total_cnt = 0;
+        double total_sum = 0.0;
+        for (const size_t w : active_workers) {
+          const CompactEpochBuffer& eb = *states[w].epoch_buf;
+          const CompactEpochSlot& sl = eb.slots[idx];
+          if (sl.stamp == eb.epoch) {
+            any = true;
+            total_cnt += sl.count;
+            total_sum += sl.sum;
+          }
+        }
+        if (!any) {
+          continue;
+        }
+        ++local_groups;
+        merged_aggs[0] = RuntimeAggState{};
+        merged_aggs[0].count = total_cnt;
+        merged_aggs[0].double_val = total_sum;
+        merged_aggs[0].has_value =
+            (req.agg_specs[0].kind == ColAggKind::kCountStar) ? true
+                                                              : (total_cnt > 0);
+      } else {
+        bool any = false;
+        for (const size_t w : active_workers) {
+          if (states[w].present[idx] != 0) {
+            any = true;
+            break;
+          }
+        }
+        if (!any) {
+          continue;
+        }
+        ++local_groups;
+        for (size_t a = 0; a < naggs; ++a) {
+          merged_aggs[a] = RuntimeAggState{};
+        }
+        for (const size_t w : active_workers) {
+          if (states[w].present[idx] == 0) {
+            continue;
+          }
+          RuntimeAggState* src_aggs = states[w].aggs.data() + idx * naggs;
+          for (size_t a = 0; a < naggs; ++a) {
+            Status mst = MergeAggState(req.agg_specs[a], merged_aggs[a],
+                                       src_aggs[a], merge_arena);
+            if (mst != Status::kSuccess) {
+              if (mst == StatusCode::kMemoryLimitExceeded) {
+                merge_budget_fallback.store(true, std::memory_order_relaxed);
+                return;
+              }
+              emit_status[s] = std::move(mst);
+              return;
+            }
+          }
+        }
+      }
+      auto h_or =
+          EvalPositionalHavingOnStates(req.positional_having, req.agg_specs,
+                                       merged_aggs.data(), &having_scratch);
+      if (!h_or.HasValue()) {
+        emit_status[s] = h_or.GetStatus();
+        return;
+      }
+      if (!h_or.Value()) {
+        continue;
+      }
+      const size_t idx0 = idx / s1;
+      const size_t idx1 = idx % s1;
+      full_keys[0] = RuntimeKeyCell{};
+      if (idx0 == nval0) {
+        full_keys[0].is_null = true;
+      } else {
+        full_keys[0].int_val = min0 + static_cast<int64_t>(idx0);
+      }
+      full_keys[1] = RuntimeKeyCell{};
+      if (idx1 == nval1) {
+        full_keys[1].is_null = true;
+      } else {
+        full_keys[1].int_val = min1 + static_cast<int64_t>(idx1);
+      }
+      SurvivorGroupRow row;
+      Status bst = BuildSurvivorRowFromStates(
+          req, fast_order_kind, full_keys.data(), merged_aggs.data(),
+          &finished_aggs, &cached_keys, &row);
+      if (bst != Status::kSuccess) {
+        emit_status[s] = std::move(bst);
+        return;
+      }
+      PushChargedSurvivor(&out_vec, &surv_batch, std::move(row));
+    }
+    total_groups.fetch_add(local_groups, std::memory_order_relaxed);
+  }));
+
+  if (merge_budget_fallback.load(std::memory_order_relaxed)) {
+    return std::optional<Relation>{};
+  }
+  for (const Status& est : emit_status) {
+    RETURN_IF_FAIL(est);
+  }
+  return FinalizePartitionedRelation(req, shard_survivors, total_groups.load(),
+                                     total_scanned, total_matching, merge_begin,
+                                     "two-key-direct", &surv_charges);
+}
+
+StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
+    const PartitionedColumnarAggRequest& req,
+    const KeyProjectionMap* precomputed_km) {
+  // Lean proofs:
+  //   - lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean (sound)
+  //   - lean/TinylambOpt/ResearchProofs/ShortStringPrefix7Bijection.lean
+  //   (sound)
+  //   - lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean
+  //   (sound)
+  if (std::getenv("TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||
+      req.candidate_blocks.empty() || req.candidate_blocks.size() > 256 ||
+      req.key_specs.size() != 1 ||
+      req.key_specs[0].kind != ColKeyKind::kColVarChar || req.stmt.Distinct() ||
+      req.any_scalar_distinct || req.stmt.GroupBy().size() != 1 ||
+      CollationOfExpression(req.stmt.GroupBy()[0]) ==
+          Collation::kCaseInsensitive) {
+    return std::optional<Relation>{};
+  }
+  const slot_t key_col = req.key_specs[0].full_col;
+  if (key_col >= req.table_schema.ColumnCount() ||
+      req.table_schema.GetColumn(key_col).IsUnsigned()) {
+    return std::optional<Relation>{};
+  }
+  for (const ColAggSpec& as : req.agg_specs) {
+    if (IsDistinctAggKind(as.kind) || as.double_arith != nullptr) {
+      return std::optional<Relation>{};
+    }
+  }
+  std::optional<KeyProjectionMap> owned_km;
+  if (precomputed_km == nullptr) {
+    ASSIGN_OR_RETURN(
+        KeyProjectionMap, built_km,
+        BuildKeyProjectionMap(*req.tlcs, req.candidate_blocks, req.key_specs));
+    owned_km = std::move(built_km);
+  }
+  const KeyProjectionMap& km =
+      precomputed_km != nullptr ? *precomputed_km : *owned_km;
+  if (km.phys_specs.size() != 1) {
+    return std::optional<Relation>{};
+  }
+
+  const uint32_t dg_count = req.tlcs->DirGroupCount();
+  std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(dg_count);
+  for (uint32_t g = 0; g < dg_count; ++g) {
+    ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
+                     req.tlcs->GetDirGroup(g));
+    dir_groups[g] = std::move(grp);
+  }
+  const bool parallel_ok = CanFoldAggsInParallel(req, dir_groups);
+  const size_t max_hw =
+      QueryParallelWorkerLimit(std::thread::hardware_concurrency());
+  const size_t workers_used =
+      parallel_ok
+          ? std::max<size_t>(
+                1, std::min<size_t>(
+                       {max_hw, req.candidate_blocks.size(), size_t{16}}))
+          : 1;
+
+  struct WorkerState {
+    VarCharLocalGroupTable table;
+    uint64_t scanned{0};
+    uint64_t matching{0};
+    Status err{Status::kSuccess};
+  };
+  std::vector<WorkerState> workers(workers_used);
+  std::atomic<size_t> next_blk{0};
+  std::atomic<bool> bail_fallback{false};
+
+  const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
+      req.table_schema, req.preds, req.key_specs, req.agg_specs);
+  const size_t ncols = req.table_schema.ColumnCount();
+  const size_t naggs = req.agg_specs.size();
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    WorkerState& ws = workers[w];
+    BlockDecodeScratch scratch;
+    std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
+    std::vector<uint32_t> cand_rows;
+    std::vector<uint8_t> local_seen;
+    std::vector<RuntimeAggState> local_aggs;
+    bool has_last = false;
+    std::string_view last_sv;
+    uint32_t last_gid = 0;
+
+    for (;;) {
+      if (bail_fallback.load(std::memory_order_relaxed)) {
+        return;
+      }
+      const size_t bi = next_blk.fetch_add(1, std::memory_order_relaxed);
+      if (bi >= req.candidate_blocks.size()) {
+        return;
+      }
+      const uint32_t bidx = req.candidate_blocks[bi];
+      uint64_t bscanned = 0;
+      auto pass_or = DecodeAndFilterBlock(*req.tlcs, bidx, req.table_schema,
+                                          req.preds, sched, &scratch, &col_ptrs,
+                                          &cand_rows, &bscanned);
+      ws.scanned += bscanned;
+      if (!pass_or.HasValue()) {
+        ws.err = pass_or.GetStatus();
+        return;
+      }
+      if (!pass_or.Value() || cand_rows.empty()) {
+        continue;
+      }
+      ws.matching += cand_rows.size();
+      const auto* kch = col_ptrs[key_col];
+
+      if (kch->dict_encoded && kch->dict != nullptr) {
+        const size_t nd = kch->dict->StringEntryCount();
+        local_seen.assign(nd + 1, 0);
+        if (naggs > 0) {
+          local_aggs.clear();
+          local_aggs.resize((nd + 1) * naggs);
+        }
+        bool dict_ok = true;
+        for (const uint32_t r : cand_rows) {
+          size_t code = nd;
+          if (!kch->IsNull(r)) {
+            if (r >= kch->dict_codes.size() || kch->dict_codes[r] >= nd) {
+              dict_ok = false;
+              break;
+            }
+            code = kch->dict_codes[r];
+          }
+          local_seen[code] = 1;
+          if (naggs == 1 && req.agg_specs[0].kind == ColAggKind::kCountStar) {
+            ++local_aggs[code].count;
+            local_aggs[code].has_value = true;
+          } else {
+            RuntimeAggState* dst = local_aggs.data() + code * naggs;
+            for (size_t a = 0; a < naggs; ++a) {
+              Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
+                                               dst[a], ws.table.arena);
+              if (fst != Status::kSuccess) {
+                if (fst == StatusCode::kMemoryLimitExceeded) {
+                  bail_fallback.store(true, std::memory_order_relaxed);
+                  return;
+                }
+                ws.err = std::move(fst);
+                return;
+              }
+            }
+          }
+        }
+        if (dict_ok) {
+          for (size_t c = 0; c <= nd; ++c) {
+            if (local_seen[c] == 0) {
+              continue;
+            }
+            RuntimeAggState* dst =
+                (c == nd)
+                    ? ws.table.GetOrCreateNull(naggs)
+                    : ws.table.GetOrCreate(kch->dict->StringEntryAt(c), naggs);
+            if (ws.table.bail) {
+              bail_fallback.store(true, std::memory_order_relaxed);
+              return;
+            }
+            RuntimeAggState* src = local_aggs.data() + c * naggs;
+            for (size_t a = 0; a < naggs; ++a) {
+              Status mst = MergeAggState(req.agg_specs[a], dst[a], src[a],
+                                         ws.table.arena);
+              if (mst != Status::kSuccess) {
+                if (mst == StatusCode::kMemoryLimitExceeded) {
+                  bail_fallback.store(true, std::memory_order_relaxed);
+                  return;
+                }
+                ws.err = std::move(mst);
+                return;
+              }
+            }
+          }
+          has_last = false;
+          continue;
+        }
+      }
+
+      for (const uint32_t r : cand_rows) {
+        RuntimeAggState* dst = nullptr;
+        if (kch->IsNull(r)) {
+          dst = ws.table.GetOrCreateNull(naggs);
+        } else {
+          const std::string_view sv = kch->VarcharAt(r);
+          uint32_t gid = 0;
+          if (has_last && sv == last_sv) {
+            gid = last_gid;
+          } else {
+            const auto found_gid = ws.table.FindOrInsertKey(sv, naggs);
+            if (!found_gid) {
+              bail_fallback.store(true, std::memory_order_relaxed);
+              return;
+            }
+            gid = *found_gid;
+            has_last = true;
+            last_sv = ws.table.keys[gid];
+            last_gid = gid;
+          }
+          dst = ws.table.aggs.data() + static_cast<size_t>(gid) * naggs;
+        }
+        if (ws.table.bail) {
+          bail_fallback.store(true, std::memory_order_relaxed);
+          return;
+        }
+        for (size_t a = 0; a < naggs; ++a) {
+          Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
+                                           dst[a], ws.table.arena);
+          if (fst != Status::kSuccess) {
+            if (fst == StatusCode::kMemoryLimitExceeded) {
+              bail_fallback.store(true, std::memory_order_relaxed);
+              return;
+            }
+            ws.err = std::move(fst);
+            return;
+          }
+        }
+      }
+      has_last = false;
+    }
+  }));
+
+  if (bail_fallback.load(std::memory_order_relaxed)) {
+    return std::optional<Relation>{};
+  }
+  uint64_t total_scanned = 0;
+  uint64_t total_matching = 0;
+  size_t total_worker_groups = 0;
+  for (size_t w = 0; w < workers_used; ++w) {
+    RETURN_IF_FAIL(workers[w].err);
+    total_scanned += workers[w].scanned;
+    total_matching += workers[w].matching;
+    total_worker_groups +=
+        workers[w].table.keys.size() + (workers[w].table.has_null ? 1 : 0);
+  }
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  const PartOrderKind fast_order_kind =
+      ClassifyPartOrderKind(req.order_bindings, req.key_specs, req.agg_specs);
+
+  if (workers_used == 1) {
+    std::vector<std::vector<SurvivorGroupRow>> single_surv(1);
+    std::vector<std::unique_ptr<QueryMemoryCharge>> surv_charges(1);
+    QueryMemoryCharge& surv_charge = SurvivorChargeFor(surv_charges, 0);
+    ChunkedCharge surv_batch(&surv_charge);
+    auto& out_vec = single_surv[0];
+    std::vector<Value> having_scratch(naggs);
+    std::vector<Value> finished_aggs(naggs);
+    std::vector<Value> cached_keys(1);
+    VarCharLocalGroupTable& wt = workers[0].table;
+    auto emit_one = [&](bool is_null, std::string_view sv,
+                        const RuntimeAggState* ast) -> Status {
+      ASSIGN_OR_RETURN(
+          bool, pass_having,
+          EvalPositionalHavingOnStates(req.positional_having, req.agg_specs,
+                                       ast, &having_scratch));
+      if (!pass_having) {
+        return Status::kSuccess;
+      }
+      RuntimeKeyCell kc{};
+      if (is_null) {
+        kc.is_null = true;
+      } else {
+        kc.str_ptr = sv.data();
+        kc.str_len = static_cast<uint32_t>(sv.size());
+      }
+      SurvivorGroupRow row;
+      RETURN_IF_FAIL(BuildSurvivorRowFromStates(
+          req, fast_order_kind, &kc, ast, &finished_aggs, &cached_keys, &row));
+      PushChargedSurvivor(&out_vec, &surv_batch, std::move(row));
+      return Status::kSuccess;
+    };
+    if (wt.has_null) {
+      RETURN_IF_FAIL(emit_one(true, {}, wt.null_aggs.data()));
+    }
+    for (size_t g = 0; g < wt.keys.size(); ++g) {
+      RETURN_IF_FAIL(emit_one(false, wt.keys[g], wt.aggs.data() + g * naggs));
+    }
+    return FinalizePartitionedRelation(
+        req, single_surv, total_worker_groups, total_scanned, total_matching,
+        merge_begin, "single-varchar-local-dict", &surv_charges);
+  }
+
+  size_t merge_shards = std::bit_floor(
+      std::min<size_t>({workers_used, size_t{16},
+                        std::max<size_t>(1, total_worker_groups / 256 + 1)}));
+  if (merge_shards == 0) {
+    merge_shards = 1;
+  }
+  const uint64_t shard_mask = merge_shards - 1;
+  struct ShardEntryRef {
+    uint32_t worker_id{0};
+    uint32_t gid{0};
+    bool is_null{false};
+  };
+  std::vector<std::vector<ShardEntryRef>> shard_refs(merge_shards);
+  for (size_t w = 0; w < workers_used; ++w) {
+    const auto& wt = workers[w].table;
+    if (wt.has_null) {
+      shard_refs[0].push_back(
+          {.worker_id = static_cast<uint32_t>(w), .gid = 0, .is_null = true});
+    }
+    for (size_t g = 0; g < wt.keys.size(); ++g) {
+      const size_t s = static_cast<size_t>((wt.hashes[g] >> 32) & shard_mask);
+      shard_refs[s].push_back({.worker_id = static_cast<uint32_t>(w),
+                               .gid = static_cast<uint32_t>(g),
+                               .is_null = false});
+    }
+  }
+
+  std::vector<std::vector<SurvivorGroupRow>> shard_survivors(merge_shards);
+  std::vector<std::unique_ptr<QueryMemoryCharge>> surv_charges(merge_shards);
+  std::vector<Status> merge_status(merge_shards, Status::kSuccess);
+  std::atomic<size_t> total_groups{0};
+  std::atomic<bool> merge_bail{false};
+
+  RETURN_IF_FAIL(RunParallelTasks(merge_shards, [&](size_t s) {
+    if (shard_refs[s].empty()) {
+      return;
+    }
+    VarCharLocalGroupTable merged;
+    merged.max_groups = 262144;
+    for (const ShardEntryRef& ref : shard_refs[s]) {
+      auto& src_wt = workers[ref.worker_id].table;
+      RuntimeAggState* dst =
+          ref.is_null ? merged.GetOrCreateNull(naggs)
+                      : merged.GetOrCreate(src_wt.keys[ref.gid], naggs);
+      if (merged.bail) {
+        merge_bail.store(true, std::memory_order_relaxed);
+        return;
+      }
+      RuntimeAggState* src =
+          ref.is_null
+              ? src_wt.null_aggs.data()
+              : (src_wt.aggs.data() + static_cast<size_t>(ref.gid) * naggs);
+      for (size_t a = 0; a < naggs; ++a) {
+        Status mst =
+            MergeAggState(req.agg_specs[a], dst[a], src[a], merged.arena);
+        if (mst != Status::kSuccess) {
+          if (mst == StatusCode::kMemoryLimitExceeded) {
+            merge_bail.store(true, std::memory_order_relaxed);
+            return;
+          }
+          merge_status[s] = std::move(mst);
+          return;
+        }
+      }
+    }
+    total_groups.fetch_add(merged.keys.size() + (merged.has_null ? 1 : 0),
+                           std::memory_order_relaxed);
+
+    QueryMemoryCharge& surv_charge = SurvivorChargeFor(surv_charges, s);
+    ChunkedCharge surv_batch(&surv_charge);
+    auto& out_vec = shard_survivors[s];
+    std::vector<Value> having_scratch(naggs);
+    std::vector<Value> finished_aggs(naggs);
+    std::vector<Value> cached_keys(1);
+
+    auto emit_merged = [&](bool is_null, std::string_view sv,
+                           const RuntimeAggState* ast) -> Status {
+      ASSIGN_OR_RETURN(
+          bool, pass_having,
+          EvalPositionalHavingOnStates(req.positional_having, req.agg_specs,
+                                       ast, &having_scratch));
+      if (!pass_having) {
+        return Status::kSuccess;
+      }
+      RuntimeKeyCell kc{};
+      if (is_null) {
+        kc.is_null = true;
+      } else {
+        kc.str_ptr = sv.data();
+        kc.str_len = static_cast<uint32_t>(sv.size());
+      }
+      SurvivorGroupRow row;
+      RETURN_IF_FAIL(BuildSurvivorRowFromStates(
+          req, fast_order_kind, &kc, ast, &finished_aggs, &cached_keys, &row));
+      PushChargedSurvivor(&out_vec, &surv_batch, std::move(row));
+      return Status::kSuccess;
+    };
+    if (merged.has_null) {
+      Status est = emit_merged(true, {}, merged.null_aggs.data());
+      if (est != Status::kSuccess) {
+        merge_status[s] = std::move(est);
+        return;
+      }
+    }
+    for (size_t g = 0; g < merged.keys.size(); ++g) {
+      Status est =
+          emit_merged(false, merged.keys[g], merged.aggs.data() + g * naggs);
+      if (est != Status::kSuccess) {
+        merge_status[s] = std::move(est);
+        return;
+      }
+    }
+  }));
+
+  if (merge_bail.load(std::memory_order_relaxed)) {
+    return std::optional<Relation>{};
+  }
+  for (const Status& mst : merge_status) {
+    RETURN_IF_FAIL(mst);
+  }
+  return FinalizePartitionedRelation(
+      req, shard_survivors, total_groups.load(), total_scanned, total_matching,
+      merge_begin, "single-varchar-local-dict", &surv_charges);
+}
 
 StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
     const PartitionedColumnarAggRequest& req) {
@@ -5856,6 +7109,21 @@ StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
     // Only constant keys (`GROUP BY 1`), handled cleanly by non-partitioned
     // small path.
     return std::optional<Relation>{};
+  }
+  if (req.key_specs.size() == 2) {
+    ASSIGN_OR_RETURN(std::optional<Relation>, two_key_res,
+                     TryRunDirectTwoKeyBoundedIntAggregate(req, &km));
+    if (two_key_res) {
+      return two_key_res;
+    }
+  }
+  if (req.key_specs.size() == 1 &&
+      req.key_specs[0].kind == ColKeyKind::kColVarChar) {
+    ASSIGN_OR_RETURN(std::optional<Relation>, local_dict_res,
+                     TryRunSingleVarCharLocalDictAggregate(req, &km));
+    if (local_dict_res) {
+      return local_dict_res;
+    }
   }
 
   // CB-2: Unordered `GROUP BY ... LIMIT K` key-fiber prefix exact subset

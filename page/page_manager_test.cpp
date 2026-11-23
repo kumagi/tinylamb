@@ -255,7 +255,7 @@ TEST_F(PageManagerTest, CheckpointRejectsUnrepresentableBlockGeneration) {
   const size_t magic = bytes.find(kMagic);
   ASSERT_NE(magic, std::string::npos);
   const size_t block_generation =
-      magic + kMagic.size() + 2 * sizeof(uint32_t) + 2 * sizeof(uint64_t);
+      magic + kMagic.size() + (2 * sizeof(uint32_t)) + (2 * sizeof(uint64_t));
   ASSERT_GE(bytes.size(), block_generation + sizeof(uint64_t) + sizeof(uint32_t));
   constexpr uint64_t kUnrepresentable = uint64_t{1} << 32;
   std::memcpy(bytes.data() + block_generation, &kUnrepresentable,

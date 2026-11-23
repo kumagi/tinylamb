@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -35,6 +36,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -47,7 +49,17 @@ namespace {
 constexpr size_t kMaxCollapsedAggs = 16;
 constexpr size_t kMaxDenseKeySpan = 65536;
 constexpr uint32_t kAbsentSlot = std::numeric_limits<uint32_t>::max();
-constexpr uint64_t kEmptyPack7Sentinel = std::numeric_limits<uint64_t>::max();
+
+struct TransparentStringHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view sv) const noexcept {
+    return std::hash<std::string_view>{}(sv);
+  }
+};
+
+using TransparentStringSlotMap =
+    std::unordered_map<std::string, uint32_t, TransparentStringHash,
+                       std::equal_to<>>;
 
 enum class SimpleAggKind : uint8_t {
   kCountStar = 0,
@@ -70,11 +82,6 @@ struct AggSlotState {
   uint8_t numeric_mode{0};
   bool invalid{false};
 };
-
-inline bool IsValidSignedInt64Cell(const Value& v) noexcept {
-  return !v.IsNull() && v.type == ValueType::kInt64 && !v.IsUnsigned() &&
-         !v.IsInterval();
-}
 
 inline bool AddValueWithWeight(AggSlotState* st, SimpleAggKind kind,
                                const Value& val, uint64_t weight) noexcept {
@@ -101,9 +108,8 @@ inline bool AddValueWithWeight(AggSlotState* st, SimpleAggKind kind,
         st->invalid = true;
         return false;
       }
-      const __int128 prod =
-          static_cast<__int128>(val.value.int_value) *
-          static_cast<__int128>(weight);
+      const __int128 prod = static_cast<__int128>(val.value.int_value) *
+                            static_cast<__int128>(weight);
       st->sum_i128 += prod;
       if (prod > 0) {
         st->pos_i128 += prod;
@@ -293,7 +299,8 @@ inline bool MergeAggSlot(AggSlotState* dst, const AggSlotState& src,
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/SemijoinGuardedCheckedEagerSum.lean (sound)
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/SemijoinGuardedCheckedEagerSum.lean (sound)
 // Conservative checked finish: rejects (returns false -> fall back to checked
 // generic execution) if even the positive partial sum or negative partial sum
 // exceeds signed INT64 bounds.
@@ -315,8 +322,8 @@ inline bool FinishAggSlot(const AggSlotState& st, SimpleAggKind kind,
       if (st.numeric_mode == 1) {
         const __int128 max64 = std::numeric_limits<int64_t>::max();
         const __int128 min64 = std::numeric_limits<int64_t>::min();
-        if (st.pos_i128 > max64 || st.neg_i128 < min64 ||
-            st.sum_i128 > max64 || st.sum_i128 < min64) {
+        if (st.pos_i128 > max64 || st.neg_i128 < min64 || st.sum_i128 > max64 ||
+            st.sum_i128 < min64) {
           return false;
         }
         *out = Value(static_cast<int64_t>(st.sum_i128));
@@ -336,8 +343,8 @@ inline bool FinishAggSlot(const AggSlotState& st, SimpleAggKind kind,
       if (st.numeric_mode == 1) {
         const __int128 max64 = std::numeric_limits<int64_t>::max();
         const __int128 min64 = std::numeric_limits<int64_t>::min();
-        if (st.pos_i128 > max64 || st.neg_i128 < min64 ||
-            st.sum_i128 > max64 || st.sum_i128 < min64) {
+        if (st.pos_i128 > max64 || st.neg_i128 < min64 || st.sum_i128 > max64 ||
+            st.sum_i128 < min64) {
           return false;
         }
         *out = Value(static_cast<double>(static_cast<long double>(st.sum_i128) /
@@ -358,8 +365,8 @@ inline bool FinishAggSlot(const AggSlotState& st, SimpleAggKind kind,
   return false;
 }
 
-std::optional<SimpleAggKind> ClassifySimpleAgg(
-    const AggregateExpression* agg, bool is_count_star) noexcept {
+std::optional<SimpleAggKind> ClassifySimpleAgg(const AggregateExpression* agg,
+                                               bool is_count_star) noexcept {
   if (is_count_star) {
     return SimpleAggKind::kCountStar;
   }
@@ -565,20 +572,6 @@ inline bool ReadIntKeyCell(const Value& v, ValueType expected_type,
   return true;
 }
 
-inline bool ReadStringKeyCell(const Value& v, std::string_view* out,
-                              bool* invalid_cell) noexcept {
-  if (v.IsNull()) {
-    return false;
-  }
-  if (v.type != ValueType::kVarChar || v.IsCaseInsensitive() ||
-      v.IsInterval()) {
-    *invalid_cell = true;
-    return false;
-  }
-  *out = v.value.varchar_value;
-  return true;
-}
-
 // Checks whether an expression (outside AggregateExpression subtrees) ONLY
 // reads columns allowed by `allowed_pred(col_name)`.
 bool AllNonAggColumnsAllowed(
@@ -645,7 +638,8 @@ std::string EncodeKeyTuple(const std::vector<Value>& vals) {
         break;
       }
       case ValueType::kVarChar: {
-        const uint32_t len = static_cast<uint32_t>(v.value.varchar_value.size());
+        const uint32_t len =
+            static_cast<uint32_t>(v.value.varchar_value.size());
         out.append(reinterpret_cast<const char*>(&len), sizeof(len));
         out.append(v.value.varchar_value);
         break;
@@ -730,8 +724,8 @@ StatusOr<Relation> EmitGroupedProjectionRelation(
   if (rep_rows.empty()) {
     if (fusion.group_keys.empty() && empty_scalar_rep_row.has_value()) {
       bool aborted = false;
-      ASSIGN_OR_RETURN(bool, ok,
-                       emit_one_group(*empty_scalar_rep_row, nullptr, &aborted));
+      ASSIGN_OR_RETURN(
+          bool, ok, emit_one_group(*empty_scalar_rep_row, nullptr, &aborted));
       (void)ok;
       if (aborted) {
         return StatusError(StatusCode::kInvalidArgument, "eager fallback");
@@ -755,6 +749,32 @@ StatusOr<Relation> EmitGroupedProjectionRelation(
   RETURN_IF_FAIL(out.FinishSpill());
   RETURN_IF_FAIL(out.GetStatus());
   out.uniform_cell_types = !out.HasSpill() && all_uniform && !out.rows.empty();
+  if (fusion.output_sink != nullptr && !out.HasSpill()) {
+    const size_t total_out = out.rows.size();
+    auto begun = fusion.output_sink->begin(out.schema, total_out, 1);
+    RETURN_IF_FAIL(begun.GetStatus());
+    if (begun.Value()) {
+      fusion.output_sink->used = true;
+      std::vector<Value> batch;
+      batch.reserve(std::min(total_out, GroupedOutputSink::kBatchRows) * ncols);
+      for (size_t first = 0; first < total_out;
+           first += GroupedOutputSink::kBatchRows) {
+        const size_t count =
+            std::min(GroupedOutputSink::kBatchRows, total_out - first);
+        batch.clear();
+        for (size_t r = 0; r < count; ++r) {
+          const Row& row = out.rows[first + r];
+          for (size_t c = 0; c < ncols; ++c) {
+            batch.push_back(row[c]);
+          }
+        }
+        RETURN_IF_FAIL(fusion.output_sink->push(
+            0, first, std::span<const Value>(batch.data(), count * ncols)));
+      }
+      out.rows.clear();
+      out.uniform_cell_types = false;
+    }
+  }
   if (fusion.columnar_output && !out.HasSpill() && !out.rows.empty()) {
     ASSIGN_OR_RETURN(std::shared_ptr<ColumnarTable>, built,
                      BuildColumnarTableFromRows(out.schema, out.rows));
@@ -775,6 +795,11 @@ StatusOr<Relation> EmitGroupedProjectionRelation(
   return out;
 }
 
+bool IsEagerFallbackStatus(const Status& st) {
+  return st.GetCode() == StatusCode::kInvalidArgument &&
+         st.GetMessage() == "eager fallback";
+}
+
 }  // namespace
 
 StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
@@ -782,15 +807,15 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     const std::vector<EqualityKey>& equality_keys, JoinType join_type,
     const std::vector<Expression>& residuals,
     const std::vector<BytecodeProgram>& key_programs,
-    const std::vector<BytecodeProgram>& child_programs,
-    const Scope* outer, const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
+    const std::vector<BytecodeProgram>& child_programs, const Scope* outer,
+    const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
   static const bool disabled =
       std::getenv("TINYLAMB_DISABLE_COLLAPSED_RIGHT_JOIN") != nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || !residuals.empty() ||
       left.HasSpill() || right.HasSpill() || left.using_columns != nullptr ||
       right.using_columns != nullptr || fusion->anti_unmatched_only ||
-      fusion->rollup_count_distribution || fusion->output_sink != nullptr ||
+      fusion->rollup_count_distribution ||
       (join_type != JoinType::kInner && join_type != JoinType::kLeft) ||
       equality_keys.size() != 1 || fusion->aggregates.empty() ||
       fusion->aggregates.size() > kMaxCollapsedAggs) {
@@ -847,16 +872,15 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       static_cast<slot_t>(probe_is_left ? eq.left : eq.right);
   const slot_t build_key_col =
       static_cast<slot_t>(probe_is_left ? eq.right : eq.left);
-  const size_t probe_width = probe_is_left ? left_width : right_width;
 
   // Classify aggregates and check side isolation.
   std::vector<SimpleAggKind> agg_kinds(fusion->aggregates.size());
   std::vector<bool> agg_on_probe(fusion->aggregates.size(), true);
   std::vector<bool> agg_direct_col(fusion->aggregates.size(), false);
   std::vector<slot_t> agg_local_col(fusion->aggregates.size(), 0);
-  bool has_build_aggs = false;
   for (size_t ai = 0; ai < fusion->aggregates.size(); ++ai) {
-    auto kind = ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
+    auto kind =
+        ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
     if (!kind.has_value()) {
       return std::optional<Relation>{};
     }
@@ -886,17 +910,13 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     }
     const bool on_probe = probe_is_left ? !loads_right : !loads_left;
     agg_on_probe[ai] = on_probe;
-    if (!on_probe) {
-      has_build_aggs = true;
-    }
     if (child->Type() == TypeTag::kColumnValue) {
       const auto off = LocalColumnOffset(
           combined_schema, child->AsColumnValue().GetColumnName());
       if (off.has_value()) {
-        const size_t local =
-            (static_cast<size_t>(*off) < left_width)
-                ? static_cast<size_t>(*off)
-                : (static_cast<size_t>(*off) - left_width);
+        const size_t local = (static_cast<size_t>(*off) < left_width)
+                                 ? static_cast<size_t>(*off)
+                                 : (static_cast<size_t>(*off) - left_width);
         const bool expected_on_left = static_cast<size_t>(*off) < left_width;
         if (expected_on_left == (probe_is_left ? on_probe : !on_probe)) {
           agg_direct_col[ai] = true;
@@ -911,15 +931,14 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   std::unordered_set<std::string> grouped_col_names;
   for (const Expression& gk : fusion->group_keys) {
     if (gk && gk->Type() == TypeTag::kColumnValue) {
-      const auto off =
-          LocalColumnOffset(combined_schema, gk->AsColumnValue().GetColumnName());
+      const auto off = LocalColumnOffset(combined_schema,
+                                         gk->AsColumnValue().GetColumnName());
       if (off.has_value()) {
         grouped_col_names.insert(AsciiToLower(
             combined_schema.GetColumn(static_cast<size_t>(*off)).Name().name));
       }
-    } else if (!AllNonAggColumnsAllowed(gk, [](const ColumnName&) {
-                 return false;
-               })) {
+    } else if (!AllNonAggColumnsAllowed(
+                   gk, [](const ColumnName&) { return false; })) {
       // Computed GROUP BY key: must match identically in SELECT/HAVING unless
       // only aggregates + constants remain outside GROUP BY.
     }
@@ -939,7 +958,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                static_cast<int>(co);
       });
     }
-    if (join_type == JoinType::kInner && co == (on_left ? eq.left : left_width + eq.right)) {
+    if (join_type == JoinType::kInner &&
+        co == (on_left ? eq.left : left_width + eq.right)) {
       const size_t probe_eq_combined =
           probe_is_left ? eq.left : (left_width + eq.right);
       return std::ranges::any_of(fusion->group_keys, [&](const Expression& gk) {
@@ -956,8 +976,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   }
   for (const Expression& se : fusion->select_items) {
     // Allow exact GROUP BY expression structural equality too.
-    bool matches_group_expr = std::ranges::any_of(
-        fusion->group_keys, [&](const Expression& gk) {
+    bool matches_group_expr =
+        std::ranges::any_of(fusion->group_keys, [&](const Expression& gk) {
           return gk && se && gk->ToString() == se->ToString();
         });
     if (!matches_group_expr && !AllNonAggColumnsAllowed(se, col_allowed)) {
@@ -1001,16 +1021,16 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   std::vector<uint32_t> dense_slots;
   FlatIntKeyMap<uint32_t> int_key_to_slot;
   bool use_pack7_str = (key_type == ValueType::kVarChar);
+  std::vector<uint32_t> page_url_slots;
   std::unordered_map<uint64_t, uint32_t> pack7_key_to_slot;
-  std::unordered_map<std::string, uint32_t> str_key_to_slot;
+  TransparentStringSlotMap str_key_to_slot;
 
   if (is_int_join_key && build_rel.TotalRows() > 0) {
     int64_t bmin = std::numeric_limits<int64_t>::max();
     int64_t bmax = std::numeric_limits<int64_t>::min();
     bool bad = false;
     ForEachRelationEntry(
-        build_rel,
-        [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+        build_rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
           int64_t kv = 0;
           if (ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
                                   &bad)) {
@@ -1051,7 +1071,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
         *slot_out = ref;
         return true;
       }
-      if (uint32_t* existing = int_key_to_slot.Find(*ikey)) {
+      if (const uint32_t* existing = int_key_to_slot.Find(*ikey)) {
         *slot_out = *existing;
         return true;
       }
@@ -1060,21 +1080,42 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       if (n_build_aggs > 0) {
         collapsed_aggs.resize(collapsed_cnt.size() * n_build_aggs);
       }
-      int_key_to_slot.Emplace(*ikey, sid);
+      *int_key_to_slot.TryEmplace(*ikey) = sid;
       *slot_out = sid;
+      return true;
+    }
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/Wave8BigBench.lean (UrlGrouping_sound)
+    // Canonical "page-<N>" URLs map bijectively into a dense flat array,
+    // disjoint from pack7/literal string maps.
+    uint32_t page_id = 0;
+    if (TryParseCanonicalPageUrl(skey, &page_id)) {
+      if (page_id >= page_url_slots.size()) {
+        page_url_slots.resize(static_cast<size_t>(page_id) + 1, kAbsentSlot);
+      }
+      uint32_t& ref = page_url_slots[page_id];
+      if (ref == kAbsentSlot) {
+        ref = static_cast<uint32_t>(collapsed_cnt.size());
+        collapsed_cnt.push_back(0);
+        if (n_build_aggs > 0) {
+          collapsed_aggs.resize(collapsed_cnt.size() * n_build_aggs);
+        }
+      }
+      *slot_out = ref;
       return true;
     }
     if (use_pack7_str) {
       if (auto p7 = PackShortString7(skey)) {
-        auto [it, inserted] =
-            pack7_key_to_slot.emplace(*p7, static_cast<uint32_t>(collapsed_cnt.size()));
+        auto [it, inserted] = pack7_key_to_slot.emplace(
+            *p7, static_cast<uint32_t>(collapsed_cnt.size()));
         if (inserted) {
           collapsed_cnt.push_back(0);
           if (n_build_aggs > 0) {
             collapsed_aggs.resize(collapsed_cnt.size() * n_build_aggs);
           }
           if (n_build_aggs == 0) {
-            // Keep key text only if we need to spill into str_key_to_slot later.
+            // Keep key text only if we need to spill into str_key_to_slot
+            // later.
           }
         }
         *slot_out = it->second;
@@ -1093,7 +1134,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       }
       pack7_key_to_slot.clear();
     }
-    auto it = str_key_to_slot.find(std::string(skey));
+    auto it = str_key_to_slot.find(skey);
     if (it != str_key_to_slot.end()) {
       *slot_out = it->second;
       return true;
@@ -1113,8 +1154,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   bool build_invalid = false;
   Status build_status = Status::kSuccess;
   ForEachRelationEntry(
-      build_rel,
-      [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+      build_rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
         uint32_t sid = kAbsentSlot;
         if (is_int_join_key) {
           int64_t kv = 0;
@@ -1137,9 +1177,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
           for (size_t ba = 0; ba < n_build_aggs; ++ba) {
             const slot_t ai = build_agg_indices[ba];
             if (agg_direct_col[ai]) {
-              if (!AddEntryCellWithWeight(&collapsed_aggs[sid * n_build_aggs + ba],
-                                          agg_kinds[ai], chunk, r, ri,
-                                          agg_local_col[ai], 1)) {
+              if (!AddEntryCellWithWeight(
+                      &collapsed_aggs[sid * n_build_aggs + ba], agg_kinds[ai],
+                      chunk, r, ri, agg_local_col[ai], 1)) {
                 build_invalid = true;
                 return false;
               }
@@ -1189,10 +1229,29 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
         left.hash_joins + right.hash_joins + 1,
         left.join_comparisons + right.join_comparisons, {&left, &right});
     if (!res_or.HasValue()) {
+      if (!IsEagerFallbackStatus(res_or.GetStatus())) {
+        return res_or.GetStatus();
+      }
       return std::optional<Relation>{};
     }
     fusion->fired = true;
     return std::optional<Relation>(res_or.MoveValue());
+  }
+
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave8Ceb.lean (SparseOuterCorrection_sound)
+  // For a LEFT JOIN whose right side contributes no aggregate payloads, every
+  // probe row contributes max(1, mult(key)) times. When no right key has
+  // multiplicity > 1, every probe row has weight 1 with zero hash lookups.
+  bool left_outer_unit_weight = false;
+  if (join_type == JoinType::kLeft && n_build_aggs == 0) {
+    left_outer_unit_weight = true;
+    for (const uint64_t cnt : collapsed_cnt) {
+      if (cnt > 1) {
+        left_outer_unit_weight = false;
+        break;
+      }
+    }
   }
 
   auto lookup_build_slot = [&](const ColumnarChunk* chunk, const Row* probe_row,
@@ -1200,6 +1259,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                                std::string_view* matched_str_out,
                                int64_t* matched_int_out, uint64_t* out_weight,
                                uint32_t* out_sid, bool* out_invalid) -> bool {
+    if (left_outer_unit_weight) {
+      return false;
+    }
     if (is_int_join_key) {
       int64_t kv = 0;
       bool inv = false;
@@ -1234,6 +1296,18 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       return false;
     }
     *matched_str_out = sv;
+    if (!page_url_slots.empty()) {
+      uint32_t page_id = 0;
+      if (TryParseCanonicalPageUrl(sv, &page_id)) {
+        if (page_id >= page_url_slots.size() ||
+            page_url_slots[page_id] == kAbsentSlot) {
+          return false;
+        }
+        *out_sid = page_url_slots[page_id];
+        *out_weight = collapsed_cnt[*out_sid];
+        return true;
+      }
+    }
     if (use_pack7_str) {
       auto p7 = PackShortString7(sv);
       if (!p7.has_value()) {
@@ -1247,7 +1321,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       *out_weight = collapsed_cnt[*out_sid];
       return true;
     }
-    auto it = str_key_to_slot.find(std::string(sv));
+    auto it = str_key_to_slot.find(sv);
     if (it == str_key_to_slot.end()) {
       return false;
     }
@@ -1258,7 +1332,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
 
   // Phase B: Parallel Probe & Group Accumulation.
   const size_t total_probe = probe_rel.TotalRows();
-  const size_t workers = ParallelWorkerCount(std::max<size_t>(1, total_probe / 16384));
+  const size_t workers =
+      ParallelWorkerCount(std::max<size_t>(1, total_probe / 16384));
   const size_t n_aggs = agg_kinds.size();
   const size_t n_gkeys = fusion->group_keys.size();
 
@@ -1279,7 +1354,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     std::vector<AggSlotState> scalar_aggs;
     FlatIntKeyMap<uint32_t> int_map;
     std::unordered_map<uint64_t, uint32_t> pack7_map;
-    std::unordered_map<std::string, uint32_t> str_map;
+    TransparentStringSlotMap str_map;
     uint32_t null_group_idx{kAbsentSlot};
     std::vector<std::vector<Value>> group_keys;
     std::vector<std::vector<AggSlotState>> group_aggs;
@@ -1352,11 +1427,10 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                 }
                 if (matched) {
                   combined_scratch.values_[build_offset + build_key_col] =
-                      is_int_join_key
-                          ? (key_type == ValueType::kDate
-                                 ? Value::Date(matched_int)
-                                 : Value(matched_int))
-                          : Value(std::string(matched_str));
+                      is_int_join_key ? (key_type == ValueType::kDate
+                                             ? Value::DateFromDays(matched_int)
+                                             : Value(matched_int))
+                                      : Value(std::string(matched_str));
                 }
                 populated_combined = true;
               }
@@ -1373,20 +1447,22 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                   return false;
                 }
                 if (wl.null_group_idx == kAbsentSlot) {
-                  wl.null_group_idx = static_cast<uint32_t>(wl.group_aggs.size());
+                  wl.null_group_idx =
+                      static_cast<uint32_t>(wl.group_aggs.size());
                   wl.group_keys.push_back({Value()});
                   wl.group_aggs.emplace_back(n_aggs);
                 }
                 dst_aggs = &wl.group_aggs[wl.null_group_idx];
               } else {
                 uint32_t gid = 0;
-                if (uint32_t* found = wl.int_map.Find(iv)) {
+                if (const uint32_t* found = wl.int_map.Find(iv)) {
                   gid = *found;
                 } else {
                   gid = static_cast<uint32_t>(wl.group_aggs.size());
-                  wl.int_map.Emplace(iv, gid);
-                  wl.group_keys.push_back(
-                      {exp_t == ValueType::kDate ? Value::Date(iv) : Value(iv)});
+                  *wl.int_map.TryEmplace(iv) = gid;
+                  wl.group_keys.push_back({exp_t == ValueType::kDate
+                                               ? Value::DateFromDays(iv)
+                                               : Value(iv)});
                   wl.group_aggs.emplace_back(n_aggs);
                 }
                 dst_aggs = &wl.group_aggs[gid];
@@ -1402,7 +1478,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                   return false;
                 }
                 if (wl.null_group_idx == kAbsentSlot) {
-                  wl.null_group_idx = static_cast<uint32_t>(wl.group_aggs.size());
+                  wl.null_group_idx =
+                      static_cast<uint32_t>(wl.group_aggs.size());
                   wl.group_keys.push_back({Value()});
                   wl.group_aggs.emplace_back(n_aggs);
                 }
@@ -1413,21 +1490,21 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                   auto [it, inserted] = wl.pack7_map.emplace(
                       *p7, static_cast<uint32_t>(wl.group_aggs.size()));
                   if (inserted) {
-                    Value owned(std::string(sv));
+                    Value owned{std::string(sv)};
                     wl.group_keys.push_back({std::move(owned)});
                     wl.group_aggs.emplace_back(n_aggs);
                   }
                   gid = it->second;
                 } else {
-                  std::string kstr(sv);
-                  auto [it, inserted] = wl.str_map.emplace(
-                      kstr, static_cast<uint32_t>(wl.group_aggs.size()));
-                  if (inserted) {
-                    Value owned(std::string(sv));
+                  if (auto it = wl.str_map.find(sv); it != wl.str_map.end()) {
+                    gid = it->second;
+                  } else {
+                    gid = static_cast<uint32_t>(wl.group_aggs.size());
+                    wl.str_map.emplace(std::string(sv), gid);
+                    Value owned{std::string(sv)};
                     wl.group_keys.push_back({std::move(owned)});
                     wl.group_aggs.emplace_back(n_aggs);
                   }
-                  gid = it->second;
                 }
                 dst_aggs = &wl.group_aggs[gid];
               }
@@ -1485,9 +1562,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
               continue;
             }
             if (agg_direct_col[ai]) {
-              if (!AddEntryCellWithWeight(&(*dst_aggs)[ai], agg_kinds[ai], chunk,
-                                          probe_row, ri, agg_local_col[ai],
-                                          weight)) {
+              if (!AddEntryCellWithWeight(&(*dst_aggs)[ai], agg_kinds[ai],
+                                          chunk, probe_row, ri,
+                                          agg_local_col[ai], weight)) {
                 wl.invalid = true;
                 return false;
               }
@@ -1516,7 +1593,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
               }
             }
           }
-          // Accumulate matched build-side aggregates (once per matched key lookup).
+          // Accumulate matched build-side aggregates (once per matched key
+          // lookup).
           if (matched && n_build_aggs > 0) {
             const size_t base = sid * n_build_aggs;
             for (size_t ba = 0; ba < n_build_aggs; ++ba) {
@@ -1554,8 +1632,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       if (!wl.has_scalar) continue;
       any_scalar = true;
       for (size_t ai = 0; ai < n_aggs; ++ai) {
-        if (!MergeAggSlot(&merged_scalar[ai], wl.scalar_aggs[ai],
-                          agg_kinds[ai], 1)) {
+        if (!MergeAggSlot(&merged_scalar[ai], wl.scalar_aggs[ai], agg_kinds[ai],
+                          1)) {
           return std::optional<Relation>{};
         }
       }
@@ -1569,8 +1647,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     for (const WorkerLocal& wl : locals) {
       for (size_t gi = 0; gi < wl.group_keys.size(); ++gi) {
         std::string enc = EncodeKeyTuple(wl.group_keys[gi]);
-        auto [it, inserted] = global_groups.emplace(std::move(enc),
-                                                    final_rep_rows.size());
+        auto [it, inserted] =
+            global_groups.emplace(std::move(enc), final_rep_rows.size());
         if (inserted) {
           Row rep(std::vector<Value>(left_width + right_width));
           for (size_t k = 0; k < n_gkeys; ++k) {
@@ -1602,7 +1680,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
 
   // Note: for computed GROUP BY expressions, evaluate against combined rep row
   // requires representative columns; we only populate direct_group_probe_cols,
-  // so verify any non-direct GROUP BY expression isn't needed ungrouped in SELECT/HAVING.
+  // so verify any non-direct GROUP BY expression isn't needed ungrouped in
+  // SELECT/HAVING.
   for (size_t k = 0; k < n_gkeys; ++k) {
     if (!direct_group_probe_cols[k].has_value()) {
       return std::optional<Relation>{};
@@ -1619,6 +1698,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       left.join_comparisons + right.join_comparisons + total_comparisons,
       {&left, &right});
   if (!result_or.HasValue()) {
+    if (!IsEagerFallbackStatus(result_or.GetStatus())) {
+      return result_or.GetStatus();
+    }
     return std::optional<Relation>{};
   }
   fusion->fired = true;
@@ -1626,8 +1708,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
 }
 
 StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
-    TransactionContext& context, const SelectStatement& statement,
-    const std::vector<Relation>& relations,
+    TransactionContext& context, const std::vector<Relation>& relations,
     const std::vector<uint8_t>& absorbed,
     const std::vector<PredicateInfo>& predicates, const Scope* outer,
     const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
@@ -1635,8 +1716,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       std::getenv("TINYLAMB_DISABLE_FACTORIZED_JOIN_TREE") != nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || fusion->rollup_count_distribution ||
-      fusion->output_sink != nullptr || fusion->anti_unmatched_only ||
-      fusion->aggregates.empty() ||
+      fusion->anti_unmatched_only || fusion->aggregates.empty() ||
       fusion->aggregates.size() > kMaxCollapsedAggs) {
     return std::optional<Relation>{};
   }
@@ -1706,10 +1786,12 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     const auto l1 = LocalColumnOffset(relations[s1].schema, lhs);
     const auto r1 = LocalColumnOffset(relations[s1].schema, rhs);
     std::optional<slot_t> c0, c1;
-    if (l0.has_value() && r1.has_value() && !r0.has_value() && !l1.has_value()) {
+    if (l0.has_value() && r1.has_value() && !r0.has_value() &&
+        !l1.has_value()) {
       c0 = static_cast<slot_t>(*l0);
       c1 = static_cast<slot_t>(*r1);
-    } else if (r0.has_value() && l1.has_value() && !l0.has_value() && !r1.has_value()) {
+    } else if (r0.has_value() && l1.has_value() && !l0.has_value() &&
+               !r1.has_value()) {
       c0 = static_cast<slot_t>(*r0);
       c1 = static_cast<slot_t>(*l1);
     } else {
@@ -1749,7 +1831,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   struct EqClassInfo {
     ValueType type{ValueType::kInt64};
     TextDomain text_domain{TextDomain::kUnspecified};
-    // active_rel -> slot in that relation; reject if a relation puts two distinct cols into the same eq class.
+    // active_rel -> slot in that relation; reject if a relation puts two
+    // distinct cols into the same eq class.
     std::vector<std::pair<size_t, slot_t>> members;
   };
   std::vector<EqClassInfo> eq_classes;
@@ -1760,32 +1843,36 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       const Column& cdef =
           relations[active_rels[col_nodes[ni].ar]].schema.GetColumn(
               col_nodes[ni].col);
-      eq_classes.push_back(EqClassInfo{
-          .type = cdef.Type(), .text_domain = cdef.GetTextDomain(), .members = {}});
+      eq_classes.push_back(EqClassInfo{.type = cdef.Type(),
+                                       .text_domain = cdef.GetTextDomain(),
+                                       .members = {}});
     }
     const size_t ec = it->second;
     const Column& cdef =
         relations[active_rels[col_nodes[ni].ar]].schema.GetColumn(
             col_nodes[ni].col);
     if (!HasSingleEquiKeyCompatible(
-            cdef, relations[active_rels[eq_classes[ec].members.empty()
-                                            ? col_nodes[ni].ar
-                                            : eq_classes[ec].members[0].first]]
-                      .schema.GetColumn(eq_classes[ec].members.empty()
-                                            ? col_nodes[ni].col
-                                            : eq_classes[ec].members[0].second))) {
+            cdef,
+            relations[active_rels[eq_classes[ec].members.empty()
+                                      ? col_nodes[ni].ar
+                                      : eq_classes[ec].members[0].first]]
+                .schema.GetColumn(eq_classes[ec].members.empty()
+                                      ? col_nodes[ni].col
+                                      : eq_classes[ec].members[0].second))) {
       return std::optional<Relation>{};
     }
     for (const auto& [existing_ar, _] : eq_classes[ec].members) {
       if (existing_ar == col_nodes[ni].ar) {
-        return std::optional<Relation>{};  // intra-relation cycle in one eq class
+        return std::optional<Relation>{};  // intra-relation cycle in one eq
+                                           // class
       }
     }
     eq_classes[ec].members.emplace_back(col_nodes[ni].ar, col_nodes[ni].col);
   }
 
-  // Build bipartite graph (Relations `0..n_active-1`, EqClasses `n_active..n_active+E-1`)
-  // and verify it is a single connected tree (Berge-acyclic).
+  // Build bipartite graph (Relations `0..n_active-1`, EqClasses
+  // `n_active..n_active+E-1`) and verify it is a single connected tree
+  // (Berge-acyclic).
   const size_t n_eq = eq_classes.size();
   const size_t b_nodes = n_active + n_eq;
   size_t b_edge_count = 0;
@@ -1822,7 +1909,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     }
   }
 
-  // Also ensure every active relation's join-key VARCHAR columns carry no collation/interval.
+  // Also ensure every active relation's join-key VARCHAR columns carry no
+  // collation/interval.
   for (size_t ec = 0; ec < n_eq; ++ec) {
     if (eq_classes[ec].type != ValueType::kVarChar) continue;
     for (const auto& [ar, col] : eq_classes[ec].members) {
@@ -1863,8 +1951,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   }
 
   // Collect all column references across GROUP BY, SELECT, HAVING, aggregates.
-  // First verify SELECT & HAVING have no ungrouped non-agg columns outside GROUP BY
-  // (using active-schema names), and every agg is a supported simple column agg.
+  // First verify SELECT & HAVING have no ungrouped non-agg columns outside
+  // GROUP BY (using active-schema names), and every agg is a supported simple
+  // column agg.
   Schema full_active_schema;
   std::vector<size_t> ar_schema_offset(n_active, 0);
   for (size_t ar = 0; ar < n_active; ++ar) {
@@ -1879,9 +1968,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     }
     for (size_t ar = n_active; ar-- > 0;) {
       if (static_cast<size_t>(*off) >= ar_schema_offset[ar]) {
-        return std::make_pair(
-            ar, static_cast<slot_t>(static_cast<size_t>(*off) -
-                                    ar_schema_offset[ar]));
+        return std::make_pair(ar,
+                              static_cast<slot_t>(static_cast<size_t>(*off) -
+                                                  ar_schema_offset[ar]));
       }
     }
     return std::nullopt;
@@ -1913,10 +2002,11 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     if (!resolved.has_value()) {
       return std::optional<Relation>{};
     }
-    gk_refs[k] = GroupKeyRef{.is_col = true,
-                             .orig_ar = resolved->first,
-                             .orig_col = resolved->second,
-                             .eq_cls = eq_class_of(resolved->first, resolved->second)};
+    gk_refs[k] =
+        GroupKeyRef{.is_col = true,
+                    .orig_ar = resolved->first,
+                    .orig_col = resolved->second,
+                    .eq_cls = eq_class_of(resolved->first, resolved->second)};
   }
 
   // Classify aggregates.
@@ -1929,7 +2019,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   };
   std::vector<AggColRef> agg_refs(fusion->aggregates.size());
   for (size_t ai = 0; ai < fusion->aggregates.size(); ++ai) {
-    auto kind = ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
+    auto kind =
+        ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
     if (!kind.has_value()) {
       return std::optional<Relation>{};
     }
@@ -1946,10 +2037,11 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     if (!resolved.has_value()) {
       return std::optional<Relation>{};
     }
-    agg_refs[ai] = AggColRef{.is_count_star = false,
-                             .ar = resolved->first,
-                             .col = resolved->second,
-                             .eq_cls = eq_class_of(resolved->first, resolved->second)};
+    agg_refs[ai] =
+        AggColRef{.is_count_star = false,
+                  .ar = resolved->first,
+                  .col = resolved->second,
+                  .eq_cls = eq_class_of(resolved->first, resolved->second)};
   }
 
   // Check SELECT and HAVING ungrouped columns: must all resolve to a GROUP BY
@@ -1979,7 +2071,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   // AND every aggregate must either map onto `R_root` or belong to a DIRECT
   // relation child of an eq-class attached to `R_root` (#11).
   // Among valid roots, pick the one with the SMALLEST TotalRows() (or fewest
-  // value branches), e.g., `pl` (200 rows) in L1, `k` (2K) in J4, `u` (5K) in C2!
+  // value branches), e.g., `pl` (200 rows) in L1, `k` (2K) in J4, `u` (5K) in
+  // C2!
   std::optional<size_t> chosen_root;
   size_t best_root_rows = std::numeric_limits<size_t>::max();
   for (size_t cand_root = 0; cand_root < n_active; ++cand_root) {
@@ -2013,7 +2106,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     for (const AggColRef& ar_ref : agg_refs) {
       if (ar_ref.is_count_star) continue;
       if (ar_ref.ar == cand_root) continue;
-      if (ar_ref.eq_cls.has_value() && eq_col_on_ar(*ar_ref.eq_cls, cand_root)) {
+      if (ar_ref.eq_cls.has_value() &&
+          eq_col_on_ar(*ar_ref.eq_cls, cand_root)) {
         continue;  // substituted onto cand_root!
       }
       if (!direct_children.contains(ar_ref.ar)) {
@@ -2076,8 +2170,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   }
 
   // Build rooted bipartite tree from `root_ar`.
-  // Relation node `ar` has parent eq-class `parent_eq[ar]` (`SIZE_MAX` for root_ar),
-  // and child eq-classes -> child relation nodes `rel_children[ar]`:
+  // Relation node `ar` has parent eq-class `parent_eq[ar]` (`SIZE_MAX` for
+  // root_ar), and child eq-classes -> child relation nodes `rel_children[ar]`:
   // Each child of `ar` is `{child_ar, parent_col_on_ar, child_join_col, ec}`.
   struct TreeChildLink {
     size_t child_ar{0};
@@ -2121,8 +2215,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     }
   }
 
-  // Summary storage per non-root relation `ar`: maps non-null parent-join key ->
-  // (weight_sum, optionally value_aggs).
+  // Summary storage per non-root relation `ar`: maps non-null parent-join key
+  // -> (weight_sum, optionally value_aggs).
   struct SubtreeSummary {
     ValueType key_type{ValueType::kInt64};
     bool is_int{true};
@@ -2132,9 +2226,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     FlatIntKeyMap<uint32_t> int_map;
     bool use_pack7{false};
     std::unordered_map<uint64_t, uint32_t> pack7_map;
-    std::unordered_map<std::string, uint32_t> str_map;
+    TransparentStringSlotMap str_map;
     std::vector<uint64_t> counts;
-    std::vector<size_t> owned_aggs;  // global agg indices
+    std::vector<size_t> owned_aggs;        // global agg indices
     std::vector<AggSlotState> agg_states;  // [sid * owned_aggs.size() + k]
 
     void Lookup(const ColumnarChunk* chunk, const Row* p_row, size_t r_idx,
@@ -2181,7 +2275,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         }
         return;
       }
-      auto it = str_map.find(std::string(sv));
+      auto it = str_map.find(sv);
       if (it != str_map.end()) {
         *sid_out = it->second;
         *w_out = counts[*sid_out];
@@ -2208,8 +2302,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     const Relation& rel = relations[active_rels[ar]];
     SubtreeSummary& sum = summaries[ar];
     sum.key_type = rel_parent_key_type[ar];
-    sum.is_int = (sum.key_type == ValueType::kInt64 ||
-                  sum.key_type == ValueType::kDate);
+    sum.is_int =
+        (sum.key_type == ValueType::kInt64 || sum.key_type == ValueType::kDate);
     sum.use_pack7 = !sum.is_int;
     if (auto it = child_owned_aggs.find(ar); it != child_owned_aggs.end()) {
       sum.owned_aggs = it->second;
@@ -2246,7 +2340,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
 
     Value sum_key_tmp;
     auto alloc_sum_slot = [&](const ColumnarChunk* chunk, const Row* row,
-                              size_t r_idx, bool* bad) -> std::optional<uint32_t> {
+                              size_t r_idx,
+                              bool* bad) -> std::optional<uint32_t> {
       if (sum.is_int) {
         int64_t kv = 0;
         if (!ReadIntKeyFromEntry(chunk, row, r_idx, up_col, sum.key_type, &kv,
@@ -2264,13 +2359,13 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
           }
           return ref;
         }
-        if (uint32_t* existing = sum.int_map.Find(kv)) {
+        if (const uint32_t* existing = sum.int_map.Find(kv)) {
           return *existing;
         }
         const auto sid = static_cast<uint32_t>(sum.counts.size());
         sum.counts.push_back(0);
         if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
-        sum.int_map.Emplace(kv, sid);
+        *sum.int_map.TryEmplace(kv) = sid;
         return sid;
       }
       std::string_view sv;
@@ -2280,8 +2375,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       }
       if (sum.use_pack7) {
         if (auto p7 = PackShortString7(sv)) {
-          auto [it, ins] =
-              sum.pack7_map.emplace(*p7, static_cast<uint32_t>(sum.counts.size()));
+          auto [it, ins] = sum.pack7_map.emplace(
+              *p7, static_cast<uint32_t>(sum.counts.size()));
           if (ins) {
             sum.counts.push_back(0);
             if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
@@ -2300,7 +2395,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         }
         sum.pack7_map.clear();
       }
-      auto it = sum.str_map.find(std::string(sv));
+      auto it = sum.str_map.find(sv);
       if (it != sum.str_map.end()) {
         return it->second;
       }
@@ -2313,50 +2408,50 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
 
     bool invalid = false;
     Value child_key_tmp;
-    ForEachRelationEntry(
-        rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
-          __int128 w = 1;
-          for (const TreeChildLink& ch : children) {
-            bool found = false;
-            uint64_t cw = 0;
-            uint32_t dummy_sid = 0;
-            summaries[ch.child_ar].Lookup(chunk, r, ri, ch.parent_col,
-                                          &child_key_tmp, &found, &cw,
-                                          &dummy_sid, &invalid);
-            if (invalid) return false;
-            if (!found) return true;  // semi-pruned by empty child
-            w *= static_cast<__int128>(cw);
-            if (w > static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
-              invalid = true;
-              return false;
-            }
-          }
-          auto sid = alloc_sum_slot(chunk, r, ri, &invalid);
-          if (invalid) return false;
-          if (!sid.has_value()) return true;
-          const uint64_t wu = static_cast<uint64_t>(w);
-          __int128 next_cnt = static_cast<__int128>(sum.counts[*sid]) +
-                              static_cast<__int128>(wu);
-          if (next_cnt >
-              static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+    ForEachRelationEntry(rel, [&](const ColumnarChunk* chunk, const Row* r,
+                                  size_t ri) {
+      __int128 w = 1;
+      for (const TreeChildLink& ch : children) {
+        bool found = false;
+        uint64_t cw = 0;
+        uint32_t dummy_sid = 0;
+        summaries[ch.child_ar].Lookup(chunk, r, ri, ch.parent_col,
+                                      &child_key_tmp, &found, &cw, &dummy_sid,
+                                      &invalid);
+        if (invalid) return false;
+        if (!found) return true;  // semi-pruned by empty child
+        w *= static_cast<__int128>(cw);
+        if (w > static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+          invalid = true;
+          return false;
+        }
+      }
+      auto sid = alloc_sum_slot(chunk, r, ri, &invalid);
+      if (invalid) return false;
+      if (!sid.has_value()) return true;
+      const uint64_t wu = static_cast<uint64_t>(w);
+      __int128 next_cnt =
+          static_cast<__int128>(sum.counts[*sid]) + static_cast<__int128>(wu);
+      if (next_cnt >
+          static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+        invalid = true;
+        return false;
+      }
+      sum.counts[*sid] = static_cast<uint64_t>(next_cnt);
+      ++total_comparisons;
+      if (n_owned > 0) {
+        for (size_t oi = 0; oi < n_owned; ++oi) {
+          const size_t ai = sum.owned_aggs[oi];
+          if (!AddEntryCellWithWeight(&sum.agg_states[*sid * n_owned + oi],
+                                      agg_kinds[ai], chunk, r, ri,
+                                      agg_refs[ai].col, wu)) {
             invalid = true;
             return false;
           }
-          sum.counts[*sid] = static_cast<uint64_t>(next_cnt);
-          ++total_comparisons;
-          if (n_owned > 0) {
-            for (size_t oi = 0; oi < n_owned; ++oi) {
-              const size_t ai = sum.owned_aggs[oi];
-              if (!AddEntryCellWithWeight(&sum.agg_states[*sid * n_owned + oi],
-                                          agg_kinds[ai], chunk, r, ri,
-                                          agg_refs[ai].col, wu)) {
-                invalid = true;
-                return false;
-              }
-            }
-          }
-          return true;
-        });
+        }
+      }
+      return true;
+    });
     if (invalid) {
       return std::optional<Relation>{};
     }
@@ -2373,7 +2468,12 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       auto res_or = EmitGroupedProjectionRelation(
           context, full_active_schema, {}, {}, agg_kinds, empty_rep, *fusion,
           n_active - 1, total_comparisons, keep_rels);
-      if (!res_or.HasValue()) return std::optional<Relation>{};
+      if (!res_or.HasValue()) {
+        if (!IsEagerFallbackStatus(res_or.GetStatus())) {
+          return res_or.GetStatus();
+        }
+        return std::optional<Relation>{};
+      }
       fusion->fired = true;
       return std::optional<Relation>(res_or.MoveValue());
     }
@@ -2421,8 +2521,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
             if (wl.invalid) return false;
             if (!found || cw[ci] == 0) return true;
             w_total *= static_cast<__int128>(cw[ci]);
-            if (w_total > static_cast<__int128>(
-                              std::numeric_limits<uint64_t>::max())) {
+            if (w_total >
+                static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
               wl.invalid = true;
               return false;
             }
@@ -2471,7 +2571,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               }
             }
           }
-          // Star-hub child value branches (#11): scale by W_other = W_total / cw[ci].
+          // Star-hub child value branches (#11): scale by W_other = W_total /
+          // cw[ci].
           for (size_t ci = 0; ci < n_rc; ++ci) {
             const SubtreeSummary& ch_sum =
                 summaries[root_children[ci].child_ar];
@@ -2497,8 +2598,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     total_comparisons += wl.comparisons;
   }
 
-  // Build representative rows of `full_active_schema` populating root_group_cols
-  // AND any eq-class partner columns (so SELECT/HAVING can read either `f.id` or `m.forum`).
+  // Build representative rows of `full_active_schema` populating
+  // root_group_cols AND any eq-class partner columns (so SELECT/HAVING can read
+  // either `f.id` or `m.forum`).
   std::vector<Row> final_rep_rows;
   std::vector<std::vector<AggSlotState>> final_group_aggs;
   const auto populate_group_rep_row = [&](Row* rep,
@@ -2572,6 +2674,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       context, full_active_schema, final_rep_rows, final_group_aggs, agg_kinds,
       empty_rep, *fusion, n_active - 1, total_comparisons, keep_rels);
   if (!result_or.HasValue()) {
+    if (!IsEagerFallbackStatus(result_or.GetStatus())) {
+      return result_or.GetStatus();
+    }
     return std::optional<Relation>{};
   }
   fusion->fired = true;
@@ -2579,8 +2684,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
 }
 
 StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
-    TransactionContext& context, const SelectStatement& statement,
-    const std::vector<Relation>& relations,
+    TransactionContext& context, const std::vector<Relation>& relations,
     const std::vector<uint8_t>& absorbed,
     const std::vector<PredicateInfo>& predicates, const Scope* outer,
     const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
@@ -2588,12 +2692,10 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
       std::getenv("TINYLAMB_DISABLE_SMALL_DIM_DENSE_LOOKUP") != nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || fusion->rollup_count_distribution ||
-      fusion->output_sink != nullptr || fusion->anti_unmatched_only ||
-      fusion->aggregates.empty() ||
+      fusion->anti_unmatched_only || fusion->aggregates.empty() ||
       fusion->aggregates.size() > kMaxCollapsedAggs) {
     return std::optional<Relation>{};
   }
-  (void)statement;
   std::vector<size_t> active_rels;
   std::vector<int> rel_to_active(relations.size(), -1);
   for (size_t i = 0; i < relations.size(); ++i) {
@@ -2638,7 +2740,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   for (size_t ar = 0; ar < n_active; ++ar) {
     if (ar != fact_ar) {
       ar_to_dim_idx[ar] = dims.size();
-      dims.push_back(DimLink{.dim_ar = ar});
+      DimLink dlk;
+      dlk.dim_ar = ar;
+      dims.push_back(std::move(dlk));
     }
   }
   std::vector<bool> dim_has_edge(dims.size(), false);
@@ -2674,10 +2778,12 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     const auto dl = LocalColumnOffset(relations[d_rel_idx].schema, lhs);
     const auto dr = LocalColumnOffset(relations[d_rel_idx].schema, rhs);
     std::optional<slot_t> fc, dc;
-    if (fl.has_value() && dr.has_value() && !fr.has_value() && !dl.has_value()) {
+    if (fl.has_value() && dr.has_value() && !fr.has_value() &&
+        !dl.has_value()) {
       fc = static_cast<slot_t>(*fl);
       dc = static_cast<slot_t>(*dr);
-    } else if (fr.has_value() && dl.has_value() && !fl.has_value() && !dr.has_value()) {
+    } else if (fr.has_value() && dl.has_value() && !fl.has_value() &&
+               !dr.has_value()) {
       fc = static_cast<slot_t>(*fr);
       dc = static_cast<slot_t>(*dl);
     } else {
@@ -2712,19 +2818,26 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     int64_t bmin = std::numeric_limits<int64_t>::max();
     int64_t bmax = std::numeric_limits<int64_t>::min();
     bool bad = false;
-    ForEachRelationEntry(
-        drel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
-          Row row_copy = (r != nullptr) ? *r : chunk->ExtractRow(ri);
-          EnsureOwnedStringValues(&row_copy);
-          int64_t kv = 0;
-          if (ReadIntKeyCell(row_copy[dlk.dim_pk_col], dlk.key_type, &kv,
-                             &bad)) {
-            bmin = std::min(bmin, kv);
-            bmax = std::max(bmax, kv);
-          }
-          dlk.dim_rows.push_back(std::move(row_copy));
-          return !bad;
-        });
+    ForEachRelationEntry(drel, [&](const ColumnarChunk* chunk, const Row* r,
+                                   size_t ri) {
+      Row row_copy;
+      if (r != nullptr) {
+        row_copy = *r;
+      } else {
+        row_copy.values_.resize(chunk->columns.size());
+        for (size_t c = 0; c < chunk->columns.size(); ++c) {
+          chunk->columns[c].WriteValueInto(ri, &row_copy.values_[c]);
+        }
+      }
+      EnsureOwnedStringValues(&row_copy);
+      int64_t kv = 0;
+      if (ReadIntKeyCell(row_copy[dlk.dim_pk_col], dlk.key_type, &kv, &bad)) {
+        bmin = std::min(bmin, kv);
+        bmax = std::max(bmax, kv);
+      }
+      dlk.dim_rows.push_back(std::move(row_copy));
+      return !bad;
+    });
     if (bad || bmin > bmax) {
       return std::optional<Relation>{};
     }
@@ -2741,9 +2854,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
                           &bad)) {
         continue;
       }
-      const size_t off =
-          static_cast<size_t>(static_cast<uint64_t>(kv) -
-                              static_cast<uint64_t>(dlk.min_pk));
+      const size_t off = static_cast<size_t>(static_cast<uint64_t>(kv) -
+                                             static_cast<uint64_t>(dlk.min_pk));
       if (dlk.dense_row_idx[off] != kAbsentSlot) {
         return std::optional<Relation>{};  // NOT strictly unique -> bail!
       }
@@ -2763,9 +2875,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     if (!off.has_value()) return std::nullopt;
     for (size_t ar = n_active; ar-- > 0;) {
       if (static_cast<size_t>(*off) >= ar_schema_offset[ar]) {
-        return std::make_pair(
-            ar, static_cast<slot_t>(static_cast<size_t>(*off) -
-                                    ar_schema_offset[ar]));
+        return std::make_pair(ar,
+                              static_cast<slot_t>(static_cast<size_t>(*off) -
+                                                  ar_schema_offset[ar]));
       }
     }
     return std::nullopt;
@@ -2781,8 +2893,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
         fusion->group_keys[k]->Type() != TypeTag::kColumnValue) {
       return std::optional<Relation>{};
     }
-    auto res =
-        resolve_to_ar_col(fusion->group_keys[k]->AsColumnValue().GetColumnName());
+    auto res = resolve_to_ar_col(
+        fusion->group_keys[k]->AsColumnValue().GetColumnName());
     if (!res.has_value()) return std::optional<Relation>{};
     gk_sources[k] = {res->first, res->second};
   }
@@ -2790,7 +2902,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   std::vector<SimpleAggKind> agg_kinds(fusion->aggregates.size());
   std::vector<ColSource> agg_sources(fusion->aggregates.size());
   for (size_t ai = 0; ai < fusion->aggregates.size(); ++ai) {
-    auto kind = ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
+    auto kind =
+        ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
     if (!kind.has_value()) return std::optional<Relation>{};
     agg_kinds[ai] = *kind;
     if (!fusion->count_star[ai]) {
@@ -2828,6 +2941,41 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   const size_t n_gkeys = gk_sources.size();
   const size_t n_dims = dims.size();
 
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave8Job.lean (FixedGender_sound)
+  // When the sole GROUP BY key comes from a dimension whose surviving rows all
+  // share one non-NULL, non-collated constant value (e.g. WHERE n.gender='F'
+  // ... GROUP BY n.gender), discharge GROUP BY to a 1-group scalar fold.
+  std::optional<Value> const_group_key;
+  if (n_gkeys == 1 && gk_sources[0].ar != fact_ar) {
+    const size_t di = ar_to_dim_idx[gk_sources[0].ar];
+    const auto& drows = dims[di].dim_rows;
+    if (!drows.empty()) {
+      const Value& first = drows[0][gk_sources[0].col];
+      if (!first.IsNull() && !first.IsCaseInsensitive() &&
+          !first.IsInterval()) {
+        bool all_same = true;
+        for (size_t ri = 1; ri < drows.size(); ++ri) {
+          const Value& v = drows[ri][gk_sources[0].col];
+          if (v.IsNull() || v.IsCaseInsensitive() || v.IsInterval() ||
+              !(v == first)) {
+            all_same = false;
+            break;
+          }
+        }
+        if (all_same) {
+          Value owned = first;
+          if (owned.type == ValueType::kVarChar && owned.owned_data.empty() &&
+              !owned.value.varchar_value.empty()) {
+            owned.owned_data.assign(owned.value.varchar_value);
+            owned.value.varchar_value = owned.owned_data;
+          }
+          const_group_key = std::move(owned);
+        }
+      }
+    }
+  }
+
   struct WorkerLocal {
     bool has_scalar{false};
     std::vector<AggSlotState> scalar_aggs;
@@ -2839,7 +2987,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   };
   std::vector<WorkerLocal> locals(workers);
   for (auto& wl : locals) {
-    if (n_gkeys == 0) wl.scalar_aggs.resize(n_aggs);
+    if (n_gkeys == 0 || const_group_key.has_value()) {
+      wl.scalar_aggs.resize(n_aggs);
+    }
   }
 
   RETURN_IF_FAIL(ParallelForEachRelationEntryRange(
@@ -2855,9 +3005,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
                                      dims[di].key_type, &fk, &wl.invalid)) {
               return !wl.invalid;
             }
-            const uint64_t off =
-                static_cast<uint64_t>(fk) -
-                static_cast<uint64_t>(dims[di].min_pk);
+            const uint64_t off = static_cast<uint64_t>(fk) -
+                                 static_cast<uint64_t>(dims[di].min_pk);
             if (off >= dims[di].dense_row_idx.size()) return true;
             const uint32_t ridx = dims[di].dense_row_idx[off];
             if (ridx == kAbsentSlot) return true;
@@ -2875,7 +3024,7 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
           };
 
           std::vector<AggSlotState>* dst = nullptr;
-          if (n_gkeys == 0) {
+          if (n_gkeys == 0 || const_group_key.has_value()) {
             wl.has_scalar = true;
             dst = &wl.scalar_aggs;
           } else {
@@ -2916,8 +3065,7 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
               }
             } else {
               read_cell_into(agg_sources[ai], &agg_tmp);
-              if (!AddValueWithWeight(&(*dst)[ai], agg_kinds[ai], agg_tmp,
-                                      1)) {
+              if (!AddValueWithWeight(&(*dst)[ai], agg_kinds[ai], agg_tmp, 1)) {
                 wl.invalid = true;
                 return false;
               }
@@ -2935,7 +3083,7 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
 
   std::vector<Row> final_rep_rows;
   std::vector<std::vector<AggSlotState>> final_group_aggs;
-  if (n_gkeys == 0) {
+  if (n_gkeys == 0 || const_group_key.has_value()) {
     bool any = false;
     std::vector<AggSlotState> merged(n_aggs);
     for (const auto& wl : locals) {
@@ -2948,8 +3096,13 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
       }
     }
     if (any) {
-      final_rep_rows.emplace_back(
-          std::vector<Value>(full_active_schema.ColumnCount()));
+      Row rep(std::vector<Value>(full_active_schema.ColumnCount()));
+      if (const_group_key.has_value()) {
+        rep.values_[ar_schema_offset[gk_sources[0].ar] + gk_sources[0].col] =
+            *const_group_key;
+        EnsureOwnedStringValues(&rep);
+      }
+      final_rep_rows.push_back(std::move(rep));
       final_group_aggs.push_back(std::move(merged));
     }
   } else {
@@ -2994,6 +3147,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
       context, full_active_schema, final_rep_rows, final_group_aggs, agg_kinds,
       empty_rep, *fusion, n_dims, total_comparisons, keep_rels);
   if (!result_or.HasValue()) {
+    if (!IsEagerFallbackStatus(result_or.GetStatus())) {
+      return result_or.GetStatus();
+    }
     return std::optional<Relation>{};
   }
   fusion->fired = true;

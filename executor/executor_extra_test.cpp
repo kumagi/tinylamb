@@ -172,7 +172,7 @@ TEST(MinMaxIndexExecutorTest,
   // NULL run crossing a batch boundary must keep the scan going instead of
   // stopping at the first all-NULL batch.
   std::vector<Row> rows;
-  rows.reserve(2 * kDefaultVectorSize + 5);
+  rows.reserve((2 * kDefaultVectorSize) + 5);
 for (size_t i = 0; i < (2 * kDefaultVectorSize) + 5;
        ++i) {  // NOLINT(readability-math-missing-parentheses)
     rows.emplace_back(std::vector<Value>{

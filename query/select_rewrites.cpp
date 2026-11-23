@@ -4034,7 +4034,7 @@ struct RuntimeUniqueColCacheKey {
 
 struct RuntimeUniqueColCacheKeyHash {
   size_t operator()(const RuntimeUniqueColCacheKey& k) const noexcept {
-    uint64_t h =
+    auto h =
         reinterpret_cast<uintptr_t>(k.table_ptr);  // NOLINT(modernize-use-auto)
     h ^= k.layout_gen * 0x9e3779b97f4a7c15ULL;
     h ^= (static_cast<uint64_t>(k.first_pid) << 16U) |
@@ -9454,10 +9454,12 @@ bool VisitSetOpLeavesAndSync(  // NOLINT(misc-no-recursion)
       auto bindings = tree->first->WithQueries();
       bool separate_scopes = false;
       for (const SelectStatement* leaf : other_leaves) {
-        if (leaf == nullptr) continue;
+        if (leaf == nullptr) { continue;
+}
         for (const auto& [name, body] : leaf->WithQueries()) {
           auto [at, inserted] = bindings.emplace(name, body);
-          if (!inserted && at->second != body) separate_scopes = true;
+          if (!inserted && at->second != body) { separate_scopes = true;
+}
         }
       }
       if (separate_scopes) {
@@ -11979,10 +11981,10 @@ bool DeferOneUniqueDimJoinPastGroupBy(SelectStatement* stmt,
           return false;
         }
         if (agg.Child() &&
-            !(agg.Child()->Type() ==
+            (agg.Child()->Type() !=
                   TypeTag::
-                      kColumnValue &&  // NOLINT(readability-simplify-boolean-expr)
-              agg.Child()->AsColumnValue().GetColumnName().name == "*")) {
+                      kColumnValue ||  // NOLINT(readability-simplify-boolean-expr)
+              agg.Child()->AsColumnValue().GetColumnName().name != "*")) {
           std::unordered_set<size_t> cs;
           if (!expr_sources(agg.Child(), &cs) || cs.contains(dim_si)) {
             return false;
@@ -12916,9 +12918,8 @@ bool DistributeDistinctUnionDimJoinsOneSelect(
     }
     u_col_names.push_back(std::move(nm));
   }
-  for (size_t b = 0; b < u_branches.size();
-       ++b) {  // NOLINT(modernize-loop-convert)
-    const SelectStatement& br = *u_branches[b];
+  for (auto & u_branche : u_branches) {  // NOLINT(modernize-loop-convert)
+    const SelectStatement& br = *u_branche;
     if (br.SelectList().size() != arity || SelectListHasStarOrModifiers(br) ||
         !br.GroupBy().empty() || br.IsGroupAll() || br.Having() ||
         br.Distinct() || br.HasLimit() || br.Offset() != 0 ||
@@ -12938,7 +12939,8 @@ bool DistributeDistinctUnionDimJoinsOneSelect(
   for (size_t si = 0; si < stmt->Sources().size(); ++si) {
     if (si == *u_idx) {
       std::vector<Column> cols;
-      for (const std::string& nm : u_col_names) {
+      cols.reserve(u_col_names.size());
+for (const std::string& nm : u_col_names) {
         cols.emplace_back(
             nm, ValueType::
                     kNull);  // NOLINT(performance-inefficient-vector-operation)

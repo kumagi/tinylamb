@@ -951,8 +951,9 @@ bool TryParallelTableScan(
       morsel_filter_batch_ok = false;
     }
     for (const SimpleComparePredicate& pred : scan_filter->simple) {
-      if (!morsel_filter_batch_ok) { break;
-}
+      if (!morsel_filter_batch_ok) {
+        break;
+      }
       if (pred.column_payload || pred.column >= result_schema.ColumnCount() ||
           !is_batch_cmp_op(pred.op)) {
         morsel_filter_batch_ok = false;
@@ -971,8 +972,9 @@ bool TryParallelTableScan(
     }
     for (const PrebuiltMembershipPredicate& pm :
          scan_filter->prebuilt_membership) {
-      if (!morsel_filter_batch_ok) { break;
-}
+      if (!morsel_filter_batch_ok) {
+        break;
+      }
       if (pm.negated || pm.column >= result_schema.ColumnCount() ||
           (pm.runtime_filter == nullptr && pm.values == nullptr)) {
         morsel_filter_batch_ok = false;
@@ -1356,12 +1358,15 @@ bool TryParallelTableScan(
   };
   std::vector<LSTableDictColFilter> lstable_dict_filters;
   std::vector<LSTableWideDictFilter> lstable_wide_filters;
-  lstable_wide_filters.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
+  lstable_wide_filters.reserve(
+      (scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<DisjBranchFilter> lstable_disj_branches;
   std::vector<LSTableDoubleZonePredicate> lstable_double_zones;
-  lstable_double_zones.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
+  lstable_double_zones.reserve(
+      (scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<LSTableIntColCompare> lstable_col_compares;
-  lstable_col_compares.reserve((scan_filter != nullptr) ? scan_filter->simple.size() : 0);
+  lstable_col_compares.reserve(
+      (scan_filter != nullptr) ? scan_filter->simple.size() : 0);
   std::vector<LSTableExtraRf> lstable_extra_rfs;
   std::vector<uint8_t> simple_covered_by_dict;
   std::vector<uint8_t> prefix_covered_by_dict;
@@ -1657,10 +1662,12 @@ bool TryParallelTableScan(
         }
       }
       if (!scan_filter->disjunctive_branches.empty()) {
-        // Lean proof: lean/TinylambOpt/ResearchProofs/NullOrLikeDictBitmapPrefilter.lean (sound)
-        // Strictly recognizes pure `(col IS NULL)` branches (never `AND` or
-        // `NOT (col = x)`) so `(col IS NULL OR col LIKE pat)` evaluates in a
-        // single dictionary bitmap pass without falling back to row bytecode.
+        // Lean proof:
+        // lean/TinylambOpt/ResearchProofs/NullOrLikeDictBitmapPrefilter.lean
+        // (sound) Strictly recognizes pure `(col IS NULL)` branches (never
+        // `AND` or `NOT (col = x)`) so `(col IS NULL OR col LIKE pat)`
+        // evaluates in a single dictionary bitmap pass without falling back to
+        // row bytecode.
         const auto extract_pure_is_null_col =
             [&](const CompiledScanFilter::DisjunctiveBranch& br,
                 slot_t* out_full_col) -> bool {
@@ -2384,8 +2391,9 @@ bool TryParallelTableScan(
          scan_filter->simple.size() == integer_peeks.size());
     const bool tlcs_rf_ok = runtime_filter == nullptr ||
                             (full_key_column.has_value() &&
-                   auto  (runtime_filter_type == ValueType::kInt64 ||
-                              runtime_filter_type == ValueType::kDate));autol tlcs_schema_ok = result_schema.ColumnCount() > 0;
+                             (runtime_filter_type == ValueType::kInt64 ||
+                              runtime_filter_type == ValueType::kDate));
+    bool tlcs_schema_ok = result_schema.ColumnCount() > 0;
     for (slot_t k = 0; k < result_schema.ColumnCount() && tlcs_schema_ok; ++k) {
       const Column& col = result_schema.GetColumn(k);
       const ValueType vt = col.Type();
@@ -2440,9 +2448,8 @@ bool TryParallelTableScan(
               stage2_cols.push_back(fc);
             } else {
               out_stage_idx[k] =
-                  static_cast<size_t>(std::distance(stage2_cols.begin(), it {2));
-          
-}  }
+                  static_cast<size_t>(std::distance(stage2_cols.begin(), it2));
+            }
           }
         }
         const uint32_t total_blocks = clean_tlcs->BlockCount();
@@ -2455,8 +2462,7 @@ bool TryParallelTableScan(
         std::mutex tlcs_err_mu;
         Status tlcs_err{Status::kSuccess};
 
-  {       const bo
-}ol rf_has_dense =
+        const bool rf_has_dense =
             runtime_filter != nullptr && runtime_filter->has_dense_bits();
         const int64_t rf_lo = rf_has_dense ? runtime_filter->Lo() : 0;
         const uint64_t rf_span =
@@ -2467,10 +2473,9 @@ bool TryParallelTableScan(
             rf_has_dense ? runtime_filter->dense_bits_data() : nullptr;
 
         auto tlcs_worker = [&](size_t w) {
-          const uint32_t b_begin = static_cast<uint32_t>(
-              (static_cast<uint64_t>(total_bl {ocks) * w) / two
-}rkers);
-          const uint32_t b_end = static_cast<uint32_t>(
+          const auto b_begin = static_cast<uint32_t>(
+              (static_cast<uint64_t>(total_blocks) * w) / tworkers);
+          const auto b_end = static_cast<uint32_t>(
               (static_cast<uint64_t>(total_blocks) * (w + 1)) / tworkers);
           if (b_begin >= b_end) {
             return;
@@ -2514,7 +2519,7 @@ bool TryParallelTableScan(
                 break;
               }
             }
-            if (!eautom_ok) {
+            if (!extra_zm_ok) {
               continue;
             }
             const bool all_match_peek =
@@ -2532,7 +2537,9 @@ bool TryParallelTableScan(
                     &io_scratch);
                 if (!st.ok()) {
                   std::scoped_lock lk(tlcs_err_mu);
-                  if (tlcs_err.ok()) tlcs_err = st;
+                  if (tlcs_err.ok()) {
+                    tlcs_err = st;
+                  }
                   abort_tlcs.store(true, std::memory_order_relaxed);
                   return;
                 }
@@ -2544,7 +2551,9 @@ bool TryParallelTableScan(
                     &io_scratch);
                 if (!st.ok()) {
                   std::scoped_lock lk(tlcs_err_mu);
-                  if (tlcs_err.ok()) tlcs_err = st;
+                  if (tlcs_err.ok()) {
+                    tlcs_err = st;
+                  }
                   abort_tlcs.store(true, std::memory_order_relaxed);
                   return;
                 }
@@ -2558,10 +2567,12 @@ bool TryParallelTableScan(
             } else {
               // Stage 1: decode filter columns only.
               const Status st1 = clean_tlcs->DecodeBlockColumns(
-                  b, stage1_cols, table.GetSchauto &blk1, true, &io_scratch);
+                  b, stage1_cols, table.GetSchema(), &blk1, true, &io_scratch);
               if (!st1.ok()) {
                 std::scoped_lock lk(tlcs_err_mu);
-                if (tlcs_err.ok()) tlcs_err = st1;
+                if (tlcs_err.ok()) {
+                  tlcs_err = st1;
+                }
                 abort_tlcs.store(true, std::memory_order_relaxed);
                 return;
               }
@@ -2606,7 +2617,7 @@ bool TryParallelTableScan(
                 continue;
               }
               for (const auto& [ef_col, ef_rf] : tlcs_extra_rfs) {
-                const size_t s1_idx = static_cast<size_t>(
+                const auto s1_idx = static_cast<size_t>(
                     std::distance(stage1_cols.begin(),
                                   std::ranges::find(stage1_cols, ef_col)));
                 const auto& ecol = blk1.columns[s1_idx];
@@ -2648,7 +2659,7 @@ bool TryParallelTableScan(
               }
               if (!all_match_peek) {
                 for (const IntegerPeekCompare& pk : integer_peeks) {
-                  const size_t s1_idx = static_cast<size_t>(
+                  const auto s1_idx = static_cast<size_t>(
                       std::distance(stage1_cols.begin(),
                                     std::ranges::find(stage1_cols, pk.column)));
                   const auto& pcol = blk1.columns[s1_idx];
@@ -2671,8 +2682,9 @@ bool TryParallelTableScan(
                           out_n += static_cast<size_t>(pcells[r] != rhs);
                         }
                         break;
-     {                
-}  case BinaryOperation::kLessThan:
+                        {
+                        }
+                      case BinaryOperation::kLessThan:
                         for (size_t i = 0; i < sel_n; ++i) {
                           const uint32_t r = sel[i];
                           sel[out_n] = r;
@@ -2759,7 +2771,9 @@ bool TryParallelTableScan(
                       &io_scratch);
                   if (!st2.ok()) {
                     std::scoped_lock lk(tlcs_err_mu);
-                    if (tlcs_err.ok()) tlcs_err = st2;
+                    if (tlcs_err.ok()) {
+                      tlcs_err = st2;
+                    }
                     abort_tlcs.store(true, std::memory_order_relaxed);
                     return;
                   }
@@ -5112,7 +5126,7 @@ bool TryParallelTableScan(
                 const size_t base = i * ncols;
                 bool ok = true;
                 for (const SimpleComparePredicate& pred : scan_filter->simple) {
-                  const size_t idx = base (+ pred.co)lumn;
+                  const size_t idx = base + pred.column;
                   if (np[idx] != 0) {
                     ok = false;
                     break;
@@ -5170,7 +5184,7 @@ bool TryParallelTableScan(
                 ColumnarColumn& dst = cur_chunk.columns[c];
                 const ValueType vt = btypes[c];
                 if ((vt == ValueType::kInt64 || vt == ValueType::kDate) &&
-                    dst.encoding == (ColumnarC)olumn::Encoding::kFlat &&
+                    dst.encoding == ColumnarColumn::Encoding::kFlat &&
                     dst.is_uniform && dst.type == vt &&
                     dst.is_unsigned == bunsigned[c]) {
                   dst.ints.resize(dst_base + take);
@@ -5181,8 +5195,8 @@ bool TryParallelTableScan(
                     out_p[k] = cp[idx];
                     any_null |= (np[idx] != 0);
                   }
-                  if (any_(null) {
- )                   if (!dst.has_null) {
+                  if (any_null) {
+                    if (!dst.has_null) {
                       dst.nulls.assign(dst_base, 0);
                       dst.has_null = true;
                     }
@@ -5202,7 +5216,7 @@ bool TryParallelTableScan(
                 } else if (vt == ValueType::kInt64 || vt == ValueType::kDate) {
                   for (size_t k = 0; k < take; ++k) {
                     const size_t r = sel[pos + k];
-                    const size_t idx = r * ncols + c;
+                    const size_t idx = (r * ncols) + c;
                     if (np[idx] != 0) {
                       cell = Value();
                     } else if (vt == ValueType::kDate) {
@@ -5248,7 +5262,7 @@ bool TryParallelTableScan(
                 } else if (vt == ValueType::kDouble) {
                   for (size_t k = 0; k < take; ++k) {
                     const size_t r = sel[pos + k];
-                    const size_t idx = r * ncols + c;
+                    const size_t idx = (r * ncols) + c;
                     if (np[idx] != 0) {
                       cell = Value();
                     } else {
@@ -5261,7 +5275,7 @@ bool TryParallelTableScan(
                   const size_t vo = vc_ord[c];
                   for (size_t k = 0; k < take; ++k) {
                     const size_t r = sel[pos + k];
-                    const size_t idx = r * ncols + c;
+                    const size_t idx = (r * ncols) + c;
                     if (np[idx] != 0) {
                       cell = Value();
                     } else {

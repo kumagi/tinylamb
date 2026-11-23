@@ -29,10 +29,13 @@
 #include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail {
+
+ValueType ValueTypeFromTypeTag(TypeTag tag);
 
 struct AggregateAccumulator;
 

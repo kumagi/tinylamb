@@ -455,7 +455,8 @@ class GroupAggLeafSource final
     const size_t gcnt = group_keys_.size();
     const bool single_cd = !partial_mode_ && UseSingleCountDistinctSort();
     const size_t key_start = partial_mode_ ? 0 : skew_raw_width_;
-    const size_t suffix_count = partial_mode_ ? aggregates_.size() : single_cd;
+    const size_t suffix_count =
+        partial_mode_ ? aggregates_.size() : static_cast<size_t>(single_cd);
     Row sorted_row;
     while (out->Size() < max_rows) {
       ASSIGN_OR_RETURN(bool, has, skew_sorter_->NextRow(&sorted_row));
@@ -679,9 +680,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
       // T4853: schema offsets also feed slot_t; keep a too-wide schema
       // column out of the fast-path slot list rather than wrapping it.
       if (offset >= 0 &&
-          static_cast<uint64_t>(offset) <=
+          std::cmp_less_equal(offset,
               std::numeric_limits<slot_t>::
-                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+                  max())) {  // NOLINT(modernize-use-integer-sign-comparison)
         group_key_slots_[i] = static_cast<slot_t>(offset);
       }
     }
@@ -731,9 +732,9 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
           strip_agg->Child()->AsColumnValue().GetColumnName());
       // T4853: same uint16 bound as the group-key slots above.
       if (off >= 0 &&
-          static_cast<uint64_t>(off) <=
+          std::cmp_less_equal(off,
               std::numeric_limits<slot_t>::
-                  max()) {  // NOLINT(modernize-use-integer-sign-comparison)
+                  max())) {  // NOLINT(modernize-use-integer-sign-comparison)
         single_distinct_child_slot_ = static_cast<slot_t>(off);
       }
     }

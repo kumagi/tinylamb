@@ -32,6 +32,9 @@ enum class ValueType : uint8_t {
   kArray,
 };
 
+// Title-case display labels, pinned by value_test.cpp. Deliberately different
+// from Type::ToString's uppercase SQL spellings (type/type.cpp) — these are
+// UI/diagnostic names, not SQL type names.
 inline std::string_view ValueTypeToString(ValueType type) {
   switch (type) {
     case ValueType::kNull:

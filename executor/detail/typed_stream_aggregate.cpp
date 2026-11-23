@@ -602,7 +602,9 @@ struct CompiledLSTableBlockFilter {
         Scratch::ActiveBranchSlice slice{
             // NOLINT(modernize-use-designated-initializers)
             // NOLINT(modernize-use-designated-initializers)
-            .pred_begin=p_begin, .pred_end=p_end};  // NOLINT(modernize-use-designated-initializers)
+            .pred_begin = p_begin,
+            .pred_end =
+                p_end};  // NOLINT(modernize-use-designated-initializers)
         // BETWEEN branches otherwise dispatch two generic comparisons and
         // load the same cell/null flag twice for each surviving row.
         if (p_end == p_begin + 2) {
@@ -3472,44 +3474,95 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
     size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
     const std::string& fold_cache_key,
     std::chrono::steady_clock::time_point scan_begin) {
+  const size_t nkeys = plan.key_offsets.size();
   if (stream_runtime_filter != nullptr ||
       stream_prebuilt_membership != nullptr ||
       (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
       stmt.GroupBy().empty() || stmt.IsGroupAll() ||
-      plan.key_offsets.size() != 1 || stmt.HasLimit() || stmt.Distinct() ||
-      stmt.WithTies() || !plan.order_items.empty() ||
-      !plan.dependent_key_programs.empty() || !plan.inlist_compares.empty() ||
-      !plan.slim || plan.aggregates.empty() || plan.aggregates.size() > 4) {
+      (nkeys != 1 && nkeys != 2) ||
+      (nkeys == 2 &&
+       (std::getenv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
+        having_expr != nullptr)) ||
+      stmt.HasLimit() || stmt.Distinct() || stmt.WithTies() ||
+      !plan.order_items.empty() || !plan.dependent_key_programs.empty() ||
+      !plan.inlist_compares.empty() || !plan.slim || plan.aggregates.empty() ||
+      plan.aggregates.size() > 4) {
     return std::optional<Relation>{};
   }
-  const slot_t key_proj = plan.key_offsets[0];
-  const ValueType key_type = proj_types[key_proj];
-  if ((key_type != ValueType::kInt64 && key_type != ValueType::kDate) ||
-      proj_unsigned[key_proj] != 0) {
+  const slot_t key_proj0 = plan.key_offsets[0];
+  const ValueType key_type0 = proj_types[key_proj0];
+  if ((key_type0 != ValueType::kInt64 && key_type0 != ValueType::kDate) ||
+      proj_unsigned[key_proj0] != 0) {
     return std::optional<Relation>{};
   }
-  const slot_t key_full = proj_to_full[key_proj];
-  if (key_full >= store.column_has_null.size() ||
-      key_full >= store.column_min_int.size() ||
-      (key_full < store.column_is_monotonic.size() &&
-       store.column_is_monotonic[key_full] != 0 && store.total_rows >= 65536)) {
+  const slot_t key_full0 = proj_to_full[key_proj0];
+  if (key_full0 >= store.column_has_null.size() ||
+      key_full0 >= store.column_min_int.size() ||
+      (nkeys == 1 && key_full0 < store.column_is_monotonic.size() &&
+       store.column_is_monotonic[key_full0] != 0 &&
+       store.total_rows >= 65536)) {
     return std::optional<Relation>{};
   }
-  const bool key_nullable = store.column_has_null[key_full] != 0;
-  const int64_t key_min = store.column_min_int[key_full];
-  const int64_t key_max = store.column_max_int[key_full];
-  size_t span = 0;
-  if (key_min <= key_max) {
-    const uint64_t raw_span =
-        static_cast<uint64_t>(key_max) - static_cast<uint64_t>(key_min) + 1ULL;
-    if (raw_span == 0 || raw_span > 262144ULL) {
+  const bool key_nullable0 = store.column_has_null[key_full0] != 0;
+  const int64_t key_min0 = store.column_min_int[key_full0];
+  const int64_t key_max0 = store.column_max_int[key_full0];
+  size_t span0 = 0;
+  if (key_min0 <= key_max0) {
+    const uint64_t diff0 =
+        static_cast<uint64_t>(key_max0) - static_cast<uint64_t>(key_min0);
+    if (diff0 >= 262144ULL) {
       return std::optional<Relation>{};
     }
-    span = static_cast<size_t>(raw_span);
-  } else if (!key_nullable) {
+    span0 = static_cast<size_t>(diff0 + 1ULL);
+  } else if (!key_nullable0) {
     return std::optional<Relation>{};
   }
-  const size_t total_slots = span + (key_nullable ? 1 : 0);
+  const size_t s0 = span0 + (key_nullable0 ? 1 : 0);
+
+  slot_t key_proj1 = 0;
+  ValueType key_type1 = ValueType::kNull;
+  slot_t key_full1 = 0;
+  bool key_nullable1 = false;
+  int64_t key_min1 = 0;
+  int64_t key_max1 = 0;
+  size_t span1 = 0;
+  size_t s1 = 1;
+  if (nkeys == 2) {
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
+    // (sound)
+    key_proj1 = plan.key_offsets[1];
+    key_type1 = proj_types[key_proj1];
+    if ((key_type1 != ValueType::kInt64 && key_type1 != ValueType::kDate) ||
+        proj_unsigned[key_proj1] != 0) {
+      return std::optional<Relation>{};
+    }
+    key_full1 = proj_to_full[key_proj1];
+    if (key_full1 >= store.column_has_null.size() ||
+        key_full1 >= store.column_min_int.size()) {
+      return std::optional<Relation>{};
+    }
+    key_nullable1 = store.column_has_null[key_full1] != 0;
+    key_min1 = store.column_min_int[key_full1];
+    key_max1 = store.column_max_int[key_full1];
+    if (key_min1 <= key_max1) {
+      const uint64_t diff1 =
+          static_cast<uint64_t>(key_max1) - static_cast<uint64_t>(key_min1);
+      if (diff1 >= 262144ULL) {
+        return std::optional<Relation>{};
+      }
+      span1 = static_cast<size_t>(diff1 + 1ULL);
+    } else if (!key_nullable1) {
+      return std::optional<Relation>{};
+    }
+    s1 = span1 + (key_nullable1 ? 1 : 0);
+    if (s0 == 0 || s1 == 0 || s1 > 262144 / s0) {
+      return std::optional<Relation>{};
+    }
+  } else if (s0 == 0) {
+    return std::optional<Relation>{};
+  }
+  const size_t total_slots = (nkeys == 2) ? (s0 * s1) : s0;
 
   for (const SlimAggKind k : plan.slim_kinds) {
     if (IsSlimDistinctKind(k)) {
@@ -3517,7 +3570,8 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
     }
   }
   for (const TypedEmitItem& item : plan.emit_items) {
-    if (item.post_agg != nullptr || item.dependent_key) {
+    if (item.post_agg != nullptr || item.dependent_key ||
+        (item.is_key && item.index >= nkeys)) {
       return std::optional<Relation>{};
     }
   }
@@ -3538,15 +3592,18 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
                                 proj_unsigned, &bindings, &always_bind_cols)) {
     return std::optional<Relation>{};
   }
-  always_bind_cols[key_full] = 1;
+  always_bind_cols[key_full0] = 1;
+  if (nkeys == 2) {
+    always_bind_cols[key_full1] = 1;
+  }
 
   // Defer to existing fast_dict_double_agg when no nullable columns, no
   // null_filters, no disjunctions, no min/max, no non-constant/double compares,
   // and at most 1 aggregate exist.
   bool needs_this_path =
-      key_nullable || !plan.filter_programs.empty() ||
+      nkeys == 2 || key_nullable0 || !plan.filter_programs.empty() ||
       !plan.filter_disjunctions.empty() || bindings.size() > 1 ||
-      (having_expr != nullptr && positional_having.empty()) || span > 65536U ||
+      (having_expr != nullptr && positional_having.empty()) || span0 > 65536U ||
       (store.total_rows >= 65536 && worker_count > 1 &&
        std::ranges::any_of(plan.slim_kinds, [](SlimAggKind k) {
          return k == SlimAggKind::kSumDouble || k == SlimAggKind::kAvgDouble;
@@ -3576,8 +3633,12 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
 
   const size_t nblocks = store.blocks.size();
   const size_t naggs = bindings.size();
-  const size_t workers_used =
+  size_t workers_used =
       std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
+  if (nkeys == 2 && total_slots > 32768) {
+    workers_used = std::max<size_t>(
+        1, std::min<size_t>(workers_used, (4 * 262144) / total_slots));
+  }
   struct alignas(64) BoundedWorkerState {
     std::vector<uint8_t> present;
     std::array<std::vector<int64_t>, 4> counts;
@@ -3635,53 +3696,103 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
       }
       st.EnsureAllocated(total_slots, bindings);
       st.matching_rows += m;
-      const DirectBlockCol& kcol = ws.cols[key_full];
-      const int64_t* keys = kcol.cells;
       const uint32_t* sel_ptr = sel.data();
       uint8_t* __restrict__ pres = st.present.data();
       row_gidx.resize(m);
       uint32_t* __restrict__ gidx = row_gidx.data();
-      if (!kcol.has_null) {
-        if (all_pass) {
-          for (uint32_t r = 0; r < m; ++r) {
-            const auto gi =
-                static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
-                                      static_cast<uint64_t>(key_min));
-            gidx[r] = gi;
-            pres[gi] = 1;
+      if (nkeys == 2) {
+        const DirectBlockCol& kcol0 = ws.cols[key_full0];
+        const DirectBlockCol& kcol1 = ws.cols[key_full1];
+        const int64_t* keys0 = kcol0.cells;
+        const int64_t* keys1 = kcol1.cells;
+        if (!kcol0.has_null && !kcol1.has_null) {
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              const auto gi =
+                  static_cast<uint32_t>((static_cast<uint64_t>(keys0[r]) -
+                                         static_cast<uint64_t>(key_min0)) *
+                                            s1 +
+                                        (static_cast<uint64_t>(keys1[r]) -
+                                         static_cast<uint64_t>(key_min1)));
+              gidx[r] = gi;
+              pres[gi] = 1;
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              const uint32_t r = sel_ptr[idx];
+              const auto gi =
+                  static_cast<uint32_t>((static_cast<uint64_t>(keys0[r]) -
+                                         static_cast<uint64_t>(key_min0)) *
+                                            s1 +
+                                        (static_cast<uint64_t>(keys1[r]) -
+                                         static_cast<uint64_t>(key_min1)));
+              gidx[idx] = gi;
+              pres[gi] = 1;
+            }
           }
         } else {
           for (uint32_t idx = 0; idx < m; ++idx) {
-            const uint32_t r = sel_ptr[idx];
-            const auto gi =
-                static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
-                                      static_cast<uint64_t>(key_min));
+            const uint32_t r = all_pass ? idx : sel_ptr[idx];
+            const size_t i0 =
+                kcol0.IsNull(r)
+                    ? span0
+                    : static_cast<size_t>(static_cast<uint64_t>(keys0[r]) -
+                                          static_cast<uint64_t>(key_min0));
+            const size_t i1 =
+                kcol1.IsNull(r)
+                    ? span1
+                    : static_cast<size_t>(static_cast<uint64_t>(keys1[r]) -
+                                          static_cast<uint64_t>(key_min1));
+            const auto gi = static_cast<uint32_t>(i0 * s1 + i1);
             gidx[idx] = gi;
             pres[gi] = 1;
           }
         }
       } else {
-        const auto null_gi = static_cast<uint32_t>(span);
-        if (all_pass) {
-          for (uint32_t r = 0; r < m; ++r) {
-            const uint32_t gi =
-                kcol.IsNull(r)
-                    ? null_gi
-                    : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
-                                            static_cast<uint64_t>(key_min));
-            gidx[r] = gi;
-            pres[gi] = 1;
+        const DirectBlockCol& kcol = ws.cols[key_full0];
+        const int64_t* keys = kcol.cells;
+        if (!kcol.has_null) {
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              const auto gi =
+                  static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                        static_cast<uint64_t>(key_min0));
+              gidx[r] = gi;
+              pres[gi] = 1;
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              const uint32_t r = sel_ptr[idx];
+              const auto gi =
+                  static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                        static_cast<uint64_t>(key_min0));
+              gidx[idx] = gi;
+              pres[gi] = 1;
+            }
           }
         } else {
-          for (uint32_t idx = 0; idx < m; ++idx) {
-            const uint32_t r = sel_ptr[idx];
-            const uint32_t gi =
-                kcol.IsNull(r)
-                    ? null_gi
-                    : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
-                                            static_cast<uint64_t>(key_min));
-            gidx[idx] = gi;
-            pres[gi] = 1;
+          const auto null_gi = static_cast<uint32_t>(span0);
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              const uint32_t gi =
+                  kcol.IsNull(r)
+                      ? null_gi
+                      : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                              static_cast<uint64_t>(key_min0));
+              gidx[r] = gi;
+              pres[gi] = 1;
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              const uint32_t r = sel_ptr[idx];
+              const uint32_t gi =
+                  kcol.IsNull(r)
+                      ? null_gi
+                      : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                              static_cast<uint64_t>(key_min0));
+              gidx[idx] = gi;
+              pres[gi] = 1;
+            }
           }
         }
       }
@@ -4116,13 +4227,23 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
             return;
           }
         }
+        auto decode_key_slot = [](size_t kidx, bool nullable, size_t kspan,
+                                  int64_t kmin, ValueType ktype) -> Value {
+          if (nullable && kidx == kspan) {
+            return Value();
+          }
+          const int64_t kv = kmin + static_cast<int64_t>(kidx);
+          return ktype == ValueType::kDate ? Value::DateFromDays(kv)
+                                           : Value(kv);
+        };
+        const size_t idx0 = (nkeys == 2) ? (idx / s1) : idx;
+        const size_t idx1 = (nkeys == 2) ? (idx % s1) : 0;
         const Value key_val =
-            (key_nullable && idx == span)
-                ? Value()
-                : (key_type == ValueType::kDate
-                       ? Value::DateFromDays(key_min +
-                                             static_cast<int64_t>(idx))
-                       : Value(key_min + static_cast<int64_t>(idx)));
+            decode_key_slot(idx0, key_nullable0, span0, key_min0, key_type0);
+        const Value key_val1 = (nkeys == 2)
+                                   ? decode_key_slot(idx1, key_nullable1, span1,
+                                                     key_min1, key_type1)
+                                   : Value();
         if (having_expr != nullptr) {
           if (!positional_having.empty()) {
             bool keep_group = true;
@@ -4157,7 +4278,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
                 aggregate_results[plan.aggregates[a].aggregate] = finished[a];
               }
             }
-            representative.values_[key_proj] = key_val;
+            representative.values_[key_proj0] = key_val;
             Scope scope{.row = &representative,
                         .schema = &qualified_schema,
                         .outer = nullptr};
@@ -4179,7 +4300,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
           if (item.constant) {
             row_values.push_back(*item.constant);
           } else if (item.is_key) {
-            row_values.push_back(key_val);
+            row_values.push_back(item.index == 0 ? key_val : key_val1);
           } else {
             row_values.push_back(finished[item.index]);
           }

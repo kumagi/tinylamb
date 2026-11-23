@@ -201,7 +201,8 @@ class LinearPrefixVM {
         run.kind != StepKind::kCharClassPlus || run.excluded_byte < 0 ||
         close.kind != StepKind::kCaptureEnd || close.capture_id != capture ||
         stop.kind != StepKind::kLiteral || stop.literal.size() != 1 ||
-        std::cmp_not_equal(stop.literal.front(), run.excluded_byte)) {
+        std::cmp_not_equal(static_cast<uint8_t>(stop.literal.front()),
+                           run.excluded_byte)) {
       return std::nullopt;
     }
     DelimitedRegexCapture description{
@@ -945,7 +946,7 @@ struct FastRegexParser {
 
   [[nodiscard]] bool Parse(FastRegexAstNode* out) {
     *out = ParseAlt();
-    return !(aborted || pos != pat.size());
+    return !aborted && pos == pat.size();
   }
 
   FastRegexAstNode ParseAlt() {

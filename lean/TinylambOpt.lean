@@ -314,3 +314,25 @@ import TinylambOpt.ResearchProofs.MultiBlockLocalDictTwoStageAggregate
 import TinylambOpt.ResearchProofs.BoundedCountRadixDescSortEquiv
 import TinylambOpt.ResearchProofs.ColumnarToPgWireChunkedFramingEquiv
 import TinylambOpt.ResearchProofs.SqlFetchWithTies
+
+-- 第七波の未証明提出型。各分野の Name.Goal を個別に証明できる。
+import TinylambOpt.ResearchGoals.ExecutionStrategies.BinaryText
+import TinylambOpt.ResearchGoals.ExecutionStrategies.CorrelatedProbes
+import TinylambOpt.ResearchGoals.ExecutionStrategies.DeltaMaintenance
+import TinylambOpt.ResearchGoals.ExecutionStrategies.EncodedBlocks
+import TinylambOpt.ResearchGoals.ExecutionStrategies.FrameIndexes
+import TinylambOpt.ResearchGoals.ExecutionStrategies.IndexPreimages
+import TinylambOpt.ResearchGoals.ExecutionStrategies.OrderedStreams
+import TinylambOpt.ResearchGoals.ExecutionStrategies.PairAggregates
+import TinylambOpt.ResearchGoals.ExecutionStrategies.PlaneKernels
+import TinylambOpt.ResearchGoals.ExecutionStrategies.RecursiveJoins
+import TinylambOpt.ResearchGoals.ExecutionStrategies.SearchBounds
+import TinylambOpt.ResearchGoals.ExecutionStrategies.VersionedIndexes
+
+-- 第八波の未証明提出型。派生分析ベンチマークの実際の SQL に対応する。
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Job
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Ceb
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.H2o
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Ldbc
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.BigBench
+import TinylambOpt.ResearchGoals.AnalyticsWorkloads.PhysicalChoices

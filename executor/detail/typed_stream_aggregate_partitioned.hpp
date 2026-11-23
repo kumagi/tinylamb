@@ -51,6 +51,18 @@ struct PartitionedColumnarAggRequest {
 StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
     const PartitionedColumnarAggRequest& req);
 
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean (sound)
+StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
+    const PartitionedColumnarAggRequest& req,
+    const KeyProjectionMap* precomputed_km = nullptr);
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean
+// (sound)
+StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
+    const PartitionedColumnarAggRequest& req,
+    const KeyProjectionMap* precomputed_km = nullptr);
+
 }  // namespace tinylamb::relational_detail
 
 #endif  // TINYLAMB_EXECUTOR_DETAIL_TYPED_STREAM_AGGREGATE_PARTITIONED_HPP

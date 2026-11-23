@@ -539,6 +539,11 @@ class TlcsFile : public std::enable_shared_from_this<TlcsFile> {
   std::vector<ColumnSynopsis> col_synopses_;
   bool has_col_synopses_{false};
 
+  // The four mutexes below (resident_mu_, dir_cache_mu_, cache_mu_,
+  // varchar_bounds_mu_) plus cache_reclaim_bridge_->mu are independent leaf
+  // locks: each critical section is separate and sequential, never nested.
+  // Multiple lock sites in one function are not an ABBA hazard and need no
+  // combined std::scoped_lock — see table/AGENTS.md.
   mutable std::mutex resident_mu_;
   mutable std::shared_ptr<const platform::MemoryMap> resident_mmap_;
   mutable std::shared_ptr<LSTableStore> resident_store_;

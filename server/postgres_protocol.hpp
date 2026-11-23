@@ -86,7 +86,9 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns);
 std::string DataRow(const Row& row);
 // Appends one PostgreSQL DataRow wire frame straight from columnar storage,
 // byte-for-byte identical to `wire_out->append(DataRow(chunk.RowAt(row_idx)))`.
-// Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
+// (sound)
 Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
                               size_t row_idx);
 std::string CommandComplete(std::string_view tag);

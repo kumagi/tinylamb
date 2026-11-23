@@ -51,6 +51,10 @@ class RelationalEvaluationContext : public EvaluationContext {
   // interpreter: indexed correlated execution when the outer scope allows it,
   // the cached uncorrelated relation otherwise, and a full ExecuteQuery as
   // the fallback.  Projects the first output column in row order.
+  // `outer_row` is part of the EvaluationContext interface but is
+  // deliberately unused here: correlation resolves through `scope_`, which
+  // already carries the outer bindings (ExecuteCorrelatedSingleSource /
+  // ExecuteQuery take the Scope, not a row).
   [[nodiscard]] StatusOr<std::vector<Value>> RunSubquery(
       const SelectStatement& statement, const Row* /*outer_row*/) override {
     last_element_type_hint_.clear();

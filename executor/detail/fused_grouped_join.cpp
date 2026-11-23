@@ -220,26 +220,27 @@ inline bool ColumnarColMayBeDouble(const ColumnarTable& table, slot_t col) {
       selected = nonnull;
     }
     return selected;
-  }     if (!has_null) {
-      for (uint32_t r = 0; r < nrows; ++r) {
-        const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
-        if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
-            [[unlikely]] {
+  }
+  if (!has_null) {
+    for (uint32_t r = 0; r < nrows; ++r) {
+      const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
+      if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
+          [[unlikely]] {
+        out_sel[n_sel++] = r;
+      }
+    }
+  } else {
+    for (uint32_t r = 0; r < nrows; ++r) {
+      const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
+      if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
+          [[unlikely]] {
+        if (!rf_col->IsNull(r)) {
           out_sel[n_sel++] = r;
         }
       }
-    } else {
-      for (uint32_t r = 0; r < nrows; ++r) {
-        const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
-        if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
-            [[unlikely]] {
-          if (!rf_col->IsNull(r)) {
-            out_sel[n_sel++] = r;
-          }
-        }
-      }
     }
- 
+  }
+
   return n_sel;
 }
 
@@ -1514,12 +1515,65 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
     child_programs.push_back(std::move(*program));
   }
+  if (deferred_left_probe != nullptr && !disabled &&
+      std::getenv("TINYLAMB_DISABLE_COLLAPSED_RIGHT_JOIN") == nullptr &&
+      outer == nullptr && ctes.empty() && !fusion->anti_unmatched_only &&
+      !fusion->rollup_count_distribution && fusion->output_sink == nullptr &&
+      join_type == JoinType::kInner && equality_keys.size() == 1 &&
+      !equality_keys[0].null_safe && equality_keys[0].left_offset == 0 &&
+      equality_keys[0].right_offset == 0 && residuals.empty() &&
+      !right_arg.HasSpill() && effective_left_rows >= 4096 &&
+      total_right_rows >= 1024 && !fusion->aggregates.empty() &&
+      fusion->aggregates.size() <= 8) {
+    const auto rk = static_cast<slot_t>(equality_keys[0].right);
+    const Column& rcol = right_arg.schema.GetColumn(rk);
+    const bool r_int =
+        (rcol.Type() == ValueType::kInt64 || rcol.Type() == ValueType::kDate) &&
+        !rcol.IsUnsigned() && !rcol.IsInterval();
+    const bool r_str = rcol.Type() == ValueType::kVarChar && !rcol.IsInterval();
+    if (r_int || r_str) {
+      constexpr size_t kFanoutSample = 256;
+      const size_t stride =
+          std::max<size_t>(1, total_right_rows / kFanoutSample);
+      std::unordered_set<int64_t> int_seen;
+      std::unordered_set<std::string> str_seen;
+      size_t non_null_sampled = 0;
+      Value tmp;
+      for (size_t i = 0, sampled = 0;
+           i < total_right_rows && sampled < kFanoutSample;
+           i += stride, ++sampled) {
+        const Value* vp = nullptr;
+        if (right_col_only) {
+          right_locator.WriteValue(rk, static_cast<uint32_t>(i), &tmp);
+          vp = &tmp;
+        } else {
+          vp = &(*build_rows[i])[rk];
+        }
+        if (vp->IsNull()) {
+          continue;
+        }
+        ++non_null_sampled;
+        if (r_int && vp->type == rcol.Type() && !vp->IsUnsigned() &&
+            !vp->IsInterval()) {
+          int_seen.insert(vp->value.int_value);
+        } else if (r_str && vp->type == ValueType::kVarChar &&
+                   !vp->IsCaseInsensitive() && !vp->IsInterval()) {
+          str_seen.emplace(vp->value.varchar_value);
+        }
+      }
+      const size_t distinct_sampled = r_int ? int_seen.size() : str_seen.size();
+      if (non_null_sampled >= 32 &&
+          distinct_sampled * 5 < non_null_sampled * 4) {
+        return not_fusable("high-fanout build: prefer collapsed-right");
+      }
+    }
+  }
   if (deferred_left_probe == nullptr) {
     ASSIGN_OR_RETURN(
         std::optional<Relation>, collapsed_grouped,
-        (TryCollapsedRightGroupedJoin(
-            context, left, right_arg, equality_keys, join_type, residuals,
-            key_programs, child_programs, outer, ctes, fusion)));
+        (TryCollapsedRightGroupedJoin(context, left, right_arg, equality_keys,
+                                      join_type, residuals, key_programs,
+                                      child_programs, outer, ctes, fusion)));
     if (collapsed_grouped.has_value()) {
       return collapsed_grouped;
     }
@@ -2294,7 +2348,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               hi = v > hi ? v : hi;
             }
             *local_max =
-                std::max(*local_max, std::max(magnitude(lo), magnitude(hi)));
+                std::max({*local_max, magnitude(lo), magnitude(hi)});
             return *local_max <= max_allowed;
           }
           const uint8_t* nul = cc.nulls.data();
@@ -2315,7 +2369,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
           if (seen) {
             *local_max =
-                std::max(*local_max, std::max(magnitude(lo), magnitude(hi)));
+                std::max({*local_max, magnitude(lo), magnitude(hi)});
             return *local_max <= max_allowed;
           }
           return true;
@@ -4030,6 +4084,12 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           if (dense_workers > 1) {
             std::atomic<uint32_t> next_blk{0};
             const auto blk_count = static_cast<uint32_t>(grp.blocks.size());
+            // The Status is intentionally discarded: this lambda only does
+            // POD reads/writes into the pre-sized dense_index (vector
+            // operator[], atomics, int64 stores) and cannot throw, so
+            // RunParallelTasks has no error to return. If the body ever
+            // gains an allocating or throwing call, propagate the Status
+            // instead — a partial fill would silently drop join matches.
             (void)RunParallelTasks(dense_workers, [&](size_t) {
               uint32_t nb = 0;
               while ((nb = next_blk.fetch_add(1, std::memory_order_relaxed)) <
@@ -5930,7 +5990,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           std::unordered_map<Value, uint32_t, DistinctValueHash,
                              DistinctValueEqual>
               src_map;
-          src_map.reserve(std::min<size_t>(sbase * 2 + 16, 4096));
+          src_map.reserve(std::min<size_t>((sbase * 2) + 16, 4096));
           uint32_t next_id = 0;
           bool seen_ci = false;
           Value tmp;
@@ -7831,19 +7891,21 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  // Lean proof: lean/TinylambOpt/ResearchProofs/FanoutWeightedBucketWorkSplit.lean (sound)
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/FanoutWeightedBucketWorkSplit.lean (sound)
   size_t estimated_fanout_pairs = total_left;
   double estimated_avg_depth = 1.0;
-  if (!left.HasSpill() && !right_arg.HasSpill() && total_left > 0 &&
-      total_left < 96000 && !singleton_right_relation &&
-      right_build_count() >= 256 &&
+  if (deferred_left_probe == nullptr && !left.HasSpill() &&
+      !right_arg.HasSpill() && total_left > 0 && total_left < 96000 &&
+      !singleton_right_relation && right_build_count() >= 256 &&
+      (left.HasColumnarOnly() || left.rows.size() == total_left) &&
       std::getenv("TINYLAMB_DISABLE_FANOUT_WORK_SPLIT") == nullptr) {
     const size_t n_samples = std::min<size_t>(total_left, 64);
     const size_t r_total = right_build_count();
     const size_t r_limit = std::min<size_t>(r_total, 65536);
-    const double r_scale =
-        r_limit > 0 ? static_cast<double>(r_total) / static_cast<double>(r_limit)
-                    : 1.0;
+    const double r_scale = r_limit > 0 ? static_cast<double>(r_total) /
+                                             static_cast<double>(r_limit)
+                                       : 1.0;
     size_t sampled_probe = 0;
     uint64_t matched_hits = 0;
     if (integer_key && left_columns.size() == 1 && right_columns.size() == 1) {
@@ -7851,7 +7913,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       probe_sample.reserve(n_samples * 2);
       Row col_row;
       Value col_cell;
-      const auto sample_left_at = [&](size_t target_idx, int64_t* out_k) -> bool {
+      const auto sample_left_at = [&](size_t target_idx,
+                                      int64_t* out_k) -> bool {
         if (!left.HasColumnarOnly()) {
           const Value& v = left.rows[target_idx][left_columns[0]];
           if (v.IsNull()) return false;
@@ -8691,9 +8754,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   if (!singleton_right_relation) {
     build_buckets();
   }
-  // Lean proof: lean/TinylambOpt/ResearchProofs/FanoutWeightestd::cmp_equal( (so,
-  // For high-f)anout skewed probes under workers > 1, partition probe rows by
-  // cstd::cmp_equal(h ma, count(k)) via b)inary search so every worker
+  // Lean proof: lean/TinylambOpt/ResearchProofs/FanoutWeightestd::cmp_equal(
+  // (so, For high-f)anout skewed probes under workers > 1, partition probe rows
+  // by cstd::cmp_equal(h ma, count(k)) via b)inary search so every worker
   // handles balanced pair work while keeping disjoint probe-row ownership.
   std::vector<size_t> fanout_key_bounds;
   if (workers > 1 && estimated_avg_depth >= 4.0 && !singleton_right_relation &&
@@ -8725,8 +8788,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         const uint64_t target = (total_w * wi) / workers;
         auto it = std::lower_bound(prefix_weight.begin(), prefix_weight.end(),
                                    target);
-        fanout_key_bounds[wi] =
-            static_cast<size_t>(it - prefix_weight.begin());
+        fanout_key_bounds[wi] = static_cast<size_t>(it - prefix_weight.begin());
       }
     }
   }
@@ -8821,8 +8883,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           const Column& cc =
               c_right ? right.schema.GetColumn(static_cast<size_t>(cmp.left) -
                                                left_width)
-                      : left.schema.GetColumn(static {_cast<size
-}_t>(cmp.left));
+                      : left.schema.GetColumn(static_cast<size_t>(cmp.left));
           const Column& vc =
               left.schema.GetColumn(static_cast<size_t>(sh.case_val_col0));
           if ((cc.Type() != ValueType::kInt64 &&
@@ -8893,7 +8954,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     const size_t jk_col = left_columns[0];
     if (v2_ok) {
       for (const ColumnarChunk& ch : left.columnar->chunks) {
-        if (ch.rows == 0) continue;
+        if (ch.rows == 0) { continue;
+}
         auto chk_int = [&](size_t c) {
           if (c >= ch.columns.size()) return false;
           const ColumnarColumn& col = ch.columns[c];
@@ -8936,9 +8998,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         bool gathered_src{false};
         size_t card{0};
         uint32_t null_id{std::numeric_limits<uint32_t>::max()};
-        std::shared_ptr<std::vector<std::string>> rep {s;
-       
-} // on_right: [right_row_count]
+        std::shared_ptr<std::vector<std::string>> reps;
+        // on_right: [right_row_count]
         std::vector<uint32_t> right_subgid;
         // gathered_src: source_table chunk_prefix + flat [src_total_rows]
         const ColumnarTable* src_table{nullptr};
@@ -8965,8 +9026,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           const auto rcol = static_cast<slot_t>(
               static_cast<size_t>(key_full_col[k]) - left_width);
           kd.right_subgid.assign(right_row_count,
-                                 std::numeric_limits<uint32 {_t>::max()
-});
+                                 std::numeric_limits<uint32_t>::max());
           std::unordered_map<std::string, uint32_t> smap;
           smap.reserve(std::min<size_t>(right_row_count, 16384));
           std::string_view last_sv;
@@ -9250,13 +9310,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             if (c_hi <= gbegin) continue;
             if (c_lo >= gend) break;
             const size_t rbegin = gbegin > c_lo ? (gbegin - c_lo) : 0;
-         {    const 
-}size_t rend = gend < c_hi ? (gend - c_lo) : (c_hi - c_lo);
+            const size_t rend = gend < c_hi ? (gend - c_lo) : (c_hi - c_lo);
             const ColumnarChunk& ch = left.columnar->chunks[ci];
             const ColumnarColumn& jk_c = ch.columns[jk_col];
-            const bool jk_flat = jk_c.IsFl {at();
-    
-}        const int64_t* __restrict jk_p =
+            const bool jk_flat = jk_c.IsFlat();
+            const int64_t* __restrict jk_p =
                 jk_flat ? jk_c.ints.data() : nullptr;
             const bool jk_null = jk_c.has_null;
 
@@ -9266,10 +9324,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             std::array<const uint32_t*, 2> k_direct_ids{nullptr, nullptr};
             for (size_t k = 0; k < 2; ++k) {
               if (kdicts[k].gathered_src) {
-            {     co
-}nst auto* gi =
-                    ch.columns[ {static_
-}cast<size_t>(key_full_col[k])]
+                const auto* gi =
+                    ch.columns[static_cast<size_t>(key_full_col[k])]
                         .gather_index.get();
                 k_gi_chunks[k] = gi->src_chunks.data();
                 k_gi_rows[k] = gi->src_rows.data();
@@ -9427,10 +9483,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 if (wstates[w].has_val[base + a] != 0) {
                   int64_t ns = 0;
                   if (__builtin_add_overflow(gsum[a], wstates[w].sums[base + a],
-                                             &ns)) [[unlikel {y]] {
+                                             &ns)) [[unlikely]] {
                     merge_overflow = true;
-                    br
-}eak;
+                    break;
                   }
                   gsum[a] = ns;
                   ghv[a] = 1;
@@ -9531,8 +9586,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   const size_t est_compact_log_rows = std::max(total_left, effective_left_rows);
   auto compact_log_charge =
       compact_counts && !compact_log_disabled && workers > 1 &&
-      !left.HasSpill() && (use_dense_int_rows || use_unique_int_table) &&
-      est_compact_log_rows <= SIZE_MAX / (2 * log_entry_bytes)
+              !left.HasSpill() &&
+              (use_dense_int_rows || use_unique_int_table) &&
+              est_compact_log_rows <= SIZE_MAX / (2 * log_entry_bytes)
           ? TryReserveQueryMemory(est_compact_log_rows * 2 * log_entry_bytes)
           : nullptr;
   compact_log_allowed = compact_log_charge != nullptr;
@@ -9584,7 +9640,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           const ColumnarColumn& kc = ch.columns[rc0];
           const bool fast =
               kc.is_uniform && !kc.is_unsigned &&
-              (kc.type == ValueType::kInt64 || kc.type == ValueType::kauto         for (size_t r = 0; r < ch.rows; ++r) {
+              (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
+          for (size_t r = 0; r < ch.rows; ++r) {
             int64_t dummy = 0;
             if (read_col_int_cell(kc, r, fast, &dummy)) {
               RETURN_IF_FAIL(on_idx(base_r + static_cast<uint32_t>(r)));
@@ -11107,8 +11164,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             : 0ULL;
     const size_t base_proj_n = deferred_left_probe->projection.size();
     const slot_t jk0_slot = left_columns[0];
-    if (dom > 524288ULL && dom <= 2097152ULL &&  {jk0_slot <
-} base_proj_n &&
+    if (dom > 524288ULL && dom <= 2097152ULL && jk0_slot < base_proj_n &&
         pk0.pk_col < base_proj_n) {
       bool expr_ok = true;
       std::array<bool, 4> need_v{false, false, false, false};
@@ -11232,7 +11288,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           const bool lazy_col = store.ColumnIsLazy(full_c);
           for (const LSTablePageBlock& blk : store.blocks) {
             if (blk.row_count == 0) continue;
-            if (full_c >= blk.columns.size()) return false;
+            if (full_c >= blk.columns.size()) { return false;
+}
             const LSTableColumnBlock& cb = blk.columns[full_c];
             if (cb.type == ValueType::kNull) continue;
             if (!lazy_col && cb.int_cells.size() < blk.row_count) return false;
@@ -11302,8 +11359,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
           }
         }
-        jit(_dense_split.sel_items.reserve(fusion->select_items.size()));
-        for ((size_t si = 0; si < fusion->select_items.size(); ++s)i) {
+        jit_dense_split.sel_items.reserve(fusion->select_items.size());
+        for (size_t si = 0; si < fusion->select_items.size(); ++si) {
           const Expression& expr = fusion->select_items[si];
           std::string nm =
               si < fusion->select_names.size() ? fusion->select_names[si] : "";
@@ -12243,7 +12300,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 ((hbits[off >> 6] >> (off & 63)) & uint64_t{1}) == 0) {
               continue;
             }
-            const double v0 = c0_dbl ? std::bit_cast<double>!fusion->select_names.empty()                   : static_cast<double>(c0cells[r]);
+            const double v0 = c0_dbl ? std::bit_cast<double>(c0cells[r])
+                                     : static_cast<double>(c0cells[r]);
             double dv = v0;
             if (op_code != 2) {
               const double v1 = c1_dbl ? std::bit_cast<double>(c1cells[r])
@@ -12334,7 +12392,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             } else {
               threshold = grand_total * fusion->post_having_constant_or_factor;
               if (!std::isfinite(threshold)) {
-                valid_threshold = falsauto           }
+                valid_threshold = false;
+              }
             }
           }
           if (valid_threshold) {
@@ -12439,16 +12498,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 ? fusion->select_names[0]
                 : left.schema.GetColumn(g_pcol).Name().name;
         std::string n1 =
-            fusion->select_names.size() > 1 && !fusion->s {elect_name
-}s[1].empty()
+            fusion->select_names.size() > 1 && !fusion->select_names[1].empty()
                 ? fusion->select_names[1]
                 : "agg_0";
         out_rel.schema =
             Schema("", {Column(std::move(n0), gtype),
                         Column(std::move(n1), ValueType::kDouble)});
         out_rel.SetColumnarTable(std::move(out_table), total_out_groups > 0);
-        out_rel.pea {k_intermed
-}iate_rows = total_out_groups;
+        out_rel.peak_intermediate_rows = total_out_groups;
         if (context.execution_runtime() != nullptr) {
           context.execution_runtime()->join_ms += ElapsedMs(join_begin);
           ++context.execution_runtime()->grouped_join_fusions;
@@ -12467,8 +12524,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     constexpr size_t kPartSize = size_t{1} << kPartShift;
     const size_t n_parts = (dom + kPartSize - 1) >> kPartShift;
 
-    std::vector<uint32_t> key_to {_rsubgid(d
-}ense_int_idxs.size(), UINT32_MAX);
+    std::vector<uint32_t> key_to_rsubgid(dense_int_idxs.size(), UINT32_MAX);
     for (size_t i = 0; i < dense_int_idxs.size(); ++i) {
       const uint32_t r_idx = dense_int_idxs[i];
       if (r_idx != kInvalidRightIdx) {
@@ -12533,11 +12589,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
     const bool has_null_peeks = !deferred_left_probe->null_peeks.empty();
-    const auto eval_int_peek = [](BinaryOperati! op, int64_t a,
- ||                 ||           int64_t c) n!oexcept -> bool {
-  ||  switch (op) {
- <     ca|| BinaryOperation::kEquals:
-          re>rn a = c;
+    const auto eval_int_peek = [](BinaryOperation op, int64_t a,
+                                  int64_t c) noexcept -> bool {
+      switch (op) {
+        case BinaryOperation::kEquals:
+          return a == c;
         case BinaryOperation::kNotEquals:
           return a != c;
         case BinaryOperation::kLessThan:
@@ -12553,23 +12609,19 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     };
 
-    std::vector<std::vector<std::vect {or<uint32_
-}t>>> worker_part_gids(
+    std::vector<std::vector<std::vector<uint32_t>>> worker_part_gids(
         workers, std::vector<std::vector<uint32_t>>(n_parts));
     std::vector<std::vector<std::vector<double>>> worker_part_vals(
         workers, std::vector<std::vector<double>>(n_parts));
     std::vector<Status> p1_errs(workers, Status::kSuccess);
 
     const auto run_phase1 = [&](size_t w) {
-      std::array<std::optional<JitDenseSp {litRadixAg
-}g::ExtractKernel>, 128>
+      std::array<std::optional<JitDenseSplitRadixAgg::ExtractKernel>, 128>
           extract_cache;
-      std::vecto {r<uint32_t
-}> rf_sel_buf;
+      std::vector<uint32_t> rf_sel_buf;
       std::vector<uint32_t> stripe_gids;
-      std::vector<double> stripe_vals; {
-      std
-}::vector<int64_t> dummy_zeros;
+      std::vector<double> stripe_vals;
+      std::vector<int64_t> dummy_zeros;
       std::vector<uint8_t> dummy_ones;
       std::vector<uint32_t> stripe_hist(n_parts, 0);
       std::vector<uint32_t*> dst_gids(n_parts, nullptr);
@@ -12588,13 +12640,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       std::array<DefExtraRf, 4> extra_rfs{};
       std::vector<slot_t> p1_mat_cols;
       p1_mat_cols.push_back(deferred_left_probe->projection[jk0_slot]);
-      p1_mat_cols.push_back(deferred_left_probe->projec {tion[pk0_s
-}lot]);
+      p1_mat_cols.push_back(deferred_left_probe->projection[pk0_slot]);
       if (full_rf_col.has_value()) {
         p1_mat_cols.push_back(*full_rf_col);
       }
-      for (const ScanRuntimeFilter& ext  {: primary_
-}rf.extra) {
+      for (const ScanRuntimeFilter& ext : primary_rf.extra) {
         if (ext.enabled() && ext.column < base_proj_cols) {
           p1_mat_cols.push_back(deferred_left_probe->projection[ext.column]);
         }
@@ -12615,8 +12665,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       SortUniqueSlots(&p1_mat_cols);
       LSTableStore::LazyBlockScratch lazy_scratch;
 
-      for (size_t stripe = w; stripe * { 64 < tota
-}l_blocks; stripe += workers) {
+      for (size_t stripe = w; stripe * 64 < total_blocks; stripe += workers) {
         const size_t b_begin = stripe * 64;
         const size_t b_end = std::min(total_blocks, b_begin + 64);
         std::fill(stripe_hist.begin(), stripe_hist.end(), 0U);
@@ -12633,8 +12682,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           for (const ScanRuntimeFilter& ext : primary_rf.extra) {
             if (!ext.enabled() || ext.column >= base_proj_cols) continue;
             if (ext.group->RejectsAll()) {
-      {         e
-}xtra_zm_reject = true;
+              extra_zm_reject = true;
               break;
             }
             const slot_t ext_full = deferred_left_probe->projection[ext.column];
@@ -12644,15 +12692,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                    mcol.type == ValueType::kDate) &&
                   mcol.type == ext.type &&
                   (!mcol.has_min_max ||
-                   ext.group->RejectRange(mcol.min_int, mcol.max_int) {)) {
-     
-}           extra_zm_reject = true;
+                   ext.group->RejectRange(mcol.min_int, mcol.max_int))) {
+                extra_zm_reject = true;
                 break;
               }
             }
-          { }
-       
-}   if (extra_zm_reject) continue;
+          }
+          if (extra_zm_reject) continue;
           if (!packed_2x32_int_key && left_key_offsets[0] == 0 &&
               jk0_slot < base_proj_cols &&
               !DenseIntBlockMayMatch(
@@ -12662,9 +12708,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
           bool peek_all_pass = true;
           if (peek_ptr != nullptr) {
-            for (const IntegerPeekCompare& pred { : *peek_ptr) {
-
-}              const LSTableColumnBlock& pcol = meta_blk.columns[pred.column];
+            for (const IntegerPeekCompare& pred : *peek_ptr) {
+              const LSTableColumnBlock& pcol = meta_blk.columns[pred.column];
               if (pcol.has_null || !pcol.has_min_max ||
                   !eval_int_peek(pred.op, pcol.min_int, pred.constant) ||
                   !eval_int_peek(pred.op, pcol.max_int, pred.constant)) {
@@ -12676,8 +12721,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           lazy_scratch.transient.clear();
           const LSTablePageBlock* mat =
               store.MaterializeBlockView(bi, &lazy_scratch, p1_mat_cols);
-          if (mat == { nullptr) 
-}{
+          if (mat == nullptr) {
             p1_errs[w] = Status::kIOError;
             return;
           }
@@ -12697,7 +12741,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           size_t extra_rf_count = 0;
           for (const ScanRuntimeFilter& ext : primary_rf.extra) {
             if (!ext.enabled() || ext.column >= base_proj_cols ||
-                extautocount >= extra_rfs.size()) {
+                extra_rf_count >= extra_rfs.size()) {
               continue;
             }
             const LSTableColumnBlock* ecol = proj_cols[ext.column];
@@ -12739,7 +12783,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 }
                 uint32_t out_n = 0;
                 for (uint32_t r = 0; r < blk.row_count; ++r) {
-                  if (rf_col_has_null && rf_col->IsNull(r)) continue;
+                  if (rf_col_has_null && rf_col->IsNull(r)) { continue;
+}
                   if (active_rf_group->Reject(rf_col->IntAt(r))) continue;
                   rf_sel_buf[out_n++] = r;
                 }
@@ -12763,7 +12808,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 continue;
               }
               if (rf_col != nullptr) {
-                if (rf_col_has_null && rf_col->IsNull(r)) continue;
+                if (rf_col_has_null && rf_col->IsNull(r)) { continue;
+}
                 const int64_t kv = rf_col->IntAt(r);
                 if (rf_has_dense) {
                   if (kv < rf_lo || kv > rf_hi) continue;
@@ -12790,13 +12836,15 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                   if (erf.dense_bits != nullptr) {
                     if (kv < erf.lo || kv > erf.hi) {
                       extra_ok = false;
-               {       
-} break;
+                      {
+                      }
+                      break;
                     }
                     const uint64_t off = static_cast<uint64_t>(kv) -
                                          static_cast<uint64_t>(erf.lo);
-      {          
-}     if ((erf.dense_bits[off >> 6] &
+                    {
+                    }
+                    if ((erf.dense_bits[off >> 6] &
                          (uint64_t{1} << (off & 63))) == 0) {
                       extra_ok = false;
                       break;
@@ -12811,8 +12859,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               if (!peek_all_pass && peek_ptr != nullptr) {
                 bool peek_ok = true;
                 for (const IntegerPeekCompare& pred : *peek_ptr) {
-                  const LSTableColumnBlock& pcol = bl {k.columns[
-}pred.column];
+                  const LSTableColumnBlock& pcol = blk.columns[pred.column];
                   if ((pcol.has_null && pcol.IsNull(r)) ||
                       !eval_int_peek(pred.op, pcol.IntAt(r), pred.constant)) {
                     peek_ok = false;
@@ -12839,8 +12886,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               [&](const LSTableColumnBlock& cb) noexcept -> const uint8_t* {
             if (!cb.has_null) return nullptr;
             const auto sp = cb.Nulls();
-            return sp.size() >= blk.row_count ? sp.data() { : nullptr
-};
+            return sp.size() >= blk.row_count ? sp.data() : nullptr;
           };
           const uint8_t* jk_nulls = null_ptr_of(jk_cb);
           const uint8_t* pk0_nulls = null_ptr_of(pk0_cb);
@@ -13031,8 +13077,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             right_gi->src_chunks.resize(cnt);
             right_gi->src_rows.resize(cnt);
             for (size_t r = 0; r < cnt; ++r) {
-              const uint64_t gid = (p << kPartS {hift) | ma
-}tched_lgs[off + r];
+              const uint64_t gid = (p << kPartShift) | matched_lgs[off + r];
               const uint32_t r_subgid =
                   split_uses_right_subgid
                       ? static_cast<uint32_t>(gid / pk0_card)
@@ -15036,16 +15081,18 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             ++local.comparisons;
             charge_numeric(
                 dw, 0, 0,
-                [&](int32_t col, doautoout) {
-                  const auto c = static_cast<size_t>(colauto               if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
+                [&](int32_t col, double* out) {
+                  const auto c = static_cast<size_t>(col);
+                  if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
                     return false;
                   }
                   const int64_t raw = proj_int_ptrs[c][r];
                   if (def_base_types[c] == ValueType::kDouble) {
                     *out = std::bit_cast<double>(raw);
                   } else {
-  auto            *out = static_cast<double>(raw);
-                  auto              return true;
+                    *out = static_cast<double>(raw);
+                  }
+                  return true;
                 },
                 [&](int32_t col, int64_t* out) {
                   const auto c = static_cast<size_t>(col);
@@ -15076,7 +15123,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                (std::cmp_greater_equal(op.col0, base_proj_cols) ||
                 def_overwritten_by_pk[static_cast<size_t>(op.col0)] != 0)) ||
               (op.col1 >= 0 &&
-        auto (std::cmp_greater_equal(op.col1, base_proj_cols) ||
+               (std::cmp_greater_equal(op.col1, base_proj_cols) ||
                 def_overwritten_by_pk[static_cast<size_t>(op.col1)] != 0))) {
             charge_from_cells = false;
             break;
@@ -15253,7 +15300,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                   }
                 }
               }
-        auto            return;
+            }
+            return;
           }
           for (size_t r = begin; r < end; ++r) {
             bool selected = true;
@@ -15694,7 +15742,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                      .pattern != CompiledDefDoubleArith::Pattern::kGeneral) &&
             std::ranges::all_of(def_pk_groups, [](const auto& g) {
               return g.dense_ptr != nullptr && g.total_rows > 0 &&
-                     g.max_k >= g.min_k && g.dense_siautospan;
+                     g.max_k >= g.min_k && g.dense_size == g.span;
             });
         const bool want_da_arith =
             fast_split_arith_agg ||
@@ -17908,16 +17956,19 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             if (!HasNullKey(next_row, left_columns)) [[likely]] {
               if (integer_key) {
                 int_buckets->PrefetchBucket(
-                    AddJoinKeyBias(IntegerJoinKey(!key_shapes.empty()s[0]),
+                    AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
                                    left_key_offsets[0]));
-              }!key_shapes.empty()   const int64_t nk0 =
+              } else {
+                const int64_t nk0 =
                     AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
                                    left_key_offsets[0]);
                 const int64_t nk1 =
                     AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[1]),
-               !fusion->select_items.empty()fsets[1]);
+                                   left_key_offsets[1]);
                 if (fits_fused_i32(nk0) && fits_fused_i32(nk1)) [[likely]] {
-                  int_buckets->PrefetchBucket(pack_fused_2x32(nk0, nk1!fusion->group_keys.empty()       }
+                  int_buckets->PrefetchBucket(pack_fused_2x32(nk0, nk1));
+                }
+              }
             }
           }
           bool matched = false;
@@ -17957,8 +18008,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
             continue;
           }
-          const CompositeIntKey key = EncodeCompositeIntKey(
-              left_row, left_columns, &left_key_offsets);
+          const CompositeIntKey key =
+              EncodeCompositeIntKey(left_row, left_columns, &left_key_offsets);
           bool matched = false;
           size_t cached_group = kNoCachedGroup;
           const auto [first, last] = buckets.equal_range(key);
@@ -17966,7 +18017,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             ++local.comparisons;
             if (use_preassigned_build_groups) {
               RETURN_IF_FAIL(accumulate_preassigned_pair(w, scratch, left_row,
-                                                     iter->second));
+                                                         iter->second));
               matched = true;
             } else {
               ASSIGN_OR_RETURN(bool, accumulated,
@@ -17983,7 +18034,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       return Status::kSuccess;
     }
     const FlatJoinIdxBuckets<std::string>& buckets = *key_buckets;
-    const auto probe_key_bucket_range = [&](size_t begin, size_t end) -> Status {
+    const auto probe_key_bucket_range = [&](size_t begin,
+                                            size_t end) -> Status {
       for (size_t ri = begin; ri < end; ++ri) {
         const Row& left_row = left.rows[ri];
         if (HasNullKey(left_row, left_columns)) {
@@ -18081,7 +18133,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               << " sel=" << fusion->select_items.size() << " k0d="
               << (key_shapes.size() > 0 ? key_shapes[0].direct_column : -2)
               << " k0e="
-              << (key_shapes.size() > 0 ? key_shapes[0].extract_date_col : -2)
+              << (!key_shapes.empty() ? key_shapes[0].extract_date_col : -2)
               << " k1d="
               << (key_shapes.size() > 1 ? key_shapes[1].direct_column : -2)
               << " k1e="
@@ -18288,7 +18340,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             right_pvals[2].empty() ? nullptr : right_pvals[2].data(),
             right_pvals[3].empty() ? nullptr : right_pvals[3].data()};
 
-        auto run_fast_profit = [&](siz!fusion->select_names.empty()t sums = w_sums[w].data();
+        auto run_fast_profit = [&](size_t w) {
+          double* const sums = w_sums[w].data();
           uint8_t* const hits = w_hits[w].data();
           uint64_t cmp = 0;
           for (size_t mi = w; mi < n_fm; mi += nworkers) {
@@ -19135,7 +19188,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
       for (size_t gid = begin; gid < end; ++gid) {
         bool any_matched = false;
-        for (size_(t w = 0; w <) dw_count; ++w) {
+        for (size_t w = 0; w < dw_count; ++w) {
           if (direct_gid_workers[w].matched[gid] != 0) {
             any_matched = true;
             break;
@@ -19342,8 +19395,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     };
     RETURN_IF_FAIL(RunParallelTasks(workers, sort_partition));
     groups.reserve(pre_group_count);
-    for (size_t gid = 0 {; gid < pr
-}e_group_count; ++gid) {
+    for (size_t gid = 0; gid < pre_group_count; ++gid) {
       bool any_matched = (cd_counts[gid] > 0);
       if (!any_matched) {
         for (size_t w = 0; w < workers; ++w) {
@@ -21069,9 +21121,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                  extract_finite_scale(bin.Left(), &scale)) {
         agg_expr = &bin.Right();
       } else {
-      std::cmp_equal(  return false;
+        return false;
       }
-    ,ression());
+      const auto* agg_ptr = &(*agg_expr)->AsAggregateExpression();
       auto found = std::ranges::find(fusion->aggregates, agg_ptr);
       if (found == fusion->aggregates.end()) {
         return false;
@@ -22294,7 +22346,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                    src_col.Type() == ValueType::kVarChar)) {
                 init_vt = src_col.Type();
                 init_unsigned = src_col.IsUnsigned();
-      auto  }
+              }
             }
           } else if (d.index - left_width < right_width &&
                      (right.uniform_cell_types || right.HasColumnarOnly())) {
@@ -22463,7 +22515,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                   } else {
                     const platform::ExtendedFloat mean = g.RawStatX()[slot] / n;
                     const platform::ExtendedFloat ssd =
-    auto            g.RawStatXX()[slot] - (n * mean * mean);
+                        g.RawStatXX()[slot] - (n * mean * mean);
                     const platform::ExtendedFloat variance =
                         ssd > 0 ? ssd / (is_samp ? n - 1 : n)
                                 : platform::ExtendedFloat{0};

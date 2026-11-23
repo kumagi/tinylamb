@@ -54,6 +54,8 @@ class TestDatabaseCleanup : public ::testing::Environment {
         snapshot_complete_ = false;
       }
     }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): gtest environment setup runs
+    // before test worker threads are started.
     const char* keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
     const std::string_view value = keep == nullptr ? "" : keep;
     keep_artifacts_ = value == "1" || value == "true" || value == "yes" ||

@@ -542,7 +542,7 @@ TEST_F(FullScanIteratorTest,
   auto& budget = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
   // operands bounded
-  constexpr size_t cap =
+  constexpr auto cap =
       static_cast<const size_t>(2 * 1024 *
       1024);  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   ASSERT_LT(budget.ColumnarUsed(), cap - 65536);

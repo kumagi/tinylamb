@@ -54,8 +54,8 @@ size_t QueryMemoryBudget::LimitFromEnv() {
 }
 
 QueryMemoryBudget::QueryMemoryBudget(size_t limit_bytes)
-    : limit_(limit_bytes)
-      {}
+    : limit_(limit_bytes),
+      soft_(limit_bytes / kSoftFractionDen * kSoftFractionNum) {}
 
 QueryMemoryBudget& QueryMemoryBudget::Global() {
   static QueryMemoryBudget instance(LimitFromEnv());

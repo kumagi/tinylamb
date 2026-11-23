@@ -261,7 +261,7 @@ namespace {
 class ThrowingResidual final : public ExpressionBase {
  public:
   [[nodiscard]] TypeTag NodeKind() const override { return TypeTag::kInvalid; }
-  [[nodiscard]] Value Evaluate(const Row&, const Schema&) const override {
+  [[nodiscard]] Value Evaluate(const Row& /*row*/, const Schema& /*schema*/) const override {
     throw std::runtime_error("residual exploded");
   }
   [[nodiscard]] StatusOr<Value> TryEvaluate(

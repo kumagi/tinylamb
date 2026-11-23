@@ -114,9 +114,8 @@ std::string_view Trim(std::string_view value) {
 }
 
 size_t Utf8CharacterCount(std::string_view text) {
-  return static_cast<size_t>(std::ranges::count_if(text, [](unsigned char c) {
-    return (c & 0xC0) != 0x80;
-  }));
+  return static_cast<size_t>(std::ranges::count_if(
+      text, [](unsigned char c) { return (c & 0xC0) != 0x80; }));
 }
 
 }  // namespace
@@ -279,7 +278,8 @@ std::optional<size_t> SqlErrorPosition(std::string_view message,
   // The "[at L:C]" tag is matched by content, not by an "ERROR:" prefix or a
   // terminal ']' — diagnostics from non-parse sources and future formats
   // with trailing hint text must keep their position.
-  if (at == std::string_view::npos || parsed_byte_offset > statement.text.size()) {
+  if (at == std::string_view::npos ||
+      parsed_byte_offset > statement.text.size()) {
     return std::nullopt;
   }
   const size_t close = diagnostic.find(']', at + 4);
@@ -319,7 +319,7 @@ std::optional<size_t> SqlErrorPosition(std::string_view message,
          sql[offset] != '\n' && sql[offset] != '\r') {
     if (sql[offset] == '\t') {
       // GoogleSQL reports columns after expansion to eight-column tab stops.
-      displ(ay_column += 8 - (displa)y_column - 1) % 8;
+      display_column += 8 - ((display_column - 1) % 8);
       ++offset;
     } else {
       offset += Utf8SequenceLength(static_cast<unsigned char>(sql[offset]));
@@ -332,8 +332,7 @@ std::optional<size_t> SqlErrorPosition(std::string_view message,
   return statement.position + Utf8CharacterCount(sql.substr(0, offset));
 }
 
-std::string NoticeResponse(std::string_view message,
-                           std::string_view sqlstate,
+std::string NoticeResponse(std::string_view message, std::string_view sqlstate,
                            std::string_view severity) {
   std::string payload;
   payload.push_back('S');
@@ -397,7 +396,9 @@ std::string DataRow(const Row& row) {
   return Message('D', payload);
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean (sound)
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
+// (sound)
 Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
                               size_t row_idx) {
   if (wire_out == nullptr || row_idx >= chunk.Size()) {
@@ -434,15 +435,59 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
     if (!col.IsHeterogeneous()) {
       switch (col.Type()) {
         case ValueType::kInt64: {
-          std::to_chars_result res{};
-          if (col.IsUnsigned()) {
-            res = std::to_chars(
-                int_buf.data(), int_buf.data() + int_buf.size(),
-                static_cast<uint64_t>(col.IntegerData()[row_idx]));
-          } else {
-            res = std::to_chars(int_buf.data(), int_buf.data() + int_buf.size(),
-                                col.IntegerData()[row_idx]);
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/Wave8PhysicalChoices.lean
+          // (FieldBytes_sound)
+          // Pre-encoded length-prefixed wire bytes for hot integers in
+          // [-1024, 65535], preserving exact DataRow framing bytes.
+          struct HotIntWireEntry {
+            std::array<char, 15> bytes{};
+            uint8_t len{0};
+          };
+          static constexpr int64_t kHotIntMin = -1024;
+          static constexpr int64_t kHotIntMax = 65535;
+          static const std::vector<HotIntWireEntry> kHotIntTable = [] {
+            std::vector<HotIntWireEntry> table(
+                static_cast<size_t>(kHotIntMax - kHotIntMin + 1));
+            std::array<char, 32> tmp{};
+            for (int64_t v = kHotIntMin; v <= kHotIntMax; ++v) {
+              const auto r =
+                  std::to_chars(tmp.data(), tmp.data() + tmp.size(), v);
+              const auto dlen = static_cast<uint32_t>(r.ptr - tmp.data());
+              HotIntWireEntry& e = table[static_cast<size_t>(v - kHotIntMin)];
+              e.bytes[0] = static_cast<char>((dlen >> 24U) & 0xffU);
+              e.bytes[1] = static_cast<char>((dlen >> 16U) & 0xffU);
+              e.bytes[2] = static_cast<char>((dlen >> 8U) & 0xffU);
+              e.bytes[3] = static_cast<char>(dlen & 0xffU);
+              std::memcpy(e.bytes.data() + 4, tmp.data(), dlen);
+              e.len = static_cast<uint8_t>(4U + dlen);
+            }
+            return table;
+          }();
+          const int64_t raw_v = col.IntegerData()[row_idx];
+          if (!col.IsUnsigned()) {
+            if (raw_v >= kHotIntMin && raw_v <= kHotIntMax) {
+              const HotIntWireEntry& e =
+                  kHotIntTable[static_cast<size_t>(raw_v - kHotIntMin)];
+              wire_out->append(e.bytes.data(), e.len);
+              continue;
+            }
+            const auto res = std::to_chars(
+                int_buf.data(), int_buf.data() + int_buf.size(), raw_v);
+            const auto len = static_cast<uint32_t>(res.ptr - int_buf.data());
+            AppendUint32(wire_out, len);
+            wire_out->append(int_buf.data(), len);
+            continue;
           }
+          const auto uv = static_cast<uint64_t>(raw_v);
+          if (uv <= static_cast<uint64_t>(kHotIntMax)) {
+            const HotIntWireEntry& e = kHotIntTable[static_cast<size_t>(
+                static_cast<int64_t>(uv) - kHotIntMin)];
+            wire_out->append(e.bytes.data(), e.len);
+            continue;
+          }
+          const auto res = std::to_chars(int_buf.data(),
+                                         int_buf.data() + int_buf.size(), uv);
           const auto len = static_cast<uint32_t>(res.ptr - int_buf.data());
           AppendUint32(wire_out, len);
           wire_out->append(int_buf.data(), len);
@@ -541,10 +586,10 @@ StatusOr<std::vector<SqlStatement>> SplitSqlStatementsWithPositions(
       if (statements.size() >= kMaxSqlStatements) {
         overflowed = true;
       } else {
-        const size_t start = segment_start +
-                             static_cast<size_t>(text.data() - current.data());
-        characters += Utf8CharacterCount(sql.substr(counted_bytes,
-                                                      start - counted_bytes));
+        const size_t start =
+            segment_start + static_cast<size_t>(text.data() - current.data());
+        characters += Utf8CharacterCount(
+            sql.substr(counted_bytes, start - counted_bytes));
         counted_bytes = start;
         statements.push_back({std::string(text), characters + 1});
       }

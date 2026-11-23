@@ -290,7 +290,7 @@ struct Rle8Run {
 };
 struct Rle8Region {
   Rle8Region()  // NOLINT(cppcoreguidelines-pro-type-member-init)
-       {}
+       = default;
 
   uint32_t n{0};
   uint32_t total_runs{0};

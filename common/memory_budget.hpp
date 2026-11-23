@@ -274,6 +274,12 @@ class ProcessMemoryBudget {
   void UnregisterReclaimHook(uint64_t hook_id);
 
   // Release listener registration (used by QueryMemoryCoordinator wakeup).
+  // Callbacks run synchronously on the thread that releases budgeted memory.
+  // UnregisterReleaseListener removes the entry from future invocations but
+  // does NOT wait for a callback already in flight on another thread, so a
+  // callback must not capture the registrant's `this`; capture a weak_ptr or
+  // otherwise keep the callback valid independent of the owner's lifetime
+  // (see QueryMemoryCoordinator's weak_signal capture in query_grant.cpp).
   uint64_t RegisterReleaseListener(ReleaseNotifyCallback cb);
   void UnregisterReleaseListener(uint64_t listener_id);
 
@@ -490,6 +496,8 @@ class ProcessMemoryCharge {
   [[nodiscard]] bool TryAddWithReclaim(size_t bytes);
   void AddForced(size_t bytes) noexcept;
   void Release(size_t bytes) noexcept;
+  // Returns void by design: releasing accounting is unconditional and has no
+  // failure to report — there is no Status to check or drop here.
   void ReleaseAll() noexcept;
   size_t TransferTo(ProcessMemoryCharge& dst, size_t bytes) noexcept {
     if (this == &dst || pool_ != dst.pool_) {

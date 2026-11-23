@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -17,6 +18,7 @@
 
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -291,7 +293,8 @@ StatusOr<ColumnarTopNResult> TryColumnarBoundedTopN(
         intern_entry_strings(&heap.back());
         std::push_heap(heap.begin(), heap.end(), heap_before);
       } else {
-        const int cmp0 = order_specs[0].Compare(cand_keys[0], heap.front().keys[0]);
+        const int cmp0 =
+            order_specs[0].Compare(cand_keys[0], heap.front().keys[0]);
         if (cmp0 > 0) {
           continue;
         }
@@ -585,9 +588,9 @@ static StatusOr<ResolvedOrderByKeys> ResolveOrderByKeys(
 }
 
 StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
-                                 const SelectStatement& statement,
-                                 Relation* output, const Scope* outer,
-                                 const CteMap& ctes) {
+                                           const SelectStatement& statement,
+                                           Relation* output, const Scope* outer,
+                                           const CteMap& ctes) {
   const char* disable_env = std::getenv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
@@ -1139,6 +1142,18 @@ Status ApplyOrderBy(TransactionContext& context,
                 entries.begin(),
                 entries.begin() + static_cast<std::ptrdiff_t>(keep),
                 entries.end(), entry_precedes);
+          } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+                     n >= 1024 && exact0) {
+            // Lean proof:
+            // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+            // (sound)
+            auto key_fn = [](const SortEntry& e) noexcept { return e.k0; };
+            if (!fully_exact || has_k1 || order_specs.size() > 1) {
+              StableRadixSortByUint64KeyAndTieBreak(entries, key_fn,
+                                                    entry_precedes);
+            } else {
+              StableRadixSortByUint64Key(entries, key_fn);
+            }
           } else {
             std::sort(entries.begin(), entries.end(), entry_precedes);
           }

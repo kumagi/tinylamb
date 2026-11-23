@@ -2,6 +2,7 @@
 
 #include "server/postgres_protocol.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -10,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "executor/data_chunk.hpp"
 #include "gtest/gtest.h"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -186,15 +188,16 @@ TEST(PostgresProtocolTest, EmptyQueryAndNegotiateProtocolVersion) {
 }
 
 TEST(PostgresProtocolTest, ErrorResponseUsesPositionInOriginalQuery) {
-  const auto statements = SplitSqlStatementsWithPositions(
-      "SELECT '雪';\r\n \tSELECT\n\t)");
+  const auto statements =
+      SplitSqlStatementsWithPositions("SELECT '雪';\r\n \tSELECT\n\t)");
   ASSERT_TRUE(statements.HasValue());
   ASSERT_EQ(statements.Value().size(), 2U);
   const SqlStatement& statement = statements.Value().back();
   constexpr std::string_view diagnostic = "ERROR: syntax error [at 2:9]";
   const auto position = SqlErrorPosition(diagnostic, statement, 0);
   EXPECT_EQ(position, 24U);
-  const std::string response = ErrorResponse(diagnostic, "42601", "ERROR", position);
+  const std::string response =
+      ErrorResponse(diagnostic, "42601", "ERROR", position);
   EXPECT_NE(response.find(std::string("P24\0", 4)), std::string::npos);
   EXPECT_EQ(response.find(std::string("L2\0", 3)), std::string::npos);
 
@@ -513,6 +516,54 @@ TEST(PostgresProtocolTest, SplitSqlStatementsCapsStatementCount) {
   ASSERT_FALSE(overflow.HasValue());
   EXPECT_NE(overflow.GetStatus().GetMessage().find("too many SQL statements"),
             std::string::npos);
+}
+
+TEST(PostgresProtocolTest, AppendDataRowFromChunkMatchesDataRow) {
+  DataChunk chunk;
+  chunk.Append(
+      Row({Value(int64_t{42}), Value(int64_t{-1}).WithUnsigned(), Value(3.125),
+           Value::DateFromDays(20000), Value("ascii"), Value()}));
+  chunk.Append(Row({Value(std::numeric_limits<int64_t>::min()),
+                    Value(int64_t{0}).WithUnsigned(), Value(-0.0),
+                    Value::DateFromDays(0), Value("utf8-\xC3\xA9"), Value()}));
+  chunk.Append(Row({Value(std::numeric_limits<int64_t>::max()),
+                    Value(int64_t{123}).WithUnsigned(),
+                    Value(std::numeric_limits<double>::infinity()), Value(),
+                    Value(""), Value()}));
+  chunk.Append(
+      Row({Value(), Value(), Value(std::numeric_limits<double>::quiet_NaN()),
+           Value::DateFromDays(19000), Value(), Value()}));
+
+  std::string batched;
+  std::string expected_batched;
+  for (size_t r = 0; r < chunk.Size(); ++r) {
+    std::string single;
+    ASSERT_EQ(AppendDataRowFromChunk(&single, chunk, r), Status::kSuccess);
+    const std::string row_bytes = DataRow(chunk.RowAt(r));
+    EXPECT_EQ(single, row_bytes) << "mismatch at row " << r;
+
+    ASSERT_EQ(AppendDataRowFromChunk(&batched, chunk, r), Status::kSuccess);
+    expected_batched += row_bytes;
+  }
+  EXPECT_EQ(batched, expected_batched);
+}
+
+TEST(PostgresProtocolTest, AppendDataRowFromChunkHotIntBoundaries) {
+  DataChunk chunk;
+  const std::vector<int64_t> signed_vals = {-1025, -1024, -1,    0,
+                                            1,     42,    65535, 65536};
+  const std::vector<uint64_t> unsigned_vals = {
+      0, 1, 65535, 65536, std::numeric_limits<uint64_t>::max()};
+  for (size_t i = 0; i < signed_vals.size(); ++i) {
+    const uint64_t uv = unsigned_vals[i % unsigned_vals.size()];
+    chunk.Append(Row({Value(signed_vals[i]),
+                      Value(static_cast<int64_t>(uv)).WithUnsigned()}));
+  }
+  for (size_t r = 0; r < chunk.Size(); ++r) {
+    std::string got;
+    ASSERT_EQ(AppendDataRowFromChunk(&got, chunk, r), Status::kSuccess);
+    EXPECT_EQ(got, DataRow(chunk.RowAt(r))) << "row " << r;
+  }
 }
 
 }  // namespace tinylamb::pgwire
