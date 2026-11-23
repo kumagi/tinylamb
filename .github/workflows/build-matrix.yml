@@ -50,7 +50,7 @@ jobs:
             build-type: Debug
             cmake-args: -DTINYLAMB_ENABLE_LLVM_JIT=OFF
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-toolchain
         with:
           compiler: ${{ matrix.compiler }}
@@ -80,7 +80,7 @@ jobs:
 
       - name: upload test logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ctest-logs-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build-type }}
           path: |

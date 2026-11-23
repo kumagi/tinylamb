@@ -99,7 +99,7 @@ runs:
 
     - name: ccache
       if: inputs.ccache-key != ''
-      uses: hendrikmuhs/ccache-action@v1.2.26
+      uses: hendrikmuhs/ccache-action@e91f31892a1d1b8c44424b1a94c0b7f52d337168 # v1.2.26
       with:
         key: ${{ inputs.ccache-key }}-${{ runner.os }}-${{ runner.arch }}
         max-size: ${{ inputs.ccache-max-size }}
