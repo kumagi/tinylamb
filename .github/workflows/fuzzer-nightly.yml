@@ -3,38 +3,181 @@ on:
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzzing time per target (seconds)
+        default: "600"
+      filter:
+        description: Only run fuzzers whose name matches this regex
+        default: "."
+
 permissions:
   contents: read
-jobs:
-  fuzz-smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FUZZ_BUILD_TYPE: RelWithDebInfo
+
+jobs:
+  # Builds every libFuzzer target once to warm ccache, and derives the matrix
+  # from the add_fuzzer_test() calls in CMakeLists.txt so new fuzzers are
+  # picked up without touching this file.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      fuzzers: ${{ steps.list.outputs.fuzzers }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: list fuzz targets
+        id: list
+        env:
+          FILTER: ${{ inputs.filter || '.' }}
+        run: |
+          names=$(grep -oE '^add_fuzzer_test\([^ )]+' CMakeLists.txt \
+                    | sed -E 's/^add_fuzzer_test\(//; s#.*/##; s/\.cpp$//' \
+                    | grep -E -- "$FILTER" | sort -u)
+          if [ -z "$names" ]; then echo "::error::no fuzz targets selected"; exit 1; fi
+          echo "fuzzers=$(printf '%s\n' "$names" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Fuzz targets"
+            while read -r n; do echo "- \`$n\`"; done <<< "$names"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$names" > fuzz-targets.txt
+
+      # libFuzzer needs clang: GCC dropped -fsanitize=fuzzer.
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: fuzz
+          ccache-max-size: 4G
+          ccache-save: "true"
+
+      # GoogleSQL stays ON: the SQL / OOC session fuzzers drive the real
+      # frontend, and OFF turns them into parse-error generators.
       - name: build fuzzers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
-          # libFuzzer needs clang: GCC 15 dropped -fsanitize=fuzzer, and the
-          # runner's default c++ is GCC.
-          CC=clang CXX=clang++ cmake -S . -B build-fuzz \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DTINYLAMB_ENABLE_FUZZ=ON \
-            -DTINYLAMB_ENABLE_GOOGLESQL=OFF
-          cmake --build build-fuzz -j"$(nproc)" --target \
-            table_fuzzer value_fuzzer date_interval_fuzzer cast_fuzzer \
-            function_fuzzer data_chunk_fuzzer \
-            expression_fuzzer
+          cmake -S . -B build-fuzz \
+            -DCMAKE_BUILD_TYPE="$FUZZ_BUILD_TYPE" \
+            -DTINYLAMB_ENABLE_FUZZ=ON
+          # shellcheck disable=SC2046
+          cmake --build build-fuzz --target $(cat fuzz-targets.txt)
 
-      - name: short fuzz run
+  fuzz:
+    name: fuzz ${{ matrix.fuzzer }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        fuzzer: ${{ fromJSON(needs.build.outputs.fuzzers) }}
+    env:
+      FUZZER: ${{ matrix.fuzzer }}
+      SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Restores the cache the build job just saved; only the link step and
+      # cache lookups run here.
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: fuzz
+          ccache-max-size: 4G
+          ccache-save: "false"
+
+      - name: build ${{ matrix.fuzzer }}
         run: |
-          for f in table_fuzzer value_fuzzer date_interval_fuzzer \
-                   cast_fuzzer function_fuzzer data_chunk_fuzzer \
-                   expression_fuzzer; do
-            ./build-fuzz/$f -runs=1000 -max_total_time=60 || true
-          done
+          cmake -S . -B build-fuzz \
+            -DCMAKE_BUILD_TYPE="$FUZZ_BUILD_TYPE" \
+            -DTINYLAMB_ENABLE_FUZZ=ON
+          cmake --build build-fuzz --target "$FUZZER"
 
-      - name: sweep fuzz database artifacts
+      - name: restore corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz-work/corpus
+          key: fuzz-corpus-${{ matrix.fuzzer }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.fuzzer }}-
+
+      - name: fuzz
+        id: fuzz
+        run: |
+          mkdir -p fuzz-work/corpus fuzz-work/artifacts
+          cd fuzz-work   # fuzzers open databases via relative paths
+          set +e
+          "$GITHUB_WORKSPACE/build-fuzz/$FUZZER" corpus \
+            -fork="$(nproc)" \
+            -max_total_time="$SECONDS_PER_TARGET" \
+            -timeout=60 -rss_limit_mb=4096 \
+            -artifact_prefix="$PWD/artifacts/" \
+            -print_final_stats=1 2>&1 | tee fuzz.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          n=$(find corpus -type f | wc -l)
+          crashes=$(find artifacts -type f | wc -l)
+          {
+            if [ "$rc" -eq 0 ]; then echo "### ✅ $FUZZER"; else echo "### ❌ $FUZZER (exit $rc)"; fi
+            echo
+            echo "| corpus | findings | time budget |"
+            echo "|---:|---:|---:|"
+            echo "| $n | $crashes | ${SECONDS_PER_TARGET}s |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=fuzz finding::$FUZZER exited with $rc ($crashes artifact(s)); see the fuzz-findings-$FUZZER artifact"
+            # Keep the stack trace next to the reproducer.
+            tail -n 200 fuzz.log > artifacts/stack-trace.txt
+          fi
+          exit "$rc"
+
+      # Save the grown corpus even when a crash ended the run.
+      - name: save corpus
         if: always()
-        run: python3 scripts/clean_root_artifacts.py
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz-work/corpus
+          key: fuzz-corpus-${{ matrix.fuzzer }}-${{ github.run_id }}
+
+      - name: upload findings
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings-${{ matrix.fuzzer }}
+          path: fuzz-work/artifacts/
+          retention-days: 30
+
+  # Nightly runs have nobody watching: turn a red night into a tracked issue
+  # (one open issue per day, reused if it already exists).
+  report:
+    needs: [build, fuzz]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create fuzz --color B60205 --description "Found by fuzzing" --force
+          title="fuzzer-nightly failed on $(date -u +%F)"
+          existing=$(gh issue list --label fuzz --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body="The nightly fuzz run failed: $RUN_URL
+
+          Reproducers and stack traces are attached to the run as \`fuzz-findings-*\` artifacts.
+          Add each reproducer as a regression test before deleting it."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label fuzz --body "$body"
+          fi

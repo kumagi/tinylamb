@@ -1,0 +1,31 @@
+name: workflow-lint
+# actionlint (+ shellcheck on every run: block) for .github/. Catches typos
+# in expressions, unknown action inputs and shell bugs before they become a
+# silently-green or permanently-red workflow.
+on:
+  push:
+    branches: [master]
+    paths: ['.github/**']
+  pull_request:
+    paths: ['.github/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          # The runner image ships ShellCheck; actionlint runs it on run: blocks.
+          # shellcheck disable=SC2016 # Go template, not shell expansion
+          ./actionlint -format '{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}{{"\n"}}{{end}}'

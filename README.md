@@ -1,5 +1,25 @@
-![ctest](https://github.com/kumagi/tinylamb/actions/workflows/run-ctest.yml/badge.svg)
-![format](https://github.com/kumagi/tinylamb/actions/workflows/clang-format.yml/badge.svg)
+<!-- CI status (master) -->
+[![ctest](https://github.com/kumagi/tinylamb/actions/workflows/run-ctest.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/run-ctest.yml?query=branch%3Amaster)
+[![build](https://github.com/kumagi/tinylamb/actions/workflows/build-matrix.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/build-matrix.yml?query=branch%3Amaster)
+[![tsan](https://github.com/kumagi/tinylamb/actions/workflows/tsan.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/tsan.yml?query=branch%3Amaster)
+[![fuzzer-nightly](https://github.com/kumagi/tinylamb/actions/workflows/fuzzer-nightly.yml/badge.svg)](https://github.com/kumagi/tinylamb/actions/workflows/fuzzer-nightly.yml)
+[![Lean proofs](https://github.com/kumagi/tinylamb/actions/workflows/lean.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/lean.yml?query=branch%3Amaster)
+[![benchmark](https://github.com/kumagi/tinylamb/actions/workflows/benchmark.yml/badge.svg)](https://github.com/kumagi/tinylamb/actions/workflows/benchmark.yml)
+
+<!-- Code quality / security -->
+[![clang-format](https://github.com/kumagi/tinylamb/actions/workflows/clang-format.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/clang-format.yml?query=branch%3Amaster)
+[![clang-tidy](https://github.com/kumagi/tinylamb/actions/workflows/clang-tidy.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/clang-tidy.yml?query=branch%3Amaster)
+[![CodeQL](https://github.com/kumagi/tinylamb/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/kumagi/tinylamb/actions/workflows/codeql.yml?query=branch%3Amaster)
+[![codecov](https://codecov.io/gh/kumagi/tinylamb/graph/badge.svg?branch=master)](https://codecov.io/gh/kumagi/tinylamb)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/kumagi/tinylamb/badge)](https://scorecard.dev/viewer/?uri=github.com/kumagi/tinylamb)
+
+<!-- Project facts -->
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/20)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?logo=linux&logoColor=white)](#continuous-integration)
+[![TPC-H](https://img.shields.io/badge/TPC--H-Q1%E2%80%93Q22-success)](#sql-frontend)
+[![Built with CMake](https://img.shields.io/badge/build-CMake%20%2B%20Ninja-064F8C?logo=cmake)](https://cmake.org)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE.txt)
+[![GitHub last commit](https://img.shields.io/github/last-commit/kumagi/tinylamb)](https://github.com/kumagi/tinylamb/commits/master)
 
 tinylamb
 ===========
@@ -255,6 +275,29 @@ deduplicated failing queries and reproduction `.test` files.
 ./scripts/oci_fuzz.sh stop
 ./scripts/oci_fuzz.sh restart
 ```
+
+Continuous integration
+======================
+
+Every workflow lives in `.github/workflows/` and shares the toolchain setup in
+`.github/actions/setup-toolchain` (LLVM/Clang 21 from apt.llvm.org pinned to
+match the dev box, Ninja, mold, ccache).
+
+| Workflow | Trigger | What it checks |
+|---|---|---|
+| `ctest` | push / PR | layering + OOC invariant lint, then the full suite (`-LE scale`) under ASan + UBSan; GoogleSQL compliance (informational) |
+| `build` | push / PR | Linux clang-21 Release, Linux gcc-14 RelWithDebInfo, macOS Apple Clang Debug (build + tests) |
+| `tsan` | push / PR | concurrency suites under ThreadSanitizer, plus advisory lock-order detection |
+| `clang-format` / `clang-tidy` | push / PR | formatting (clang-format 22; a fix-up patch is uploaded on failure) and tidy on changed lines |
+| `CodeQL` / `flawfinder` / `Scorecard` | push / weekly | static security analysis and supply-chain posture → Security tab |
+| `coverage` | push to master / weekly | gcov line coverage of production sources → Codecov + job summary |
+| `fuzzer-nightly` | daily | every `add_fuzzer_test()` target for 10 min each with a persisted corpus; findings are uploaded as artifacts and filed as a `fuzz` issue |
+| `benchmark` | weekly | TPC-H SF=1 regression gate against `BenchmarkHistory.md` (GitHub runners are noisy; authoritative numbers come from evo-x2) |
+| `Lean proofs` | `lean/**` changes | `lake build` of the optimizer proofs |
+| `workflow-lint` | `.github/**` changes | actionlint + ShellCheck on the workflows themselves |
+
+Test results, slowest tests, coverage and TPC-H timings are rendered into each
+run's job summary. Dependabot keeps the pinned actions current.
 
 License
 ==========

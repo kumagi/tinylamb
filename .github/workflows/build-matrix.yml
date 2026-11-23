@@ -1,0 +1,93 @@
+name: build
+# Cross-compiler / cross-platform matrix. tinylamb must keep building and
+# passing on both Linux and macOS; the ASan job in ctest.yml covers Debug +
+# sanitizers, this one covers optimized builds, GCC and Apple Clang.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Release catches optimizer-dependent UB and keeps -O2 warnings
+          # clean; LLVM JIT is ON so the ORC expression kernels are exercised.
+          - name: Linux / clang-21 / Release
+            os: ubuntu-24.04
+            compiler: clang
+            build-type: Release
+            cmake-args: ""
+          - name: Linux / gcc-14 / RelWithDebInfo
+            os: ubuntu-24.04
+            compiler: gcc
+            build-type: RelWithDebInfo
+            cmake-args: ""
+          # Apple's libc++ has no C++20 tzdb (CFTimeZone path) and ld64
+          # rejects --start-group; this job keeps both code paths honest.
+          # Homebrew's llvm tracks the newest major, which jit.cpp does not
+          # target, so the JIT is off here.
+          - name: macOS / Apple Clang / Debug
+            os: macos-15
+            compiler: apple-clang
+            build-type: Debug
+            cmake-args: -DTINYLAMB_ENABLE_LLVM_JIT=OFF
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          compiler: ${{ matrix.compiler }}
+          ccache-key: build-${{ matrix.compiler }}-${{ matrix.build-type }}
+
+      - name: configure
+        env:
+          BUILD_TYPE: ${{ matrix.build-type }}
+          EXTRA_ARGS: ${{ matrix.cmake-args }}
+        run: |
+          # shellcheck disable=SC2086
+          cmake -S . -B build -DCMAKE_BUILD_TYPE="$BUILD_TYPE" $EXTRA_ARGS
+
+      - name: build
+        run: cmake --build build
+
+      - name: test
+        run: |
+          ctest --test-dir build -LE scale \
+            --output-junit "$PWD/build/ctest-junit.xml" --timeout 300
+
+      - name: test summary
+        if: always()
+        env:
+          TITLE: ctest (${{ matrix.name }})
+        run: python3 .github/scripts/ctest_summary.py build/ctest-junit.xml --title "$TITLE"
+
+      - name: upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-logs-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build-type }}
+          path: |
+            build/ctest-junit.xml
+            build/Testing/Temporary/LastTest*.log
+          retention-days: 14
+
+      - name: sweep test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py

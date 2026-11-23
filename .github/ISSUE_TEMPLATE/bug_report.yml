@@ -1,0 +1,56 @@
+name: Bug report
+description: Wrong result, crash, hang, or recovery / durability problem
+labels: [bug]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Wrong query result
+        - Crash / sanitizer report
+        - Hang / does not finish
+        - Recovery / durability (data lost or corrupted after restart)
+        - Build failure
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Smallest SQL script (piped into `./build/tinylamb`) or fuzz reproducer that shows the problem.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected (e.g. DuckDB / PostgreSQL output) and what tinylamb did.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      placeholder: git rev-parse --short HEAD
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Linux x86_64, Linux arm64, macOS arm64, macOS x86_64, Other]
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build configuration
+      placeholder: "Debug, clang-21, TINYLAMB_ENABLE_SANITIZERS=ON"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / stack trace
+      render: text

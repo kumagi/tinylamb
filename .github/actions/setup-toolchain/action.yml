@@ -1,0 +1,121 @@
+name: Setup tinylamb toolchain
+description: >
+  Installs the pinned compiler toolchain (LLVM/Clang 21 from apt.llvm.org, or
+  GCC), Ninja, mold and ccache, and exports CC/CXX/LLVM_ROOT/CMAKE_GENERATOR
+  so every workflow configures tinylamb the same way as the local dev box
+  (clang/llvm 21.1.8, see AGENTS.local.md).
+
+inputs:
+  compiler:
+    description: "clang | gcc | apple-clang"
+    default: clang
+  llvm-version:
+    description: LLVM major version to install from apt.llvm.org
+    default: "21"
+  gcc-version:
+    description: GCC major version (compiler=gcc only)
+    default: "14"
+  extra-packages:
+    description: Extra apt / brew packages to install
+    default: ""
+  ccache-key:
+    description: ccache cache key (empty disables ccache)
+    default: ""
+  ccache-max-size:
+    description: ccache maximum size
+    default: 2G
+  ccache-save:
+    description: "auto (save except on pull_request) | true | false"
+    default: auto
+
+runs:
+  using: composite
+  steps:
+    - name: Install toolchain (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        COMPILER: ${{ inputs.compiler }}
+        LLVM: ${{ inputs.llvm-version }}
+        GCC: ${{ inputs.gcc-version }}
+        EXTRA: ${{ inputs.extra-packages }}
+      run: |
+        set -euo pipefail
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        # The runner image ships several LLVM versions side by side (and an
+        # older default clang). expression/jit.cpp targets the LLVM 21 API,
+        # so pin the exact toolchain instead of relying on "apt install clang".
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+          sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm-snapshot.gpg
+        echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${LLVM} main" | \
+          sudo tee /etc/apt/sources.list.d/llvm-${LLVM}.list > /dev/null
+        sudo apt-get update -qq
+        # cmake and python3 come with the runner image (newer than apt's).
+        pkgs=(ninja-build mold ccache
+              "llvm-${LLVM}-dev" "libclang-rt-${LLVM}-dev"
+              zlib1g-dev libzstd-dev)
+        if [ "$COMPILER" = gcc ]; then
+          pkgs+=("gcc-${GCC}" "g++-${GCC}")
+        else
+          pkgs+=("clang-${LLVM}" "lld-${LLVM}")
+        fi
+        # shellcheck disable=SC2206
+        pkgs+=($EXTRA)
+        sudo apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
+
+        if [ "$COMPILER" = gcc ]; then
+          echo "CC=gcc-${GCC}" >> "$GITHUB_ENV"
+          echo "CXX=g++-${GCC}" >> "$GITHUB_ENV"
+        else
+          echo "CC=clang-${LLVM}" >> "$GITHUB_ENV"
+          echo "CXX=clang++-${LLVM}" >> "$GITHUB_ENV"
+        fi
+        # find_package(LLVM CONFIG) honours <Pkg>_ROOT (CMP0074); without it
+        # CMake may pick whichever llvm-*/cmake it finds first.
+        echo "LLVM_ROOT=/usr/lib/llvm-${LLVM}" >> "$GITHUB_ENV"
+        echo "/usr/lib/llvm-${LLVM}/bin" >> "$GITHUB_PATH"
+
+    - name: Install toolchain (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        EXTRA: ${{ inputs.extra-packages }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        brew install --quiet ninja ccache $EXTRA
+        echo "CC=$(xcrun -f clang)" >> "$GITHUB_ENV"
+        echo "CXX=$(xcrun -f clang++)" >> "$GITHUB_ENV"
+
+    - name: Common CMake environment
+      shell: bash
+      run: |
+        {
+          echo "CMAKE_GENERATOR=Ninja"
+          echo "CTEST_OUTPUT_ON_FAILURE=1"
+          echo "CTEST_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)"
+        } >> "$GITHUB_ENV"
+
+    - name: ccache
+      if: inputs.ccache-key != ''
+      uses: hendrikmuhs/ccache-action@v1.2.26
+      with:
+        key: ${{ inputs.ccache-key }}-${{ runner.os }}-${{ runner.arch }}
+        max-size: ${{ inputs.ccache-max-size }}
+        evict-old-files: job
+        # By default only non-PR runs populate the cache; PRs restore from it.
+        save: ${{ inputs.ccache-save == 'true' || (inputs.ccache-save == 'auto' && github.event_name != 'pull_request') }}
+
+    - name: Toolchain summary
+      shell: bash
+      run: |
+        {
+          echo "### Toolchain"
+          echo '```'
+          "$CXX" --version | head -1
+          cmake --version | head -1
+          echo "ninja $(ninja --version)"
+          command -v ccache >/dev/null && ccache --version | head -1
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,31 +1,64 @@
 name: clang-format
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # CI pins clang-format 22 explicitly rather than using the distro
       # default: clang-format (< 19) disagrees on requires-clause indentation,
-      # which made this job fail even on empty patches. Local dev toolchain is
-      # clang/llvm 21.1.8 (AGENTS.local.md); run the pinned version to match CI.
+      # which made this job fail even on empty patches. Run the same pinned
+      # version locally to match CI.
       - name: Install clang-format 22
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
             sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm-snapshot.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-format-22
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang-format-22
 
       - name: Check diff
         run: |
           # Quote the pathspecs: an unquoted *.{...} glob expands against the
           # repo root only, so nested files silently dropped out of the check.
           git ls-files '*.c' '*.h' '*.cc' '*.cpp' '*.hpp' '*.tcc' '*.inc' '*.ipp' '*.inl' | \
-            xargs -r clang-format-22 -style=file -i
-          git diff --exit-code
+            xargs -r -P "$(nproc)" -n 32 clang-format-22 -style=file -i
+          if git diff --quiet; then
+            echo "### ✅ clang-format clean" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git diff > clang-format.patch
+          {
+            echo "### ❌ clang-format found unformatted files"
+            echo
+            echo "Fix locally with \`git apply clang-format.patch\` (artifact) or run clang-format-22."
+            echo
+            git diff --stat | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff --name-only | while read -r f; do
+            echo "::error file=$f,title=clang-format::$f is not clang-format-22 clean"
+          done
+          exit 1
+
+      - name: Upload fix-up patch
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clang-format-patch
+          path: clang-format.patch
+          retention-days: 7

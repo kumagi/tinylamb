@@ -1,21 +1,34 @@
 name: clang-tidy
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   tidy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: install deps
-        run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy clang-tools
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          extra-packages: clang-tidy-21 clang-tools-21
 
       - name: configure
-        run: CC=clang CXX=clang++ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTINYLAMB_ENABLE_GOOGLESQL=OFF
 
       - name: clang-tidy diff
         env:
@@ -23,39 +36,40 @@ jobs:
           PUSH_BASE: ${{ github.event.before }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          # Match the diff helper to the clang-tidy binary; several LLVM
-          # versions can be installed side by side on the runner. The helper
-          # is a Python script and need not carry the executable bit.
-          TIDY_VERSION=$(clang-tidy --version | sed -nE 's/.*LLVM version ([0-9]+).*/\1/p' | head -1)
-          if [ -z "$TIDY_VERSION" ]; then
-            echo "could not determine clang-tidy LLVM version" >&2
-            exit 1
-          fi
-          TIDY_DIFF="/usr/bin/clang-tidy-diff-${TIDY_VERSION}.py"
+          # Use the helper and binary of the pinned LLVM so the diff driver
+          # and the checks always come from the same release.
+          TIDY_DIFF=/usr/bin/clang-tidy-diff-21.py
           if [ ! -f "$TIDY_DIFF" ]; then
-            echo "matching clang-tidy-diff helper not found: $TIDY_DIFF" >&2
+            echo "::error::clang-tidy-diff helper not found: $TIDY_DIFF"
             exit 1
           fi
           if [ -n "$PR_BASE" ]; then
             BASE=$(git merge-base "$PR_BASE" HEAD)
-          elif [ "$PUSH_BASE" = "0000000000000000000000000000000000000000" ]; then
-            DEFAULT_REF="origin/$DEFAULT_BRANCH"
-            if ! git rev-parse --verify "$DEFAULT_REF" >/dev/null 2>&1; then
-              echo "default branch ref not found: $DEFAULT_REF" >&2
-              exit 1
-            fi
-            BASE=$(git merge-base "$DEFAULT_REF" HEAD)
+          elif [ -z "$PUSH_BASE" ] || [ "$PUSH_BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)
           else
             BASE="$PUSH_BASE"
           fi
           CHANGED=$(git diff --no-prefix -U0 "$BASE" HEAD -- '*.cpp' '*.hpp')
           if [ -z "$CHANGED" ]; then
-            echo "no C++ diff"
+            echo "no C++ diff" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # CHANGED was produced with --no-prefix, so its '+++' lines carry
           # no a/ or b/ component. clang-tidy-diff defaults to -p1 and would
           # match none of them, reporting "No relevant changes found" with a
           # success exit code. -p0 keeps the CI job from passing vacuously.
+          set -o pipefail
           printf '%s\n' "$CHANGED" | \
-            python3 "$TIDY_DIFF" -p0 -path build -quiet -j "$(nproc)"
+            python3 "$TIDY_DIFF" -p0 -path build -quiet -j "$(nproc)" \
+              -clang-tidy-binary clang-tidy-21 | tee clang-tidy.log
+
+      - name: Annotate findings
+        if: failure()
+        run: |
+          # file:line:col: warning|error: message [check]
+          # Annotations need repo-relative paths; clang-tidy prints absolute.
+          [ -f clang-tidy.log ] || exit 0
+          grep -E '^[^ ]+:[0-9]+:[0-9]+: (warning|error):' clang-tidy.log | sort -u | head -50 | \
+            sed -E "s#^${GITHUB_WORKSPACE}/##" | \
+            sed -E 's#^([^:]+):([0-9]+):([0-9]+): (warning|error): (.*)$#::\4 file=\1,line=\2,col=\3,title=clang-tidy::\5#' || true

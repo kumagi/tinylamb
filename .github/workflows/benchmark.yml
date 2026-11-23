@@ -7,27 +7,33 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   tpch-sf1:
     # P3-1 benchmark regression gate. SF=1 fixed; bench_gate.py compares
     # per-query times (and the q1..q22 sum) against BenchmarkHistory.md.
+    # GitHub-hosted runners are noisy: authoritative numbers come from
+    # evo-x2; this job only catches order-of-magnitude regressions.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
+      # LLVM 21 + JIT ON: the Release engine relies on the ORC kernels.
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: bench-release
 
       - name: Build TPC-H driver (Release)
         run: |
           cmake -S . -B build-rel \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=clang++ \
             -DTINYLAMB_ENABLE_GOOGLESQL=ON
-          cmake --build build-rel --target tinylamb_tpch_benchmark -j"$(nproc)"
+          cmake --build build-rel --target tinylamb_tpch_benchmark
 
       - name: Run TPC-H SF=1 (load + Q1-Q22)
         working-directory: build-rel
@@ -36,11 +42,11 @@ jobs:
           ./tinylamb_tpch_benchmark ./tpch-run/sf1 \
             --scale-factor 1 --force | tee tpch-sf1.log
 
-      - name: Convert TPCH_PROFILE output to TSV
+      - name: Convert TPCH_PROFILE output to TSV + job summary
         working-directory: build-rel
         run: |
           python3 - <<'EOF'
-          import re, sys
+          import os, re, sys
           total_ms = 0.0
           rows = []
           for line in open("tpch-sf1.log", encoding="utf-8"):
@@ -56,6 +62,14 @@ jobs:
                   out.write(f"q{q}_ms\t{ms}\n")
               out.write(f"query_sum_q1_q22\t{total_ms / 1000.0}\n")
           print(open("results.tsv").read())
+          peak = max(ms for _, ms in rows)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write("## TPC-H SF=1 (GitHub runner, cold)\n\n")
+              s.write(f"**Σ Q1–Q22: {total_ms / 1000.0:.2f} s**\n\n")
+              s.write("| query | ms | |\n|---|---:|---|\n")
+              for q, ms in sorted(rows):
+                  bar = "█" * max(1, round(20 * ms / peak))
+                  s.write(f"| Q{q} | {ms:.1f} | `{bar}` |\n")
           EOF
 
       - name: Regression gate (fail on >10% slowdown vs BenchmarkHistory.md)
@@ -67,9 +81,10 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tpch-sf1-results
           path: |
             build-rel/tpch-sf1.log
             build-rel/results.tsv
+          if-no-files-found: ignore
