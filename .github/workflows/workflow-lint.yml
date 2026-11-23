@@ -27,5 +27,8 @@ jobs:
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
           # The runner image ships ShellCheck; actionlint runs it on run: blocks.
-          # shellcheck disable=SC2016 # Go template, not shell expansion
-          ./actionlint -format '{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}{{"\n"}}{{end}}'
+          # ANSI-C quoting gives the template a real newline per annotation
+          # (actionlint's template parser rejects an escaped "\\n").
+          # shellcheck disable=SC2016 # Go template, not shell expansion.
+          fmt=$'{{range $err := .}}::error file={{$err.Filepath}},line={{$err.Line}},col={{$err.Column}}::{{$err.Message}}\n{{end}}'
+          ./actionlint -format "$fmt"
