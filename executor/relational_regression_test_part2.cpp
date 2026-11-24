@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/test_util.hpp"
 #include "executor/relational_regression_test.hpp"
 
 namespace tinylamb {
@@ -487,7 +488,7 @@ TEST_F(RelationalRegressionTest, DependentIntegerGroupKeysKeepErrorsAndNulls) {
     } else {
       EXPECT_EQ(result.GetStatus(), expected_error.GetStatus());
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -764,7 +765,7 @@ TEST_F(RelationalRegressionTest,
   while (prepared.Value()->Next(&row, nullptr)) {
   }
   EXPECT_EQ(prepared.Value()->GetStatus(), Status::kIsInfinity);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, NumericProjectionAccountsForLateTextValues) {
@@ -1484,7 +1485,7 @@ TEST_F(RelationalRegressionTest, CorrelatedCteIndexTracksBindingAndNullKeys) {
   bind(40);
   probe(Value(1), Value(41.0));
   context.set_execution_runtime(nullptr);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, StringCorrelationDomainTracksGeneration) {
@@ -1531,7 +1532,7 @@ TEST_F(RelationalRegressionTest, StringCorrelationDomainTracksGeneration) {
   runtime.correlated_outer_relation = nullptr;
   probe("alpha group", 3);
   context.set_execution_runtime(nullptr);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -1575,7 +1576,7 @@ TEST_F(RelationalRegressionTest,
   EXPECT_EQ(output.rows[0][1], Value(int64_t{-100}));
   EXPECT_EQ(output.rows[0][2], Value(int64_t{100}));
   EXPECT_EQ(output.rows[0][3], Value(int64_t{3}));
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -1630,7 +1631,7 @@ TEST_F(RelationalRegressionTest,
         EXPECT_NEAR(row[5].value.double_value, std::sqrt(variance), 1e-10);
         EXPECT_NEAR(row[6].value.double_value, std::sqrt(sample), 1e-10);
       }
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     }
   }
 }
@@ -1734,7 +1735,7 @@ TEST_F(RelationalRegressionTest, CompactStatisticsKeepSequentialMoments) {
     EXPECT_FALSE(declined.has_value());
     owned.back()->SetWhereFilter(nullptr);
     context.set_execution_runtime(nullptr);
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -1771,7 +1772,7 @@ TEST_F(RelationalRegressionTest, ParallelProbePadsNullAndNaNLeftKeys) {
     }
   }
   EXPECT_EQ(padded, 2U);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -1799,7 +1800,7 @@ TEST_F(RelationalRegressionTest,
   relational_detail::Relation output = finished.MoveValue();
   ASSERT_EQ(output.rows.size(), 1U);
   EXPECT_EQ(output.rows[0][0], Value(int64_t{kRowCount / 2}));
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -1950,7 +1951,7 @@ TEST_F(RelationalRegressionTest,
         relational_detail::TryCompactGroupingSets(context, sets, repeated);
     EXPECT_EQ(parallel_overflow.GetStatus(), Status::kIsInfinity);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, CompactGroupingFoldsExpandedConstantOutputs) {
@@ -2555,7 +2556,7 @@ TEST_F(RelationalRegressionTest, CompactMaterializedGroupsPreserveBoundaries) {
   QueryMemoryBudget::Global().ResetForTest(limit);
   ASSERT_TRUE(compact.HasValue());
   EXPECT_FALSE(compact.Value().has_value());
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, CompactBorrowedKeysPreserveCanonicalPeers) {
@@ -2601,7 +2602,7 @@ TEST_F(RelationalRegressionTest, CompactBorrowedKeysPreserveCanonicalPeers) {
   EXPECT_EQ(output->rows[0][0], Value("long text repeated across rows"));
   EXPECT_TRUE(std::isnan(output->rows[0][1].value.double_value));
   EXPECT_FALSE(std::signbit(output->rows[1][1].value.double_value));
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 // Computed GROUP BY keys and aggregate arguments join the parallel fold
@@ -2658,7 +2659,7 @@ TEST_F(RelationalRegressionTest,
     EXPECT_EQ(iter->second.first, 65536) << "group " << q;
     EXPECT_EQ(iter->second.second, 65536 * (2 * q + 4)) << "group " << q;
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 // A single statement that first narrows AggTable through an uncorrelated IN

@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 
+#include "common/platform/process.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "server/postgres_server.hpp"
 
@@ -76,7 +77,7 @@ int main(int argc, char** argv) {
   tinylamb::PostgresServerOptions options;
   // Connection cap can be preset through the environment; the command line
   // flag overrides it. Connections beyond the limit are shed on accept.
-  if (const char* env = std::getenv("TINYLAMB_MAX_CONNECTIONS");
+  if (const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_MAX_CONNECTIONS");
       env != nullptr && env[0] != '\0') {
     unsigned long connections = 0;
     // P382: the flag path validates 1..65536; the env preset must apply the

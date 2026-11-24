@@ -36,10 +36,14 @@ std::mutex& TraceLogLevelMutex() {
   return mutex;
 }
 
-class ScopedTraceLogLevel {
+class
+    ScopedTraceLogLevel {  // NOLINT(cppcoreguidelines-special-member-functions):
+                           // scope-owned cleanup.
+
  public:
   ScopedTraceLogLevel()
-      : lock_(TraceLogLevelMutex()), previous_(::tinylamb::detail::MinLogLevel()) {
+      : lock_(TraceLogLevelMutex()),
+        previous_(::tinylamb::detail::MinLogLevel()) {
     ::tinylamb::detail::SetMinLogLevel(TRACE);
   }
   ~ScopedTraceLogLevel() { ::tinylamb::detail::SetMinLogLevel(previous_); }
@@ -79,7 +83,8 @@ TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
 TEST(LogMessageTest, UnknownSeverityReportsTheMessageWithoutAborting) {
   const ScopedTraceLogLevel trace_level;
   ::testing::internal::CaptureStderr();
-  LogMessage(static_cast<LogLevel>(65535), __FILE__, __LINE__, __func__, true)
+  LogMessage(static_cast<LogLevel>(65535),  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+             __FILE__, __LINE__, __func__, true)
           .stream()
       << "unrecognized-severity-message";
   const std::string output = ::testing::internal::GetCapturedStderr();

@@ -295,6 +295,7 @@ std::optional<size_t> SqlErrorPosition(std::string_view message,
   const char* const end = location.data() + location.size();
   size_t line = 0;
   size_t column = 0;
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): from_chars receives the explicit end pointer.
   const auto parsed_line = std::from_chars(location.data(), split, line);
   const auto parsed_col = std::from_chars(split + 1, end, column);
   if (parsed_line.ptr != split || parsed_line.ec != std::errc{} || line == 0 ||

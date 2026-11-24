@@ -1128,8 +1128,10 @@ TEST_F(TableTest, Insert_WhenPageIsFull_AllocatesNewPage) {
 TEST_F(TableTest, NoWaitRejectsForeignTailBeforePublication) {
   rs_->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
   auto setup = rs_->BeginContext();
-  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(setup,
-      Schema("tail_nowait", {Column("v", ValueType::kVarChar)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      rs_->CreateTable(
+          setup, Schema("tail_nowait", {Column("v", ValueType::kVarChar)})));
   ASSERT_SUCCESS(setup.PreCommit());
   auto owner = rs_->BeginContext();
   auto waiter = rs_->BeginContext();
@@ -1138,8 +1140,10 @@ TEST_F(TableTest, NoWaitRejectsForeignTailBeforePublication) {
   ASSERT_SUCCESS(pm->ReserveTableTail(owner.txn_, head, head));
   const Status reserved = pm->ReserveTableTail(waiter.txn_, head, head);
   EXPECT_EQ(reserved, Status::kConflicts);
-  EXPECT_EQ(reserved.GetMessage(), "table tail reservation held by another transaction");
-  ASSIGN_OR_ASSERT_FAIL(PageRef, successor, pm->AllocateNewPage(owner.txn_, PageType::kRowPage));
+  EXPECT_EQ(reserved.GetMessage(),
+            "table tail reservation held by another transaction");
+  ASSIGN_OR_ASSERT_FAIL(PageRef, successor,
+                        pm->AllocateNewPage(owner.txn_, PageType::kRowPage));
   const page_id_t tail = successor->PageID();
   successor.PageUnlock();
   ASSERT_SUCCESS(pm->LinkReservedTableTail(owner.txn_.ID(), head, head, tail));
@@ -1743,7 +1747,11 @@ TEST_F(TableTest, UniqueIndexWaitsForAbortedWriterAndSucceeds) {
       auto tbl = s2.GetTable(tbl_name).Value();
       Status ins = tbl->Insert(s2.txn_, Row({Value(42), Value(2)})).GetStatus();
       if (ins != Status::kSuccess) {
-        (void)s2.txn_.Abort();
+        const Status abort_status = s2.txn_.Abort();
+        if (abort_status != Status::kSuccess) {
+          LOG(WARN) << "rollback after failed insert also failed: "
+                    << abort_status;
+        }
         return ins;
       }
       return s2.txn_.PreCommit();

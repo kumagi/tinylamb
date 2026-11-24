@@ -449,8 +449,10 @@ Status ForeignKeyCounts::RebuildWithDeltas() {
               RETURN_IF_FAIL(decode_leaf_block(top.offset, top.length, emit));
             } else {
               // T4637: Read fills every byte; skip the memset.
-              std::unique_ptr<char[]> dir_raw(
-                  new char[top.length]);  // NOLINT(modernize-avoid-c-arrays)
+              std::unique_ptr<char[]>  // NOLINT(modernize-avoid-c-arrays): runtime-sized read owner.
+              dir_raw(  // NOLINT(modernize-avoid-c-arrays):
+                        // runtime-sized read buffer.
+                  new char[top.length]);
               RETURN_IF_FAIL(
                   store_->Read(old_seg, top.offset, dir_raw.get(), top.length));
               std::string_view sv(dir_raw.get(), top.length);
@@ -518,8 +520,8 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
     // T4636: store_->Read overwrites every byte; the old
     // std::string(leaf->length, '\0') memset the same block again for
     // nothing. Default-new'ed char[] skips it, view keeps parsing identical.
-    std::unique_ptr<char[]> dir_raw(
-        new char[leaf->length]);  // NOLINT(modernize-avoid-c-arrays)
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized read buffer.
+    std::unique_ptr<char[]> dir_raw(new char[leaf->length]);
     RETURN_IF_FAIL(
         store_->Read(segment_id_, leaf->offset, dir_raw.get(), leaf->length));
     std::string_view sv(dir_raw.get(), leaf->length);
@@ -558,8 +560,8 @@ StatusOr<int64_t> ForeignKeyCounts::LookupSpilledCount(
   }
 
   // T4635: same uninit-buffer rule as the dir read above.
-  std::unique_ptr<char[]> leaf_raw(
-      new char[leaf_len]);  // NOLINT(modernize-avoid-c-arrays)
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized read buffer.
+  std::unique_ptr<char[]> leaf_raw(new char[leaf_len]);
   RETURN_IF_FAIL(store_->Read(segment_id_, leaf_off, leaf_raw.get(), leaf_len));
   std::string_view sv(leaf_raw.get(), leaf_len);
   uint32_t n = 0;

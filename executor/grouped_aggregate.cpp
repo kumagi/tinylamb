@@ -614,12 +614,14 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
         return StatusError(StatusCode::kInvalidArgument,
                            "aggregate argument has no positional offset");
       }
-      const Value value =
-          aggregate_count_star_[i]
-              ? Value(1)
-              // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-              // harness assumes success
-              : image[*value_offset];
+      Value value(1);
+      if (!aggregate_count_star_[i]) {
+        if (!value_offset.has_value()) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "aggregate argument has no positional offset");
+        }
+        value = image[value_offset.value()];
+      }
       ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, table->StateFor(group, i));
       RETURN_IF_FAIL(state->Add(value));
     }

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/status_or.hpp"
 #ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
@@ -45,7 +46,8 @@ namespace {
 // The trace flag is fixed for the lifetime of a benchmark process. Reading the
 // environment once keeps it out of the timed SQL path.
 bool SqlTraceEnabled() {
-  static const bool enabled = std::getenv("TPCC_SQL_TRACE") != nullptr;
+  static const bool enabled =
+      ::tinylamb::platform::GetEnv("TPCC_SQL_TRACE") != nullptr;
   return enabled;
 }
 
@@ -287,7 +289,8 @@ class TpccWorkload::Transaction {
   }
   void Abort() {
     if (active_) {
-      session_->Abort();
+      session_->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                          // rollback preserves the primary error.
     }
     active_ = false;
   }
@@ -340,9 +343,12 @@ class TpccWorkload::Transaction {
       return;
     }
     if (session_ != nullptr) {
-      session_->Abort();
+      session_->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                          // rollback preserves the primary error.
     } else if (native_.has_value()) {
-      native_->Abort();
+      static_cast<void>(native_  // NOLINT(bugprone-unused-return-value):
+                                 // best-effort rollback.
+                            ->Abort());
     }
     active_ = false;
   }
@@ -431,7 +437,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
   for (std::string_view statement : schema) {
     Status status = ExecuteSql(database, schema_context, statement, error);
     if (status != Status::kSuccess) {
-      schema_context.Abort();
+      static_cast<void>(schema_context  // NOLINT(bugprone-unused-return-value):
+                                        // best-effort rollback.
+                            .Abort());
       return status;
     }
   }
@@ -458,7 +466,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       if (error != nullptr) {
         *error = "failed to create TPC-C index";
       }
-      schema_context.Abort();
+      static_cast<void>(schema_context  // NOLINT(bugprone-unused-return-value):
+                                        // best-effort rollback.
+                            .Abort());
       return status;
     }
   }
@@ -498,7 +508,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     StatusOr<std::array<std::shared_ptr<Table>, kTpccTables.size()>> tables =
         open_tables(item_context);
     if (!tables.HasValue()) {
-      item_context.Abort();
+      static_cast<void>(item_context  // NOLINT(bugprone-unused-return-value):
+                                      // best-effort rollback.
+                            .Abort());
       return tables.GetStatus();
     }
     auto insert = [&](size_t table, const Row& row) {
@@ -518,7 +530,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       if (error != nullptr) {
         *error = "failed to load TPC-C fixture";
       }
-      item_context.Abort();
+      static_cast<void>(item_context  // NOLINT(bugprone-unused-return-value):
+                                      // best-effort rollback.
+                            .Abort());
       return status;
     }
     status = item_context.PreCommit();
@@ -535,7 +549,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
     StatusOr<std::array<std::shared_ptr<Table>, kTpccTables.size()>> tables =
         open_tables(load_context);
     if (!tables.HasValue()) {
-      load_context.Abort();
+      static_cast<void>(load_context  // NOLINT(bugprone-unused-return-value):
+                                      // best-effort rollback.
+                            .Abort());
       return tables.GetStatus();
     }
     auto insert = [&](size_t table, const Row& row) {
@@ -626,7 +642,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       if (error != nullptr) {
         *error = "failed to load TPC-C fixture";
       }
-      load_context.Abort();
+      static_cast<void>(load_context  // NOLINT(bugprone-unused-return-value):
+                                      // best-effort rollback.
+                            .Abort());
       return status;
     }
     status = load_context.PreCommit();
@@ -645,7 +663,9 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       if (error != nullptr) {
         *error = "failed to refresh TPC-C statistics for " + std::string(table);
       }
-      stats_context.Abort();
+      static_cast<void>(stats_context  // NOLINT(bugprone-unused-return-value):
+                                       // best-effort rollback.
+                            .Abort());
       return status;
     }
   }
@@ -728,10 +748,16 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
   }
   if (SqlTraceEnabled()) {
     if (sql.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
-      fprintf(stderr, "[tpcc-sql][%d] %.*s\n", static_cast<int>(result->type),
+      // NOLINTNEXTLINE(cert-err33-c): best-effort diagnostic output.
+      fprintf(stderr, "[tpcc-sql][%d] %.*s\n",
+              static_cast<int>(result->type),  // NOLINT(cert-err33-c):
+                                               // best-effort diagnostic output.
               static_cast<int>(sql.size()), sql.empty() ? "" : sql.data());
     } else {
-      fprintf(stderr, "[tpcc-sql][%d] %s\n", static_cast<int>(result->type),
+      // NOLINTNEXTLINE(cert-err33-c): best-effort diagnostic output.
+      fprintf(stderr, "[tpcc-sql][%d] %s\n",
+              static_cast<int>(result->type),  // NOLINT(cert-err33-c):
+                                               // best-effort diagnostic output.
               std::string(sql).c_str());
     }
   }
@@ -743,8 +769,8 @@ Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
     return Status::kRuntimeError;
   } catch (...) {
     result->error = std::string(ToString(result->type)) +
-                    ": unexpected SQL result exception [" +
-                    std::string(sql) + "]";
+                    ": unexpected SQL result exception [" + std::string(sql) +
+                    "]";
     return Status::kRuntimeError;
   }
   Status stream_status = query_result.Value().GetStatus();
@@ -768,10 +794,18 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
   if (SqlTraceEnabled()) {
     if (operation.size() <=
         static_cast<size_t>(std::numeric_limits<int>::max())) {
-      fprintf(stderr, "[tpcc-empty] %.*s\n", static_cast<int>(operation.size()),
-              operation.empty() ? "" : operation.data());
+      // NOLINTNEXTLINE(cert-err33-c): best-effort diagnostic output.
+      fprintf(
+          stderr, "[tpcc-empty] %.*s\n",
+          static_cast<int>(operation.size()),  // NOLINT(cert-err33-c):
+                                               // best-effort diagnostic output.
+          operation.empty() ? "" : operation.data());
     } else {
-      fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
+      // NOLINTNEXTLINE(cert-err33-c): best-effort diagnostic output.
+      fprintf(
+          stderr, "[tpcc-empty] %s\n",
+          std::string(operation).c_str());  // NOLINT(cert-err33-c): best-effort
+                                            // diagnostic output.
     }
   }
   result->error = std::string(operation) + " returned no rows";
@@ -851,7 +885,8 @@ TpccTransactionResult TpccWorkload::NewOrder() {
 
   auto context = BeginTransaction();
   auto fail = [&]() {
-    context.Abort();
+    context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
     return result;
   };
   std::vector<Row> rows;
@@ -1068,7 +1103,8 @@ TpccTransactionResult TpccWorkload::Payment() {
   result.amount = static_cast<double>(Random(100, 500000)) / 100.0;
   auto context = BeginTransaction();
   auto fail = [&]() {
-    context.Abort();
+    context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
     return result;
   };
   std::vector<Row> rows;
@@ -1207,7 +1243,8 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   result.customer_id = PickCustomerId();
   auto context = BeginTransaction(true);
   auto fail = [&]() {
-    context.Abort();
+    context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
     return result;
   };
   std::vector<Row> rows;
@@ -1269,7 +1306,8 @@ TpccTransactionResult TpccWorkload::Delivery() {
   const int carrier_id = Random(1, 10);
   auto context = BeginTransaction();
   auto fail = [&]() {
-    context.Abort();
+    context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
     return result;
   };
   // A statement whose executor throws (partial apply, lock timeout) must
@@ -1381,7 +1419,8 @@ TpccTransactionResult TpccWorkload::Delivery() {
   } catch (...) {
     if (!context.IsFinished()) {
       try {
-        context.Abort();
+        context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                          // rollback preserves the primary error.
       } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
         // The undo path itself hit a broken WAL; the original error below
         // is the one worth propagating.
@@ -1399,7 +1438,8 @@ TpccTransactionResult TpccWorkload::StockLevel() {
   const int threshold = Random(10, 20);
   auto context = BeginTransaction(true);
   auto fail = [&]() {
-    context.Abort();
+    context.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
     return result;
   };
   std::vector<Row> rows;

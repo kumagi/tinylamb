@@ -26,6 +26,7 @@
 #include "common/decoder.hpp"
 #include "common/exc_shim.hpp"
 #include "common/exception_status.hpp"
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
@@ -185,8 +186,9 @@ class SortKeyEncoder {
       spec.nulls_first = key.nulls_first.value_or(key.ascending);
       spec.collation = key.collation;
       spec.order = MakeSortKeyOrder(key);
-      if (domains != nullptr) { spec.shared_order = &domains->at(specs_.size());
-}
+      if (domains != nullptr) {
+        spec.shared_order = &domains->at(specs_.size());
+      }
       if (key.expression->Type() == TypeTag::kColumnValue) {
         const int offset =
             schema.Offset(key.expression->AsColumnValue().GetColumnName());
@@ -203,7 +205,7 @@ class SortKeyEncoder {
     }
     single_int_ = specs_.size() == 1 && specs_[0].column >= 0;
     const char* disable_packed =
-        std::getenv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
     const bool allow_packed =
         disable_packed == nullptr || disable_packed[0] != '1';
     if (!single_int_ && allow_packed && specs_.size() == 2 &&
@@ -309,7 +311,9 @@ class SortKeyEncoder {
         v = &evaluated;
       }
       if (error != nullptr && error->ok()) {
-        *error = ((spec.shared_order != nullptr) ? *spec.shared_order : spec.order).Observe(*v);
+        *error =
+            ((spec.shared_order != nullptr) ? *spec.shared_order : spec.order)
+                .Observe(*v);
       }
       // Collation-aware encoding: a case-insensitive key folds its text
       // before the memcomparable form is written, so byte order *is* the
@@ -376,8 +380,9 @@ void RadixSortIndices(size_t* begin, const size_t* end,
   }
   // Every pass below scatters all n slots of the scratch buffer before any of
   // them is read, so the buffer needs no zero-initialization.
-  std::unique_ptr<size_t[]> scratch(
-      new size_t[n]);  // NOLINT(modernize-avoid-c-arrays)
+  std::unique_ptr<size_t[]> scratch(  // NOLINT(modernize-avoid-c-arrays):
+                                      // uninitialized runtime-sized scratch.
+      new size_t[n]);
   size_t* src = begin;
   size_t* dst = scratch.get();
   for (int pass = 0; pass < 8; ++pass) {

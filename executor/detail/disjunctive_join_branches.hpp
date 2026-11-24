@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/collation.hpp"
@@ -30,7 +31,10 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean proof: lean/TinylambOpt/OuterOrBranches.lean (outer_or_branches_sound)
+// Lean proofs:
+//   - lean/TinylambOpt/OuterOrBranches.lean (outer_or_branches_sound)
+//   - lean/TinylambOpt/ResearchProofs/CrossTableDisjunctiveBranchMask.lean
+//     (sound)
 // Splits `ON p OR q` (up to 4 error-free disjunctive equi-branches) into
 // exclusive branch-by-branch hash lookups. A right row emits in branch i iff
 // IS_TRUE(d_i) AND NOT IS_TRUE(d_j) for all j < i (preserving
@@ -213,7 +217,7 @@ inline bool PlainHashableVarChar(const Value& v) noexcept {
 }  // namespace disjunctive_detail
 
 inline bool DisjunctiveOrBranchesDisabled() noexcept {
-  const char* env = std::getenv("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
   return env != nullptr && env[0] == '1';
 }
 

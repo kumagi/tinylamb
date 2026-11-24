@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/memory_budget.hpp"
 
@@ -135,7 +136,7 @@ class TableIncarnation {
       constexpr auto kMaxMillis = static_cast<unsigned long long>(
           std::chrono::duration_cast<Milliseconds>(Clock::duration::max())
               .count());
-      const char* env = std::getenv("TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS");
+      const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS");
       if (env == nullptr || *env == '\0') {
         return kDefault;
       }

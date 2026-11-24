@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/test_util.hpp"
 #include "query/query_test.hpp"
 
 namespace tinylamb {
@@ -731,7 +732,7 @@ TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
   // Aborting the locker releases the row to the writer.
   ASSERT_SUCCESS(locker.txn_.Abort());
   EXPECT_TRUE(writer.txn_.TryAddWriteSet(positions[1]));
-  writer.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, writer.txn_.Abort());
 
   // Re-running the same text locks again: a cached plan must not turn the
   // statement into an unlocked read.
@@ -812,7 +813,7 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
   EXPECT_LT(elapsed_ms, 10000.0) << elapsed_ms << "ms";
   ASSERT_SUCCESS(other.txn_.Abort());
   ASSERT_SUCCESS(holder.txn_.Abort());
-  reader.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, reader.txn_.Abort());
 }
 
 // The wait mode must also be part of the cache key when FOR and UPDATE are
@@ -869,8 +870,8 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitWhitespaceVariantFailsFast) {
             Transaction::IntentWaitFailure::kConflict);
   EXPECT_LT(elapsed_ms, 10000.0) << elapsed_ms << "ms";
   ASSERT_SUCCESS(other.txn_.Abort());
-  holder.txn_.Abort();
-  reader.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, holder.txn_.Abort());
+  EXPECT_EQ(tinylamb::Status::kSuccess, reader.txn_.Abort());
 }
 
 // Calc merge policy: a filter that the scan already applies (the scan rule
@@ -937,7 +938,7 @@ TEST_F(QueryTest, SqlEngineCalcMergesDuplicateScanFilters) {
   ASSERT_EQ(filtered.size(), 2U);
   EXPECT_EQ(filtered[0][0], Value(20 + 2));
   EXPECT_EQ(filtered[1][0], Value(30 + 3));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 // The shapes FOR UPDATE cannot lock are refused with a message naming the
@@ -958,7 +959,7 @@ TEST_F(QueryTest, SqlEngineForUpdateRejectsUnlockableShapes) {
     EXPECT_NE(engine.LastError().find("FOR UPDATE"), std::string::npos)
         << sql << ": " << engine.LastError();
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 // GoogleSQL has no DELETE ... USING, so the join spelling is a correlated
@@ -986,7 +987,7 @@ TEST_F(QueryTest, SqlEngineDeleteJoinsThroughCorrelatedSubqueries) {
   rows = RunSql(ctx, *db_, "SELECT k FROM dt ORDER BY k;");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(4));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 // Bug 48 regression: UPDATE/DELETE with a non-correlated `x IN (SELECT ...)`
@@ -1581,7 +1582,7 @@ TEST_F(QueryTest, SqlEngineExplainRequiresQuery) {
   EXPECT_FALSE(prepared.HasValue());
   EXPECT_EQ(prepared.GetStatus(), Status::kUnknown);
   EXPECT_EQ(engine.LastError(), "EXPLAIN requires a query");
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineExplainRejectsNonSelect) {
@@ -1596,7 +1597,7 @@ TEST_F(QueryTest, SqlEngineExplainRejectsNonSelect) {
   EXPECT_EQ(prepared.GetStatus(), Status::kNotImplemented);
   EXPECT_EQ(engine.LastError(),
             "EXPLAIN currently supports SELECT and WITH queries");
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
@@ -1626,7 +1627,7 @@ TEST_F(QueryTest, SqlEngineExplainAnalyzeSelect) {
   EXPECT_NE(text.find("Actual Rows"), std::string::npos) << text;
   EXPECT_NE(text.find("Execution Time"), std::string::npos) << text;
   EXPECT_NE(text.find("Buffer Pool"), std::string::npos) << text;
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineAnalyzeRefreshesStatistics) {
@@ -1678,7 +1679,7 @@ TEST_F(QueryTest, SqlEngineAnalyzeRefreshesStatistics) {
   }
   EXPECT_GE(analyze_rows, 1U);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineExplainBoundaryRejectsMalformedKeyword) {
@@ -1689,7 +1690,7 @@ TEST_F(QueryTest, SqlEngineExplainBoundaryRejectsMalformedKeyword) {
   // Act + Assert -- "EXPLAINX" is not EXPLAIN; it must fail as bad SQL.
   StatusOr<Executor> prepared = engine.Prepare(ctx, "EXPLAINX SELECT 1;");
   EXPECT_FALSE(prepared.HasValue());
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineInsertValidationErrors) {
@@ -1731,7 +1732,7 @@ TEST_F(QueryTest, SqlEngineInsertValidationErrors) {
 
   // Act + Assert -- a well-formed insert still works afterwards.
   EXPECT_TRUE(engine.Prepare(ctx, "INSERT INTO t VALUES (1, 2);").HasValue());
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineDistinctAndDropTable) {
@@ -1837,7 +1838,7 @@ TEST_F(QueryTest, SqlEngineQueryDataRewriteErrors) {
   Row row;
   ASSERT_TRUE(fn.Value()->Next(&row, nullptr));
   EXPECT_EQ(row[0], Value(2));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
@@ -1892,7 +1893,7 @@ TEST_F(QueryTest, SqlEngineAnalyzeEdgeCases) {
   // Act + Assert -- table names separated without a comma are rejected.
   EXPECT_FALSE(engine.Prepare(ctx, "ANALYZE t1 t2").HasValue());
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineTemplateCacheEvictsFullShard) {
@@ -1963,7 +1964,7 @@ TEST_F(QueryTest, SqlEngineUpdateAndDelete) {
   std::vector<Row> remaining = RunSql(ctx, *db_, "SELECT a FROM t;");
   ASSERT_EQ(remaining.size(), 2U);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, UpdateWithAliasAndTableQualifiedSetTargets) {
@@ -2004,7 +2005,7 @@ TEST_F(QueryTest, UpdateWithAliasAndTableQualifiedSetTargets) {
             std::string::npos)
       << unknown.GetStatus().GetMessage();
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
@@ -2052,7 +2053,7 @@ TEST_F(QueryTest, SqlEngineSelectOrderByLimitOffset) {
       RunSql(ctx, *db_, "SELECT DISTINCT a FROM t LIMIT 3;");
   ASSERT_EQ(distinct_page.size(), 3U);
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, DistinctWithInSubqueryOnNonProjectedColumn) {
@@ -2080,7 +2081,7 @@ TEST_F(QueryTest, DistinctWithInSubqueryOnNonProjectedColumn) {
   std::sort(as.begin(), as.end());
   EXPECT_EQ(as, (std::vector<int64_t>{1, 2}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, OrderByAliasKeyResolvesAcrossSelfJoinScopes) {
@@ -2122,7 +2123,7 @@ TEST_F(QueryTest, OrderByAliasKeyResolvesAcrossSelfJoinScopes) {
   EXPECT_EQ(alias_only[4], Row({Value(3), Value(3)}));
   EXPECT_EQ(alias_only[5], Row({Value(4), Value(3)}));
 
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineWindowFunctionsPartitionRankAndCumulativeSum) {
@@ -2141,7 +2142,7 @@ TEST_F(QueryTest, SqlEngineWindowFunctionsPartitionRankAndCumulativeSum) {
   EXPECT_EQ(rows[1], Row({Value(1), Value(20), Value(2), Value(30)}));
   EXPECT_EQ(rows[2], Row({Value(2), Value(5), Value(1), Value(5)}));
   EXPECT_EQ(rows[3], Row({Value(2), Value(15), Value(2), Value(20)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, WindowRangeOffsetFollowingStartBoundsFrameCorrectly) {
@@ -2170,7 +2171,7 @@ TEST_F(QueryTest, WindowRangeOffsetFollowingStartBoundsFrameCorrectly) {
   EXPECT_EQ(rows[2], Row({Value(3), Value(130)}));
   EXPECT_EQ(rows[3], Row({Value(5), Value(80)}));
   EXPECT_TRUE(rows[4][1].IsNull());
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
@@ -2198,13 +2199,15 @@ TEST_F(QueryTest, WindowGroupsFrameUsesPeerGroups) {
                                                   std::move(input), nullptr, {})
                       .MoveValue();
   std::vector<Row> rows;
-  windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+  EXPECT_EQ(tinylamb::Status::kSuccess,
+            windowed.input.ForEachRow(
+                [&](const Row& row) { rows.push_back(row); }));
   ASSERT_EQ(rows.size(), 4U);
   EXPECT_EQ(rows[0][1], Value(20));
   EXPECT_EQ(rows[1][1], Value(20));
   EXPECT_EQ(rows[2][1], Value(40));
   EXPECT_EQ(rows[3][1], Value(50));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
@@ -2232,12 +2235,14 @@ TEST_F(QueryTest, WindowFrameExclusionRemovesCurrentRow) {
                                                   std::move(input), nullptr, {})
                       .MoveValue();
   std::vector<Row> rows;
-  windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+  EXPECT_EQ(tinylamb::Status::kSuccess,
+            windowed.input.ForEachRow(
+                [&](const Row& row) { rows.push_back(row); }));
   ASSERT_EQ(rows.size(), 3U);
   EXPECT_TRUE(rows[0][1].IsNull());
   EXPECT_EQ(rows[1][1], Value(10));
   EXPECT_EQ(rows[2][1], Value(30));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
@@ -2270,12 +2275,14 @@ TEST_F(QueryTest, WindowFrameExclusionHandlesPeerGroupsAndTies) {
                         .MoveValue();
     std::vector<Row> rows;
     rows.reserve(1024);
-    windowed.input.ForEachRow([&](const Row& row) { rows.push_back(row); });
+    EXPECT_EQ(tinylamb::Status::kSuccess,
+              windowed.input.ForEachRow(
+                  [&](const Row& row) { rows.push_back(row); }));
     ASSERT_EQ(rows.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
       EXPECT_EQ(rows[i][1], expected[i]) << "row " << i;
     }
-    ctx.txn_.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
   }
 }
 
@@ -2311,7 +2318,7 @@ TEST_F(QueryTest, SqlEngineUnionAllConcatenatesMultipleBranches) {
       RunSql(ctx, *db_, "SELECT v FROM u UNION ALL SELECT v FROM u LIMIT 3;");
   EXPECT_EQ(limited_union, (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
                                              Row({Value(1)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, RightJoinRoutesThroughCascadesOuterLowering) {
@@ -2357,7 +2364,7 @@ TEST_F(QueryTest, RightJoinRoutesThroughCascadesOuterLowering) {
   }
   EXPECT_EQ(matched, 2U);
   EXPECT_EQ(padded, 1U);
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, FullJoinRoutesThroughCascadesOuterLowering) {
@@ -2407,7 +2414,7 @@ TEST_F(QueryTest, FullJoinRoutesThroughCascadesOuterLowering) {
   EXPECT_EQ(matched, 2U);
   EXPECT_EQ(left_padded, 1U);
   EXPECT_EQ(right_padded, 1U);
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, OuterJoinChainPlansThroughCascadesAndStaysCorrect) {
@@ -2488,7 +2495,7 @@ TEST_F(QueryTest, OuterJoinChainPlansThroughCascadesAndStaysCorrect) {
   EXPECT_EQ(inner_left[0][0], Value(2));
   EXPECT_EQ(inner_left[0][1], Value(2));
   EXPECT_TRUE(inner_left[0][2].IsNull());
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, StarSelectReportsExpandedColumnNames) {
@@ -2519,7 +2526,7 @@ TEST_F(QueryTest, SetOperationKeepsFirstBranchColumnNames) {
   }
   EXPECT_EQ(engine.ResultColumnNames(),
             (std::vector<std::string>{"first_col"}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
@@ -2550,7 +2557,7 @@ TEST_F(QueryTest, MixedSetOperationChainsHonorPerPairOperators) {
   const std::vector<Row> distinct_tail = RunSql(
       ctx, *db_, "SELECT x FROM m UNION ALL SELECT 9 UNION DISTINCT SELECT 9;");
   ASSERT_EQ(distinct_tail.size(), 3U);
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, CteIsMaterializedOnceAndCanBeReadByMultipleConsumers) {
@@ -2564,7 +2571,7 @@ TEST_F(QueryTest, CteIsMaterializedOnceAndCanBeReadByMultipleConsumers) {
       "SELECT v FROM filtered UNION ALL SELECT v FROM filtered ORDER BY v;");
   EXPECT_EQ(rows, (std::vector<Row>{Row({Value(2)}), Row({Value(2)}),
                                     Row({Value(3)}), Row({Value(3)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnnestExpandsArraysAndEmitsOffsets) {
@@ -2592,7 +2599,7 @@ TEST_F(QueryTest, SqlEngineUnnestExpandsArraysAndEmitsOffsets) {
       "SELECT x FROM UNNEST([[1, 2], [3]]) arr, UNNEST(arr) x ORDER BY x;");
   EXPECT_EQ(lateral, (std::vector<Row>{Row({Value(1)}), Row({Value(2)}),
                                        Row({Value(3)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnnestStructColumnKeepsWholeElementWidth) {
@@ -2627,7 +2634,7 @@ TEST_F(QueryTest, SqlEngineUnnestStructColumnKeepsWholeElementWidth) {
                    "SELECT elem.f1 FROM StructArr t, t.arr elem ORDER BY 1;"),
             (std::vector<Row>{Row({Value()}), Row({Value()}), Row({Value(11)}),
                               Row({Value(21)}), Row({Value(31)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnnestFlattenedStructFeedsProjectionAndAggregate) {
@@ -2640,7 +2647,7 @@ TEST_F(QueryTest, SqlEngineUnnestFlattenedStructFeedsProjectionAndAggregate) {
       (std::vector<Row>{Row({Value(1), Value(2)})}));
   EXPECT_EQ(RunSql(ctx, *db_, "SELECT SUM(y) FROM UNNEST([STRUCT(1 AS y)]) x;"),
             (std::vector<Row>{Row({Value(1)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnnestStructFieldNameContainingColon) {
@@ -2653,7 +2660,7 @@ TEST_F(QueryTest, SqlEngineUnnestStructFieldNameContainingColon) {
                    "SELECT e.`a:b` AS v FROM UNNEST([STRUCT(1 AS `a:b`), "
                    "STRUCT(2)]) e ORDER BY v;"),
             (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineCastWrapsAggregateOverUnnest) {
@@ -2661,7 +2668,7 @@ TEST_F(QueryTest, SqlEngineCastWrapsAggregateOverUnnest) {
   EXPECT_EQ(RunSql(ctx, *db_,
                    "SELECT CAST(SUM(x) AS STRING) FROM UNNEST([1,2]) AS x;"),
             (std::vector<Row>{Row({Value(std::string("3"))})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineNullSafeJoinMatchesNulls) {
@@ -2677,7 +2684,7 @@ TEST_F(QueryTest, SqlEngineNullSafeJoinMatchesNulls) {
              "SELECT l.id, r.id FROM ns_l l JOIN ns_r r "
              "ON l.k IS NOT DISTINCT FROM r.k ORDER BY l.id;"),
       (std::vector<Row>{Row({Value(1), Value(7)}), Row({Value(2), Value(8)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, UsingColumnSignednessMismatchDoesNotJoin) {
@@ -2692,7 +2699,7 @@ TEST_F(QueryTest, UsingColumnSignednessMismatchDoesNotJoin) {
              "JOIN (SELECT CAST(18446744073709551615 AS UINT64) AS x) b "
              "USING (x);");
   EXPECT_TRUE(rows.empty()) << "-1 INT64 must not equal UINT64_MAX in USING";
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, OocHashJoinDoesNotMatchSignedUnsignedBitTwins) {
@@ -2704,7 +2711,7 @@ TEST_F(QueryTest, OocHashJoinDoesNotMatchSignedUnsignedBitTwins) {
              "ON a.k = b.k;");
   EXPECT_TRUE(rows.empty())
       << "signed -1 must not equal unsigned 2^64-1 in the OOC hash join";
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineChainedUsingEnforcesEveryKey) {
@@ -2753,7 +2760,7 @@ TEST_F(QueryTest, SqlEngineChainedUsingEnforcesEveryKey) {
     EXPECT_NE(status.GetMessage().find("ambiguous"), std::string::npos)
         << status.GetMessage();
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineContradictoryOrPredicateEliminatesScan) {
@@ -2767,7 +2774,7 @@ TEST_F(QueryTest, SqlEngineContradictoryOrPredicateEliminatesScan) {
              "SELECT x FROM contra "
              "WHERE (x > 100 AND x < 10) OR (b IS TRUE AND b IS FALSE);")
           .empty());
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineCompositeAndResidualEquiJoin) {
@@ -2786,7 +2793,7 @@ TEST_F(QueryTest, SqlEngineCompositeAndResidualEquiJoin) {
              "ON l.id = r.id AND l.a = r.a AND l.amt > r.qty "
              "ORDER BY l.id, r.id;"),
       (std::vector<Row>{Row({Value(1), Value(1)}), Row({Value(2), Value(2)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnusedParentJoinEliminatedKeepsMultiplicity) {
@@ -2802,7 +2809,7 @@ TEST_F(QueryTest, SqlEngineUnusedParentJoinEliminatedKeepsMultiplicity) {
              "SELECT c.cid FROM up_child c JOIN up_parent p "
              "ON c.pid = p.pid ORDER BY c.cid;"),
       (std::vector<Row>{Row({Value(10)}), Row({Value(11)}), Row({Value(12)})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineOrderBySelectAliasOnJoin) {
@@ -2820,7 +2827,7 @@ TEST_F(QueryTest, SqlEngineOrderBySelectAliasOnJoin) {
   EXPECT_EQ(rows[0], Row({Value(1), Value(1)}));
   EXPECT_EQ(rows[1], Row({Value(1), Value(2)}));
   EXPECT_EQ(rows.back(), Row({Value(4), Value(4)}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, SqlEngineUnresolvedColumnInSubqueryPredicateFailsCleanly) {
@@ -2848,7 +2855,7 @@ TEST_F(QueryTest, SqlEngineUnresolvedColumnInSubqueryPredicateFailsCleanly) {
     });
     EXPECT_NE(executed.Value().GetStatus(), Status::kSuccess);
   }
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, DmlWhereBareBoolColumnOnlyTouchesTrueRows) {
@@ -2878,7 +2885,7 @@ TEST_F(QueryTest, DmlWhereBareBoolColumnOnlyTouchesTrueRows) {
       RunSql(ctx, *db_, "SELECT COUNT(*) FROM bb WHERE u = 9;");
   ASSERT_EQ(untouched.size(), 1U);
   EXPECT_EQ(untouched[0][0], Value(int64_t{0}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(QueryTest, ComparisonAgainstNullLiteralIsUnknownNotError) {
@@ -2901,7 +2908,7 @@ TEST_F(QueryTest, ComparisonAgainstNullLiteralIsUnknownNotError) {
   EXPECT_EQ(RunSql(ctx, *db_,
                    "SELECT COUNT(*) FROM nl WHERE (a > NULL) AND (a > 0);"),
             (std::vector<Row>{Row({Value(int64_t{0})})}));
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 }  // namespace tinylamb

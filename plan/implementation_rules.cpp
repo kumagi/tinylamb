@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "plan/implementation_rules.hpp"
 
 #include <algorithm>
@@ -95,7 +96,7 @@ namespace {
 // a 10x slower alternative. Revisit after that interaction is root-caused.
 bool ScanProjectionEnabled() {
   static const bool enabled =
-      std::getenv("TINYLAMB_SCAN_PROJECTION") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_SCAN_PROJECTION") != nullptr;
   return enabled;
 }
 
@@ -104,7 +105,7 @@ bool ScanProjectionEnabled() {
 // candidates so a collapsed estimate or a wrong build side is visible.
 bool JoinCardinalityDebug() {
   static const bool join_card_debug =
-      std::getenv("TINYLAMB_JOIN_CARD_DEBUG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_JOIN_CARD_DEBUG") != nullptr;
   return join_card_debug;
 }
 

@@ -1533,6 +1533,63 @@ CompiledColumnarProjection CompiledColumnarProjection::Compile(
       plan.items.push_back(std::move(item));
       return true;
     };
+    if (expr->Type() == TypeTag::kBinaryExp &&
+        expr->AsBinaryExpression().Op() == BinaryOperation::kSubtract) {
+      const BinaryExpression& bin = expr->AsBinaryExpression();
+      if (bin.Left() && bin.Right() &&
+          bin.Left()->Type() == TypeTag::kColumnValue &&
+          bin.Right()->Type() == TypeTag::kFunctionCallExp) {
+        const FunctionCallExpression& fn =
+            bin.Right()->AsFunctionCallExpression();
+        if ((IdentifierEqualsIgnoreCase(fn.FuncName(), "coalesce") ||
+             IdentifierEqualsIgnoreCase(fn.FuncName(), "ifnull")) &&
+            fn.Args().size() == 2 && fn.Args()[0] && fn.Args()[1] &&
+            fn.Args()[0]->Type() == TypeTag::kColumnValue &&
+            fn.Args()[1]->Type() == TypeTag::kConstantValue) {
+          const auto off0 = ResolveScalarColumnOffset(
+              input_schema, bin.Left()->AsColumnValue().GetColumnName());
+          const auto off1 = ResolveScalarColumnOffset(
+              input_schema, fn.Args()[0]->AsColumnValue().GetColumnName());
+          const Value& cv = fn.Args()[1]->AsConstantValue().GetValue();
+          if (off0.has_value() && off1.has_value() &&
+              *off0 < input_schema.ColumnCount() &&
+              *off1 < input_schema.ColumnCount() && !cv.IsNull() &&
+              !cv.IsUnsigned() && !cv.IsInterval()) {
+            const Column& c0 = input_schema.GetColumn(*off0);
+            const Column& c1 = input_schema.GetColumn(*off1);
+            if (!c0.IsUnsigned() && !c1.IsUnsigned() && !c0.IsInterval() &&
+                !c1.IsInterval() && c0.Type() == c1.Type()) {
+              if (c0.Type() == ValueType::kInt64 &&
+                  cv.type == ValueType::kInt64) {
+                item.kind = Kind::kSubCoalesceConst;
+                item.src_col = static_cast<slot_t>(*off0);
+                item.alt_col = static_cast<slot_t>(*off1);
+                item.constant = cv;
+                mark_col(item.src_col);
+                mark_col(item.alt_col);
+                plan.items.push_back(std::move(item));
+                continue;
+              }
+              if (c0.Type() == ValueType::kDouble &&
+                  (cv.type == ValueType::kDouble ||
+                   cv.type == ValueType::kInt64)) {
+                item.kind = Kind::kSubCoalesceConst;
+                item.src_col = static_cast<slot_t>(*off0);
+                item.alt_col = static_cast<slot_t>(*off1);
+                item.constant =
+                    Value(cv.type == ValueType::kDouble
+                              ? cv.value.double_value
+                              : static_cast<double>(cv.value.int_value));
+                mark_col(item.src_col);
+                mark_col(item.alt_col);
+                plan.items.push_back(std::move(item));
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
     if (expr->Type() == TypeTag::kCaseExp) {
       const CaseExpression& ce = expr->AsCaseExpression();
       if (ce.when_clauses_.size() == 1 && ce.else_clause_ &&
@@ -2017,6 +2074,97 @@ StatusOr<std::optional<std::shared_ptr<ColumnarTable>>> TryProjectColumnarTable(
                 out_nulls[i] = 1;
                 any_out_null = true;
               }
+            }
+          } else {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          if (any_out_null) {
+            col.has_null = true;
+            col.nulls = std::move(out_nulls);
+          }
+          break;
+        }
+        case CompiledColumnarProjection::Kind::kSubCoalesceConst: {
+          if (item.src_col >= src.columns.size() ||
+              item.alt_col >= src.columns.size()) {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          const ColumnarColumn& c0 = src.columns[item.src_col];
+          const ColumnarColumn& c1 = src.columns[item.alt_col];
+          const ValueType vt = item.constant.type;
+          const bool c0_all_null =
+              (c0.type == ValueType::kNull &&
+               c0.encoding != ColumnarColumn::Encoding::kGathered);
+          const bool c1_all_null =
+              (c1.type == ValueType::kNull &&
+               c1.encoding != ColumnarColumn::Encoding::kGathered);
+          if ((!c0_all_null &&
+               (!c0.is_uniform || c0.is_unsigned || c0.is_interval ||
+                (c0.encoding != ColumnarColumn::Encoding::kGathered &&
+                 c0.type != vt))) ||
+              (!c1_all_null &&
+               (!c1.is_uniform || c1.is_unsigned || c1.is_interval ||
+                (c1.encoding != ColumnarColumn::Encoding::kGathered &&
+                 c1.type != vt)))) {
+            unsupported_flag.store(1, std::memory_order_relaxed);
+            abort_flag.store(true, std::memory_order_relaxed);
+            return;
+          }
+          if (c0_all_null) {
+            col.SetConstantNull(vt, false, false, row_cnt);
+            break;
+          }
+          dst.RetainColumnOwners(c0);
+          dst.RetainColumnOwners(c1);
+          col.Init(vt, false, false, row_cnt);
+          std::vector<uint8_t> out_nulls(row_cnt, 0);
+          bool any_out_null = false;
+          if (vt == ValueType::kInt64) {
+            const int64_t def_v = item.constant.value.int_value;
+            col.ints.resize(row_cnt);
+            int64_t* __restrict__ out_ptr = col.ints.data();
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const size_t r = row_off + i;
+              int64_t a = 0;
+              if (!c0.TryReadNonNullInt(r, &a)) [[unlikely]] {
+                out_ptr[i] = 0;
+                out_nulls[i] = 1;
+                any_out_null = true;
+                continue;
+              }
+              int64_t b = 0;
+              const int64_t rhs =
+                  (!c1_all_null && c1.TryReadNonNullInt(r, &b)) ? b : def_v;
+              int64_t diff = 0;
+              if (__builtin_sub_overflow(a, rhs, &diff)) [[unlikely]] {
+                *err_out = StatusError(StatusCode::kIsInfinity,
+                                       "integer overflow in subtraction");
+                abort_flag.store(true, std::memory_order_relaxed);
+                return;
+              }
+              out_ptr[i] = diff;
+            }
+          } else if (vt == ValueType::kDouble) {
+            const double def_v = item.constant.value.double_value;
+            col.doubles.resize(row_cnt);
+            double* __restrict__ out_ptr = col.doubles.data();
+            for (size_t i = 0; i < row_cnt; ++i) {
+              const size_t r = row_off + i;
+              double a = 0.0;
+              if (!c0.TryReadNonNullDouble(r, &a)) [[unlikely]] {
+                out_ptr[i] = 0.0;
+                out_nulls[i] = 1;
+                any_out_null = true;
+                continue;
+              }
+              double b = 0.0;
+              const double rhs =
+                  (!c1_all_null && c1.TryReadNonNullDouble(r, &b)) ? b : def_v;
+              out_ptr[i] = a - rhs;
             }
           } else {
             unsupported_flag.store(1, std::memory_order_relaxed);

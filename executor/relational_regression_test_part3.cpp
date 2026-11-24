@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/test_util.hpp"
 #include "executor/detail/build_input_internal.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/relational_regression_test.hpp"
@@ -42,7 +43,7 @@ TEST_F(RelationalRegressionTest, WherePredicateError_PropagatesFailure) {
   while (prepared.Value()->Next(&row, nullptr)) {
   }
   EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
-  run_ctx.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, run_ctx.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -104,7 +105,7 @@ TEST_F(RelationalRegressionTest,
     while (prepared.Value()->Next(&row, nullptr)) {
     }
     EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
-    run_ctx.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, run_ctx.Abort());
   }
 }
 
@@ -114,14 +115,14 @@ TEST_F(RelationalRegressionTest, WindowFunctions_ArgumentAndFrameValidation) {
     SqlEngine engine(*rs_);
     StatusOr<Executor> prepared = engine.Prepare(run_ctx, sql);
     if (!prepared.HasValue()) {
-      run_ctx.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, run_ctx.Abort());
       return;
     }
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
     }
     EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    run_ctx.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, run_ctx.Abort());
   };
 
   // NTILE validations
@@ -260,13 +261,12 @@ TEST_F(RelationalRegressionTest, FusedConditionalAggregateKeepsNullElse) {
     FROM CaseFacts f, SmallKeys d WHERE f.k=d.k GROUP BY d.k ORDER BY d.k
   )sql";
   EXPECT_EQ(RelationalRun(*rs_, sql),
-            std::vector<Row>(
-                {Row({Value(1), Value(2.5), Value(2.5), Value(1), Value(),
-                      Value(2), Value(2), Value(1)}),
-                 Row({Value(2), Value(), Value(), Value(0), Value(-12.0),
-                      Value(0), Value(1), Value(0)}),
-                 Row({Value(3), Value(), Value(), Value(0), Value(), Value(0),
-                      Value(1), Value(0)})}));
+            std::vector<Row>({Row({Value(1), Value(2.5), Value(2.5), Value(1),
+                                   Value(), Value(2), Value(2), Value(1)}),
+                              Row({Value(2), Value(), Value(), Value(0),
+                                   Value(-12.0), Value(0), Value(1), Value(0)}),
+                              Row({Value(3), Value(), Value(), Value(0),
+                                   Value(), Value(0), Value(1), Value(0)})}));
 }
 
 TEST_F(RelationalRegressionTest, GroupedJoinFusionKeepsGroupedJoinSemantics) {
@@ -382,7 +382,7 @@ TEST_F(RelationalRegressionTest,
     } else {
       EXPECT_NE(prepared.GetStatus(), Status::kSuccess);
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
   EXPECT_EQ(RelationalRun(*rs_, valid, /*force_relational=*/true),
             std::vector<Row>({Row({Value(60.0)})}));
@@ -1384,7 +1384,7 @@ TEST_F(RelationalRegressionTest, ExactPartialTotalsCheckActualValues) {
     }
     EXPECT_EQ(left.rows[0][1], input);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, LargeBuildGroupsMergeParallelAggregateStates) {
@@ -2155,7 +2155,7 @@ TEST_F(RelationalRegressionTest,
   ASSERT_EQ(joined.Value().rows.size(), 2U);
   EXPECT_EQ(joined.Value().rows[0][2], Value("second"));
   EXPECT_EQ(joined.Value().rows[1][2], Value("first"));
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -2279,7 +2279,7 @@ TEST_F(RelationalRegressionTest, CompositeDateFullJoinKeepsNullsAndResiduals) {
       Row({Value(), Value(), Value(), Value(4), other, Value(0)})};
   EXPECT_TRUE(std::ranges::is_permutation(joined.Value().rows, expected));
   EXPECT_EQ(joined.Value().join_comparisons, 4U);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, SmallInnerBuildStreamsEverySpilledProbeRow) {
@@ -2363,7 +2363,7 @@ TEST_F(RelationalRegressionTest,
   const std::vector<int64_t> left_keys = {3, 1, 7, 0, 9, 5};
   std::vector<int64_t> right_keys;
   right_keys.reserve(9000);
-for (int i = 0; i < 9000; ++i) {
+  for (int i = 0; i < 9000; ++i) {
     right_keys.push_back(i % 11);
   }
   auto build_sides = [&] {
@@ -2589,7 +2589,7 @@ TEST_F(RelationalRegressionTest, DateStringPeeksKeepHolesAndTypeBoundaries) {
     EXPECT_TRUE(
         relational_detail::BuildIntegerPeeks(dates, &projection, integer_schema)
             .empty());
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -2680,7 +2680,7 @@ TEST_F(RelationalRegressionTest, PackedDateComparisonsKeepHolesAndProjection) {
     EXPECT_TRUE(
         relational_detail::BuildIntegerPeeks(dates, &projection, integer_schema)
             .empty());
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -2696,9 +2696,10 @@ TEST_F(RelationalRegressionTest, ColumnarNullTestsKeepProjectionAndResiduals) {
                           setup.GetTable("NullScan"));
     for (int i = 0; i < 10000; ++i) {
       const Value key = i >= 1000 && i % 3 == 0 ? Value() : Value(i % 7);
-      const Value text = i >= 1000 && i % 5 == 0
-                             ? Value()
-                             : Value(std::string(96, 'a' + (i % 20)));
+      const Value text =
+          i >= 1000 && i % 5 == 0
+              ? Value()
+              : Value(std::string(96, static_cast<char>('a' + (i % 20))));
       const Value number = i % 2 == 0 ? Value() : Value(i * 0.5);
       ASSERT_SUCCESS(
           table->Insert(setup.txn_, Row({Value(i), key, text, number, Value()}))
@@ -2773,7 +2774,7 @@ TEST_F(RelationalRegressionTest, ColumnarNullTestsKeepProjectionAndResiduals) {
       }));
       EXPECT_EQ(actual, expected);
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -3571,17 +3572,17 @@ TEST_F(RelationalRegressionTest,
     } else {
       EXPECT_EQ(pending.GetStatus(), Status::kConflicts);
     }
-    writer.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, writer.Abort());
     auto fresh = rs_->BeginReadOnlyContext();
     EXPECT_EQ(read(fresh, &visited), expected);
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
   RelationalRun(*rs_, "UPDATE RangeSource SET k=0 WHERE id=980");
   EXPECT_EQ(read(old, &visited), expected);
   auto fresh = rs_->BeginReadOnlyContext();
   EXPECT_EQ(read(fresh, &visited).size(), 19U);
-  fresh.Abort();
-  old.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
+  EXPECT_EQ(tinylamb::Status::kSuccess, old.Abort());
 }
 
 TEST_F(RelationalRegressionTest,

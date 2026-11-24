@@ -209,7 +209,7 @@ TEST_F(RecoveryManagerTest, TornTailWithoutLoggerIsNotReportedRepaired) {
   }
   RecoveryManager reader(path, nullptr, size_t{64} << 20);
   EXPECT_EQ(reader.RecoverFrom(0, nullptr), Status::kCorrupt);
-  EXPECT_EQ(std::filesystem::file_size(path), valid.size() + tail.size() / 2);
+  EXPECT_EQ(std::filesystem::file_size(path), valid.size() + (tail.size() / 2));
   EXPECT_TRUE(std::filesystem::remove(path));
 }
 
@@ -231,7 +231,7 @@ TEST_F(RecoveryManagerTest, ReadsRecordLargerThanLoggerRing) {
   RecoveryManager reader(path, pm_->GetPool(), logger->SegmentSize());
   reader.SetLogger(logger.get());
   const auto original = LogRecord::LsmPutLogRecord(
-      0, 10, 3, "key", std::string(128 * 1024, 'x'), "", false);
+      0, 10, 3, "key", std::string(size_t{128} * 1024, 'x'), "", false);
   const auto position = logger->AddLog(original.Serialize());
   ASSERT_TRUE(position.HasValue());
   LogRecord decoded;
@@ -254,7 +254,7 @@ TEST_F(RecoveryManagerTest, RejectsCorruptFooterOnCurrentSegment) {
   ASSERT_NE(logger, nullptr);
   ASSERT_TRUE(logger->FixedSizeSegments());
 
-  const std::string payload(128 * 1024, 'x');
+  const std::string payload(size_t{128} * 1024, 'x');
   const auto record =
       LogRecord::LsmPutLogRecord(0, 10, 3, "key", payload, "", false);
   const auto pos = logger->AddLog(record.Serialize());
@@ -340,8 +340,8 @@ TEST_F(RecoveryManagerTest, InflatedLengthOnNonFinalRecordNeedsForce) {
 
   // Inflate damaged's total_len past the end of the file so ReadLogDetailed
   // reports kShort at its offset even though `committed` follows it.
-  const auto inflated = static_cast<uint32_t>(
-      first.size() + damaged.size() + committed.size() + 4096);
+  const auto inflated = static_cast<uint32_t>(first.size() + damaged.size() +
+                                              committed.size() + 4096);
   ASSERT_GE(inflated, 30U);
   ASSERT_LE(inflated, Logger::kMaxRecordSize);
   std::memcpy(damaged.data() + 4, &inflated, sizeof(inflated));
@@ -517,9 +517,7 @@ TEST(LogRecordDumpTest, RendersTypeNameAndSuppressesSentinelLocation) {
   oss.str("");
   oss << LogRecord(
       5, 6,
-      static_cast<LogType>(
-          200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange):
-                  // exercise unknown log type
+      static_cast<LogType>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
   EXPECT_EQ(oss.str(), "{prev:5 txn:6 type:kInvalid}");
 }
 

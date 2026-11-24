@@ -17,7 +17,9 @@ TEST(SortedDistinctRunsTest, ExactUnsignedUnionAcrossWorkersAndRuns) {
   ASSERT_SUCCESS(left.Add(std::array<uint64_t, 4>{0, 0, 7, UINT64_MAX}));
   ASSERT_SUCCESS(left.Add(std::array<uint64_t, 3>{1, 7, uint64_t{1} << 63}));
   ASSERT_SUCCESS(right.Add(std::array<uint64_t, 3>{0, 9, UINT64_MAX}));
-  ASSERT_SUCCESS(left.Absorb(std::move(right)));
+  ASSERT_SUCCESS(left.Absorb(
+      std::move(right)));  // NOLINT(bugprone-use-after-move): failed Absorb
+                           // preserves its rvalue input.
   std::vector<uint64_t> result;
   ASSERT_SUCCESS(
       left.ForEach([&](uint64_t value) { result.push_back(value); }));
@@ -60,8 +62,10 @@ TEST(SortedDistinctRunsTest, FailedAbsorbPreservesBothInputs) {
   ASSERT_SUCCESS(left.Add(std::array<uint64_t, 2>{1, 3}));
   ASSERT_SUCCESS(right.Add(std::array<uint64_t, 2>{2, 4}));
   left.SetFailNextMergeForTest(true);
+  // Failed Absorb preserves the rvalue input so the test can verify retry.
   EXPECT_FALSE(left.Absorb(std::move(right)).ok());
   left.SetFailNextMergeForTest(false);
+  // NOLINTNEXTLINE(bugprone-use-after-move): failed Absorb preserves this input.
   ASSERT_SUCCESS(left.Absorb(std::move(right)));
   std::vector<uint64_t> actual;
   ASSERT_SUCCESS(left.ForEach([&](uint64_t v) { actual.push_back(v); }));

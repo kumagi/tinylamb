@@ -16,7 +16,8 @@ namespace tinylamb {
 
 TEST(QueryGrantTest, PoolFloorsProtectGuaranteedMinimums) {
   ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
-  struct ResetGuard {
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
     ProcessMemoryBudget& budget;
     ~ResetGuard() { budget.ResetForTest(0); }
   } reset_guard{b};
@@ -44,7 +45,8 @@ TEST(QueryGrantTest, ReclaimHooksExecuteInOrderOnPressure) {
   ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
   // ASSERT below must not strand the 800 bytes reserved on the global budget:
   // a later test would then start with an unexpectedly depleted allowance.
-  struct ResetBudgetOnExit {
+  struct ResetBudgetOnExit {  // NOLINT(cppcoreguidelines-special-member-functions):
+                              // scope-owned cleanup.
     ProcessMemoryBudget& budget;
     ~ResetBudgetOnExit() { budget.ResetForTest(0); }
   } reset{b};

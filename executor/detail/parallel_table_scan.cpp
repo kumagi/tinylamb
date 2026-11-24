@@ -29,6 +29,7 @@
 #include "common/constants.hpp"
 #include "common/exception_status.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/range_selection.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -1240,7 +1241,7 @@ bool TryParallelTableScan(
   // worker evaluator adds measurable per-row overhead on multi-million-row
   // scans with nothing non-simple to evaluate.
   static const bool worker_filter_disabled =
-      std::getenv("TINYLAMB_DISABLE_WORKER_FILTER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WORKER_FILTER") != nullptr;
   const bool has_post_simple_filter =
       filter_during_scan && scan_filter != nullptr &&
       (scan_filter->compile_decided_reject ||
@@ -2877,7 +2878,8 @@ bool TryParallelTableScan(
         const Status run_st = RunParallelTasks(tworkers, tlcs_worker);
         if (run_st.ok() && tlcs_err.ok() &&
             !abort_tlcs.load(std::memory_order_relaxed)) {
-          if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+          if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") !=
+              nullptr) {
             const double tlcs_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - tlcs_begin)
@@ -2975,7 +2977,7 @@ bool TryParallelTableScan(
     for (const auto& interval : scan_intervals) {
       runtime_run_bounds =
           lstable_store->IntegerRunBounds(*lstable_key_column, interval.column);
-      if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
         // NOLINTNEXTLINE(cert-err33-c) error intentionally ignored
         std::fprintf(stderr,
                      "[scan-bounds] key=%u value=%u rows=%zu null=%d min=%lld "
@@ -3116,7 +3118,7 @@ bool TryParallelTableScan(
       (columnar_output && lstable_store != nullptr && has_ample_memory_budget &&
        result->rows.empty() && !result->HasSpill() &&
        result->columnar == nullptr && !filter_unsigned_or_incomplete);
-  if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
     // NOLINTNEXTLINE(cert-err33-c) error intentionally ignored
     std::fprintf(
         stderr,
@@ -3834,6 +3836,40 @@ bool TryParallelTableScan(
                             ? cur_chunk.EnsureArena()
                             : nullptr;
                     dst_col.AppendValue(value, arena, prev_rows + i);
+                  }
+                  break;
+                }
+                case CompiledColumnarProjection::Kind::kSubCoalesceConst: {
+                  const auto& first = resolve_blk_col(item.src_col);
+                  const auto& alternate = resolve_blk_col(item.alt_col);
+                  for (size_t i = 0; i < n; ++i) {
+                    const uint32_t r = slice_sel != nullptr
+                                           ? slice_sel[i]
+                                           : static_cast<uint32_t>(offset + i);
+                    const Value a = ReadLSTableCellValue(first, r);
+                    if (a.IsNull()) {
+                      dst_col.AppendValue(Value(), nullptr, prev_rows + i);
+                      continue;
+                    }
+                    const Value b = ReadLSTableCellValue(alternate, r);
+                    const Value& rhs = b.IsNull() ? item.constant : b;
+                    if (a.type == ValueType::kInt64) {
+                      int64_t diff = 0;
+                      if (__builtin_sub_overflow(a.value.int_value,
+                                                 rhs.value.int_value, &diff)) {
+                        record_worker_error(
+                            StatusError(StatusCode::kIsInfinity,
+                                        "integer overflow in subtraction"));
+                        return false;
+                      } else {
+                        dst_col.AppendValue(Value(diff), nullptr,
+                                            prev_rows + i);
+                      }
+                    } else {
+                      dst_col.AppendValue(
+                          Value(a.value.double_value - rhs.value.double_value),
+                          nullptr, prev_rows + i);
+                    }
                   }
                   break;
                 }
@@ -5463,6 +5499,35 @@ bool TryParallelTableScan(
                                                : item.alt_col < row.Count()
                                                    ? row[item.alt_col]
                                                    : Value());
+                    break;
+                  }
+                  case CompiledColumnarProjection::Kind::kSubCoalesceConst: {
+                    const Value a = item.src_col < row.Count()
+                                        ? row[item.src_col]
+                                        : Value();
+                    if (a.IsNull()) {
+                      proj_row.values_.emplace_back();
+                      break;
+                    }
+                    const Value b = item.alt_col < row.Count()
+                                        ? row[item.alt_col]
+                                        : Value();
+                    const Value& rhs = b.IsNull() ? item.constant : b;
+                    if (a.type == ValueType::kInt64) {
+                      int64_t diff = 0;
+                      if (__builtin_sub_overflow(a.value.int_value,
+                                                 rhs.value.int_value, &diff)) {
+                        record_error(
+                            StatusError(StatusCode::kIsInfinity,
+                                        "integer overflow in subtraction"));
+                        proj_row.values_.emplace_back();
+                      } else {
+                        proj_row.values_.emplace_back(diff);
+                      }
+                    } else {
+                      proj_row.values_.emplace_back(a.value.double_value -
+                                                    rhs.value.double_value);
+                    }
                     break;
                   }
                   case CompiledColumnarProjection::Kind::kFallback:

@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_session_fuzzer.hpp"
 
 #include <algorithm>
@@ -228,7 +229,7 @@ struct SPred {
         // op ANY folds to an OR-chain, op ALL to an AND-chain over the
         // snapshot (empty: ANY=FALSE, ALL=TRUE), matching both the
         // prepare-time fold and TryEvaluateQuantifiedComparison.
-        if (std::getenv("TINYLAMB_SESSION_PRED_DEBUG") != nullptr) {
+        if (::tinylamb::platform::GetEnv("TINYLAMB_SESSION_PRED_DEBUG") != nullptr) {
           std::cerr << "[pred-debug] quant col=" << col << " op=" << op
                     << (sub_is_all ? " ALL" : " ANY") << " neg=" << negated
                     << " subn=" << sub_vals.size() << " render=" << Render()
@@ -824,8 +825,8 @@ std::vector<std::string> SortedDump(const std::vector<Row>& rows) {
 // the long sweeps opt in explicitly.
 bool RouteFlipFor(size_t ordinal) {
   static const bool enabled =
-      std::getenv("TINYLAMB_SESSION_ROUTE_FLIP") != nullptr &&
-      std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_ROUTE_FLIP") != nullptr &&
+      ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_FORCE_RELATIONAL") == nullptr;
   return enabled && (ordinal % 3U) == 2U;
 }
 
@@ -1007,7 +1008,7 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
 // what type each page actually is.
 std::string DebugDumpTableChain(TransactionContext& ctx,
                                 const std::string& name) {
-  if (std::getenv("TINYLAMB_SESSION_DEBUG_PAGES") == nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_SESSION_DEBUG_PAGES") == nullptr) {
     return "";
   }
   std::string report;
@@ -2203,9 +2204,13 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           if (expect_overflow) {
             t.steps.push_back({.must_fail = true, .sql = sql});
             if (ok || why.find("integer overflow") == std::string::npos) {
-              return "INSERT SELECT did not report the predicted integer "
-                     "overflow: " +
-                     sql + " :: " + why + "\n";
+              std::string error =
+                  "INSERT SELECT did not report the predicted integer overflow: ";
+              error += sql;
+              error += " :: ";
+              error += why;
+              error += '\n';
+              return error;
             }
             break;
           }
@@ -2332,7 +2337,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         // Debug aid: quantified/EXISTS predicates expose snapshot drift
         // instantly; check right after applying them (env-gated).
         const bool dbg_pred =
-            std::getenv("TINYLAMB_SESSION_CHECK_QUANT") != nullptr;
+            ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_CHECK_QUANT") != nullptr;
         const SPredPtr pred =
             GenPred(g, *target, tables, g.Pick(1, 2), SubqMode::kConjunct);
         const int set_col =
@@ -2484,8 +2489,13 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         if (expect_overflow) {
           t.steps.push_back({.must_fail = true, .sql = sql});
           if (ok || why.find("integer overflow") == std::string::npos) {
-            return "UPDATE did not report the predicted integer overflow: " +
-                   sql + " :: " + why + "\n";
+            std::string error =
+                "UPDATE did not report the predicted integer overflow: ";
+            error += sql;
+            error += " :: ";
+            error += why;
+            error += '\n';
+            return error;
           }
           break;
         }

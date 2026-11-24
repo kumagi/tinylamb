@@ -35,11 +35,10 @@ std::vector<std::string> RunOnBothRoutes(SqlEngine* engine,
   // RAII for the route knob: every early return below must leave the engine
   // as it was found so a failing case cannot leak into later tests sharing
   // this engine.
-  struct ForceRelationalGuard {
+  struct ForceRelationalGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                                 // scope-owned cleanup.
     explicit ForceRelationalGuard(SqlEngine* e)
         : engine(e), saved(e->ForceRelationalFallback()) {}
-    ForceRelationalGuard(const ForceRelationalGuard&) = delete;
-    ForceRelationalGuard& operator=(const ForceRelationalGuard&) = delete;
     ~ForceRelationalGuard() { engine->SetForceRelationalFallback(saved); }
     SqlEngine* engine;
     bool saved;

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "common/exc_shim.hpp"
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/executor_base.hpp"
@@ -532,26 +533,27 @@ TEST(SortShapeExecutorTest, MixedSignednessSingleKeyMatchesCanonicalOrder) {
 // Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
 TEST(SortShapeExecutorTest,
      PackedTwoKeyInt64MatchesFallbackAcrossNullOrdersAndOverflow) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
+                      // scope-owned cleanup.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };

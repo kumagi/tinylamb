@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/log_message.hpp"
 #include "common/platform/os.hpp"
 #include "query/fuzz_flaky_marker.hpp"
@@ -78,7 +79,7 @@ class ScopedDb {
  public:
   explicit ScopedDb(std::string_view prefix) : name_(ResolveDbName(prefix)) {
     InstallFuzzSigtrapBridge();
-    if (std::getenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE") ==
+    if (::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE") ==
         nullptr) {
       StatusOr<std::unique_ptr<Database>> created = Database::Create(name_);
       if (created.HasValue()) {
@@ -269,7 +270,7 @@ class ScopedDb {
  private:
   static std::string ResolveDbName(std::string_view prefix) {
     std::string base = std::string(prefix) + "-" + RandomString(8);
-    const char* db_dir = std::getenv("TINYLAMB_FUZZ_DB_DIR");
+    const char* db_dir = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_DB_DIR");
     if (db_dir == nullptr || *db_dir == '\0') {
       return base;
     }
@@ -293,7 +294,7 @@ class ScopedDb {
 inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
                            std::string_view ddl) {
   static const bool kTraceFuzzSql =
-      std::getenv("TINYLAMB_FUZZ_TRACE_SQL") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_TRACE_SQL") != nullptr;
   if (kTraceFuzzSql) {
     std::cerr << "[fuzz-sql] " << ddl << "\n" << std::flush;
   }
@@ -512,7 +513,7 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
               << filename << "\n"
               << std::flush;
   }
-  if (const char* dir = std::getenv("TINYLAMB_FUZZ_FINDINGS_DIR");
+  if (const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_FINDINGS_DIR");
       dir != nullptr && dir[0] != '\0') {
     std::string target = dir;
     if (!target.ends_with('/')) {
@@ -537,7 +538,7 @@ inline void EmitFuzzFinding(std::string_view tag, uint64_t seed,
             << (verify.empty() ? "" : "\n" + std::string(verify)) << "\n"
             << std::flush;
 
-  const char* cont = std::getenv("TINYLAMB_FUZZ_CONTINUE");
+  const char* cont = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_CONTINUE");
   if (replay_skipped ||
       (cont != nullptr && cont[0] != '\0' && std::string_view(cont) != "0")) {
     return;

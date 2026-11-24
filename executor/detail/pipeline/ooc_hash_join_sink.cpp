@@ -18,6 +18,7 @@
 
 #include "common/join_hash.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "executor/detail/ooc/chunk_codec.hpp"
 #include "executor/detail/ooc/recursive_partitioner.hpp"
 #include "executor/detail/pipeline/ooc_sinks.hpp"
@@ -715,7 +716,8 @@ OocHashBuildSink::OocHashBuildSink(std::shared_ptr<OocHashJoinContext> join_ctx,
 OocHashBuildSink::~OocHashBuildSink() {
   for (auto& w : bucket_writers_) {
     if (w != nullptr) {
-      w->Abort();
+      w->Abort();  // NOLINT(bugprone-unused-return-value): best-effort rollback
+                   // preserves the primary error.
     }
   }
   bucket_writers_.clear();
@@ -1425,8 +1427,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               probe_pass_eof = true;
               break;
             }
-            if (!out->Empty()) { return Status::kSuccess;
-}
+            if (!out->Empty()) {
+              return Status::kSuccess;
+            }
             ASSIGN_OR_RETURN(bool, has, ReadProbeFrame());
             if (!has) {
               probe_pass_eof = true;
@@ -1495,8 +1498,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
         // Finished this build slice. Either load next slice or finish
         // partition!
         if (!build_eof) {
-          if (!out->Empty()) { return Status::kSuccess;
-}
+          if (!out->Empty()) {
+            return Status::kSuccess;
+          }
           RETURN_IF_FAIL(LoadNextBuildSlice());
           if (!slice_build_rows.empty()) {
             continue;
@@ -1528,8 +1532,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               probe_pass_eof = true;
               break;
             }
-            if (!out->Empty()) { return Status::kSuccess;
-}
+            if (!out->Empty()) {
+              return Status::kSuccess;
+            }
             ASSIGN_OR_RETURN(bool, has, ReadProbeFrame());
             if (!has) {
               probe_pass_eof = true;
@@ -1543,8 +1548,9 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
               break;
             }
             if (!build_eof) {
-              if (!out->Empty()) { return Status::kSuccess;
-}
+              if (!out->Empty()) {
+                return Status::kSuccess;
+              }
               RETURN_IF_FAIL(LoadNextBuildSlice());
               if (!slice_build_rows.empty()) {
                 continue;
@@ -1705,7 +1711,8 @@ void OocAdaptiveHashProbeSource::EnableFilteredProbe() {
       schema.GetColumn(keys[0]).Type() != ValueType::kInt64) {
     return;
   }
-  const char* option = std::getenv("TINYLAMB_FILTER_HASH_PROBE");
+  const char* option =
+      ::tinylamb::platform::GetEnv("TINYLAMB_FILTER_HASH_PROBE");
   const std::string_view mode = option != nullptr ? option : "auto";
   if (mode == "off") {
     return;
@@ -2064,7 +2071,8 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
     if (ShouldKeepProbeOnlyUnmatched(spec.kind, spec.build_left) ||
         spec.kind == JoinKind::kSemi) {
       const uint64_t match_bytes =
-          (pair.probe_rows / 8) + static_cast<uint64_t>(pair.probe_rows % 8 != 0);
+          (pair.probe_rows / 8) +
+          static_cast<uint64_t>(pair.probe_rows % 8 != 0);
       if (match_bytes > cur->probe_matched_bits.max_size()) {
         return StatusError(StatusCode::kTooBigData,
                            "spill join match bitmap is too large");
@@ -2168,12 +2176,15 @@ Status OocAdaptiveHashProbeSource::OpenNextPartitionPair(PipelineContext* ctx,
     st = partition_side(pair.probe_seg, pcols, &p_segs, &p_cnts, &p_bytes);
   }
   if (st != Status::kSuccess) {
-    for (SpillSegmentId id : b_segs) { ctx->spill_store.DropSegment(id);
-}
-    for (SpillSegmentId id : p_segs) { ctx->spill_store.DropSegment(id);
-}
-    if (cache_ptr != nullptr) { cache_ptr->ReleaseAll();
-}
+    for (SpillSegmentId id : b_segs) {
+      ctx->spill_store.DropSegment(id);
+    }
+    for (SpillSegmentId id : p_segs) {
+      ctx->spill_store.DropSegment(id);
+    }
+    if (cache_ptr != nullptr) {
+      cache_ptr->ReleaseAll();
+    }
     return st;
   }
   pending_pairs_.pop_back();

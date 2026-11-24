@@ -256,7 +256,8 @@ TEST_F(PageManagerTest, CheckpointRejectsUnrepresentableBlockGeneration) {
   ASSERT_NE(magic, std::string::npos);
   const size_t block_generation =
       magic + kMagic.size() + (2 * sizeof(uint32_t)) + (2 * sizeof(uint64_t));
-  ASSERT_GE(bytes.size(), block_generation + sizeof(uint64_t) + sizeof(uint32_t));
+  ASSERT_GE(bytes.size(),
+            block_generation + sizeof(uint64_t) + sizeof(uint32_t));
   constexpr uint64_t kUnrepresentable = uint64_t{1} << 32;
   std::memcpy(bytes.data() + block_generation, &kUnrepresentable,
               sizeof(kUnrepresentable));
@@ -427,9 +428,9 @@ TEST_F(PageManagerTest, CheckpointLsmRotationSerializesWithConcurrentFlushes) {
   // write-buffer limit and flush/compaction streams actually run.
   pm_->SetBufferPoolLimitBytesForTest(1U << 20);
   std::vector<std::string> keys;
-  keys.reserve(kChunks * kPerChunk);
+  keys.reserve(size_t{kChunks} * kPerChunk);
   std::vector<std::string> values;
-  values.reserve(kChunks * kPerChunk);
+  values.reserve(size_t{kChunks} * kPerChunk);
   for (int i = 0; i < kChunks * kPerChunk; ++i) {
     // NOLINTNEXTLINE(modernize-avoid-c-arrays) runtime-sized buffer
     char buf[16];

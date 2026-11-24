@@ -230,7 +230,8 @@ class SegmentRowWriter {
   void Abort() noexcept {
     pending_.clear();
     pending_bytes_ = 0;
-    writer_.Abort();
+    writer_.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                      // rollback preserves the primary error.
   }
 
  private:
@@ -3379,7 +3380,8 @@ StatusOr<SpillSegmentId> EvalSpilledCallsMaterializingSegment(
       }
       Status st = writer.Append(std::move(r));
       if (st != Status::kSuccess) {
-        writer.Abort();
+        writer.Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                         // rollback preserves the primary error.
         if (active_seg != cur_seg) {
           store->DropSegment(active_seg);
         }
@@ -4221,7 +4223,8 @@ Status OocWindowSink::Consume(PipelineContext* ctx, size_t /*worker_id*/,
   const size_t chunk_bytes = EstimateChunkMemoryBytes(input);
   if (!ooc_mode_ &&
       (always_spill ||
-       chunk_bytes > in_mem_budget_ - std::min(buffered_bytes_, in_mem_budget_) ||
+       chunk_bytes >
+           in_mem_budget_ - std::min(buffered_bytes_, in_mem_budget_) ||
        (grant_cache_.has_value() && !grant_cache_->Reserve(chunk_bytes)))) {
     RETURN_IF_FAIL(TransitionToOoc(ctx));
   }
@@ -4315,7 +4318,8 @@ StatusOr<std::shared_ptr<PipelineSource>> OocWindowSink::Finalize(
                        "OocWindowSink requires a TransactionContext");
   }
   if (!stage0_sorter_) {
-    return StatusError(StatusCode::kInvalidArgument, "window input sorter already consumed");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "window input sorter already consumed");
   }
   RETURN_IF_FAIL(stage0_sorter_->Finish());
   std::unique_ptr<ExternalSorter> cur_sorter = std::move(stage0_sorter_);

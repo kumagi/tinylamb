@@ -4,11 +4,12 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "common/platform/process.hpp"
 #include "query/sql_diff_oracle_fuzzer.hpp"
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
   tinylamb::DiffOracleFuzzTry(data, size,
-                             std::getenv("TINYLAMB_FUZZ_VERBOSE") != nullptr);
+                             ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_VERBOSE") != nullptr);
   return 0;
 }

@@ -205,13 +205,13 @@ bool RunDdl(tinylamb::Database& database, std::string_view sql,
       engine.Execute(context, sql);
   if (!result.HasValue()) {
     *error = engine.LastError();
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return false;
   }
   result.Value().Drain();
   if (result.Value().GetStatus() != tinylamb::Status::kSuccess) {
     *error = result.Value().GetStatus().GetMessage();
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return false;
   }
   if (context.PreCommit() != tinylamb::Status::kSuccess) {
@@ -228,7 +228,7 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
   tinylamb::StatusOr<tinylamb::Table> found = database.GetTable(context, table);
   if (!found.HasValue()) {
     *error = "cannot open table " + std::string(table);
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return false;
   }
   tinylamb::Table destination = std::move(found.Value());
@@ -238,7 +238,7 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
     if (!inserted.HasValue()) {
       *error = "insert failed for " + std::string(table) + ": " +
                inserted.GetStatus().GetMessage();
-      context.Abort();
+      static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
       return false;
     }
     if (++in_transaction == options.batch_rows) {
@@ -251,7 +251,7 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
           database.GetTable(context, table);
       if (!reopened.HasValue()) {
         *error = "cannot reopen table " + std::string(table);
-        context.Abort();
+        static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
         return false;
       }
       destination = std::move(reopened.Value());
@@ -273,13 +273,13 @@ bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
       engine.Execute(context, "ANALYZE;");
   if (!result.HasValue()) {
     *error = engine.LastError().empty() ? "ANALYZE failed" : engine.LastError();
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return false;
   }
   result.Value().Drain();
   if (result.Value().GetStatus() != tinylamb::Status::kSuccess) {
     *error = result.Value().GetStatus().GetMessage();
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return false;
   }
   if (context.PreCommit() != tinylamb::Status::kSuccess) {
@@ -342,7 +342,7 @@ QueryProfile RunQuery(tinylamb::Database& database, std::string_view name,
   if (!result.HasValue()) {
     profile.error = engine.LastError();
     tinylamb::SqlEngine::SetThreadRuntimeProfiling(false);
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return profile;
   }
   try {
@@ -352,7 +352,7 @@ QueryProfile RunQuery(tinylamb::Database& database, std::string_view name,
     // recorded as a query error, not allowed to terminate the run.
     profile.error = std::string(name) + ": " + exception.what();
     tinylamb::SqlEngine::SetThreadRuntimeProfiling(false);
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return profile;
   }
   profile.milliseconds =
@@ -360,7 +360,7 @@ QueryProfile RunQuery(tinylamb::Database& database, std::string_view name,
   if (result.Value().GetStatus() != tinylamb::Status::kSuccess) {
     profile.error = result.Value().GetStatus().GetMessage();
     tinylamb::SqlEngine::SetThreadRuntimeProfiling(false);
-    context.Abort();
+    static_cast<void>(context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort rollback preserves the primary error.
     return profile;
   }
   // prepare_ns covers SqlEngine::Prepare. Set operations execute every

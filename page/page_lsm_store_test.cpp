@@ -26,14 +26,21 @@ void* operator new(std::size_t bytes) {
   if (allocations_before_failure > 0) {
     --allocations_before_failure;
   }
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory): global operator new.
   if (void* result = std::malloc(bytes == 0 ? 1 : bytes)) {
     return result;
   }
   throw std::bad_alloc();
 }
 
-void operator delete(void* ptr) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t /*unused*/) noexcept { std::free(ptr); }
+void operator delete(void* ptr) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory): paired global delete.
+  std::free(ptr);
+}
+void operator delete(void* ptr, std::size_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory): paired sized delete.
+  std::free(ptr);
+}
 
 namespace tinylamb {
 namespace {
@@ -61,7 +68,8 @@ TEST(LsmRunWriterTest, RejectsEntryLargerThanReadableBlock) {
 }
 
 TEST(LsmBlockCacheTest, AllocationFailureReturnsStatusAndLeavesCacheUsable) {
-  struct TempRun {
+  struct TempRun {  // NOLINT(cppcoreguidelines-special-member-functions):
+                    // scope-owned cleanup.
     int fd = platform::OpenUnlinkedTempFile();
     ~TempRun() {
       if (fd >= 0) {
@@ -96,7 +104,8 @@ TEST(LsmBlockCacheTest, AllocationFailureReturnsStatusAndLeavesCacheUsable) {
     SCOPED_TRACE(fail_after);
     LsmBlockCache cache;
     auto attempted = [&] {
-      struct ResetFailure {
+      struct ResetFailure {  // NOLINT(cppcoreguidelines-special-member-functions):
+                             // scope-owned cleanup.
         ~ResetFailure() { allocations_before_failure = -1; }
       } reset_failure;
       allocations_before_failure = fail_after;

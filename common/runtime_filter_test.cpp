@@ -161,8 +161,8 @@ TEST(RuntimeFilterTest, GroupIgnoresMissingParts) {
 TEST(RuntimeFilterTest, IncompletePrebuiltBitmapKeepsExactKeys) {
   std::vector<std::unique_ptr<RuntimeFilter>> parts;
   parts.push_back(nullptr);
-  parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
-      std::vector<int64_t>{3, 99}));
+  parts.push_back(
+      std::make_unique<ExactSetRuntimeFilter>(std::vector<int64_t>{3, 99}));
   const RuntimeFilterGroup group(std::move(parts), {uint64_t{1} << 3}, 0, 100);
   EXPECT_FALSE(group.has_dense_bits());
   EXPECT_FALSE(group.Reject(3));
@@ -272,7 +272,7 @@ TEST(RuntimeFilterTest, ExactSetAccountsOnlyForAllocatedHashSlots) {
   const ExactSetRuntimeFilter hashed({1, 3, 5});
   const ExactSetRuntimeFilter sorted({1, 3, 5}, true, true);
   EXPECT_EQ(sorted.MemoryBytes(),
-            sizeof(sorted) + sorted.Keys().capacity() * sizeof(int64_t));
+            sizeof(sorted) + (sorted.Keys().capacity() * sizeof(int64_t)));
   EXPECT_GT(hashed.MemoryBytes(), sorted.MemoryBytes());
   for (int64_t key = 0; key <= 6; ++key) {
     EXPECT_EQ(hashed.Reject(key), sorted.Reject(key));

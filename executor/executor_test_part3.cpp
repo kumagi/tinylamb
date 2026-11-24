@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 
+#include "common/platform/process.hpp"
 #include "executor/executor_test.hpp"
 
 namespace tinylamb {
@@ -229,16 +230,16 @@ TEST_F(ExecutorTest, RelationalExplainNestedLoopUnknownRows) {
 
 // T1794: pins that the QueryMemory annotation tracks the ACTIVE lane.
 struct ScopedExecEnv {  // NOLINT(cppcoreguidelines-special-member-functions)
-  ScopedExecEnv() : saved_(std::getenv("TINYLAMB_EXEC_ENGINE") != nullptr) {
+  ScopedExecEnv() : saved_(::tinylamb::platform::GetEnv("TINYLAMB_EXEC_ENGINE") != nullptr) {
     if (saved_) {
-      original_ = std::getenv("TINYLAMB_EXEC_ENGINE");
+      original_ = ::tinylamb::platform::GetEnv("TINYLAMB_EXEC_ENGINE");
     }
   }
   ~ScopedExecEnv() {
     if (saved_) {
-      (void)setenv("TINYLAMB_EXEC_ENGINE", original_.c_str(), 1);
+      (void)::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", original_.c_str(), 1);
     } else {
-      (void)unsetenv("TINYLAMB_EXEC_ENGINE");
+      (void)::tinylamb::platform::UnsetEnv("TINYLAMB_EXEC_ENGINE");
     }
   }
   std::string original_;
@@ -262,7 +263,7 @@ TEST_F(ExecutorTest, RelationalExplainMemoryLimitBranches) {
     // The legacy lane keeps reporting the global QueryMemoryBudget; pin
     // all three branches (unlimited / mid / byte-granular) there.
     ScopedExecEnv env;
-    (void)setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1);
+    (void)::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", "legacy", 1);
     {
       ScopedQueryMemory unlimited(0);
       const std::string plan = RelationalExplain(*rs_, sql);

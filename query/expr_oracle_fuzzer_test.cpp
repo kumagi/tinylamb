@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/expr_oracle_fuzzer.hpp"
 
 #include <cstdint>
@@ -393,7 +394,7 @@ TEST(ExprOracleFuzzer, ReplayPinnedDeadBranchCastOrderRegression) {
 TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 64;
   if (scale != nullptr) {
     char* end = nullptr;
@@ -436,7 +437,7 @@ constexpr uint32_t kExtendedOpsShards = 4;
 TEST_P(ExprOracleExtendedTest, SeededExtendedOpsHoldOracles) {
   int ran = 0;
   int engine_ran = 0;
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 200;
   if (scale != nullptr) {
     char* end = nullptr;
@@ -513,7 +514,7 @@ TEST(ExprOracleFuzzer, TestFileRoundTripAndReplay) {
 }
 
 TEST(ExprOracleFuzzer, RowAwareNullRejectAndDifferentialEquivalence) {
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 64;
   if (scale != nullptr) {
     char* end = nullptr;

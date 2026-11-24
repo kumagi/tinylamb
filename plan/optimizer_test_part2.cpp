@@ -1153,8 +1153,8 @@ TEST_F(OptimizerTest, IndexJoinRulePushesOneRangeBoundIntoTheProbe) {
       IndexSchema("ProbeRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext stat_ctx = rs_->BeginContext();
-  rs_->RefreshStatistics(stat_ctx, "ProbeLeft");
-  rs_->RefreshStatistics(stat_ctx, "ProbeRight");
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "ProbeLeft"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "ProbeRight"));
   ASSERT_SUCCESS(stat_ctx.PreCommit());
 
   TransactionContext context = rs_->BeginContext();
@@ -1290,8 +1290,8 @@ TEST_F(OptimizerTest, IndexJoinRuleAdoptsBothIntervalBoundsIntoTheProbe) {
       IndexSchema("IntervalRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext stat_ctx = rs_->BeginContext();
-  rs_->RefreshStatistics(stat_ctx, "IntervalLeft");
-  rs_->RefreshStatistics(stat_ctx, "IntervalRight");
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "IntervalLeft"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "IntervalRight"));
   ASSERT_SUCCESS(stat_ctx.PreCommit());
 
   TransactionContext context = rs_->BeginContext();
@@ -1433,8 +1433,8 @@ TEST_F(OptimizerTest, IndexJoinRuleKeepsUnprobedPredicatesResidual) {
       IndexSchema("ProbeRightAB", {0, 1}, {}, IndexMode::kNonUnique)));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext stat_ctx = rs_->BeginContext();
-  rs_->RefreshStatistics(stat_ctx, "ProbeLeft");
-  rs_->RefreshStatistics(stat_ctx, "ProbeRight");
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "ProbeLeft"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "ProbeRight"));
   ASSERT_SUCCESS(stat_ctx.PreCommit());
 
   TransactionContext context = rs_->BeginContext();
@@ -1627,8 +1627,8 @@ TEST_F(OptimizerTest, BandJoinSurvivesJoinCommutativity) {
   }
   ASSERT_SUCCESS(setup.txn_.PreCommit());
   TransactionContext stat_ctx = rs_->BeginContext();
-  rs_->RefreshStatistics(stat_ctx, "BandLeft");
-  rs_->RefreshStatistics(stat_ctx, "BandRight");
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "BandLeft"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(stat_ctx, "BandRight"));
   ASSERT_SUCCESS(stat_ctx.PreCommit());
 
   TransactionContext context = rs_->BeginContext();
@@ -3144,9 +3144,9 @@ TEST_F(OptimizerTest, OrderedOuterDiscountsTheIndexProbeIntoAWin) {
     ASSERT_SUCCESS(
         rs_->CreateIndex(setup, "LocInner", IndexSchema("LocInnerPK", {0})));
   }
-  rs_->RefreshStatistics(setup, "LocOrdered");
-  rs_->RefreshStatistics(setup, "LocPlain");
-  rs_->RefreshStatistics(setup, "LocInner");
+  ASSERT_SUCCESS(rs_->RefreshStatistics(setup, "LocOrdered"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(setup, "LocPlain"));
+  ASSERT_SUCCESS(rs_->RefreshStatistics(setup, "LocInner"));
   ASSERT_SUCCESS(setup.txn_.PreCommit());
 
   // Returns the plan text and the emitted rows for one outer table.

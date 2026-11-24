@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/string_util.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -1317,7 +1318,7 @@ void SearchEngine::Explore(GroupId root) {
   seed(root);
   (void)memo_.DrainTouchedGroups();
   size_t steps = 0;
-  rule_stats_ = std::getenv("TINYLAMB_RULE_STATS") != nullptr;
+  rule_stats_ = ::tinylamb::platform::GetEnv("TINYLAMB_RULE_STATS") != nullptr;
   rule_attempt_counts_.clear();
   rule_attempt_nanos_.clear();
   constexpr size_t kMaxExploreSteps = 20000;
@@ -1340,7 +1341,7 @@ void SearchEngine::Explore(GroupId root) {
   }
   explore_limit_reached_ =
       explore_limit_reached_ || (!budget_exhausted_ && !queue.empty());
-  if (std::getenv("TINYLAMB_DEBUG_DUMP_MEMO") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_DUMP_MEMO") != nullptr) {
     memo_.Dump(std::cerr);
   }
   if (rule_stats_) {
@@ -1436,7 +1437,7 @@ void SearchEngine::ExploreGroup(GroupId group,
 std::optional<BestPlan> SearchEngine::Optimize(
     GroupId root, const PhysicalProperties& properties,
     const Implement& implement, const RuleContext& context) {
-  const bool profile = std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
+  const bool profile = ::tinylamb::platform::GetEnv("TINYLAMB_PLAN_PROFILE") != nullptr;
   const auto explore_begin = std::chrono::steady_clock::now();
   Explore(root);
   // The memo is append-only, so a truncated exploration still yields a valid

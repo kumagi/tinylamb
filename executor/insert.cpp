@@ -122,12 +122,9 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
     if (key_offsets.empty() || row.values_.empty()) {
       return false;
     }
-    for (const size_t offset : key_offsets) {
-      if (offset >= row.values_.size()) {
-        return false;
-      }
-    }
-    return true;
+    return std::ranges::all_of(key_offsets, [&row](size_t offset) {
+      return offset < row.values_.size();
+    });
   };
   if (!key_offsets.empty()) {
     auto it = target_->BeginFullScan(*txn_);

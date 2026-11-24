@@ -15,6 +15,7 @@
  */
 
 #include <cstdlib>
+#include <string_view>
 
 #include "common/platform/process.hpp"
 #include "common/unwind_guard.hpp"
@@ -64,7 +65,9 @@ TEST_F(QueryTest, GroupedUnionRewriteKeepsCteUsedInClauseSubqueries) {
         break;
       case Clause::kOrderBy:
         root.SetOrderBy(
-            {SelectStatement::OrderByTerm{.expression=ref, .ascending=true, .nulls_first=std::nullopt}});
+            {SelectStatement::OrderByTerm{.expression = ref,
+                                          .ascending = true,
+                                          .nulls_first = std::nullopt}});
         break;
       case Clause::kDistinctOn:
         root.SetDistinctOn({ref});
@@ -73,7 +76,8 @@ TEST_F(QueryTest, GroupedUnionRewriteKeepsCteUsedInClauseSubqueries) {
 
     ASSERT_TRUE(RewriteDistributeGroupedSumOverUnionAll(&root, ctx));
     ASSERT_EQ(grouped->Sources().size(), 1U);
-    EXPECT_EQ(root.WithQueries().contains("union_cte"), clause != Clause::kNone);
+    EXPECT_EQ(root.WithQueries().contains("union_cte"),
+              clause != Clause::kNone);
   }
   ASSERT_SUCCESS(ctx.txn_.Abort());
 }
@@ -989,8 +993,8 @@ TEST_F(QueryTest, SqlEnginePlanCacheRetainsSubqueryTablesAcrossDmlReplays) {
   {
     // Auto-compaction advances the schema epoch and invalidates the plans.
     // Keep this checkpoint focused on replaying the existing cached plans.
-    constexpr char kAutoTlcs[] = "TINYLAMB_AUTO_TLCS";
-    const char* configured = std::getenv(kAutoTlcs);
+    constexpr const char* kAutoTlcs = "TINYLAMB_AUTO_TLCS";
+    const char* configured = ::tinylamb::platform::GetEnv(kAutoTlcs);
     const auto previous = configured != nullptr
                               ? std::optional<std::string>(configured)
                               : std::nullopt;
@@ -1206,10 +1210,9 @@ TEST_F(QueryTest, IntersectWithEmptyBranchKeepsExpandedHeadColumnNames) {
   auto context = db_->BeginContext();
   RunSql(context, *db_, "ANALYZE;");
 
-  EXPECT_TRUE(RunSql(
-                  context, *db_,
-                  "SELECT a, b FROM (SELECT * FROM intersect_head "
-                  "INTERSECT DISTINCT SELECT x, y FROM intersect_empty);")
+  EXPECT_TRUE(RunSql(context, *db_,
+                     "SELECT a, b FROM (SELECT * FROM intersect_head "
+                     "INTERSECT DISTINCT SELECT x, y FROM intersect_empty);")
                   .empty());
 }
 
@@ -1779,7 +1782,8 @@ TEST_F(QueryTest, CompositeIndexLookupJoinRangeAndResidualSemantics) {
   RunSql(setup, *db_,
          "INSERT INTO lk VALUES (1, 5, 2.5), (1, 6, 3.5), (2, 1, 0.5), "
          "(3, 9, 1.5);");
-  RunSql(setup, *db_, "CREATE TABLE rk (a INT64, b INT64, c INT64, d FLOAT64);");
+  RunSql(setup, *db_,
+         "CREATE TABLE rk (a INT64, b INT64, c INT64, d FLOAT64);");
   {
     std::string values =
         "(1, 10, 1, 9.5), (1, 20, 7, 1.5), (1, 30, 1, 3.5), (1, 4, 5, 0.5), "
@@ -2019,7 +2023,7 @@ TEST_F(QueryTest, ZigZagJoinSqlContracts) {
 
   TransactionContext stats_context = db_->BeginContext();
   ASSERT_SUCCESS(db_->RefreshStatistics(stats_context, "zz_left"));
-  db_->RefreshStatistics(stats_context, "zz_right");
+  ASSERT_SUCCESS(db_->RefreshStatistics(stats_context, "zz_right"));
   ASSERT_SUCCESS(stats_context.txn_.PreCommit());
 
   TransactionContext ctx = db_->BeginContext();
@@ -2502,7 +2506,7 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
       std::filesystem::temp_directory_path() /
       ("tinylamb-spill-test-" + RandomString());
   std::filesystem::create_directories(spill_isolation_dir);
-  setenv("TINYLAMB_TEMP", spill_isolation_dir.c_str(), 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", spill_isolation_dir.c_str(), 1);
   // Restore the process-global budget cap and TINYLAMB_TEMP on every exit
   // path: the ASSERT_* checks below return early on failure, and without
   // this guard a failed assertion would leak both into later tests.
@@ -2515,7 +2519,7 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
     SpillIsolationGuard& operator=(SpillIsolationGuard&&) = delete;
     ~SpillIsolationGuard() {
       QueryMemoryBudget::Global().ResetForTest(0);
-      unsetenv("TINYLAMB_TEMP");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_TEMP");
       std::error_code ec;
       std::filesystem::remove_all(dir_, ec);
     }
@@ -2594,7 +2598,7 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
   EXPECT_EQ(count_spill_files(), baseline_spills);
   EXPECT_EQ(db_->PinnedPageCount(), 0U);
 
-  unsetenv("TINYLAMB_TEMP");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_TEMP");
   std::error_code cleanup_ec;
   std::filesystem::remove_all(spill_isolation_dir, cleanup_ec);
 

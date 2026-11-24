@@ -89,7 +89,7 @@ Status SpillableStore::SpillChunk(const DataChunk& chunk) {
                        "SpillableStore missing SpillSegmentWriter");
   }
   const uint64_t before = writer_->BytesWritten();
-  const Status st = WriteDataChunk(writer_.get(), chunk, &scratch_codec_,
+  Status st = WriteDataChunk(writer_.get(), chunk, &scratch_codec_,
                                    StagingFlushBytes());
   // Trim even when the write fails: a partially encoded oversized frame still
   // grew scratch_codec_, so leaving that capacity behind would keep it charged
@@ -127,7 +127,7 @@ Status SpillableStore::TransitionToSpill() {
   // them instead of relying on the local unique_ptr's destructor: the writer
   // drops the same segment either way, but making it explicit keeps the
   // cleanup contract true for every I/O boundary, not just Flush().
-  const Status opened = writer->EnsureOpen();
+  Status opened = writer->EnsureOpen();
   if (opened != Status::kSuccess) {
     writer->Abort();
     return opened;
@@ -141,7 +141,7 @@ Status SpillableStore::TransitionToSpill() {
     }
     TrimCodecScratch();
   }
-  const Status flush = writer->Flush();
+  Status flush = writer->Flush();
   if (flush != Status::kSuccess) {
     writer->Abort();
     return flush;
@@ -259,11 +259,12 @@ Status SpillableStore::AppendRow(const Row& row, RowPosition pos) {
       RETURN_IF_FAIL(FlushStagingChunk());
     }
     if (grant_cache_.has_value()) {
-      if (!grant_cache_->Reserve(row_bytes)) {
+      auto& grant_cache = grant_cache_.value();
+      if (!grant_cache.Reserve(row_bytes)) {
         if (!staging_chunk_.Empty()) {
           RETURN_IF_FAIL(FlushStagingChunk());
         }
-        if (!grant_cache_->Reserve(row_bytes)) {
+        if (!grant_cache.Reserve(row_bytes)) {
           if (!spilled_) {
             RETURN_IF_FAIL(TransitionToSpill());
           }

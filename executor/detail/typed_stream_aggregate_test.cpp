@@ -244,7 +244,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
       ColumnValueExp(ColumnName("l_quantity")), BinaryOperation::kLessThan,
       ConstantValueExp(Value(24)));
   auto compiled = TryCompileTypedFilterCompare(pred, schema, true);
-  ASSERT_TRUE(compiled.has_value());
+  if (!compiled.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled->left, 1U);
   EXPECT_TRUE(compiled->constant_payload);
   EXPECT_EQ(compiled->int_constant, 24);
@@ -255,9 +258,8 @@ TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
 TEST(TypedStreamAggregateTest, LiteralLikeMatchesAstAndRejectsOtherDomains) {
   const Schema schema("input", {Column("s", ValueType::kVarChar)});
   const std::vector<std::string> patterns{
-      "",       "%",       "%%",    "alpha", "alpha%", "%alpha",
-      "%alpha%", "尾%",     "%尾",   "%a%b%", "%a%%b%",
-      std::string("%a\0b%", 5)};
+      "",        "%",   "%%",  "alpha", "alpha%", "%alpha",
+      "%alpha%", "尾%", "%尾", "%a%b%", "%a%%b%", std::string("%a\0b%", 5)};
   const std::vector<Value> values{Value(),
                                   Value(""),
                                   Value("alpha"),
@@ -327,7 +329,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedConditionalInput) {
       ConstantValueExp(Value()));
 
   auto compiled = TryCompileTypedConditionalInput(case_expr, schema);
-  ASSERT_TRUE(compiled.has_value());
+  if (!compiled.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled->result_type, ValueType::kInt64);
 
   const Row matching_row({Value(1), Value(15), Value(100.0), Value(0.05),
@@ -347,7 +352,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
   // 1. kSingleDoubleCol: l_extendedprice
   const Expression single_col = ColumnValueExp(ColumnName("l_extendedprice"));
   auto compiled_single = TryCompileTypedDoubleExpr(single_col, schema);
-  ASSERT_TRUE(compiled_single.has_value());
+  if (!compiled_single.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled_single->shape,
             TypedDoubleExprInput::Shape::kSingleDoubleCol);
   EXPECT_DOUBLE_EQ(
@@ -359,7 +367,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
       ColumnValueExp(ColumnName("l_extendedprice")), BinaryOperation::kMultiply,
       ColumnValueExp(ColumnName("l_discount")));
   auto compiled_mul2 = TryCompileTypedDoubleExpr(mul_two, schema);
-  ASSERT_TRUE(compiled_mul2.has_value());
+  if (!compiled_mul2.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled_mul2->shape,
             TypedDoubleExprInput::Shape::kMulTwoDoubleCols);
   EXPECT_DOUBLE_EQ(
@@ -374,7 +385,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
       BinaryExpressionExp(ColumnValueExp(ColumnName("l_extendedprice")),
                           BinaryOperation::kMultiply, one_minus_disc);
   auto compiled_disc = TryCompileTypedDoubleExpr(disc_price, schema);
-  ASSERT_TRUE(compiled_disc.has_value());
+  if (!compiled_disc.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled_disc->shape,
             TypedDoubleExprInput::Shape::kMulConstMinusCol);
   EXPECT_DOUBLE_EQ(
@@ -389,7 +403,10 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
   const Expression charge =
       BinaryExpressionExp(disc_price, BinaryOperation::kMultiply, one_plus_tax);
   auto compiled_charge = TryCompileTypedDoubleExpr(charge, schema);
-  ASSERT_TRUE(compiled_charge.has_value());
+  if (!compiled_charge.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(compiled_charge->shape,
             TypedDoubleExprInput::Shape::kMulConstMinusColMulConstPlusCol);
   EXPECT_NEAR(
@@ -419,7 +436,10 @@ TEST(TypedStreamAggregateTest, TryCompilePositionalHavingAndConjuncts) {
   const Expression having1 = BinaryExpressionExp(
       sum_qty, BinaryOperation::kGreaterThan, ConstantValueExp(Value(300)));
   auto single = TryCompilePositionalHaving(having1, aggs);
-  ASSERT_TRUE(single.has_value());
+  if (!single.has_value()) {
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   EXPECT_EQ(single->agg_index, 0U);
   EXPECT_EQ(single->op, BinaryOperation::kGreaterThan);
   EXPECT_EQ(single->constant, Value(300));
@@ -558,8 +578,8 @@ TEST(TypedStreamAggregateTest, AccumulatorChunksCommitsStorageInSegments) {
                 sizeof(AggregateAccumulator));
 
   // The accumulators are still live and writable through the same indexing.
-  chunks.State(0, 0).Add(Value(int64_t{7}));
-  chunks.State(9, 0).Add(Value(int64_t{9}));
+  EXPECT_EQ(chunks.State(0, 0).Add(Value(int64_t{7})), Status::kSuccess);
+  EXPECT_EQ(chunks.State(9, 0).Add(Value(int64_t{9})), Status::kSuccess);
 
   // Fill past the first segment and past the first chunk: commitment must
   // track usage, then cap at the whole slab per chunk.
@@ -574,11 +594,11 @@ TEST(TypedStreamAggregateTest, AccumulatorChunksCommitsStorageInSegments) {
   EXPECT_EQ(chunks.CommittedBytes(),
             // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
             // is unambiguous
-            relational_detail::AccumulatorChunks::kSlotsPerChunk *
-                    sizeof(AggregateAccumulator) +
+            (relational_detail::AccumulatorChunks::kSlotsPerChunk *
+             sizeof(AggregateAccumulator)) +
                 relational_detail::AccumulatorChunks::kSegmentBytes);
-  chunks.State(511, 0).Add(Value(int64_t{5}));
-  chunks.State(520, 0).Add(Value(int64_t{6}));
+  EXPECT_EQ(chunks.State(511, 0).Add(Value(int64_t{5})), Status::kSuccess);
+  EXPECT_EQ(chunks.State(520, 0).Add(Value(int64_t{6})), Status::kSuccess);
   EXPECT_EQ(chunks.State(0, 0).TryFinish().Value(), Value(int64_t{7}));
   EXPECT_EQ(chunks.State(9, 0).TryFinish().Value(), Value(int64_t{9}));
   EXPECT_EQ(chunks.State(511, 0).TryFinish().Value(), Value(int64_t{5}));
@@ -808,6 +828,80 @@ TEST(TypedStreamAggregateTest, TypedColumnEvalOverflowUsesCanonicalStatus) {
                                  Row({Value(kMax), Value(1)}));
   ASSERT_TRUE(ok.HasValue()) << ToString(ok.GetStatus());
   EXPECT_EQ(ok.Value().AsInt64(), kMax - 1);
+}
+
+// Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+// (InRangeSynopsis_sound).
+// Verifies scalar IN-list + integer range folds (both 64-bit bitmask and
+// wide-span list, plus empty-match zone-map/bloom skipping and NULL handling)
+// match the canonical row-ordered fold bit-for-bit.
+TEST(TypedStreamAggregateTest, ScalarInRangeSynopsisMatchesCanonicalFold) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  const std::string prefix = "tsagg_inrange_" + RandomString();
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  Schema schema(
+      "x", {Column("id1", ValueType::kInt64), Column("id2", ValueType::kInt64),
+            Column("v1", ValueType::kInt64)});
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
+    Table table = db->GetTable(ctx, "x").MoveValue();
+    for (int64_t i = 0; i < 20000; ++i) {
+      Value id1 = (i % 37 == 0) ? Value() : Value((i % 100) + 1);
+      Value id2 = (i % 53 == 0) ? Value() : Value(i % 100);
+      Value v1 = (i % 29 == 0) ? Value() : Value((i * 17) % 1000 - 250);
+      if (i % 1000 == 0) {
+        id1 = Value(int64_t{50000});
+      }
+      ASSERT_TRUE(table.Insert(ctx.txn_, Row(std::vector<Value>{id1, id2, v1}))
+                      .HasValue());
+    }
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+
+  SqlEngine engine(*db);
+  const std::vector<std::string> queries = {
+      "SELECT COUNT(*) AS n, COALESCE(SUM(v1), 0) AS s "
+      "FROM x WHERE id1 IN (1, 2, 3, 7, 11) AND id2 BETWEEN 10 AND 40",
+      "SELECT COUNT(*) AS n, COALESCE(SUM(v1), 0) AS s "
+      "FROM x WHERE id1 IN (1, 50000) AND id2 BETWEEN 10 AND 40",
+      "SELECT COUNT(*) AS n, COALESCE(SUM(v1), 0) AS s "
+      "FROM x WHERE id1 IN (999999, 1000000) AND id2 BETWEEN 10 AND 40",
+  };
+
+  const auto verify_all = [&]() {
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    for (const std::string& sql : queries) {
+      Status status = Status::kSuccess;
+      const std::vector<Row> fast =
+          RunGroupedQuery(&engine, &ctx, sql, &status);
+      ASSERT_EQ(status, Status::kSuccess) << sql;
+      ASSERT_EQ(fast.size(), 1U) << sql;
+
+      ScopedEnvVar disable_typed("TINYLAMB_DISABLE_TYPED_AGG", "1");
+      const std::vector<Row> canonical =
+          RunGroupedQuery(&engine, &ctx, sql, &status);
+      disable_typed.Set(nullptr);
+      ASSERT_EQ(status, Status::kSuccess) << sql;
+      ASSERT_EQ(canonical.size(), 1U) << sql;
+
+      EXPECT_EQ(fast[0], canonical[0]) << sql;
+    }
+  };
+
+  // 1. Direct LSTableStore path (CompiledLSTableBlockFilter::IntInList).
+  verify_all();
+
+  // 2. Compacted TLCS path (FastNumericPred::Kind::kIntInMask64 / kIntInList).
+  {
+    TransactionContext compact_ctx = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(compact_ctx, "x"), Status::kSuccess);
+    ASSERT_EQ(compact_ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  verify_all();
+  db->DeleteAll();
 }
 
 }  // namespace

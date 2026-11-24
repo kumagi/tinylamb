@@ -123,7 +123,7 @@ TEST_F(LoggerSegmentTest, SegmentMetadataWrittenAndValidated) {
   EXPECT_EQ(ReadMetaSegmentSize(base_), 0U);  // Absent before first Create.
   auto logger = Logger::Create(base_, 4096, 1, 4096).MoveValue();
   EXPECT_EQ(ReadMetaSegmentSize(base_), 4096U);
-  logger->Finish();
+  ASSERT_SUCCESS(logger->Finish());
 
   // A corrupt sidecar must fail closed instead of silently re-reading a
   // wrong geometry.

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <utility>
 
+#include "common/platform/process.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -26,7 +27,7 @@ namespace pax_detail {
 
 // Benchmark A/B hook: TINYLAMB_FORCE_PLAIN=1 bypasses the chooser entirely so
 // the same dataset can be measured with and without lightweight encodings.
-bool ForcePlain() { return std::getenv("TINYLAMB_FORCE_PLAIN") != nullptr; }
+bool ForcePlain() { return ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_PLAIN") != nullptr; }
 
 EncodedCol EncConstI64(int64_t v) {
   EncodedCol e;

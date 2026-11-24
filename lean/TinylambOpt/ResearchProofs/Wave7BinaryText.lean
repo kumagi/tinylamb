@@ -1214,13 +1214,493 @@ theorem sound : TinylambOpt.ResearchGoals.BinaryText.TupleEncoding.Goal := by
 
 end InternalTupleEncoding
 
--- TODO(PrefixCardinality): the counting identity for sorted dictionaries is still under construction; no compiling proof obtained in this session.
+namespace InternalPrefixCardinality
+
+open TinylambOpt.ResearchGoals.BinaryText
+
+private theorem between_prefix (q a b w : Bytes) (hqa : q <+: a) (hqw : q <+: w)
+    (hab : a ≤ b) (hbw : b ≤ w) : q <+: b := by
+  rcases hqa with ⟨ta, rfl⟩
+  rcases hqw with ⟨tw, rfl⟩
+  rcases List.le_iff_exists.mp hab with hprefix | ⟨i, hi_a, hi_b, hagree, hlt_ab⟩
+  · have ht := List.take_prefix (q ++ ta).length b
+    rw [← hprefix] at ht
+    rcases ht with ⟨t', ht'⟩
+    exact ⟨ta ++ t', by simpa [List.append_assoc] using ht'⟩
+  · by_cases hqi : i < q.length
+    · let x : UInt8 := (q ++ ta)[i]'(by simpa using hi_a)
+      let y : UInt8 := b[i]'(by simpa using hi_b)
+      have hltxy : x < y := by simpa [x, y] using hlt_ab
+      have hxq : x = q[i]'(by simpa using hqi) := by
+        dsimp [x]
+        exact List.getElem_append_left (h := hqi) (h' := by simpa using hi_a)
+      rcases List.le_iff_exists.mp hbw with hbwp | ⟨j, hj_b, hj_w, hagree_bw, hlt_bw⟩
+      · have hyq : y = q[i]'(by simpa using hqi) := by
+          dsimp [y]
+          have h1 : b[i]? = (q ++ tw)[i]? := by
+            rw [hbwp, List.getElem?_take]
+            simp [hi_b]
+          have h2 : (q ++ tw)[i]? = q[i]? := by
+            simp [List.getElem?_append, hqi]
+          have h3 : some ((b[i]'(by simpa using hi_b))) = some (q[i]'(by simpa using hqi)) := by
+            rw [← show b[i]? = some (b[i]'(by simpa using hi_b)) by simp,
+                ← show q[i]? = some (q[i]'(by simpa using hqi)) by simp, h1, h2]
+          exact Option.some.inj h3
+        have : x < x := by simpa [hxq, hyq] using hltxy
+        exact False.elim ((Std.Irrefl.irrefl (r := fun u v : UInt8 => u < v) x) this)
+      · by_cases hji : j < i
+        · let xj : UInt8 := (q ++ ta)[j]'(by omega)
+          let bj : UInt8 := b[j]'(by simpa using hj_b)
+          let wj : UInt8 := (q ++ tw)[j]'(by simpa using hj_w)
+          have hlt_bj : bj < wj := by simpa [bj, wj] using hlt_bw
+          have hxjq : xj = q[j]'(by omega) := by
+            dsimp [xj]
+            exact List.getElem_append_left (h := by omega) (h' := by simp; omega)
+          have hwjq : wj = q[j]'(by omega) := by
+            dsimp [wj]
+            have hjqlen : j < q.length := by omega
+            exact List.getElem_append_left (h := hjqlen) (h' := by omega)
+          have hbjq : bj = q[j]'(by omega) := by
+            have hag := hagree j hji
+            dsimp [xj, bj] at hag ⊢
+            exact hag.symm.trans hxjq
+          have : q[j]'(by omega) < q[j]'(by omega) := by
+            simpa [hbjq, hwjq] using hlt_bj
+          exact False.elim ((Std.Irrefl.irrefl (r := fun u v : UInt8 => u < v) (q[j]'(by omega))) this)
+        · by_cases hjeq : j = i
+          · subst j
+            let z : UInt8 := (q ++ tw)[i]'(by omega)
+            have hlt_yz : y < z := by simpa [y, z] using hlt_bw
+            have hzq : z = q[i]'(by simpa using hqi) := by
+              dsimp [z]
+              exact List.getElem_append_left (h := hqi) (h' := by omega)
+            have hlt_qy : q[i]'(by simpa using hqi) < y := by simpa [hxq] using hltxy
+            have hlt_yq : y < q[i]'(by simpa using hqi) := by simpa [hzq] using hlt_yz
+            exact False.elim ((Std.Asymm.asymm (r := fun u v : UInt8 => u < v)
+              (q[i]'(by simpa using hqi)) y hlt_qy) hlt_yq)
+          · have hij : i < j := by omega
+            let z : UInt8 := (q ++ tw)[i]'(by omega)
+            have heq_yz : y = z := by
+              dsimp [y, z]
+              exact hagree_bw i hij
+            have hzq : z = q[i]'(by simpa using hqi) := by
+              dsimp [z]
+              exact List.getElem_append_left (h := hqi) (h' := by omega)
+            have : x < x := by simpa [hxq, heq_yz, hzq] using hltxy
+            exact False.elim ((Std.Irrefl.irrefl (r := fun u v : UInt8 => u < v) x) this)
+    · have hle : q.length ≤ i := Nat.le_of_not_gt hqi
+      have hqb : q = b.take q.length := by
+        apply List.ext_getElem
+        · simp [List.length_take]
+          omega
+        · intro k hkq hkb
+          have hki : k < i := by omega
+          have hka : (q ++ ta)[k]'(by omega) = q[k]'(by simpa using hkq) :=
+            List.getElem_append_left (h := hkq) (h' := by simp; omega)
+          have hagree' := hagree k hki
+          simpa [hka] using hagree'
+      rw [hqb]
+      exact List.take_prefix q.length b
+
+--------------------------------------------------------------------
+-- lcp helpers
+
+private theorem lcp_le_left (a b : Bytes) : lcp a b ≤ a.length := by
+  induction a generalizing b with
+  | nil => simp [lcp]
+  | cons x xs ih =>
+      cases b with
+      | nil => simp [lcp]
+      | cons y ys =>
+          by_cases hxy : x == y
+          · simp [lcp, hxy]
+            have := ih ys
+            omega
+          · simp [lcp, hxy]
+
+private theorem lcp_le_right (a b : Bytes) : lcp a b ≤ b.length := by
+  induction a generalizing b with
+  | nil => simp [lcp]
+  | cons x xs ih =>
+      cases b with
+      | nil => simp [lcp]
+      | cons y ys =>
+          by_cases hxy : x == y
+          · simp [lcp, hxy]
+            have := ih ys
+            omega
+          · simp [lcp, hxy]
+
+private theorem lcp_take_eq (a b : Bytes) (k : Nat) (hk : k ≤ lcp a b) :
+    a.take k = b.take k := by
+  induction a generalizing b k with
+  | nil =>
+      have hk0 : k = 0 := by simpa [lcp] using hk
+      subst k
+      simp
+  | cons x xs ih =>
+      cases b with
+      | nil =>
+          have hk0 : k = 0 := by simpa [lcp] using hk
+          subst k
+          simp
+      | cons y ys =>
+          by_cases hxy : x == y
+          · cases k with
+            | zero => simp
+            | succ k =>
+                have hk'0 : k + 1 ≤ 1 + lcp xs ys := by
+                  simpa [lcp, hxy] using hk
+                have hk' : k ≤ lcp xs ys := by omega
+                have ih' := ih ys k hk'
+                have hxeq : x = y := beq_iff_eq.mp hxy
+                simp [List.take_succ_cons, hxeq, ih']
+          · have hk0 : k = 0 := by simpa [lcp, hxy] using hk
+            subst k
+            simp
+
+private theorem lcp_ge_of_take_eq (a b : Bytes) (k : Nat)
+    (hka : k ≤ a.length) (hkb : k ≤ b.length) (h : a.take k = b.take k) :
+    k ≤ lcp a b := by
+  induction a generalizing b k with
+  | nil =>
+      have hk0 : k = 0 := by simpa using hka
+      subst k
+      simp
+  | cons x xs ih =>
+      cases b with
+      | nil =>
+          have hk0 : k = 0 := by simpa using hkb
+          subst k
+          simp
+      | cons y ys =>
+          cases k with
+          | zero => simp
+          | succ k =>
+              have hhead : x = y := by
+                have hh := congrArg List.head? h
+                simpa [List.take_succ_cons] using hh
+              have htail : xs.take k = ys.take k := by
+                have ht := congrArg List.tail h
+                simpa [List.take_succ_cons] using ht
+              have hka' : k ≤ xs.length := by simpa using hka
+              have hkb' : k ≤ ys.length := by simpa using hkb
+              have hk' : k ≤ lcp xs ys := ih ys k hka' hkb' htail
+              have hxy : x == y := by simpa [hhead.symm]
+              have hgoal : k + 1 ≤ 1 + lcp xs ys := by omega
+              simpa [lcp, hxy] using hgoal
+
+private theorem lcp_comm (a b : Bytes) : lcp a b = lcp b a := by
+  induction a generalizing b with
+  | nil => cases b <;> simp [lcp]
+  | cons x xs ih =>
+      cases b with
+      | nil => simp [lcp]
+      | cons y ys =>
+          by_cases hxy : x == y
+          · have hyx : y == x := beq_iff_eq.mpr (beq_iff_eq.mp hxy).symm
+            simp [lcp, hxy, hyx, ih]
+          · have hyx : ¬ y == x := by
+              intro hh
+              apply hxy
+              exact beq_iff_eq.mpr (beq_iff_eq.mp hh).symm
+            simp [lcp, hxy, hyx]
+
+private theorem take_prefix_of_le_lcp (a b : Bytes) (k : Nat) (hk : k ≤ lcp a b) :
+    (b.take k) <+: a := by
+  have htake := lcp_take_eq a b k hk
+  have hle : k ≤ a.length := Nat.le_trans hk (lcp_le_left a b)
+  rw [← htake]
+  exact List.take_prefix k a
+
+private theorem le_lcp_of_prefix_take (a b : Bytes) (k : Nat) (hkb : k ≤ b.length)
+    (h : (b.take k) <+: a) : k ≤ lcp a b := by
+  apply lcp_ge_of_take_eq a b k
+  · have hlen := List.IsPrefix.length_le h
+    rw [List.length_take, Nat.min_eq_left hkb] at hlen
+    omega
+  · exact hkb
+  · rcases h with ⟨t, ht⟩
+    have hlen : (b.take k).length = k := by simp [List.length_take, Nat.min_eq_left hkb]
+    rw [← ht]
+    simpa [hlen] using (List.take_left' (l₁ := b.take k) (l₂ := t) hlen)
+
+--------------------------------------------------------------------
+-- prefixes helpers
+
+private theorem prefixes_nodup (b : Bytes) : (prefixes b).Nodup := by
+  unfold prefixes
+  have hgen : ∀ n, n ≤ b.length → ((List.range n).map fun i => b.take (i + 1)).Nodup := by
+    intro n
+    induction n with
+    | zero => intro hn; simp
+    | succ n ih =>
+        intro hn
+        rw [List.range_succ, List.map_append, List.nodup_append]
+        constructor
+        · exact ih (by omega)
+        constructor
+        · simp
+        · intro q hq r hr
+          rcases List.mem_map.mp hq with ⟨i, hi, rfl⟩
+          have hilen : i + 1 < b.length + 1 := by
+            have := List.mem_range.mp hi
+            omega
+          have hr' : r = b.take (n + 1) := by simpa using hr
+          subst r
+          intro heq
+          have hlen1 : (b.take (i + 1)).length = i + 1 := by
+            rw [List.length_take, Nat.min_eq_left (by omega)]
+          have hlen2 : (b.take (n + 1)).length = n + 1 := by
+            rw [List.length_take, Nat.min_eq_left hn]
+          have heqlen : i + 1 = n + 1 := by
+            calc
+              i + 1 = (b.take (i + 1)).length := hlen1.symm
+              _ = (b.take (n + 1)).length := congrArg List.length heq
+              _ = n + 1 := hlen2
+          have hin : i < n := List.mem_range.mp hi
+          exact (Nat.ne_of_lt hin) (Nat.succ.inj heqlen)
+  exact hgen b.length (Nat.le_refl _)
+
+private theorem prefixes_mem (b q : Bytes) : q ∈ prefixes b ↔ q <+: b ∧ q ≠ [] := by
+  constructor
+  · intro h
+    unfold prefixes at h
+    rcases List.mem_map.mp h with ⟨i, hi, rfl⟩
+    constructor
+    · exact List.take_prefix (i + 1) b
+    · have hlen : (b.take (i + 1)).length = i + 1 := by
+        rw [List.length_take, Nat.min_eq_left (by
+          have := List.mem_range.mp hi
+          omega)]
+      intro hnil
+      rw [hnil] at hlen
+      simp at hlen
+  · intro h
+    rcases h with ⟨⟨t, ht⟩, hqne⟩
+    have hkpos : 0 < q.length := by
+      cases q with
+      | nil => contradiction
+      | cons _ _ => simp
+    let i := q.length - 1
+    have hi : i < b.length := by
+      rw [← ht]
+      simp
+      omega
+    have htake : b.take (i + 1) = q := by
+      have hi1 : i + 1 = q.length := by omega
+      rw [hi1, ← ht]
+      simp
+    unfold prefixes
+    rw [List.mem_map]
+    exact ⟨i, List.mem_range.mpr hi, htake⟩
+
+private def fresh (prev b : Bytes) : List Bytes :=
+  (prefixes b).filter fun p => p.isPrefixOf prev = false
+
+private theorem mem_fresh (prev b q : Bytes) :
+    q ∈ fresh prev b ↔ q <+: b ∧ q ≠ [] ∧ ¬ q <+: prev := by
+  simp only [fresh, List.mem_filter]
+  constructor
+  · intro h
+    rcases h with ⟨hq, hfalse⟩
+    have hbfalse : q.isPrefixOf prev = false := of_decide_eq_true hfalse
+    have hb := (prefixes_mem b q).mp hq
+    refine ⟨hb.1, hb.2, ?_⟩
+    intro hp
+    have htrue : q.isPrefixOf prev = true := List.isPrefixOf_iff_prefix.mpr hp
+    simp [htrue] at hbfalse
+  · intro h
+    rcases h with ⟨hqb, hqne, hnprev⟩
+    refine ⟨(prefixes_mem b q).mpr ⟨hqb, hqne⟩, ?_⟩
+    apply decide_eq_true
+    cases hb : q.isPrefixOf prev
+    · rfl
+    · exact False.elim (hnprev (List.isPrefixOf_iff_prefix.mp hb))
+
+private theorem length_filter_range_ge (k n : Nat) :
+    ((List.range n).filter fun i => k ≤ i).length = n - k := by
+  induction n generalizing k with
+  | zero => simp
+  | succ n ih =>
+      rw [List.range_succ, List.filter_append, List.length_append]
+      have hih := ih k
+      by_cases hkn : k ≤ n
+      · simp [hkn]
+        omega
+      · have hnlt : n < k := Nat.lt_of_not_ge hkn
+        have hkbig : ¬ k ≤ n := hkn
+        have hkbig' : ¬ k ≤ n + 1 ∨ k = n + 1 := by omega
+        by_cases hkeq : k = n + 1
+        · subst k
+          rw [hih]
+          simp
+        · have hkgt : n + 1 < k := by omega
+          rw [hih]
+          simp [hkbig, Nat.not_le_of_gt hkgt]
+          omega
+
+private theorem lcp_take_prefix_iff (a b : Bytes) (k : Nat) (hk : k < b.length) :
+    (b.take (k + 1)).isPrefixOf a = true ↔ k < lcp a b := by
+  constructor
+  · intro h
+    have hp : (b.take (k + 1)) <+: a := List.isPrefixOf_iff_prefix.mp h
+    have hle : k + 1 ≤ lcp a b := le_lcp_of_prefix_take a b (k + 1) (by omega) hp
+    omega
+  · intro h
+    have hle : k + 1 ≤ lcp a b := by omega
+    exact List.isPrefixOf_iff_prefix.mpr (take_prefix_of_le_lcp a b (k + 1) hle)
+
+private theorem fresh_length (a b : Bytes) :
+    (fresh a b).length = b.length - lcp a b := by
+  unfold fresh
+  unfold prefixes
+  rw [List.filter_map, List.length_map]
+  change ((List.range b.length).filter (fun i => (b.take (i + 1)).isPrefixOf a = false)).length =
+    b.length - lcp a b
+  have hfilt : (List.range b.length).filter (fun i => (b.take (i + 1)).isPrefixOf a = false) =
+      (List.range b.length).filter (fun i => lcp a b ≤ i) := by
+    apply List.filter_congr
+    intro i hi
+    have hil : i < b.length := List.mem_range.mp hi
+    have hchar := lcp_take_prefix_iff a b i (by omega)
+    by_cases hlt : i < lcp a b
+    · have hpref : (b.take (i + 1)).isPrefixOf a = true := hchar.mpr hlt
+      simp [hpref, Nat.not_le_of_lt hlt]
+    · have hnot : ¬ (b.take (i + 1)).isPrefixOf a = true := by
+        intro ht
+        exact hlt (hchar.mp ht)
+      have hpref : (b.take (i + 1)).isPrefixOf a = false := by
+        cases hh : (b.take (i + 1)).isPrefixOf a <;> simp [hh] at hnot ⊢
+      simp [hpref, Nat.le_of_not_gt hlt]
+  rw [hfilt, length_filter_range_ge]
+
+--------------------------------------------------------------------
+-- freshRun: partition of the distinct prefixes along a sorted dictionary
+
+private def freshRun (prev : Bytes) : List Bytes → List Bytes
+  | [] => []
+  | b :: rest => fresh prev b ++ freshRun b rest
+
+private theorem mem_freshRun_iff (prev : Bytes) (dict : List Bytes)
+    (hsorted : dict.Pairwise (· ≤ ·)) (hle : ∀ w ∈ dict, prev ≤ w) (q : Bytes) :
+    q ∈ freshRun prev dict ↔ (∃ w ∈ dict, q <+: w) ∧ ¬ q <+: prev := by
+  induction dict generalizing prev with
+  | nil => simp [freshRun]
+  | cons b rest ih =>
+      have hrest_sorted : rest.Pairwise (· ≤ ·) := List.Pairwise.of_cons hsorted
+      have hb_le_rest : ∀ w ∈ rest, b ≤ w := (List.pairwise_cons.mp hsorted).1
+      have hprev_b : prev ≤ b := hle b (by simp)
+      simp only [freshRun, List.mem_append]
+      constructor
+      · intro h
+        rcases h with hfirst | htail
+        · have hf := (mem_fresh prev b q).mp hfirst
+          exact ⟨⟨b, by simp, hf.1⟩, hf.2.2⟩
+        · have ht := (ih b hrest_sorted (by intro w hw; exact hb_le_rest w hw)).mp htail
+          rcases ht.1 with ⟨w, hw, hqw⟩
+          refine ⟨⟨w, by simp [hw], hqw⟩, ?_⟩
+          intro hqprev
+          exact ht.2 (between_prefix q prev b w hqprev hqw hprev_b (hb_le_rest w hw))
+      · intro h
+        rcases h with ⟨hex, hnprev⟩
+        rcases hex with ⟨w, hw, hqw⟩
+        have hqne : q ≠ [] := by
+          intro hnil
+          apply hnprev
+          rw [hnil]
+          exact List.nil_prefix
+        simp only [List.mem_cons] at hw
+        rcases hw with rfl | hwrest
+        · left
+          exact (mem_fresh prev w q).mpr ⟨hqw, hqne, hnprev⟩
+        · by_cases hqb : q <+: b
+          · left
+            exact (mem_fresh prev b q).mpr ⟨hqb, hqne, hnprev⟩
+          · right
+            exact (ih b hrest_sorted (by intro w hw; exact hb_le_rest w hw)).mpr
+              ⟨⟨w, hwrest, hqw⟩, hqb⟩
+
+private theorem freshRun_nodup (prev : Bytes) (dict : List Bytes)
+    (hsorted : dict.Pairwise (· ≤ ·)) (hle : ∀ w ∈ dict, prev ≤ w) :
+    (freshRun prev dict).Nodup := by
+  induction dict generalizing prev with
+  | nil => simp [freshRun]
+  | cons b rest ih =>
+      have hrest_sorted : rest.Pairwise (· ≤ ·) := List.Pairwise.of_cons hsorted
+      have hb_le_rest : ∀ w ∈ rest, b ≤ w := (List.pairwise_cons.mp hsorted).1
+      rw [freshRun, List.nodup_append]
+      refine ⟨(prefixes_nodup b).filter _, ?_, ?_⟩
+      · exact ih b hrest_sorted hb_le_rest
+      · intro q hq r hr hqr
+        have hqb : q <+: b := ((mem_fresh prev b q).mp hq).1
+        have hrin := (mem_freshRun_iff b rest hrest_sorted hb_le_rest r).mp hr
+        exact hrin.2 (hqr ▸ hqb)
+
+private theorem nodup_eraseDups {α : Type} [BEq α] [LawfulBEq α] (l : List α) :
+    l.eraseDups.Nodup := by
+  cases l with
+  | nil => simp
+  | cons a as =>
+      rw [List.eraseDups_cons, List.nodup_cons]
+      constructor
+      · intro ha
+        rw [List.mem_eraseDups] at ha
+        have hf := (List.mem_filter.mp ha).2
+        simpa using hf
+      · exact nodup_eraseDups (as.filter fun b => ! b == a)
+termination_by l.length
+decreasing_by exact Nat.lt_succ_of_le (List.length_filter_le _ _)
+
+private theorem freshRun_length (prev : Bytes) (dict : List Bytes) :
+    (freshRun prev dict).length =
+      (((prev :: dict).zip dict).map fun (a, b) => b.length - lcp a b).sum := by
+  induction dict generalizing prev with
+  | nil => simp [freshRun]
+  | cons b rest ih =>
+      simp [freshRun, fresh_length, ih b, List.zip]
+
+theorem sound : TinylambOpt.ResearchGoals.BinaryText.PrefixCardinality.Goal := by
+  intro dict hdict
+  have hle : ∀ w ∈ dict, ([] : Bytes) ≤ w := by
+    intro w hw
+    exact List.nil_prefix.le
+  have hmem : ∀ q, q ∈ (dict.flatMap prefixes).eraseDups ↔ q ∈ freshRun [] dict := by
+    intro q
+    rw [List.mem_eraseDups]
+    rw [mem_freshRun_iff [] dict hdict hle q]
+    constructor
+    · intro h
+      rcases List.mem_flatMap.mp h with ⟨w, hw, hqw⟩
+      have hpm := (prefixes_mem w q).mp hqw
+      refine ⟨⟨w, hw, hpm.1⟩, ?_⟩
+      intro hnilpref
+      have hlen := List.IsPrefix.length_le hnilpref
+      simp at hlen
+      subst q
+      exact hpm.2 rfl
+    · intro h
+      rcases h with ⟨⟨w, hw, hqw⟩, hnpref⟩
+      apply List.mem_flatMap.mpr
+      refine ⟨w, hw, (prefixes_mem w q).mpr ⟨hqw, ?_⟩⟩
+      intro hnil
+      apply hnpref
+      rw [hnil]
+      exact List.nil_prefix
+  have hperm : List.Perm ((dict.flatMap prefixes).eraseDups) (freshRun [] dict) :=
+    (List.perm_ext_iff_of_nodup (nodup_eraseDups _) (freshRun_nodup [] dict hdict hle)).mpr hmem
+  have hlen := hperm.length_eq
+  rw [hlen, freshRun_length]
+
+end InternalPrefixCardinality
+
 
 theorem PrefixFence_sound : TinylambOpt.ResearchGoals.BinaryText.PrefixFence.Goal := InternalPrefixFence.sound
 theorem SharedPrefixCompare_sound : TinylambOpt.ResearchGoals.BinaryText.SharedPrefixCompare.Goal := InternalSharedPrefixCompare.sound
 theorem AnchorPositions_sound : TinylambOpt.ResearchGoals.BinaryText.AnchorPositions.Goal := InternalAnchorPositions.sound
 theorem DeleteSignature_sound : TinylambOpt.ResearchGoals.BinaryText.DeleteSignature.Goal := InternalDeleteSignature.sound
 theorem StripSort_sound : TinylambOpt.ResearchGoals.BinaryText.StripSort.Goal := InternalStripSort.sound
+theorem PrefixCardinality_sound : TinylambOpt.ResearchGoals.BinaryText.PrefixCardinality.Goal := InternalPrefixCardinality.sound
 theorem AcrossChunks_sound : TinylambOpt.ResearchGoals.BinaryText.AcrossChunks.Goal := InternalAcrossChunks.sound
 theorem TupleEncoding_sound : TinylambOpt.ResearchGoals.BinaryText.TupleEncoding.Goal := InternalTupleEncoding.sound
 

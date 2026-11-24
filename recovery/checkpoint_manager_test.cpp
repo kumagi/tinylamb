@@ -63,8 +63,8 @@ class CheckpointManagerTest : public ::testing::Test {
     rm_->SetLogger(logger_.get());
     tm_ = std::make_unique<TransactionManager>(pm_.get(), logger_.get(),
                                                rm_.get());
-    cm_ = std::make_unique<CheckpointManager>(prefix_,
-                                              tm_.get(), pm_->GetPool(), 0);
+    cm_ = std::make_unique<CheckpointManager>(prefix_, tm_.get(),
+                                              pm_->GetPool(), 0);
     ASSERT_SUCCESS(rm_->RecoverFrom(checkpoint_lsn, tm_.get()));
   }
 
@@ -269,7 +269,8 @@ TEST_F(CheckpointManagerTest,
     }
     gate->cv.notify_all();
   };
-  struct Finally {
+  struct Finally {  // NOLINT(cppcoreguidelines-special-member-functions):
+                    // scope-owned cleanup.
     std::function<void()> f;
     ~Finally() { f(); }
   } finally{[&] {
@@ -312,8 +313,8 @@ TEST_F(CheckpointManagerTest,
   // Wait until T1's commit record has actually entered the WAL buffer. The
   // unrelated write above already made BufferedLSN nonzero, so checking only
   // DurableLSN < BufferedLSN would not establish that this commit is pending.
-  const auto commit_record_deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::seconds(10);
+  const auto commit_record_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (logger_->BufferedLSN() <= buffered_before_t1_commit &&
          std::chrono::steady_clock::now() < commit_record_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

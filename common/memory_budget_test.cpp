@@ -24,13 +24,13 @@ namespace {
 // A release-listener callback captures local counters by reference. If an
 // ASSERT/exception/GTEST_SKIP ends the test early, an explicit unregister at
 // the bottom is skipped and the global budget keeps a dangling reference.
-class ScopedReleaseListener {
+class ScopedReleaseListener {  // NOLINT(cppcoreguidelines-special-member-functions):
+                               // scope-owned cleanup.
+
  public:
   ScopedReleaseListener(ProcessMemoryBudget& budget, uint64_t id)
       : budget_(budget), id_(id) {}
   ~ScopedReleaseListener() { budget_.UnregisterReleaseListener(id_); }
-  ScopedReleaseListener(const ScopedReleaseListener&) = delete;
-  ScopedReleaseListener& operator=(const ScopedReleaseListener&) = delete;
 
  private:
   ProcessMemoryBudget& budget_;
@@ -41,7 +41,8 @@ class ScopedReleaseListener {
 
 TEST(MemoryBudgetTest, ServerBufferFloorRejectsOverflowAndCanBeReleased) {
   auto& budget = ProcessMemoryBudget::Global();
-  struct ResetBudgetOnExit {
+  struct ResetBudgetOnExit {  // NOLINT(cppcoreguidelines-special-member-functions):
+                              // scope-owned cleanup.
     ProcessMemoryBudget& budget;
     ~ResetBudgetOnExit() { budget.ResetForTest(0); }
   } reset{budget};
@@ -60,7 +61,9 @@ TEST(MemoryBudgetTest, ServerBufferFloorRejectsOverflowAndCanBeReleased) {
 // A failing ASSERT inside a budget test must not leave the process-global
 // soft limit pinned to a test value; restore the uncapped default on scope
 // exit (same contract as the explicit ResetForTest(0) at each test's end).
-class ScopedBudgetUncapped {
+class ScopedBudgetUncapped {  // NOLINT(cppcoreguidelines-special-member-functions):
+                              // scope-owned cleanup.
+
  public:
   ~ScopedBudgetUncapped() { ProcessMemoryBudget::Global().ResetForTest(0); }
 };
@@ -198,7 +201,7 @@ TEST(MemoryBudgetTest, ProcessRssReportingReturnsPositiveOnLinux) {
 }
 
 TEST(MemoryBudgetTest, TempDirectoryRespectsRegisteredDefaultWhenEnvUnset) {
-  if (std::getenv("TINYLAMB_TEMP") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_TEMP") != nullptr) {
     GTEST_SKIP() << "TINYLAMB_TEMP explicitly set in caller environment";
   }
   // Unique per-process/per-run path: a fixed name in the shared temp dir is
@@ -349,13 +352,17 @@ TEST(MemoryBudgetTest, RssGatedReclaimPurgesRetainedHeapBeforeRefusing) {
     GTEST_SKIP() << "no process RSS sampling on this platform";
   }
 #ifdef TINYLAMB_MEMORY_TEST_CAN_MALLOPT
-  const int saved_mmap = mallopt(M_MMAP_THRESHOLD, 1 << 30);
-  const int saved_trim = mallopt(M_TRIM_THRESHOLD, 1 << 30);
+  // These process-wide allocator knobs are changed by this single-threaded
+  // test before it allocates the reclaim workload.
+  const int saved_mmap =
+      mallopt(M_MMAP_THRESHOLD, 1 << 30);  // NOLINT(concurrency-mt-unsafe)
+  const int saved_trim =
+      mallopt(M_TRIM_THRESHOLD, 1 << 30);  // NOLINT(concurrency-mt-unsafe)
 #endif
   auto restore_mallopt = [&] {
 #ifdef TINYLAMB_MEMORY_TEST_CAN_MALLOPT
-    mallopt(M_MMAP_THRESHOLD, saved_mmap);
-    mallopt(M_TRIM_THRESHOLD, saved_trim);
+    mallopt(M_MMAP_THRESHOLD, saved_mmap);  // NOLINT(concurrency-mt-unsafe)
+    mallopt(M_TRIM_THRESHOLD, saved_trim);  // NOLINT(concurrency-mt-unsafe)
 #endif
   };
   constexpr size_t kChunk = size_t{384} << 20;
@@ -374,8 +381,8 @@ TEST(MemoryBudgetTest, RssGatedReclaimPurgesRetainedHeapBeforeRefusing) {
   // Place the RSS cap strictly between the retained-heap reading and the
   // (approximately base) reading a successful purge produces.
   const uint64_t gate = (rss_retained + base) / 2;
-  if (gate > (static_cast<uint64_t>(std::numeric_limits<size_t>::max()) - 8) *
-                 7 / 8) {
+  if (gate >
+      (static_cast<uint64_t>(std::numeric_limits<size_t>::max()) - 8) * 7 / 8) {
     GTEST_SKIP() << "RSS gate cannot be represented by size_t";
   }
   b.ResetForTest(static_cast<size_t>((gate * 8 / 7) + 8), 0, 0,

@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "gtest/gtest.h"
 #include "query/fuzz_scoped_db.hpp"
@@ -52,7 +53,8 @@ TEST(SqlOocFuzzer, NonReproducingVerifyMarkerIsFiltered) {
     }
   }
   ASSERT_FALSE(fname.empty());
-  struct Cleanup {
+  struct Cleanup {  // NOLINT(cppcoreguidelines-special-member-functions):
+                    // scope-owned cleanup.
     std::string fname;
     std::string stem;
     ~Cleanup() {
@@ -60,7 +62,7 @@ TEST(SqlOocFuzzer, NonReproducingVerifyMarkerIsFiltered) {
       std::filesystem::remove(fname, ec);
       std::filesystem::remove(stem + ".report.txt", ec);
     }
-  } cleanup{.fname=fname, .stem=stem};
+  } cleanup{.fname = fname, .stem = stem};
   EmitFuzzFinding("sql_ooc_fuzz", 42, fname, "-- tinylamb-ooc-test v1\n",
                   "non-reproducing failure", kOocNonReproducingVerify);
   EXPECT_FALSE(std::filesystem::exists(fname));
@@ -75,7 +77,7 @@ TEST(OocRngTest, PickHandlesFullWidthAndHighestInt64Intervals) {
   EXPECT_EQ(
       rng.Pick(low, high),
       static_cast<int64_t>(static_cast<uint64_t>(low) + baseline.Next64()));
-  EXPECT_EQ(rng.Pick(high - 1, high), high - 1 + baseline.Next32() % 2);
+  EXPECT_EQ(rng.Pick(high - 1, high), high - 1 + (baseline.Next32() % 2));
 }
 
 TEST(OocRngTest, PadJoinsBoundBothInputsEvenForOneDistinctValue) {
@@ -89,8 +91,9 @@ TEST(OocRngTest, PadJoinsBoundBothInputsEvenForOneDistinctValue) {
   int found = 0;
   for (int i = 0; i < 10000 && found < 20; ++i) {
     const auto query = GenerateOocQuery(rng, tables, 2000);
-    if (!query.shape.starts_with("join_pad")) { continue;
-}
+    if (!query.shape.starts_with("join_pad")) {
+      continue;
+    }
     ++found;
     const auto first = query.sql.find(" BETWEEN ");
     ASSERT_NE(first, std::string::npos) << query.sql;
@@ -107,7 +110,9 @@ TEST(OocRngTest, EmptyChoicesRaiseAndSingletonReturnsMember) {
   EXPECT_EQ(&rng.OneOf(one), &one.front());
 }
 
-bool Verbose() { return std::getenv("TINYLAMB_OOC_FUZZ_VERBOSE") != nullptr; }
+bool Verbose() {
+  return ::tinylamb::platform::GetEnv("TINYLAMB_OOC_FUZZ_VERBOSE") != nullptr;
+}
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
@@ -195,8 +200,8 @@ TEST(SqlOocFuzzer, ZeroOpTimeoutDisablesWatchdog) {
 class OpWatchdog {
  public:
   explicit OpWatchdog(uint64_t seed) : seed_(seed) {
-    timeout_ =
-        ParseOpWatchdogTimeout(std::getenv("TINYLAMB_OOC_FUZZ_OP_TIMEOUT"));
+    timeout_ = ParseOpWatchdogTimeout(
+        ::tinylamb::platform::GetEnv("TINYLAMB_OOC_FUZZ_OP_TIMEOUT"));
     if (timeout_ > 0) {
       // Poll well below the deadline; a fixed 100 ms tick is coarser than a
       // short configured timeout and mis-measures the hang boundary.
@@ -320,7 +325,8 @@ OocStats RunSeeds(uint64_t first, uint64_t count, OocRunOptions options,
 }
 
 void RunShard(uint64_t shard) {
-  const char* only = std::getenv("TINYLAMB_OOC_FUZZ_ONLY_SEED");
+  const char* only =
+      ::tinylamb::platform::GetEnv("TINYLAMB_OOC_FUZZ_ONLY_SEED");
   if (only != nullptr) {
     if (shard != 0) {
       GTEST_SKIP() << "single-seed run handled by shard 0";
@@ -621,7 +627,7 @@ TEST(SqlOocFuzzer, HandWrittenTraceHolds) {
 class OocCommittedRegressionTest : public ::testing::TestWithParam<size_t> {};
 
 TEST_P(OocCommittedRegressionTest, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_OOC_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_OOC_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "set TINYLAMB_OOC_REGRESSION_DIR to replay .test files";
   }

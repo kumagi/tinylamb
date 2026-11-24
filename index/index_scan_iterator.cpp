@@ -17,6 +17,7 @@
 #include "index_scan_iterator.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "common/decoder.hpp"
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "index/index.hpp"
 #include "index/lsm_index.hpp"
@@ -374,9 +376,10 @@ void IndexScanIterator::UpdateIteratorState() {
       // A single-value index has no list to empty, so skipping the stale
       // entry is the only sound interpretation -- decoding it as a
       // RowPosition would fail the whole scan with kCorrupt.
-      static constexpr char kEmptyList[sizeof(uint64_t)] = {};
+      static constexpr std::array<char, sizeof(uint64_t)> kEmptyList{};
       while (encoded_value.size() == sizeof(uint64_t) &&
-             encoded_value == std::string_view(kEmptyList, sizeof(uint64_t))) {
+             encoded_value ==
+                 std::string_view(kEmptyList.data(), kEmptyList.size())) {
         ++iter_;
         if (!iter_.IsValid()) {
           // A lazy cursor can become invalid because of an I/O error, not
@@ -780,7 +783,8 @@ bool IndexScanIterator::TryReadIndexOnly(Row* dst) const {
     return false;
   }
   static const bool visibility_map_disabled =
-      std::getenv("TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP") != nullptr;
+      ::tinylamb::platform::GetEnv(
+          "TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP") != nullptr;
   if (visibility_map_disabled) {
     return false;
   }

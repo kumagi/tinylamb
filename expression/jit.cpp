@@ -27,6 +27,7 @@
 #include "common/constants.hpp"
 #include "common/join_hash.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/process.hpp"
 #include "common/regex_guard.hpp"
 #include "expression/bytecode.hpp"
 #include "type/schema.hpp"
@@ -243,7 +244,7 @@ std::unique_ptr<llvm::orc::LLJIT> OptimizeAndCompileModule(
   }
   // ORC compiles IR to machine code; it does not implicitly run the LLVM
   // middle-end. Run the same target-aware O3 loop/vector pipeline as AOT.
-  if (std::getenv("TINYLAMB_JIT_DISABLE_OPT") == nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_JIT_DISABLE_OPT") == nullptr) {
     llvm::LoopAnalysisManager loops;
     llvm::FunctionAnalysisManager functions;
     llvm::CGSCCAnalysisManager cgscc;
@@ -265,7 +266,8 @@ std::unique_ptr<llvm::orc::LLJIT> OptimizeAndCompileModule(
     llvm::consumeError(jit.takeError());
     return nullptr;
   }
-  if (const char* directory = std::getenv("TINYLAMB_JIT_DUMP_DIR")) {
+  if (const char* directory =
+          ::tinylamb::platform::GetEnv("TINYLAMB_JIT_DUMP_DIR")) {
     static std::atomic<uint64_t> sequence{0};
     std::error_code error;
     std::filesystem::create_directories(directory, error);
@@ -1125,14 +1127,16 @@ std::optional<JitLiteralSearch> JitLiteralSearch::Compile(
   // The lane mask uses lane 0 as its least significant bit.
   if (std::endian::native != std::endian::little || needle.size() < 2 ||
       needle.size() > kMaxNeedle ||
-      std::getenv("TINYLAMB_DISABLE_LITERAL_SEARCH_JIT") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_LITERAL_SEARCH_JIT") !=
+          nullptr) {
     return std::nullopt;
   }
   bool full_literal_mask = false;
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
   full_literal_mask =
       needle.size() <= 8 && __builtin_cpu_supports("avx512bw") &&
-      std::getenv("TINYLAMB_DISABLE_FULL_LITERAL_MASK_JIT") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FULL_LITERAL_MASK_JIT") ==
+          nullptr;
 #endif
   const size_t lanes = full_literal_mask ? 64 : 32;
   struct Entry {
@@ -1143,7 +1147,8 @@ std::optional<JitLiteralSearch> JitLiteralSearch::Compile(
   // Process-lifetime cache: lazy init is thread-safe by C++11 and every
   // subsequent access is serialized by jit_cache_mutex below.
   // NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
-  static auto* const cache = new std::unordered_map<std::string, Entry>;
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): process-lifetime JIT cache.
+  static auto cache = std::make_unique<std::unordered_map<std::string, Entry>>();
   const std::scoped_lock lock(jit_cache_mutex);
   std::string key(needle);
   const auto cached = cache->find(key);
@@ -1324,14 +1329,15 @@ std::optional<JitDelimitedCapture> JitDelimitedCapture::Compile(
       std::ranges::any_of(
           capture.prefixes,
           [](const auto& prefix) { return prefix.size() > 32; }) ||
-      std::getenv("TINYLAMB_DISABLE_DELIMITED_CAPTURE_JIT") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_DELIMITED_CAPTURE_JIT") !=
+          nullptr) {
     return std::nullopt;
   }
   struct Entry {
     std::unique_ptr<llvm::orc::LLJIT> jit;
     CaptureFn capture;
   };
-  static auto* const cache = new std::unordered_map<std::string, Entry>;
+  static auto cache = std::make_unique<std::unordered_map<std::string, Entry>>();
   std::string key(1, static_cast<char>(capture.delimiter));
   for (const auto& prefix : capture.prefixes) {
     key.push_back(static_cast<char>(prefix.size()));
@@ -1547,10 +1553,12 @@ std::optional<JitGroupHash> JitGroupHash::Compile() {
 #ifndef TINYLAMB_HAS_LLVM
   return std::nullopt;
 #else
-  if (std::getenv("TINYLAMB_DISABLE_GROUP_HASH_JIT") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_GROUP_HASH_JIT") !=
+      nullptr) {
     return std::nullopt;
   }
   const std::scoped_lock lock(jit_cache_mutex);
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): process-lifetime JIT owner.
   static auto* const owner = new std::unique_ptr<llvm::orc::LLJIT>;
   static HashFn compiled = nullptr;
   if (compiled != nullptr) {
@@ -1613,7 +1621,8 @@ std::optional<JitDatePartHash> JitDatePartHash::Compile(unsigned offset) {
 #else
   if (std::endian::native != std::endian::little ||
       (offset != 11 && offset != 14) ||
-      std::getenv("TINYLAMB_DISABLE_DATE_PART_HASH_JIT") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_DATE_PART_HASH_JIT") !=
+          nullptr) {
     return std::nullopt;
   }
   struct Entry {
@@ -1752,7 +1761,8 @@ std::optional<JitStringFingerprint> JitStringFingerprint::Compile() {
   return std::nullopt;
 #else
   if (std::endian::native != std::endian::little ||
-      std::getenv("TINYLAMB_DISABLE_STRING_FINGERPRINT_JIT") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_STRING_FINGERPRINT_JIT") !=
+          nullptr) {
     return std::nullopt;
   }
   const std::scoped_lock lock(jit_cache_mutex);
@@ -3133,23 +3143,31 @@ std::optional<JitBranchlessProgram> JitBranchlessProgram::Compile(
     std::string_view unchecked_symbol;
   };
   constexpr std::array<KernelVariant, 4> variants{{
-      {.nullable_cols=false, .filter_only=false, .checked_symbol="tinylamb_bc_eval_nonnull_checked",
-       .unchecked_symbol="tinylamb_bc_eval_nonnull_unchecked"},
-      {.nullable_cols=true, .filter_only=false, .checked_symbol="tinylamb_bc_eval_nullable_checked",
-       .unchecked_symbol="tinylamb_bc_eval_nullable_unchecked"},
-      {.nullable_cols=false, .filter_only=true, .checked_symbol="tinylamb_bc_filter_nonnull_checked",
-       .unchecked_symbol="tinylamb_bc_filter_nonnull_unchecked"},
-      {.nullable_cols=true, .filter_only=true, .checked_symbol="tinylamb_bc_filter_nullable_checked",
-       .unchecked_symbol="tinylamb_bc_filter_nullable_unchecked"},
+      {.nullable_cols = false,
+       .filter_only = false,
+       .checked_symbol = "tinylamb_bc_eval_nonnull_checked",
+       .unchecked_symbol = "tinylamb_bc_eval_nonnull_unchecked"},
+      {.nullable_cols = true,
+       .filter_only = false,
+       .checked_symbol = "tinylamb_bc_eval_nullable_checked",
+       .unchecked_symbol = "tinylamb_bc_eval_nullable_unchecked"},
+      {.nullable_cols = false,
+       .filter_only = true,
+       .checked_symbol = "tinylamb_bc_filter_nonnull_checked",
+       .unchecked_symbol = "tinylamb_bc_filter_nonnull_unchecked"},
+      {.nullable_cols = true,
+       .filter_only = true,
+       .checked_symbol = "tinylamb_bc_filter_nullable_checked",
+       .unchecked_symbol = "tinylamb_bc_filter_nullable_unchecked"},
   }};
   for (const auto& variant : variants) {
-    if (!EmitBranchlessKernelPair(module.get(), *validated, variant.nullable_cols,
-                                  true, variant.filter_only,
-                                  variant.checked_symbol) ||
+    if (!EmitBranchlessKernelPair(
+            module.get(), *validated, variant.nullable_cols, true,
+            variant.filter_only, variant.checked_symbol) ||
         (validated->has_fallible_ops &&
-         !EmitBranchlessKernelPair(module.get(), *validated, variant.nullable_cols,
-                                   false, variant.filter_only,
-                                   variant.unchecked_symbol))) {
+         !EmitBranchlessKernelPair(
+             module.get(), *validated, variant.nullable_cols, false,
+             variant.filter_only, variant.unchecked_symbol))) {
       return std::nullopt;
     }
   }
@@ -3766,7 +3784,7 @@ void EmitPrefetchWrite(llvm::IRBuilder<>& b, llvm::Function* pf_fn,
 
 llvm::MDNode* UnlikelyBranchWeights(llvm::LLVMContext& ctx) {
   auto* i32 = llvm::Type::getInt32Ty(ctx);
-  llvm::Metadata* md[] = {
+  const std::array<llvm::Metadata*, 3> md = {
       llvm::MDString::get(ctx, "branch_weights"),
       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32, 1)),
       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32, 100000)),
@@ -3842,8 +3860,8 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
   auto* ptr = b.getPtrTy();
   constexpr std::string_view kSymbol = "tinylamb_dense_split_extract";
   std::array<llvm::Type*, 27> arg_tys{
-      i32, ptr, ptr, ptr, i64, i64, ptr, ptr, ptr, i64, i64, ptr, i32,
-      ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, f64, ptr, ptr, ptr, i32, i64};
+      i32, ptr, ptr, ptr, i64, i64, ptr, ptr, ptr, i64, i64, ptr, i32, ptr,
+      ptr, ptr, ptr, ptr, ptr, ptr, ptr, f64, ptr, ptr, ptr, i32, i64};
   auto* fn =
       llvm::Function::Create(llvm::FunctionType::get(i32, arg_tys, false),
                              llvm::Function::ExternalLinkage, kSymbol, *module);
@@ -3895,7 +3913,7 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
 
   b.SetInsertPoint(valid_input);
   auto* inputs_ok = spec.use_sel ? b.CreateIsNotNull(sel)
-                                  : b.CreateICmpULE(count, source_count);
+                                 : b.CreateICmpULE(count, source_count);
   b.CreateCondBr(inputs_ok, loop_hdr, invalid_input);
 
   b.SetInsertPoint(loop_hdr);
@@ -3982,65 +4000,61 @@ JitDenseSplitRadixAgg::CompileExtract(ExtractSpec spec) {
     }
   }
 
-  llvm::Value* raw_val = llvm::ConstantFP::get(f64, 0.0);
-  bool is_coalesce = false;
-  switch (spec.op) {
+  const auto [raw_val, is_coalesce] = [&]() -> std::pair<llvm::Value*, bool> {
+    switch (spec.op) {
     case ExprOp::kColDouble:
-      raw_val = LoadAsDouble(b, v_ptrs[0], r64, false);
-      break;
+      return {LoadAsDouble(b, v_ptrs[0], r64, false), false};
     case ExprOp::kColInt64:
-      raw_val = LoadAsDouble(b, v_ptrs[0], r64, true);
-      break;
+      return {LoadAsDouble(b, v_ptrs[0], r64, true), false};
     case ExprOp::kSubDouble:
-      raw_val = b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, false));
-      break;
+      return {b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, false)),
+              false};
     case ExprOp::kAddDouble:
-      raw_val = b.CreateFAdd(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, false));
-      break;
+      return {b.CreateFAdd(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, false)),
+              false};
     case ExprOp::kSubDivConst:
-      raw_val =
-          b.CreateFDiv(b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
-                                    LoadAsDouble(b, v_ptrs[1], r64, false)),
-                       div_const);
-      break;
+      return {b.CreateFDiv(
+                  b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
+                               LoadAsDouble(b, v_ptrs[1], r64, false)),
+                  div_const),
+              false};
     case ExprOp::kSubSubAddDivConst: {
       auto* d01 = b.CreateFSub(LoadAsDouble(b, v_ptrs[0], r64, false),
                                LoadAsDouble(b, v_ptrs[1], r64, false));
       auto* d2 = b.CreateFSub(d01, LoadAsDouble(b, v_ptrs[2], r64, false));
       auto* d3 = b.CreateFAdd(d2, LoadAsDouble(b, v_ptrs[3], r64, false));
-      raw_val = b.CreateFDiv(d3, div_const);
-      break;
+      return {b.CreateFDiv(d3, div_const), false};
     }
     case ExprOp::kMulDoubleInt:
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, true));
-      break;
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, true)),
+              false};
     case ExprOp::kCoalesceMulZero:
-      is_coalesce = true;
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, true));
-      break;
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, true)),
+              true};
     case ExprOp::kMulDoubleDouble:
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, false));
-      break;
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, false)),
+              false};
     case ExprOp::kCoalesceMulDoubleZero:
-      is_coalesce = true;
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
-                             LoadAsDouble(b, v_ptrs[1], r64, false));
-      break;
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, false),
+                           LoadAsDouble(b, v_ptrs[1], r64, false)),
+              true};
     case ExprOp::kMulIntInt:
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
-                             LoadAsDouble(b, v_ptrs[1], r64, true));
-      break;
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
+                           LoadAsDouble(b, v_ptrs[1], r64, true)),
+              false};
     case ExprOp::kCoalesceMulIntZero:
-      is_coalesce = true;
-      raw_val = b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
-                             LoadAsDouble(b, v_ptrs[1], r64, true));
-      break;
-  }
+      return {b.CreateFMul(LoadAsDouble(b, v_ptrs[0], r64, true),
+                           LoadAsDouble(b, v_ptrs[1], r64, true)),
+              true};
+    default:
+      llvm_unreachable("unexpected expression op in fused grouped join");
+    }
+  }();
 
   auto* emit_val =
       b.CreateSelect(any_null, llvm::ConstantFP::get(f64, 0.0), raw_val);
@@ -4370,9 +4384,8 @@ JitDenseSplitRadixAgg::CompileAccum(bool is_avg, bool check_inf) {
 TINYLAMB_JIT_CALL_BOUNDARY
 uint32_t JitDenseSplitRadixAgg::ExtractKernel::Run(
     uint32_t count, uint32_t source_count, const uint32_t* sel,
-    const int64_t* jk_vals,
-    const uint8_t* jk_nulls, int64_t jk_min, uint64_t jk_span,
-    const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
+    const int64_t* jk_vals, const uint8_t* jk_nulls, int64_t jk_min,
+    uint64_t jk_span, const uint32_t* key_to_rsubgid, const int64_t* pk0_vals,
     const uint8_t* pk0_nulls, int64_t pk0_min, uint64_t pk0_span,
     const uint32_t* pk0_subgid, uint32_t pk0_card, const int64_t* v0,
     const uint8_t* n0, const int64_t* v1, const uint8_t* n1, const int64_t* v2,

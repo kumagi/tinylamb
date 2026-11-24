@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "gtest/gtest.h"
 #include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
@@ -44,17 +45,17 @@ class ScopedForceScheme {
  public:
   explicit ScopedForceScheme(const char* value) {
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    if (const char* old = std::getenv("TINYLAMB_FORCE_SCHEME")) {
+    if (const char* old = ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME")) {
       previous_ = old;
     }
-    setenv("TINYLAMB_FORCE_SCHEME", value, 1);  // NOLINT(concurrency-mt-unsafe)
+    ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", value, 1);  // NOLINT(concurrency-mt-unsafe)
   }
   ~ScopedForceScheme() {
     if (previous_) {
       // NOLINTNEXTLINE(concurrency-mt-unsafe)
-      setenv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ScopedForceScheme(const ScopedForceScheme&) = delete;
@@ -345,9 +346,9 @@ TEST(PaxStorageFuzzerTest, ForceSchemeRestoresPreviousValue) {
   ScopedForceScheme outer("ORIGINAL");
   {
     ScopedForceScheme inner("TEMPORARY");
-    EXPECT_STREQ(std::getenv("TINYLAMB_FORCE_SCHEME"), "TEMPORARY");
+    EXPECT_STREQ(::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME"), "TEMPORARY");
   }
-  EXPECT_STREQ(std::getenv("TINYLAMB_FORCE_SCHEME"), "ORIGINAL");
+  EXPECT_STREQ(::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME"), "ORIGINAL");
 }
 
 TEST(PaxStorageFuzzerTest, ForcedDoubleCasesReachTheRequestedEncoding) {

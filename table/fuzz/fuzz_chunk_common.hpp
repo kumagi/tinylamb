@@ -198,10 +198,10 @@ inline StatusOr<PaxChunk> MergeAllSortedRuns(
     if (!winner_deleted) {
       const auto key_off = static_cast<uint32_t>(merged_blob.size());
       const uint32_t be_len = htobe32(static_cast<uint32_t>(key_copy.size()));
-      char be_len_bytes[sizeof(be_len)];
-      std::memcpy(be_len_bytes, &be_len, sizeof(be_len));
-      merged_blob.insert(merged_blob.end(), be_len_bytes,
-                         be_len_bytes + sizeof(be_len_bytes));
+      std::array<char, sizeof(be_len)> be_len_bytes{};
+      std::memcpy(be_len_bytes.data(), &be_len, sizeof(be_len));
+      merged_blob.insert(merged_blob.end(), be_len_bytes.begin(),
+                         be_len_bytes.end());
       merged_blob.insert(merged_blob.end(), key_copy.begin(), key_copy.end());
       const auto row_off = static_cast<uint32_t>(merged_blob.size());
       std::vector<char> rbuf(winner_row.Size());
@@ -309,9 +309,9 @@ inline SortedRun MakeRun(const std::vector<Row>& rows, const Schema& sc,
     const std::string key = r.EncodeKeyMemcomparableFormat(sc);
     const auto key_off = static_cast<uint32_t>(blob.size());
     const uint32_t be_len = htobe32(static_cast<uint32_t>(key.size()));
-    char be_len_bytes[sizeof(be_len)];
-    std::memcpy(be_len_bytes, &be_len, sizeof(be_len));
-    blob.insert(blob.end(), be_len_bytes, be_len_bytes + sizeof(be_len_bytes));
+    std::array<char, sizeof(be_len)> be_len_bytes{};
+    std::memcpy(be_len_bytes.data(), &be_len, sizeof(be_len));
+    blob.insert(blob.end(), be_len_bytes.begin(), be_len_bytes.end());
     blob.insert(blob.end(), key.begin(), key.end());
     const auto row_off = static_cast<uint32_t>(blob.size());
     std::vector<char> buf(r.Size());
@@ -583,7 +583,9 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
       std::abort();
     }
     for (slot_t c = 0; c < ncols; ++c) {
-      (void)chunk.ReadColumnValue(i, c, sc);
+      (void)chunk.ReadColumnValue(i, c,
+                                  sc);  // NOLINT(bugprone-unused-return-value):
+                                        // fuzz probe is for crash coverage.
     }
   }
   for (size_t over : {total, total + 1, total + 1000, SIZE_MAX}) {
@@ -591,27 +593,39 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
     if (r.HasValue()) {
       std::abort();
     }
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.ReadColumnValue(over, 0, sc);
   }
 
   size_t idx = 0;
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.PointLookup(key_probe, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.PointLookup(INT64_MIN, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.PointLookup(INT64_MAX, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.LowerBoundIndex(key_probe, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.LowerBoundIndex(INT64_MIN, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)chunk.HashLookup(key_probe, &idx);
 
   for (slot_t c = 0; c < ncols; ++c) {
     PaxChunk::Footer::ColumnStats st;
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.ColumnStats(c, sc, &st);
     uint64_t u = 0;
     bool ex = false;
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.CountNonNull(c, sc, &u);
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.CountEqualFromStats(c, sc, key_probe, &u, &ex);
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.CountRangeFromStats(c, sc, INT64_MIN, INT64_MAX, &u);
     int64_t mn = 0;
     int64_t mx = 0;
+    // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
     (void)chunk.ColumnMinMax(c, &mn, &mx);
     int64_t sum = 0;
     uint64_t cnt = 0;

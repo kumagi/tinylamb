@@ -97,7 +97,7 @@ TEST(SqlDiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
   // run that executed nothing looks like a fully-agreed sweep.
   constexpr const char* kForceFailure =
       "TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE";
-  const char* current = std::getenv(kForceFailure);
+  const char* current = ::tinylamb::platform::GetEnv(kForceFailure);
   const std::optional<std::string> previous =
       current != nullptr ? std::optional<std::string>(current) : std::nullopt;
   ASSERT_EQ(platform::SetEnv(kForceFailure, "1"), 0);
@@ -160,8 +160,8 @@ TEST(SqlDiffOracleFuzzer, SkippedVerificationPreservesTraceAndContinues) {
 
   ASSERT_EXIT(
       {
-        unsetenv("TINYLAMB_FUZZ_CONTINUE");
-        unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_FUZZ_CONTINUE");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_FUZZ_FINDINGS_DIR");
         EmitFuzzFinding("sql_diff_oracle_fuzz", 42, regression,
                         "-- tinylamb-diff-oracle v1\n", "first run differed\n",
                         "replay skipped", /*replay_skipped=*/true);

@@ -127,7 +127,10 @@ TEST(ProtoTextPlausibilityTest, LooksLikeProtoTextClassifiesBodies) {
 
 TEST(ProtoTextNormalizeTest, CanonicalizesSpacingAndOrdersExtensions) {
   const auto normalized = NormalizeProtoText("b: 2 [x.y]: 1 a: 0");
-  ASSERT_TRUE(normalized.has_value());
+  if (!normalized.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   assert(normalized.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*normalized, "b: 2 a: 0 [x.y]: 1");
@@ -135,13 +138,19 @@ TEST(ProtoTextNormalizeTest, CanonicalizesSpacingAndOrdersExtensions) {
   // Normalization preserves field order inside message bodies (only
   // extension entries move after plain fields); it re-nests recursively.
   const auto nested = NormalizeProtoText("m { b: 2 a: 1 }");
-  ASSERT_TRUE(nested.has_value());
+  if (!nested.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   assert(nested.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*nested, "m { b: 2 a: 1 }");
 
   const auto empty = NormalizeProtoText("   ");
-  ASSERT_TRUE(empty.has_value());
+  if (!empty.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_EQ(empty.value(), "");  // NOLINT(bugprone-unchecked-optional-access)
 
   EXPECT_FALSE(NormalizeProtoText("a:").has_value());
@@ -154,7 +163,10 @@ TEST(ProtoTextFormatTest, TimestampOffsetsAreAppliedBeforeEncodingFields) {
         "1970-01-01T05:30:11.125+05:30:11", "1969-12-31T21:00:00.125-03",
         "1970-01-01T00:00:00.125Z"}) {
     const auto nanos = ParseTimestampTextNanos(text);
-    ASSERT_TRUE(nanos.has_value()) << text;
+    if (!nanos.has_value()) {
+      ADD_FAILURE() << text;
+      return;
+    }
     EXPECT_TRUE(nanos.value() == k125Millis) << text;
   }
 
@@ -271,21 +283,30 @@ TEST(ProtoTextSetFieldTest, UpdatesCreatesAndClears) {
       TryProtoTextSetField("a: 1 b: 2", {"b"}, Value(int64_t{9}), "");
   ASSERT_TRUE(updated_or.HasValue()) << updated_or.GetStatus();
   auto updated = updated_or.MoveValue();
-  ASSERT_TRUE(updated.has_value());
+  if (!updated.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_EQ(*updated, "a: 1 b: 9");
 
   // Append a new field at the end.
   auto appended_or = TryProtoTextSetField("a: 1", {"c"}, Value(int64_t{3}), "");
   ASSERT_TRUE(appended_or.HasValue()) << appended_or.GetStatus();
   auto appended = appended_or.MoveValue();
-  ASSERT_TRUE(appended.has_value());
+  if (!appended.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_EQ(*appended, "a: 1 c: 3");
 
   // A NULL clears the field.
   auto cleared_or = TryProtoTextSetField("a: 1 b: 2", {"a"}, Value(), "");
   ASSERT_TRUE(cleared_or.HasValue()) << cleared_or.GetStatus();
   auto cleared = cleared_or.MoveValue();
-  ASSERT_TRUE(cleared.has_value());
+  if (!cleared.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_EQ(*cleared, "b: 2");
 
   // Dotted paths reach into nested messages.
@@ -293,7 +314,10 @@ TEST(ProtoTextSetFieldTest, UpdatesCreatesAndClears) {
                                         Value(int64_t{5}), "");
   ASSERT_TRUE(nested_or.HasValue()) << nested_or.GetStatus();
   auto nested = nested_or.MoveValue();
-  ASSERT_TRUE(nested.has_value());
+  if (!nested.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_NE(nested->find("inner: 5"), std::string::npos);
   Value out;
   auto extracted = TryProtoTextExtractField(*nested, "m", &out);
@@ -314,9 +338,16 @@ TEST(ProtoTextSetFieldTest, SetsLeafInEveryRepeatedParent) {
   // second `m { inner: ... }` stale.
   auto updated = TryProtoTextSetField("m { inner: 1 } m { inner: 2 }",
                                       {"m", "inner"}, Value(int64_t{9}), "");
-  ASSERT_TRUE(updated.HasValue()) << updated.GetStatus();
-  ASSERT_TRUE(updated.Value().has_value());
-  const std::string& text = *updated.Value();
+  if (!updated.HasValue()) {
+    ADD_FAILURE() << updated.GetStatus();
+    return;
+  }
+  const auto& maybe_updated = updated.Value();
+  if (!maybe_updated.has_value()) {
+    ADD_FAILURE() << "updated proto text is empty";
+    return;
+  }
+  const std::string& text = *maybe_updated;
   const size_t first = text.find("inner: 9");
   ASSERT_NE(first, std::string::npos) << text;
   EXPECT_NE(text.find("inner: 9", first + 1), std::string::npos) << text;
@@ -346,7 +377,10 @@ TEST(ProtoTextSetFieldTest, AuditMalformedPayloadNeverBecomesReplacement) {
 TEST(ProtoTextSetFieldTest, OuterBracesAreOptional) {
   auto updated = TryProtoTextSetField("{ a: 1 }", {"a"}, Value(int64_t{4}), "")
                      .MoveValue();
-  ASSERT_TRUE(updated.has_value());
+  if (!updated.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   assert(updated.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_EQ(*updated, "a: 4");
@@ -367,7 +401,10 @@ TEST(ProtoTextWriteTest, VarCharValuesQuotedEnumMembersStayBare) {
     auto updated = TryProtoTextSetField(base, {"string_val"},
                                         Value(std::string(text)), type)
                        .MoveValue();
-    ASSERT_TRUE(updated.has_value());
+    if (!updated.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     EXPECT_NE(updated->find("string_val: \""), std::string::npos) << *updated;
     Value out;
@@ -390,8 +427,11 @@ TEST(ProtoTextWriteTest, VarCharValuesQuotedEnumMembersStayBare) {
                      .MoveValue();
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
     // assumes success
-    ASSERT_TRUE(again.has_value())
-        << *updated;  // NOLINT(bugprone-unchecked-optional-access)
+    if (!again.has_value()) {
+      ADD_FAILURE()
+        << *updated;
+      return;
+    }  // NOLINT(bugprone-unchecked-optional-access)
   }
 
   // Known enum fields carry enum member names, which proto TEXT renders
@@ -399,7 +439,10 @@ TEST(ProtoTextWriteTest, VarCharValuesQuotedEnumMembersStayBare) {
   auto enum_set = TryProtoTextSetField(base, {"test_enum"},
                                        Value(std::string("TESTENUM1")), type)
                       .MoveValue();
-  ASSERT_TRUE(enum_set.has_value());
+  if (!enum_set.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_NE(enum_set->find("test_enum: TESTENUM1"), std::string::npos);
   Value enum_out;
@@ -465,14 +508,21 @@ TEST(ProtoTextExtractFieldTest, DateDecimalDecodesYearsBefore1000) {
         Value::DateFromDays(TryParseDateDays(text).MoveValue());
     const auto serialized =
         TryProtoTextSetField("date_decimal: 0", {"date_decimal"}, original, "");
-    ASSERT_TRUE(serialized.HasValue() && serialized.Value().has_value());
+    if (!serialized.HasValue()) {
+      ADD_FAILURE() << serialized.GetStatus();
+      return;
+    }
+    if (!serialized.Value().has_value()) {
+      ADD_FAILURE() << "serialized proto text is empty";
+      return;
+    }
+    const std::string& serialized_text = *serialized.Value();
     Value decoded;
-    ASSERT_TRUE(
-        TryProtoTextExtractField(*serialized.Value(), "date_decimal", &decoded)
-            .MoveValue())
-        << text << " -> " << *serialized.Value();
+    ASSERT_TRUE(TryProtoTextExtractField(serialized_text, "date_decimal", &decoded)
+                    .MoveValue())
+        << text << " -> " << serialized_text;
     EXPECT_EQ(decoded.type, ValueType::kDate) << text;
-    EXPECT_EQ(decoded, original) << text << " -> " << *serialized.Value();
+    EXPECT_EQ(decoded, original) << text << " -> " << serialized_text;
   }
 }
 
@@ -481,11 +531,19 @@ TEST(ProtoTextSetFieldTest, DateDecimalWritePreservesFiveDigitYears) {
       Value::DateFromDays(TryParseDateDays("10000-03-15").MoveValue());
   const auto serialized =
       TryProtoTextSetField("date_decimal: 0", {"date_decimal"}, original, "");
-  ASSERT_TRUE(serialized.HasValue() && serialized.Value().has_value());
-  EXPECT_EQ(*serialized.Value(), "date_decimal: 100000315");
+  if (!serialized.HasValue()) {
+    ADD_FAILURE() << serialized.GetStatus();
+    return;
+  }
+  if (!serialized.Value().has_value()) {
+    ADD_FAILURE() << "serialized proto text is empty";
+    return;
+  }
+  const std::string& serialized_text = *serialized.Value();
+  EXPECT_EQ(serialized_text, "date_decimal: 100000315");
   Value decoded;
   ASSERT_TRUE(
-      TryProtoTextExtractField(*serialized.Value(), "date_decimal", &decoded)
+      TryProtoTextExtractField(serialized_text, "date_decimal", &decoded)
           .MoveValue());
   EXPECT_EQ(decoded, original);
 
@@ -505,7 +563,10 @@ TEST(ProtoTextParseTest, WireDecoderRejectsAnIncompleteKnownSubmessage) {
   // The first two fields are valid. Field 22 carries a known nested message.
   const std::string complete = "\x08\x01\x10\x02\xb2\x01\x02\x08\x07";
   const auto decoded = DecodeProtoWireBytes(type, complete);
-  ASSERT_TRUE(decoded.has_value());
+  if (!decoded.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_NE(decoded->find("nested_int64: 7"), std::string::npos);
   const std::string incomplete = "\x08\x01\x10\x02\xb2\x01\x01\x08";
   EXPECT_FALSE(DecodeProtoWireBytes(type, incomplete).has_value());
@@ -520,7 +581,10 @@ TEST(ProtoTextParseTest, WireDecoderKeepsNegativeAndLargeProto2EnumMembers) {
   for (const auto& [wire, name] : {std::pair{negative, "TESTENUMNEGATIVE"},
                                    std::pair{large, "TESTENUM2147483647"}}) {
     auto decoded = DecodeProtoWireBytes(type, wire);
-    ASSERT_TRUE(decoded.has_value());
+    if (!decoded.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     EXPECT_NE(decoded->find(std::string("required_test_enum: ") + name),
               std::string::npos)
         << *decoded;

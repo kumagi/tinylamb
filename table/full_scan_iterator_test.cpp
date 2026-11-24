@@ -542,8 +542,8 @@ TEST_F(FullScanIteratorTest,
   auto& budget = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result)
   // operands bounded
-  constexpr auto cap =
-      static_cast<const size_t>(2 * 1024 *
+  constexpr auto cap = static_cast<const size_t>(
+      2 * 1024 *
       1024);  // NOLINT(bugprone-implicit-widening-of-multiplication-result)
   ASSERT_LT(budget.ColumnarUsed(), cap - 65536);
   // Model a large old image without putting MiB of row payload in a unit test.
@@ -1680,7 +1680,8 @@ TEST_F(
   EXPECT_NE(hot.GetCachedLSTableColumn(0, hot_gen), nullptr);
 
   auto& budget = ProcessMemoryBudget::Global();
-  struct RestoreColumnarLimit {
+  struct RestoreColumnarLimit {  // NOLINT(cppcoreguidelines-special-member-functions):
+                                 // scope-owned cleanup.
     size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
     ~RestoreColumnarLimit() {
       ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);

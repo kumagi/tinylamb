@@ -25,11 +25,11 @@
 namespace tinylamb {
 namespace {
 template <typename Callback>
-class ScopeExit {
+class ScopeExit {  // NOLINT(cppcoreguidelines-special-member-functions):
+                   // scope-owned cleanup.
+
  public:
   explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
-  ScopeExit(const ScopeExit&) = delete;
-  ScopeExit& operator=(const ScopeExit&) = delete;
   ~ScopeExit() { callback_(); }
 
  private:
@@ -49,8 +49,7 @@ ParallelIndexScan::ParallelIndexScan(
       schema_(table.GetSchema()),
       index_read_guard_(index_read_guard.HoldsLock()
                             ? std::move(index_read_guard)
-                            : txn.AcquireIndexReadGuard(index.Root()))
-      {
+                            : txn.AcquireIndexReadGuard(index.Root())) {
   StatusOr<TableLease> lease = table.AcquireLease(txn.ID());
   if (!lease.HasValue()) {
     worker_status_ = lease.GetStatus();

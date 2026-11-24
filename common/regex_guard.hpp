@@ -39,6 +39,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 
@@ -214,12 +215,14 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
   const auto flush = [&] {
     if (!groups.empty()) {
       Frame& f = groups.back();
-      if (f.cur_len == kVar || pending_len == kVar) {
-        f.cur_len = kVar;
-      } else if (__builtin_add_overflow(f.cur_len, pending_len, &f.cur_len)) {
+      int64_t combined_len = 0;
+      if (f.cur_len == kVar || pending_len == kVar ||
+          __builtin_add_overflow(f.cur_len, pending_len, &combined_len)) {
         // An unrepresentable fixed length is just an unknown-length operand;
         // it is not a nested-repetition (ReDoS) hazard on its own.
         f.cur_len = kVar;
+      } else {
+        f.cur_len = combined_len;
       }
       if (!f.first_done) {
         f.cur_first |= pending_first;
@@ -516,14 +519,16 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
                       (pending_nullable && pending_first.any()))) {
       return true;
     }
-    if (!exact || pending_len == kVar) {
-      pending_len = kVar;
-    } else if (__builtin_mul_overflow(pending_len, repeat, &pending_len)) {
+    int64_t repeated_len = 0;
+    if (!exact || pending_len == kVar ||
+        __builtin_mul_overflow(pending_len, repeat, &repeated_len)) {
       // Huge *bounded* repetitions are slow but not ReDoS. Treat the length
       // as unknown instead of rejecting the pattern as "nested repetition";
       // an actually unbounded quantifier around it is still caught by the
       // pending_var check above.
       pending_len = kVar;
+    } else {
+      pending_len = repeated_len;
     }
     pending_var = (pending_len == kVar);
     pending_nullable = can_be_empty || pending_nullable;
@@ -575,6 +580,10 @@ StatusOr<std::regex> CompileCheckedPattern(const std::string& pattern) {
       // Evict the oldest entries only while a slot or bytes are needed.
       while (count == cache.size() || used + bytes > kPatternCacheBudget) {
         auto& slot = cache[head];
+        if (!slot.has_value()) {
+          return StatusError(StatusCode::kRuntimeError,
+                             "regex pattern cache count is inconsistent");
+        }
         used -= slot->bytes;
         slot.reset();
         head = (head + 1) % cache.size();
@@ -625,7 +634,7 @@ inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
 //     lean/TinylambOpt/ThompsonSearch.lean (compiled_search_iff)
 inline std::atomic<bool>& FastRegexDisabledFlag() noexcept {
   static std::atomic<bool> flag = [] {
-    const char* env = std::getenv("TINYLAMB_DISABLE_FAST_REGEX");
+    const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FAST_REGEX");
     return env != nullptr && env[0] == '1';
   }();
   return flag;
@@ -636,7 +645,7 @@ inline void SetFastRegexDisabledForTest(bool disabled) noexcept {
 }
 
 inline void ReloadFastRegexDisabledFromEnv() noexcept {
-  const char* env = std::getenv("TINYLAMB_DISABLE_FAST_REGEX");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FAST_REGEX");
   FastRegexDisabledFlag().store(env != nullptr && env[0] == '1',
                                 std::memory_order_relaxed);
 }

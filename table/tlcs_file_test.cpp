@@ -1043,7 +1043,8 @@ void WriteMinimalTlcsFile(const std::string& path, bool out_of_bounds,
 
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(out.is_open());
-  out.write(reinterpret_cast<const char*>(f.data()), f.size());
+  out.write(reinterpret_cast<const char*>(f.data()),
+            static_cast<std::streamsize>(f.size()));
   out.close();
 }
 
@@ -1135,12 +1136,8 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   bu64(0);        // aux_size
   const uint32_t body_crc = Crc32C(body.data(), body.size());
 
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer,
-  // std::array not applicable
-  const uint64_t group_offsets[2] = {72, 72 + 8 + body.size()};
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)  // runtime-sized buffer,
-  // std::array not applicable
-  const uint64_t pids[2] = {50000, 10000};
+  const std::array<uint64_t, 2> group_offsets{72, 72 + 8 + body.size()};
+  const std::array<uint64_t, 2> pids{50000, 10000};
   std::vector<uint8_t> dir;
   const auto du8 = [&](uint8_t v) { dir.push_back(v); };
   const auto du32 = [&](uint32_t v) {
@@ -1220,7 +1217,8 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
 
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(out.is_open());
-  out.write(reinterpret_cast<const char*>(f.data()), f.size());
+  out.write(reinterpret_cast<const char*>(f.data()),
+            static_cast<std::streamsize>(f.size()));
   out.close();
   ASSERT_TRUE(out.good());
 }
@@ -2451,7 +2449,7 @@ TEST(TlcsFileTest, DenseGetOrBuildUpgradesLazyCachedColumnsAndReusesBlocks) {
     EXPECT_EQ(dense_store->IntegerColumn(1).size(), static_cast<size_t>(kRows));
 
     size_t row_base = 0;
-    for (const auto & blk : dense_store->blocks) {
+    for (const auto& blk : dense_store->blocks) {
       for (uint32_t r = 0; r < blk.row_count; r += 137) {
         const auto g = static_cast<int64_t>(row_base + r);
         EXPECT_EQ(blk.columns[0].int_cells[r], g);

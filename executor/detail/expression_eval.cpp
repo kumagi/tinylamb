@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/expression_eval.hpp"
 
 // The regexp_* branches below drive libstdc++'s <regex>, and under
@@ -1824,7 +1825,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
                op == BinaryOperation::kGreaterThanEquals;
       };
       const char* qrs_disable =
-          std::getenv("TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY");
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY");
       const bool want_quantified_range =
           !has_own_ctes && !value.Exists() && value.Test() &&
           !value.ArrayResult() && !value.Negated() &&

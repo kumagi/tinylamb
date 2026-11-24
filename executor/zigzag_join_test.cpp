@@ -354,7 +354,8 @@ TEST(ZigZagJoinTest, EmptyOutputSchemaBindsToTheJoinedRow) {
 TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
   ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, database,
                         Database::Create("zigzag_join_test-" + RandomString()));
-  struct Cleanup {
+  struct Cleanup {  // NOLINT(cppcoreguidelines-special-member-functions):
+                    // scope-owned cleanup.
     Database* database;
     ~Cleanup() { database->DeleteAll(); }
   } cleanup{database.get()};

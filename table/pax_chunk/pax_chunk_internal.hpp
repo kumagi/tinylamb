@@ -296,7 +296,7 @@ struct Rle8Region {
   uint32_t total_runs{0};
   std::array<uint32_t, 8> plane_runs{};
   std::array<uint32_t, 8> plane_offsets{};
-  std::array<Rle8Run, PaxChunk::kRowGroupSize * 8> runs;
+  std::array<Rle8Run, PaxChunk::kRowGroupSize * 8> runs{};
 };
 struct RleDeltaRun {
   uint32_t start;

@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "common/query_grant.hpp"
 
 #include "common/log_message.hpp"
@@ -15,7 +16,7 @@ namespace tinylamb {
 namespace {
 
 size_t ReadGrantEnvU64(const char* name, size_t fallback) noexcept {
-  const char* raw = std::getenv(name);
+  const char* raw = ::tinylamb::platform::GetEnv(name);
   if (raw == nullptr || raw[0] == '\0') {
     return fallback;
   }

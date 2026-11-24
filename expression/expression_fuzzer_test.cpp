@@ -6,6 +6,7 @@
 // libFuzzer inputs hex-encoded by WriteExpressionFuzzRepro) through the same
 // ExpressionFuzzRun entry the fuzzer uses.
 
+#include "common/platform/process.hpp"
 #include "expression/expression_fuzzer.hpp"
 
 #include <algorithm>
@@ -67,7 +68,7 @@ TEST(ExpressionFuzzerReplayTest, OutOfBandInputsAreSkipped) {
 }
 
 TEST(ExpressionFuzzerReplayTest, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_EXPR_FUZZ_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "TINYLAMB_EXPR_FUZZ_REGRESSION_DIR not set";
   }

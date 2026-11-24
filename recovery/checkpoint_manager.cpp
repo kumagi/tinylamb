@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/platform/process.hpp"
 #include "recovery/checkpoint_manager.hpp"
 
 #include <algorithm>
@@ -313,7 +314,7 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
 
 uint64_t CheckpointManager::DefaultWalRetentionWarnBytes() noexcept {
   static const uint64_t kDefaultBytes = []() -> uint64_t {
-    const char* raw = std::getenv("TINYLAMB_WAL_RETENTION_WARN_BYTES");
+    const char* raw = ::tinylamb::platform::GetEnv("TINYLAMB_WAL_RETENTION_WARN_BYTES");
     if (raw == nullptr || *raw == '\0') {
       return uint64_t{64} << 20;
     }

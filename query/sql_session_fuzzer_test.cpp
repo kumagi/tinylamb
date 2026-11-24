@@ -1,7 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_session_fuzzer.hpp"
 
+#include <filesystem>
+#include <system_error>
 #include <dirent.h>
 
 #include <algorithm>
@@ -20,21 +23,15 @@ namespace {
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
-  DIR* handle = opendir(dir.c_str());
-  if (handle == nullptr) {
-    return files;
-  }
-  while (const dirent* entry = readdir(handle)) {
-    const std::string name = entry->d_name;
-    if (name.size() > 5 && name.ends_with(".test")) {
-      std::string path = dir;
-      path += '/';
-      path += name;
-      files.push_back(std::move(path));
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const std::filesystem::path path = it->path();
+    if (path.filename().string().ends_with(".test")) {
+      files.push_back(path.string());
     }
   }
-  closedir(handle);
-  std::ranges::sort(files);
   return files;
 }
 
@@ -52,7 +49,7 @@ void RunSeededSessionRange(uint64_t begin_seed, uint64_t end_seed,
     std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
     SessionStats stats;
     std::string report = RunSessionIteration(
-        rng, std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr, &stats);
+        rng, ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_VERBOSE") != nullptr, &stats);
     ASSERT_EQ(report, "") << "failing seed=" << seed << "\n" << report;
     total_checks += stats.checks;
     indexes_created += stats.indexes_created;
@@ -72,7 +69,7 @@ void RunSeededSessionRange(uint64_t begin_seed, uint64_t end_seed,
 }
 
 void ReplayCommittedRegressionShard(size_t shard, size_t total_shards) {
-  const char* dir = std::getenv("TINYLAMB_SESSION_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "set TINYLAMB_SESSION_REGRESSION_DIR to replay .test files";
   }
@@ -105,7 +102,7 @@ void ReplayCommittedRegressionShard(size_t shard, size_t total_shards) {
 // committed mutation.
 TEST(SqlSessionFuzzer, SeededSessionsHoldStateShard0) {
   constexpr uint64_t kHalfIterations = 32;
-  const char* only = std::getenv("TINYLAMB_SESSION_ONLY_SEED");
+  const char* only = ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_ONLY_SEED");
   // A seed asked for via TINYLAMB_SESSION_ONLY_SEED runs even when it
   // lies outside the sweep range (libFuzzer seeds are full-width; the
   // old uint32 stoul + 64-iteration loop turned such asks into "run
@@ -133,20 +130,20 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldStateShard0) {
 }
 
 TEST(SqlSessionFuzzer, SeededSessionsHoldStateShard1) {
-  if (std::getenv("TINYLAMB_SESSION_ONLY_SEED") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_SESSION_ONLY_SEED") != nullptr) {
     return;
   }
   RunSeededSessionRange(32, 64, true);
 }
 
 TEST(SqlSessionFuzzer, ResourcePressureSkipsWithoutFailure) {
-  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
   // The seed is fixed on purpose: this trace must be reproducible.
   std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
   SessionTrace trace;
   EXPECT_EQ(RunSessionIteration(rng, false, nullptr, &trace), "");
   EXPECT_TRUE(trace.steps.empty());
-  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+  EXPECT_EQ(::tinylamb::platform::UnsetEnv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
 }
 
 // Minimal probe for the abort-undo phantom-row bug: a committed empty table,
@@ -295,8 +292,8 @@ TEST(SqlSessionFuzzer,
 // leaving a half-visible row) may only fire under specific timing, so a
 // single iteration is not enough.  Opt-in via env vars.
 TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
-  const char* seed_env = std::getenv("TINYLAMB_SESSION_SEED");
-  const char* count_env = std::getenv("TINYLAMB_SESSION_REPEAT");
+  const char* seed_env = ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_SEED");
+  const char* count_env = ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_REPEAT");
   if (seed_env == nullptr || count_env == nullptr) {
     GTEST_SKIP() << "set TINYLAMB_SESSION_SEED + TINYLAMB_SESSION_REPEAT";
   }

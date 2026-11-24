@@ -24,6 +24,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -234,10 +235,14 @@ TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
   for (Scheme scheme :
        {Scheme::kPlain, Scheme::kConst, Scheme::kRle, Scheme::kBp128}) {
     auto encoded = codec_benchmark::EncodeInt64Block(scheme, values);
-    ASSERT_TRUE(encoded.has_value());
+    if (!encoded.has_value()) {
+      ADD_FAILURE() << "integer block encoding failed";
+      return;
+    }
+    const auto& encoded_block = *encoded;
     auto chunk =
         AuditSingleColumnChunk(scheme, static_cast<slot_t>(values.size()),
-                               encoded->bytes, encoded->param);
+                               encoded_block.bytes, encoded_block.param);
     ReducePlan plan;
     plan.op = AggOp::kSum;
     plan.col = 0;
@@ -1059,18 +1064,22 @@ TEST(PaxChunkCodecsTest, AuditHuffDictCheckpointBitPositionsArePinned) {
   ASSERT_EQ(rows.size(), 200U);
 
   struct ScopedForceScheme {
+    ScopedForceScheme(const ScopedForceScheme&) = delete;
+    ScopedForceScheme& operator=(const ScopedForceScheme&) = delete;
+    ScopedForceScheme(ScopedForceScheme&&) = delete;
+    ScopedForceScheme& operator=(ScopedForceScheme&&) = delete;
     ScopedForceScheme() {
-      const char* value = std::getenv("TINYLAMB_FORCE_SCHEME");
+      const char* value = ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME");
       had_value = value != nullptr;
       if (had_value) { saved_value = value;
 }
-      setenv("TINYLAMB_FORCE_SCHEME", "HUFFDICT", 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", "HUFFDICT", 1);
     }
     ~ScopedForceScheme() {
       if (had_value) {
-        setenv("TINYLAMB_FORCE_SCHEME", saved_value.c_str(), 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", saved_value.c_str(), 1);
       } else {
-        unsetenv("TINYLAMB_FORCE_SCHEME");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_FORCE_SCHEME");
       }
     }
     bool had_value{};

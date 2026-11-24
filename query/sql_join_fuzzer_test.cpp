@@ -1,7 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_join_fuzzer.hpp"
 
+#include <filesystem>
+#include <system_error>
 #include <dirent.h>
 
 #include <cstdint>
@@ -21,20 +24,15 @@ namespace {
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
-  DIR* handle = opendir(dir.c_str());
-  if (handle == nullptr) {
-    return files;
-  }
-  while (const dirent* entry = readdir(handle)) {
-    const std::string name = entry->d_name;
-    if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      std::string path = dir;
-      path += "/";
-      path += name;
-      files.push_back(path);
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const std::filesystem::path path = it->path();
+    if (path.filename().string().ends_with(".test")) {
+      files.push_back(path.string());
     }
   }
-  closedir(handle);
   return files;
 }
 
@@ -43,7 +41,7 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlJoinFuzzer, SeededJoinsMatchMirror) {
   int queries = 0;
   int left_joins = 0;
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 48;
   if (scale != nullptr) {
     char* end = nullptr;
@@ -203,7 +201,7 @@ TEST(SqlJoinFuzzer, SpillNullAwareAntiAndNonEquiRightFullJoinRegression) {
 }
 
 TEST(SqlJoinFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_JOIN_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_JOIN_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }

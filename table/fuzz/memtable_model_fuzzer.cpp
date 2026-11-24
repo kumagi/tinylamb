@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
 #include "table/memtable/memtable.hpp"
@@ -101,7 +102,7 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
     const uint32_t sel = rng.Below(100);
     const auto id = static_cast<int64_t>(rng.Below(kKeyspace));
 
-    const bool dbg = std::getenv("MTDBG") != nullptr;
+    const bool dbg = ::tinylamb::platform::GetEnv("MTDBG") != nullptr;
     if (dbg) {
       std::cerr << "op=" << op << " sel=" << sel << " id=" << id << "\n";
     }

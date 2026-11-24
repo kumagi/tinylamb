@@ -44,6 +44,7 @@
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -394,19 +395,19 @@ class ExplodingKey final : public ExpressionBase {
 class ScopedTempDir {
  public:
   explicit ScopedTempDir(const std::filesystem::path& path) {
-    const char* previous = std::getenv("TINYLAMB_TEMP");
+    const char* previous = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP");
     if (previous != nullptr) {
       previous_ = previous;
       had_previous_ = true;
     }
     path_ = path;
-    setenv("TINYLAMB_TEMP", path_.c_str(), 1);
+    ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", path_.c_str(), 1);
   }
   ~ScopedTempDir() {
     if (had_previous_) {
-      setenv("TINYLAMB_TEMP", previous_.c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", previous_.c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_TEMP");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_TEMP");
     }
   }
   ScopedTempDir(const ScopedTempDir&) = delete;

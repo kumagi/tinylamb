@@ -914,7 +914,7 @@ TEST(FunctionCallTest, CurrentUserIsStableWhenEnvironmentChanges) {
     }
   });
   for (const char* key : {"USER", "LOGNAME"}) {
-    const char* old = std::getenv(key);
+    const char* old = ::tinylamb::platform::GetEnv(key);
     saved.emplace_back(key,
                        (old != nullptr) ? std::optional<std::string>(old) : std::nullopt);
     ASSERT_EQ(platform::SetEnv(key, "", 1), 0);

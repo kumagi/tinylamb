@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "query/expr_oracle_fuzzer.hpp"
 
 #include <algorithm>
@@ -312,6 +313,7 @@ std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
 // Quote an S-expression for the documented shell cross-check command. A bare
 // `'...'` wrapper breaks when the sexpr contains a string literal with an
 // apostrophe; close the quote, emit an escaped apostrophe, reopen it.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shell quoting helper is file-local.
 static std::string ShellSingleQuote(std::string_view value) {
   std::string out = "'";
   for (char c : value) {
@@ -442,7 +444,7 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   std::mt19937 run_rng(seed32);
   std::string report = RunExprOracleIteration(run_rng, verbose, &trace, config);
   if (report.empty()) {
-    const char* row_env = std::getenv("TINYLAMB_EXPR_ROW_ORACLE");
+    const char* row_env = ::tinylamb::platform::GetEnv("TINYLAMB_EXPR_ROW_ORACLE");
     const bool run_row_oracle = (row_env != nullptr)
                                     ? (std::string_view(row_env) != "0")
                                     : ((seed32 & 3U) == 0U);

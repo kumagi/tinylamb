@@ -106,6 +106,8 @@ OwnedValuePayload& OwnedValuePayload::operator=(std::string text) {
   return *this;
 }
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast): is_array and
+// null checks above each cast select the matching payload subtype.
 void OwnedValuePayload::Release() noexcept {
   ValuePayload* previous = std::exchange(payload_, nullptr);
   if (previous->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -1094,6 +1096,7 @@ uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
   }
   return hash;
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 bool Value::EqualsSlow(const Value& rhs) const {
   if (type != rhs.type) {
@@ -1462,15 +1465,18 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
   // value and restore it unless a successful return marks the decode committed.
   const Value saved = *this;
   bool committed = false;
-  struct RestoreOnFailure {
+  struct
+      RestoreOnFailure {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     Value& target;
     const Value& saved;
     const bool& committed;
     ~RestoreOnFailure() {
-      if (!committed) { target = saved;
-}
+      if (!committed) {
+        target = saved;
+      }
     }
-  } restore{.target=*this, .saved=saved, .committed=committed};
+  } restore{.target = *this, .saved = saved, .committed = committed};
   const auto publish = [&committed](size_t bytes) -> StatusOr<size_t> {
     committed = true;
     return bytes;

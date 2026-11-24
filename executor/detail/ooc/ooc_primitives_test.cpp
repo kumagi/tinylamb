@@ -389,6 +389,8 @@ TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
   }
   DataChunk large;
   large.Append(Row({Value(std::string(8192, 'x'))}), RowPosition());
+  DataChunk large_retry;
+  large_retry.Append(Row({Value(std::string(8192, 'x'))}), RowPosition());
   auto& mem = ProcessMemoryBudget::Global();
   mem.SetTestSpillIoFailCountdown(2);
   const Status failure = sstore.AppendChunk(std::move(large));
@@ -396,7 +398,7 @@ TEST(SpillableStoreTest, FailedTransitionPreservesBufferedChunks) {
   EXPECT_EQ(failure.GetCode(), StatusCode::kIOError);
   ASSERT_FALSE(sstore.Spilled());
   EXPECT_EQ(store.Stats().live_segments, 0U);
-  ASSERT_EQ(sstore.AppendChunk(std::move(large)), Status::kSuccess);
+  ASSERT_EQ(sstore.AppendChunk(std::move(large_retry)), Status::kSuccess);
   ASSERT_TRUE(sstore.Spilled());
   ASSERT_EQ(sstore.Seal(), Status::kSuccess);
   Row row;
@@ -603,9 +605,11 @@ TEST(OocPrimitivesSorterTest, FinishRetriesAfterAnIntermediateGroupWasMerged) {
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   bool retried_partial_pass = false;
   for (unsigned fault = 1; fault < 64 && !retried_partial_pass; ++fault) {
-    ExternalSorter sorter(ExternalSorter::Options{
-        .spill_store = &store, .memory_budget_bytes = 1,
-        .keys = {OocSortKey{.column_index = 0}}, .limit = 8});
+    ExternalSorter sorter(
+        ExternalSorter::Options{.spill_store = &store,
+                                .memory_budget_bytes = 1,
+                                .keys = {OocSortKey{.column_index = 0}},
+                                .limit = 8});
     for (int key = 9; key > 0; --key) {
       ASSERT_EQ(sorter.AddRow(Row({Value(key)})), Status::kSuccess);
     }
@@ -1041,7 +1045,7 @@ TEST(RecursivePartitionerTest, FinalizeRetriesFailedRootWriteAndSplitRead) {
           const auto id = static_cast<uint64_t>(row[0].AsInt64());
           return id == 3 ? id << 62 : id << 60;
         });
-    const std::string payload(9 * 1024, 'x');
+    const std::string payload(size_t{9} * 1024, 'x');
     for (int64_t id : {0, 1, 3}) {
       ASSERT_EQ(part.AddRow(Row({Value(id), Value(std::string(payload))})),
                 Status::kSuccess);
@@ -1050,7 +1054,9 @@ TEST(RecursivePartitionerTest, FinalizeRetriesFailedRootWriteAndSplitRead) {
     PartitionLeafSet leaves;
     leaves.leaves.emplace_back().row_count = 99;
     auto& budget = ProcessMemoryBudget::Global();
-    struct ResetSpillIoFailure {
+    struct
+        ResetSpillIoFailure {  // NOLINT(cppcoreguidelines-special-member-functions):
+                               // scope-owned cleanup.
       ProcessMemoryBudget& budget;
       ~ResetSpillIoFailure() { budget.SetTestSpillIoFailCountdown(0); }
     } reset_spill_io_failure{budget};
@@ -1138,7 +1144,8 @@ TEST(SpillableStoreTest, AppendRowStagingRespectsTightGrantAndMoveAppendWorks) {
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct ResetGuard {
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
     ProcessMemoryBudget* budget;
@@ -1193,8 +1200,11 @@ TEST(SpillableStoreTest, FailedStagingFlushRetainsChargeAndRows) {
   auto acquired = coord.AcquireGrant(256ULL << 10, 256ULL << 10);
   ASSERT_TRUE(acquired.HasValue());
   auto grant = acquired.MoveValue();
-  SpillableStore rows({.spill_store = &store, .memory_budget_bytes = 256ULL << 10,
-                       .grant = &grant, .io_buffer_bytes = 0, .force_spill = true});
+  SpillableStore rows({.spill_store = &store,
+                       .memory_budget_bytes = 256ULL << 10,
+                       .grant = &grant,
+                       .io_buffer_bytes = 0,
+                       .force_spill = true});
   const Row expected({Value(std::string(8192, 'x'))});
   ASSERT_EQ(rows.AppendRow(expected), Status::kSuccess);
   const auto before = grant.UsedBytes();
@@ -1218,7 +1228,8 @@ TEST(SpillableStoreTest, SpilledRowsChargeGrantOrFlushImmediately) {
   TempDirGuard dir("ooc_spillable_spilled_staging");
   SpillStore store(SpillStoreOptions{.temp_dir = dir.path});
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
-  struct ResetGuard {
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
     ProcessMemoryBudget* budget;
     ~ResetGuard() { budget->ResetForTest(0); }
   } guard{&mb};
@@ -1284,6 +1295,11 @@ TEST(RecursivePartitionerTest,
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
   struct ResetGuard {
+   public:
+    ResetGuard(const ResetGuard&) = delete;
+    ResetGuard& operator=(const ResetGuard&) = delete;
+    ResetGuard(ResetGuard&&) = delete;
+    ResetGuard& operator=(ResetGuard&&) = delete;
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
     ProcessMemoryBudget* budget;
@@ -1344,7 +1360,8 @@ TEST(OocPrimitivesSorterTest,
   ProcessMemoryBudget& mb = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct ResetGuard {
+  struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
     explicit ResetGuard(ProcessMemoryBudget* b) : budget(b) {}
     ~ResetGuard() { budget->ResetForTest(0); }
     ProcessMemoryBudget* budget;

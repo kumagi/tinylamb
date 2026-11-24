@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/query_memory.hpp"
 
 #include <algorithm>
@@ -23,7 +24,7 @@ size_t QueryMemoryBudget::LimitFromEnv() {
   const size_t default_bytes =
       proc_lim == 0 ? kDefaultQueryMemoryBytes
                     : std::min(kDefaultQueryMemoryBytes, proc_lim);
-  const char* env = std::getenv("TINYLAMB_QUERY_MEMORY_BYTES");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_QUERY_MEMORY_BYTES");
   if (env == nullptr || env[0] == '\0') {
     return default_bytes;
   }

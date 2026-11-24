@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_plan_cache_fuzzer.hpp"
 
 #include <algorithm>
@@ -17,7 +18,7 @@ namespace tinylamb {
 
 TEST(SqlPlanCacheFuzzer, SeededPhasesAgree) {
   int compared = 0;
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 32;
   if (scale != nullptr) {
     char* end = nullptr;
@@ -39,7 +40,7 @@ TEST(SqlPlanCacheFuzzer, SeededPhasesAgree) {
 }
 
 TEST(SqlPlanCacheFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_PLANCACHE_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_PLANCACHE_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }

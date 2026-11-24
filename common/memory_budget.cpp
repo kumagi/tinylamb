@@ -39,7 +39,7 @@ constexpr size_t SaturatingAdd(size_t a, size_t b) noexcept {
 thread_local bool tl_in_reclaim_hook = false;
 
 size_t ReadEnvBytes(const char* name, size_t fallback) noexcept {
-  const char* raw = std::getenv(name);
+  const char* raw = ::tinylamb::platform::GetEnv(name);
   if (raw == nullptr || raw[0] == '\0') {
     return fallback;
   }
@@ -65,7 +65,7 @@ size_t ReadEnvBytes(const char* name, size_t fallback) noexcept {
 }
 
 bool ReadEnvBool(const char* name) noexcept {
-  const char* raw = std::getenv(name);
+  const char* raw = ::tinylamb::platform::GetEnv(name);
   return raw != nullptr && raw[0] != '\0' && std::string_view(raw) != "0";
 }
 
@@ -174,7 +174,7 @@ ProcessMemoryBudget::ProcessMemoryBudget() {
   // of column projections resident.  Any other value keeps the fixed caps.
   size_t default_limit = kDefaultLimitBytes;
   bool auto_scaled = false;
-  if (const char* env = std::getenv("TINYLAMB_MEMORY_LIMIT_BYTES");
+  if (const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_MEMORY_LIMIT_BYTES");
       env != nullptr && std::string_view(env) == "auto") {
     if (const uint64_t phys = platform::PhysicalMemoryBytes(); phys > 0) {
       default_limit =
@@ -1059,7 +1059,7 @@ void ProcessMemoryBudget::SetDefaultTempDirectory(
 }
 
 std::filesystem::path ProcessMemoryBudget::ResolveTempDirectory() {
-  if (const char* env = std::getenv("TINYLAMB_TEMP");
+  if (const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP");
       env != nullptr && env[0] != '\0') {
     std::filesystem::path dir(env);
     std::error_code ec;

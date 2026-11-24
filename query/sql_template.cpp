@@ -77,6 +77,7 @@ bool TryParseDouble(std::string_view token, double* out) {
 
 bool TryParseInt64(std::string_view token, int64_t* out) {
   const char* end = token.data() + token.size();
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): from_chars receives the explicit end pointer.
   const auto result = std::from_chars(token.data(), end, *out);
   return result.ec == std::errc{} && result.ptr == end;
 }

@@ -105,14 +105,12 @@ TEST(IntervalTest, JustifyHours) {
   // 1-2 37 1:5:6.789 (months ride along while the time overflow lands in
   // days; folding months into the nanos total would erase them).
   EXPECT_EQ(
-      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
-      // unambiguous
-      Iv(14, 35, (49LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL)
+      Iv(14, 35,
+         (((49LL * 3600LL) + (5LL * 60LL) + 6) * 1000000000LL) + 789000000LL)
           .TryJustifyHours()
           .MoveValue(),
-      // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
-      // unambiguous
-      Iv(14, 37, (1LL * 3600 + 5LL * 60 + 6) * 1000000000LL + 789000000LL));
+      Iv(14, 37,
+         (((1LL * 3600LL) + (5LL * 60LL) + 6) * 1000000000LL) + 789000000LL));
 }
 
 TEST(IntervalTest, JustifyDays) {

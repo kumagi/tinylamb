@@ -55,13 +55,13 @@ inline bool TryParseCanonicalPageUrl(std::string_view sv, uint32_t* out_id,
   if (digits > 1 && sv[5] == '0') {
     return false;
   }
-  uint32_t val = 0;
+  auto val = static_cast<uint32_t>(0);
   for (size_t i = 5; i < sv.size(); ++i) {
-    const unsigned char c = static_cast<unsigned char>(sv[i]);
+    const auto c = static_cast<unsigned char>(sv[i]);
     if (c < '0' || c > '9') {
       return false;
     }
-    val = val * 10U + static_cast<uint32_t>(c - '0');
+    val = (val * 10U) + static_cast<uint32_t>(c - '0');
     if (val > max_id) {
       return false;
     }
@@ -101,8 +101,7 @@ inline std::vector<size_t> SelectOffsetHeavyReverseTopNIndices(
       }
     }
     std::sort_heap(heap.begin(), heap.end(), less_fn);
-    return std::vector<size_t>(
-        heap.begin() + static_cast<std::ptrdiff_t>(offset), heap.end());
+    return {heap.begin() + static_cast<std::ptrdiff_t>(offset), heap.end()};
   }
   // Offset-heavy reverse Top-N: keep the largest `avail = total_n - offset`
   // indices using an inverted comparator (min-heap on `less_fn`).
@@ -160,6 +159,63 @@ class LazyDictionaryPredicateCache {
 };
 
 // Lean proof:
+// lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+//   (DisjointRangeBucketHistogram_sound)
+// Maps a non-NULL `ship - sold` day difference to its unique disjoint 5-bin
+// bucket (<=30, 31..60, 61..90, 91..120, >120) in one dispatch.
+constexpr uint8_t ClassifyDisjointRangeBucket5(int64_t diff) noexcept {
+  if (diff <= 30) {
+    return 0;
+  }
+  if (diff <= 60) {
+    return 1;
+  }
+  if (diff <= 90) {
+    return 2;
+  }
+  if (diff <= 120) {
+    return 3;
+  }
+  return 4;
+}
+
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+//   (LeftJoinNullFlagSplitCount_sound)
+// Accumulates (no_match, matched, total) for a LEFT JOIN whose nullable side
+// is only inspected via `right_key IS NULL` / `IS NOT NULL`.
+inline void FoldLeftJoinNullFlagCounts(uint64_t right_mult, uint64_t* no_match,
+                                       uint64_t* matched,
+                                       uint64_t* total) noexcept {
+  if (right_mult == 0) {
+    *no_match += 1;
+    *total += 1;
+  } else {
+    *matched += right_mult;
+    *total += right_mult;
+  }
+}
+
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+//   (TopKCountPruneByRemainingRows_sound)
+// Returns the K-th largest count (0 if fewer than K groups exist). Once this
+// threshold strictly exceeds the remaining unread rows, unseen keys cannot
+// enter the Top-K.
+inline uint64_t ComputeTopKRemainingPruneThreshold(
+    const std::vector<uint64_t>& counts, size_t k) {
+  if (k == 0 || counts.size() < k) {
+    return 0;
+  }
+  std::vector<uint64_t> copy = counts;
+  const size_t nth = k - 1;
+  std::nth_element(copy.begin(),
+                   copy.begin() + static_cast<std::ptrdiff_t>(nth), copy.end(),
+                   std::greater<uint64_t>{});
+  return copy[nth];
+}
+
+// Lean proof:
 // lean/TinylambOpt/ResearchProofs/BoundedCountRadixDescSortEquiv.lean (sound)
 // Order-preserving (ASC) / order-reversing (DESC) unsigned encoding of signed
 // int64_t keys over the full [INT64_MIN, INT64_MAX] range.
@@ -204,7 +260,7 @@ void StableRadixSortByUint64Key(std::vector<T>& items, KeyFn&& key_fn) {
       sum += c;
     }
     for (size_t i = 0; i < n; ++i) {
-      const uint8_t byte =
+      const auto byte =
           static_cast<uint8_t>((key_fn(items[i]) >> shift) & 0xFFU);
       scratch[counts[byte]++] = std::move(items[i]);
     }

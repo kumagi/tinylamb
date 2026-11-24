@@ -650,7 +650,8 @@ TEST(GoogleSqlAstTest, NestedUpdateRejectsFromBeforeExecution) {
   ASSERT_TRUE(ast.HasValue());
   const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
   ASSERT_FALSE(visited.HasValue());
-  EXPECT_NE(visited.GetStatus().GetMessage().find("nested DML FROM"), std::string::npos);
+  EXPECT_NE(visited.GetStatus().GetMessage().find("nested DML FROM"),
+            std::string::npos);
 }
 
 TEST(GoogleSqlAstTest, NestedInsertRejectsReturningClause) {
@@ -1078,7 +1079,7 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
     GTEST_SKIP() << "skipped";
   }
   std::string sql = "SELECT 1";
-  sql.reserve(sql.size() + (600 * 2) + 1);
+  sql.reserve(sql.size() + (size_t{600} * 2) + 1);
   for (int i = 0; i < 600; ++i) {
     sql += "+1";
   }

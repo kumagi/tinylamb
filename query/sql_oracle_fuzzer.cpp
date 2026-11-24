@@ -132,7 +132,7 @@ struct RPred {
   bool between_hi_null{false};
   std::vector<int64_t> in_list{};
   int64_t str_const{0};  // index into kStrPool
-  int str_pattern{0};  // Index into the five patterns rendered below.
+  int str_pattern{0};    // Index into the five patterns rendered below.
   bool bool_positive{true};
   int64_t mask{1};
   int64_t arith_const{0};
@@ -2571,7 +2571,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   bool skipped = false;
   // Generation probes legitimately skip when a statement cannot execute;
   // only the replay guards surface those skips as reports.
-  const std::string report =
+  std::string report =
       ReplayOracleTrace(t, verbose, &skipped, /*surface_skips=*/false);
   if (skipped) {
     // No database: nothing ran, so no family may be reported as "ran".

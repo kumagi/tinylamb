@@ -32,8 +32,11 @@ TEST(JitTest, BranchlessProgramsSurviveCacheEviction) {
     auto expression = BinaryExpressionExp(
         ColumnValueExp("x"), BinaryOperation::kAdd, ConstantValueExp(Value(i)));
     auto bytecode = BytecodeCompiler::Compile(expression, schema);
-    ASSERT_TRUE(bytecode.has_value());
-    auto compiled = JitBranchlessProgram::Compile(*bytecode, schema);
+    if (!bytecode.has_value()) {
+      ADD_FAILURE() << "bytecode compilation failed";
+      return;
+    }
+    auto compiled = JitBranchlessProgram::Compile(bytecode.value(), schema);
     if (!compiled) {
       GTEST_SKIP() << "LLVM JIT unavailable";
     }
@@ -56,9 +59,17 @@ TEST(JitTest, DelimitedCaptureAgreesWithGreedyRegexReplacement) {
       R"(^https?://(?:www\.)?([^/]+)/[\s\S]*$)";
   constexpr std::string_view replacement = R"(\1)";
   auto description = DescribeDelimitedRegexCapture(pattern, replacement);
-  ASSERT_TRUE(description.HasValue());
-  ASSERT_TRUE(description.Value());
-  const auto jit = JitDelimitedCapture::Compile(*description.Value());
+  if (!description.HasValue()) {
+    ADD_FAILURE() << description.GetStatus();
+    return;
+  }
+  const auto& maybe_capture = description.Value();
+  if (!maybe_capture.has_value()) {
+    ADD_FAILURE() << "regex capture was not recognized";
+    return;
+  }
+  const auto& capture_description = maybe_capture.value();
+  const auto jit = JitDelimitedCapture::Compile(capture_description);
   if (!jit) {
     GTEST_SKIP() << "LLVM JIT unavailable";
   }
@@ -415,8 +426,11 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
           .val_null_mask = 0x03U,
           .part_shift = 2,
       });
-  ASSERT_TRUE(ext_mul.has_value());
-  ASSERT_TRUE(ext_coal.has_value());
+  if (!ext_mul.has_value() || !ext_coal.has_value()) {
+    GTEST_SKIP() << "LLVM JIT unavailable";
+  }
+  const auto& ext_mul_program = ext_mul.value();
+  const auto& ext_coal_program = ext_coal.value();
   constexpr uint8_t kMaxShift = JitDenseSplitRadixAgg::kMaxPartShift;
   EXPECT_TRUE(JitDenseSplitRadixAgg::CompileScatter(kMaxShift).has_value());
   EXPECT_TRUE(JitDenseSplitRadixAgg::CompileExtract({
@@ -457,7 +471,7 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
   std::array<uint32_t, 2> hist{0, 0};
 
   // Empty count = 0 check.
-  EXPECT_EQ(ext_mul->Run(0, 8, sel.data(), jk_vals.data(), jk_nulls.data(), 10,
+  EXPECT_EQ(ext_mul_program.Run(0, 8, sel.data(), jk_vals.data(), jk_nulls.data(), 10,
                          key_to_r.size(), key_to_r.data(), pk0_vals.data(),
                          pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(),
                          2, v0.data(), n0.data(), v1.data(), n1.data(), nullptr,
@@ -467,7 +481,7 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
 
   const auto run_selected = [&](std::span<const uint32_t> selected,
                                 std::span<uint32_t> histogram) {
-    return ext_mul->Run(
+    return ext_mul_program.Run(
         static_cast<uint32_t>(selected.size()), 8, selected.data(),
         jk_vals.data(), jk_nulls.data(), 10, key_to_r.size(), key_to_r.data(),
         pk0_vals.data(), pk0_nulls.data(), 100, pk0_lut.size(), pk0_lut.data(), 2,
@@ -541,7 +555,7 @@ TEST(JitTest, JitDenseSplitRadixAgg_ExtractScatterAccum) {
   std::vector<double> c_val(1);
   std::array<uint32_t, 2> c_hist{0, 0};
   ASSERT_EQ(
-      ext_coal->Run(1, 1, nullptr, c_jk.data(), nullptr, 10, key_to_r.size(),
+      ext_coal_program.Run(1, 1, nullptr, c_jk.data(), nullptr, 10, key_to_r.size(),
                     key_to_r.data(), c_pk.data(), nullptr, 100, pk0_lut.size(),
                     pk0_lut.data(), 2, c_v0.data(), c_n0.data(), c_v1.data(),
                     c_n1.data(), nullptr, nullptr, nullptr, nullptr, 1.0,

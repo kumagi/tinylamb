@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "plan/cascades.hpp"
 
 #include <algorithm>
@@ -1653,13 +1654,14 @@ std::string LogicalExpression::Fingerprint() const {
     out << "#s:";
     for (size_t i = 0; i < target_list.size(); ++i) {
       out << (i < sort_ascending.size() && sort_ascending[i] ? 'a' : 'd');
-      if (i < sort_nulls_first.size() && sort_nulls_first[i].has_value()) {
-        out << (*sort_nulls_first[i] ? 'f' : 'l');
-      } else {
-        // Unspecified (nullopt, or a shorter vector) means the engine default,
-        // which is NOT the same ordering requirement as an explicit NULLS LAST.
-        out << 'd';
+      char null_order = 'd';
+      if (i < sort_nulls_first.size()) {
+        const auto nulls_first = sort_nulls_first[i];
+        if (nulls_first.has_value()) {
+          null_order = nulls_first.value() ? 'f' : 'l';
+        }
       }
+      out << null_order;
     }
   }
   if (operation == LogicalOperator::kLimit) {
@@ -5472,9 +5474,8 @@ const RuleSet& RuleSet::Default() {
                   return false;
               }
             }
-            // NOLINTNEXTLINE(readability-use-anyofallof) explicit loop is
-            // clearer here
-            for (const Expression& child : ExpressionChildren(expr)) {
+            for (const Expression& child : ExpressionChildren(expr)) {  // NOLINT(readability-use-anyofallof): recursive short-circuit walk.
+
               if (!self(self, child)) {
                 return false;
               }
@@ -7157,7 +7158,7 @@ const RuleSet& RuleSet::Default() {
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           const char* disable_halo =
-              std::getenv("TINYLAMB_DISABLE_WINDOW_HALO");
+              ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
           if (disable_halo != nullptr && disable_halo[0] != '\0' &&
               disable_halo[0] != '0') {
             return;
@@ -7411,7 +7412,7 @@ const RuleSet& RuleSet::Default() {
         [](const Bindings& bindings, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
           const char* disable_ties =
-              std::getenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+              ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
           if (disable_ties != nullptr && disable_ties[0] != '\0' &&
               disable_ties[0] != '0') {
             return;
@@ -11240,16 +11241,15 @@ const RuleSet& RuleSet::Default() {
               if (cval.IsNull() || cval.type != *col_domain) {
                 continue;
               }
-              if (ext_type == AggregationType::kMax &&
+              const bool is_max_lower_bound =
+                  ext_type == AggregationType::kMax &&
                   (op == BinaryOperation::kGreaterThan ||
-                   // NOLINTNEXTLINE(bugprone-branch-clone) distinct intent in
-                   // each branch
-                   op == BinaryOperation::kGreaterThanEquals)) {
-                pushed_bounds.push_back(
-                    BinaryExpressionExp(ColumnValueExp(ext_col), op, rhs));
-              } else if (ext_type == AggregationType::kMin &&
-                         (op == BinaryOperation::kLessThan ||
-                          op == BinaryOperation::kLessThanEquals)) {
+                   op == BinaryOperation::kGreaterThanEquals);
+              const bool is_min_upper_bound =
+                  ext_type == AggregationType::kMin &&
+                  (op == BinaryOperation::kLessThan ||
+                   op == BinaryOperation::kLessThanEquals);
+              if (is_max_lower_bound || is_min_upper_bound) {
                 pushed_bounds.push_back(
                     BinaryExpressionExp(ColumnValueExp(ext_col), op, rhs));
               }
@@ -12341,22 +12341,20 @@ const RuleSet& RuleSet::Default() {
                 // field through the catalog identifies a scan of the shared
                 // table under either spelling.
                 const auto scans_shared_table = [&](GroupId scan_group) {
-                  for (const LogicalExpression& e :
-                       memo.Get(scan_group).expressions) {
-                    if (e.operation != LogicalOperator::kScan ||
-                        e.table.empty()) {
-                      continue;
-                    }
-                    if (e.table == shared_table) {
-                      return true;
-                    }
-                    const auto owner = rel_schemas.find(e.table);
-                    if (owner != rel_schemas.end() &&
-                        owner->second.Name() == shared_table) {
-                      return true;
-                    }
-                  }
-                  return false;
+                  const auto& expressions = memo.Get(scan_group).expressions;
+                  return std::ranges::any_of(
+                      expressions, [&](const LogicalExpression& e) {
+                        if (e.operation != LogicalOperator::kScan ||
+                            e.table.empty()) {
+                          return false;
+                        }
+                        if (e.table == shared_table) {
+                          return true;
+                        }
+                        const auto owner = rel_schemas.find(e.table);
+                        return owner != rel_schemas.end() &&
+                               owner->second.Name() == shared_table;
+                      });
                 };
                 if (!scans_shared_table(s_id)) {
                   continue;

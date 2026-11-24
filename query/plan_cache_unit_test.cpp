@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -340,31 +341,35 @@ TEST(PlanCacheToggleInvalidationTest, BothCachesCheckAllMemorySettings) {
     EXPECT_EQ(FindThreadCompiledPlan(sql, nullptr, 0), nullptr);
     EXPECT_EQ(PreparedPlanCache::Instance().Find(sql, nullptr, 0), nullptr);
   };
-  expect_miss({.process_limit=settings.process_limit ^ 1U, .operator_limit=settings.operator_limit,
-               .always_spill=settings.always_spill});
-  expect_miss({.process_limit=settings.process_limit, .operator_limit=settings.operator_limit ^ 1U,
-               .always_spill=settings.always_spill});
-  expect_miss({.process_limit=settings.process_limit, .operator_limit=settings.operator_limit,
-               .always_spill=!settings.always_spill});
+  expect_miss({.process_limit = settings.process_limit ^ 1U,
+               .operator_limit = settings.operator_limit,
+               .always_spill = settings.always_spill});
+  expect_miss({.process_limit = settings.process_limit,
+               .operator_limit = settings.operator_limit ^ 1U,
+               .always_spill = settings.always_spill});
+  expect_miss({.process_limit = settings.process_limit,
+               .operator_limit = settings.operator_limit,
+               .always_spill = !settings.always_spill});
 }
 
 TEST(PlanCacheToggleInvalidationTest, OptBitsIsolateCachedPlansPerToggle) {
-  struct ScopedUnset {
+  struct ScopedUnset {  // NOLINT(cppcoreguidelines-special-member-functions):
+                        // scope-owned cleanup.
     const char* name;
     std::string prev;
     bool had_prev{false};
     explicit ScopedUnset(const char* n) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
-      ::unsetenv(name);
+      ::tinylamb::platform::UnsetEnv(name);
     }
     ~ScopedUnset() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -389,7 +394,7 @@ TEST(PlanCacheToggleInvalidationTest, OptBitsIsolateCachedPlansPerToggle) {
   EXPECT_EQ(PreparedPlanCache::Instance().Find(fp, dummy_db, epoch, bits_on),
             plan_on);
 
-  ::setenv("TINYLAMB_DISABLE_ROW_IN_MASK", "1", 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_ROW_IN_MASK", "1", 1);
   const uint64_t bits_off = CurrentPlanOptToggleBits();
   EXPECT_NE(bits_off, bits_on);
   EXPECT_NE(PlanCacheKeyWithOptBits(fp, bits_off),

@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 
+#include "common/platform/process.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
@@ -76,7 +77,7 @@ inline void RemoveLogAndSegments(const std::string& log_path) {
 class ScopedEnvVar {
  public:
   ScopedEnvVar(const char* key, const char* value) : key_(key) {
-    if (const char* prev = std::getenv(key)) {
+    if (const char* prev = ::tinylamb::platform::GetEnv(key)) {
       had_prev_ = true;
       prev_ = prev;
     }
@@ -88,16 +89,16 @@ class ScopedEnvVar {
   ScopedEnvVar& operator=(ScopedEnvVar&&) = delete;
   ~ScopedEnvVar() {
     if (had_prev_) {
-      ::setenv(key_.c_str(), prev_.c_str(), 1);
+      ::tinylamb::platform::SetEnv(key_.c_str(), prev_.c_str(), 1);
     } else {
-      ::unsetenv(key_.c_str());
+      ::tinylamb::platform::UnsetEnv(key_.c_str());
     }
   }
   void Set(const char* value) {
     if (value != nullptr) {
-      ::setenv(key_.c_str(), value, 1);
+      ::tinylamb::platform::SetEnv(key_.c_str(), value, 1);
     } else {
-      ::unsetenv(key_.c_str());
+      ::tinylamb::platform::UnsetEnv(key_.c_str());
     }
   }
 

@@ -420,27 +420,21 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
           ContainsParameterSlot(window.frame_end.offset)) {
         return true;
       }
-      for (const Expression& arg : window.args) {
-        if (ContainsParameterSlot(arg)) {
-          return true;
-        }
-      }
-      for (const Expression& key : window.partition_by) {
-        if (ContainsParameterSlot(key)) {
-          return true;
-        }
-      }
-      for (const WindowOrderTerm& term : window.inner_order_by) {
-        if (ContainsParameterSlot(term.expression)) {
-          return true;
-        }
-      }
-      for (const WindowOrderTerm& term : window.order_by) {
-        if (ContainsParameterSlot(term.expression)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(window.args, [](const Expression& arg) {
+               return ContainsParameterSlot(arg);
+             }) ||
+             std::ranges::any_of(window.partition_by,
+                                 [](const Expression& key) {
+                                   return ContainsParameterSlot(key);
+                                 }) ||
+             std::ranges::any_of(window.inner_order_by,
+                                 [](const WindowOrderTerm& term) {
+                                   return ContainsParameterSlot(term.expression);
+                                 }) ||
+             std::ranges::any_of(window.order_by,
+                                 [](const WindowOrderTerm& term) {
+                                   return ContainsParameterSlot(term.expression);
+                                 });
     }
     default:
       return false;

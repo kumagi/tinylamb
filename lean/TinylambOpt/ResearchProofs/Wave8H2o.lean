@@ -2,10 +2,6 @@ import TinylambOpt.ResearchGoals.AnalyticsWorkloads.H2o
 
 namespace TinylambOpt.ResearchProofs.Wave8H2o
 
--- TODO(SkewHybrid): goal appears true (verified by exhaustive small-input probes),
--- but the hash-map fold invariants for the hot/cold partition are not yet
--- formalized here.
-
 open TinylambOpt.ResearchGoals.AnalyticsWorkloads
 open TinylambOpt.ResearchGoals.AnalyticsWorkloads.H2o
 open TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown
@@ -1243,6 +1239,27 @@ private theorem pplus_zero_right (a : Totals × Totals) : pplus a (zero, zero) =
   cases a
   simp [pplus, plus_zero_right]
 
+private theorem pfold_start (l : List (Totals × Totals)) (st a : Totals × Totals) :
+    l.foldl pplus (pplus a st) = pplus a (l.foldl pplus st) := by
+  induction l generalizing st a with
+  | nil => simp
+  | cons x xs ih =>
+      change xs.foldl pplus (pplus (pplus a st) x) = pplus a (xs.foldl pplus (pplus st x))
+      rw [show pplus (pplus a st) x = pplus a (pplus st x) by rw [pplus_assoc]]
+      exact ih (pplus st x) a
+
+private theorem pfold_map_start {α : Type} (l : List α) (f : α → Totals × Totals)
+    (st a : Totals × Totals) :
+    l.foldl (fun t x => pplus t (f x)) (pplus a st) =
+      pplus a (l.foldl (fun t x => pplus t (f x)) st) := by
+  induction l generalizing st a with
+  | nil => simp
+  | cons x xs ih =>
+      change xs.foldl (fun t y => pplus t (f y)) (pplus (pplus a st) (f x)) =
+        pplus a (xs.foldl (fun t y => pplus t (f y)) (pplus st (f x)))
+      rw [show pplus (pplus a st) (f x) = pplus a (pplus st (f x)) by rw [pplus_assoc]]
+      exact ih (pplus st (f x)) a
+
 private theorem h2c_add_left (l₁ l₂ r : Totals) : h2c (plus l₁ l₂) r = pplus (h2c l₁ r) (h2c l₂ r) := by
   cases l₁
   cases l₂
@@ -1258,47 +1275,1475 @@ private theorem h2c_zero_right (l : Totals) : h2c l zero = (zero, zero) := by
   cases l
   simp [h2c, zero]
 
-private theorem h2c_eq_zero_of_cnt (l r : Totals) (h : l.cnt = 0 ∨ r.cnt = 0) :
-    h2c l r = (zero, zero) := by
+private def Valid (t : Totals) : Prop := t.nn ≤ t.cnt ∧ (t.nn = 0 → t.sum = 0)
+
+private theorem valid_zero : Valid zero := by
+  simp [Valid, zero]
+
+private theorem valid_weighted (n : Nat) (v : Option Int) : Valid (weighted n v) := by
+  cases v with
+  | none => simp [Valid, weighted]
+  | some x =>
+      constructor
+      · simp [weighted]
+      · intro h
+        simp [weighted] at h
+        subst n
+        simp [weighted]
+
+private theorem valid_plus {a b : Totals} (ha : Valid a) (hb : Valid b) : Valid (plus a b) := by
+  rcases a with ⟨ac, an, as⟩
+  rcases b with ⟨bc, bn, bs⟩
+  simp [Valid, plus] at ha hb ⊢
+  constructor
+  · omega
+  · intro h1
+    intro h2
+    rw [ha.2 h1, hb.2 h2]
+    simp
+
+private theorem valid_summarize (vs : List (Option Int)) : Valid (summarize vs) := by
+  induction vs with
+  | nil => exact valid_zero
+  | cons v vs ih =>
+      rw [summarize_cons]
+      exact valid_plus (valid_weighted 1 v) ih
+
+private theorem valid_h2c_fst {l r : Totals} (hl : Valid l) (hr : Valid r) :
+    Valid (h2c l r).1 := by
+  rcases l with ⟨lc, ln, ls⟩
+  rcases r with ⟨rc, rn, rs⟩
+  simp [Valid, h2c] at hl hr ⊢
+  constructor
+  · exact Nat.mul_le_mul_right rc hl.1
+  · intro h
+    have hz : ln = 0 ∨ rc = 0 := Nat.mul_eq_zero.mp h
+    rcases hz with hz | hz
+    · rw [hl.2 hz]
+      simp
+    · simp [hz]
+
+private theorem valid_h2c_snd {l r : Totals} (hl : Valid l) (hr : Valid r) :
+    Valid (h2c l r).2 := by
+  rcases l with ⟨lc, ln, ls⟩
+  rcases r with ⟨rc, rn, rs⟩
+  simp [Valid, h2c] at hl hr ⊢
+  constructor
+  · exact Nat.mul_le_mul_right lc hr.1
+  · intro h
+    have hz : rn = 0 ∨ lc = 0 := Nat.mul_eq_zero.mp h
+    rcases hz with hz | hz
+    · rw [hr.2 hz]
+      simp
+    · simp [hz]
+
+private theorem h2c_eq_zero_of_cnt_valid {l r : Totals} (hl : Valid l) (hr : Valid r)
+    (h : l.cnt = 0 ∨ r.cnt = 0) : h2c l r = (zero, zero) := by
+  rcases l with ⟨lc, ln, ls⟩
+  rcases r with ⟨rc, rn, rs⟩
+  simp [Valid] at hl hr
+  simp only [h2c, zero, Prod.mk.injEq, PreAgg.mk.injEq]
   rcases h with h | h
-  · cases l with
-    | mk lc ln ls =>
-      cases r with
-      | mk rc rn rs =>
-        simp at h
-        subst lc
-        simp [h2c, zero]
-  · cases l with
-    | mk lc ln ls =>
-      cases r with
-      | mk rc rn rs =>
-        subst rc
-        simp [h2c, zero]
+  · simp at h
+    subst lc
+    have hln : ln = 0 := by omega
+    subst ln
+    have hls : ls = 0 := hl.2 rfl
+    subst ls
+    simp
+  · simp at h
+    subst rc
+    have hrn : rn = 0 := by omega
+    subst rn
+    have hrs : rs = 0 := hr.2 rfl
+    subst rs
+    simp
 
 private theorem contribute_getD (h : Groups) (g q : Int) (l r : Totals) :
     (contribute h g l r).getD q (zero, zero) =
-      if q == g then pplus (h.getD q (zero, zero)) (h2c l r)
+      if (q == g) = true && !(l.cnt == 0 || r.cnt == 0) then
+        pplus (h.getD q (zero, zero)) (h2c l r)
       else h.getD q (zero, zero) := by
   unfold contribute
   by_cases hz : l.cnt == 0 || r.cnt == 0
   · rw [if_pos hz]
-    by_cases hq : q == g
-    · have hc : l.cnt = 0 ∨ r.cnt = 0 := by
-        simpa [Bool.or_eq_true] using hz
-      rw [if_pos hq]
-      rw [h2c_eq_zero_of_cnt l r hc, pplus_zero_right]
-    · rw [if_neg hq]
+    simp [hz]
   · rw [if_neg hz]
     by_cases hq : q == g
     · have hqeq : q = g := by simpa using hq
       subst q
-      rw [if_pos (by simp : (g == g) = true)]
-      simp [Std.HashMap.getD_insert, pplus, h2c, plus, zero,
+      simp [Std.HashMap.getD_insert, pplus, h2c, plus, zero, hz,
         Nat.mul_comm, Nat.mul_left_comm, Nat.mul_assoc, Int.mul_comm]
-    · rw [if_neg hq]
-      have hne : g ≠ q := by
+    · have hne : g ≠ q := by
         intro heq
         exact hq (by simpa [heq])
-      simp [Std.HashMap.getD_insert, hne]
+      simp [Std.HashMap.getD_insert, hq, hne, hz]
 
+private theorem contribute_getD_v (h : Groups) (g q : Int) (l r : Totals)
+    (hl : Valid l) (hr : Valid r) :
+    (contribute h g l r).getD q (zero, zero) =
+      if (q == g) = true then pplus (h.getD q (zero, zero)) (h2c l r)
+      else h.getD q (zero, zero) := by
+  rw [contribute_getD]
+  by_cases hq : (q == g) = true
+  · by_cases hz : l.cnt == 0 || r.cnt == 0
+    · have hc : l.cnt = 0 ∨ r.cnt = 0 := by simpa [Bool.or_eq_true] using hz
+      simp [hq, hz, h2c_eq_zero_of_cnt_valid hl hr hc, pplus_zero_right]
+    · simp [hq, hz]
+  · simp [hq]
+
+private def rTotals (rs : List RRow) (k : Int) : Totals :=
+  summarize ((rs.filter fun r => r.k == some k).map fun r => r.v)
+
+private theorem rTotals_append (rs : List RRow) (k : Int) (r : RRow) :
+    rTotals (rs ++ [r]) k =
+      if r.k == some k then plus (rTotals rs k) (weighted 1 r.v) else rTotals rs k := by
+  unfold rTotals
+  rw [List.filter_append, List.map_append, summarize_append]
+  cases hr : r.k with
+  | none => simp [hr, summarize, plus_zero_right]
+  | some rk =>
+      by_cases h : rk == k
+      · have hrk : some rk == some k := by simp [h]
+        simp [hr, hrk, summarize_singleton, plus_zero_right]
+      · have hrk : ¬(some rk == some k) = true := by simp [h]
+        simp [hr, hrk, summarize, plus_zero_right]
+
+private theorem build_inv (rs : List RRow) :
+    ∀ (xs ys : List RRow) (h : Std.HashMap Int Totals),
+      (∀ k, h.getD k zero = rTotals ys k) →
+      ∀ k, (xs.foldl (fun h r => match r.k with
+        | none => h
+        | some k => h.insert k (plus (h.getD k zero) (weighted 1 r.v))) h).getD k zero =
+          rTotals (ys ++ xs) k := by
+  intro xs
+  induction xs with
+  | nil =>
+      intro ys h hh k
+      simpa using hh k
+  | cons r xs ih =>
+      intro ys h hh k
+      simp only [List.foldl_cons]
+      cases hr : r.k with
+      | none =>
+          have hh' : ∀ k, h.getD k zero = rTotals (ys ++ [r]) k := by
+            intro k
+            rw [hh k]
+            rw [rTotals_append]
+            simp [hr]
+          simpa [hr, List.append_assoc] using ih (ys ++ [r]) h hh' k
+      | some rk =>
+          have hh' : ∀ k', (h.insert rk (plus (h.getD rk zero) (weighted 1 r.v))).getD k' zero =
+              rTotals (ys ++ [r]) k' := by
+            intro k'
+            by_cases hk' : rk == k'
+            · have heq : rk = k' := by simpa using hk'
+              subst k'
+              rw [Std.HashMap.getD_insert]
+              simp
+              rw [hh rk]
+              rw [rTotals_append]
+              simp [hr, summarize_singleton]
+            · rw [Std.HashMap.getD_insert]
+              simp [hk']
+              rw [hh k']
+              rw [rTotals_append]
+              simp [hr, hk']
+          simpa [hr, List.append_assoc] using
+            ih (ys ++ [r]) (h.insert rk (plus (h.getD rk zero) (weighted 1 r.v))) hh' k
+
+private theorem build_final (rs : List RRow) :
+    ∀ k, (rs.foldl (fun (h : Std.HashMap Int Totals) (r : RRow) => match r.k with
+      | none => h
+      | some k => h.insert k (plus (h.getD k zero) (weighted 1 r.v))) {}).getD k zero = rTotals rs k := by
+  simpa [rTotals, summarize] using build_inv rs rs [] {} (by intro k; simp [rTotals, summarize])
+
+private def lContrib (rs : List RRow) (l : LRow) : Totals × Totals :=
+  match l.k with
+  | none => (zero, zero)
+  | some k => h2c (weighted 1 l.v) (rTotals rs k)
+
+private def lActive (rs : List RRow) (g : Int) (l : LRow) : Bool :=
+  l.g == g && (match l.k with
+    | some k => !(rTotals rs k).cnt == 0
+    | none => false)
+
+private def naiveFold (rs : List RRow) (h : Groups) (xs : List LRow) : Groups :=
+  xs.foldl (fun h l => match l.k with
+    | none => h
+    | some k => contribute h l.g (weighted 1 l.v) (rTotals rs k)) h
+
+private theorem naiveFold_getD (rs : List RRow) (xs : List LRow) (h : Groups) (g : Int) :
+    (naiveFold rs h xs).getD g (zero, zero) =
+      pplus (h.getD g (zero, zero))
+        ((xs.filter (lActive rs g)).foldl (fun t l => pplus t (lContrib rs l)) (zero, zero)) := by
+  induction xs generalizing h with
+  | nil => simp [naiveFold, lActive, pplus_zero_right]
+  | cons l xs ih =>
+      simp only [naiveFold, List.foldl_cons]
+      unfold naiveFold at ih
+      cases hk : l.k with
+      | none =>
+          have hact : lActive rs g l = false := by simp [lActive, hk]
+          simp [hk, hact] at ih ⊢
+          exact ih h
+      | some k =>
+          simp [hk]
+          by_cases hg : l.g == g
+          · have hgeq : l.g = g := by simpa using hg
+            by_cases hcnt : (rTotals rs k).cnt == 0
+            · have hact : lActive rs g l = false := by simp [lActive, hk, hg, hcnt]
+              have hskip : contribute h l.g (weighted 1 l.v) (rTotals rs k) = h := by
+                unfold contribute
+                simp [hk, hcnt]
+              rw [hskip]
+              simp [hact] at ih ⊢
+              exact ih h
+            · have hact : lActive rs g l = true := by simp [lActive, hk, hg, hcnt]
+              have hcont : (contribute h l.g (weighted 1 l.v) (rTotals rs k)).getD g (zero, zero) =
+                  pplus (h.getD g (zero, zero)) (lContrib rs l) := by
+                rw [contribute_getD]
+                simp [lContrib, hk, hgeq, hg, hcnt, weighted]
+              have hfold := ih (h := contribute h l.g (weighted 1 l.v) (rTotals rs k))
+              rw [hcont] at hfold
+              rw [hfold]
+              simp [hact]
+              rw [pplus_zero_left]
+              rw [← pplus_zero_right (lContrib rs l)]
+              rw [pfold_map_start (List.filter (lActive rs g) xs) (lContrib rs) (zero, zero) (lContrib rs l)]
+              rw [pplus_zero_right (lContrib rs l)]
+              rw [pplus_assoc]
+          · have hact : lActive rs g l = false := by simp [lActive, hk, hg]
+            have hgne : g ≠ l.g := by
+              intro heq
+              exact hg (by simpa [heq])
+            have hskip : (contribute h l.g (weighted 1 l.v) (rTotals rs k)).getD g (zero, zero) =
+                h.getD g (zero, zero) := by
+              rw [contribute_getD]
+              simp [hg, hgne]
+            have hfold := ih (h := contribute h l.g (weighted 1 l.v) (rTotals rs k))
+            rw [hskip] at hfold
+            rw [hfold]
+            simp [hact]
+
+private theorem valid_rTotals (rs : List RRow) (k : Int) : Valid (rTotals rs k) :=
+  valid_summarize _
+
+private def eContrib (rs : List RRow) (e : (Int × Int) × Totals) : Totals × Totals :=
+  h2c e.2 (rTotals rs e.1.2)
+
+private def entryStep (rs : List RRow) (h : Groups) (e : (Int × Int) × Totals) : Groups :=
+  contribute h e.1.1 e.2 (rTotals rs e.1.2)
+
+private def entryFold (rs : List RRow) (es : List ((Int × Int) × Totals)) (h : Groups) : Groups :=
+  es.foldl (entryStep rs) h
+
+private theorem entryFold_getD (rs : List RRow) (es : List ((Int × Int) × Totals))
+    (h : Groups) (g : Int) (hv : ∀ e ∈ es, Valid e.2) :
+    (entryFold rs es h).getD g (zero, zero) =
+      pplus (h.getD g (zero, zero))
+        ((es.filter fun e => e.1.1 == g).foldl (fun t e => pplus t (eContrib rs e)) (zero, zero)) := by
+  induction es generalizing h with
+  | nil => simp [entryFold, pplus_zero_right]
+  | cons e es ih =>
+      simp only [entryFold, List.foldl_cons]
+      unfold entryFold at ih
+      have hev : Valid e.2 := hv e (by simp)
+      have htailv : ∀ e' ∈ es, Valid e'.2 := by
+        intro e' h'
+        exact hv e' (by simp [h'])
+      by_cases hg : e.1.1 == g
+      · have hgeq : e.1.1 = g := by simpa using hg
+        have hcont : (entryStep rs h e).getD g (zero, zero) =
+            pplus (h.getD g (zero, zero)) (eContrib rs e) := by
+          unfold entryStep eContrib
+          rw [contribute_getD_v _ _ _ _ _ hev (valid_rTotals rs e.1.2)]
+          simp [hgeq]
+        have hfold := ih (h := entryStep rs h e) htailv
+        rw [hcont] at hfold
+        rw [hfold]
+        simp [hg]
+        rw [pplus_zero_left]
+        rw [← pplus_zero_right (eContrib rs e)]
+        rw [pfold_map_start (List.filter (fun e : (Int × Int) × Totals => e.1.1 == g) es)
+          (eContrib rs) (zero, zero) (eContrib rs e)]
+        rw [pplus_zero_right (eContrib rs e)]
+        rw [pplus_assoc]
+      · have hgne : e.1.1 ≠ g := by
+          intro heq
+          exact hg (by simpa [heq])
+        have hgne2 : g ≠ e.1.1 := by
+          intro heq
+          exact hgne heq.symm
+        have hskip : (entryStep rs h e).getD g (zero, zero) = h.getD g (zero, zero) := by
+          unfold entryStep
+          rw [contribute_getD_v _ _ _ _ _ hev (valid_rTotals rs e.1.2)]
+          simp [hgne2]
+        have hfold := ih (h := entryStep rs h e) htailv
+        rw [hskip] at hfold
+        rw [hfold]
+        simp [hg]
+
+private theorem pplus_foldl_zero {α : Type} (l : List α) (f : α → Totals × Totals)
+    (acc : Totals × Totals) :
+    pplus acc (l.foldl (fun t x => pplus t (f x)) (zero, zero)) =
+      l.foldl (fun t x => pplus t (f x)) acc := by
+  rw [← pfold_map_start l f (zero, zero) acc]
+  rw [pplus_zero_right acc]
+
+private theorem pfold_entries_perm {α : Type} {l₁ l₂ : List α} (hp : l₁.Perm l₂)
+    (f : α → Totals × Totals) (acc : Totals × Totals) :
+    l₁.foldl (fun t x => pplus t (f x)) acc = l₂.foldl (fun t x => pplus t (f x)) acc := by
+  induction hp generalizing acc with
+  | nil => rfl
+  | cons x h ih =>
+      simp only [List.foldl_cons]
+      exact ih (acc := pplus acc (f x))
+  | swap x y l => simp [pplus_assoc, pplus_comm, pplus_left_comm]
+  | trans h₁ h₂ ih₁ ih₂ => exact (ih₁ acc).trans (ih₂ acc)
+
+private theorem entryFold_perm (rs : List RRow) {es₁ es₂ : List ((Int × Int) × Totals)}
+    (hp : es₁.Perm es₂) (hv : ∀ e ∈ es₁, Valid e.2) (h : Groups) (g : Int) :
+    (entryFold rs es₁ h).getD g (zero, zero) = (entryFold rs es₂ h).getD g (zero, zero) := by
+  have hv2 : ∀ e ∈ es₂, Valid e.2 := by
+    intro e he
+    exact hv e (hp.mem_iff.mpr he)
+  rw [entryFold_getD rs es₁ h g hv, entryFold_getD rs es₂ h g hv2]
+  rw [pplus_foldl_zero, pplus_foldl_zero]
+  rw [pfold_entries_perm (hp.filter _) (eContrib rs) (h.getD g (zero, zero))]
+
+instance : Std.Associative pplus := ⟨pplus_assoc⟩
+instance : Std.Commutative pplus := ⟨pplus_comm⟩
+
+private def gsum (rs : List RRow) (es : List ((Int × Int) × Totals)) (g : Int) : Totals × Totals :=
+  (es.filter fun e => e.1.1 == g).foldl (fun t e => pplus t (eContrib rs e)) (zero, zero)
+
+private def finalize (rs : List RRow) (p : Std.HashMap (Int × Int) Totals) (cold : Groups) : Groups :=
+  p.fold (fun groups (g, k) left => contribute groups g left (rTotals rs k)) cold
+
+private theorem finalize_eq_entryFold (rs : List RRow) (p : Std.HashMap (Int × Int) Totals)
+    (cold : Groups) :
+    finalize rs p cold = entryFold rs p.toList cold := by
+  unfold finalize entryFold entryStep
+  rw [Std.HashMap.fold_eq_foldl_toList]
+
+private theorem valid_getD (p : Std.HashMap (Int × Int) Totals) (q : Int × Int)
+    (hv : ∀ e ∈ p.toList, Valid e.2) : Valid (p.getD q zero) := by
+  by_cases hq : q ∈ p
+  · have hsome : p[q]? = some (p.getD q zero) := Std.HashMap.getElem?_eq_some_getD hq
+    have hmem : (q, p.getD q zero) ∈ p.toList :=
+      Std.HashMap.mem_toList_iff_getElem?_eq_some.mpr hsome
+    exact hv (q, p.getD q zero) hmem
+  · have hnone : p[q]? = none := Std.HashMap.getElem?_eq_none hq
+    rw [Std.HashMap.getD_eq_getD_getElem?, hnone]
+    simp
+    exact valid_zero
+
+private theorem pairwise_key_eq {l : List ((Int × Int) × Totals)}
+    (h : l.Pairwise (fun a b => (a.1 == b.1) = false))
+    {u v : (Int × Int) × Totals} (hu : u ∈ l) (hv : v ∈ l) (hk : u.1 == v.1) : u = v := by
+  induction l generalizing u v with
+  | nil => cases hu
+  | cons z zs ih =>
+      simp only [List.mem_cons] at hu hv
+      rcases hu with huz | hu
+      · have huz' : u = z := by simpa using huz
+        rcases hv with hvz | hv
+        · have hvz' : v = z := by simpa using hvz
+          rw [huz', hvz']
+        · have hne : (z.1 == v.1) = false := List.rel_of_pairwise_cons h hv
+          simp [huz', hne] at hk
+      · rcases hv with hvz | hv
+        · have hvz' : v = z := by simpa using hvz
+          have hne : (z.1 == u.1) = false := List.rel_of_pairwise_cons h hu
+          have huk : u.1 = z.1 := by simpa [hvz'] using hk
+          exfalso
+          have htrue : (z.1 == u.1) = true := by simpa [huk]
+          rw [htrue] at hne
+          cases hne
+        · exact ih h.tail hu hv hk
+
+private theorem toList_filter_key_eq (p : Std.HashMap (Int × Int) Totals) (q : Int × Int)
+    {e : (Int × Int) × Totals} (he : e ∈ p.toList.filter fun z => z.1 == q) :
+    e = (q, p.getD q zero) := by
+  have hm := List.mem_filter.mp he
+  have hkey : e.1 = q := by simpa using hm.2
+  have hcong : p[e.1]? = p[q]? := by
+    simpa [hkey]
+  have hsome := Std.HashMap.mem_toList_iff_getElem?_eq_some.mp hm.1
+  have hget : p.getD q zero = e.2 := by
+    rw [Std.HashMap.getD_eq_getD_getElem?]
+    rw [← hcong, hsome]
+    simp
+  have heq : e = (q, e.2) := by
+    cases e
+    simp at hkey ⊢
+    exact hkey
+  rw [heq]
+  simp at hget ⊢
+  rw [hget]
+
+private theorem pfold_append {α : Type} (l₁ l₂ : List α) (f : α → Totals × Totals)
+    (acc : Totals × Totals) :
+    (l₁ ++ l₂).foldl (fun t x => pplus t (f x)) acc =
+      l₂.foldl (fun t x => pplus t (f x)) (l₁.foldl (fun t x => pplus t (f x)) acc) := by
+  simp [List.foldl_append]
+
+private theorem filter_key_nil_or_singleton (p : Std.HashMap (Int × Int) Totals) (q : Int × Int) :
+    (p.toList.filter fun e => e.1 == q) = [] ∨
+      (p.toList.filter fun e => e.1 == q) = [(q, p.getD q zero)] := by
+  let l := p.toList.filter fun e : (Int × Int) × Totals => e.1 == q
+  have hpair : l.Pairwise (fun a b => (a.1 == b.1) = false) := by
+    dsimp [l]
+    exact (Std.HashMap.distinct_keys_toList (m := p)).filter _
+  have hall : ∀ e ∈ l, e = (q, p.getD q zero) := by
+    intro e he
+    dsimp [l] at he
+    exact toList_filter_key_eq p q he
+  change l = [] ∨ l = [(q, p.getD q zero)]
+  cases hl : l with
+  | nil => exact Or.inl rfl
+  | cons e es =>
+      right
+      rw [hl] at hpair
+      have he := hall e (by rw [hl]; simp)
+      have hes : es = [] := by
+        cases es with
+        | nil => rfl
+        | cons e2 es2 =>
+            have hkey : e2.1 == e.1 := by
+              have he2 := hall e2 (by rw [hl]; simp)
+              rw [he2, he]
+              simp
+            have hne : (e.1 == e2.1) = false := List.rel_of_pairwise_cons hpair (by simp)
+            exfalso
+            have heqkeys : e2.1 = e.1 := by simpa using hkey
+            have htrue : (e.1 == e2.1) = true := by simp [heqkeys]
+            rw [htrue] at hne
+            cases hne
+      simp [hl, he, hes]
+
+private theorem filter_key_partition (p : Std.HashMap (Int × Int) Totals) (q : Int × Int)
+    (g : Int) (hqg : (q.1 == g) = true) :
+    (p.toList.filter fun e => e.1.1 == g).Perm
+      ((p.toList.filter fun e => e.1 == q) ++
+        (p.toList.filter fun e => e.1.1 == g && !(q == e.1))) := by
+  have hd : ∀ e ∈ p.toList, ¬((e.1 == q) = true ∧ (e.1.1 == g && !(q == e.1)) = true) := by
+    intro e he h
+    rcases h with ⟨h1, h2⟩
+    have heq : e.1 = q := by simpa using h1
+    have hqeq : (q == e.1) = true := by simp [heq]
+    simpa [hqeq] using h2
+  have hp := split_filter_perm_h2 (fun e : (Int × Int) × Totals => e.1 == q)
+    (fun e => e.1.1 == g && !(q == e.1)) p.toList hd
+  refine (List.Perm.of_eq ?_).trans hp
+  apply List.filter_congr
+  intro e he
+  by_cases hq : e.1 == q
+  · have heq : e.1 = q := by simpa using hq
+    have hk : e.1.1 == g := by simpa [heq] using hqg
+    simp [hq, hk]
+  · by_cases hk : e.1.1 == g
+    · have hq' : (q == e.1) = false := by
+        apply Bool.eq_false_of_ne_true
+        intro ht
+        have heq : q = e.1 := by simpa using ht
+        exact hq (by simpa [heq])
+      simp [hq, hk, hq']
+    · simp [hq, hk]
+
+private theorem finalize_insert (rs : List RRow) (p : Std.HashMap (Int × Int) Totals)
+    (q : Int × Int) (v : Totals) (cold : Groups)
+    (hv : Valid v) (hvmap : ∀ e ∈ p.toList, Valid e.2) :
+    ∀ g : Int, (finalize rs (p.insert q (plus (p.getD q zero) v)) cold).getD g (zero, zero) =
+      (contribute (finalize rs p cold) q.1 v (rTotals rs q.2)).getD g (zero, zero) := by
+  intro g
+  let oldv := p.getD q zero
+  let newv := plus oldv v
+  let r := rTotals rs q.2
+  have holdv : Valid oldv := by dsimp [oldv]; exact valid_getD p q hvmap
+  have hnewv : Valid newv := by dsimp [newv]; exact valid_plus holdv hv
+  have hvmapNew : ∀ e ∈ (p.insert q newv).toList, Valid e.2 := by
+    intro e he
+    have hsome : (p.insert q newv)[e.1]? = some e.2 :=
+      Std.HashMap.mem_toList_iff_getElem?_eq_some.mp he
+    have heqval : e.2 = (p.insert q newv).getD e.1 zero := by
+      rw [Std.HashMap.getD_eq_getD_getElem?, hsome]
+      simp
+    rw [heqval, Std.HashMap.getD_insert]
+    by_cases hq : q == e.1
+    · simp [hq, hnewv]
+    · simp [hq]
+      exact valid_getD p e.1 hvmap
+  have hL : (finalize rs (p.insert q newv) cold).getD g (zero, zero) =
+      pplus (cold.getD g (zero, zero)) (gsum rs (p.insert q newv).toList g) := by
+    rw [finalize_eq_entryFold]
+    unfold gsum
+    exact entryFold_getD rs (p.insert q newv).toList cold g hvmapNew
+  have hP : (finalize rs p cold).getD g (zero, zero) =
+      pplus (cold.getD g (zero, zero)) (gsum rs p.toList g) := by
+    rw [finalize_eq_entryFold]
+    unfold gsum
+    exact entryFold_getD rs p.toList cold g hvmap
+  let esNew := (q, newv) :: p.toList.filter (fun e => !(q == e.1))
+  have hpPerm : (p.insert q newv).toList.Perm esNew := by
+    dsimp [esNew]
+    exact Std.HashMap.toList_insert_perm
+  have hgsumNew : gsum rs (p.insert q newv).toList g = gsum rs esNew g := by
+    unfold gsum
+    exact pfold_entries_perm (hpPerm.filter _) (eContrib rs) (zero, zero)
+  rw [hL, hgsumNew]
+  rw [contribute_getD_v _ _ _ _ _ hv (valid_rTotals rs q.2)]
+  rw [hP]
+  by_cases hqg : (q.1 == g) = true
+  · have hqgeq : q.1 = g := by simpa using hqg
+    rw [if_pos (by simpa [hqgeq] : (g == q.1) = true)]
+    -- describe the g-filter of esNew
+    have hesNew : esNew.filter (fun e : (Int × Int) × Totals => e.1.1 == g) =
+        (q, newv) :: (p.toList.filter (fun e => !(q == e.1))).filter
+          (fun e => e.1.1 == g) := by
+      dsimp [esNew]
+      simp [hqgeq]
+    have hrest : (p.toList.filter fun e => !(q == e.1)).filter (fun e => e.1.1 == g) =
+        p.toList.filter (fun e => e.1.1 == g && !(q == e.1)) := by
+      ext e
+      simp [Bool.and_comm, Bool.and_left_comm, Bool.and_assoc]
+    have hQ : p.toList.filter (fun e => e.1 == q) = [] ∨
+        p.toList.filter (fun e => e.1 == q) = [(q, oldv)] := by
+      dsimp [oldv]
+      exact filter_key_nil_or_singleton p q
+    have hpart := filter_key_partition p q g hqg
+    let Q := p.toList.filter fun e => e.1 == q
+    let R := p.toList.filter fun e => e.1.1 == g && !(q == e.1)
+    let f := fun t e => pplus t (eContrib rs e)
+    have hsumP : gsum rs p.toList g = pplus (Q.foldl f (zero, zero)) (R.foldl f (zero, zero)) := by
+      unfold gsum
+      have hpf : (Q ++ R).foldl f (zero, zero) =
+          (p.toList.filter fun e => e.1.1 == g).foldl f (zero, zero) := by
+        exact (pfold_entries_perm (by simpa [Q, R] using hpart) (eContrib rs) (zero, zero)).symm
+      rw [← hpf]
+      rw [pfold_append]
+      exact (pplus_foldl_zero R (eContrib rs) (Q.foldl f (zero, zero))).symm
+    have hLsum : gsum rs esNew g =
+        pplus (eContrib rs (q, newv)) (R.foldl f (zero, zero)) := by
+      unfold gsum
+      rw [hesNew, hrest]
+      simp only [List.foldl_cons]
+      rw [pplus_zero_left]
+      change R.foldl (fun t e => pplus t (eContrib rs e)) (eContrib rs (q, newv)) =
+        pplus (eContrib rs (q, newv))
+          (R.foldl (fun t e => pplus t (eContrib rs e)) (zero, zero))
+      have htmp := pfold_map_start R (eContrib rs) (zero, zero) (eContrib rs (q, newv))
+      rw [pplus_zero_right] at htmp
+      exact htmp
+    rw [hLsum, hsumP]
+    rcases hQ with hnil | hsingle
+    · have hQnil : Q = [] := by simpa [Q] using hnil
+      have hnotmem : q ∉ p := by
+        intro hqmem
+        have hs : p[q]? = some (p.getD q zero) := Std.HashMap.getElem?_eq_some_getD hqmem
+        have hm : (q, p.getD q zero) ∈ p.toList := Std.HashMap.mem_toList_iff_getElem?_eq_some.mpr hs
+        have : (q, p.getD q zero) ∈ Q := by simp [Q, hm]
+        simp [hQnil] at this
+      have holdzero : oldv = zero := by
+        dsimp [oldv]
+        rw [Std.HashMap.getD_eq_getD_getElem?, Std.HashMap.getElem?_eq_none hnotmem]
+        simp
+      have hnewEq : newv = v := by
+        dsimp [newv]
+        rw [holdzero]
+        cases v
+        simp [plus, zero]
+      rw [show eContrib rs (q, newv) = h2c v r by simp [eContrib, hnewEq, r]]
+      rw [show Q.foldl f (zero, zero) = (zero, zero) by simp [hQnil, f]]
+      dsimp [r]
+      rw [pplus_zero_left]
+      ac_rfl
+    · have hQsingle : Q = [(q, oldv)] := by simpa [Q] using hsingle
+      rw [show Q.foldl f (zero, zero) = eContrib rs (q, oldv) by
+        simp [hQsingle, f, eContrib, pplus_zero_left]]
+      rw [show eContrib rs (q, newv) = pplus (eContrib rs (q, oldv)) (h2c v r) by
+        dsimp [eContrib, newv, r]
+        exact h2c_add_left oldv v (rTotals rs q.2)]
+      dsimp [r]
+      ac_rfl
+  · have hqgne : q.1 ≠ g := by
+      intro heq
+      exact hqg (by simpa [heq])
+    rw [if_neg (by
+      intro ht
+      have heq : g = q.1 := by simpa using ht
+      exact hqgne heq.symm)]
+    unfold gsum
+    have hesNew : esNew.filter (fun e : (Int × Int) × Totals => e.1.1 == g) =
+        (p.toList.filter (fun e => !(q == e.1))).filter (fun e => e.1.1 == g) := by
+      dsimp [esNew]
+      simp [hqgne]
+    rw [hesNew]
+    have hrest : (p.toList.filter fun e => !(q == e.1)).filter (fun e => e.1.1 == g) =
+        p.toList.filter (fun e => e.1.1 == g) := by
+      rw [List.filter_filter]
+      apply List.filter_congr
+      intro e he
+      by_cases hg' : e.1.1 == g
+      · have hnq : (q == e.1) = false := by
+          apply Bool.eq_false_of_ne_true
+          intro hqe
+          have heq : q = e.1 := by simpa using hqe
+          have : q.1 == g := by simpa [heq] using hg'
+          exact hqg this
+        simp [hg', hnq]
+      · simp [hg']
+    rw [hrest]
+
+private def hStep (rs : List RRow) (hot : Int → Bool)
+    (st : Std.HashMap (Int × Int) Totals × Groups) (l : LRow) :=
+  match l.k with
+  | none => st
+  | some k =>
+      let left := weighted 1 l.v
+      if hot k then
+        (st.1.insert (l.g, k) (plus (st.1.getD (l.g, k) zero) left), st.2)
+      else (st.1, contribute st.2 l.g left (rTotals rs k))
+
+private def hProcess (rs : List RRow) (hot : Int → Bool) (ls : List LRow) :=
+  ls.foldl (hStep rs hot) ({}, {})
+
+private theorem process_partial_valid (rs : List RRow) (hot : Int → Bool) :
+    ∀ (xs : List LRow) (p : Std.HashMap (Int × Int) Totals) (c : Groups),
+      (∀ e ∈ p.toList, Valid e.2) →
+      ∀ e ∈ (xs.foldl (hStep rs hot) (p, c)).1.toList, Valid e.2 := by
+  intro xs
+  induction xs with
+  | nil =>
+      intro p c hv e he
+      exact hv e he
+  | cons l xs ih =>
+      intro p c hv
+      cases hk : l.k with
+      | none =>
+          simpa [hStep, hk] using ih p c hv
+      | some k =>
+          by_cases hhot : hot k
+          · let p' := p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))
+            have hpvalid : ∀ e ∈ p'.toList, Valid e.2 := by
+              intro e he
+              have hs : p'[e.1]? = some e.2 := Std.HashMap.mem_toList_iff_getElem?_eq_some.mp he
+              have heqval : e.2 = p'.getD e.1 zero := by
+                rw [Std.HashMap.getD_eq_getD_getElem?, hs]
+                simp
+              rw [heqval, Std.HashMap.getD_insert]
+              by_cases hq : (l.g, k) == e.1
+              · simp [hq]
+                apply valid_plus
+                · exact valid_getD p (l.g, k) hv
+                · exact valid_weighted 1 l.v
+              · simp [hq]
+                exact valid_getD p e.1 hv
+            simpa [hStep, hk, hhot, p'] using ih p' c hpvalid
+          · simpa [hStep, hk, hhot] using ih p (contribute c l.g (weighted 1 l.v) (rTotals rs k)) hv
+
+private theorem finalize_contribute (rs : List RRow) (p : Std.HashMap (Int × Int) Totals)
+    (cold : Groups) (g : Int) (l r : Totals) (hl : Valid l) (hr : Valid r)
+    (hv : ∀ e ∈ p.toList, Valid e.2) :
+    ∀ q, (finalize rs p (contribute cold g l r)).getD q (zero, zero) =
+      (contribute (finalize rs p cold) g l r).getD q (zero, zero) := by
+  intro q
+  rw [finalize_eq_entryFold, finalize_eq_entryFold]
+  rw [contribute_getD_v _ _ _ _ _ hl hr]
+  rw [entryFold_getD rs p.toList (contribute cold g l r) q hv]
+  rw [contribute_getD_v _ _ _ _ _ hl hr]
+  rw [entryFold_getD rs p.toList cold q hv]
+  by_cases hq : (q == g) = true <;> simp [hq] <;> ac_rfl
+
+private theorem naiveFold_append_singleton (rs : List RRow) (h : Groups) (ys : List LRow)
+    (l : LRow) (k : Int) (hk : l.k = some k) :
+    naiveFold rs h (ys ++ [l]) =
+      contribute (naiveFold rs h ys) l.g (weighted 1 l.v) (rTotals rs k) := by
+  unfold naiveFold
+  rw [List.foldl_append]
+  simp [hk]
+
+private theorem process_final_aux (rs : List RRow) (hot : Int → Bool) :
+    ∀ (xs ys : List LRow) (p : Std.HashMap (Int × Int) Totals) (c : Groups),
+      (∀ e ∈ p.toList, Valid e.2) →
+      (∀ q, (finalize rs p c).getD q (zero, zero) =
+        (naiveFold rs {} ys).getD q (zero, zero)) →
+      ∀ q, (finalize rs (xs.foldl (hStep rs hot) (p, c)).1
+          (xs.foldl (hStep rs hot) (p, c)).2).getD q (zero, zero) =
+        (naiveFold rs {} (ys ++ xs)).getD q (zero, zero) := by
+  intro xs
+  induction xs with
+  | nil =>
+      intro ys p c hv h q
+      simpa using h q
+  | cons l xs ih =>
+      intro ys p c hv h q
+      cases hk : l.k with
+      | none =>
+          simp only [List.foldl_cons]
+          have hstep : hStep rs hot (p, c) l = (p, c) := by simp [hStep, hk]
+          rw [hstep]
+          have happ : ys ++ l :: xs = (ys ++ [l]) ++ xs := by simp [List.append_assoc]
+          rw [happ]
+          have hnaive : ∀ q', (naiveFold rs {} (ys ++ [l])).getD q' (zero, zero) =
+              (naiveFold rs {} ys).getD q' (zero, zero) := by
+            intro q'
+            simp [naiveFold, hk, List.foldl_append]
+          exact ih (ys ++ [l]) p c hv (by intro q'; rw [hnaive q']; exact h q') q
+      | some k =>
+          by_cases hhot : hot k
+          · let p' := p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))
+            have hv' : ∀ e ∈ p'.toList, Valid e.2 := by
+              intro e he
+              have hs : p'[e.1]? = some e.2 := Std.HashMap.mem_toList_iff_getElem?_eq_some.mp he
+              have heqval : e.2 = p'.getD e.1 zero := by
+                rw [Std.HashMap.getD_eq_getD_getElem?, hs]
+                simp
+              rw [heqval, Std.HashMap.getD_insert]
+              by_cases hke : (l.g, k) == e.1
+              · simp [hke]
+                exact valid_plus (valid_getD p (l.g, k) hv) (valid_weighted 1 l.v)
+              · simp [hke]
+                exact valid_getD p e.1 hv
+            have hfinal' : ∀ q', (finalize rs p' c).getD q' (zero, zero) =
+                (naiveFold rs {} (ys ++ [l])).getD q' (zero, zero) := by
+              intro q'
+              dsimp [p']
+              rw [finalize_insert rs p (l.g, k) (weighted 1 l.v) c
+                (valid_weighted 1 l.v) hv q']
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v)
+                (valid_rTotals rs (l.g, k).2)]
+              rw [h q']
+              rw [naiveFold_append_singleton rs {} ys l k hk]
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v)
+                (valid_rTotals rs (l.g, k).2)]
+            simp only [List.foldl_cons]
+            have hstep : hStep rs hot (p, c) l = (p', c) := by
+              simp [hStep, hk, hhot, p']
+            rw [hstep]
+            have happ : ys ++ l :: xs = (ys ++ [l]) ++ xs := by simp [List.append_assoc]
+            rw [happ]
+            exact ih (ys ++ [l]) p' c hv' hfinal' q
+          · have hfinal' : ∀ q', (finalize rs p
+                (contribute c l.g (weighted 1 l.v) (rTotals rs k))).getD q' (zero, zero) =
+                (naiveFold rs {} (ys ++ [l])).getD q' (zero, zero) := by
+              intro q'
+              rw [finalize_contribute rs p c l.g (weighted 1 l.v) (rTotals rs k)
+                (valid_weighted 1 l.v) (valid_rTotals rs k) hv q']
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v)
+                (valid_rTotals rs k)]
+              rw [h q']
+              rw [naiveFold_append_singleton rs {} ys l k hk]
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v)
+                (valid_rTotals rs k)]
+            simp only [List.foldl_cons]
+            have hstep : hStep rs hot (p, c) l =
+                (p, contribute c l.g (weighted 1 l.v) (rTotals rs k)) := by
+              simp [hStep, hk, hhot]
+            rw [hstep]
+            have happ : ys ++ l :: xs = (ys ++ [l]) ++ xs := by simp [List.append_assoc]
+            rw [happ]
+            exact ih (ys ++ [l]) p (contribute c l.g (weighted 1 l.v) (rTotals rs k)) hv hfinal' q
+
+private def buildOf (rs : List RRow) : Std.HashMap Int Totals :=
+  rs.foldl (fun (h : Std.HashMap Int Totals) r => match r.k with
+    | none => h
+    | some k => h.insert k (plus (h.getD k zero) (weighted 1 r.v))) {}
+
+private theorem buildOf_getD (rs : List RRow) (k : Int) : (buildOf rs).getD k zero = rTotals rs k := by
+  unfold buildOf
+  exact build_final rs k
+
+private theorem buildOf_valid (rs : List RRow) (k : Int) : Valid ((buildOf rs).getD k zero) := by
+  rw [buildOf_getD]
+  exact valid_rTotals rs k
+
+private def buildContribStep (rs : List RRow) (h : Groups) (l : LRow) : Groups :=
+  match l.k with
+  | none => h
+  | some k => contribute h l.g (weighted 1 l.v) ((buildOf rs).getD k zero)
+
+private theorem naiveFold_build_eq (rs : List RRow) (ys : List LRow) (h : Groups) :
+    ∀ g, (ys.foldl (buildContribStep rs) h).getD g (zero, zero) =
+      (naiveFold rs h ys).getD g (zero, zero) := by
+  induction ys generalizing h with
+  | nil => intro g; rfl
+  | cons l ys ih =>
+      intro g
+      simp only [List.foldl_cons]
+      cases hk : l.k with
+      | none =>
+          simp [buildContribStep, naiveFold, hk]
+          exact ih h g
+      | some k =>
+          have hget : (buildOf rs).getD k zero = rTotals rs k := buildOf_getD rs k
+          simpa [buildContribStep, naiveFold, hk, hget] using
+            ih (contribute h l.g (weighted 1 l.v) (rTotals rs k)) g
+
+private def hProcessBuild (rs : List RRow) (hot : Int → Bool) (ls : List LRow)
+    : Std.HashMap (Int × Int) Totals × Groups :=
+  ls.foldl (fun (st : Std.HashMap (Int × Int) Totals × Groups) l => match l.k with
+    | none => st
+    | some k =>
+        let left := weighted 1 l.v
+        if hot k then
+          (st.1.insert (l.g, k) (plus (st.1.getD (l.g, k) zero) left), st.2)
+        else (st.1, contribute st.2 l.g left ((buildOf rs).getD k zero))) ({}, {})
+
+private theorem hProcess_fst_eq_aux (rs : List RRow) (hot : Int → Bool) :
+    ∀ (ls : List LRow) (p : Std.HashMap (Int × Int) Totals) (cB cR : Groups),
+      (ls.foldl (fun (st : Std.HashMap (Int × Int) Totals × Groups) l => match l.k with
+        | none => st
+        | some k =>
+            let left := weighted 1 l.v
+            if hot k then
+              (st.1.insert (l.g, k) (plus (st.1.getD (l.g, k) zero) left), st.2)
+            else (st.1, contribute st.2 l.g left ((buildOf rs).getD k zero))) (p, cB)).1 =
+      (ls.foldl (hStep rs hot) (p, cR)).1 := by
+  intro ls
+  induction ls with
+  | nil => intro p cB cR; rfl
+  | cons l ls ih =>
+      intro p cB cR
+      cases hk : l.k with
+      | none => simpa [hStep, hk] using ih p cB cR
+      | some k =>
+          by_cases hhot : hot k
+          · simpa [hStep, hk, hhot] using
+              ih (p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))) cB cR
+          · simpa [hStep, hk, hhot] using
+              ih p (contribute cB l.g (weighted 1 l.v) ((buildOf rs).getD k zero))
+                (contribute cR l.g (weighted 1 l.v) (rTotals rs k))
+
+private theorem hProcess_fst_eq (rs : List RRow) (hot : Int → Bool) (ls : List LRow) :
+    (hProcessBuild rs hot ls).1 = (hProcess rs hot ls).1 := by
+  unfold hProcessBuild hProcess
+  exact hProcess_fst_eq_aux rs hot ls {} {} {}
+
+private theorem hProcessBuild_snd_getD_aux (rs : List RRow) (hot : Int → Bool) :
+    ∀ (ls : List LRow) (p : Std.HashMap (Int × Int) Totals) (cB cR : Groups),
+      (∀ q, cB.getD q (zero, zero) = cR.getD q (zero, zero)) →
+      ∀ q, (ls.foldl (fun (st : Std.HashMap (Int × Int) Totals × Groups) l => match l.k with
+        | none => st
+        | some k =>
+            let left := weighted 1 l.v
+            if hot k then
+              (st.1.insert (l.g, k) (plus (st.1.getD (l.g, k) zero) left), st.2)
+            else (st.1, contribute st.2 l.g left ((buildOf rs).getD k zero))) (p, cB)).2.getD q (zero, zero) =
+        (ls.foldl (hStep rs hot) (p, cR)).2.getD q (zero, zero) := by
+  intro ls
+  induction ls with
+  | nil => intro p cB cR hc q; exact hc q
+  | cons l ls ih =>
+      intro p cB cR hc q
+      cases hk : l.k with
+      | none => simpa [hStep, hk] using ih p cB cR hc q
+      | some k =>
+          by_cases hhot : hot k
+          · simpa [hStep, hk, hhot] using
+              ih (p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))) cB cR hc q
+          · have hget : (buildOf rs).getD k zero = rTotals rs k := buildOf_getD rs k
+            have hnext : ∀ q', (contribute cB l.g (weighted 1 l.v) ((buildOf rs).getD k zero)).getD q' (zero, zero) =
+                (contribute cR l.g (weighted 1 l.v) (rTotals rs k)).getD q' (zero, zero) := by
+              intro q'
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v) (buildOf_valid rs k)]
+              rw [contribute_getD_v _ _ _ _ _ (valid_weighted 1 l.v) (valid_rTotals rs k)]
+              rw [hget]
+              by_cases hq : (q' == l.g) = true
+              · simp [hq]
+                rw [hc q']
+              · simp [hq]
+                exact hc q'
+            simpa [hStep, hk, hhot] using
+              ih p (contribute cB l.g (weighted 1 l.v) ((buildOf rs).getD k zero))
+                (contribute cR l.g (weighted 1 l.v) (rTotals rs k)) hnext q
+
+private theorem hProcessBuild_snd_getD (rs : List RRow) (hot : Int → Bool) (ls : List LRow) :
+    ∀ g, (hProcessBuild rs hot ls).2.getD g (zero, zero) =
+      (hProcess rs hot ls).2.getD g (zero, zero) := by
+  unfold hProcessBuild hProcess
+  exact hProcessBuild_snd_getD_aux rs hot ls {} {} {} (by intro q; rfl)
+
+private def finalizeBuild (rs : List RRow) (p : Std.HashMap (Int × Int) Totals) (c : Groups) : Groups :=
+  p.fold (fun groups (g, k) left => contribute groups g left ((buildOf rs).getD k zero)) c
+
+private theorem entryFold_build_eq_aux (rs : List RRow) :
+    ∀ (es : List ((Int × Int) × Totals)) (cB cR : Groups),
+      (∀ q, cB.getD q (zero, zero) = cR.getD q (zero, zero)) →
+      (∀ e ∈ es, Valid e.2) →
+      ∀ g, (es.foldl (fun h e => contribute h e.1.1 e.2 ((buildOf rs).getD e.1.2 zero)) cB).getD g (zero, zero) =
+        (es.foldl (entryStep rs) cR).getD g (zero, zero) := by
+  intro es
+  induction es with
+  | nil =>
+      intro cB cR hc hv g
+      exact hc g
+  | cons e es ih =>
+      intro cB cR hc hv g
+      have hev : Valid e.2 := hv e (by simp)
+      have htail : ∀ e' ∈ es, Valid e'.2 := by
+        intro e' h'
+        exact hv e' (by simp [h'])
+      have hnext : ∀ q, (contribute cB e.1.1 e.2 ((buildOf rs).getD e.1.2 zero)).getD q (zero, zero) =
+          (entryStep rs cR e).getD q (zero, zero) := by
+        intro q
+        rw [contribute_getD_v _ _ _ _ _ hev (buildOf_valid rs e.1.2)]
+        unfold entryStep
+        rw [contribute_getD_v _ _ _ _ _ hev (valid_rTotals rs e.1.2)]
+        rw [buildOf_getD]
+        by_cases hq : e.1.1 == q
+        · have hqeq : e.1.1 = q := by simpa using hq
+          simp [hqeq]
+          rw [hc q]
+        · have hqne : e.1.1 ≠ q := by
+            intro heq
+            exact hq (by simpa [heq])
+          have hqne2 : q ≠ e.1.1 := by intro heq; exact hqne heq.symm
+          simp [hqne2]
+          exact hc q
+      exact ih (contribute cB e.1.1 e.2 ((buildOf rs).getD e.1.2 zero))
+        (entryStep rs cR e) hnext htail g
+
+private theorem entryFold_build_eq (rs : List RRow) (es : List ((Int × Int) × Totals))
+    (c : Groups) (hv : ∀ e ∈ es, Valid e.2) :
+    ∀ g, (es.foldl (fun h e => contribute h e.1.1 e.2 ((buildOf rs).getD e.1.2 zero)) c).getD g (zero, zero) =
+      (es.foldl (entryStep rs) c).getD g (zero, zero) := by
+  exact entryFold_build_eq_aux rs es c c (by intro q; rfl) hv
+
+private theorem finalizeBuild_eq_aux (rs : List RRow) (p : Std.HashMap (Int × Int) Totals)
+    (cB cR : Groups) (hc : ∀ q, cB.getD q (zero, zero) = cR.getD q (zero, zero))
+    (hv : ∀ e ∈ p.toList, Valid e.2) :
+    ∀ g, (finalizeBuild rs p cB).getD g (zero, zero) =
+      (finalize rs p cR).getD g (zero, zero) := by
+  intro g
+  unfold finalizeBuild finalize
+  rw [Std.HashMap.fold_eq_foldl_toList, Std.HashMap.fold_eq_foldl_toList]
+  exact entryFold_build_eq_aux rs p.toList cB cR hc hv g
+
+private theorem process_partial_valid_final (rs : List RRow) (hot : Int → Bool) (ls : List LRow) :
+    ∀ e ∈ (hProcess rs hot ls).1.toList, Valid e.2 := by
+  unfold hProcess
+  exact process_partial_valid rs hot ls {} {} (by
+    intro e he
+    have : False := by simpa using he
+    exact False.elim this)
+
+private theorem hybridGroups_getD (ls : List LRow) (rs : List RRow)
+    (hot : Int → Bool) (g : Int) :
+    (hybridGroups ls rs hot).getD g (zero, zero) = (naiveFold rs {} ls).getD g (zero, zero) := by
+  unfold hybridGroups
+  dsimp
+  change (finalizeBuild rs (hProcessBuild rs hot ls).1 (hProcessBuild rs hot ls).2).getD g (zero, zero) =
+    (naiveFold rs {} ls).getD g (zero, zero)
+  rw [hProcess_fst_eq]
+  rw [finalizeBuild_eq_aux rs (hProcess rs hot ls).1 (hProcessBuild rs hot ls).2
+    (hProcess rs hot ls).2 (hProcessBuild_snd_getD rs hot ls)
+    (process_partial_valid_final rs hot ls) g]
+  have hinit : ∀ q, (finalize rs {} {}).getD q (zero, zero) =
+      (naiveFold rs {} []).getD q (zero, zero) := by
+    intro q
+    rw [finalize_eq_entryFold]
+    simp [entryFold, naiveFold]
+  exact process_final_aux rs hot ls [] {} {}
+    (by
+      intro e he
+      have : False := by simpa using he
+      exact False.elim this) hinit g
+
+private theorem h2c_add_right (l r₁ r₂ : Totals) :
+    h2c l (plus r₁ r₂) = pplus (h2c l r₁) (h2c l r₂) := by
+  cases l
+  cases r₁
+  cases r₂
+  simp [h2c, pplus, plus, Nat.add_mul, Nat.mul_add, Int.add_mul, Int.mul_add,
+    Int.mul_comm, Int.mul_left_comm, Int.mul_assoc]
+
+private theorem h2c_weighted_weighted (x y : Option Int) :
+    h2c (weighted 1 x) (weighted 1 y) = (weighted 1 x, weighted 1 y) := by
+  cases x <;> cases y <;> simp [h2c, weighted, zero]
+
+private theorem h2c_weighted_pairs (rs : List RRow) (k : Int) (l : LRow) :
+    h2c (weighted 1 l.v) (rTotals rs k) =
+      let rsK := rs.filter fun r => r.k == some k
+      (summarize ((rsK.map fun r => (l, r)).map fun p => p.1.v),
+       summarize ((rsK.map fun r => (l, r)).map fun p => p.2.v)) := by
+  induction rs with
+  | nil =>
+      simp [rTotals, summarize, h2c, weighted, zero]
+  | cons r rs ih =>
+      by_cases hrk : r.k == some k
+      · have hrt : rTotals (r :: rs) k =
+            plus (weighted 1 r.v) (rTotals rs k) := by
+          unfold rTotals
+          simp [hrk, summarize_cons]
+        rw [hrt, h2c_add_right, h2c_weighted_weighted]
+        dsimp
+        simp [hrk, ih, summarize_cons, pplus, List.map_map, plus]
+      · have hrt : rTotals (r :: rs) k = rTotals rs k := by
+          unfold rTotals
+          simp [hrk]
+        rw [hrt]
+        simp [hrk] at ih ⊢
+        exact ih
+
+private theorem beq_int_comm_h5 (a b : Int) : (a == b) = (b == a) := by
+  apply Bool.eq_iff_iff.mpr
+  constructor
+  · intro h
+    have : a = b := by simpa using h
+    simp [this]
+  · intro h
+    have : b = a := by simpa using h
+    simp [this]
+
+private theorem rTotals_cnt (rs : List RRow) (k : Int) :
+    (rTotals rs k).cnt = (rs.filter fun r => r.k == some k).length := by
+  unfold rTotals
+  rw [summarize_char]
+  simp
+
+private theorem h2c_weighted_pairsFM (rs : List RRow) (k : Int) (l : LRow) :
+    h2c (weighted 1 l.v) (rTotals rs k) =
+      let ps := rs.filterMap fun r =>
+        match some k, r.k with
+        | some lk, some rk => if lk == rk then some (l, r) else none
+        | _, _ => none
+      (summarize (ps.map fun p => p.1.v), summarize (ps.map fun p => p.2.v)) := by
+  induction rs with
+  | nil => simp [rTotals, summarize, h2c, weighted, zero]
+  | cons r rs ih =>
+      cases hr : r.k with
+      | none =>
+          have hrt : rTotals (r :: rs) k = rTotals rs k := by
+            unfold rTotals
+            simp [hr]
+          rw [hrt]
+          simp [hr] at ih ⊢
+          exact ih
+      | some rk =>
+          by_cases h1 : k == rk
+          · have hEq : k = rk := by simpa using h1
+            have hrt : rTotals (r :: rs) k = plus (weighted 1 r.v) (rTotals rs k) := by
+              unfold rTotals
+              simp [hr, hEq, summarize_cons]
+            rw [hrt, h2c_add_right, h2c_weighted_weighted, ih]
+            dsimp
+            simp [hr, hEq, summarize_cons, pplus, plus]
+          · have hEq : k ≠ rk := by
+              intro heq
+              exact h1 (by simp [heq])
+            have hrt : rTotals (r :: rs) k = rTotals rs k := by
+              unfold rTotals
+              have hEq' : rk ≠ k := by
+                intro heq
+                exact hEq heq.symm
+              have hne : (r.k == some k) = false := by simp [hr, hEq']
+              simp [hne]
+            rw [hrt]
+            simp [hr, hEq] at ih ⊢
+            exact ih
+
+
+private theorem pairsFM_nil_of_cnt_zero (rs : List RRow) (k : Int) (l : LRow)
+    (h : (rTotals rs k).cnt = 0) :
+    (rs.filterMap fun r =>
+      match some k, r.k with
+      | some lk, some rk => if lk == rk then some (l, r) else none
+      | _, _ => none) = [] := by
+  let ps := rs.filterMap fun r =>
+    match some k, r.k with
+    | some lk, some rk => if lk == rk then some (l, r) else none
+    | _, _ => none
+  have hw := h2c_weighted_pairsFM rs k l
+  have hz : h2c (weighted 1 l.v) (rTotals rs k) = (zero, zero) :=
+    h2c_eq_zero_of_cnt_valid (valid_weighted 1 l.v) (valid_rTotals rs k) (Or.inr h)
+  change h2c (weighted 1 l.v) (rTotals rs k) =
+    (summarize (ps.map fun p => p.1.v), summarize (ps.map fun p => p.2.v)) at hw
+  rw [hz] at hw
+  have hfst := congrArg Prod.fst hw
+  rw [summarize_char] at hfst
+  simp [zero] at hfst
+  exact List.eq_nil_of_length_eq_zero hfst.1.symm
+
+private theorem filterMap_none_nil {α β : Type} : ∀ xs : List α,
+    xs.filterMap (fun _ => (none : Option β)) = []
+  | [] => rfl
+  | a :: xs => by simp [filterMap_none_nil xs]
+
+private theorem refJoinedPairs_cons (l : LRow) (ls : List LRow) (rs : List RRow) (g : Int) :
+    refJoinedPairs (l :: ls) rs g =
+      (if l.g == g then rs.filterMap (fun r =>
+        match l.k, r.k with
+        | some lk, some rk => if lk == rk then some (l, r) else none
+        | _, _ => none) else []) ++ refJoinedPairs ls rs g := by
+  unfold refJoinedPairs
+  by_cases h : l.g == g <;> simp [h] <;> rfl
+
+private theorem pfold_start_eq {α : Type} (l : List α) (f : α → Totals × Totals)
+    (acc : Totals × Totals) :
+    l.foldl (fun t x => pplus t (f x)) acc =
+      pplus acc (l.foldl (fun t x => pplus t (f x)) (zero, zero)) := by
+  have h := pfold_map_start l f (zero, zero) acc
+  rw [pplus_zero_right acc] at h
+  exact h
+
+private theorem activeVals_eq_refTotals (ls : List LRow) (rs : List RRow) (g : Int) :
+    ((ls.filter (lActive rs g)).foldl (fun t l => pplus t (lContrib rs l)) (zero, zero)) =
+      (summarize ((refJoinedPairs ls rs g).map fun p => p.1.v),
+       summarize ((refJoinedPairs ls rs g).map fun p => p.2.v)) := by
+  induction ls with
+  | nil => simp [refJoinedPairs, lActive, summarize, zero]
+  | cons l ls ih =>
+      cases hk : l.k with
+      | none =>
+          have hact : lActive rs g l = false := by simp [lActive, hk]
+          rw [List.filter_cons_of_neg (by simpa using hact)]
+          rw [refJoinedPairs_cons]
+          by_cases hlg : l.g == g
+          · simp [hlg, hk]
+            rw [show rs.filterMap (fun _ : RRow => (none : Option (LRow × RRow))) = [] from
+              filterMap_none_nil rs]
+            simp
+            exact ih
+          · simp [hlg, hk]
+            exact ih
+      | some k =>
+          by_cases hlg : l.g == g
+          · by_cases hcnt : (rTotals rs k).cnt == 0
+            · have hact : lActive rs g l = false := by simp [lActive, hk, hlg, hcnt]
+              have hnil := pairsFM_nil_of_cnt_zero rs k l (by simpa using hcnt)
+              rw [List.filter_cons_of_neg (by simpa using hact)]
+              rw [refJoinedPairs_cons]
+              simp only [if_pos hlg]
+              rw [hk]
+              rw [hnil]
+              simp
+              exact ih
+            · have hact : lActive rs g l = true := by simp [lActive, hk, hlg, hcnt]
+              have hp := h2c_weighted_pairsFM rs k l
+              dsimp at hp
+              rw [List.filter_cons_of_pos (by simpa using hact)]
+              simp only [List.foldl_cons, pplus_zero_left]
+              have hlc : lContrib rs l = h2c (weighted 1 l.v) (rTotals rs k) := by
+                simp [lContrib, hk]
+              rw [hlc]
+              rw [hp]
+              rw [refJoinedPairs_cons]
+              simp [hlg, hk]
+              rw [summarize_append, summarize_append]
+              rw [pfold_start_eq]
+              rw [ih]
+              simp [pplus]
+          · have hact : lActive rs g l = false := by simp [lActive, hk, hlg]
+            rw [List.filter_cons_of_neg (by simpa using hact)]
+            rw [refJoinedPairs_cons]
+            simp [hlg, hk]
+            exact ih
+
+
+private theorem naiveFold_eq_refTotals (ls : List LRow) (rs : List RRow) (g : Int) :
+    (naiveFold rs {} ls).getD g (zero, zero) =
+      let ps := refJoinedPairs ls rs g
+      (summarize (ps.map fun p => p.1.v), summarize (ps.map fun p => p.2.v)) := by
+  have hzero : ({} : Groups).getD g (zero, zero) = (zero, zero) := by simp
+  rw [naiveFold_getD, hzero, pplus_zero_left]
+
+  exact activeVals_eq_refTotals ls rs g
+
+private def Good (h : Groups) : Prop :=
+  ∀ g, h.contains g = decide (0 < (h.getD g (zero, zero)).1.cnt)
+
+private theorem good_empty : Good ({} : Groups) := by
+  intro g
+  simp [zero]
+
+private theorem good_contribute (h : Groups) (g : Int) (l r : Totals)
+    (hh : Good h) (hl : Valid l) (hr : Valid r) : Good (contribute h g l r) := by
+  intro q
+  unfold contribute
+  by_cases hz : l.cnt == 0 || r.cnt == 0
+  · rw [if_pos hz]
+    exact hh q
+  · rw [if_neg hz]
+    by_cases hq : g == q
+    · have hqeq : g = q := by simpa using hq
+      subst q
+      rw [Std.HashMap.contains_insert, Std.HashMap.getD_insert]
+      simp
+      have hl0 : l.cnt ≠ 0 := by
+        intro h0
+        apply hz
+        simp [h0]
+      have hr0 : r.cnt ≠ 0 := by
+        intro h0
+        apply hz
+        simp [h0]
+      have hp : 0 < l.cnt * r.cnt := Nat.mul_pos (Nat.pos_of_ne_zero hl0) (Nat.pos_of_ne_zero hr0)
+      change 0 < (Std.HashMap.getD h g (zero, zero)).1.cnt + l.cnt * r.cnt
+      omega
+    · have hq' : (q == g) = false := by
+        apply Bool.eq_false_of_ne_true
+        intro ht
+        have heq : q = g := by simpa using ht
+        exact hq (by simpa [heq])
+      rw [Std.HashMap.contains_insert, Std.HashMap.getD_insert]
+      simp [hq, hq']
+      exact hh q
+
+private theorem naiveFold_good_aux (rs : List RRow) :
+    ∀ (ys : List LRow) (h : Groups), Good h → Good (naiveFold rs h ys) := by
+  intro ys
+  induction ys with
+  | nil => intro h hh; simpa [naiveFold] using hh
+  | cons l ys ih =>
+      intro h hh
+      cases hk : l.k with
+      | none => simpa [naiveFold, hk] using ih h hh
+      | some k =>
+          simpa [naiveFold, hk] using
+            ih (contribute h l.g (weighted 1 l.v) (rTotals rs k))
+              (good_contribute h l.g (weighted 1 l.v) (rTotals rs k) hh
+                (valid_weighted 1 l.v) (valid_rTotals rs k))
+
+private theorem naiveFold_good (rs : List RRow) (ls : List LRow) : Good (naiveFold rs {} ls) := by
+  exact naiveFold_good_aux rs ls {} good_empty
+
+private theorem fold_entries_good (rs : List RRow) (es : List ((Int × Int) × Totals))
+    (c : Groups) (hc : Good c) (hv : ∀ e ∈ es, Valid e.2) :
+    Good (es.foldl (fun h e => contribute h e.1.1 e.2 ((buildOf rs).getD e.1.2 zero)) c) := by
+  induction es generalizing c with
+  | nil => exact hc
+  | cons e es ih =>
+      apply ih
+      · exact good_contribute c e.1.1 e.2 ((buildOf rs).getD e.1.2 zero) hc
+          (hv e (by simp)) (buildOf_valid rs e.1.2)
+      · intro e' h'
+        exact hv e' (by simp [h'])
+
+private theorem hProcess_good_aux (rs : List RRow) (hot : Int → Bool) :
+    ∀ (ls : List LRow) (p : Std.HashMap (Int × Int) Totals) (c : Groups), Good c →
+      Good (ls.foldl (hStep rs hot) (p, c)).2 := by
+  intro ls
+  induction ls with
+  | nil => intro p c hc; simpa using hc
+  | cons l ls ih =>
+      intro p c hc
+      cases hk : l.k with
+      | none => simpa [hStep, hk] using ih p c hc
+      | some k =>
+          by_cases hhot : hot k
+          · simpa [hStep, hk, hhot] using
+              ih (p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))) c hc
+          · simpa [hStep, hk, hhot] using
+              ih p (contribute c l.g (weighted 1 l.v) (rTotals rs k))
+                (good_contribute c l.g (weighted 1 l.v) (rTotals rs k) hc
+                  (valid_weighted 1 l.v) (valid_rTotals rs k))
+
+private theorem hProcess_good (rs : List RRow) (hot : Int → Bool) :
+    ∀ ls : List LRow, Good (hProcess rs hot ls).2 := by
+  intro ls
+  unfold hProcess
+  exact hProcess_good_aux rs hot ls {} {} good_empty
+
+private theorem hProcessBuild_good_aux (rs : List RRow) (hot : Int → Bool) :
+    ∀ (ls : List LRow) (p : Std.HashMap (Int × Int) Totals) (c : Groups), Good c →
+      Good (ls.foldl (fun (st : Std.HashMap (Int × Int) Totals × Groups) l => match l.k with
+        | none => st
+        | some k =>
+            let left := weighted 1 l.v
+            if hot k then
+              (st.1.insert (l.g, k) (plus (st.1.getD (l.g, k) zero) left), st.2)
+            else (st.1, contribute st.2 l.g left ((buildOf rs).getD k zero))) (p, c)).2 := by
+  intro ls
+  induction ls with
+  | nil => intro p c hc; simpa using hc
+  | cons l ls ih =>
+      intro p c hc
+      cases hk : l.k with
+      | none => simpa [hk] using ih p c hc
+      | some k =>
+          by_cases hhot : hot k
+          · simpa [hk, hhot] using
+              ih (p.insert (l.g, k) (plus (p.getD (l.g, k) zero) (weighted 1 l.v))) c hc
+          · simpa [hk, hhot] using
+              ih p (contribute c l.g (weighted 1 l.v) ((buildOf rs).getD k zero))
+                (good_contribute c l.g (weighted 1 l.v) ((buildOf rs).getD k zero) hc
+                  (valid_weighted 1 l.v) (buildOf_valid rs k))
+
+private theorem hProcessBuild_good (rs : List RRow) (hot : Int → Bool) :
+    ∀ ls : List LRow, Good (hProcessBuild rs hot ls).2 := by
+  intro ls
+  unfold hProcessBuild
+  exact hProcessBuild_good_aux rs hot ls {} {} good_empty
+
+private theorem hybridGroups_good (ls : List LRow) (rs : List RRow) (hot : Int → Bool) :
+    Good (hybridGroups ls rs hot) := by
+  unfold hybridGroups
+  dsimp
+  change Good (finalizeBuild rs (hProcessBuild rs hot ls).1 (hProcessBuild rs hot ls).2)
+  unfold finalizeBuild
+  rw [Std.HashMap.fold_eq_foldl_toList]
+  apply fold_entries_good
+  · exact hProcessBuild_good rs hot ls
+  · intro e he
+    have hv := process_partial_valid_final rs hot ls
+    rw [hProcess_fst_eq rs hot ls] at he
+    exact hv e he
+
+
+private def nnCount : List (Option Int) → Nat
+  | [] => 0
+  | none :: xs => nnCount xs
+  | some _ :: xs => nnCount xs + 1
+
+private def nnSum : List (Option Int) → Int
+  | [] => 0
+  | none :: xs => nnSum xs
+  | some v :: xs => v + nnSum xs
+
+private theorem nnSum_eq_zero_of_nnCount_eq_zero {xs : List (Option Int)}
+    (h : nnCount xs = 0) : nnSum xs = 0 := by
+  induction xs with
+  | nil => simp [nnSum]
+  | cons x xs ih =>
+      cases x with
+      | none => simpa [nnCount, nnSum] using ih h
+      | some v => simp [nnCount] at h
+
+private def sumStep (a v : Option Int) : Option Int :=
+  match a, v with
+  | none, y => y
+  | x, none => x
+  | some a, some b => some (a + b)
+
+private theorem sumOptListAux (acc : Option Int) (xs : List (Option Int)) :
+    xs.foldl sumStep acc =
+      match acc with
+      | none => if nnCount xs = 0 then none else some (nnSum xs)
+      | some a => if nnCount xs = 0 then some a else some (a + nnSum xs) := by
+  induction xs generalizing acc with
+  | nil => cases acc <;> simp [nnCount, nnSum]
+  | cons x xs ih =>
+      cases acc with
+      | none =>
+          cases x with
+          | none =>
+              change xs.foldl sumStep none = (if nnCount xs = 0 then none else some (nnSum xs))
+              exact ih (acc := none)
+          | some v =>
+              simp [sumStep, nnCount, nnSum]
+              rw [ih (acc := some v)]
+              by_cases h : nnCount xs = 0
+              · rw [nnSum_eq_zero_of_nnCount_eq_zero h]
+                simp [h]
+              · simp [h]
+      | some a =>
+          cases x with
+          | none =>
+              change xs.foldl sumStep (some a) =
+                (if nnCount xs = 0 then some a else some (a + nnSum xs))
+              exact ih (acc := some a)
+          | some v =>
+              simp [sumStep, nnCount, nnSum]
+              rw [ih (acc := some (a + v))]
+              by_cases h : nnCount xs = 0
+              · rw [nnSum_eq_zero_of_nnCount_eq_zero h]
+                simp [h]
+              · simp [h]
+                omega
+
+private theorem sumOptList_char (xs : List (Option Int)) :
+    sumOptList xs = if nnCount xs = 0 then none else some (nnSum xs) := by
+  change xs.foldl sumStep none = if nnCount xs = 0 then none else some (nnSum xs)
+  exact sumOptListAux none xs
+
+private theorem nnCount_eq_length (xs : List (Option Int)) :
+    nnCount xs = (xs.filterMap id).length := by
+  induction xs with
+  | nil => simp [nnCount]
+  | cons x xs ih => cases x <;> simp [nnCount, ih]
+
+private theorem nnSum_eq_sum (xs : List (Option Int)) :
+    nnSum xs = (xs.map fun v => v.getD 0).sum := by
+  induction xs with
+  | nil => simp [nnSum]
+  | cons x xs ih => cases x <;> simp [nnSum, ih]
+
+private theorem finish_eq_of_getD (h₁ h₂ : Groups) (g : Int)
+    (heq : h₁.getD g (zero, zero) = h₂.getD g (zero, zero)) :
+    finish h₁ g = finish h₂ g := by
+  unfold finish
+  rw [heq]
+
+private theorem if_beq_zero_eq (n : Nat) (x : Int) :
+    (if (n == 0) = true then (none : Option Int) else some x) = (if n = 0 then none else some x) := by
+  by_cases hn : n = 0 <;> simp [hn]
+
+private theorem finish_naive_ref (ls : List LRow) (rs : List RRow) (g : Int) :
+    finish (naiveFold rs {} ls) g = refGroup ls rs g := by
+  have hget := naiveFold_eq_refTotals ls rs g
+  unfold finish
+  rw [hget]
+  unfold refGroup
+  dsimp
+  let ps := refJoinedPairs ls rs g
+  let lv := ps.map fun p => p.1.v
+  let rv := ps.map fun p => p.2.v
+  change (let lT := summarize lv
+          let rT := summarize rv
+          (lT.cnt, (if lT.nn == 0 then none else some lT.sum),
+            (if rT.nn == 0 then none else some rT.sum))) =
+         (ps.length, sumOptList lv, sumOptList rv)
+  rw [summarize_char, summarize_char]
+  rw [sumOptList_char, sumOptList_char]
+  rw [nnCount_eq_length, nnSum_eq_sum, nnCount_eq_length, nnSum_eq_sum]
+  dsimp [lv, rv]
+  let n1 := (List.filterMap id (List.map (fun p : LRow × RRow => p.1.v) ps)).length
+  let n2 := (List.filterMap id (List.map (fun p : LRow × RRow => p.2.v) ps)).length
+  let s1 := (List.map ((fun v => v.getD 0) ∘ fun p : LRow × RRow => p.1.v) ps).sum
+  let s2 := (List.map ((fun v => v.getD 0) ∘ fun p : LRow × RRow => p.2.v) ps).sum
+  rw [Prod.mk.injEq]
+  rw [Prod.mk.injEq]
+  constructor
+  · simp
+  constructor
+  · simpa [List.map_map, Function.comp_apply] using if_beq_zero_eq
+      (List.filterMap id (List.map (fun p : LRow × RRow => p.1.v) ps)).length
+      (List.map ((fun v => v.getD 0) ∘ fun p : LRow × RRow => p.1.v) ps).sum
+  · simpa [List.map_map, Function.comp_apply] using if_beq_zero_eq
+      (List.filterMap id (List.map (fun p : LRow × RRow => p.2.v) ps)).length
+      (List.map ((fun v => v.getD 0) ∘ fun p : LRow × RRow => p.2.v) ps).sum
+
+theorem SkewHybrid_sound : TinylambOpt.ResearchGoals.AnalyticsWorkloads.H2o.SkewHybrid.Goal := by
+  intro ls rs g hot
+  constructor
+  · rw [finish_eq_of_getD (hybridGroups ls rs hot) (naiveFold rs {} ls) g
+      (hybridGroups_getD ls rs hot g)]
+    exact finish_naive_ref ls rs g
+  · have hgood := hybridGroups_good ls rs hot g
+    rw [hgood]
+    have hcnt : (hybridGroups ls rs hot).getD g (zero, zero) =
+        (naiveFold rs {} ls).getD g (zero, zero) := hybridGroups_getD ls rs hot g
+    rw [hcnt]
+    have hnf := naiveFold_eq_refTotals ls rs g
+    have hcntNat : ((naiveFold rs {} ls).getD g (zero, zero)).1.cnt =
+        (refJoinedPairs ls rs g).length := by
+      rw [hnf]
+      dsimp
+      rw [summarize_char]
+      simp
+    have href : (refGroup ls rs g).1 = (refJoinedPairs ls rs g).length := by rfl
+    by_cases hp : 0 < ((naiveFold rs {} ls).getD g (zero, zero)).1.cnt
+    · have hq : 0 < (refGroup ls rs g).1 := by
+        rw [href, ← hcntNat]
+        exact hp
+      simp [hp, hq]
+    · have hq : ¬0 < (refGroup ls rs g).1 := by
+        intro hq
+        apply hp
+        have hlen : 0 < (refJoinedPairs ls rs g).length := by
+          simpa [href] using hq
+        simpa [hcntNat] using hlen
+      simp [hp, hq]
 end TinylambOpt.ResearchProofs.Wave8H2o

@@ -1,5 +1,9 @@
 # SQL 最適化の証明課題
 
+[DuckDB より遅かったクエリに対する未証明命題 50 件](research/duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。
+
+[クラウド・BI ワークロードの未証明命題 42 件](research/cloud-bi.md)を、4 系統の実測と対応づけました。
+
 [第八波の未証明命題 33 件](research/analytics-workloads/README.md) を、JOB・STATS-CEB・H2O・LDBC-SNB・BigBench の全 26 クエリに対応づけました。
 
 [第七波の未証明命題 100 件](research/execution-strategies/README.md) には、提出型と各最適化の狙いを分野別にまとめています。

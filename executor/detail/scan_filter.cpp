@@ -31,6 +31,7 @@
 #include "common/exception_status.hpp"
 #include "common/literal_like_pattern.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/regex_guard.hpp"
 #include "common/status_or.hpp"
@@ -556,7 +557,8 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   // A/B hatch: TINYLAMB_DISABLE_COLCOL_COMPARE=1 keeps column-vs-column
   // predicates in the residual (bytecode/AST) path.
   static const bool colcol_disabled =
-      std::getenv("TINYLAMB_DISABLE_COLCOL_COMPARE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COLCOL_COMPARE") !=
+      nullptr;
   if (!is_like && !colcol_disabled && column->Type() == TypeTag::kColumnValue &&
       constant->Type() == TypeTag::kColumnValue) {
     // Like-kind column pairs only: the positional match below cannot raise
@@ -810,7 +812,7 @@ bool MatchPrefixIn(const Row& row, const PrefixInPredicate& pred) {
 std::optional<PrefixInPredicate> TryCompilePrefixIn(const Expression& predicate,
                                                     const Schema& schema) {
   static const bool prefix_in_disabled =
-      std::getenv("TINYLAMB_DISABLE_PREFIX_IN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PREFIX_IN") != nullptr;
   if (prefix_in_disabled || !predicate ||
       predicate->Type() != TypeTag::kInExp) {
     return std::nullopt;
@@ -903,9 +905,11 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
     TransactionContext& context, const CteMap& ctes,
     bool allow_grouped_override = false) {
   static const bool membership_peel_disabled =
-      std::getenv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") !=
+      nullptr;
   static const bool membership_peel_debug =
-      std::getenv("TINYLAMB_PREBUILT_MEMBERSHIP_DEBUG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_PREBUILT_MEMBERSHIP_DEBUG") !=
+      nullptr;
   const auto mbail = [&](const char* why) {
     if (membership_peel_debug) {
       std::cerr << "[prebuilt-mem] not peeled: " << why << "\n";
@@ -1010,7 +1014,8 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
   // the table's ANALYZE row count with a running safety check that falls
   // back to the generic execution below the moment the estimate looks stale.
   static const bool direct_fill_disabled =
-      std::getenv("TINYLAMB_DISABLE_ARENA_MEMBERSHIP") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_ARENA_MEMBERSHIP") !=
+      nullptr;
   if (!direct_fill_disabled && !grouped_subquery &&
       statement.Sources().size() == 1 && statement.SelectList().size() == 1 &&
       statement.SelectList()[0].expression->Type() == TypeTag::kColumnValue &&
@@ -1406,7 +1411,8 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
             const std::vector<slot_t> projection{col_idx};
             bool overflow = false;
             static const bool parallel_membership_disabled =
-                std::getenv("TINYLAMB_DISABLE_PARALLEL_MEMBERSHIP") != nullptr;
+                ::tinylamb::platform::GetEnv(
+                    "TINYLAMB_DISABLE_PARALLEL_MEMBERSHIP") != nullptr;
             // Morsel-parallel fill: the serial walk boxes one Row per member
             // on one thread (Q22: 1.5M orders rows ≈ 90 ms of the filter
             // phase).  Workers collect raw int payloads per morsel chunk; the
@@ -1990,7 +1996,8 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
     const Expression& predicate, const Schema& schema,
     const FilterCompileEnv& env) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") !=
+      nullptr;
   if (disabled || !predicate || predicate->Type() != TypeTag::kQueryExp ||
       env.input_rows == 0 || env.context == nullptr || env.ctes == nullptr ||
       env.context->execution_runtime() == nullptr) {
@@ -2795,9 +2802,10 @@ std::optional<PrebuiltScalarComparePredicate> TryCompilePrebuiltScalarCompare(
   // when the grouped execution re-pays the join).  Off until the build can
   // share the statement's own join.
   static const bool scalar_peel_enabled =
-      std::getenv("TINYLAMB_ENABLE_PREBUILT_SCALAR") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_ENABLE_PREBUILT_SCALAR") !=
+      nullptr;
   static const bool scalar_peel_debug =
-      std::getenv("TINYLAMB_PREBUILT_SCALAR_DEBUG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_PREBUILT_SCALAR_DEBUG") != nullptr;
   const auto bail = [&](const char* why) {
     if (scalar_peel_debug) {
       std::cerr << "[prebuilt-scalar] not peeled: " << why
@@ -3777,7 +3785,8 @@ CompiledScanFilter CompileScanFilterUncached(
   // sequential/bytecode evaluation so cheap predicates short-circuit expensive
   // LIKE / REGEXP_CONTAINS / OR checks.
   if (compiled.residual.size() >= 2) {
-    const char* disable_order = std::getenv("TINYLAMB_DISABLE_FILTER_ORDER");
+    const char* disable_order =
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FILTER_ORDER");
     if (disable_order == nullptr || disable_order[0] != '1') {
       auto residual_error_free = [&](const Expression& expr) -> bool {
         if (IsNonThrowingLocalFilter(expr, schema, nullptr)) {
@@ -3915,7 +3924,8 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
   }
   key->push_back(BytecodeEnabled() ? char{1} : char{0});
   {
-    const char* disable_order = std::getenv("TINYLAMB_DISABLE_FILTER_ORDER");
+    const char* disable_order =
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FILTER_ORDER");
     key->push_back(disable_order != nullptr && disable_order[0] == '1'
                        ? char{1}
                        : char{0});
@@ -4845,8 +4855,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
       };
       auto extract_col = [&](const Expression& raw_e, slot_t* out) -> bool {
         const Expression& e = unwrap_double_cast(raw_e);
-        if (!e || e->Type() != TypeTag::kColumnValue) { return false;
-}
+        if (!e || e->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
         const auto off =
             LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -4860,14 +4871,17 @@ bool TryFilterColumnarTable(TransactionContext& context,
       };
       auto extract_const = [&](const Expression& raw_e, double* out) -> bool {
         const Expression& e = unwrap_double_cast(raw_e);
-        if (!e || e->Type() != TypeTag::kConstantValue) { return false;
-}
+        if (!e || e->Type() != TypeTag::kConstantValue) {
+          return false;
+        }
         const Value& v = e->AsConstantValue().GetValue();
-        if (v.IsNull()) { return false;
-}
+        if (v.IsNull()) {
+          return false;
+        }
         if (v.type == ValueType::kDouble) {
-          if (!std::isfinite(v.value.double_value)) { return false;
-}
+          if (!std::isfinite(v.value.double_value)) {
+            return false;
+          }
           *out = v.value.double_value;
           return true;
         }
@@ -4954,8 +4968,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
         bop == BinaryOperation::kEquals || bop == BinaryOperation::kNotEquals) {
       auto extract_id_col = [&](const Expression& e, slot_t* out,
                                 ValueType* vt_out) -> bool {
-        if (!e || e->Type() != TypeTag::kColumnValue) { return false;
-}
+        if (!e || e->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
         const auto off =
             LocalColumnOffset(match_schema, e->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -4972,8 +4987,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
         return true;
       };
       auto extract_i64_const = [](const Expression& e, int64_t* out) -> bool {
-        if (!e || e->Type() != TypeTag::kConstantValue) { return false;
-}
+        if (!e || e->Type() != TypeTag::kConstantValue) {
+          return false;
+        }
         const Value& v = e->AsConstantValue().GetValue();
         if (v.IsNull() || v.type != ValueType::kInt64 || v.IsUnsigned()) {
           return false;
@@ -4984,8 +5000,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
       auto extract_shifted = [&](const Expression& e, slot_t* col_out,
                                  ValueType* vt_out,
                                  int64_t* delta_out) -> bool {
-        if (!e || e->Type() != TypeTag::kBinaryExp) { return false;
-}
+        if (!e || e->Type() != TypeTag::kBinaryExp) {
+          return false;
+        }
         const auto& ab = e->AsBinaryExpression();
         if (ab.Op() != BinaryOperation::kAdd &&
             ab.Op() != BinaryOperation::kSubtract) {
@@ -4995,8 +5012,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
         if (extract_id_col(ab.Left(), col_out, vt_out) &&
             extract_i64_const(ab.Right(), &k)) {
           if (ab.Op() == BinaryOperation::kSubtract) {
-            if (k == std::numeric_limits<int64_t>::min()) { return false;
-}
+            if (k == std::numeric_limits<int64_t>::min()) {
+              return false;
+            }
             k = -k;
           }
           *delta_out = k;
@@ -5053,8 +5071,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
   if (fast_scaled_cmp.active) {
     fast_residual_covers_all_chunks = true;
     for (const ColumnarChunk& ch : input.chunks) {
-      if (ch.rows == 0) { continue;
-}
+      if (ch.rows == 0) {
+        continue;
+      }
       if (fast_scaled_cmp.lhs_col >= ch.columns.size() ||
           fast_scaled_cmp.rhs_col >= ch.columns.size()) {
         fast_residual_covers_all_chunks = false;
@@ -5073,8 +5092,9 @@ bool TryFilterColumnarTable(TransactionContext& context,
     const ValueType want_vt =
         fast_date_cmp.is_date ? ValueType::kDate : ValueType::kInt64;
     for (const ColumnarChunk& ch : input.chunks) {
-      if (ch.rows == 0) { continue;
-}
+      if (ch.rows == 0) {
+        continue;
+      }
       if (fast_date_cmp.lhs_col >= ch.columns.size() ||
           fast_date_cmp.rhs_col >= ch.columns.size()) {
         fast_residual_covers_all_chunks = false;
@@ -6599,7 +6619,8 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
   constexpr size_t kMinParallelFilterRows = 16384;
   constexpr size_t kMaxParallelFilterWorkers = 16;
   static const bool parallel_filter_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
+      ::tinylamb::platform::GetEnv(
+          "TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
   if (source.HasSpill() ||
       (movable_source != nullptr && movable_source != &source)) {
     return false;
@@ -7358,7 +7379,7 @@ StatusOr<bool> TrySelectiveIndexSource(
                                false, &guard);
     if (projection != nullptr) {
       RETURN_IF_FAIL(iterator.SetProjection(*projection));
-}
+    }
     while (iterator.IsValid()) {
       if (++visited > kMaxRows) {
         return false;
@@ -7623,7 +7644,8 @@ bool TryFilterArenaCache(
   constexpr size_t kMinParallelFilterRows = 32768;
   constexpr size_t kMaxParallelFilterWorkers = 16;
   static const bool parallel_filter_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
+      ::tinylamb::platform::GetEnv(
+          "TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
   const size_t workers =
       (!parallel_filter_disabled && arena.rows >= kMinParallelFilterRows &&
        (!has_non_simple || programs.complete))
@@ -8320,17 +8342,16 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         keyed_cache_key.reserve(
             keyed_cache_key.size() +
             (sorted_keys
-                    .size() *  // NOLINT(readability-math-missing-parentheses)
-                sizeof(
-                    int64_t)));  // NOLINT(readability-math-missing-parentheses)
+                 .size() *       // NOLINT(readability-math-missing-parentheses)
+             sizeof(int64_t)));  // NOLINT(readability-math-missing-parentheses)
         for (int64_t k : sorted_keys) {
           // Copy the object representation explicitly instead of treating the
           // int64 object as a char array: a cache key only needs stable bytes
           // within this process, and memcpy keeps the aliasing/alignment
           // contract unambiguous.
-          char k_bytes[sizeof(k)];
-          std::memcpy(k_bytes, &k, sizeof(k));
-          keyed_cache_key.append(k_bytes, sizeof(k));
+          std::array<char, sizeof(k)> k_bytes{};
+          std::memcpy(k_bytes.data(), &k, sizeof(k));
+          keyed_cache_key.append(k_bytes.data(), k_bytes.size());
         }
         const auto k_it =
             context.execution_runtime()->base_relations.find(keyed_cache_key);
@@ -8395,7 +8416,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                                         : ValueType::kNull;
       Status eval_error{Status::kSuccess};
       static const bool keyed_parallel_disabled =
-          std::getenv("TINYLAMB_DISABLE_PARALLEL_KEYED_SCAN") != nullptr;
+          ::tinylamb::platform::GetEnv(
+              "TINYLAMB_DISABLE_PARALLEL_KEYED_SCAN") != nullptr;
       bool indexed_ok = false;
       if (!reusable && (filter_during_scan || int_runtime_filter != nullptr)) {
         auto statistics = context.GetStats(source.table);
@@ -8858,7 +8880,7 @@ std::vector<Expression> FoldRowIndependentSubqueries(
     TransactionContext& context, const std::vector<Expression>& predicates,
     const Scope* outer, const CteMap& ctes) {
   static const bool fold_disabled =
-      std::getenv("TINYLAMB_DISABLE_SUBQUERY_FOLD") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SUBQUERY_FOLD") != nullptr;
   if (fold_disabled || context.execution_runtime() == nullptr ||
       std::ranges::none_of(predicates, [](const Expression& predicate) {
         return ContainsQuery(predicate);

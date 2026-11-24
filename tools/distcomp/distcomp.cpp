@@ -1,3 +1,4 @@
+#include "common/platform/process.hpp"
 #include "protocol.hpp"
 
 #include <csignal>
@@ -32,7 +33,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const char* sock_env = std::getenv("DISTCOMP_SOCK");
+  const char* sock_env = ::tinylamb::platform::GetEnv("DISTCOMP_SOCK");
   std::string sock_path = (sock_env && *sock_env) ? sock_env : "/tmp/distcomp_coord.sock";
 
   sockaddr_un addr{};

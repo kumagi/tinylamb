@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/platform/synced_stream.hpp"
 #include "common/random_string.hpp"
@@ -1085,10 +1086,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (const char* env_dur = std::getenv("FUZZ_DURATION_SEC")) {
+  if (const char* env_dur = ::tinylamb::platform::GetEnv("FUZZ_DURATION_SEC")) {
     duration_sec = parse_int(env_dur, duration_sec);
   }
-  if (const char* env_threads = std::getenv("FUZZ_THREADS")) {
+  if (const char* env_threads = ::tinylamb::platform::GetEnv("FUZZ_THREADS")) {
     num_threads = parse_int(env_threads, num_threads);
   }
   if (num_threads <= 0) {

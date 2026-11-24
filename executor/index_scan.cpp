@@ -18,6 +18,7 @@
 // Created by kumagi on 22/06/19.
 //
 
+#include "common/platform/process.hpp"
 #include "index_scan.hpp"
 
 #include <cstddef>
@@ -61,7 +62,7 @@ inline constexpr size_t kIndexScanPrefetchDistance = 8;
 bool IndexScanPrefetchDisabled() {
   // Environment configuration is sampled once; set it before the first scan.
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
   return disabled;
 }
 

@@ -1,8 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_oracle_fuzzer.hpp"
 
 #include <dirent.h>
+#include <system_error>
 
 #include <cerrno>
 #include <cstdint>
@@ -28,20 +30,15 @@ namespace {
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
-  DIR* handle = opendir(dir.c_str());
-  if (handle == nullptr) {
-    return files;
-  }
-  while (const dirent* entry = readdir(handle)) {
-    const std::string name = entry->d_name;
-    if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      std::string path = dir;
-      path += "/";
-      path += name;
-      files.push_back(std::move(path));
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const std::filesystem::path path = it->path();
+    if (path.filename().string().ends_with(".test")) {
+      files.push_back(path.string());
     }
   }
-  closedir(handle);
   return files;
 }
 
@@ -77,7 +74,7 @@ void RunSeededOracleRange(uint32_t begin_seed, uint32_t end_seed) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     OracleTrace trace;
-    const bool verbose = std::getenv("TINYLAMB_FUZZ_VERBOSE") != nullptr;
+    const bool verbose = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_VERBOSE") != nullptr;
     std::string report = RunOracleIteration(rng, verbose, &stats, &trace);
     ASSERT_EQ(report, "") << "seed " << seed << "\n" << report;
     EXPECT_GE(trace.norec.size(), 32U) << "seed " << seed;
@@ -145,7 +142,7 @@ void RunPlanFeedbackRange(uint32_t begin_seed, uint32_t end_seed) {
 // a malformed value must not silently shrink the sweep to shard0 alone.
 // NOLINTNEXTLINE(misc-use-internal-linkage) intentional pattern in this code
 bool OracleItersEnvValid() {
-  const char* env = std::getenv("TINYLAMB_ORACLE_ITERS");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_ORACLE_ITERS");
   if (env == nullptr) {
     return false;
   }
@@ -158,7 +155,7 @@ bool OracleItersEnvValid() {
 
 TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard0) {
   uint32_t end_seed = 16;
-  if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
+  if (const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_ORACLE_ITERS")) {
     char* end = nullptr;
     errno = 0;
     const long parsed = std::strtol(env, &end, 10);
@@ -654,7 +651,7 @@ TEST(SqlOracleFuzzer, ScopedDbRemovesFullArtifactFamily) {
 // file captured has been fixed).  Point TINYLAMB_ORACLE_REGRESSION_DIR at a
 // directory to enable; with no directory the test passes trivially.
 TEST(SqlOracleFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_ORACLE_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_ORACLE_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }
@@ -692,8 +689,8 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
   std::filesystem::create_directories(tmp_dir);
   ScopedEnvVar continue_guard("TINYLAMB_FUZZ_CONTINUE", nullptr);
   ScopedEnvVar findings_guard("TINYLAMB_FUZZ_FINDINGS_DIR", nullptr);
-  ASSERT_EQ(setenv("TINYLAMB_FUZZ_CONTINUE", "1", 1), 0);
-  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FINDINGS_DIR", tmp_dir.c_str(), 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_FUZZ_CONTINUE", "1", 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_FUZZ_FINDINGS_DIR", tmp_dir.c_str(), 1), 0);
 
   const std::string fname =
       "sql_oracle_fuzz-repro-test-" + RandomString(6) + ".test";

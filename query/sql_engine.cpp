@@ -34,6 +34,7 @@
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -305,7 +306,7 @@ Status SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
 StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
                                          std::string_view sql) {
   static const bool kTraceFuzzSql =
-      std::getenv("TINYLAMB_FUZZ_TRACE_SQL") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_TRACE_SQL") != nullptr;
   if (kTraceFuzzSql) {
     std::cerr << "[fuzz-sql] " << sql << "\n" << std::flush;
   }
@@ -871,7 +872,7 @@ bool PostRewriteNeedsRelational(const SelectStatement& select,
     single_right_full_slice = first_plain && second_outer;
   }
   static const bool trace_route =
-      std::getenv("TINYLAMB_TRACE_ROUTE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_TRACE_ROUTE") != nullptr;
   for (const SelectSource& source : select.Sources()) {
     // Plain LEFT joins are M6 territory (lowered with join-type payloads);
     // single RIGHT/FULL edges are M6+1 territory (same payloads, kinds 1/2);
@@ -1305,7 +1306,7 @@ std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint,
 }
 
 bool PipelineEngineEnabled() noexcept {
-  const char* env = std::getenv("TINYLAMB_EXEC_ENGINE");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_EXEC_ENGINE");
   if (env == nullptr || env[0] == '\0') {
     return true;
   }
@@ -1884,7 +1885,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
   if (!statement) {
     static const bool plan_profile =
-        std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_PLAN_PROFILE") != nullptr;
     const auto parse_begin = std::chrono::steady_clock::now();
     GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(query_sql);
     if (plan_profile) {
@@ -1991,7 +1992,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   }
   PlanCacheCandidateGuard candidate_guard{this};
   static const bool plan_profile2 =
-      std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_PLAN_PROFILE") != nullptr;
   const auto prepare_stmt_begin = std::chrono::steady_clock::now();
   // Statement execution (e.g. eager DML application) must uphold the
   // StatusOr contract: runtime errors surface as Status values, never as
@@ -2569,7 +2570,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   // TryFusedGroupedJoin).  TINYLAMB_GROUPED_ROUTE=cascades restores the
   // old Cascades-first order.
   const bool grouped_route_relational = [] {
-    const char* route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+    const char* route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
     if (route != nullptr && std::string_view(route) != "cascades") {
       LOG(LogLevel::kWarn) << "unknown TINYLAMB_GROUPED_ROUTE=" << route
                            << ", using relational default";
@@ -3801,6 +3802,15 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
       plan_cache_parameters_.clear();
     }
   }
+  // Hoist structurally identical grouped derived-table sources (e.g. TPC-DS
+  // Q65 `sa` and `sc`) into a shared CTE before CTE restriction pushdown and
+  // materialization (Lean: Wave9TpcdsMultiChannelAndTpch.lean
+  // GroupAvgThresholdTwoPassSplit_sound).
+  if (HoistDuplicateDerivedTablesToCte(select.get())) {
+    dml_fold_applied_ = true;
+    plan_cache_fingerprint_.clear();
+    plan_cache_parameters_.clear();
+  }
   // A CTE that stays shared cannot take one consumer's filter, but it can
   // take the disjunction of every consumer's restriction: that keeps every
   // row any reference can emit and drops the rest before the cell is
@@ -3857,6 +3867,7 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     tpch_rewritten |=
         DeferUniqueDimensionAttributesAfterTopN(select.get(), ctx);
     tpch_rewritten |= RewriteAffineLinearSums(select.get(), ctx);
+    tpch_rewritten |= PreGroupBeforeExpressionGroupBy(select.get(), ctx);
     if (tpch_rewritten) {
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();

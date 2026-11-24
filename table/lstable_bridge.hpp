@@ -580,8 +580,11 @@ struct LSTableBlockLayout {
 
 struct LSTableLazyDecodedBlock {
   LSTableColumnBlock block;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized cache payload.
   std::unique_ptr<int64_t[]> owned_ints;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized cache payload.
   std::unique_ptr<uint8_t[]> owned_nulls;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized cache payload.
   std::unique_ptr<uint8_t[]> owned_dict_codes;
   std::vector<uint8_t> owned_varchar_bytes;
   std::vector<uint32_t> owned_varchar_ends;
@@ -607,6 +610,7 @@ struct LSTableLazyBlockMeta {
 struct LSTableLazyColumnState {
   static constexpr size_t kLazyStripeCount = 64;
   std::shared_ptr<const TlcsFile> backing_tlcs;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized atomic cache.
   std::unique_ptr<std::atomic<const LSTableColumnBlock*>[]> lazy_blocks;
   mutable std::vector<std::shared_ptr<const LSTableLazyDecodedBlock>>
       lazy_owners;
@@ -629,8 +633,10 @@ struct LSTableColumnCacheEntry {
   int64_t min_int{std::numeric_limits<int64_t>::max()};
   int64_t max_int{std::numeric_limits<int64_t>::min()};
   std::vector<int64_t> integer_column;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized cache payload.
   std::unique_ptr<int64_t[]> integer_column_raw;
   size_t integer_column_raw_size{0};
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized cache payload.
   std::unique_ptr<uint8_t[]> narrow_codes_raw;
   size_t narrow_codes_raw_size{0};
   LSTableColumnDictionary dictionary;

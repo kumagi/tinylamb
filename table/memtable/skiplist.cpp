@@ -134,8 +134,10 @@ SkipList::ConstIterator SkipList::Begin() const {
 // ---- Construction / destruction -------------------------------------------
 
 void SkipList::InitHead() {
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): arena owns the memory.
   auto* mem = static_cast<char*>(arena_.Allocate(
       sizeof(Node) + (static_cast<size_t>(kMaxLevel) * sizeof(void*))));
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): arena retains this node.
   auto* h = new (mem) Node{
       .entry = {}, .word0 = 0, .tail9 = 0, .key_len = 0, .height = kMaxLevel};
   for (int i = 0; i < kMaxLevel; ++i) {
@@ -172,6 +174,7 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
   if (key.size() > std::numeric_limits<size_t>::max() - node_bytes) {
     throw std::bad_alloc();
   }
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): arena owns the memory.
   auto* mem = static_cast<char*>(arena_.Allocate(node_bytes + key.size()));
   if (mem == nullptr) {
     // Allocate reports an unserviceable size by returning nullptr; placement-
@@ -180,6 +183,7 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
     // oversized-key guard above.
     throw std::bad_alloc();
   }
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): arena retains this node.
   auto* n = new (mem) Node{.entry = std::move(entry),
                            .word0 = 0,
                            .tail9 = 0,

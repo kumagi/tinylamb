@@ -73,8 +73,7 @@ struct JVal {
         }
         if (std::floor(num) == num && std::abs(num) < 1e15) {
           if (num == 0.0 && std::signbit(num)) {
-            return std::string(
-                "-0");  // NOLINT(modernize-return-braced-init-list)
+            return {"-0"};
           }
           return std::to_string(static_cast<int64_t>(num));
         }

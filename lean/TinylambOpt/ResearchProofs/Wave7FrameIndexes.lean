@@ -639,7 +639,7 @@ private theorem blockAt_tbPairs_drop (start pos s i : Nat) (lens : List Nat)
           simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
             ih (start := start + 1) (pos := pos + l) (lens := ls) h'
 
-private theorem blockAt_tbPairs_head (start pos i len : Nat) (hl : pos ≤ i) (hi : i < pos + len) :
+private theorem blockAt_tbPairs_head (start pos i len : Nat) (ls : List Nat) (hl : pos ≤ i) (hi : i < pos + len) :
     blockAt (tbPairs start (len :: ls)) pos i = some start := by
   simp [tbPairs, blockAt, hi]
 
@@ -1454,6 +1454,368 @@ theorem PeerRankRuns_sound : TinylambOpt.ResearchGoals.FrameIndexes.PeerRankRuns
   rw [rankRuns_eq_from]
   simpa using rankRunsFrom_sound runs 0 hp
 
--- TODO(SlidingMinimum): queue invariant proof not completed in this wave.
+/-! Sliding minimum.  The queue is kept in strictly increasing value order; stale
+positions (left of the window) and entries dominated by a newer, no-larger value are
+discarded.  Its head is therefore the minimum of the current window. -/
+
+private def smStep (w : Nat) (s : List (Nat × Int) × List (Option Int)) (p : Int × Nat) :=
+  let next := pushMin s.1 p.2 w p.1
+  (next, (next.head?.map Prod.snd) :: s.2)
+
+private def smProcessFrom (w base : Nat) (q : List (Nat × Int)) :
+    List Int → List (Nat × Int) × List (Option Int)
+  | [] => (q, [])
+  | v :: vs =>
+      let next := pushMin q base w v
+      let r := smProcessFrom w (base + 1) next vs
+      (r.1, (next.head?.map Prod.snd) :: r.2)
+
+private theorem smProcessFrom_length (w base : Nat) (q : List (Nat × Int)) (xs : List Int) :
+    (smProcessFrom w base q xs).2.length = xs.length := by
+  induction xs generalizing base q with
+  | nil => simp [smProcessFrom]
+  | cons v vs ih => simp [smProcessFrom, ih]
+
+private theorem smProcessFrom_eq_foldl (w base : Nat) (q : List (Nat × Int))
+    (xs : List Int) (out : List (Option Int)) :
+    (xs.zipIdx base).foldl (smStep w) (q, out) =
+      let r := smProcessFrom w base q xs
+      (r.1, r.2.reverse ++ out) := by
+  induction xs generalizing base q out with
+  | nil => simp [smProcessFrom]
+  | cons v vs ih =>
+      rw [List.zipIdx_cons, List.foldl_cons]
+      dsimp [smStep, smProcessFrom]
+      rw [ih]
+      simp [List.reverse_cons, Nat.add_assoc]
+
+private theorem runningMin_eq_smProcess (xs : List Int) (w : Nat) :
+    runningMin xs w = (smProcessFrom w 0 [] xs).2 := by
+  unfold runningMin
+  change (((xs.zipIdx 0).foldl (smStep w) ([], [])).2).reverse = (smProcessFrom w 0 [] xs).2
+  rw [smProcessFrom_eq_foldl]
+  simp [List.reverse_reverse]
+
+private def QueueInv (xs : List Int) (w i : Nat) (q : List (Nat × Int)) : Prop :=
+  (∀ e ∈ q, e.1 < xs.length ∧ i + 1 - w ≤ e.1 ∧ e.1 ≤ i ∧ e.2 = xs[e.1]?.getD 0) ∧
+  List.Pairwise (fun a b : Nat × Int => a.1 < b.1) q ∧
+  List.Pairwise (fun a b : Nat × Int => a.2 < b.2) q ∧
+  (∀ p, p < xs.length → i + 1 - w ≤ p → p ≤ i →
+    ∃ e ∈ q, p ≤ e.1 ∧ e.2 ≤ xs[p]?.getD 0)
+
+private def QueueState (xs : List Int) (w n : Nat) (q : List (Nat × Int)) : Prop :=
+  match n with
+  | 0 => q = []
+  | m + 1 => QueueInv xs w m q
+
+private theorem not_stale_of_mem_dropWhile (q : List (Nat × Int)) (j w : Nat)
+    (hpos : List.Pairwise (fun a b : Nat × Int => a.1 < b.1) q) :
+    ∀ {e : Nat × Int}, e ∈ q.dropWhile (fun x => x.1 + w ≤ j) → ¬ e.1 + w ≤ j := by
+  induction q with
+  | nil => simp
+  | cons a as ih =>
+      intro e he
+      by_cases ha : a.1 + w ≤ j
+      · rw [List.dropWhile_cons] at he
+        simp [ha] at he
+        exact ih (List.Pairwise.of_cons hpos) he
+      · rw [List.dropWhile_cons] at he
+        simp [ha] at he
+        rcases he with rfl | heas
+        · exact ha
+        · have hlt := (List.pairwise_cons.mp hpos).1 e heas
+          omega
+
+private theorem mem_dropWhile_of_not_stale (q : List (Nat × Int)) (j w : Nat)
+    (hpos : List.Pairwise (fun a b : Nat × Int => a.1 < b.1) q) :
+    ∀ {e : Nat × Int}, e ∈ q → ¬ e.1 + w ≤ j →
+      e ∈ q.dropWhile (fun x => x.1 + w ≤ j) := by
+  induction q with
+  | nil => simp
+  | cons a as ih =>
+      intro e heq hnot
+      rcases List.mem_cons.mp heq with rfl | heas
+      · simp [List.dropWhile, hnot]
+      · by_cases ha : a.1 + w ≤ j
+        · rw [List.dropWhile_cons]
+          simp [ha]
+          exact ih (List.Pairwise.of_cons hpos) heas hnot
+        · rw [List.dropWhile_cons]
+          simp [ha]
+          exact Or.inr heas
+
+private theorem val_lt_of_mem_takeWhile (q : List (Nat × Int)) (v : Int) :
+    ∀ {e : Nat × Int}, e ∈ q.takeWhile (fun x => x.2 < v) → e.2 < v := by
+  induction q with
+  | nil => simp
+  | cons a as ih =>
+      intro e he
+      by_cases ha : a.2 < v
+      · rw [List.takeWhile_cons] at he
+        simp [ha] at he
+        rcases he with rfl | he
+        · exact ha
+        · exact ih he
+      · rw [List.takeWhile_cons] at he
+        simp [ha] at he
+
+private theorem mem_takeWhile_of_lt (q : List (Nat × Int)) (v : Int)
+    (hval : List.Pairwise (fun a b : Nat × Int => a.2 < b.2) q) :
+    ∀ {e : Nat × Int}, e ∈ q → e.2 < v → e ∈ q.takeWhile (fun x => x.2 < v) := by
+  induction q with
+  | nil => simp
+  | cons a as ih =>
+      intro e heq hlt
+      rcases List.mem_cons.mp heq with rfl | heas
+      · simp [List.takeWhile, hlt]
+      · have halt : a.2 < v := by
+          have hltav := (List.pairwise_cons.mp hval).1 e heas
+          omega
+        rw [List.takeWhile_cons]
+        simp [halt]
+        exact Or.inr (ih (List.Pairwise.of_cons hval) heas hlt)
+
+private theorem mem_frame_of_bounds (xs : List Int) (l r p : Nat) (hp : p < xs.length)
+    (hlp : l ≤ p) (hpr : p < r) : xs[p]?.getD 0 ∈ frame xs l r := by
+  unfold frame
+  rw [List.mem_iff_getElem?]
+  refine ⟨p - l, ?_⟩
+  rw [List.getElem?_drop, List.getElem?_take]
+  rw [if_pos (by omega : l + (p - l) < r)]
+  rw [Nat.add_sub_of_le hlp]
+  rw [List.getElem?_eq_some_iff.mpr ⟨hp, rfl⟩]
+  simp
+
+private theorem mem_frame_exists (xs : List Int) (l r : Nat) {x : Int} (hx : x ∈ frame xs l r) :
+    ∃ p, p < xs.length ∧ l ≤ p ∧ p < r ∧ xs[p]?.getD 0 = x := by
+  unfold frame at hx
+  rw [List.mem_iff_getElem?] at hx
+  obtain ⟨k, hk⟩ := hx
+  rw [List.getElem?_drop, List.getElem?_take] at hk
+  by_cases hltr : l + k < r
+  · rw [if_pos hltr] at hk
+    obtain ⟨hplen, hval⟩ := List.getElem?_eq_some_iff.mp hk
+    refine ⟨l + k, hplen, by omega, hltr, ?_⟩
+    rw [hk]
+    simp
+  · rw [if_neg hltr] at hk
+    simp at hk
+
+private theorem queueState_one (xs : List Int) (w : Nat) (hw : 0 < w) {x : Int}
+    (hxlen : 0 < xs.length) (hxeq : x = xs[0]?.getD 0) :
+    QueueState xs w 1 (pushMin [] 0 w x) := by
+  dsimp [QueueState]
+  have hq : pushMin [] 0 w x = [(0, x)] := by simp [pushMin]
+  rw [hq]
+  unfold QueueInv
+  constructor
+  · intro e he
+    simp only [List.mem_singleton] at he
+    subst e
+    refine ⟨hxlen, ?_, ?_, ?_⟩
+    · omega
+    · omega
+    · simpa [hxeq]
+  constructor
+  · simp
+  constructor
+  · simp
+  · intro p hplen hlo hhi
+    have hp0 : p = 0 := by omega
+    subst p
+    refine ⟨(0, x), by simp, by omega, ?_⟩
+    rw [hxeq]
+    simp
+
+private theorem pushMin_preserves (xs : List Int) (w i : Nat) (hw : 0 < w)
+    (hi1 : i + 1 < xs.length) (q : List (Nat × Int)) (hq : QueueInv xs w i q) :
+    QueueInv xs w (i + 1) (pushMin q (i + 1) w (xs[i + 1]?.getD 0)) := by
+  rcases hq with ⟨hA, hB, hC, hD⟩
+  let kept := (q.dropWhile fun e : Nat × Int => e.1 + w ≤ i + 1).takeWhile
+    (fun e : Nat × Int => e.2 < (xs[i + 1]?.getD 0))
+  have hnext : pushMin q (i + 1) w (xs[i + 1]?.getD 0) =
+      kept ++ [(i + 1, (xs[i + 1]?.getD 0))] := by rfl
+  have hsub1 : (q.dropWhile (fun e : Nat × Int => e.1 + w ≤ i + 1)).Sublist q :=
+    List.dropWhile_sublist (p := fun e : Nat × Int => e.1 + w ≤ i + 1) (l := q)
+  have hsub2 : kept.Sublist (q.dropWhile (fun e : Nat × Int => e.1 + w ≤ i + 1)) :=
+    List.takeWhile_sublist (p := fun e : Nat × Int => e.2 < (xs[i + 1]?.getD 0))
+      (l := q.dropWhile (fun e : Nat × Int => e.1 + w ≤ i + 1))
+  have hsub : kept.Sublist q := hsub2.trans hsub1
+  have hkept_mem : ∀ e ∈ kept, e ∈ q := fun e he => hsub.subset he
+  have hkept_val : ∀ e ∈ kept, e.2 < (xs[i + 1]?.getD 0) := by
+    intro e he
+    exact val_lt_of_mem_takeWhile
+      (q.dropWhile fun x : Nat × Int => x.1 + w ≤ i + 1) (xs[i + 1]?.getD 0) he
+  have hkept_pos : List.Pairwise (fun a b : Nat × Int => a.1 < b.1) kept :=
+    List.Pairwise.sublist hsub hB
+  have hkept_val_pair : List.Pairwise (fun a b : Nat × Int => a.2 < b.2) kept :=
+    List.Pairwise.sublist hsub hC
+  unfold QueueInv
+  constructor
+  · intro e he
+    rw [hnext, List.mem_append] at he
+    rcases he with he | he
+    · have hed : e ∈ q.dropWhile (fun x : Nat × Int => x.1 + w ≤ i + 1) := hsub2.subset he
+      have hnot := not_stale_of_mem_dropWhile q (i + 1) w hB hed
+      have heq := hkept_mem e he
+      rcases hA e heq with ⟨hlen, hlo, hhi, hval⟩
+      refine ⟨hlen, ?_, by omega, hval⟩
+      omega
+    · simp only [List.mem_singleton] at he
+      subst e
+      refine ⟨hi1, ?_, ?_, rfl⟩ <;> omega
+  constructor
+  · rw [hnext]
+    refine List.pairwise_append.mpr ⟨hkept_pos, by simp, ?_⟩
+    intro a ha b hb
+    simp only [List.mem_singleton] at hb
+    subst b
+    have hai : a.1 ≤ i := (hA a (hkept_mem a ha)).2.2.1
+    omega
+  constructor
+  · rw [hnext]
+    refine List.pairwise_append.mpr ⟨hkept_val_pair, by simp, ?_⟩
+    intro a ha b hb
+    simp only [List.mem_singleton] at hb
+    subst b
+    exact hkept_val a ha
+  · intro p hplen hplo hphi
+    by_cases hpj : p = i + 1
+    · subst p
+      refine ⟨(i + 1, (xs[i + 1]?.getD 0)), ?_, ?_, ?_⟩
+      · rw [hnext]; simp
+      · omega
+      · simp
+    · have hpi : p ≤ i := by omega
+      have hplo_i : i + 1 - w ≤ p := by omega
+      obtain ⟨e, heq, hpe, hvale⟩ := hD p hplen hplo_i hpi
+      have hnotstale : ¬ e.1 + w ≤ i + 1 := by
+        intro hst
+        have hpw : i + 2 ≤ p + w := by omega
+        omega
+      have hed : e ∈ q.dropWhile (fun x : Nat × Int => x.1 + w ≤ i + 1) :=
+        mem_dropWhile_of_not_stale q (i + 1) w hB heq hnotstale
+      by_cases hlt : e.2 < (xs[i + 1]?.getD 0)
+      · have hekept : e ∈ kept :=
+          mem_takeWhile_of_lt
+            (q.dropWhile fun x : Nat × Int => x.1 + w ≤ i + 1) (xs[i + 1]?.getD 0)
+            (List.Pairwise.sublist hsub1 hC) hed hlt
+        refine ⟨e, ?_, hpe, hvale⟩
+        rw [hnext]
+        exact List.mem_append.mpr (Or.inl hekept)
+      · refine ⟨(i + 1, (xs[i + 1]?.getD 0)), ?_, ?_, ?_⟩
+        · rw [hnext]; simp
+        · have hei : e.1 ≤ i := (hA e heq).2.2.1
+          omega
+        · omega
+
+private theorem head_min_eq_min (xs : List Int) (w i : Nat) (hw : 0 < w)
+    (hi : i < xs.length) (q : List (Nat × Int)) (hq : QueueInv xs w i q) :
+    q.head?.map Prod.snd = (frame xs (i + 1 - w) (i + 1)).min? := by
+  rcases hq with ⟨hA, hB, hC, hD⟩
+  have hnonempty : q ≠ [] := by
+    intro h
+    subst q
+    obtain ⟨e, he⟩ := hD i hi (by omega) (by omega)
+    simp at he
+  cases q with
+  | nil => contradiction
+  | cons a as =>
+      simp only [List.head?_cons, Option.map_some]
+      have hale : ∀ e ∈ a :: as, a.2 ≤ e.2 := by
+        intro e he
+        rcases List.mem_cons.mp he with rfl | heas
+        · omega
+        · have hlt := (List.pairwise_cons.mp hC).1 e heas
+          omega
+      rcases hA a (by simp) with ⟨alen, alo, ahi, aval⟩
+      have hmem : a.2 ∈ frame xs (i + 1 - w) (i + 1) := by
+        have hm := mem_frame_of_bounds xs (i + 1 - w) (i + 1) a.1 alen (by omega) (by omega)
+        simpa [aval] using hm
+      have hle : ∀ x : Int, x ∈ frame xs (i + 1 - w) (i + 1) → a.2 ≤ x := by
+        intro x hx
+        obtain ⟨p, hplen, hplo, hphi, hpx⟩ := mem_frame_exists xs (i + 1 - w) (i + 1) hx
+        obtain ⟨e, heq, hpe, hvale⟩ := hD p hplen (by omega) (by omega)
+        rw [← hpx]
+        have hale' := hale e heq
+        omega
+      exact (List.min?_eq_some_iff.mpr ⟨hmem, hle⟩).symm
+
+private theorem smProcessFrom_sound (xs : List Int) (w : Nat) (hw : 0 < w) :
+    ∀ (n : Nat) (ys : List Int), xs.drop n = ys →
+      ∀ (q : List (Nat × Int)), QueueState xs w n q →
+        ∀ k, k < (smProcessFrom w n q ys).2.length →
+          (smProcessFrom w n q ys).2[k]? =
+            some (frame xs (n + k + 1 - w) (n + k + 1)).min? := by
+  intro n ys
+  induction ys generalizing n with
+  | nil =>
+      intro hdrop q hqs k hk
+      simp [smProcessFrom] at hk
+  | cons x xs' ih =>
+      intro hdrop q hqs
+      have hnlen : n < xs.length := by
+        by_cases hge : xs.length ≤ n
+        · have hdn : xs.drop n = [] := List.drop_eq_nil_iff.mpr hge
+          rw [hdn] at hdrop
+          simp at hdrop
+        · omega
+      have hxeq : x = xs[n]?.getD 0 := by
+        have hg := List.getElem?_drop (xs := xs) (i := n) (j := 0)
+        rw [hdrop] at hg
+        simp at hg
+        rw [← hg]
+        simp
+      let next := pushMin q n w x
+      have hnext_state : QueueState xs w (n + 1) next := by
+        cases n with
+        | zero =>
+            dsimp [QueueState] at hqs
+            subst q
+            dsimp [QueueState, next]
+            simpa [hxeq, QueueState] using queueState_one xs w hw hnlen hxeq
+        | succ m =>
+            dsimp [QueueState] at hqs ⊢
+            dsimp [next]
+            have hp := pushMin_preserves xs w m hw (by simpa using hnlen) q hqs
+            simpa [hxeq] using hp
+      have hout : next.head?.map Prod.snd = (frame xs (n + 1 - w) (n + 1)).min? :=
+        head_min_eq_min xs w n hw hnlen next hnext_state
+      dsimp [smProcessFrom]
+      intro k hk
+      cases k with
+      | zero =>
+          simpa [next, hout]
+      | succ k =>
+          have hdrop' : xs.drop (n + 1) = xs' := by
+            calc
+              xs.drop (n + 1) = List.drop 1 (xs.drop n) := by
+                simpa [Nat.add_comm] using (List.drop_drop 1 n xs).symm
+              _ = (x :: xs').drop 1 := by rw [hdrop]
+              _ = xs' := by simp
+          have hrec := ih (n + 1) hdrop' next hnext_state
+          have hk' : k < (smProcessFrom w (n + 1) next xs').2.length := by
+            simpa [next] using hk
+          have hidx1 : (n + 1) + k + 1 = n + (k + 1) + 1 := by omega
+          have hidx2 : (n + 1) + k + 1 - w = n + (k + 1) + 1 - w := by omega
+          simpa [next, hidx1, hidx2] using hrec k hk'
+
+theorem SlidingMinimum_sound : TinylambOpt.ResearchGoals.FrameIndexes.SlidingMinimum.Goal := by
+  intro xs w hw
+  rw [runningMin_eq_smProcess xs w]
+  let r := smProcessFrom w 0 [] xs
+  have hlens : r.2.length = xs.length := by
+    dsimp [r]
+    rw [smProcessFrom_length]
+  have hrhs : ((List.range xs.length).map fun i => (frame xs (i + 1 - w) (i + 1)).min?).length =
+      xs.length := by simp
+  apply List.ext_getElem
+  · exact hlens.trans hrhs.symm
+  · intro k hk₁ hk₂
+    have hs := smProcessFrom_sound xs w hw 0 xs rfl ([] : List (Nat × Int))
+      (by simp [QueueState]) k (by simpa [r] using hk₁)
+    obtain ⟨_, heq⟩ := List.getElem?_eq_some_iff.mp (by simpa [r] using hs)
+    rw [List.getElem_map]
+    simpa [heq]
 
 end TinylambOpt.ResearchProofs.Wave7FrameIndexes

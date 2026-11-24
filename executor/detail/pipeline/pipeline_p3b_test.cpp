@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -526,8 +527,9 @@ TEST(PipelineP3bTest, WindowCanRetryFirstSorterFinishOnSameSink) {
     for (;;) {
       auto next = output.Value()->NextBatch(&ctx, &rows);
       ASSERT_TRUE(next.HasValue()) << next.GetStatus();
-      if (!next.Value()) { break;
-}
+      if (!next.Value()) {
+        break;
+      }
       for (size_t i = 0; i < rows.Size(); ++i, ++expected) {
         EXPECT_EQ(rows.RowAt(i)[0], Value(expected));
         EXPECT_EQ(rows.RowAt(i)[2], Value(expected));
@@ -679,14 +681,15 @@ TEST(PipelineP3bTest, OocGroupAggSingleDistinctSkewStripsAndStaysExact) {
   }
   ASSERT_GT(expected_distinct.size(), 1U);
 
-  const struct {
+  struct AggCase {
     AggregationType type;
     ValueType out_type;
-  } cases[] = {
-      {.type=AggregationType::kCount, .out_type=ValueType::kInt64},
-      {.type=AggregationType::kSum, .out_type=ValueType::kInt64},
-      {.type=AggregationType::kAvg, .out_type=ValueType::kDouble},
   };
+  const std::array<AggCase, 3> cases = {{
+      {.type = AggregationType::kCount, .out_type = ValueType::kInt64},
+      {.type = AggregationType::kSum, .out_type = ValueType::kInt64},
+      {.type = AggregationType::kAvg, .out_type = ValueType::kDouble},
+  }};
   for (const auto& tc : cases) {
     auto agg =
         std::make_shared<AggregateExpression>(tc.type, ColumnValueExp("v"),
@@ -1277,11 +1280,10 @@ TEST(PipelineP3bTest,
 TEST(PipelineP3bTest, SetOperationsAcceptEntirelyNullColumns) {
   const Schema schema("n", {Column("x", ValueType::kNull)});
   auto input_stream = [&] {
-    return OocSetOpInputStream{
-        .source = std::make_shared<RowVectorSource>(
-            std::vector<Row>{Row({Value()})}),
-        .operators = {},
-        .schema = schema};
+    return OocSetOpInputStream{.source = std::make_shared<RowVectorSource>(
+                                   std::vector<Row>{Row({Value()})}),
+                               .operators = {},
+                               .schema = schema};
   };
   DataChunk output;
   OocConcatSource concat({input_stream(), input_stream()}, schema);

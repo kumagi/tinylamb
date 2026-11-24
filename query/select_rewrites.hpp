@@ -370,6 +370,21 @@ bool PushDisjunctiveNullRejectingLeftJoinSemiFilter(SelectStatement* outer,
 bool RecursiveCteLiftable(const SelectStatement& outer,
                           const std::string& name);
 
+// Hoists structurally identical grouped derived-table sources (e.g. TPC-DS Q65
+// `sa` inside `sb` and sibling `sc`) into a shared CTE so the fact scan and
+// inner GROUP BY execute once instead of twice.
+// Lean: Wave9TpcdsMultiChannelAndTpch.lean
+//   (GroupAvgThresholdTwoPassSplit_sound).
+bool HoistDuplicateDerivedTablesToCte(SelectStatement* select);
+
+// Pre-aggregates a single-table COUNT(*) query by its underlying base columns
+// when GROUP BY contains an expensive VARCHAR CASE/LIKE/function expression
+// over <= 3 base columns, then evaluates the expression over the compact
+// grouped keys and folds counts with SUM (Public BI MLB suffix CASE).
+// Lean: CloudBI/PublicBI.lean (sound_GroupBeforeSuffix).
+bool PreGroupBeforeExpressionGroupBy(SelectStatement* select,
+                                     TransactionContext& ctx);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_SELECT_REWRITES_HPP

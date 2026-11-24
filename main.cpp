@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <csignal>
 #include <exception>
@@ -62,9 +63,9 @@ constexpr size_t kMaxSqlInputBytes = static_cast<size_t>(16U * 1024U * 1024U);
 
 tinylamb::StatusOr<std::string> ReadStandardInput() {
   std::string sql;
-  char buffer[64 * 1024];
+  std::array<char, 65536> buffer{};
   for (;;) {
-    std::cin.read(buffer, sizeof(buffer));
+    std::cin.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
     const std::streamsize got = std::cin.gcount();
     if (got > 0) {
       if (sql.size() + static_cast<size_t>(got) > kMaxSqlInputBytes) {
@@ -74,7 +75,7 @@ tinylamb::StatusOr<std::string> ReadStandardInput() {
                 "-byte SQL input limit; split the script into smaller "
                 "inputs");
       }
-      sql.append(buffer, static_cast<size_t>(got));
+      sql.append(buffer.data(), static_cast<size_t>(got));
     }
     if (!std::cin) {
       break;

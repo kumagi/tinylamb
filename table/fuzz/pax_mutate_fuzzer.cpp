@@ -92,7 +92,8 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
   auto bytes = kGood.Data();
   const size_t mask_len = std::min(size - 8, bytes.size());
   for (size_t i = 0; i < mask_len; ++i) {
-    bytes[i] ^= static_cast<char>(data[i]);
+    bytes[i] ^= static_cast<char>(data[i]);  // NOLINT(bugprone-narrowing-conversions):
+                                             // mutate one payload byte.
   }
   // Re-sign the checksums after mutating the payload: otherwise every nonzero
   // mutation is rejected by ValidateChunkBytes and the early return below
@@ -129,7 +130,9 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
   auto cv = bad.ReadColumnValue(row_i, col, sc);
   (void)cv;
   size_t idx = 12345;
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)bad.PointLookup(probe, sc, &idx);
+  // NOLINTNEXTLINE(bugprone-unused-return-value): fuzz probe checks crashes.
   (void)bad.LowerBoundIndex(probe ^ 0x5555, sc, &idx);
   return 0;
 }

@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 
 #include <algorithm>
@@ -1917,7 +1918,7 @@ std::optional<ScanRuntimeFilter> CorrelationDomainFilter(
     const ColumnName& outer_column, const std::vector<slot_t>& projection,
     const ExecutionRuntime& runtime) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
   if (disabled || runtime.correlated_outer_relation == nullptr ||
       local_column >= source_schema.ColumnCount()) {
     return std::nullopt;
@@ -2156,7 +2157,7 @@ void StashBuildDomainFilter(
 }
 
 bool SubqueryEnvDisabled(const char* name) {
-  const char* v = std::getenv(name);
+  const char* v = ::tinylamb::platform::GetEnv(name);
   return v != nullptr && std::strcmp(v, "1") == 0;
 }
 
@@ -2790,7 +2791,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       const auto& runtime = *context.execution_runtime();
       const Relation* domain = runtime.correlated_outer_relation;
       const bool domain_disabled =
-          std::getenv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
       if (!domain_disabled && (domain != nullptr) && !domain->HasSpill() &&
           !source.HasSpill() && domain->TotalRows() <= 2000000) {
         const auto offset =
@@ -3157,7 +3158,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // unordered_map for int group keys; the adapter keeps every use site
       // identical across the two backends.
       static const bool flat_map_disabled =
-          std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_MAP") != nullptr;
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FLAT_GROUP_MAP") != nullptr;
       using IntGroupMap = IntGroupMapAdapter<GroupAggs>;
       IntGroupMap int_groups{!flat_map_disabled};
       std::unordered_map<std::string, GroupAggs> str_groups;
@@ -3184,7 +3185,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // A/B hatch: TINYLAMB_DISABLE_AGG_COLUMN_PEEK=1 keeps column-vs-column
       // conjuncts in the bytecode residual (the pre-change behavior).
       static const bool column_peek_disabled =
-          std::getenv("TINYLAMB_DISABLE_AGG_COLUMN_PEEK") != nullptr;
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_AGG_COLUMN_PEEK") != nullptr;
       std::vector<ColumnCompare> column_compares;
       std::vector<Expression> residual_predicates;
       residual_predicates.reserve(local_predicates.size());
@@ -3317,7 +3318,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
            ++i) {
         const AggregateExpression& aggregate = *aggregate_expressions[i];
         static const bool distinct_count_disabled =
-            std::getenv("TINYLAMB_DISABLE_PARALLEL_COUNT_DISTINCT") != nullptr;
+            ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_COUNT_DISTINCT") != nullptr;
         const bool distinct_count =
             !distinct_count_disabled && aggregate.Distinct() &&
             aggregate.GetType() == AggregationType::kCount;
@@ -3995,7 +3996,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // rows instead of re-scanning the base table.  Domain-filtered
       // entries are only shared under the same registration context.
       static const bool sharing_disabled =
-          std::getenv("TINYLAMB_DISABLE_SHARED_EXISTS_BUILD") != nullptr;
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SHARED_EXISTS_BUILD") != nullptr;
       const bool shareable = !sharing_disabled && !source.HasSpill() &&
                              statement.Sources().size() == 1 && !from.query &&
                              !from.table.empty() &&

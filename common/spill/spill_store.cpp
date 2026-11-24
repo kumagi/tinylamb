@@ -13,6 +13,7 @@
 
 #include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 
 namespace tinylamb {
 namespace {
@@ -76,7 +77,7 @@ std::filesystem::path ResolveTempDir(const SpillStoreOptions& options) {
   if (!options.temp_dir.empty()) {
     return options.temp_dir;
   }
-  const char* env_dir = std::getenv("TINYLAMB_TEMP_DIR");
+  const char* env_dir = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP_DIR");
   if (env_dir != nullptr && env_dir[0] != '\0') {
     return {env_dir};
   }
@@ -256,8 +257,9 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
             ? 0
             : (kBlockSize - intra);
     const size_t remaining_after_tail = len > tail_free ? (len - tail_free) : 0;
-    const size_t needed_blocks = (remaining_after_tail / kBlockSize) +
-                                 static_cast<size_t>(remaining_after_tail % kBlockSize != 0);
+    const size_t needed_blocks =
+        (remaining_after_tail / kBlockSize) +
+        static_cast<size_t>(remaining_after_tail % kBlockSize != 0);
 
     const size_t limit_bytes = EffectiveTempLimitBytes();
     if (limit_bytes > 0) {
@@ -280,8 +282,7 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
                          "spill store maximum addressable blocks reached");
     }
 
-    if (needed_blocks > newly_reserved.max_size() ||
-        needed_blocks >= plan.max_size() ||
+    if (needed_blocks >= plan.max_size() ||
         needed_blocks > seg.blocks.max_size() - seg.blocks.size()) {
       return StatusError(StatusCode::kTooBigData,
                          "spill store append plan is too large");
@@ -349,7 +350,7 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
   Status io_status = Status::kSuccess;
   uint64_t written_extent = 0;
   const auto* bytes = static_cast<const uint8_t*>(data);
-  for (const auto & s : plan) {  // NOLINT(modernize-loop-convert)
+  for (const auto& s : plan) {  // NOLINT(modernize-loop-convert)
     // T37: consume once per physical Pwrite so "fail the N-th spill I/O
     // call" (docs/ooc_fuzzing.md) counts the same events the loop emits;
     // previously only the SECOND+ block of one Append consulted the

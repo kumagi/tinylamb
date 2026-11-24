@@ -216,6 +216,7 @@ template <typename T>
 // space, U+2000-U+200A, line/paragraph separators, narrow NBSP, medium
 // math space and ideographic space included.  Multi-byte members stay
 // intact because TrimCodePoints matches whole code points.
+// NOLINTNEXTLINE(modernize-avoid-c-arrays): null-terminated UTF-8 byte set.
 inline constexpr char kDefaultTrimCutset[] =
     " \t\n\v\f\r"
     "\xC2\x85"      // U+0085 NEXT LINE

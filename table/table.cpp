@@ -158,7 +158,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
     // NOLINTNEXTLINE(modernize-return-braced-init-list) intentional pattern in
     // this code
     return {StatusCode::kConflicts,
-                  "table was modified while CREATE INDEX was scanning; retry"};
+            "table was modified while CREATE INDEX was scanning; retry"};
   }
   return Status::kSuccess;
 }
@@ -360,7 +360,12 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       PageRef new_page = new_page_result.MoveValue();
       StatusOr<slot_t> new_pos = new_page->Insert(txn, serialized_row);
       if (!new_pos.HasValue()) {
-        page_manager->DestroyPage(txn, new_page.get());
+        const Status destroy_status =
+            page_manager->DestroyPage(txn, new_page.get());
+        if (destroy_status != Status::kSuccess) {
+          LOG(WARN) << "failed to destroy a page after row insert failure: "
+                    << destroy_status;
+        }
         page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
         return new_pos.GetStatus();
       }
@@ -869,7 +874,12 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     PageRef new_page = new_page_result.MoveValue();
     StatusOr<slot_t> new_slot = new_page->Insert(txn, serialized_row);
     if (!new_slot.HasValue()) {
-      page_manager->DestroyPage(txn, new_page.get());
+      const Status destroy_status =
+          page_manager->DestroyPage(txn, new_page.get());
+      if (destroy_status != Status::kSuccess) {
+        LOG(WARN) << "failed to destroy a page after tail insert failure: "
+                  << destroy_status;
+      }
       page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
       return contextualize(new_slot.GetStatus(), "new tail insert");
     }
@@ -1460,10 +1470,9 @@ std::shared_ptr<const LSTableStore> Table::GetLSTableStore() const {
       incarnation_state_->GetLSTableStoreRaw());
 }
 
-void Table::SetLSTableStore(
-    std::shared_ptr<const LSTableStore>
-        store) const {  // NOLINT(readability-make-member-function-const):
-                  // explicit mutation API
+void Table::SetLSTableStore(std::shared_ptr<const LSTableStore> store)
+    const {  // NOLINT(readability-make-member-function-const):
+             // explicit mutation API
   RefillLSTableStore(std::move(store));
 }
 
@@ -1593,10 +1602,9 @@ void Table::SetCleanPageDirectory(
   }
 }
 
-void Table::SetBackingTLCSStore(
-    std::shared_ptr<const TlcsFile>
-        store) const {  // NOLINT(readability-make-member-function-const):
-                  // explicit mutation API
+void Table::SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store)
+    const {  // NOLINT(readability-make-member-function-const):
+             // explicit mutation API
   RefillBackingTLCSStore(std::move(store));
 }
 

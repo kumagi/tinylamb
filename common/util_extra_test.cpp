@@ -139,7 +139,10 @@ TEST(DigestExtraTest, ToHexEncodesNibblesAndFixedOutputSize) {
 TEST(JsonStringTest, EscapedNulIsPreservedAndRawNulIsRejected) {
   const std::string value({'a', '\0', 'b'});
   const auto decoded = json_text::DecodeJsonString(R"("a\u0000b")");
-  ASSERT_TRUE(decoded.has_value());
+  if (!decoded.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   EXPECT_EQ(*decoded, value);
   EXPECT_EQ(digest::ToHex(*decoded), "610062");
   EXPECT_EQ(json_text::EncodeJsonString(*decoded), "\"a\\u0000b\"");

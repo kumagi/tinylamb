@@ -27,15 +27,19 @@ void ClearRelationRows(std::vector<Row>& rows) noexcept {
     try {
       const size_t workers = ParallelWorkerCount(rows.size() / 4096);
       if (workers > 1) {
-        (void)RunParallelTasks(workers, [&](size_t w) {
+        if (RunParallelTasks(workers, [&](size_t w) {
           const size_t begin = rows.size() * w / workers;
           const size_t end = rows.size() * (w + 1) / workers;
+          // NOLINTNEXTLINE(bugprone-inc-dec-in-conditions): canonical counted loop.
           for (size_t r = begin; r < end; ++r) {
             // swap is noexcept and leaves an empty, valid row. The ordinary
             // clear below also handles any work not started on a failure.
             std::vector<Value>().swap(rows[r].values_);
           }
-        });
+        }) != Status::kSuccess) {
+          // The serial clear below completes any ranges left by a scheduler
+          // failure.
+        }
       }
     } catch (...) {  // NOLINT(bugprone-empty-catch)
       // Destruction must remain noexcept even if scheduling cannot allocate.
@@ -603,7 +607,10 @@ void Relation::MergeInMemoryShard(Relation&& shard) {
     return;
   }
   if (shard.HasSpill()) {
-    (void)AdoptSpilledShard(std::move(shard));
+    const Status adopt_status = AdoptSpilledShard(std::move(shard));
+    if (adopt_status != Status::kSuccess && spill_error_ == Status::kSuccess) {
+      spill_error_ = adopt_status;
+    }
     return;
   }
   if (HasSpill() || !shard.uniform_cell_types) {

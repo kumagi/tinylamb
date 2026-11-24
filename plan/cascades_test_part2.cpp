@@ -3304,6 +3304,7 @@ TEST(CascadesTest, OuterToInnerOnHavingDemotesStrictAggAndRefusesCountStar) {
   EXPECT_FALSE(run_test(/*include_count_star=*/true));
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): test helper is file-local.
 static bool OffersEagerAggregation(AggregationType aggregate,
                                    std::string_view grouping_column) {
   Memo memo;

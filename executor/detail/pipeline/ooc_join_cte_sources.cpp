@@ -1571,7 +1571,7 @@ Status OocRecursiveCteSource::Open(PipelineContext* ctx) {
   ASSIGN_OR_RETURN(
       relational_detail::Relation, anchor_res,
       relational_detail::ExecuteQuery(*ctx->txn, anchor, nullptr, {}));
-  anchor_res.FinishSpill();
+  RETURN_IF_FAIL(anchor_res.FinishSpill());
 
   const bool track_depth = depth_spec_.has_value();
   const bool distinct = body_->UnionDistinct();

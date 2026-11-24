@@ -40,6 +40,7 @@
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 #include "common/serdes.hpp"
 
 namespace tinylamb {
@@ -63,10 +64,10 @@ StatusOr<int> CreateFile(const std::filesystem::path& path) {
       {.mode = platform::OpenMode::kReadWrite, .create = true, .append = true},
       0666);
   if (fd == -1) {
-    return StatusError(
-        StatusCode::kIOError,
-        "Failed to open log file: " + std::string(std::strerror(errno)) +
-            " for " + path.string());
+    return StatusError(StatusCode::kIOError,
+                       "Failed to open log file: " +
+                           std::string(::tinylamb::platform::StrError(errno)) +
+                           " for " + path.string());
   }
   return fd;
 }
@@ -82,7 +83,7 @@ Status SyncDirectoryOf(const std::filesystem::path& path) {
     const int saved = errno;
     return StatusError(StatusCode::kIOError,
                        "Failed to fsync directory: " + dir.string() + ": " +
-                           std::strerror(saved));
+                           ::tinylamb::platform::StrError(saved));
   }
   return Status::kSuccess;
 }
@@ -392,7 +393,7 @@ Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
     std::filesystem::remove(tmp, remove_ec);
     return StatusError(StatusCode::kIOError,
                        "Failed to fsync WAL segment metadata " + tmp.string() +
-                           ": " + std::strerror(saved));
+                           ": " + ::tinylamb::platform::StrError(saved));
   }
   const int close_rc = platform::CloseFile(fd);
   if (close_rc != 0) {
@@ -401,7 +402,7 @@ Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
     std::filesystem::remove(tmp, remove_ec);
     return StatusError(StatusCode::kIOError,
                        "Failed to close WAL segment metadata " + tmp.string() +
-                           ": " + std::strerror(saved));
+                           ": " + ::tinylamb::platform::StrError(saved));
   }
   std::filesystem::rename(tmp, path, ec);
   if (ec) {
@@ -465,9 +466,10 @@ StatusOr<size_t> Logger::SegmentLogicalSize(const std::filesystem::path& base,
 }
 
 StatusOr<size_t> Logger::ReadSegmentLogicalSize(uint64_t index,
-                                                 bool allow_torn_footer) const {
+                                                bool allow_torn_footer) const {
   std::scoped_lock footer_guard(footer_mu_);
-  return SegmentLogicalSize(base_path_, index, segment_size_, allow_torn_footer);
+  return SegmentLogicalSize(base_path_, index, segment_size_,
+                            allow_torn_footer);
 }
 
 namespace {
@@ -637,7 +639,7 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
   if (src < 0) {
     return StatusError(StatusCode::kIOError,
                        "Failed to open legacy log " + base.string() + ": " +
-                           std::string(std::strerror(errno)));
+                           std::string(::tinylamb::platform::StrError(errno)));
   }
   auto close_src = [&src] { platform::CloseFile(src); };
   std::vector<char> chunk(segment_size);
@@ -653,10 +655,10 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
                                        0666);
     if (dst < 0) {
       close_src();
-      return StatusError(StatusCode::kIOError,
-                         "Failed to create WAL segment " +
-                             SegmentPath(base, index).string() + ": " +
-                             std::string(std::strerror(errno)));
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to create WAL segment " + SegmentPath(base, index).string() +
+              ": " + std::string(::tinylamb::platform::StrError(errno)));
     }
     size_t done = 0;
     while (done < want) {
@@ -679,10 +681,11 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
           }
           platform::CloseFile(dst);
           close_src();
-          return StatusError(StatusCode::kIOError,
-                             "Failed to write WAL segment " +
-                                 SegmentPath(base, index).string() + ": " +
-                                 std::string(std::strerror(errno)));
+          return StatusError(
+              StatusCode::kIOError,
+              "Failed to write WAL segment " +
+                  SegmentPath(base, index).string() + ": " +
+                  std::string(::tinylamb::platform::StrError(errno)));
         }
         written += static_cast<size_t>(w);
       }
@@ -698,7 +701,7 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
     platform::CloseFile(dst);
     ++index;
   }
-  const Status synced = SyncDirectoryOf(base);
+  Status synced = SyncDirectoryOf(base);
   if (synced != Status::kSuccess) {
     close_src();
     return synced;
@@ -708,14 +711,15 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
     close_src();
     return StatusError(StatusCode::kIOError,
                        "Failed to trim legacy log " + base.string() + ": " +
-                           std::string(std::strerror(saved)));
+                           std::string(::tinylamb::platform::StrError(saved)));
   }
   if (FdataSync(src) != 0) {
     const int saved = errno;
     close_src();
     return StatusError(StatusCode::kIOError,
                        "Failed to fsync trimmed legacy log " + base.string() +
-                           ": " + std::string(std::strerror(saved)));
+                           ": " +
+                           std::string(::tinylamb::platform::StrError(saved)));
   }
   close_src();
   RETURN_IF_FAIL(SyncDirectoryOf(base));
@@ -855,9 +859,10 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
                              !existed || zero_length_frame) != 0)) {
       const int saved = errno;
       platform::CloseFile(fd);
-      return StatusError(StatusCode::kIOError,
-                         "Failed to initialize fixed WAL: " +
-                             std::string(std::strerror(saved)));
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to initialize fixed WAL: " +
+              std::string(::tinylamb::platform::StrError(saved)));
     }
   }
   Status directory_status =
@@ -912,7 +917,7 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
     platform::CloseFile(fd);
     return StatusError(StatusCode::kIOError,
                        "Failed to fsync existing WAL segment before reopen: " +
-                           std::string(std::strerror(saved)));
+                           std::string(::tinylamb::platform::StrError(saved)));
   }
   // std::thread has no noexcept construction path; EAGAIN/ENOMEM from the
   // pthread layer is caught at this boundary and mapped to a Status.
@@ -1044,15 +1049,17 @@ void Logger::SetFailed(int err) {
     const auto free_bytes = std::filesystem::space(
         std::filesystem::path(base_path_).parent_path(), ec);
     if (!ec) {
-      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL volume of "
-                 << base_path_ << ": " << (free_bytes.available >> 20)
-                 << " MiB free of " << (free_bytes.capacity >> 20) << " MiB";
+      LOG(ERROR) << std::string(::tinylamb::platform::StrError(err))
+                 << " on WAL volume of " << base_path_ << ": "
+                 << (free_bytes.available >> 20) << " MiB free of "
+                 << (free_bytes.capacity >> 20) << " MiB";
     } else {
-      LOG(ERROR) << std::string(std::strerror(err)) << " on WAL " << base_path_;
+      LOG(ERROR) << std::string(::tinylamb::platform::StrError(err))
+                 << " on WAL " << base_path_;
     }
   } else {
-    LOG(ERROR) << std::string(std::strerror(err)) << " (WAL " << base_path_
-               << ")";
+    LOG(ERROR) << std::string(::tinylamb::platform::StrError(err)) << " (WAL "
+               << base_path_ << ")";
   }
   durable_cv_.notify_all();
   {
@@ -1067,7 +1074,7 @@ Status Logger::CheckFailed() const {
   }
   return StatusError(StatusCode::kIOError,
                      "Logger write failed: " +
-                         std::string(std::strerror(
+                         std::string(::tinylamb::platform::StrError(
                              error_number_.load(std::memory_order_acquire))));
 }
 
@@ -1154,7 +1161,8 @@ Status Logger::WaitForDurable(lsn_t lsn) {
   // The guard is constructed immediately after the increment, before any
   // early-return check, so every exit -- including the already-satisfied path
   // and the exception translation below -- decrements the waiter count.
-  struct WaiterGuard {
+  struct WaiterGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                        // scope-owned cleanup.
     std::atomic<int>& count;
     ~WaiterGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
   } waiter_guard{pending_durable_waiters_};
@@ -1199,9 +1207,10 @@ Status Logger::RollToLocked(uint64_t index) {
       const int saved = errno == 0 ? EIO : errno;
       platform::CloseFile(dst_);
       dst_ = -1;
-      return StatusError(StatusCode::kIOError,
-                         "Failed to stat WAL segment before roll: " +
-                             std::string(std::strerror(saved)));
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to stat WAL segment before roll: " +
+              std::string(::tinylamb::platform::StrError(saved)));
     }
     if (file_size < 0) {
       platform::CloseFile(dst_);
@@ -1221,9 +1230,10 @@ Status Logger::RollToLocked(uint64_t index) {
         const int saved = errno;
         platform::CloseFile(dst_);
         dst_ = -1;
-        return StatusError(StatusCode::kIOError,
-                           "Failed to extend WAL segment before roll: " +
-                               std::string(std::strerror(saved)));
+        return StatusError(
+            StatusCode::kIOError,
+            "Failed to extend WAL segment before roll: " +
+                std::string(::tinylamb::platform::StrError(saved)));
       }
     } else if (std::cmp_greater(
                    file_size,
@@ -1243,9 +1253,10 @@ Status Logger::RollToLocked(uint64_t index) {
       const int saved = errno;
       platform::CloseFile(dst_);
       dst_ = -1;
-      return StatusError(StatusCode::kIOError,
-                         "Failed to fsync WAL segment before roll: " +
-                             std::string(std::strerror(saved)));
+      return StatusError(
+          StatusCode::kIOError,
+          "Failed to fsync WAL segment before roll: " +
+              std::string(::tinylamb::platform::StrError(saved)));
     }
     platform::CloseFile(dst_);
     dst_ = -1;
@@ -1278,7 +1289,7 @@ Status Logger::RollToLocked(uint64_t index) {
     platform::CloseFile(fd);
     return StatusError(StatusCode::kIOError,
                        "Failed to allocate next WAL segment: " +
-                           std::string(std::strerror(saved)));
+                           std::string(::tinylamb::platform::StrError(saved)));
   }
   footer_generation_ = 0;
   Status directory_status = SyncDirectoryOf(SegmentPath(base_path_, index));
@@ -1376,9 +1387,9 @@ Status Logger::TruncateTo(lsn_t valid_end) {
     const int saved = errno;
     platform::CloseFile(tail_fd);
     SetFailed(saved);
-    return StatusError(StatusCode::kIOError, "Failed to truncate WAL segment " +
-                                                 tail.string() + ": " +
-                                                 std::strerror(saved));
+    return StatusError(StatusCode::kIOError,
+                       "Failed to truncate WAL segment " + tail.string() +
+                           ": " + ::tinylamb::platform::StrError(saved));
   }
   if (FdataSync(tail_fd) != 0) {
     const int saved = errno;
@@ -1386,7 +1397,7 @@ Status Logger::TruncateTo(lsn_t valid_end) {
     SetFailed(saved);
     return StatusError(StatusCode::kIOError,
                        std::string("Failed to fsync truncated WAL segment: ") +
-                           std::string(std::strerror(saved)));
+                           std::string(::tinylamb::platform::StrError(saved)));
   }
   Status directory_status = SyncDirectoryOf(base_path_);
   if (directory_status != Status::kSuccess) {
@@ -1526,8 +1537,8 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
     const lsn_t advise_to =
         std::min<lsn_t>(segment_start + segment_size_, before);
     if (advise_to > segment_start) {
-      platform::AdviseDontNeed(
-          fd, 0, static_cast<int64_t>(advise_to - segment_start));
+      platform::AdviseDontNeed(fd, 0,
+                               static_cast<int64_t>(advise_to - segment_start));
     }
     platform::CloseFile(fd);
   }
@@ -1662,10 +1673,10 @@ Status Logger::Finish() {
 Status Logger::CheckAppendSize(size_t size) const {
   // D1: refuse records the recovery reader could never parse back.
   if (size > kMaxRecordSize) {
-    return StatusError(StatusCode::kTooBigData,
-                       "WAL record exceeds Logger::kMaxRecordSize: " +
-                           std::to_string(size) + " > " +
-                           std::to_string(kMaxRecordSize));
+    return StatusError(
+        StatusCode::kTooBigData,
+        "WAL record exceeds Logger::kMaxRecordSize: " + std::to_string(size) +
+            " > " + std::to_string(kMaxRecordSize));
   }
   if (size > segment_size_) {
     return StatusError(StatusCode::kTooBigData,

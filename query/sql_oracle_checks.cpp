@@ -362,7 +362,7 @@ namespace {
 
 struct ScopedEnv {
   ScopedEnv(const char* name, const char* value) : name_(name) {
-    if (const char* prev = std::getenv(name)) {
+    if (const char* prev = ::tinylamb::platform::GetEnv(name)) {
       had_prev_ = true;
       prev_ = prev;
     }

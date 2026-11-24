@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/memory_budget.hpp"
 #include "common/query_grant.hpp"
 #include "common/random_string.hpp"
@@ -29,15 +30,15 @@ namespace {
 class EnvVarGuard {
  public:
   EnvVarGuard(const char* name, const char* value) : name_(name) {
-    const char* prev = std::getenv(name);
+    const char* prev = ::tinylamb::platform::GetEnv(name);
     if (prev != nullptr) {
       had_prev_ = true;
       prev_ = prev;
     }
     if (value != nullptr) {
-      setenv(name_, value, 1);
+      ::tinylamb::platform::SetEnv(name_, value, 1);
     } else {
-      unsetenv(name_);
+      ::tinylamb::platform::UnsetEnv(name_);
     }
   }
   EnvVarGuard(const EnvVarGuard&) = delete;
@@ -46,9 +47,9 @@ class EnvVarGuard {
   EnvVarGuard& operator=(EnvVarGuard&&) = delete;
   ~EnvVarGuard() {
     if (had_prev_) {
-      setenv(name_, prev_.c_str(), 1);
+      ::tinylamb::platform::SetEnv(name_, prev_.c_str(), 1);
     } else {
-      unsetenv(name_);
+      ::tinylamb::platform::UnsetEnv(name_);
     }
   }
 

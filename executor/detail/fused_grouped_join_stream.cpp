@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/parallel_work.hpp"
 #include "common/platform/int128_conversion.hpp"
@@ -117,7 +118,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   if ((fusion == nullptr) || !fusion->eligible || fusion->having ||
       statement.Sources().size() != 2 || (outer != nullptr) || !ctes.empty() ||
       fusion->group_keys.size() > 1 || fusion->aggregates.empty() ||
-      (std::getenv("TINYLAMB_DISABLE_FUSED_STREAM_GROUPED_JOIN") != nullptr)) {
+      (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FUSED_STREAM_GROUPED_JOIN") != nullptr)) {
     return decline();
   }
   for (size_t i = 0; i < 2; ++i) {
@@ -3352,7 +3353,7 @@ StatusOr<DistinctLSTableProbeOutcome> TryDistinctLSTableProbe(
     const size_t part_mask = kParts - 1;
     bool use_jit_packed_dedup =
         deferred_left_probe != nullptr && n_keys == 2 &&
-        std::getenv("TINYLAMB_DISABLE_JIT_PACKED_DEDUP") == nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_JIT_PACKED_DEDUP") == nullptr;
     std::array<std::optional<JitPacked2x32RadixDedup::PackKernel>, 8>
         jit_pack_kernels;
     std::optional<JitPacked2x32RadixDedup::ScatterKernel> jit_scatter_kernel;

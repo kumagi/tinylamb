@@ -1,5 +1,7 @@
 # 派生分析ベンチマーク比較（5種 × 3DB、SF指定・グループ棒グラフ）
 
+[CostBench・Snowset/PBench・Iceberg・Public BI の追加比較](reports/cloud-bi/README.md)は、同じ 3 エンジンのアダプターを使って混在負荷、巨大 SQL、削除適用、実データの文字列集約を測定しています。
+
 `analytics_bench.py` は、既存の3製品比較ハーネス（`run.py`）とは独立した
 スタンドアロンツールです。既存ファイルは変更しません。
 

@@ -37,6 +37,7 @@
 
 #include "common/constants.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "common/serdes.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
@@ -204,7 +205,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
           if (error_out != nullptr) {
             *error_out = write_st;
           }
-          segment_writer_->Abort();
+          segment_writer_
+              ->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                          // rollback preserves the primary error.
           segment_writer_.reset();
           spill_segment_id_ = kInvalidSpillSegmentId;
           spill_store_.reset();
@@ -221,7 +224,9 @@ bool TransactionWriteSet::TryInsert(const value_type& value,
         if (error_out != nullptr) {
           *error_out = write_st;
         }
-        segment_writer_->Abort();
+        segment_writer_
+            ->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                        // rollback preserves the primary error.
         segment_writer_.reset();
         spill_segment_id_ = kInvalidSpillSegmentId;
         spill_store_.reset();
@@ -414,7 +419,9 @@ void TransactionWriteSet::clear() {
   std::unordered_set<RowPosition>().swap(spill_);
   std::vector<RowPosition>().swap(spill_tail_);
   if (segment_writer_ != nullptr) {
-    segment_writer_->Abort();
+    segment_writer_
+        ->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                    // rollback preserves the primary error.
     segment_writer_.reset();
   }
   if (spill_segment_id_ != kInvalidSpillSegmentId && spill_store_ != nullptr) {
@@ -596,7 +603,7 @@ void Transaction::FinalizeFinishHooks() noexcept {
 Transaction::Transaction(txn_id_t txn_id, TransactionManager* tm,
                          bool read_only)
     : txn_id_(txn_id),
-      
+
       shard_epoch_(NextShardEpoch()),
       transaction_manager_(tm),
       status_(TransactionStatus::kRunning),
@@ -1385,7 +1392,8 @@ StatusOr<lsn_t> Transaction::DestroyPageLog(
 
 bool Transaction::NoWaitForConflicts() const {
   return transaction_manager_ != nullptr &&
-         transaction_manager_->GetDeadlockPolicy() == TransactionManager::DeadlockPolicy::kNoWait;
+         transaction_manager_->GetDeadlockPolicy() ==
+             TransactionManager::DeadlockPolicy::kNoWait;
 }
 
 void Transaction::NoteWaitForHolder(txn_id_t holder, RowPosition row) const {
@@ -1452,7 +1460,8 @@ std::chrono::milliseconds Transaction::DefaultStatementTimeout() noexcept {
     return std::chrono::milliseconds(over);
   }
   static const int64_t kEnvTimeoutMs = []() -> int64_t {
-    const char* raw = std::getenv("TINYLAMB_STATEMENT_TIMEOUT_MS");
+    const char* raw =
+        ::tinylamb::platform::GetEnv("TINYLAMB_STATEMENT_TIMEOUT_MS");
     if (raw == nullptr || *raw == '\0') {
       return 0;
     }

@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
+
 // setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
@@ -57,7 +59,8 @@ TEST(SpillFileTest, AppendRejectsOversizedStringsWithoutChangingTheFile) {
   constexpr size_t limit = std::numeric_limits<bin_size_t>::max();
   constexpr size_t kMaxOversizedTestAllocation = 1U << 20;
   if (limit >= kMaxOversizedTestAllocation) {
-    GTEST_SKIP() << "bin_size_t limit is too large for an oversized-string test";
+    GTEST_SKIP()
+        << "bin_size_t limit is too large for an oversized-string test";
   }
   const Value oversized(std::string(limit + 1, 'a'));
   const Row invalid({oversized});
@@ -382,27 +385,31 @@ TEST(SpillFileTest, TempDirectory_WhenEnvSet_HonorsEnvPath) {
       std::filesystem::temp_directory_path() /
       ("tinylamb_spill_test_env_" + RandomString());
   {
-    const char* previous_temp = std::getenv("TINYLAMB_TEMP");
-    const std::string saved_temp = previous_temp != nullptr ? previous_temp : "";
-    struct TempEnvGuard {
+    const char* previous_temp = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP");
+    const std::string saved_temp =
+        previous_temp != nullptr ? previous_temp : "";
+    struct
+        TempEnvGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                        // scope-owned cleanup.
       std::filesystem::path dir;
       bool had_value;
       std::string saved;
       ~TempEnvGuard() {
         if (had_value) {
-          setenv("TINYLAMB_TEMP", saved.c_str(), 1);
+          ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", saved.c_str(), 1);
         } else {
-          unsetenv("TINYLAMB_TEMP");
+          ::tinylamb::platform::UnsetEnv("TINYLAMB_TEMP");
         }
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
       }
-    } env_guard{.dir=tmp, .had_value=previous_temp != nullptr, .saved=saved_temp};
+    } env_guard{
+        .dir = tmp, .had_value = previous_temp != nullptr, .saved = saved_temp};
     std::error_code ec;
     std::filesystem::remove_all(tmp, ec);
     std::filesystem::create_directories(tmp, ec);
     ASSERT_FALSE(ec) << ec.message();
-    setenv("TINYLAMB_TEMP", tmp.c_str(), 1);
+    ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", tmp.c_str(), 1);
     EXPECT_EQ(SpillFile::TempDirectory(), tmp);
     {
       SpillFile spill;
@@ -435,11 +442,15 @@ TEST(SpillFileTest, RowReaderStreamsRowsAndTracksFileBytes) {
 
   ASSIGN_OR_ASSERT_FAIL(SpillFile::RowReader, original, spill.OpenRowReader());
   SpillFile::RowReader moved(std::move(original));
+  // NOLINTNEXTLINE(bugprone-use-after-move): moved-from reader state is tested.
   EXPECT_FALSE(original.IsOpen());
+  // NOLINTNEXTLINE(bugprone-use-after-move): moved-from reader state is tested.
   EXPECT_EQ(original.Remaining(), 0U);
   ASSIGN_OR_ASSERT_FAIL(SpillFile::RowReader, reader, spill.OpenRowReader());
   reader = std::move(moved);
+  // NOLINTNEXTLINE(bugprone-use-after-move): moved-from reader state is tested.
   EXPECT_FALSE(moved.IsOpen());
+  // NOLINTNEXTLINE(bugprone-use-after-move): moved-from reader state is tested.
   EXPECT_EQ(moved.Remaining(), 0U);
   EXPECT_TRUE(reader.IsOpen());
   EXPECT_EQ(reader.Remaining(), static_cast<uint64_t>(kRows));

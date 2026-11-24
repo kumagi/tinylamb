@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -319,8 +320,9 @@ struct PlanMemorySettings {
 
   static PlanMemorySettings Current() noexcept {
     const auto& budget = ProcessMemoryBudget::Global();
-    return {.process_limit=budget.Limit(), .operator_limit=budget.OpMemoryOverrideBytes(),
-            .always_spill=budget.AlwaysSpillEnabled()};
+    return {.process_limit = budget.Limit(),
+            .operator_limit = budget.OpMemoryOverrideBytes(),
+            .always_spill = budget.AlwaysSpillEnabled()};
   }
   bool operator==(const PlanMemorySettings&) const = default;
 };
@@ -530,7 +532,9 @@ inline void DemoteVolatileFingerprint(const std::string& fingerprint,
 
 // A compile that folds session data permanently excludes this fingerprint
 // from reuse, including when compilation exits by throwing.
-class ScopedFoldFingerprint {
+class ScopedFoldFingerprint {  // NOLINT(cppcoreguidelines-special-member-functions):
+                               // scope-owned cleanup.
+
  public:
   ScopedFoldFingerprint(const std::string& fingerprint, const bool& folded)
       : fingerprint_(fingerprint),
@@ -556,46 +560,57 @@ class ScopedFoldFingerprint {
     bits |= uint64_t{1} << 8U;
   }
   const auto env_on = [](const char* name) noexcept {
-    const char* v = std::getenv(name);
+    const char* v = ::tinylamb::platform::GetEnv(name);
     return v != nullptr && v[0] != '\0';
   };
-  if (env_on("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN")) { bits |= uint64_t{1} << 9U;
-}
-  if (env_on("TINYLAMB_DISABLE_DISTINCT_ON_TOP1")) { bits |= uint64_t{1} << 10U;
-}
-  if (env_on("TINYLAMB_DISABLE_OUTER_OR_BRANCHES")) { bits |= uint64_t{1} << 11U;
-}
-  if (env_on("TINYLAMB_DISABLE_OUTER_FETCH_TIES")) { bits |= uint64_t{1} << 12U;
-}
-  if (env_on("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS")) { bits |= uint64_t{1} << 13U;
-}
+  if (env_on("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN")) {
+    bits |= uint64_t{1} << 9U;
+  }
+  if (env_on("TINYLAMB_DISABLE_DISTINCT_ON_TOP1")) {
+    bits |= uint64_t{1} << 10U;
+  }
+  if (env_on("TINYLAMB_DISABLE_OUTER_OR_BRANCHES")) {
+    bits |= uint64_t{1} << 11U;
+  }
+  if (env_on("TINYLAMB_DISABLE_OUTER_FETCH_TIES")) {
+    bits |= uint64_t{1} << 12U;
+  }
+  if (env_on("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS")) {
+    bits |= uint64_t{1} << 13U;
+  }
   if (env_on("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE")) {
     bits |= uint64_t{1} << 14U;
-}
-  if (env_on("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME")) { bits |= uint64_t{1} << 15U;
-}
+  }
+  if (env_on("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME")) {
+    bits |= uint64_t{1} << 15U;
+  }
   if (env_on("TINYLAMB_DISABLE_RANGE_DISTINCT_INDEX")) {
     bits |= uint64_t{1} << 16U;
-}
+  }
   if (env_on("TINYLAMB_DISABLE_QUANTIFIED_RANGE_SUMMARY")) {
     bits |= uint64_t{1} << 17U;
-}
-  if (env_on("TINYLAMB_DISABLE_DEMAND_SCALAR")) { bits |= uint64_t{1} << 18U;
-}
-  if (env_on("TINYLAMB_DISABLE_SKYLINE_ANTIJOIN")) { bits |= uint64_t{1} << 19U;
-}
+  }
+  if (env_on("TINYLAMB_DISABLE_DEMAND_SCALAR")) {
+    bits |= uint64_t{1} << 18U;
+  }
+  if (env_on("TINYLAMB_DISABLE_SKYLINE_ANTIJOIN")) {
+    bits |= uint64_t{1} << 19U;
+  }
   if (env_on("TINYLAMB_DISABLE_INTERVAL_COUNT_SWEEP")) {
     bits |= uint64_t{1} << 20U;
-}
-  if (env_on("TINYLAMB_DISABLE_PACKED_ORDER_KEY")) { bits |= uint64_t{1} << 21U;
-}
-  if (env_on("TINYLAMB_DISABLE_WINDOW_HALO")) { bits |= uint64_t{1} << 22U;
-}
+  }
+  if (env_on("TINYLAMB_DISABLE_PACKED_ORDER_KEY")) {
+    bits |= uint64_t{1} << 21U;
+  }
+  if (env_on("TINYLAMB_DISABLE_WINDOW_HALO")) {
+    bits |= uint64_t{1} << 22U;
+  }
   if (env_on("TINYLAMB_DISABLE_GROUPED_JOIN_FUSION")) {
     bits |= uint64_t{1} << 23U;
-}
-  if (env_on("TINYLAMB_DISABLE_BLOCK_KLEENE")) { bits |= uint64_t{1} << 24U;
-}
+  }
+  if (env_on("TINYLAMB_DISABLE_BLOCK_KLEENE")) {
+    bits |= uint64_t{1} << 24U;
+  }
   return bits;
 }
 

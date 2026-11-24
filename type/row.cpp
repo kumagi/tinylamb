@@ -61,7 +61,7 @@ size_t Row::Serialize(char* dst) const {
     memset(dst, 0, bitmap_size);
     for (size_t i = 0; i < values_.size(); ++i) {
       if (values_[i].IsNull()) {
-        dst[i / 8] |= static_cast<char>(1U << (i % 8));
+        dst[i / 8] |= static_cast<char>(1U << (i % 8));  // NOLINT(bugprone-narrowing-conversions): byte mask fits in the low byte.
       }
     }
     dst += bitmap_size;

@@ -251,8 +251,7 @@ class LsmRunCursor {
 
 // Writes sorted entries from an arbitrary producer callback as CRC-protected
 // ~32 KiB SSTable blocks sequentially into `fd` starting at `*append_offset`.
-Status WriteLsmRunStream(int fd, std::mutex& file_mu,
-                         uint64_t* append_offset,
+Status WriteLsmRunStream(int fd, std::mutex& file_mu, uint64_t* append_offset,
                          const std::function<bool(LsmRunEntry*)>& next_entry,
                          std::vector<LsmRunBlockMeta>* blocks_out,
                          uint64_t* entry_count_out, bool* has_tombstones_out);
@@ -261,8 +260,8 @@ Status WriteLsmRunStream(int fd, std::mutex& file_mu,
 // optional newest sorted memory overlay producer (`next_mem_entry`), writing
 // the merged output run to `out_fd` (~O(K * 32 KiB) memory total).
 Status MergeLsmSourcesToFd(
-    int in_fd, std::mutex& in_file_mu, int out_fd,
-    std::mutex& out_file_mu, uint64_t* out_append_offset, LsmBlockCache& cache,
+    int in_fd, std::mutex& in_file_mu, int out_fd, std::mutex& out_file_mu,
+    uint64_t* out_append_offset, LsmBlockCache& cache,
     std::span<const LsmRunSpec> runs,
     const std::function<bool(LsmRunEntry*)>& next_mem_entry,
     bool drop_tombstones, std::vector<LsmRunBlockMeta>* blocks_out,
@@ -284,12 +283,12 @@ Status MergeLsmSourcesToFd(
 // value resolution, inclusive bounds (empty `end` means unbounded above).
 // On I/O or decode failure Next() returns false and status() reports the
 // error; entries already emitted stay valid.
-class LsmScanCursor {
+class LsmScanCursor {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
+
  public:
   LsmScanCursor() = default;
   virtual ~LsmScanCursor() = default;
-  LsmScanCursor(const LsmScanCursor&) = delete;
-  LsmScanCursor& operator=(const LsmScanCursor&) = delete;
 
   // Advances to the next live entry. On success `out` receives an owned copy
   // of the resolved (key, value) pair and true is returned. Returns false at

@@ -24,8 +24,8 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <ranges>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -55,7 +55,6 @@ namespace tinylamb {
 // A write set can live on disk, so enumeration must expose I/O failures.
 static_assert(!std::ranges::range<TransactionWriteSet>);
 static_assert(!std::ranges::range<const TransactionWriteSet>);
-
 
 class TransactionTest : public ::testing::Test {
  public:
@@ -115,7 +114,7 @@ class RecordingFinishHook final : public TransactionFinishHook {
 // of riding the full write-intent limit while holding its own row intents.
 TEST_F(TransactionTest, ReservationDrainBailsWhenWounded) {
   Transaction holder = tm_->Begin();
-  holder.ReserveIndexUndoBytes(1234, 512);
+  ASSERT_SUCCESS(holder.ReserveIndexUndoBytes(1234, 512));
   Transaction waiter = tm_->Begin();
   waiter.Wound();
   const auto start = std::chrono::steady_clock::now();
@@ -133,7 +132,7 @@ TEST_F(TransactionTest, ReservationDrainBailsWhenWounded) {
 // the same gate. Past the budget the honest kConflicts surfaces.
 TEST_F(TransactionTest, ReservationDrainHonorsShortBudget) {
   Transaction holder = tm_->Begin();
-  holder.ReserveIndexUndoBytes(4321, 512);
+  ASSERT_SUCCESS(holder.ReserveIndexUndoBytes(4321, 512));
   Transaction waiter = tm_->Begin();
   const auto start = std::chrono::steady_clock::now();
   const Status drained =
@@ -156,7 +155,9 @@ TEST_F(TransactionTest, Construct) {
 TEST(TransactionFinishHookTest, ConcurrentFinalizationRunsHookOnce) {
   class Counter final : public TransactionFinishHook {
    public:
-    void OnTransactionFinished(TransactionStatus /*status*/) noexcept override { ++calls; }
+    void OnTransactionFinished(TransactionStatus /*status*/) noexcept override {
+      ++calls;
+    }
     std::atomic<int> calls{0};
   };
   auto hook = std::make_shared<Counter>();
@@ -165,11 +166,12 @@ TEST(TransactionFinishHookTest, ConcurrentFinalizationRunsHookOnce) {
   txn.SetStatus(TransactionStatus::kCommitted);
   std::vector<std::thread> threads;
   threads.reserve(16);
-for (int i = 0; i < 16; ++i) {
+  for (int i = 0; i < 16; ++i) {
     threads.emplace_back([&] { txn.FinalizeFinishHooks(); });
-}
-  for (auto& thread : threads) { thread.join();
-}
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
   EXPECT_EQ(hook->calls.load(), 1);
 }
 
@@ -178,7 +180,7 @@ TEST(TransactionFinishHookTest, RegistrationRacingFinalizationRunsEachHook) {
   txn.SetStatus(TransactionStatus::kCommitted);
   std::vector<std::shared_ptr<RecordingFinishHook>> hooks;
   hooks.reserve(64);
-for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i < 64; ++i) {
     hooks.push_back(std::make_shared<RecordingFinishHook>());
   }
   std::barrier start(2);
@@ -485,11 +487,11 @@ TEST_F(TransactionTest, MvccWriteIntentCanFollowACommittedWriter) {
   EXPECT_TRUE(concurrent.AddWriteSet(rp));
   ASSERT_SUCCESS_AND_EQ(
       tm_->ReadVersion(concurrent, rp, std::string_view("new")), "new");
-  concurrent.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, concurrent.Abort());
 
   Transaction fresh = tm_->Begin();
   EXPECT_TRUE(fresh.AddWriteSet(rp));
-  fresh.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
 }
 
 TEST_F(TransactionTest, CompensateLogsThroughManager) {
@@ -529,7 +531,8 @@ TEST_F(TransactionTest, AddWriteSetFailsWhenMvccIntentHeldElsewhere) {
 }
 
 TEST_F(TransactionTest, AuditReservationModeKeepsRegistrationWithoutDiscount) {
-  const char* mode = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
+  const char* mode =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_RESERVATION");
   const bool discount_off = mode != nullptr && std::string_view(mode) == "4";
   if (mode != nullptr && std::string_view(mode) != "0" && !discount_off) {
     GTEST_SKIP() << "TINYLAMB_DISABLE_INDEX_RESERVATION is set to an "
@@ -537,7 +540,7 @@ TEST_F(TransactionTest, AuditReservationModeKeepsRegistrationWithoutDiscount) {
   }
   Transaction owner = tm_->Begin();
   Transaction other = tm_->Begin();
-  owner.ReserveIndexUndoBytes(132, 64);
+  ASSERT_SUCCESS(owner.ReserveIndexUndoBytes(132, 64));
   EXPECT_TRUE(tm_->HasForeignIndexReservations(other.ID()));
   EXPECT_EQ(other.IndexUndoReservedBytes(132), discount_off ? 0U : 64U);
   EXPECT_EQ(owner.IndexUndoReservedBytes(132), 0U);
@@ -832,7 +835,7 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
     ASSERT_TRUE(writer.IsFinished());
 
     // Must not roll back the committed write.
-    writer.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, writer.Abort());
     ASSERT_TRUE(writer.IsFinished());
 
     Transaction reader = tm.Begin(true);
@@ -853,7 +856,7 @@ TEST_F(TransactionTest, WoundFlagSurvivesMove) {
 
   Transaction moved = std::move(victim);
   EXPECT_TRUE(moved.IsWounded());
-  moved.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, moved.Abort());
 }
 
 }  // namespace tinylamb
@@ -995,7 +998,8 @@ TEST_F(TransactionTest, MoveAssignmentTransfersStatementTimer) {
 namespace {
 
 TEST_F(TransactionTest, WalStagingFailureDoesNotAppendRecord) {
-  struct ResetKnob {
+  struct ResetKnob {  // NOLINT(cppcoreguidelines-special-member-functions):
+                      // scope-owned cleanup.
     ~ResetKnob() {
       ProcessMemoryBudget::Global().SetTestMemoryFailCountdown(0);
     }
@@ -1519,9 +1523,8 @@ TEST_F(TransactionP6aTest,
 TEST_F(TransactionP6aTest,
        WriteSetSpillIoFailurePreservesStatusWithoutMaskingAsConflict) {
   tm_->SetWriteSetSpillThresholdForTest(64);
-  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
-  // non-copyable by design
-  struct InjectResetGuard {
+  struct InjectResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                             // scope-owned cleanup.
     ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } guard;
 
@@ -1549,7 +1552,9 @@ TEST_F(TransactionP6aTest,
   tm_->SetWriteSetSpillThresholdForTest(64);
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct InjectResetGuard {
+  struct
+      InjectResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } guard;
 

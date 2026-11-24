@@ -410,7 +410,8 @@ int main(int argc, char** argv) {
         !execute("UPDATE tpcc_transport_probe SET v=20 WHERE id=1")) {
       return 1;
     }
-    session->Abort();
+    session->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                       // rollback preserves the primary error.
     if (!execute("SELECT v FROM tpcc_transport_probe") ||
         rows != std::vector<Row>{Row{Value(int64_t{10})}}) {
       return 1;
@@ -429,7 +430,8 @@ int main(int argc, char** argv) {
                          &rows) == Status::kSuccess) {
       return 1;
     }
-    session->Abort();
+    session->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                       // rollback preserves the primary error.
     if (!execute("SELECT v FROM tpcc_transport_probe") ||
         rows != std::vector<Row>{Row{Value(int64_t{30})}} ||
         !execute("UPDATE tpcc_transport_probe SET v=0 WHERE id=2") ||

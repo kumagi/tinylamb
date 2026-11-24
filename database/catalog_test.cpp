@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
@@ -219,7 +220,7 @@ TEST_F(CatalogTest, GetTable) {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
                                 ctx.GetTable("test_schema"));
-    ctx.txn_.PreCommit();
+    EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
 
     // Assert -- retrieved table's schema matches the created schema
     ASSERT_EQ(new_schema, tbl->GetSchema());
@@ -432,7 +433,7 @@ TEST_F(CatalogTest, StreamDatabaseAndContext) {
   oss << *rs_;
   // Assert -- the database dump includes its PageStorage member
   EXPECT_NE(oss.str().find("PageStorage"), std::string::npos);
-  ctx.txn_.PreCommit();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, TransactionContextCache) {
@@ -480,7 +481,7 @@ TEST_F(CatalogTest, DebugDumpMultipleTables) {
   // Assert -- both tables are present in the dump
   EXPECT_NE(oss.str().find("tbl_one"), std::string::npos);
   EXPECT_NE(oss.str().find("tbl_two"), std::string::npos);
-  ctx.txn_.PreCommit();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
 }
 
 TEST_F(CatalogTest, GetTableNotExists) {
@@ -490,14 +491,14 @@ TEST_F(CatalogTest, GetTableNotExists) {
 
   // Assert -- the lookup fails with kNotExists
   ASSERT_EQ(status, Status::kNotExists);
-  ctx.txn_.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.Abort());
 }
 
 TEST_F(CatalogTest, PageStorageIgnoresRetiredPoolCapacityEnv) {
   // TINYLAMB_PAGE_POOL_BYTES is retired: PageManager::Create discards its
   // capacity argument. A stale value in the environment must not affect
   // database creation.
-  ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "8388608", 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_PAGE_POOL_BYTES", "8388608", 1), 0);
   {
     auto env_db_holder =
         Database::Create("catalog_test_env_pool-" + RandomString()).MoveValue();
@@ -509,10 +510,10 @@ TEST_F(CatalogTest, PageStorageIgnoresRetiredPoolCapacityEnv) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
     env_db.DeleteAll();
   }
-  unsetenv("TINYLAMB_PAGE_POOL_BYTES");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_PAGE_POOL_BYTES");
 
   // Arrange -- a sub-page value is equally ignored
-  ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "1000", 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_PAGE_POOL_BYTES", "1000", 1), 0);
   {
     auto small_env_db_holder =
         Database::Create("catalog_test_small_env-" + RandomString())
@@ -525,7 +526,7 @@ TEST_F(CatalogTest, PageStorageIgnoresRetiredPoolCapacityEnv) {
     ASSERT_SUCCESS(ctx.txn_.PreCommit());
     small_env_db.DeleteAll();
   }
-  unsetenv("TINYLAMB_PAGE_POOL_BYTES");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_PAGE_POOL_BYTES");
 }
 
 TEST_F(CatalogTest, PageStoragePageSlotsAllocateReuse) {
@@ -743,7 +744,7 @@ TEST_F(CatalogTest, CannotAddForeignKeyWhileParentDropWaitsForALease) {
             Status::kConflicts);
   ASSERT_SUCCESS(create_child.Abort());
   lease.Release();
-  reader.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, reader.Abort());
   drop_thread.join();
 
   auto check = rs_->BeginReadOnlyContext();

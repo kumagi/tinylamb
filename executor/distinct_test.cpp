@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -86,9 +87,9 @@ TEST(DistinctExecutorTest, CollapsesAllNan) {
 TEST(DistinctExecutorTest, DistinctOnFailureClearsPartialBatchAndStaysFailed) {
   const Schema schema("input", {Column("v", ValueType::kInt64)});
   auto key = BinaryExpressionExp(ConstantValueExp(Value(1)),
-                                 BinaryOperation::kDivide,
-                                 ColumnValueExp("v"));
-  auto source = std::make_shared<FakeSource>(Rows({Value(1), Value(0), Value(2)}));
+                                 BinaryOperation::kDivide, ColumnValueExp("v"));
+  auto source =
+      std::make_shared<FakeSource>(Rows({Value(1), Value(0), Value(2)}));
   DistinctExecutor distinct(source, schema, {key});
   DataChunk result;
   EXPECT_EQ(distinct.NextBatch(&result), 0U);
@@ -112,8 +113,9 @@ TEST(DistinctExecutorTest, CollapsesNulls) {
 }
 
 TEST(DistinctExecutorTest, CollapsesInfinities) {
-  std::vector<Value> vals{Value(INFINITY), Value(INFINITY), Value(-INFINITY),
-                          Value(-INFINITY)};
+  const double infinity = std::numeric_limits<double>::infinity();
+  std::vector<Value> vals{Value(infinity), Value(infinity), Value(-infinity),
+                          Value(-infinity)};
   EXPECT_EQ(CountDistinct(Rows(std::move(vals))), 2);
 }
 
@@ -127,8 +129,8 @@ TEST(DistinctExecutorTest, DistinctDoublesScenarioMatchesGoogleSql) {
   for (int k = 0; k < 9; ++k) {
     d(nan);
   }
-  d(INFINITY);
-  d(-INFINITY);
+  d(std::numeric_limits<double>::infinity());
+  d(-std::numeric_limits<double>::infinity());
   d(1.0);
   d(-1.0);
   d(1.0);

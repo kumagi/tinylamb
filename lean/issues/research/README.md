@@ -1,10 +1,18 @@
 # 次の SQL 最適化の未証明課題
 
+[DuckDB より遅かったクエリに対する未証明命題 50 件](duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。
+
+[クラウド・BI の命題 42 件](cloud-bi.md)（第九波）は、CostBench、Snowset/PBench、Iceberg、Public BI の比較結果から、書き換え条件と実行方式の検証課題を定めています。42 件すべて `theorem sound_* : *.Goal` を証明済み（[RESULTS.md](RESULTS.md)）。
+
 各モデルの主定理と元の SQL・実装との対応は、[接続命題と監査後の状況](sql-refinement.md)を参照。
 
 各 Issue は独立した研究課題。課題の作成側で参照計算・入力条件・観測結果を定め、証明担当者へ渡す前に提出型を固定する。計算量の結論にはコストを数える評価器を用いる。
 
-証明・反例の登録結果は [RESULTS.md](RESULTS.md) を参照（初回 26 件＋型検査済み提出型 1 件、差し戻し後・新規の 7 件（第二波）、追加第三波 6 件、第四波 36 件（jit-skip 16 + engine-opt 20）、第五波 27 件、第六波 18 件、第二波からの複合提出型 1 件をすべて証明または反例登録し、`lake build`（CheckProofs の `sorryAx` 検査込み）成功）。
+証明・反例の登録結果は [RESULTS.md](RESULTS.md) を参照（初回 26 件＋型検査済み提出型 1 件、差し戻し後・新規の 7 件（第二波）、追加第三波 6 件、第四波 36 件（jit-skip 16 + engine-opt 20）、第五波 27 件、第六波 18 件、第二波からの複合提出型 1 件、第九波（クラウド・BI）42 件をすべて証明または反例登録し、`lake build`（CheckProofs の `sorryAx` 検査込み）成功）。
+
+## クラウド・BI ワークロードの命題（第九波・証明済み）
+
+[42 件の Issue と提出型](cloud-bi.md)。CostBench（Quotes 10 件）、Snowset/PBench 派生（NestedBI 10 件）、Iceberg Merge-on-Read（DeleteFiles 11 件）、Public BI MLB_11（PublicBI 11 件）。全 42 件 `theorem sound_* : *.Goal` 証明済み（反例なし）。共通補題ライブラリ `ResearchProofs/CloudBI/Common.lean` を併設。
 
 ## 派生分析ベンチマークの実行計画と物理演算（第八波・未証明）
 

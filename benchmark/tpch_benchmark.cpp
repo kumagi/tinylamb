@@ -361,7 +361,7 @@ std::optional<fs::path> ResolveExecutable(const fs::path& requested) {
     return regular_file(requested) ? std::optional<fs::path>(requested)
                                    : std::nullopt;
   }
-  const char* path_env = std::getenv("PATH");
+  const char* path_env = ::tinylamb::platform::GetEnv("PATH");
   if (path_env == nullptr) {
     return std::nullopt;
   }
@@ -374,12 +374,12 @@ std::optional<fs::path> ResolveExecutable(const fs::path& requested) {
   size_t begin = 0;
   while (begin <= path.size()) {
     const size_t end = path.find(kPathSeparator, begin);
-    const std::string_view entry = path.substr(
-        begin, end == std::string_view::npos ? path.size() - begin
-                                             : end - begin);
+    const std::string_view entry =
+        path.substr(begin, end == std::string_view::npos ? path.size() - begin
+                                                         : end - begin);
     const fs::path directory =
         entry.empty() ? fs::current_path() : fs::path(entry);
-    const fs::path candidate = directory / requested;
+    fs::path candidate = directory / requested;
     if (regular_file(candidate)) {
       return candidate;
     }
@@ -539,7 +539,8 @@ bool CreateSchema(tinylamb::Database& database, std::string* error) {
   tinylamb::TransactionContext context = database.BeginContext();
   for (const TableSpec& table : Tables()) {
     if (!RunSql(database, context, table.ddl, error)) {
-      context.Abort();
+      // NOLINTNEXTLINE(bugprone-unused-return-value): preserve the primary error.
+      (void)context.Abort();
       return false;
     }
   }
@@ -623,7 +624,9 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
       database.GetTable(context, table.name);
   if (!found.HasValue()) {
     *error = "cannot open table " + std::string(table.name);
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   }
   tinylamb::Table destination = std::move(found.Value());
@@ -641,7 +644,8 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
   while (std::getline(input, line)) {
     tinylamb::Row row;
     if (!ParseRow(line, table, &row, error)) {
-      context.Abort();
+      // NOLINTNEXTLINE(bugprone-unused-return-value): preserve the primary error.
+      (void)context.Abort();
       return false;
     }
     const tinylamb::StatusOr<tinylamb::RowPosition> insert_result =
@@ -650,7 +654,8 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
       *error = "insert failed for " + std::string(table.name) +
                " at input row " + std::to_string(rows + 1) + ": " +
                std::string(ToString(insert_result.GetStatus()));
-      context.Abort();
+      // NOLINTNEXTLINE(bugprone-unused-return-value): preserve the primary error.
+      (void)context.Abort();
       return false;
     }
     ++rows;
@@ -665,7 +670,8 @@ bool LoadTable(tinylamb::Database& database, const Options& options,
       if (!reopened.HasValue()) {
         *error = "cannot reopen table " + std::string(table.name) + ": " +
                  reopened.GetStatus().GetMessage();
-        context.Abort();
+        // NOLINTNEXTLINE(bugprone-unused-return-value): preserve the primary error.
+        (void)context.Abort();
         return false;
       }
       destination = reopened.MoveValue();
@@ -782,7 +788,9 @@ bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
       engine.Execute(context, "ANALYZE;");
   if (!result.HasValue()) {
     *error = engine.LastError().empty() ? "ANALYZE failed" : engine.LastError();
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   }
   size_t tables = 0;
@@ -795,7 +803,9 @@ bool AnalyzeAllTables(tinylamb::Database& database, std::string* error) {
   if (const tinylamb::Status status = result.Value().GetStatus();
       status != tinylamb::Status::kSuccess) {
     *error = "ANALYZE failed: " + status.GetMessage();
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   }
   if (context.PreCommit() != tinylamb::Status::kSuccess) {
@@ -815,7 +825,9 @@ bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
       context, tinylamb::TpchBenchmarkQueryText(query - 1, scale_factor));
   if (!result.HasValue()) {
     *error = "Q" + std::to_string(query) + ": " + engine.LastError();
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   }
   size_t rows = 0;
@@ -823,11 +835,15 @@ bool RunQuery(tinylamb::Database& database, size_t query, double scale_factor,
     rows = result.Value().Drain();
   } catch (const std::exception& exception) {
     *error = "Q" + std::to_string(query) + ": " + exception.what();
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   } catch (...) {
     *error = "Q" + std::to_string(query) + ": unknown exception while draining";
-    context.Abort();
+    static_cast<void>(
+        context.Abort());  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     return false;
   }
   const double milliseconds =
@@ -929,7 +945,7 @@ int main(int argc, char** argv) {
   }
 
   // Cap query working memory so join/agg/sort spill before the host thrashes.
-  if (std::getenv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
     tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592",
                                0);  // 8 GiB
   }
@@ -965,7 +981,7 @@ int main(int argc, char** argv) {
   // --reuse-database runs that skipped the load path).  TINYLAMB_SKIP_ANALYZE=1
   // keeps persisted statistics when a profiling run must not fold the
   // ANALYZE cost into the collected window.
-  if (std::getenv("TINYLAMB_SKIP_ANALYZE") == nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_SKIP_ANALYZE") == nullptr) {
     const Clock::time_point analyze_begin = Clock::now();
     if (!AnalyzeAllTables(database, &error)) {
       std::cerr << "ANALYZE failed: " << error << '\n';

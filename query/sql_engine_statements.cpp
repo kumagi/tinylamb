@@ -1272,12 +1272,12 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
                   std::string(produced_query.GetStatus().GetMessage()));
             }
             relational_detail::Relation produced = produced_query.MoveValue();
-            produced.ForEachRow([&](const Row& row) {
+            RETURN_IF_FAIL(produced.ForEachRow([&](const Row& row) {
               if (!row.values_.empty()) {
                 state.working.push_back(row.values_.front());
                 ++inserted;
               }
-            });
+            }));
           } else {
             for (const auto& values : item.insert_values) {
               if (values.empty()) {
@@ -1823,7 +1823,8 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
       relational_detail::Relation, source_rel,
       (relational_detail::ExecuteQuery(ctx, *merge.Source(), nullptr, {})));
   std::vector<Row> source_rows;
-  source_rel.ForEachRow([&](const Row& row) { source_rows.push_back(row); });
+  RETURN_IF_FAIL(
+      source_rel.ForEachRow([&](const Row& row) { source_rows.push_back(row); }));
   const std::string source_alias =
       merge.SourceAlias().empty() ? merge.TargetTable() : merge.SourceAlias();
   const Schema source_schema =
@@ -2534,7 +2535,7 @@ StatusOr<Expression> SqlEngine::FoldQuantifiedComparison(
     }
   }
   dml_fold_applied_ = true;
-  if (std::getenv("TINYLAMB_FOLD_TRACE") != nullptr) {  // NOLINT(cert-err33-c)
+  if (::tinylamb::platform::GetEnv("TINYLAMB_FOLD_TRACE") != nullptr) {  // NOLINT(cert-err33-c)
     (void)fprintf(stderr, "[fold] quant cands=%zu neg=%d\n", candidates.size(),
                   (int)query.Negated());
   }
@@ -2749,7 +2750,8 @@ StatusOr<Executor> SqlEngine::ExecuteCreateTable(
     }
     relational_detail::Relation materialized = materialized_query.MoveValue();
     std::vector<Row> rows;
-    materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+    RETURN_IF_FAIL(materialized.ForEachRow(
+        [&rows](const Row& row) { rows.push_back(row); }));
     std::vector<Column> columns;
     columns.reserve(materialized.schema.ColumnCount());
     for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {
@@ -2927,8 +2929,8 @@ StatusOr<Executor> SqlEngine::ExecuteInsert(TransactionContext& ctx,
       return MaterializeFailure(materialized_query.GetStatus(), &last_error_);
     }
     relational_detail::Relation materialized = materialized_query.MoveValue();
-    materialized.ForEachRow(
-        [&rows](Row row) { rows.push_back(std::move(row)); });
+    RETURN_IF_FAIL(materialized.ForEachRow(
+        [&rows](Row row) { rows.push_back(std::move(row)); }));
   }
   if (insert.Query() == nullptr) {
     if (insert.Values().empty()) {
@@ -3764,7 +3766,8 @@ StatusOr<Executor> SqlEngine::ExecuteCreateMaterializedView(
   }
   relational_detail::Relation materialized = materialized_query.MoveValue();
   std::vector<Row> rows;
-  materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
+  RETURN_IF_FAIL(
+      materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); }));
   std::vector<Column> columns;
   columns.reserve(materialized.schema.ColumnCount());
   for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {

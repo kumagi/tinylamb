@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/string_util.hpp"
 
 namespace tinylamb {
@@ -22,7 +23,8 @@ namespace tinylamb {
 //   - lean/TinylambOpt/LikeShiftAnd.lean (shiftAnd_iff)
 inline std::atomic<bool>& FastLikeDisabledFlag() noexcept {
   static std::atomic<bool> flag = [] {
-    const char* env = std::getenv("TINYLAMB_DISABLE_FAST_LIKE");
+    const char* env =
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FAST_LIKE");
     return env != nullptr && env[0] == '1';
   }();
   return flag;
@@ -33,7 +35,7 @@ inline void SetFastLikeDisabledForTest(bool disabled) noexcept {
 }
 
 inline void ReloadFastLikeDisabledFromEnv() noexcept {
-  const char* env = std::getenv("TINYLAMB_DISABLE_FAST_LIKE");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FAST_LIKE");
   FastLikeDisabledFlag().store(env != nullptr && env[0] == '1',
                                std::memory_order_relaxed);
 }
@@ -70,8 +72,9 @@ inline bool EscapedLikeMatchUtf8(std::string_view value,
       }
     }
   }
-  while (p < pattern.size() && pattern[p] == '%') { ++p;
-}
+  while (p < pattern.size() && pattern[p] == '%') {
+    ++p;
+  }
   return p == pattern.size();
 }
 
@@ -114,16 +117,13 @@ struct CompiledLikePattern {
   std::vector<WildSegment> interior_wild;
 
   [[nodiscard]] static bool IsAllAscii(std::string_view v) noexcept {
-    for (const char ch : v) {
-      if (static_cast<uint8_t>(ch) >= kShiftAndAlphabetSize) {
-        return false;
-      }
-    }
-    return true;
+    return std::ranges::all_of(v, [](char ch) {
+      return static_cast<uint8_t>(ch) < kShiftAndAlphabetSize;
+    });
   }
 
   [[nodiscard]] static bool MatchWildAt(
-      const char* data, const std::vector<Token>& seg) noexcept {
+      std::string_view data, const std::vector<Token>& seg) noexcept {
     for (size_t i = 0; i < seg.size(); ++i) {
       if (!seg[i].is_wild && static_cast<uint8_t>(data[i]) != seg[i].byte) {
         return false;
@@ -280,7 +280,8 @@ struct CompiledLikePattern {
       if (!has_underscore) {
         return value == head_literal;
       }
-      return n == head_wild.size() && MatchWildAt(value.data(), head_wild);
+      return n == head_wild.size() &&
+             MatchWildAt(value.substr(0, head_wild.size()), head_wild);
     }
 
     size_t pos = 0;
@@ -318,19 +319,19 @@ struct CompiledLikePattern {
 
     if (head_anchor) {
       if (end - pos < head_wild.size() ||
-          !MatchWildAt(value.data(), head_wild)) {
+          !MatchWildAt(value.substr(0, head_wild.size()), head_wild)) {
         return false;
       }
       pos += head_wild.size();
     }
     if (tail_anchor) {
       if (end - pos < tail_wild.size() ||
-          !MatchWildAt(value.data() + end - tail_wild.size(), tail_wild)) {
+          !MatchWildAt(value.substr(end - tail_wild.size(), tail_wild.size()),
+                       tail_wild)) {
         return false;
       }
       end -= tail_wild.size();
     }
-    const char* pdata = value.data();
     for (const WildSegment& seg : interior_wild) {
       const size_t slen = seg.tokens.size();
       if (end - pos < slen) {
@@ -344,7 +345,7 @@ struct CompiledLikePattern {
         bool matched = false;
         for (size_t i = pos; i < end; ++i) {
           state = ((state << 1U) | uint64_t{1}) &
-                  seg.sa_mask[static_cast<unsigned char>(pdata[i])];
+                  seg.sa_mask[static_cast<unsigned char>(value[i])];
           if ((state & accept) != 0) {
             pos = i + 1;
             matched = true;
@@ -357,7 +358,7 @@ struct CompiledLikePattern {
       } else {
         bool matched = false;
         for (size_t s = pos; s + slen <= end; ++s) {
-          if (MatchWildAt(pdata + s, seg.tokens)) {
+          if (MatchWildAt(value.substr(s, slen), seg.tokens)) {
             pos = s + slen;
             matched = true;
             break;
@@ -421,8 +422,9 @@ struct LiteralLikePattern {
   std::string_view literal;
 
   static std::optional<LiteralLikePattern> Compile(std::string_view pattern) {
-    if (pattern.find('\\') != std::string_view::npos) { return std::nullopt;
-}
+    if (pattern.find('\\') != std::string_view::npos) {
+      return std::nullopt;
+    }
     // Strip all consecutive wildcards at each end; %%abc%% is the same
     // pattern as %abc% and must still be treated as a pure substring match.
     const bool leading = pattern.starts_with('%');

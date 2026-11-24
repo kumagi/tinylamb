@@ -85,7 +85,7 @@ inline std::vector<Row> RelationalRun(Database& database, std::string_view sql,
   std::vector<Row> rows;
   if (!prepared.HasValue()) {
     ADD_FAILURE() << sql << "\n" << engine.LastError();
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return rows;
   }
   Row row;
@@ -108,7 +108,7 @@ inline std::string ExplainAnalyze(Database& database, std::string_view sql,
   std::string profile;
   if (!prepared.HasValue()) {
     ADD_FAILURE() << sql << "\n" << engine.LastError();
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return profile;
   }
   Row row;

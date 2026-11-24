@@ -216,7 +216,7 @@ class TpcdsQueryTest : public ::testing::Test {
     StatusOr<QueryResult> result = engine.Execute(context, sql);
     if (!result.HasValue()) {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return;
     }
     result.Value().Drain();
@@ -253,7 +253,7 @@ class TpcdsQueryTest : public ::testing::Test {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << " -> " << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return {};
     }
     std::vector<Row> rows;

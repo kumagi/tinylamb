@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "common/test_util.hpp"
+#include "common/platform/process.hpp"
 #include "executor/executor_test.hpp"
 
 namespace tinylamb {
@@ -111,8 +113,8 @@ TEST_F(ExecutorTest, IndexScanRejectedPredicateReleasesWriteIntent) {
   TransactionContext contender = rs_->BeginContext();
   EXPECT_TRUE(contender.txn_.TryAddWriteSet(candidate));
   EXPECT_SUCCESS(contender.Abort());
-  find_context.Abort();
-  scan_context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, find_context.Abort());
+  EXPECT_EQ(tinylamb::Status::kSuccess, scan_context.Abort());
 }
 
 TEST_F(ExecutorTest, IndexOnlyScan) {
@@ -598,7 +600,7 @@ TEST_F(ExecutorTest, IndexScanPrefetchesHeapPagesAhead) {
                             Value(static_cast<int64_t>(i) * 2)}));
   }
   static const bool prefetch_disabled =
-      std::getenv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
   if (prefetch_disabled) {
     EXPECT_EQ(warmed, 0U);
   } else {
@@ -2254,7 +2256,7 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanSurfacesDeferredRowErrors) {
   // match or a non-match: the scan ends in an error, never a row.
   EXPECT_TRUE(keys.empty());
   EXPECT_FALSE(keys.contains(kBoomKey));
-  reader.txn_.PreCommit();
+  EXPECT_EQ(tinylamb::Status::kSuccess, reader.txn_.PreCommit());
 }
 
 TEST_F(ExecutorTest, ThreadLocalAggregationMergesPartialAndDistinctStates) {

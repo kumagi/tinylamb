@@ -1,7 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/platform/process.hpp"
 #include "query/sql_aggregate_fuzzer.hpp"
 
+#include <filesystem>
+#include <system_error>
 #include <dirent.h>
 
 #include <cstdint>
@@ -21,20 +24,15 @@ namespace {
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
-  DIR* handle = opendir(dir.c_str());
-  if (handle == nullptr) {
-    return files;
-  }
-  while (const dirent* entry = readdir(handle)) {
-    const std::string name = entry->d_name;
-    if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      std::string path = dir;
-      path += "/";
-      path += name;
-      files.push_back(path);
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const std::filesystem::path path = it->path();
+    if (path.filename().string().ends_with(".test")) {
+      files.push_back(path.string());
     }
   }
-  closedir(handle);
   return files;
 }
 
@@ -73,7 +71,7 @@ void RunSeededAggregateRange(uint32_t begin_seed, uint32_t end_seed) {
 
 TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard0) {
   uint32_t end_seed = 24;
-  if (const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS")) {
+  if (const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS")) {
     char* end = nullptr;
     errno = 0;
     const unsigned long parsed = std::strtoul(scale, &end, 10);
@@ -130,7 +128,7 @@ TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {
 // TINYLAMB_AGGREGATE_REGRESSION_DIR at a directory to enable; with no
 // directory the test passes trivially.
 TEST(SqlAggregateFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_AGGREGATE_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_AGGREGATE_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }

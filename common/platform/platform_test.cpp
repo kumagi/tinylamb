@@ -118,10 +118,12 @@ TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
 #endif
 
 TEST(PlatformRandomTest, UniformIntAndShuffleMatchLibstdcxxVectors) {
+  // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp): fixed regression vector.
   std::mt19937 uniform_engine(12345);
   for (int expected : {59, 55, 8, -7, -2, -14, -1, 50}) {
     EXPECT_EQ(UniformInt(uniform_engine, -17, 64), expected);
   }
+  // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp): fixed regression vector.
   std::mt19937 shuffle_engine(12345);
   std::array values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
   Shuffle(values.begin(), values.end(), shuffle_engine);
@@ -173,21 +175,21 @@ TEST(SoftExtendedAuditTest, ArithmeticRetainsLowBitsAndRoundsEven) {
 }
 
 TEST(ProcessAuditTest, InvalidOverrideLeavesEnvironmentUnchanged) {
-  constexpr char kEnv[] = "TINYLAMB_AUDIT_INVALID_OVERRIDE";
+  constexpr const char* kEnv = "TINYLAMB_AUDIT_INVALID_OVERRIDE";
   ASSERT_EQ(SetEnv(kEnv, "parent", 1), 0);
   std::string error;
   EXPECT_EQ(RunProcess("unused_program", {},
                        {{kEnv, "child"}, {"bad=key", "value"}}, &error),
             -1);
   EXPECT_EQ(error, "invalid environment override");
-  EXPECT_STREQ(std::getenv(kEnv), "parent");
+  EXPECT_STREQ(::tinylamb::platform::GetEnv(kEnv), "parent");
   EXPECT_EQ(UnsetEnv(kEnv), 0);
 }
 
 #ifdef TINYLAMB_OS_WINDOWS
 TEST(ProcessAuditTest, ConcurrentChildrenReceiveIndependentEnvironmentBlocks) {
-  constexpr char kEnv[] = "TINYLAMB_AUDIT_CHILD_ENV";
-  const char* shell = std::getenv("ComSpec");
+  constexpr const char* kEnv = "TINYLAMB_AUDIT_CHILD_ENV";
+  const char* shell = ::tinylamb::platform::GetEnv("ComSpec");
   ASSERT_NE(shell, nullptr);
   const std::filesystem::path executable(shell);
   ASSERT_EQ(SetEnv(kEnv, "parent", 1), 0);
@@ -203,9 +205,9 @@ TEST(ProcessAuditTest, ConcurrentChildrenReceiveIndependentEnvironmentBlocks) {
   auto second = std::async(std::launch::async, launch, "second");
   first.get();
   second.get();
-  EXPECT_STREQ(std::getenv(kEnv), "parent");
+  EXPECT_STREQ(::tinylamb::platform::GetEnv(kEnv), "parent");
   EXPECT_EQ(UnsetEnv(kEnv), 0);
-  EXPECT_EQ(std::getenv(kEnv), nullptr);
+  EXPECT_EQ(::tinylamb::platform::GetEnv(kEnv), nullptr);
 }
 #else
 TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
@@ -213,6 +215,11 @@ TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
   // A failed EXPECT below still unwinds this guard: the variable is
   // process-wide, so an early ASSERT/return must not leak it to later tests.
   struct EnvGuard {
+    EnvGuard() = default;
+    EnvGuard(const EnvGuard&) = delete;
+    EnvGuard& operator=(const EnvGuard&) = delete;
+    EnvGuard(EnvGuard&&) = delete;
+    EnvGuard& operator=(EnvGuard&&) = delete;
     ~EnvGuard() { EXPECT_EQ(UnsetEnv("TINYLAMB_AUDIT_SPAWN_ENV"), 0); }
   } env_guard;
   std::string error;
@@ -224,7 +231,7 @@ TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
                        {{"TINYLAMB_AUDIT_SPAWN_ENV", "child value"}}, &error),
             0)
       << error;
-  EXPECT_STREQ(std::getenv("TINYLAMB_AUDIT_SPAWN_ENV"), "parent");
+  EXPECT_STREQ(::tinylamb::platform::GetEnv("TINYLAMB_AUDIT_SPAWN_ENV"), "parent");
   EXPECT_EQ(RunProcess("/bin/sh", {"-c", "exit 23"}, {}, &error), 23);
   EXPECT_EQ(RunProcess("/path/that/does/not/exist", {}, {}, &error), -1);
   EXPECT_FALSE(error.empty());
@@ -392,6 +399,11 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
       std::filesystem::temp_directory_path() /
       ("platform_empty_map_" + std::to_string(GetPid()) + "_" + RandomString());
   struct Cleanup {
+    Cleanup() = default;
+    Cleanup(const Cleanup&) = delete;
+    Cleanup& operator=(const Cleanup&) = delete;
+    Cleanup(Cleanup&&) = delete;
+    Cleanup& operator=(Cleanup&&) = delete;
     std::array<std::filesystem::path, 2> paths;
     std::array<int, 4> fds{-1, -1, -1, -1};
     ~Cleanup() {
@@ -406,7 +418,8 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
         ec.clear();
       }
     }
-  } cleanup{.paths={path, empty_path}};
+  } cleanup;
+  cleanup.paths = {path, empty_path};
   const int fd = OpenFile(
       path, {.mode = OpenMode::kReadWrite, .create = true, .truncate = true},
       0644);
@@ -509,7 +522,10 @@ TEST(PlatformSocketTest, FlagsAreApplied) {
 
 TEST(PlatformSocketTest, AcceptAppliesFlagsAndSendSkipsSigPipe) {
   const auto pair = TcpPair();
-  ASSERT_TRUE(pair.has_value());
+  if (!pair.has_value()) {
+    ADD_FAILURE() << "TCP socket pair could not be created";
+    return;
+  }
   auto [client, server] = *pair;
   ASSERT_TRUE(IsValidSocketFd(client) && IsValidSocketFd(server));
   EXPECT_TRUE(IsCloseOnExec(server));
@@ -548,7 +564,10 @@ TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
   EventPoller poller;
   ASSERT_TRUE(poller.Open());
   const auto pair = TcpPair();
-  ASSERT_TRUE(pair.has_value());
+  if (!pair.has_value()) {
+    ADD_FAILURE() << "TCP socket pair could not be created";
+    return;
+  }
   auto [client, server] = *pair;
   ASSERT_TRUE(IsValidSocketFd(client) && IsValidSocketFd(server));
 

@@ -624,24 +624,15 @@ TEST_F(SqlAuditRegressionTest, UnionAllNullConstantVarcharPartialSlice) {
   for (bool force_relational : {false, true}) {
     SCOPED_TRACE(force_relational);
     engine_->SetForceRelationalFallback(force_relational);
+    std::string query = "SELECT c FROM (SELECT '";
+    query += payload;
+    query += "' AS c UNION ALL SELECT '";
+    query += payload;
+    query += "' UNION ALL SELECT CAST(NULL AS STRING) UNION ALL SELECT '";
+    query += payload;
+    query += "' UNION ALL SELECT 'tail') LIMIT 3 OFFSET 1";
     EXPECT_EQ(
-        Rows("SELECT c FROM ("
-             "SELECT '" +
-             payload +
-             "' AS c "
-             // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
-             // short fixed concatenations
-             "UNION ALL SELECT '" +
-             payload +
-             "' "
-             "UNION ALL SELECT CAST(NULL AS STRING) "
-             // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
-             // short fixed concatenations
-             "UNION ALL SELECT '" +
-             payload +
-             "' "
-             "UNION ALL SELECT 'tail'"
-             ") LIMIT 3 OFFSET 1"),
+        Rows(query),
         (std::vector<Row>{Row({Value(std::string(payload))}), Row({Value()}),
                           Row({Value(std::string(payload))})}));
     EXPECT_EQ(
@@ -743,7 +734,8 @@ TEST_F(SqlAuditRegressionTest,
   const size_t prev_limit = QueryMemoryBudget::Global().Limit();
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct Restore {
+  struct Restore {  // NOLINT(cppcoreguidelines-special-member-functions):
+                    // scope-owned cleanup.
     size_t limit;
     ~Restore() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{prev_limit};
@@ -797,7 +789,8 @@ TEST_F(SqlAuditRegressionTest, WindowPartitionCollationAndSpillParity) {
 
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
-  struct KnobRestore {
+  struct KnobRestore {  // NOLINT(cppcoreguidelines-special-member-functions):
+                        // scope-owned cleanup.
     ~KnobRestore() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } restore;
   ProcessMemoryBudget::Global().SetTestOpMemoryBytes(96ULL << 10);

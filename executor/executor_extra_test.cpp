@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -58,8 +59,9 @@ TEST(ConstantRowsTest, MixedSignednessSurvivesOneRowBatches) {
   const std::vector<Row> rows{Row({Value(int64_t{1}).WithUnsigned()}),
                               Row({Value(int64_t{-1})}),
                               Row({Value(int64_t{-1}).WithUnsigned()})};
-  const Executor sources[] = {std::make_shared<ConstantExecutor>(rows),
-                              std::make_shared<ValuesExecutor>(rows)};
+  const std::array<Executor, 2> sources = {
+      std::make_shared<ConstantExecutor>(rows),
+      std::make_shared<ValuesExecutor>(rows)};
   for (const auto& source : sources) {
     DataChunk batch;
     for (const Row& row : rows) {
@@ -173,7 +175,7 @@ TEST(MinMaxIndexExecutorTest,
   // stopping at the first all-NULL batch.
   std::vector<Row> rows;
   rows.reserve((2 * kDefaultVectorSize) + 5);
-for (size_t i = 0; i < (2 * kDefaultVectorSize) + 5;
+  for (size_t i = 0; i < (2 * kDefaultVectorSize) + 5;
        ++i) {  // NOLINT(readability-math-missing-parentheses)
     rows.emplace_back(std::vector<Value>{
         Value()});  // NOLINT(performance-inefficient-vector-operation)
@@ -1350,7 +1352,7 @@ TEST(DrainErrorPropagationTest, AuditHashJoinReportsSpillReadErrorAtEof) {
     std::optional<std::string> temp;
     std::filesystem::path directory;
     Restore() {
-      if (const char* current = std::getenv("TINYLAMB_TEMP")) {
+      if (const char* current = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP")) {
         temp = current;
       }
       directory = std::filesystem::temp_directory_path() /

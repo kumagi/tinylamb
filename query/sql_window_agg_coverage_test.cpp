@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "common/test_util.hpp"
+#include "common/platform/process.hpp"
 #include "common/memory_budget.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -111,10 +113,11 @@ std::optional<std::string> DumpSql(SqlEngine* engine, TransactionContext* ctx,
 // Restores an environment variable to the value it held on construction (or
 // unsets it when it was absent) on destruction, so tests that toggle
 // TINYLAMB_EXEC_ENGINE do not leak state into later tests.
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): scoped test environment guard.
 class EnvGuard {
  public:
   explicit EnvGuard(const char* name) : name_(name) {
-    if (const char* value = std::getenv(name)) {
+    if (const char* value = ::tinylamb::platform::GetEnv(name)) {
       had_value_ = true;
       value_ = value;
     }
@@ -124,9 +127,9 @@ class EnvGuard {
   ~EnvGuard() { Restore(); }
   void Restore() {
     if (had_value_) {
-      setenv(name_.c_str(), value_.c_str(), 1);
+      ::tinylamb::platform::SetEnv(name_.c_str(), value_.c_str(), 1);
     } else {
-      unsetenv(name_.c_str());
+      ::tinylamb::platform::UnsetEnv(name_.c_str());
     }
   }
 
@@ -224,6 +227,7 @@ TEST_F(SqlWindowAggCoverageTest, SlidingSumIgnoresTransientFrameOverflow) {
   auto& budget = ProcessMemoryBudget::Global();
   // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
   // non-copyable by design
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): scoped test state guard.
   struct ResetGuard {
     ResetGuard() = default;
     ResetGuard(const ResetGuard&) = delete;
@@ -1089,7 +1093,7 @@ TEST_F(WindowSqlCov, GroupByWindowLimitOffsetAppliesExactlyOnce) {
   // unconditionally unsetting it.
   EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
   for (const char* mode : {static_cast<const char*>("legacy"), "pipeline"}) {
-    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", mode, 1), 0);
+    ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", mode, 1), 0);
     const auto rows = TryRunSql(
         engine_.get(), context_.get(),
         "SELECT g, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY g) AS rn, "
@@ -1218,7 +1222,7 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
 
   for (const auto& c : cases) {
     // The AST ground truth itself.
-    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1), 0);
+    ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", "legacy", 1), 0);
     const auto legacy = TryRunSql(engine_.get(), context_.get(), c.sql);
     engine_env.Restore();
     ASSERT_TRUE(legacy.HasValue()) << legacy.GetStatus().GetMessage();
@@ -1227,7 +1231,7 @@ TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
     // In-memory pipeline lane and the forced-spill (OOC RangeFrameScanner)
     // lane, both pinned to the pipeline engine regardless of the caller's
     // TINYLAMB_EXEC_ENGINE.
-    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
+    ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
     const auto normal = TryRunSql(engine_.get(), context_.get(), c.sql);
     ASSERT_TRUE(normal.HasValue()) << normal.GetStatus().GetMessage();
     EXPECT_EQ(normal.Value(), c.expected) << c.sql;
@@ -1261,7 +1265,7 @@ TEST_F(WindowSqlCov, SpilledSlidingSumsForgetDepartedUnsignedValues) {
   ASSERT_EQ(types.Value()[0][0].type, ValueType::kDouble);
 
   EnvGuard engine_env("TINYLAMB_EXEC_ENGINE");
-  ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_EXEC_ENGINE", "pipeline", 1), 0);
   auto& budget = ProcessMemoryBudget::Global();
   // RAII, not a manual restore: an early ASSERT before the end of this test
   // must not leave the process-global budget in always-spill/4096 mode and
@@ -1562,8 +1566,9 @@ class DirectWinCov : public ::testing::Test {
       return windowed.GetStatus();
     }
     std::vector<Value> out;
-    windowed.Value().input.ForEachRow(
-        [&](const Row& row) { out.push_back(row[1]); });
+    EXPECT_EQ(tinylamb::Status::kSuccess,
+              windowed.Value().input.ForEachRow(
+                  [&](const Row& row) { out.push_back(row[1]); }));
     return out;
   }
 
@@ -1596,8 +1601,9 @@ class DirectWinCov : public ::testing::Test {
       return windowed.GetStatus();
     }
     std::vector<Value> out;
-    windowed.Value().input.ForEachRow(
-        [&](const Row& row) { out.push_back(row[1]); });
+    EXPECT_EQ(tinylamb::Status::kSuccess,
+              windowed.Value().input.ForEachRow(
+                  [&](const Row& row) { out.push_back(row[1]); }));
     return out;
   }
 
@@ -2080,7 +2086,10 @@ TEST_F(AggSmallCov, TypedColumnAggregateSweep) {
   // 66 rows fed all 17 typed column aggregates (66 * 17 = 1122 updates), so
   // the sweep touched every row/aggregate pair rather than short-circuiting.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("aggregate_input_rows=66"), std::string::npos) << *dump;
   EXPECT_NE(dump->find("aggregate_updates=1122"), std::string::npos) << *dump;
 }
@@ -2108,7 +2117,10 @@ TEST_F(AggSmallCov, ConstantAggregatesSkipColumnDecoding) {
   // Every aggregate argument is a literal, so the scan decodes no column
   // values (scan_values_decoded=0) even though it still counts 66 rows.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("scan_values_decoded=0"), std::string::npos) << *dump;
 }
 
@@ -2134,7 +2146,10 @@ TEST_F(AggSmallCov, AllNullColumnAggregatesEvaluateToNull) {
   // aggregates (66 * 10 = 660 updates), each folding NULLs to the shown
   // NULL/0 results.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("aggregate_input_rows=66"), std::string::npos) << *dump;
   EXPECT_NE(dump->find("aggregate_updates=660"), std::string::npos) << *dump;
 }
@@ -2183,7 +2198,10 @@ TEST_F(AggSmallCov, DistinctAggregatesRouteThroughAccumulators) {
   // the typed batch sweep: the plan shows a HashAggregate consuming all 66
   // input rows into one group.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("HashAggregate"), std::string::npos) << *dump;
   EXPECT_NE(dump->find("input_rows=66"), std::string::npos) << *dump;
 }
@@ -2203,7 +2221,10 @@ TEST_F(AggSmallCov, FilteredAggregatesSkipNonMatchingRows) {
   // The FILTER (WHERE ...) clauses survive into the aggregate plan rather
   // than being silently dropped — each member keeps its own predicate text.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("a > 32"), std::string::npos) << *dump;
   EXPECT_NE(dump->find("a > 1000"), std::string::npos) << *dump;
 }
@@ -2243,7 +2264,10 @@ TEST_F(AggSmallCov, EmptyInputScalarAggregates) {
   // The empty input is observable: the scalar aggregate consumed zero rows
   // (input_rows=0) yet still emitted the single NULL/0 group row.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("input_rows=0"), std::string::npos) << *dump;
 }
 
@@ -2267,7 +2291,10 @@ TEST_F(AggSmallCov, SingleSumUsesCheckedTypedFoldPath) {
   // A lone SUM over a scanned column folds through the checked typed path
   // (fused-typed-fold), which is what makes the overflow below safe.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("fused-typed-fold"), std::string::npos) << *dump;
   const auto overflow =
       TryRunSql(engine_.get(), context_.get(),
@@ -2524,7 +2551,10 @@ TEST_F(AggBigCov, GroupedFilteredAggregatesApplyRowFilters) {
   // applied each member's row filter during accumulation: 30002 updates is
   // exactly the per-(row,aggregate) pairs whose predicate held.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("aggregate_input_rows=10003"), std::string::npos)
       << *dump;
   EXPECT_NE(dump->find("aggregate_groups=4"), std::string::npos) << *dump;
@@ -2554,7 +2584,10 @@ TEST_F(AggBigCov, StatisticalAggregatesOnExpressionChildren) {
   EXPECT_NEAR((*g2)[1].value.double_value, var_pop, (var_pop * 1e-9) + 1e-9);
   EXPECT_NEAR((*g2)[2].value.double_value, 1.0, 1e-9);
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("aggregate_input_rows=10003"), std::string::npos)
       << *dump;
   EXPECT_NE(dump->find("aggregate_updates=20006"), std::string::npos) << *dump;
@@ -2593,7 +2626,10 @@ TEST_F(AggBigCov, ParallelScanAppliesSimpleAndResidualFilters) {
   // two of them carry s = 'zz'.  The dump proves the parallel worker-filter
   // scan ran rather than a serial full scan.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("ParallelScan: big ("), std::string::npos) << *dump;
   EXPECT_NE(dump->find("worker-filter"), std::string::npos) << *dump;
 }
@@ -2612,7 +2648,10 @@ TEST_F(AggBigCov, JoinInstallsIntegerKeyFilterOnProbeSide) {
   // The dump proves a runtime join filter was installed and consulted at
   // least one scan.
   const auto dump = DumpSql(engine_.get(), context_.get(), sql);
-  ASSERT_TRUE(dump.has_value()) << "executor dump unavailable";
+  if (!dump.has_value()) {
+    FAIL() << "executor dump unavailable";
+    return;
+  }
   EXPECT_NE(dump->find("RuntimeFilter type="), std::string::npos) << *dump;
   EXPECT_NE(dump->find("scans="), std::string::npos) << *dump;
 }
@@ -3085,16 +3124,16 @@ TEST(LeanPhase3ParityTest,
   for (const std::string& q : queries) {
     auto eval = [&](bool disable) -> std::vector<Row> {
       if (disable) {
-        setenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
       } else {
-        unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
       }
       PreparedPlanCache::Instance().Clear();
       CurrentCompiledPlans().clear();
       TransactionContext ctx = db->BeginReadOnlyContext();
       SqlEngine engine(*db);
       auto rows = RunSql(&engine, &ctx, q);
-      ctx.txn_.PreCommit();
+      EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
       return rows;
     };
     const auto on_rows = eval(false);
@@ -3137,9 +3176,9 @@ TEST(LeanPhase3ParityTest,
         Row({Value(7), Value(20)}), Row({Value(8), Value()})};
     auto run_excl = [&](bool disable) -> std::vector<Row> {
       if (disable) {
-        setenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE", "1", 1);
       } else {
-        unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
       }
       TransactionContext ctx = db->BeginReadOnlyContext();
       relational_detail::Relation rel;
@@ -3152,8 +3191,10 @@ TEST(LeanPhase3ParityTest,
         return {};
       }
       std::vector<Row> out;
-      res_or.Value().input.ForEachRow([&](const Row& r) { out.push_back(r); });
-      ctx.txn_.PreCommit();
+      EXPECT_EQ(tinylamb::Status::kSuccess,
+                res_or.Value().input.ForEachRow(
+                    [&](const Row& r) { out.push_back(r); }));
+      EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
       return out;
     };
     const auto on_excl = run_excl(false);
@@ -3161,7 +3202,7 @@ TEST(LeanPhase3ParityTest,
     EXPECT_EQ(on_excl.size(), base_rows.size());
     EXPECT_EQ(on_excl, off_excl);
   }
-  unsetenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
   db->DeleteAll();
 }
 
@@ -3215,16 +3256,16 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
   auto eval_sorted = [&](const std::string& q, const char* disable_var,
                          bool disable) -> std::vector<Row> {
     if (disable) {
-      setenv(disable_var, "1", 1);
+      ::tinylamb::platform::SetEnv(disable_var, "1", 1);
     } else {
-      unsetenv(disable_var);
+      ::tinylamb::platform::UnsetEnv(disable_var);
     }
     PreparedPlanCache::Instance().Clear();
     CurrentCompiledPlans().clear();
     TransactionContext ctx = db->BeginReadOnlyContext();
     SqlEngine engine(*db);
     auto rows = RunSql(&engine, &ctx, q);
-    ctx.txn_.PreCommit();
+    EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
     return rows;
   };
 
@@ -3258,9 +3299,9 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
 
     auto run_apply = [&](bool disable) -> std::vector<Row> {
       if (disable) {
-        setenv("TINYLAMB_DISABLE_WINDOW_HALO", "1", 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_WINDOW_HALO", "1", 1);
       } else {
-        unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
       }
       TransactionContext ctx = db->BeginReadOnlyContext();
       relational_detail::Relation rel;
@@ -3277,8 +3318,10 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
           *win_res.statement, std::move(win_res.input), &ctx, nullptr, {});
       EXPECT_TRUE(fin_or.HasValue()) << fin_or.GetStatus();
       std::vector<Row> out;
-      fin_or.Value().ForEachRow([&](const Row& r) { out.push_back(r); });
-      ctx.txn_.PreCommit();
+      EXPECT_EQ(tinylamb::Status::kSuccess,
+                fin_or.Value().ForEachRow(
+                    [&](const Row& r) { out.push_back(r); }));
+      EXPECT_EQ(tinylamb::Status::kSuccess, ctx.txn_.PreCommit());
       return out;
     };
 
@@ -3300,7 +3343,7 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
     const auto off_rows = eval_sorted(wq, "TINYLAMB_DISABLE_WINDOW_HALO", true);
     EXPECT_EQ(on_rows, off_rows) << wq;
   }
-  unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
 
   // DistinctOnTop1 parity (ties, DESC + NULLS FIRST/LAST, ordinals, expression
   // keys).
@@ -3317,7 +3360,7 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
         eval_sorted(dq, "TINYLAMB_DISABLE_DISTINCT_ON_TOP1", true);
     EXPECT_EQ(on_rows, off_rows) << dq;
   }
-  unsetenv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
 
   // OuterOrBranches end-to-end through SqlEngine (PipelineLowering
   // OocCrossJoinProbeSource).
@@ -3335,7 +3378,7 @@ TEST(LeanPhase3ParityTest, WindowHaloAndDistinctOnAndOuterOrBranchesParity) {
     std::ranges::sort(off_rows, cmp);
     EXPECT_EQ(on_rows, off_rows) << jq;
   }
-  unsetenv("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_OUTER_OR_BRANCHES");
 
   db->DeleteAll();
 }

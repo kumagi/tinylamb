@@ -50,6 +50,7 @@
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 #include "common/serdes.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
@@ -303,9 +304,9 @@ Status PwriteAllFd(int fd, const void* data, size_t len, uint64_t offset) {
       // errno is not guaranteed to be updated when pwrite returns 0
       // (disk full / file-size limit / invalid fd); never print "Success"
       // or spin forever on a stale EINTR from an earlier syscall.
-      const std::string reason = n == 0
-                                     ? "no progress (disk full or invalid fd)"
-                                     : std::string(std::strerror(errno));
+      const std::string reason =
+          n == 0 ? "no progress (disk full or invalid fd)"
+                 : std::string(::tinylamb::platform::StrError(errno));
       return StatusError(StatusCode::kIOError, "pwrite failed: " + reason);
     }
     done += static_cast<size_t>(n);
@@ -326,8 +327,10 @@ Status PreadAllFd(int fd, void* dst, size_t len, uint64_t offset) {
       if (errno == EINTR) {
         continue;
       }
-      return StatusError(StatusCode::kIOError,
-                         "pread failed: " + std::string(std::strerror(errno)));
+      return StatusError(
+          StatusCode::kIOError,
+          "pread failed: " +
+              std::string(::tinylamb::platform::StrError(errno)));
     }
     done += static_cast<size_t>(n);
   }
@@ -365,8 +368,8 @@ class BufferedCheckpointWriter {
   Status Finalize() {
     RETURN_IF_FAIL(FlushChunk());
     const uint32_t finalized_crc = crc_ ^ 0xffffffffU;
-    RETURN_IF_FAIL(
-        PwriteAllFd(fd_, &finalized_crc, sizeof(finalized_crc), written_offset_));
+    RETURN_IF_FAIL(PwriteAllFd(fd_, &finalized_crc, sizeof(finalized_crc),
+                               written_offset_));
     written_offset_ += sizeof(crc_);
     return Status::kSuccess;
   }
@@ -907,8 +910,9 @@ Status PageManager::OpenOrCreateLsmFileLocked(uint64_t generation,
                                      .truncate = truncate},
                                     0644);
   if (fd < 0) {
-    return StatusError(StatusCode::kIOError, "open failed on LSM file " + path +
-                                                 ": " + std::strerror(errno));
+    return StatusError(StatusCode::kIOError,
+                       "open failed on LSM file " + path + ": " +
+                           ::tinylamb::platform::StrError(errno));
   }
   std::error_code ec;
   const auto fsize = std::filesystem::file_size(path, ec);
@@ -1268,8 +1272,9 @@ Status PageManager::FlushTreeCommittedMemToDisk(page_id_t /*tree_id*/,
     {
       std::scoped_lock file_lk(lsm_file_mu_);
       const int fd = lsm_fd_.load(std::memory_order_acquire);
-      if (fd >= 0 && append_start <= static_cast<uint64_t>(
-                                       std::numeric_limits<int64_t>::max()) &&
+      if (fd >= 0 &&
+          append_start <=
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) &&
           platform::Truncate(fd, static_cast<int64_t>(append_start)) == 0) {
         lsm_append_offset_ = append_start;
       } else if (fd >= 0) {
@@ -1361,10 +1366,10 @@ Status PageManager::CompactTreeRunsToDisk(page_id_t /*tree_id*/,
   Status merge_st = Status::kSuccess;
   {
     std::scoped_lock append_lk(lsm_append_mu_);
-    merge_st = MergeLsmSourcesToFd(
-        lsm_fd_, lsm_file_mu_, lsm_fd_, lsm_file_mu_, &lsm_append_offset_,
-        lsm_cache_, specs, nullptr, drop_tombstones, &out_blocks, &entry_count,
-        &has_tombstones);
+    merge_st = MergeLsmSourcesToFd(lsm_fd_, lsm_file_mu_, lsm_fd_, lsm_file_mu_,
+                                   &lsm_append_offset_, lsm_cache_, specs,
+                                   nullptr, drop_tombstones, &out_blocks,
+                                   &entry_count, &has_tombstones);
   }
 
   if (merge_st != Status::kSuccess) {
@@ -1460,9 +1465,9 @@ StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
   const int fd = platform::OpenFile(
       path, {.mode = platform::OpenMode::kReadWrite, .create = true}, 0644);
   if (fd < 0) {
-    return StatusError(
-        StatusCode::kIOError,
-        "failed to open database file " + path + ": " + std::strerror(errno));
+    return StatusError(StatusCode::kIOError,
+                       "failed to open database file " + path + ": " +
+                           ::tinylamb::platform::StrError(errno));
   }
   if (platform::TryLockExclusive(fd) != 0) {
     const int err = errno;
@@ -1471,9 +1476,9 @@ StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
       return StatusError(StatusCode::kConflicts,
                          "database file is already open: " + path);
     }
-    return StatusError(
-        StatusCode::kIOError,
-        "failed to lock database file " + path + ": " + std::strerror(err));
+    return StatusError(StatusCode::kIOError,
+                       "failed to lock database file " + path + ": " +
+                           ::tinylamb::platform::StrError(err));
   }
   // The constructor still allocates (ReclaimBridge / reclaim hook). If that
   // throws, the partially-constructed PageManager's destructor never runs, so
@@ -1720,7 +1725,7 @@ Status PageManager::OpenOrCreateBlocksFileLocked(uint64_t generation,
   if (fd < 0) {
     return StatusError(StatusCode::kIOError,
                        "open failed on blocks file " + path + ": " +
-                           std::string(std::strerror(errno)));
+                           std::string(::tinylamb::platform::StrError(errno)));
   }
   std::error_code ec;
   const auto fsize = std::filesystem::file_size(path, ec);
@@ -2013,13 +2018,16 @@ size_t PageManager::TryEvictForReclaim(size_t bytes_needed) noexcept {
       // reclaimed byte count is measured from resident_bytes_ below.
       const Status evict_status = EvictBatch(target, /*try_locks_only=*/true);
       if (evict_status != Status::kSuccess) {
+        // NOLINTBEGIN(bugprone-empty-catch): preserve the noexcept reclaim path.
         try {
           LOG(WARN) << "TryEvictForReclaim: EvictBatch(" << target
                     << " bytes) failed: " << evict_status;
-        } catch (...) {
+        } catch (
+            ...) {
           // This reclaim path is noexcept and may run while memory is tight;
           // a diagnostic allocation failure must not terminate the process.
         }
+        // NOLINTEND(bugprone-empty-catch)
       }
       const size_t after = resident_bytes_.load(std::memory_order_relaxed);
       if (before > after) {
@@ -2297,9 +2305,10 @@ Status PageManager::EvictBatch(size_t target_bytes, bool try_locks_only) {
           }
           if (platform::DataSync(blocks_fd_) != 0) {
             drop_all_pending_spills();
-            return StatusError(StatusCode::kIOError,
-                               "fdatasync failed on blocks file: " +
-                                   std::string(std::strerror(errno)));
+            return StatusError(
+                StatusCode::kIOError,
+                "fdatasync failed on blocks file: " +
+                    std::string(::tinylamb::platform::StrError(errno)));
           }
           blocks_append_offset_ = write_base + io_buf.size();
         }
@@ -3194,7 +3203,10 @@ void CopyLsmSnapshotRange(const std::map<std::string, EntryT, std::less<>>& src,
 // PageManager::LsmScanRange(..., ascending=true, ...): strictly ascending
 // unique keys, newest-source-wins value resolution, tombstones hidden,
 // inclusive bounds.
-class PageManagerLsmScanCursor final : public LsmScanCursor {
+class
+    PageManagerLsmScanCursor final  // NOLINT(cppcoreguidelines-special-member-functions):
+                                    // scope-owned cleanup.
+    : public LsmScanCursor {
  public:
   using CommittedSnap =
       std::vector<std::pair<std::string, LsmTreeState::CommittedEntry>>;
@@ -3315,16 +3327,16 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       return;
     }
     if (!memtable_.empty()) {
-      heap_.push(
-          HeapItem{.key=std::string_view(memtable_.front().first), .src=kSrcMemtable});
+      heap_.push(HeapItem{.key = std::string_view(memtable_.front().first),
+                          .src = kSrcMemtable});
     }
     if (!committed_.empty()) {
-      heap_.push(
-          HeapItem{.key=std::string_view(committed_.front().first), .src=kSrcCommitted});
+      heap_.push(HeapItem{.key = std::string_view(committed_.front().first),
+                          .src = kSrcCommitted});
     }
     if (!immutable_.empty()) {
-      heap_.push(
-          HeapItem{.key=std::string_view(immutable_.front().first), .src=kSrcImmutable});
+      heap_.push(HeapItem{.key = std::string_view(immutable_.front().first),
+                          .src = kSrcImmutable});
     }
     for (size_t i = 0; i < run_cursors_.size(); ++i) {
       const Status st = begin_.empty() ? run_cursors_[i].SeekToFirst()
@@ -3336,7 +3348,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       if (run_cursors_[i].Valid()) {
         const std::string_view k = run_cursors_[i].Current().key;
         if (!PastEnd(k)) {
-          heap_.push(HeapItem{.key=k, .src=RunSrc(i)});
+          heap_.push(HeapItem{.key = k, .src = RunSrc(i)});
         }
       }
     }
@@ -3348,7 +3360,8 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
       const std::vector<std::pair<std::string, EntryT>>& vec) {
     ++(*pos);
     if (*pos < vec.size()) {
-      heap_.push(HeapItem{.key=std::string_view(vec[*pos].first), .src=src});
+      heap_.push(
+          HeapItem{.key = std::string_view(vec[*pos].first), .src = src});
     }
   }
 
@@ -3374,7 +3387,7 @@ class PageManagerLsmScanCursor final : public LsmScanCursor {
     if (run_cursors_[ri].Valid()) {
       const std::string_view k = run_cursors_[ri].Current().key;
       if (!PastEnd(k)) {
-        heap_.push(HeapItem{.key=k, .src=src});
+        heap_.push(HeapItem{.key = k, .src = src});
       }
     }
   }
@@ -4434,7 +4447,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     if (compacted_lsm_fd < 0) {
       return StatusError(StatusCode::kIOError,
                          "open failed on compacted LSM file " + new_lsm_path +
-                             ": " + std::strerror(errno));
+                             ": " + ::tinylamb::platform::StrError(errno));
     }
   }
 
@@ -4578,7 +4591,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     cleanup_compacted_lsm();
     return StatusError(StatusCode::kIOError,
                        "fdatasync failed on compacted lsm: " +
-                           std::string(std::strerror(err)));
+                           std::string(::tinylamb::platform::StrError(err)));
   }
 
   int compacted_fd = -1;
@@ -4612,9 +4625,10 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
                                       0644);
     if (compacted_fd < 0) {
       cleanup_compacted_lsm();
-      return StatusError(StatusCode::kIOError,
-                         "open failed on compacted blocks " + new_path + ": " +
-                             std::string(std::strerror(errno)));
+      return StatusError(
+          StatusCode::kIOError,
+          "open failed on compacted blocks " + new_path + ": " +
+              std::string(::tinylamb::platform::StrError(errno)));
     }
     compacted_io_buf.reserve(kEvictionBatchTargetBytes);
   }
@@ -4628,9 +4642,9 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   if (tmp_fd < 0) {
     close_compacted_on_err();
     cleanup_compacted_lsm();
-    return StatusError(
-        StatusCode::kIOError,
-        "open failed on checkpoint temp: " + std::string(std::strerror(errno)));
+    return StatusError(StatusCode::kIOError,
+                       "open failed on checkpoint temp: " +
+                           std::string(::tinylamb::platform::StrError(errno)));
   }
   auto cleanup_tmp = [&](int fd_to_close) {
     if (fd_to_close >= 0) {
@@ -5191,17 +5205,19 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     }
     if (write_status == Status::kSuccess &&
         platform::DataSync(compacted_fd) != 0) {
-      write_status = StatusError(StatusCode::kIOError,
-                                 "fdatasync failed on compacted blocks: " +
-                                     std::string(std::strerror(errno)));
+      write_status =
+          StatusError(StatusCode::kIOError,
+                      "fdatasync failed on compacted blocks: " +
+                          std::string(::tinylamb::platform::StrError(errno)));
     }
   } else if (write_status == Status::kSuccess && use_disk_blocks &&
              (dirty_count > 0 || streamed_dirty_write)) {
     std::scoped_lock blk_lk(blocks_file_mu_);
     if (blocks_fd_ >= 0 && platform::DataSync(blocks_fd_) != 0) {
-      write_status = StatusError(StatusCode::kIOError,
-                                 "fdatasync failed on blocks file: " +
-                                     std::string(std::strerror(errno)));
+      write_status =
+          StatusError(StatusCode::kIOError,
+                      "fdatasync failed on blocks file: " +
+                          std::string(::tinylamb::platform::StrError(errno)));
     }
   }
 
@@ -5277,16 +5293,16 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   if (platform::DataSync(tmp_fd) != 0) {
     const int err = errno;
     cleanup_tmp(tmp_fd);
-    return StatusError(
-        StatusCode::kIOError,
-        "fdatasync failed on checkpoint: " + std::string(std::strerror(err)));
+    return StatusError(StatusCode::kIOError,
+                       "fdatasync failed on checkpoint: " +
+                           std::string(::tinylamb::platform::StrError(err)));
   }
   if (platform::TryLockExclusive(tmp_fd) != 0) {
     const int err = errno;
     cleanup_tmp(tmp_fd);
-    return StatusError(
-        StatusCode::kIOError,
-        "lock failed on checkpoint temp: " + std::string(std::strerror(err)));
+    return StatusError(StatusCode::kIOError,
+                       "lock failed on checkpoint temp: " +
+                           std::string(::tinylamb::platform::StrError(err)));
   }
   std::error_code rename_ec;
   std::filesystem::rename(tmp_path, db_name_, rename_ec);
@@ -5303,7 +5319,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   const int dir_sync_rc = platform::SyncDirectory(
       parent_dir.empty() ? std::filesystem::path(".") : parent_dir);
   // Capture the fsync errno now; the unlock/close/file_size calls below can
-  // overwrite errno and would otherwise produce a misleading strerror().
+  // overwrite errno and would otherwise produce a misleading
+  // ::tinylamb::platform::StrError().
   const int dir_sync_errno = errno;
   (void)platform::UnlockFile(lock_fd_);
   platform::CloseFile(lock_fd_);
@@ -5433,9 +5450,10 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     }
   }
   if (dir_sync_rc != 0) {
-    return StatusError(StatusCode::kIOError,
-                       "directory fsync failed after checkpoint rename: " +
-                           std::string(std::strerror(dir_sync_errno)));
+    return StatusError(
+        StatusCode::kIOError,
+        "directory fsync failed after checkpoint rename: " +
+            std::string(::tinylamb::platform::StrError(dir_sync_errno)));
   }
   return Status::kSuccess;
 }
@@ -6195,7 +6213,9 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
       break;
     }
     if (watcher != nullptr && watcher->NoWaitForConflicts()) {
-      early_result = StatusError(StatusCode::kConflicts, "table tail reservation held by another transaction");
+      early_result =
+          StatusError(StatusCode::kConflicts,
+                      "table tail reservation held by another transaction");
       break;
     }
     if (holds_other_tail()) {
@@ -6369,7 +6389,8 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
       break;
     }
     if (watcher != nullptr && watcher->NoWaitForConflicts()) {
-      early_result = StatusError(StatusCode::kConflicts, "table tail is unpublished");
+      early_result =
+          StatusError(StatusCode::kConflicts, "table tail is unpublished");
       break;
     }
     if (watcher != nullptr && watcher->IsWounded()) {

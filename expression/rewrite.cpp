@@ -3017,9 +3017,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             // earlier constant determines the value. Drop only untyped NULLs.
             std::vector<Expression> new_args;
             for (const auto& arg : fn.Args()) {
-              if (arg && IsConstant(arg) && arg->AsConstantValue().GetValue().IsNull() &&
-                  !arg->ResultType(Schema{}).IsValid()) { continue;
-}
+              if (arg && IsConstant(arg) &&
+                  arg->AsConstantValue().GetValue().IsNull() &&
+                  !arg->ResultType(Schema{}).IsValid()) {
+                continue;
+              }
               new_args.push_back(arg);
             }
             const bool changed = new_args.size() != fn.Args().size();
@@ -5042,9 +5044,8 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
       // below. ExpressionChildren deliberately enumerates only Child() for
       // aggregates (WithExpressionChildren's arity contract), so walk the
       // extra slots explicitly.
-      if (aggregate.HasWhereFilter() &&
-          ContainsNotOfOrderedDoubleComparison(aggregate.WhereFilter(),
-                                               schema)) {
+      if (aggregate.HasWhereFilter() && ContainsNotOfOrderedDoubleComparison(
+                                            aggregate.WhereFilter(), schema)) {
         return true;
       }
       if (aggregate.HavingCondition() &&
@@ -5058,9 +5059,8 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
           return true;
         }
       }
-      if (aggregate.SecondaryArg() &&
-          ContainsNotOfOrderedDoubleComparison(aggregate.SecondaryArg(),
-                                               schema)) {
+      if (aggregate.SecondaryArg() && ContainsNotOfOrderedDoubleComparison(
+                                          aggregate.SecondaryArg(), schema)) {
         return true;
       }
       for (const Expression& arg : aggregate.TrailingArgs()) {
@@ -5068,12 +5068,11 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
           return true;
         }
       }
-      for (const Expression& key : aggregate.InnerGroupBy()) {
-        if (ContainsNotOfOrderedDoubleComparison(key, schema)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(aggregate.InnerGroupBy(),
+                                 [&](const Expression& key) {
+                                   return ContainsNotOfOrderedDoubleComparison(
+                                       key, schema);
+                                 });
     }
     case TypeTag::kCastExp:
       return ContainsNotOfOrderedDoubleComparison(

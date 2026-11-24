@@ -1613,7 +1613,7 @@ TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
   };
-  Expression raise = CastExpressionExp(ConstantValueExp(Value(-INFINITY)),
+  Expression raise = CastExpressionExp(ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
                                        "INT64");  // raises when evaluated
   Expression null_c = ConstantValueExp(Value());
   // (NULL AND raising) OR NULL  -- x = NULL, y = raising.
@@ -1632,7 +1632,7 @@ TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
   };
-  Expression raise = CastExpressionExp(ConstantValueExp(Value(-INFINITY)),
+  Expression raise = CastExpressionExp(ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
                                        "INT64");  // raises when evaluated
   Expression t =
       UnaryExpressionExp(UnaryExpressionExp(raise, UnaryOperation::kIsNotNull),
@@ -3406,7 +3406,10 @@ TEST(ExpressionAuditTest, JsonStringTokensRetainOnlyTheirOwnStorage) {
   }
   document += ']';
   const auto root = json_doc::ParseDocument(document);
-  ASSERT_TRUE(root.has_value());
+  if (!root.has_value()) {
+    ADD_FAILURE() << "parsed JSON document is empty";
+    return;
+  }
   ASSERT_EQ(root->arr.size(), count);
   for (const auto& item : root->arr) {
     ASSERT_NE(item, nullptr);

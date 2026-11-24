@@ -67,7 +67,7 @@ TEST(IndexReservationTest, NoWaitPolicyDoesNotParkBehindAnotherSession) {
     // A reservation without a physical mutation isolates admission from WAL
     // and row-intent waits. It must remain reserved after a failed drain.
     constexpr page_id_t page = 42;
-    owner.txn_.ReserveIndexUndoBytes(page, 128);
+    ASSERT_SUCCESS(owner.txn_.ReserveIndexUndoBytes(page, 128));
     const auto start = std::chrono::steady_clock::now();
     EXPECT_EQ(
         waiter.txn_.WaitAllIndexReservationsDrain(std::chrono::seconds(2)),
@@ -94,15 +94,15 @@ TEST(IndexReservationTest, ForeignOwnerSummaryTracksRepeatedAndSharedPages) {
     auto observer = database->BeginReadOnlyContext();
     // Cover every shard and many entries belonging only to one owner.
     for (page_id_t page = 1; page <= 4097; ++page) {
-      owner.txn_.ReserveIndexUndoBytes(page, 32);
-      owner.txn_.ReserveIndexUndoBytes(page, 64);
+      ASSERT_SUCCESS(owner.txn_.ReserveIndexUndoBytes(page, 32));
+      ASSERT_SUCCESS(owner.txn_.ReserveIndexUndoBytes(page, 64));
     }
     EXPECT_FALSE(owner.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(other.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
-    other.txn_.ReserveIndexUndoBytes(1, 128);
-    other.txn_.ReserveIndexUndoBytes(1, 256);
-    other.txn_.ReserveIndexUndoBytes(4098, 128);
+    ASSERT_SUCCESS(other.txn_.ReserveIndexUndoBytes(1, 128));
+    ASSERT_SUCCESS(other.txn_.ReserveIndexUndoBytes(1, 256));
+    ASSERT_SUCCESS(other.txn_.ReserveIndexUndoBytes(4098, 128));
     EXPECT_TRUE(owner.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(other.txn_.HasForeignIndexReservations());
     EXPECT_EQ(owner.txn_.IndexUndoReservedBytes(1), 384U);
@@ -113,7 +113,7 @@ TEST(IndexReservationTest, ForeignOwnerSummaryTracksRepeatedAndSharedPages) {
     ASSERT_EQ(owner.PreCommit(), Status::kSuccess);
     EXPECT_FALSE(observer.txn_.HasForeignIndexReservations());
     auto again = database->BeginContext();
-    again.txn_.ReserveIndexUndoBytes(1, 16);
+    ASSERT_SUCCESS(again.txn_.ReserveIndexUndoBytes(1, 16));
     EXPECT_FALSE(again.txn_.HasForeignIndexReservations());
     EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
     EXPECT_EQ(again.Abort(), Status::kSuccess);

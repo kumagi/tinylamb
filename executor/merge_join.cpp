@@ -13,11 +13,11 @@
 #include "common/join_kind.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
-#include "transaction/transaction.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction.hpp"
 #include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -62,10 +62,10 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
   // The emit path only knows inner/left/right/semi/anti; a null-aware-anti or
   // mark join here would silently fall through to the inner path and emit
   // combined-width rows. Fail loudly, like the relational factory does.
-  CHECK_MSG(kind != JoinKind::kNullAwareAnti &&
-                kind != JoinKind::kMark,  // NOLINT(readability-simplify-boolean-expr):
-                                          // CHECK_MSG negates its condition
+  // NOLINTBEGIN(readability-simplify-boolean-expr): CHECK_MSG negates condition.
+  CHECK_MSG(kind != JoinKind::kNullAwareAnti && kind != JoinKind::kMark,
             "MergeJoin does not support null-aware anti / mark joins");
+  // NOLINTEND(readability-simplify-boolean-expr)
 }
 
 bool MergeJoin::KeyCannotMatch(const Row& row,
@@ -95,9 +95,8 @@ int MergeJoin::CompareKeys(const Row& left, const Row& right) const {
     if (!lhs.IsNull() && !rhs.IsNull() && lhs.type != rhs.type) {
       return static_cast<int>(lhs.type) < static_cast<int>(rhs.type) ? -1 : 1;
     }
-    return CompareUnderCollation(lhs, rhs, ResolveCollation(lhs, rhs)) < 0
-               ? -1
-               : 1;
+    return CompareUnderCollation(lhs, rhs, ResolveCollation(lhs, rhs)) < 0 ? -1
+                                                                           : 1;
   }
   return 0;
 }

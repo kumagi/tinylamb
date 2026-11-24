@@ -16,6 +16,7 @@
 
 #include <cstddef>
 
+#include "common/test_util.hpp"
 #include "executor/detail/relational_sort_limit.hpp"
 #include "executor/relational_regression_test.hpp"
 
@@ -403,10 +404,10 @@ TEST_F(RelationalRegressionTest, StringColumnFiltersCompareTimestampInstants) {
   arena.null_bits.resize(2);
   arena.varchars.resize(2);
   for (const Row& row : rows) {
-    const int64_t cells[2]{};
-    const uint8_t nulls[2]{static_cast<uint8_t>(row[0].IsNull()),
-                           static_cast<uint8_t>(row[1].IsNull())};
-    arena.AppendRun(cells, nulls, 1);
+    const std::array<int64_t, 2> cells{};
+    const std::array<uint8_t, 2> nulls{static_cast<uint8_t>(row[0].IsNull()),
+                                       static_cast<uint8_t>(row[1].IsNull())};
+    arena.AppendRun(cells.data(), nulls.data(), 1);
     for (size_t column = 0; column < 2; ++column) {
       auto& run = arena.varchars[column];
       if (!row[column].IsNull()) {
@@ -507,7 +508,8 @@ TEST_F(RelationalRegressionTest, ParallelFiltersReportCollatedLikeErrors) {
 
 TEST_F(RelationalRegressionTest, WithTiesStreamsSpilledPeerGroup) {
   auto& budget = QueryMemoryBudget::Global();
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     size_t limit;
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{budget.Limit()};
@@ -570,7 +572,8 @@ TEST_F(RelationalRegressionTest, WithTiesStreamsSpilledPeerGroup) {
 
 TEST_F(RelationalRegressionTest, BoundedTraversalEarlyExitLeavesTailWritable) {
   auto& budget = QueryMemoryBudget::Global();
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     size_t limit;
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{budget.Limit()};
@@ -1245,7 +1248,7 @@ TEST_F(RelationalRegressionTest, FusedDoubleArithmeticKeepsNullsAndErrors) {
   while (prepared.Value()->Next(&row, nullptr)) {
   }
   EXPECT_EQ(prepared.Value()->GetStatus(), Status::kIsInfinity);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -1456,7 +1459,7 @@ TEST_F(RelationalRegressionTest, FullJoinNullAggregatesKeepMultiplicity) {
   } else {
     EXPECT_EQ(overflow.GetStatus(), Status::kIsInfinity);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, DirectWindowOrderingKeepsPeersAndNulls) {
@@ -2535,7 +2538,7 @@ TEST_F(RelationalRegressionTest, DictionaryScalarKeysCountAfterFiltering) {
     result.Value().Drain();
     EXPECT_NE(result.Value().GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, PackedTimestampGroupsKeepFallbacksAndOrder) {
@@ -2638,7 +2641,7 @@ TEST_F(RelationalRegressionTest, PackedTimestampGroupsKeepFallbacksAndOrder) {
   } else {
     EXPECT_EQ(bad.GetStatus(), Status::kInvalidArgument);
   }
-  invalid.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, invalid.Abort());
   const std::string snapshot_query =
       query("s", "MINUTE", "n>=0", " ORDER BY c DESC,m NULLS FIRST LIMIT 13");
   const auto expected = RelationalRun(*rs_, snapshot_query);
@@ -2997,7 +3000,7 @@ TEST_F(RelationalRegressionTest,
     result.Value().Drain();
     EXPECT_NE(result.Value().GetStatus(), Status::kSuccess);
   }
-  error_context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, error_context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -3117,7 +3120,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_NE(result.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, DictionaryCaseKeysAndNonKeyFiltersKeepRows) {

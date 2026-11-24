@@ -566,7 +566,7 @@ TEST(PipelineP3aTest, FilteredHashProbeSwitchKeepsOrderAndDuplicateChains) {
     EXPECT_EQ(rows[i][3].AsInt64(), 101 + static_cast<int64_t>(i % 2));
   }
   if (direct && compact &&
-      std::getenv("TINYLAMB_FILTER_HASH_PROBE") == nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_FILTER_HASH_PROBE") == nullptr) {
     std::ostringstream explain;
     probe_source->DumpExplain(explain, 0);
     EXPECT_NE(explain.str().find(
@@ -720,18 +720,18 @@ class
  public:
   explicit ScopedSpillTempDir(std::filesystem::path path)
       : path_(std::move(path)) {
-    const char* previous = std::getenv("TINYLAMB_TEMP");
+    const char* previous = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP");
     if (previous != nullptr) {
       previous_ = previous;
       had_previous_ = true;
     }
-    setenv("TINYLAMB_TEMP", path_.c_str(), 1);
+    ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", path_.c_str(), 1);
   }
   ~ScopedSpillTempDir() {
     if (had_previous_) {
-      setenv("TINYLAMB_TEMP", previous_.c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_TEMP", previous_.c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_TEMP");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_TEMP");
     }
     std::error_code ec;
     std::filesystem::remove_all(path_, ec);

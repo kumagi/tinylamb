@@ -16,6 +16,8 @@
 
 #include <cstdlib>
 
+#include "common/test_util.hpp"
+#include "common/platform/process.hpp"
 #include "executor/relational_regression_test.hpp"
 #include "table/tlcs_file.hpp"
 
@@ -98,11 +100,11 @@ TEST_F(RelationalRegressionTest,
       std::optional<Value> scalar;
       auto result = ExecuteCorrelatedSingleSource(
           ctx, statement, scope, {{"d", input}}, false, nullptr, &scalar);
-      ASSERT_TRUE(result.has_value());
-      ASSERT_TRUE(scalar.has_value());
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-      // success
-      const Value& actual = *scalar;
+      if (!result.has_value() || !scalar.has_value()) {
+        ADD_FAILURE() << "correlated aggregate returned no scalar";
+        return;
+      }
+      const Value& actual = scalar.value();
       AggregateAccumulator reference(aggregate.get(), &input->schema);
       for (const auto& value : groups[k]) {
         ASSERT_SUCCESS(reference.Add(value));
@@ -118,7 +120,7 @@ TEST_F(RelationalRegressionTest,
     }
   }
   ctx.set_execution_runtime(nullptr);
-  ctx.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
 }
 
 TEST_F(RelationalRegressionTest, PackedProbeCountGroupsKeepSignedKeysAndNulls) {
@@ -307,7 +309,7 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
       const bool direct_scan = mode != 0;
       // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type
       // is non-copyable by design
-      struct RestoreColumnarLimit {
+      struct RestoreColumnarLimit {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreColumnarLimit() {
           ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
@@ -345,10 +347,10 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
         EXPECT_EQ(
             // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
             // is unambiguous
-            actual.at((i + probe_begin) * 4 + key_bias),
+            actual.at(((i + probe_begin) * 4) + key_bias),
             // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence
             // is unambiguous
-            Row({Value((i + probe_begin) * 4 + key_bias),
+            Row({Value(((i + probe_begin) * 4) + key_bias),
                  Value((i + probe_begin) % 7),
                  nullable && i % 11 == 0 ? Value()
                                          : Value(direct_scan ? 25.0 : 50.0)}));
@@ -376,7 +378,7 @@ TEST_F(RelationalRegressionTest, LargeUniqueBuildKeepsDirectAggregateGroups) {
         ++rows;
         // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
         // unambiguous
-        const int64_t i = (row[0].value.int_value - key_bias) / 4 - probe_begin;
+        const int64_t i = ((row[0].value.int_value - key_bias) / 4) - probe_begin;
         EXPECT_EQ(row[2], Value(i == 1 ? 50.0 : 25.0));
       }));
       EXPECT_EQ(rows, 888U);
@@ -400,7 +402,7 @@ TEST_F(RelationalRegressionTest,
       ASSERT_SUCCESS(
           // NOLINTNEXTLINE(readability-math-missing-parentheses) precedence is
           // unambiguous
-          probe->Insert(ctx.txn_, Row({Value(k * 1800000 - 28800000)}))
+          probe->Insert(ctx.txn_, Row({Value((k * 1800000) - 28800000)}))
               .GetStatus());
     }
     for (size_t nullable = 0; nullable < 2; ++nullable) {
@@ -417,7 +419,7 @@ TEST_F(RelationalRegressionTest,
                       ctx.txn_,
                       // NOLINTNEXTLINE(readability-math-missing-parentheses)
                       // precedence is unambiguous
-                      Row({Value(k * 1800000 - 28800000),
+                      Row({Value((k * 1800000) - 28800000),
                            is_null ? Value() : Value(a), Value(0)}))
                   .GetStatus());
           if (!is_null) {
@@ -665,7 +667,7 @@ TEST_F(RelationalRegressionTest, GroupedJoinUsesProjectedFactStore) {
                   Row({i % 37 == 0 ? Value() : Value(i % 31),
                        // NOLINTNEXTLINE(readability-math-missing-parentheses)
                        // precedence is unambiguous
-                       i % 19 == 0 ? Value() : Value(i % 7 - 2),
+                       i % 19 == 0 ? Value() : Value((i % 7) - 2),
                        Value(std::string(64, 'x'))}))
               .GetStatus());
     }
@@ -773,7 +775,7 @@ TEST_F(RelationalRegressionTest, ColumnarCorrelatedFilterRetainsPayloads) {
       output.ForEachRow([&](const Row& row) { actual.push_back(row); }));
   EXPECT_EQ(actual, expected);
   ctx.set_execution_runtime(nullptr);
-  ctx.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
 }
 
 TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
@@ -812,30 +814,28 @@ TEST_F(RelationalRegressionTest, CorrelationDomainReadsGatheredKeyOnly) {
                         {Column("v", ValueType::kVarChar), Column("k", type)});
     const auto filter = CorrelationDomainFilter(source, 1, ColumnName("o", "k"),
                                                 {1, 0}, runtime);
-    ASSERT_TRUE(filter.has_value());
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-    // success
-    EXPECT_EQ(filter->column, 0);
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-    // success
-    EXPECT_EQ(filter->type, type);
+    if (!filter.has_value()) {
+      ADD_FAILURE() << "correlation filter was not built";
+      return;
+    }
+    const auto& filter_value = filter.value();
+    EXPECT_EQ(filter_value.column, 0);
+    EXPECT_EQ(filter_value.type, type);
     for (int64_t k = -10; k <= 10; ++k) {
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-      // success
-      EXPECT_EQ(!filter->group->Reject(k), k == -3 || k == 2);
+      EXPECT_EQ(!filter_value.group->Reject(k), k == -3 || k == 2);
     }
     // A new domain must not retain keys from the previous gathered image.
     domain.columnar.reset();
     domain.rows = {Row({key(7), Value("replacement")})};
     const auto replacement = CorrelationDomainFilter(
         source, 1, ColumnName("o", "k"), {1, 0}, runtime);
-    ASSERT_TRUE(replacement.has_value());
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-    // success
-    EXPECT_FALSE(replacement->group->Reject(7));
-    // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-    // success
-    EXPECT_TRUE(replacement->group->Reject(2));
+    if (!replacement.has_value()) {
+      ADD_FAILURE() << "replacement correlation filter was not built";
+      return;
+    }
+    const auto& replacement_value = replacement.value();
+    EXPECT_FALSE(replacement_value.group->Reject(7));
+    EXPECT_TRUE(replacement_value.group->Reject(2));
   }
 }
 
@@ -1072,15 +1072,20 @@ TEST_F(RelationalRegressionTest, ScalarFloatingFiltersKeepAllComparisons) {
       for (bool reversed : {false, true}) {
         const std::string lower = name + ">=" + std::to_string(lo);
         const std::string upper = name + "<=" + std::to_string(hi);
-        const std::string sql =
-            // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
-            // short fixed concatenations
-            "SELECT SUM(k*k+1),COUNT(*),SUM(" + name + "*" + name +
-            ") FROM FloatSelection WHERE k BETWEEN 3 "
-            "AND 9 AND " +
-            // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
-            // short fixed concatenations
-            (reversed ? upper + " AND " + lower : lower + " AND " + upper);
+        std::string sql = "SELECT SUM(k*k+1),COUNT(*),SUM(";
+        sql += name;
+        sql += '*';
+        sql += name;
+        sql += ") FROM FloatSelection WHERE k BETWEEN 3 AND 9 AND ";
+        if (reversed) {
+          sql += upper;
+          sql += " AND ";
+          sql += lower;
+        } else {
+          sql += lower;
+          sql += " AND ";
+          sql += upper;
+        }
         EXPECT_EQ(
             RelationalRun(*rs_, sql),
             std::vector<Row>{Row({count ? Value(sum) : Value(), Value(count),
@@ -1163,7 +1168,7 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
         "k BETWEEN " +
         std::to_string(lo) + " AND " + std::to_string(hi) +
         " AND j BETWEEN 1 AND 3 AND (v BETWEEN 0 AND 1 OR v BETWEEN 4 AND 6)";
-    const Row expected({(count != 0) ? Value(sum / count) : Value(),
+    const Row expected({(count != 0) ? Value(sum / static_cast<double>(count)) : Value(),
                         Value(count),
                         Value(static_cast<int64_t>(distinct.size()))});
     EXPECT_EQ(RelationalRun(*rs_, branch), std::vector<Row>({expected}));
@@ -1172,9 +1177,10 @@ TEST_F(RelationalRegressionTest, ScalarRangeSelectionKeepsNullsAndInt64Bounds) {
     ASSERT_NE(pos, std::string::npos);
     reversed.replace(pos, std::string("v BETWEEN 0 AND 1").size(),
                      "(v <= 1 AND v >= 0)");
-    // NOLINTNEXTLINE(performance-inefficient-string-concatenation) short fixed
-    // concatenations
-    EXPECT_EQ(RelationalRun(*rs_, branch + " UNION ALL " + reversed),
+    std::string union_sql = branch;
+    union_sql += " UNION ALL ";
+    union_sql += reversed;
+    EXPECT_EQ(RelationalRun(*rs_, union_sql),
               std::vector<Row>({expected, expected}));
   }
 }
@@ -1351,7 +1357,7 @@ TEST_F(RelationalRegressionTest, IndexedRuntimeFilterKeepsRunsAndResiduals) {
     for (bool allow_index : {false, true}) {
       // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type
       // is non-copyable by design
-      struct RestoreLimit {
+      struct RestoreLimit {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
         size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
         ~RestoreLimit() {
           ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
@@ -1596,7 +1602,7 @@ TEST_F(RelationalRegressionTest, FusedIntegerCaseRangesKeepNullAndOverflow) {
   ASSERT_TRUE(executed.HasValue());
   executed.Value().Collect();
   EXPECT_NE(executed.Value().GetStatus(), Status::kSuccess);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, InnerJoinCompiledResidualPreservesNulls) {
@@ -2005,7 +2011,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_EQ(result.GetStatus(), Status::kIsInfinity);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -2153,7 +2159,7 @@ TEST_F(RelationalRegressionTest, PartitionOwnedNumericGroupsKeepGlobalTopN) {
       const auto& g = expected_groups[i];
       result.emplace_back(std::vector<Value>{
           Value(g.key), Value(g.second), Value(g.count), Value(g.sum),
-          Value(static_cast<double>(g.width_sum) / g.count)});
+          Value(static_cast<double>(g.width_sum) / static_cast<double>(g.count))});
     }
     return result;
   };
@@ -2269,8 +2275,8 @@ TEST_F(RelationalRegressionTest,
     auto fresh = rs_->BeginReadOnlyContext();
     expected.erase(expected.begin());
     EXPECT_EQ(read(fresh), expected);
-    old.Abort();
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, old.Abort());
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
 }
 
@@ -2442,7 +2448,7 @@ TEST_F(RelationalRegressionTest,
   ASSERT_SUCCESS(prepared.Value()->GetStatus());
   check(old_rows, false);
   check(RelationalRun(*rs_, sql), true);
-  old.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, old.Abort());
   RelationalRun(*rs_, "CREATE TABLE DenseOverflow (k INT64,g INT64,v INT64)");
   RelationalRun(*rs_,
                 "INSERT INTO DenseOverflow VALUES (1,0,9223372036854775807)");
@@ -2456,7 +2462,7 @@ TEST_F(RelationalRegressionTest,
   ASSERT_TRUE(overflow.HasValue());
   EXPECT_FALSE(overflow.Value()->Next(&row, nullptr));
   EXPECT_EQ(overflow.Value()->GetStatus(), Status::kIsInfinity);
-  overflow_context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, overflow_context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -2528,7 +2534,7 @@ TEST_F(RelationalRegressionTest,
     EXPECT_EQ(read(fresh),
               std::vector<Row>({Row({Value(0), Value(ones + twos),
                                      Value((7 * ones) + (5 * twos))})}));
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
   auto writer = rs_->BeginContext();
   ASSERT_TRUE(fact->Update(writer.txn_, first,
@@ -2542,9 +2548,9 @@ TEST_F(RelationalRegressionTest,
         read(fresh),
         std::vector<Row>({Row({Value(0), Value(ones + twos),
                                Value((7 * (ones + 1)) + (5 * (twos - 1)))})}));
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
-  old.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, old.Abort());
   // Warm the exact histogram after the fact update, then add a positive
   // duplicate dimension key. A cache hit counts it once per dimension row.
   {
@@ -2566,8 +2572,8 @@ TEST_F(RelationalRegressionTest,
         read(fresh),
         std::vector<Row>({Row({Value(0), Value(ones + (2 * twos) - 1),
                                Value((7 * (ones + 1)) + (9 * (twos - 1)))})}));
-    fresh.Abort();
-    warm.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
+    EXPECT_EQ(tinylamb::Status::kSuccess, warm.Abort());
     RelationalRun(*rs_, "DELETE FROM CachedDim WHERE v=4");
   }
   // Columnar input must retain the canonical signed and duplicate-key folds.
@@ -2578,7 +2584,7 @@ TEST_F(RelationalRegressionTest,
     EXPECT_EQ(read(fresh),
               std::vector<Row>({Row({Value(0), Value(ones + (2 * twos) - 1),
                                      Value(-(ones + 1) + (9 * (twos - 1)))})}));
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
   RelationalRun(*rs_, "DELETE FROM CachedDim WHERE v=4");
   RelationalRun(*rs_, "UPDATE CachedDim SET k=100000 WHERE k=2");
@@ -2586,7 +2592,7 @@ TEST_F(RelationalRegressionTest,
     auto fresh = rs_->BeginReadOnlyContext();
     EXPECT_EQ(read(fresh), std::vector<Row>({Row({Value(0), Value(ones + 1),
                                                   Value(-(ones + 1))})}));
-    fresh.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, fresh.Abort());
   }
   RelationalRun(*rs_, "UPDATE CachedDim SET k=2 WHERE k=100000");
   RelationalRun(*rs_, "UPDATE CachedDim SET v=9223372036854775807 WHERE k=1");
@@ -2596,7 +2602,7 @@ TEST_F(RelationalRegressionTest,
   Row row;
   EXPECT_FALSE(overflow.Value()->Next(&row, nullptr));
   EXPECT_EQ(overflow.Value()->GetStatus(), Status::kIsInfinity);
-  overflow_context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, overflow_context.Abort());
   RelationalRun(*rs_, "DROP TABLE CachedFact");
   RelationalRun(*rs_, "CREATE TABLE CachedFact (k INT64,p STRING)");
   RelationalRun(*rs_, "INSERT INTO CachedFact VALUES (2,'new')");
@@ -2604,7 +2610,7 @@ TEST_F(RelationalRegressionTest,
   auto recreated = rs_->BeginReadOnlyContext();
   EXPECT_EQ(read(recreated),
             std::vector<Row>({Row({Value(0), Value(1), Value(5)})}));
-  recreated.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, recreated.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -2643,7 +2649,7 @@ TEST_F(RelationalRegressionTest,
       }
       EXPECT_SUCCESS(plan.Value()->GetStatus());
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return rows;
   };
   EXPECT_EQ(read(), expected);
@@ -2693,7 +2699,7 @@ TEST_F(RelationalRegressionTest,
                       Value(160000), Value(200000), Value(240000)}));
   EXPECT_FALSE(plan.Value()->Next(&row, nullptr));
   EXPECT_SUCCESS(plan.Value()->GetStatus());
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -2776,14 +2782,14 @@ TEST_F(RelationalRegressionTest,
     SqlEngine engine(*rs_);
     StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
     if (!prepared.HasValue()) {
-      ctx.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
       return;
     }
     Row row;
     while (prepared.Value()->Next(&row, nullptr)) {
     }
     EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
-    ctx.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
   };
 
   // Bug 4: DOUBLE count in window APPROX_QUANTILES must not reinterpret IEEE754
@@ -2882,7 +2888,7 @@ TEST_F(RelationalRegressionTest, AuditSubqueryInPropagatesComparisonErrors) {
       }
       EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -2901,7 +2907,7 @@ TEST_F(RelationalRegressionTest, AuditDateIntegerFiltersPreserveTypeErrors) {
       }
       EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
     }
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   }
 }
 
@@ -3271,7 +3277,7 @@ TEST_F(RelationalRegressionTest, PartitionedGroupMergeKeepsKeysAndStates) {
         previous = output.rows;
       }
       context.set_execution_runtime(nullptr);
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     }
   }
 }
@@ -3335,7 +3341,7 @@ TEST_F(RelationalRegressionTest,
   EXPECT_EQ((*result)[2].rows[0][1], Value(static_cast<int64_t>(kRows)));
   result.reset();
   context.set_execution_runtime(nullptr);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, GroupingSetsBudgetUsesPromotedSlimState) {
@@ -3399,7 +3405,7 @@ TEST_F(RelationalRegressionTest, GroupingSetsBudgetUsesPromotedSlimState) {
   EXPECT_EQ((*result)[2].rows[0][1], Value(static_cast<double>(kRows)));
   result.reset();
   context.set_execution_runtime(nullptr);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, ParallelResidualProbePadsOnlyRejectedMatches) {
@@ -3467,7 +3473,7 @@ TEST_F(RelationalRegressionTest, ParallelResidualProbePadsOnlyRejectedMatches) {
       }
     }
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -3515,7 +3521,7 @@ TEST_F(RelationalRegressionTest,
       }
     }
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, CompactPartitionPreservesFloatOrderAndHaving) {
@@ -3573,7 +3579,7 @@ TEST_F(RelationalRegressionTest, CompactPartitionPreservesFloatOrderAndHaving) {
     }
     context.set_execution_runtime(nullptr);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, JoinTypeMismatchedEqualityStaysResidual) {
@@ -3611,7 +3617,7 @@ TEST_F(RelationalRegressionTest, JoinTypeMismatchedEqualityStaysResidual) {
   while (keyed.Value()->Next(&row, nullptr)) {
   }
   EXPECT_NE(keyed.Value()->GetStatus(), Status::kSuccess);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, JoinNumericPromotionEqualityMatches) {
@@ -3638,7 +3644,7 @@ TEST_F(RelationalRegressionTest, JoinNumericPromotionEqualityMatches) {
   ASSERT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
   ASSERT_EQ(rows.size(), 1);
   EXPECT_EQ(rows[0].values_[0].value.int_value, 10);
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, GroupOutputPushPreservesOuterFanoutAndNulls) {
@@ -3724,7 +3730,7 @@ TEST_F(RelationalRegressionTest, GroupOutputPushChainsBuildsAndKeepsErrors) {
   } else {
     EXPECT_NE(executed.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, GroupOutputSinkBatchesDeclinesAndErrors) {
@@ -3802,7 +3808,7 @@ TEST_F(RelationalRegressionTest, GroupOutputSinkBatchesDeclinesAndErrors) {
       }
     }
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -3978,7 +3984,7 @@ TEST_F(RelationalRegressionTest, PredicateTransferKeepsRejectedGroupErrors) {
   } else {
     EXPECT_NE(result.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -3999,7 +4005,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_NE(result.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, PredicateTransferKeepsFloatingOverflow) {
@@ -4021,7 +4027,7 @@ TEST_F(RelationalRegressionTest, PredicateTransferKeepsFloatingOverflow) {
   } else {
     EXPECT_NE(result.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, PredicateTransferKeepsCompleteFloatingGroups) {
@@ -4067,7 +4073,7 @@ TEST_F(RelationalRegressionTest, PredicateTransferDoesNotHideBuildOverflow) {
   } else {
     EXPECT_NE(result.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -4110,7 +4116,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_NE(res.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -4198,7 +4204,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_NE(res.GetStatus(), Status::kSuccess);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -4265,7 +4271,7 @@ TEST_F(RelationalRegressionTest,
   } else {
     EXPECT_EQ(sum_overflow.GetStatus(), Status::kIsInfinity);
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
 }
 
 TEST_F(RelationalRegressionTest, ParallelScanPushesNullCoalesce) {
@@ -4320,7 +4326,7 @@ TEST_F(RelationalRegressionTest, ParallelScanPushesNullCoalesce) {
   EXPECT_EQ(first, 4500U);
   EXPECT_EQ(second, 3000U);
   EXPECT_EQ(nulls, 1500U);
-  ctx.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
 }
 
 TEST_F(RelationalRegressionTest, SelfSumHavingKeepsIntegerPrecision) {
@@ -5356,26 +5362,26 @@ TEST_F(RelationalRegressionTest,
 // Lean proof: lean/TinylambOpt/ProposedProofs/NthNonNullFrame.lean (sound)
 TEST_F(RelationalRegressionTest,
        NthNonNullFrameMatchesFallbackAcrossIgnoreNullsAndExclusions) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5466,26 +5472,26 @@ TEST_F(RelationalRegressionTest,
 // Lean proof: lean/TinylambOpt/ProposedProofs/RangeDistinctIndex.lean (sound)
 TEST_F(RelationalRegressionTest,
        RangeDistinctIndexMatchesFallbackAcrossArbitraryFrames) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5571,26 +5577,26 @@ for (int i = 0; i < 20; ++i) {
 // (sound)
 TEST_F(RelationalRegressionTest,
        QuantifiedRangeSummaryMatchesFallbackAllOpsAndNulls) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5646,26 +5652,26 @@ TEST_F(RelationalRegressionTest,
 // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
 TEST_F(RelationalRegressionTest,
        DemandScalarDefersUnusedMultiRowErrorAndErrorsOnActive) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5715,33 +5721,33 @@ TEST_F(RelationalRegressionTest,
               StatusCode::kInvalidArgument);
     EXPECT_NE(prepared.Value()->GetStatus().GetMessage().find("more than one"),
               std::string::npos);
-    ctx.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, ctx.Abort());
   }
 }
 
 // Lean proof: lean/TinylambOpt/ProposedProofs/SkylineAntiJoin.lean (sound)
 TEST_F(RelationalRegressionTest,
        SkylineAntiJoinMatchesFallbackTiesNullsAndExtremes) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5784,26 +5790,26 @@ TEST_F(RelationalRegressionTest,
 // Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
 TEST_F(RelationalRegressionTest,
        IntervalCountSweepMatchesFallbackBoundariesNullsAndClosedOpen) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5859,26 +5865,26 @@ TEST_F(RelationalRegressionTest,
 // Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
 TEST_F(RelationalRegressionTest,
        ExternalSorterPackedOrderKeyMatchesFallbackViaSql) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -5906,7 +5912,13 @@ TEST_F(RelationalRegressionTest,
     } else {
       sb = std::to_string(((i * 5) % 9) - 4);
     }
-    ins += "(" + sa + ", " + sb + ", " + std::to_string(i) + ")";
+    ins += '(';
+    ins += sa;
+    ins += ", ";
+    ins += sb;
+    ins += ", ";
+    ins += std::to_string(i);
+    ins += ')';
   }
   ins += ";";
   RelationalRun(*rs_, ins);

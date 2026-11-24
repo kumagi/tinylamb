@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/explain_format.hpp"
 
 #include <algorithm>
@@ -102,7 +103,7 @@ namespace {
 // configured by TINYLAMB_QUERY_MEMORY_BYTES.  Label both so the number can
 // never be mistaken for the per-query grant.
 void EmitQueryMemoryLine(std::ostream& output, const std::string& pad) {
-  const char* env = std::getenv("TINYLAMB_EXEC_ENGINE");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_EXEC_ENGINE");
   const bool pipeline =
       env == nullptr || env[0] == '\0' || std::string_view(env) != "legacy";
   output << pad << "QueryMemory limit=";

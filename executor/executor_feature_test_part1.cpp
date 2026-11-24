@@ -427,7 +427,7 @@ TEST_F(ExecutorFeatureSqlTest, SetOperationSpillsUnderTinyBudget) {
   Run("CREATE TABLE big2(x INT64)");
   for (int64_t base = 0; base < 4; ++base) {
     std::string values;
-    values.reserve(40 * 6);
+    values.reserve(size_t{40} * 6);
     for (int64_t i = 0; i < 40; ++i) {
       if (i != 0) {
         values += ", ";

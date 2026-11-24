@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/platform/process.hpp"
 #include "log_message.hpp"
 
 #include <array>
@@ -44,7 +45,7 @@ std::atomic<int> g_min_log_level{static_cast<int>(LogLevel::kTrace)};
 std::once_flag g_log_level_env_once;
 
 LogLevel ParseLogLevelEnv() {
-  const char* env = std::getenv("TINYLAMB_LOG_LEVEL");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_LOG_LEVEL");
   if (env == nullptr || *env == '\0') {
     return LogLevel::kTrace;
   }
@@ -96,10 +97,10 @@ bool LogLevelEnabled(LogLevel level) noexcept {
 namespace {
 bool LogUsesColor() {
   static const bool kUseColor = [] {
-    if (std::getenv("NO_COLOR") != nullptr) {
+    if (::tinylamb::platform::GetEnv("NO_COLOR") != nullptr) {
       return false;
     }
-    if (std::getenv("TINYLAMB_FORCE_COLOR") != nullptr) {
+    if (::tinylamb::platform::GetEnv("TINYLAMB_FORCE_COLOR") != nullptr) {
       return true;
     }
 #ifndef _WIN32

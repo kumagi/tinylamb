@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
@@ -319,7 +320,7 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     }
   }
   const size_t argc = args.size();
-  if (getenv("TINYLAMB_FUNC_FUZZ_TRACE") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_FUNC_FUZZ_TRACE") != nullptr) {
     (void)fprintf(stderr, "trace %s argc=%zu", name.c_str(), argc);
     for (const auto& a : args) {
       if (a->Type() == TypeTag::kConstantValue) {

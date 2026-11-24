@@ -796,8 +796,7 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
 // UNPIVOT subquery source. Everything that describes how this source joins
 // to its siblings must survive that replacement, otherwise a PIVOT on the
 // right operand of a JOIN silently turns the join into a cross product.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared only within this TU.
 static void CarryPivotJoinContext(const SelectSource& from, SelectSource* to) {
   to->join_type = from.join_type;
   to->join_condition = from.join_condition;

@@ -18,6 +18,7 @@
 #define TINYLAMB_CRC32C_HPP
 
 #include <array>
+#include "common/platform/process.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -260,7 +261,7 @@ struct AdvanceByteTable {
   // A/B hatch: presence of TINYLAMB_DISABLE_CRC_LANES (any value, even =0)
   // restores the plain chained loop.
   static const bool lanes_disabled =
-      std::getenv("TINYLAMB_DISABLE_CRC_LANES") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CRC_LANES") != nullptr;
   // Below 2 KiB, direct chained _mm_crc32_u64 avoids table-build thrashing on
   // diverse row/WAL record sizes while remaining sub-microsecond.
   if (data.size() >= 2048 && !lanes_disabled) {

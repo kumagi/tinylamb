@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
+#include "common/test_util.hpp"
 #include "benchmark/tpcc_workload.hpp"
 
 #include <gtest/gtest.h>
@@ -91,7 +92,7 @@ class TestSqlSession final : public TpccSqlSession {
   void Abort() override {
     ++aborts;
     if (context_) {
-      context_->Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context_->Abort());
     }
   }
   std::string_view LastError() const override { return "session failure"; }
@@ -659,7 +660,7 @@ TEST(TpccWorkloadFailPathTest, NewOrderAbortsWhenSupportingRowsMissing) {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << "\n" << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return;
     }
     Row row;
@@ -766,7 +767,7 @@ TEST(TpccWorkloadFailPathTest, PaymentAbortsWhenSupportingRowsMissing) {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << "\n" << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return;
     }
     Row row;
@@ -865,7 +866,7 @@ TEST(TpccWorkloadFailPathTest, OrderStatusAbortsWhenSupportingRowsMissing) {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << "\n" << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return;
     }
     Row row;
@@ -964,7 +965,7 @@ TEST(TpccWorkloadFailPathTest, DeliveryAndStockLevelAbortWhenRowsMissing) {
     StatusOr<Executor> prepared = engine.Prepare(context, sql);
     if (!prepared.HasValue()) {
       ADD_FAILURE() << sql << "\n" << engine.LastError();
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return;
     }
     Row row;

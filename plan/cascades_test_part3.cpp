@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <cstdlib>
 
+#include "common/platform/process.hpp"
 #include "plan/cascades_test.hpp"
 
 namespace tinylamb::cascades {
@@ -2600,7 +2601,7 @@ TEST(CascadesTest, EliminateTrueSelectionPreservesInputScanFilter) {
 }
 
 TEST(CascadesTest, WindowHaloTopNPushesSliceAndPreservesOffset) {
-  unsetenv("TINYLAMB_DISABLE_WINDOW_HALO");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
   Memo memo;
   const GroupId scan = memo.Build({"t"});
 
@@ -2710,7 +2711,7 @@ TEST(CascadesTest, WindowHaloTopNPushesSliceAndPreservesOffset) {
 }
 
 TEST(CascadesTest, OuterFetchTiesPushesThroughLeftJoin) {
-  unsetenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
   for (const bool with_ties : {false, true}) {
     Memo memo;
     (void)memo.Build({"l", "r"});

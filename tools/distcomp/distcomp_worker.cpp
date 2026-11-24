@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "protocol.hpp"
 
 namespace fs = std::filesystem;
@@ -231,7 +232,7 @@ void HandleClient(int client_fd, const std::string& expected_token) {
       distcomp::AppendI32(resp, 1);
       distcomp::AppendStr(resp, "");
       distcomp::AppendStr(
-          resp, std::string("fork failed: ") + std::strerror(fork_errno));
+          resp, std::string("fork failed: ") + ::tinylamb::platform::StrError(fork_errno));
       distcomp::AppendStr(resp, "");
       distcomp::AppendStr(resp, "");
       if (!distcomp::SendFrame(client_fd, resp)) {
@@ -306,7 +307,7 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
   uint16_t port = 19876;
   std::string bind_ip = "0.0.0.0";
-  const char* token_env = std::getenv("DISTCOMP_TOKEN");
+  const char* token_env = ::tinylamb::platform::GetEnv("DISTCOMP_TOKEN");
   std::string expected_token = (token_env && *token_env) ? token_env : "";
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];

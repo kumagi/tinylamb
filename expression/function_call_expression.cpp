@@ -16,6 +16,8 @@
 
 #include "expression/function_call_expression.hpp"
 
+#include "common/platform/process.hpp"
+
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX gmtime_r/timegm
 #include <time.h>
 
@@ -1308,8 +1310,9 @@ Value NormalizeIfBranch(Value value, const bool to_double) {
 }
 
 Status MergeCoalesceType(TypeTag candidate, TypeTag* common) {
-  if (candidate == TypeTag::kInteger) { candidate = TypeTag::kBigInt;
-}
+  if (candidate == TypeTag::kInteger) {
+    candidate = TypeTag::kBigInt;
+  }
   if (candidate == TypeTag::kInvalid || candidate == *common) {
     return Status::kSuccess;
   }
@@ -3083,13 +3086,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return false;  // NULL elements never match (GoogleSQL semantics)
       }
       if (v.type == ValueType::kArray) {
-        for (const Value& element :
-             v.ArrayElements()) {  // NOLINT(readability-use-anyofallof)
-          if (walk(element)) {
-            return true;
-          }
-        }
-        return false;
+        return std::ranges::any_of(v.ArrayElements(),
+                                   [&](const Value& element) {
+                                     return walk(element);
+                                   });
       }
       return UnicodeCaseFold(raw_str(v)).find(needle) != std::string::npos;
     };
@@ -3499,7 +3499,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     std::vector<Value> elements;
     elements.reserve(values[0].value.varchar_value.size());
     for (const uint32_t cp : CodePointsOf(values[0].value.varchar_value)) {
-      elements.emplace_back(static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
+      elements.emplace_back(
+          static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -4041,7 +4042,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
       // Iterate the tail in place: s.substr() used to copy the remainder
       // of the string once per row before the regex scan.
-      std::sregex_iterator it(s.cbegin() + byte_start, s.cend(), re);
+      std::sregex_iterator it(
+          s.cbegin() + static_cast<std::ptrdiff_t>(byte_start), s.cend(), re);
       std::sregex_iterator end;
       for (int64_t current_occ = 1; it != end; ++it, ++current_occ) {
         if (current_occ == occ_arg) {
@@ -4158,7 +4160,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     try {
       ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(plain));
       // Iterate the tail in place (see REGEXP_EXTRACT above).
-      std::sregex_iterator it(s.cbegin() + byte_start, s.cend(), re);
+      std::sregex_iterator it(
+          s.cbegin() + static_cast<std::ptrdiff_t>(byte_start), s.cend(), re);
       std::sregex_iterator end;
       std::vector<Value> out;
       int64_t current_occ = 0;
@@ -4514,9 +4517,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // The OS user is constant for the process; resolve it once instead of
     // scanning the environment and allocating a string on every row.
     static const std::string kUser = [] {
-      const char* os_user = std::getenv("USER");
+      const char* os_user = ::tinylamb::platform::GetEnv("USER");
       if (os_user == nullptr || *os_user == '\0') {
-        os_user = std::getenv("LOGNAME");
+        os_user = ::tinylamb::platform::GetEnv("LOGNAME");
       }
       return os_user != nullptr && *os_user != '\0' ? std::string(os_user)
                                                     : std::string("tinylamb");
@@ -5762,7 +5765,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         }
         step_us = (static_cast<platform::Int128>(parsed.days) * kDayMicros) +
                   (parsed.nanos /
-                      1000);  // NOLINT(readability-math-missing-parentheses)
+                   1000);  // NOLINT(readability-math-missing-parentheses)
       }
     }
     if (step_us == 0) {
@@ -5795,13 +5798,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         std::string text(buffer.data());
         if (frac != 0) {
           std::array<char, 12> digits{};
-          std::snprintf(digits.data(), digits.size(),
-                        ".%06lld",  // NOLINT(cert-err33-c)
-                        static_cast<long long>(frac));
+          const int written = std::snprintf(
+              digits.data(), digits.size(), ".%06lld",
+              static_cast<long long>(frac));
+          if (written < 0 || static_cast<size_t>(written) >= digits.size()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "TIMESTAMP fractional seconds out of range");
+          }
           text += digits.data();
         }
         text += "+00";
-        elements.emplace_back(std::move(text));  // NOLINT(modernize-use-emplace)
+        elements.emplace_back(
+            std::move(text));  // NOLINT(modernize-use-emplace)
         const platform::Int128 next =
             static_cast<platform::Int128>(t) + step_us;
         if (next < std::numeric_limits<int64_t>::min() ||
@@ -6725,7 +6733,8 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
   // evaluator (see the plain overload): errors inside unevaluated branches
   // never surface.
   if (func_name_ == "coalesce") {
-    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(left_schema, &right_schema)));
+    ASSIGN_OR_RETURN(TypeTag, common,
+                     (CoalesceType(left_schema, &right_schema)));
     for (const auto& arg : args_) {
       ASSIGN_OR_RETURN(
           Value, value,
@@ -7323,12 +7332,14 @@ StatusOr<TypeTag> FunctionCallExpression::CoalesceType(
     const Schema& schema, const Schema* right) const {
   TypeTag common = TypeTag::kInvalid;
   for (const Expression& argument : args_) {
-    if (!argument) { return Status::kInvalidArgument;
-}
-    TypeTag candidate;
+    if (!argument) {
+      return Status::kInvalidArgument;
+    }
+    TypeTag candidate{};
     try {
       candidate = ((right != nullptr) ? argument->ResultType(schema, *right)
-                         : argument->ResultType(schema)).GetType();
+                                      : argument->ResultType(schema))
+                      .GetType();
     } catch (const std::runtime_error&) {
       // Correlated references may only be bound by the execution scope.
       continue;

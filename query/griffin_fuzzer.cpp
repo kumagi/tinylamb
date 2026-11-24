@@ -823,7 +823,7 @@ struct ScopedQueryMemory {
 
 struct ScopedEnvVar {
   ScopedEnvVar(const char* name, const char* value) : name_(name) {
-    if (const char* prev = std::getenv(name)) {
+    if (const char* prev = ::tinylamb::platform::GetEnv(name)) {
       had_prev_ = true;
       prev_ = prev;
     }
@@ -1206,7 +1206,7 @@ std::string ReplayGriffinTrace(const GriffinTrace& trace, bool verbose,
   TransactionContext ctx = db.BeginContext();
   GriffinTrace fresh;
   fresh.seed = trace.seed;
-  const std::string report =
+  std::string report =
       RunSession(db, ctx, trace.statements, &fresh, nullptr);
   db.DeleteAll();
   if (trace.ran_select && !fresh.ran_select) {

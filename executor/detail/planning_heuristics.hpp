@@ -177,6 +177,7 @@ struct JoinKeyFrequencyMaps {
   bool composite_int{false};
   bool hashed_key{false};
   bool hashed_fallback{false};
+  bool sampling_failed{false};
   std::vector<slot_t> right_columns;
   size_t build_stride{1};
   FlatIntKeyMap<size_t> single_int_frequencies;

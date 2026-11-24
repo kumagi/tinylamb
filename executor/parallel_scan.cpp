@@ -18,6 +18,7 @@
 #include "common/exception_status.hpp"
 #include "common/literal_like_pattern.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
@@ -73,15 +74,15 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
       table_(&table),
       projection_(std::move(projection)),
       peek_compares_(std::move(peek_compares)),
-      ordered_(ordered)
-      {
+      ordered_(ordered) {
   if (projection_) {
     const size_t width = table_->GetSchema().ColumnCount();
     for (size_t i = 0; i < projection_->size(); ++i) {
       if ((*projection_)[i] >= width ||
           (i > 0 && (*projection_)[i - 1] >= (*projection_)[i])) {
-        worker_status_ = StatusError(StatusCode::kInvalidArgument,
-                                    "scan projection must be ascending and in range");
+        worker_status_ =
+            StatusError(StatusCode::kInvalidArgument,
+                        "scan projection must be ascending and in range");
         return;
       }
     }
@@ -616,7 +617,9 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       // reallocates only when a block is strictly larger than every block
       // seen so far. Fluctuating (smaller) blocks reuse this one buffer, so
       // there is no per-block malloc/free churn at LSTable boundaries.
-      std::unique_ptr<uint32_t[]> simple_matches;
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): reusable runtime-sized
+      // scratch.
+      std::unique_ptr<uint32_t[]> simple_matches;  // NOLINT(modernize-avoid-c-arrays): reusable runtime-sized scratch.
       size_t simple_capacity = 0;
       for (size_t b = b_begin; b < b_end; ++b) {
         if (failed.load(std::memory_order_acquire)) {
@@ -632,7 +635,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
         bool kleene_all_pass = !row_filter_conjuncts_.empty();
         if (!row_filter_conjuncts_.empty()) {
           const char* disable_kleene =
-              std::getenv("TINYLAMB_DISABLE_BLOCK_KLEENE");
+              ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_BLOCK_KLEENE");
           if (disable_kleene == nullptr || disable_kleene[0] != '1') {
             // Lean proof: lean/TinylambOpt/BlockKleene.lean
             //   (aeval_contains_ceval, block_kleene_sound,
@@ -829,8 +832,9 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           if (!col.has_null &&
               (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
             if (simple_capacity < blk.row_count) {
+              // NOLINTNEXTLINE(modernize-avoid-c-arrays): reusable scratch.
               simple_matches =
-                  std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);
+                  std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);  // NOLINT(modernize-avoid-c-arrays): runtime-sized scratch.
               simple_capacity = blk.row_count;
             }
             uint32_t* __restrict out = simple_matches.get();
@@ -1151,7 +1155,8 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
     }
     // A/B hatch: TINYLAMB_DISABLE_CHUNK_COPY_APPEND=1 restores move-append.
     static const bool copy_append_disabled =
-        std::getenv("TINYLAMB_DISABLE_CHUNK_COPY_APPEND") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CHUNK_COPY_APPEND") !=
+        nullptr;
     // When the chunk layout holds only fixed-width cells (INT64/DATE/DOUBLE,
     // NULLs), appending by const reference is strictly cheaper than moving:
     // the copy is a scalar push per column, and the iterator keeps reusing
@@ -1239,7 +1244,7 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
           bool kleene_all_pass = !row_filter_conjuncts_.empty();
           if (!row_filter_conjuncts_.empty()) {
             const char* disable_kleene =
-                std::getenv("TINYLAMB_DISABLE_BLOCK_KLEENE");
+                ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_BLOCK_KLEENE");
             if (disable_kleene == nullptr || disable_kleene[0] != '1') {
               // Lean proof: lean/TinylambOpt/BlockKleene.lean
               //   (aeval_contains_ceval, block_kleene_sound,

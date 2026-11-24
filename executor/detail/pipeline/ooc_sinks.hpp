@@ -1142,7 +1142,9 @@ class OocCrossJoinBuildSink final : public PipelineSink {
   std::shared_ptr<OocCrossJoinContext> cross_ctx_;
 };
 
-class OocCrossJoinProbeSource final : public PipelineSource {
+class OocCrossJoinProbeSource final  // NOLINT(cppcoreguidelines-special-member-functions):
+                                     // scope-owned cleanup.
+    : public PipelineSource {
  public:
   OocCrossJoinProbeSource(std::shared_ptr<OocCrossJoinContext> cross_ctx,
                           OocSetOpInputStream left_stream);

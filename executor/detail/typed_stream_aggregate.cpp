@@ -39,6 +39,7 @@
 #include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
 #include "common/platform/int128_conversion.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/range_selection.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/regex_guard.hpp"
@@ -304,6 +305,16 @@ struct CompiledLSTableBlockFilter {
     int64_t hi{std::numeric_limits<int64_t>::max()};
     bool empty{false};
   };
+  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+  // (InRangeSynopsis_sound).
+  struct IntInList {
+    slot_t full_col{0};
+    int64_t lo{0};
+    int64_t hi{0};
+    uint64_t mask{0};
+    bool use_mask{false};
+    std::vector<int64_t> values;
+  };
   struct Branch {
     std::vector<CompiledComparePred> preds;
   };
@@ -313,6 +324,7 @@ struct CompiledLSTableBlockFilter {
 
   std::vector<NullPred> null_preds;
   std::vector<IntInterval> int_intervals;
+  std::vector<IntInList> int_inlists;
   std::vector<CompiledComparePred> stage1_preds;
   std::vector<Disjunction> disjunctions;
   std::vector<uint8_t> referenced_full_cols;
@@ -485,6 +497,46 @@ struct CompiledLSTableBlockFilter {
       }
       disjunctions.push_back(std::move(disj));
     }
+    for (const TypedInListCompare& list : plan.inlist_compares) {
+      if (list.is_string || list.is_double ||
+          list.column >= proj_types.size() || proj_unsigned[list.column] != 0 ||
+          (proj_types[list.column] != ValueType::kInt64 &&
+           proj_types[list.column] != ValueType::kDate)) {
+        return false;
+      }
+      const slot_t full_col = proj_to_full[list.column];
+      if (full_col >= store.column_has_null.size()) {
+        return false;
+      }
+      if (list.int_values.empty()) {
+        always_false = true;
+        continue;
+      }
+      IntInList compiled;
+      compiled.full_col = full_col;
+      compiled.values = list.int_values;
+      compiled.lo = compiled.values[0];
+      compiled.hi = compiled.values[0];
+      for (const int64_t v : compiled.values) {
+        compiled.lo = std::min(compiled.lo, v);
+        compiled.hi = std::max(compiled.hi, v);
+      }
+      const uint64_t span = static_cast<uint64_t>(compiled.hi) -
+                            static_cast<uint64_t>(compiled.lo);
+      if (span < 64ULL) {
+        compiled.use_mask = true;
+        compiled.mask = 0;
+        for (const int64_t v : compiled.values) {
+          compiled.mask |=
+              (uint64_t{1} << (static_cast<uint64_t>(v) -
+                               static_cast<uint64_t>(compiled.lo)));
+        }
+      } else if (compiled.values.size() > 16) {
+        return false;
+      }
+      int_inlists.push_back(std::move(compiled));
+      referenced_full_cols[full_col] = 1;
+    }
     return true;
   }
 
@@ -505,6 +557,7 @@ struct CompiledLSTableBlockFilter {
     std::vector<uint8_t> col_bound;
     std::vector<const NullPred*> active_nulls;
     std::vector<const IntInterval*> active_intervals;
+    std::vector<const IntInList*> active_inlists;
     std::vector<const CompiledComparePred*> active_stage1;
     std::vector<const CompiledComparePred*> flat_disj_preds;
     std::vector<ActiveBranchSlice> flat_disj_branches;
@@ -553,6 +606,31 @@ struct CompiledLSTableBlockFilter {
         }
       }
       ws->active_intervals.push_back(&iv);
+    }
+    ws->active_inlists.clear();
+    for (const IntInList& il : int_inlists) {
+      const LSTableColumnBlock& col = blk.columns[il.full_col];
+      if (col.has_min_max) {
+        if (col.max_int < il.lo || col.min_int > il.hi) {
+          *all_pass = false;
+          return 0;
+        }
+        if (il.values.size() <= 16) {
+          bool any_may_match = false;
+          for (const int64_t v : il.values) {
+            if (v >= col.min_int && v <= col.max_int &&
+                col.BlockBloomMayContain(v)) {
+              any_may_match = true;
+              break;
+            }
+          }
+          if (!any_may_match) {
+            *all_pass = false;
+            return 0;
+          }
+        }
+      }
+      ws->active_inlists.push_back(&il);
     }
     ws->active_stage1.clear();
     for (const CompiledComparePred& pred : stage1_preds) {
@@ -651,7 +729,8 @@ struct CompiledLSTableBlockFilter {
       }
     }
     if (ws->active_nulls.empty() && ws->active_intervals.empty() &&
-        ws->active_stage1.empty() && ws->active_disjs.empty()) {
+        ws->active_inlists.empty() && ws->active_stage1.empty() &&
+        ws->active_disjs.empty()) {
       *all_pass = true;
       return n;
     }
@@ -661,6 +740,9 @@ struct CompiledLSTableBlockFilter {
     }
     for (const IntInterval* iv : ws->active_intervals) {
       ensure_col_bound(iv->full_col);
+    }
+    for (const IntInList* il : ws->active_inlists) {
+      ensure_col_bound(il->full_col);
     }
     for (const CompiledComparePred* pred : ws->active_stage1) {
       ensure_col_bound(pred->full_left);
@@ -703,6 +785,83 @@ struct CompiledLSTableBlockFilter {
         }
         m = out_m;
       }
+      if (m == 0) {
+        return 0;
+      }
+    }
+
+    for (const IntInList* il : ws->active_inlists) {
+      const DirectBlockCol& col = ws->cols[il->full_col];
+      const uint32_t count = initialized_sel ? m : n;
+      uint32_t out_m = 0;
+      if (il->use_mask) {
+        const auto lo_u = static_cast<uint64_t>(il->lo);
+        const uint64_t mask = il->mask;
+        if (!initialized_sel) {
+          if (!col.has_null && col.cells != nullptr) {
+            const int64_t* __restrict cells = col.cells;
+            for (uint32_t r = 0; r < count; ++r) {
+              const uint64_t d = static_cast<uint64_t>(cells[r]) - lo_u;
+              const bool hit =
+                  (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+              (*sel)[out_m] = r;
+              out_m += static_cast<uint32_t>(hit);
+            }
+          } else {
+            for (uint32_t r = 0; r < count; ++r) {
+              if (col.IsNull(r)) {
+                continue;
+              }
+              const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
+              const bool hit =
+                  (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+              (*sel)[out_m] = r;
+              out_m += static_cast<uint32_t>(hit);
+            }
+          }
+        } else if (!col.has_null) {
+          for (uint32_t idx = 0; idx < count; ++idx) {
+            const uint32_t r = (*sel)[idx];
+            const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
+            const bool hit =
+                (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+            (*sel)[out_m] = r;
+            out_m += static_cast<uint32_t>(hit);
+          }
+        } else {
+          for (uint32_t idx = 0; idx < count; ++idx) {
+            const uint32_t r = (*sel)[idx];
+            if (col.IsNull(r)) {
+              continue;
+            }
+            const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
+            const bool hit =
+                (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+            (*sel)[out_m] = r;
+            out_m += static_cast<uint32_t>(hit);
+          }
+        }
+      } else {
+        const auto match_val = [&](int64_t v) -> bool {
+          if (v < il->lo || v > il->hi) {
+            return false;
+          }
+          for (const int64_t item : il->values) {
+            if (v == item) {
+              return true;
+            }
+          }
+          return false;
+        };
+        for (uint32_t idx = 0; idx < count; ++idx) {
+          const uint32_t r = initialized_sel ? (*sel)[idx] : idx;
+          if ((!col.has_null || !col.IsNull(r)) && match_val(col.Int(r))) {
+            (*sel)[out_m++] = r;
+          }
+        }
+      }
+      m = out_m;
+      initialized_sel = true;
       if (m == 0) {
         return 0;
       }
@@ -1519,7 +1678,8 @@ StatusOr<std::optional<Relation>> TryRunParallelScalarCountDistinct(
 
   const bool no_predicates =
       filter.null_preds.empty() && filter.int_intervals.empty() &&
-      filter.stage1_preds.empty() && filter.disjunctions.empty();
+      filter.int_inlists.empty() && filter.stage1_preds.empty() &&
+      filter.disjunctions.empty();
   if (no_predicates && full_col < store.dictionaries.size()) {
     const LSTableColumnDictionary& dict = store.dictionaries[full_col];
     const size_t entry_count =
@@ -1980,8 +2140,8 @@ std::optional<std::vector<Value>> TryScalarBlockMetaMinMax(
     const LSTableStore& store, const CompiledLSTableBlockFilter& filter,
     const std::vector<DirectAggBinding>& bindings) {
   if (filter.always_false || !filter.null_preds.empty() ||
-      !filter.int_intervals.empty() || !filter.stage1_preds.empty() ||
-      !filter.disjunctions.empty()) {
+      !filter.int_intervals.empty() || !filter.int_inlists.empty() ||
+      !filter.stage1_preds.empty() || !filter.disjunctions.empty()) {
     return std::nullopt;
   }
   const size_t naggs = bindings.size();
@@ -2056,7 +2216,8 @@ StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
     const LSTableStore& store, const Schema& table_schema,
     const CompiledLSTableBlockFilter& filter,
     const std::vector<DirectAggBinding>& bindings, size_t* matching_rows_out) {
-  if (filter.always_false || !filter.disjunctions.empty()) {
+  if (filter.always_false || !filter.disjunctions.empty() ||
+      !filter.int_inlists.empty()) {
     return std::optional<std::vector<Value>>{};
   }
   constexpr size_t kMaxShortcutDictEntries = 262'144;
@@ -2715,8 +2876,8 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
       !(stmt.GroupBy().empty() || stmt.IsGroupAll()) ||
       !plan.key_offsets.empty() || having_expr != nullptr || stmt.HasLimit() ||
       stmt.Distinct() || stmt.WithTies() || !plan.order_items.empty() ||
-      !plan.dependent_key_programs.empty() || !plan.inlist_compares.empty() ||
-      !plan.slim || plan.aggregates.empty() || plan.aggregates.size() > 128) {
+      !plan.dependent_key_programs.empty() || !plan.slim ||
+      plan.aggregates.empty() || plan.aggregates.size() > 128) {
     return std::optional<Relation>{};
   }
   for (const TypedEmitItem& item : plan.emit_items) {
@@ -3480,9 +3641,9 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
       (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
       stmt.GroupBy().empty() || stmt.IsGroupAll() ||
       (nkeys != 1 && nkeys != 2) ||
-      (nkeys == 2 &&
-       (std::getenv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
-        having_expr != nullptr)) ||
+      (nkeys == 2 && (::tinylamb::platform::GetEnv(
+                          "TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
+                      having_expr != nullptr)) ||
       stmt.HasLimit() || stmt.Distinct() || stmt.WithTies() ||
       !plan.order_items.empty() || !plan.dependent_key_programs.empty() ||
       !plan.inlist_compares.empty() || !plan.slim || plan.aggregates.empty() ||
@@ -3637,7 +3798,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
       std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
   if (nkeys == 2 && total_slots > 32768) {
     workers_used = std::max<size_t>(
-        1, std::min<size_t>(workers_used, (4 * 262144) / total_slots));
+        1, std::min<size_t>(workers_used, (size_t{4} * 262144) / total_slots));
   }
   struct alignas(64) BoundedWorkerState {
     std::vector<uint8_t> present;
@@ -3709,9 +3870,9 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
           if (all_pass) {
             for (uint32_t r = 0; r < m; ++r) {
               const auto gi =
-                  static_cast<uint32_t>((static_cast<uint64_t>(keys0[r]) -
-                                         static_cast<uint64_t>(key_min0)) *
-                                            s1 +
+                  static_cast<uint32_t>(((static_cast<uint64_t>(keys0[r]) -
+                                          static_cast<uint64_t>(key_min0)) *
+                                         s1) +
                                         (static_cast<uint64_t>(keys1[r]) -
                                          static_cast<uint64_t>(key_min1)));
               gidx[r] = gi;
@@ -3721,9 +3882,9 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
             for (uint32_t idx = 0; idx < m; ++idx) {
               const uint32_t r = sel_ptr[idx];
               const auto gi =
-                  static_cast<uint32_t>((static_cast<uint64_t>(keys0[r]) -
-                                         static_cast<uint64_t>(key_min0)) *
-                                            s1 +
+                  static_cast<uint32_t>(((static_cast<uint64_t>(keys0[r]) -
+                                          static_cast<uint64_t>(key_min0)) *
+                                         s1) +
                                         (static_cast<uint64_t>(keys1[r]) -
                                          static_cast<uint64_t>(key_min1)));
               gidx[idx] = gi;
@@ -3743,7 +3904,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
                     ? span1
                     : static_cast<size_t>(static_cast<uint64_t>(keys1[r]) -
                                           static_cast<uint64_t>(key_min1));
-            const auto gi = static_cast<uint32_t>(i0 * s1 + i1);
+            const auto gi = static_cast<uint32_t>((i0 * s1) + i1);
             gidx[idx] = gi;
             pres[gi] = 1;
           }
@@ -4391,7 +4552,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const PrebuiltMembershipPredicate* stream_prebuilt_membership) {
   ExecutionRuntime* runtime = context.execution_runtime();
   const auto scan_begin = std::chrono::steady_clock::now();
-  const bool group_phases = std::getenv("TINYLAMB_GROUP_PHASES") != nullptr;
+  const bool group_phases =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr;
   auto phase_begin = scan_begin;
   const auto phase = [&](const char* name, size_t workers, size_t groups) {
     if (group_phases) {
@@ -4704,7 +4866,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // same trade ParallelScan makes for its chunk appends; VARCHAR/ARRAY cells
   // keep the move so long text never deep-copies.
   static const bool fill_copy_disabled =
-      std::getenv("TINYLAMB_DISABLE_FILL_COPY") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FILL_COPY") != nullptr;
   bool fill_copy = !fill_copy_disabled;
   for (slot_t i = 0; i < qualified_schema.ColumnCount(); ++i) {
     const ValueType type = qualified_schema.GetColumn(i).Type();
@@ -5392,7 +5554,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // cache-hit pass can stream cells without visiting per-Row heap blocks
   // (Q18/Q21's multi-million-row folds).
   static const bool arena_disabled =
-      std::getenv("TINYLAMB_DISABLE_AGG_ARENA") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_AGG_ARENA") != nullptr;
   std::shared_ptr<BaseRelationArena> fill_arena;
   std::vector<int64_t> arena_cell_buffer;
   std::vector<char> arena_null_buffer;
@@ -5403,7 +5565,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // same decoded batches without mirroring them. Programs needing a Row use
   // owned scratch cells and the existing filter/accumulator evaluator.
   static const bool typed_fill_enabled =
-      std::getenv("TINYLAMB_DISABLE_TYPED_FILL") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TYPED_FILL") == nullptr;
   bool typed_fill = false;
   if (!arena_disabled) {
     bool all_typed = qualified_schema.ColumnCount() > 0;
@@ -5531,7 +5693,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // A/B hatch: TINYLAMB_DISABLE_HAVING_FAST=1 restores the per-group
   // AggregateResultMap path for every HAVING shape.
   static const bool having_fast_disabled =
-      std::getenv("TINYLAMB_DISABLE_HAVING_FAST") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_HAVING_FAST") != nullptr;
   std::vector<PositionalHaving> positional_having;
   if (having_expr != nullptr && !having_fast_disabled) {
     if (!TryCompilePositionalHavingConjuncts(having_expr, plan.aggregates,
@@ -5542,7 +5704,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
   // vector-of-vector group storage.
   static const bool flat_fold_disabled =
-      std::getenv("TINYLAMB_DISABLE_FLAT_GROUP_FOLD") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FLAT_GROUP_FOLD") !=
+      nullptr;
   const slot_t early_mono_full_key =
       (int_key && plan.key_offsets.size() == 1)
           ? (projection.empty() ? plan.key_offsets[0]
@@ -5707,6 +5870,139 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     }
     interval_empty = interval_empty || interval_low > interval_high;
+  }
+
+  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+  // (InRangeSynopsis_sound).
+  // A scalar fold over one integer IN-list AND one integer interval on a
+  // direct LSTableStore avoids boxed rows and per-cell predicate/aggregate
+  // dispatch while preserving block zone-map/bloom skipping, NULL semantics,
+  // and signed/floating-point overflow/infinity provenance.
+  struct ScalarInRangeAgg {
+    SlimAggKind kind{SlimAggKind::kNone};
+    std::optional<slot_t> full_column;
+  };
+  bool scalar_in_range_sum =
+      !scalar_interval && use_direct_lstable &&
+      stream_runtime_filter == nullptr &&
+      stream_prebuilt_membership == nullptr && plan.slim &&
+      plan.key_offsets.empty() && !plan.aggregates.empty() &&
+      plan.aggregates.size() <= 4 && plan.filter_programs.empty() &&
+      plan.filter_disjunctions.empty() && plan.inlist_compares.size() == 1 &&
+      compares_covered_by_peeks && peek_ptr != nullptr && !peek_ptr->empty();
+  slot_t in_range_in_col = 0;
+  slot_t in_range_range_col = 0;
+  int64_t in_range_low = std::numeric_limits<int64_t>::min();
+  int64_t in_range_high = std::numeric_limits<int64_t>::max();
+  bool in_range_empty = false;
+  int64_t in_range_in_min = 0;
+  int64_t in_range_in_max = 0;
+  uint64_t in_range_in_mask = 0;
+  bool in_range_use_mask = false;
+  std::vector<int64_t> in_range_in_vals;
+  std::vector<ScalarInRangeAgg> in_range_aggs;
+  if (scalar_in_range_sum) {
+    const TypedInListCompare& inlist = plan.inlist_compares[0];
+    if (inlist.is_string || inlist.is_double || inlist.int_values.empty() ||
+        inlist.column >= qualified_schema.ColumnCount() ||
+        proj_unsigned[inlist.column] ||
+        (proj_types[inlist.column] != ValueType::kInt64 &&
+         proj_types[inlist.column] != ValueType::kDate)) {
+      scalar_in_range_sum = false;
+    } else {
+      in_range_in_col = proj_to_full[inlist.column];
+      in_range_in_vals = inlist.int_values;
+      in_range_in_min = in_range_in_vals[0];
+      in_range_in_max = in_range_in_vals[0];
+      for (const int64_t v : in_range_in_vals) {
+        in_range_in_min = std::min(in_range_in_min, v);
+        in_range_in_max = std::max(in_range_in_max, v);
+      }
+      const uint64_t span = static_cast<uint64_t>(in_range_in_max) -
+                            static_cast<uint64_t>(in_range_in_min);
+      if (span < 64ULL) {
+        in_range_use_mask = true;
+        in_range_in_mask = 0;
+        for (const int64_t v : in_range_in_vals) {
+          in_range_in_mask |=
+              (uint64_t{1} << (static_cast<uint64_t>(v) -
+                               static_cast<uint64_t>(in_range_in_min)));
+        }
+      } else if (in_range_in_vals.size() > 16) {
+        scalar_in_range_sum = false;
+      }
+    }
+    if (scalar_in_range_sum) {
+      in_range_range_col = peek_ptr->front().column;
+      for (const auto& compare : *peek_ptr) {
+        if (compare.column != in_range_range_col) {
+          scalar_in_range_sum = false;
+          break;
+        }
+        const int64_t value = compare.constant;
+        switch (compare.op) {
+          case BinaryOperation::kEquals:
+            in_range_low = std::max(in_range_low, value);
+            in_range_high = std::min(in_range_high, value);
+            break;
+          case BinaryOperation::kGreaterThanEquals:
+            in_range_low = std::max(in_range_low, value);
+            break;
+          case BinaryOperation::kGreaterThan:
+            if (value == std::numeric_limits<int64_t>::max()) {
+              in_range_empty = true;
+            } else {
+              in_range_low = std::max(in_range_low, value + 1);
+            }
+            break;
+          case BinaryOperation::kLessThanEquals:
+            in_range_high = std::min(in_range_high, value);
+            break;
+          case BinaryOperation::kLessThan:
+            if (value == std::numeric_limits<int64_t>::min()) {
+              in_range_empty = true;
+            } else {
+              in_range_high = std::min(in_range_high, value - 1);
+            }
+            break;
+          default:
+            scalar_in_range_sum = false;
+            break;
+        }
+      }
+      in_range_empty = in_range_empty || in_range_low > in_range_high;
+    }
+    if (scalar_in_range_sum) {
+      in_range_aggs.reserve(plan.aggregates.size());
+      for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+        const auto& input = plan.aggregates[i];
+        const SlimAggKind kind = plan.slim_kinds[i];
+        if (input.conditional.has_value() || input.double_expr.has_value() ||
+            input.coalesce_double.has_value() || input.int_expr.has_value() ||
+            input.child.has_value()) {
+          scalar_in_range_sum = false;
+          break;
+        }
+        if (kind == SlimAggKind::kCount && IsCountStar(*input.aggregate)) {
+          in_range_aggs.push_back({kind, std::nullopt});
+        } else if (kind == SlimAggKind::kSumInt64 && input.column.has_value() &&
+                   *input.column < qualified_schema.ColumnCount() &&
+                   !proj_unsigned[*input.column] &&
+                   (proj_types[*input.column] == ValueType::kInt64 ||
+                    proj_types[*input.column] == ValueType::kDate)) {
+          in_range_aggs.push_back({kind, proj_to_full[*input.column]});
+        } else if ((kind == SlimAggKind::kSumDouble ||
+                    kind == SlimAggKind::kAvgDouble) &&
+                   input.column.has_value() &&
+                   *input.column < qualified_schema.ColumnCount() &&
+                   proj_types[*input.column] == ValueType::kDouble) {
+          in_range_aggs.push_back({kind, proj_to_full[*input.column]});
+        } else {
+          scalar_in_range_sum = false;
+          break;
+        }
+      }
+    }
   }
 
   const bool monotonic_int_key =
@@ -6795,6 +7091,186 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               local.SlimDoubleTotal(group, 0) = sum;
               if (scalar_kind == SlimAggKind::kSumDouble && saw_infinity) {
                 local.SlimFlags(group, 0) |= 1;
+              }
+            }
+            counters[worker].scanned += matching_rows;
+            counters[worker].emitted += matching_rows;
+            counters[worker].updates += matching_rows;
+          }
+          return;
+        }
+
+        if (scalar_in_range_sum) {
+          // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+          // (InRangeSynopsis_sound).
+          if (in_range_empty) {
+            return;
+          }
+          const size_t num_aggs = in_range_aggs.size();
+          size_t matching_rows = 0;
+          std::array<int64_t, 4> counts{};
+          std::array<int64_t, 4> int_sums{};
+          std::array<double, 4> dbl_sums{};
+          std::array<bool, 4> saw_inf{};
+
+          const bool is_count_and_sum_int =
+              num_aggs == 2 &&
+              ((in_range_aggs[0].kind == SlimAggKind::kCount &&
+                in_range_aggs[1].kind == SlimAggKind::kSumInt64) ||
+               (in_range_aggs[0].kind == SlimAggKind::kSumInt64 &&
+                in_range_aggs[1].kind == SlimAggKind::kCount));
+          const size_t cs_count_idx =
+              (is_count_and_sum_int &&
+               in_range_aggs[0].kind == SlimAggKind::kCount)
+                  ? 0
+                  : 1;
+          const size_t cs_sum_idx = 1 - cs_count_idx;
+          const slot_t cs_sum_col =
+              is_count_and_sum_int ? *in_range_aggs[cs_sum_idx].full_column : 0;
+          const uint64_t range_span = static_cast<uint64_t>(in_range_high) -
+                                      static_cast<uint64_t>(in_range_low);
+
+          const auto match_in = [&](int64_t v) -> bool {
+            if (in_range_use_mask) {
+              const uint64_t d = static_cast<uint64_t>(v) -
+                                 static_cast<uint64_t>(in_range_in_min);
+              return d < 64ULL && (((in_range_in_mask >> d) & 1ULL) != 0);
+            }
+            if (v < in_range_in_min || v > in_range_in_max) {
+              return false;
+            }
+            for (const int64_t item : in_range_in_vals) {
+              if (v == item) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+            const auto& block = direct_lstable_store->blocks[bi];
+            if (block.row_count == 0 ||
+                !block.MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
+              continue;
+            }
+            const auto& in_blk = block.columns[in_range_in_col];
+            if (!in_blk.is_unsigned) {
+              if (!in_blk.has_min_max) {
+                continue;
+              }
+              if (in_range_in_max < in_blk.min_int ||
+                  in_range_in_min > in_blk.max_int) {
+                continue;
+              }
+              if (in_range_in_vals.size() <= 16) {
+                bool any_may_match = false;
+                for (const int64_t v : in_range_in_vals) {
+                  if (v >= in_blk.min_int && v <= in_blk.max_int &&
+                      in_blk.BlockBloomMayContain(v)) {
+                    any_may_match = true;
+                    break;
+                  }
+                }
+                if (!any_may_match) {
+                  continue;
+                }
+              }
+            }
+            const auto& range_blk = block.columns[in_range_range_col];
+            const uint32_t nrows = block.row_count;
+            const int64_t* __restrict in_cells = in_blk.int_cells.data();
+            const int64_t* __restrict range_cells = range_blk.int_cells.data();
+
+            if (is_count_and_sum_int && in_range_use_mask && !in_blk.has_null &&
+                !range_blk.has_null && !block.columns[cs_sum_col].has_null) {
+              const int64_t* __restrict sum_cells =
+                  block.columns[cs_sum_col].int_cells.data();
+              size_t blk_match = 0;
+              int64_t blk_sum = int_sums[cs_sum_idx];
+              for (uint32_t r = 0; r < nrows; ++r) {
+                const uint64_t d = static_cast<uint64_t>(in_cells[r]) -
+                                   static_cast<uint64_t>(in_range_in_min);
+                const uint64_t rd = static_cast<uint64_t>(range_cells[r]) -
+                                    static_cast<uint64_t>(in_range_low);
+                const bool hit =
+                    (d < 64ULL) &
+                    (((in_range_in_mask >> (d & 63ULL)) & 1ULL) != 0) &
+                    (rd <= range_span);
+                if (hit) {
+                  ++blk_match;
+                  int64_t updated = 0;
+                  if (__builtin_add_overflow(blk_sum, sum_cells[r], &updated)) {
+                    err = StatusError(StatusCode::kIsInfinity,
+                                      "integer overflow in SUM");
+                    return;
+                  }
+                  blk_sum = updated;
+                }
+              }
+              matching_rows += blk_match;
+              counts[cs_count_idx] += static_cast<int64_t>(blk_match);
+              counts[cs_sum_idx] += static_cast<int64_t>(blk_match);
+              int_sums[cs_sum_idx] = blk_sum;
+              continue;
+            }
+
+            const bool check_nulls = in_blk.has_null || range_blk.has_null;
+            for (uint32_t r = 0; r < nrows; ++r) {
+              if (check_nulls && (in_blk.IsNull(r) || range_blk.IsNull(r))) {
+                continue;
+              }
+              const uint64_t rd = static_cast<uint64_t>(range_cells[r]) -
+                                  static_cast<uint64_t>(in_range_low);
+              if (rd > range_span || !match_in(in_cells[r])) {
+                continue;
+              }
+              ++matching_rows;
+              for (size_t a = 0; a < num_aggs; ++a) {
+                const auto& agg = in_range_aggs[a];
+                if (agg.kind == SlimAggKind::kCount) {
+                  ++counts[a];
+                  continue;
+                }
+                const auto& vcol = block.columns[*agg.full_column];
+                if (vcol.IsNull(r)) {
+                  continue;
+                }
+                if (agg.kind == SlimAggKind::kSumInt64) {
+                  int64_t updated = 0;
+                  if (__builtin_add_overflow(int_sums[a], vcol.int_cells[r],
+                                             &updated)) {
+                    err = StatusError(StatusCode::kIsInfinity,
+                                      "integer overflow in SUM");
+                    return;
+                  }
+                  int_sums[a] = updated;
+                  ++counts[a];
+                } else {
+                  const auto v = std::bit_cast<double>(vcol.int_cells[r]);
+                  dbl_sums[a] += v;
+                  ++counts[a];
+                  saw_inf[a] = saw_inf[a] || std::isinf(v);
+                }
+              }
+            }
+          }
+
+          if (matching_rows > 0) {
+            bool inserted = false;
+            const size_t group =
+                local.FindOrInsert({}, 0, plan.aggregates.size(),
+                                   aggregate_expressions, &inserted);
+            for (size_t a = 0; a < num_aggs; ++a) {
+              local.SlimCount(group, a) = counts[a];
+              if (in_range_aggs[a].kind == SlimAggKind::kSumInt64) {
+                local.SlimIntTotal(group, a) = int_sums[a];
+              } else if (in_range_aggs[a].kind == SlimAggKind::kSumDouble ||
+                         in_range_aggs[a].kind == SlimAggKind::kAvgDouble) {
+                local.SlimDoubleTotal(group, a) = dbl_sums[a];
+                if (in_range_aggs[a].kind == SlimAggKind::kSumDouble &&
+                    saw_inf[a]) {
+                  local.SlimFlags(group, a) |= 1;
+                }
               }
             }
             counters[worker].scanned += matching_rows;

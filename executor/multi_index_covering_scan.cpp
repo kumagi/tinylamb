@@ -59,12 +59,9 @@ MultiIndexCoveringScan::MultiIndexCoveringScan(
 }
 
 bool MultiIndexCoveringScan::AllGuardsHoldLocks() const {
-  for (const auto& guard : guards_) {
-    if (!guard.HoldsLock()) {
-      return false;
-    }
-  }
-  return true;
+  return std::ranges::all_of(guards_, [](const auto& guard) {
+    return guard.HoldsLock();
+  });
 }
 
 void MultiIndexCoveringScan::FillFromImage(Row* values,

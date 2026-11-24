@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX timegm/gmtime_r
@@ -251,6 +252,7 @@ StatusOr<uint64_t> ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
 // Window inner LIMIT is stored as size_t; a uint64 literal that does not
 // fit (32-bit targets) must clamp to "unlimited", never truncate to a
 // smaller limit.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared only within this TU.
 static size_t WindowLimitFromUint64(uint64_t v) {
   return static_cast<size_t>(std::min<uint64_t>(
       v, static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
@@ -261,6 +263,7 @@ static size_t WindowLimitFromUint64(uint64_t v) {
 // check plus a trailing-whitespace allowance keeps '+3' and ' 3 ' working
 // while compound forms ('1-2') yield 0 — TryParse stays the validity
 // authority and every Amount() consumer rejects compound units anyway.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared only within this TU.
 static int64_t ParseIntervalAmount(const std::string& raw) {
   const char* s = raw.c_str();
   char* end = nullptr;
@@ -5024,7 +5027,7 @@ bool NeedsRelationalEvaluation(
         }
       }
       static const bool scalar_functions_cascades = [] {
-        const char* hatch = std::getenv("TINYLAMB_SCALAR_FN_CASCADES");
+        const char* hatch = ::tinylamb::platform::GetEnv("TINYLAMB_SCALAR_FN_CASCADES");
         return hatch != nullptr && std::string_view(hatch) == "1";
       }();
       return !scalar_functions_cascades;

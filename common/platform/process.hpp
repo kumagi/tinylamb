@@ -43,6 +43,15 @@ int GetPid();
 int SetEnv(const char* name, const char* value, int overwrite = 1);
 int UnsetEnv(const char* name);
 
+// Reads the current process environment. The returned pointer has the same
+// lifetime rules as getenv: it may be invalidated by a later environment
+// mutation. Use this together with SetEnv/UnsetEnv so reads and writes share
+// the process-environment lock.
+const char* GetEnv(const char* name);
+
+// Returns an owned, thread-safe message for an errno value.
+std::string StrError(int error);
+
 // Spawns `executable` with `args` (excluding argv[0]) and `env_overrides`
 // merged into the current environment, waits for completion, and returns the
 // child's exit code (0 on success, non-zero exit code, or -1 if spawning

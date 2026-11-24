@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/typed_stream_aggregate_internal.hpp"
 
@@ -154,10 +155,17 @@ StatusOr<std::optional<Relation>> TryUniqueGroupLimit(
     } else {
       const auto& input = plan.aggregates[item.index];
       const auto kind = input.aggregate->GetType();
-      type = kind == AggregationType::kCount ? ValueType::kInt64
-             : kind == AggregationType::kAvg
-                 ? ValueType::kDouble
-                 : schema.GetColumn(*input.column).Type();
+      if (kind == AggregationType::kCount) {
+        type = ValueType::kInt64;
+      } else if (kind == AggregationType::kAvg) {
+        type = ValueType::kDouble;
+      } else {
+        if (!input.column.has_value()) {
+          return StatusError(StatusCode::kRuntimeError,
+                             "aggregate input column is missing");
+        }
+        type = schema.GetColumn(input.column.value()).Type();
+      }
     }
     columns.emplace_back(ProjectionName(statement.SelectList()[i], i), type);
     columns.back().SetUnsigned(is_unsigned);
@@ -198,9 +206,15 @@ StatusOr<std::optional<Relation>> TryUniqueGroupLimit(
       for (size_t a = 0; a < plan.aggregates.size(); ++a) {
         const auto& input = plan.aggregates[a];
         AggregateAccumulator state(input.aggregate, shapes[a]);
-        RETURN_IF_FAIL(state.Add(IsCountStar(*input.aggregate)
-                                     ? Value(1)
-                                     : value_at(*input.column)));
+        Value aggregate_input(1);
+        if (!IsCountStar(*input.aggregate)) {
+          if (!input.column.has_value()) {
+            return StatusError(StatusCode::kRuntimeError,
+                               "aggregate input column is missing");
+          }
+          aggregate_input = value_at(input.column.value());
+        }
+        RETURN_IF_FAIL(state.Add(aggregate_input));
         ASSIGN_OR_RETURN(Value, value, state.TryFinish());
         finished.push_back(std::move(value));
       }
@@ -322,7 +336,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
   if (HasPostAggItem(plan)) {
     return std::optional<Relation>{};
   }
-  if (std::getenv("TINYLAMB_DISABLE_PARTITIONED_NUMERIC_AGG") != nullptr ||
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARTITIONED_NUMERIC_AGG") != nullptr ||
       plan.key_offsets.empty() || !plan.dependent_key_programs.empty() ||
       !plan.filter_programs.empty() || !plan.filter_disjunctions.empty() ||
       statement.Having() || statement.Distinct() || !statement.HasLimit() ||
@@ -403,7 +417,7 @@ StatusOr<std::optional<Relation>> TryPartitionedNumericTopN(
   QueryMemoryCharge charge(bytes);
   const auto started = std::chrono::steady_clock::now();
   auto phase_start = started;
-  const bool trace = std::getenv("TINYLAMB_GROUP_PHASES") != nullptr;
+  const bool trace = ::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr;
   const auto phase = [&](const char* name) {
     if (trace) {
       std::cerr << "[partitioned-numeric] " << name
@@ -726,7 +740,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
     return std::optional<Relation>{};
   }
   if ((!statement.HasLimit() &&
-       std::getenv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
+       ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
       plan.key_offsets.size() != 1 || !plan.filter_programs.empty() ||
       !plan.null_filters.empty() || !plan.filter_disjunctions.empty() ||
       statement.Distinct() || statement.WithTies() ||
@@ -1593,7 +1607,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                       groups.begin() + static_cast<std::ptrdiff_t>(retained),
                       groups.end(), precedes);
     sorted_with_radix = true;
-  } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+  } else if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
              groups.size() >= 1024 && plan.order_items.size() == 1) {
     const auto& item = plan.order_items[0];
     if (!item.constant && !item.is_key && !item.dependent_key &&
@@ -1720,7 +1734,7 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
     return std::optional<Relation>{};
   }
   if ((!statement.HasLimit() &&
-       std::getenv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
+       ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_UNBOUNDED_DICTIONARY_AGG") != nullptr) ||
       plan.key_offsets.empty() ||
       (plan.key_offsets.size() < 2 && !require_selective) ||
       plan.key_offsets.size() > 8 || !plan.dependent_key_programs.empty() ||
@@ -2388,7 +2402,7 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
                         order.begin() + static_cast<std::ptrdiff_t>(retained),
                         order.end(), precedes);
       sorted_with_radix = true;
-    } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+    } else if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
                order.size() >= 1024 && plan.order_items.size() == 1) {
       const auto& item = plan.order_items[0];
       if (!item.constant && !item.is_key && !item.dependent_key) {
@@ -2959,7 +2973,7 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
   // every small preparation wave. No expression results survive this call.
   const auto partitioned_fold = [&]() -> StatusOr<bool> {
     if (!encoded || !pure_key || !prepared_consume || input_count < 8192 ||
-        std::getenv("TINYLAMB_DISABLE_PARTITIONED_DICTIONARY_FOLD")) {
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARTITIONED_DICTIONARY_FOLD")) {
       return false;
     }
     const auto* call = key->Type() == TypeTag::kFunctionCallExp
@@ -3082,7 +3096,7 @@ StatusOr<bool> TryFoldDictionaryAggregateRows(
     const auto start = std::chrono::steady_clock::now();
     auto phase_start = start;
     const auto phase = [&](const char* name) {
-      if (std::getenv("TINYLAMB_GROUP_PHASES")) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES")) {
         std::cerr << "[dictionary-owned] " << name
                   << " ms=" << ElapsedMs(phase_start) << '\n';
         phase_start = std::chrono::steady_clock::now();

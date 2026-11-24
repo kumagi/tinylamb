@@ -1515,9 +1515,13 @@ TEST(ValueTest, OperatorLessAgreesWithTryLessForVarchar) {
   const Value ci_a = Value("a").WithCollation(2);  // und:ci
   const Value ci_B = Value("B").WithCollation(2);
   const Value plain_B("B");
-  const std::pair<const Value*, const Value*> pairs[] = {
-      {&negative, &zero}, {&zero, &negative}, {&ci_a, &ci_B},
-      {&ci_B, &ci_a},     {&ci_B, &zero},     {&zero, &plain_B}};
+  const std::array<std::pair<const Value*, const Value*>, 6> pairs = {
+      {{&negative, &zero},
+       {&zero, &negative},
+       {&ci_a, &ci_B},
+       {&ci_B, &ci_a},
+       {&ci_B, &zero},
+       {&zero, &plain_B}}};
   for (const auto& [lhs, rhs] : pairs) {
     const auto canonical = lhs->TryLess(*rhs);
     ASSERT_TRUE(canonical.HasValue());

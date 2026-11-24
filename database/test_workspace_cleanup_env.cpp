@@ -20,6 +20,7 @@
 #include <system_error>
 #include <unordered_set>
 
+#include "common/platform/process.hpp"
 #include "database/database.hpp"
 #include "gtest/gtest.h"
 
@@ -56,7 +57,7 @@ class TestDatabaseCleanup : public ::testing::Environment {
     }
     // NOLINTNEXTLINE(concurrency-mt-unsafe): gtest environment setup runs
     // before test worker threads are started.
-    const char* keep = std::getenv("TINYLAMB_KEEP_TEST_DATABASES");
+    const char* keep = ::tinylamb::platform::GetEnv("TINYLAMB_KEEP_TEST_DATABASES");
     const std::string_view value = keep == nullptr ? "" : keep;
     keep_artifacts_ = value == "1" || value == "true" || value == "yes" ||
                       value == "on";

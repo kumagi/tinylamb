@@ -22,6 +22,7 @@
 #define TINYLAMB_HAS_CALLGRIND 1
 #endif
 
+#include "common/platform/process.hpp"
 #include "benchmark/tpcc_workload.hpp"
 #include "common/constants.hpp"
 #include "database/database.hpp"
@@ -339,7 +340,7 @@ int main(int argc, char** argv) {
     }
     return tinylamb::Database::DeadlockPolicy::kLegacy;
   };
-  const char* deadlock_env = std::getenv("TINYLAMB_DEADLOCK_POLICY");
+  const char* deadlock_env = ::tinylamb::platform::GetEnv("TINYLAMB_DEADLOCK_POLICY");
   std::string deadlock_arg;
   for (int i = 2; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--deadlock-policy") {
@@ -531,7 +532,7 @@ int main(int argc, char** argv) {
   // Opt-in instruction profiling excludes database recovery, verification,
   // population and warmup.  Those phases otherwise dwarf a short OLTP run
   // under Callgrind and produce a confidently wrong optimization target.
-  const char* callgrind_flag = std::getenv("TINYLAMB_CALLGRIND_MEASUREMENT");
+  const char* callgrind_flag = ::tinylamb::platform::GetEnv("TINYLAMB_CALLGRIND_MEASUREMENT");
   if (callgrind_flag != nullptr && callgrind_flag[0] != '\0' &&
       std::string_view(callgrind_flag) != "0" &&
       std::string_view(callgrind_flag) != "false") {

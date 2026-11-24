@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/pipeline_lowering.hpp"
 
 #include <algorithm>
@@ -497,7 +498,7 @@ class FusedFilterProjectSumSink final : public PipelineSink {
 
 std::shared_ptr<PipelineSink> TryFuseFilterProjectSum(
     const AggregationPlan& plan, LoweredStream* stream) {
-  if (std::getenv("TINYLAMB_DISABLE_FUSED_SUM_JIT") != nullptr ||
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FUSED_SUM_JIT") != nullptr ||
       !BytecodeEnabled() || !plan.GroupKeys().empty() || plan.Having() ||
       plan.Aggregates().size() != 1 || stream->operators.empty()) {
     return nullptr;
@@ -696,7 +697,7 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
           // parked rows under the unprojected table schema, so neither may
           // take a row filter. Share the A/B hatch too.
           if (pscan->CanTakeRowFilter() &&
-              std::getenv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
+              ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
               !relational_detail::ContainsQuery(sel->Predicate()) &&
               BytecodeEnabled()) {
             std::vector<Expression> conjuncts =

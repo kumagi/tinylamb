@@ -164,15 +164,17 @@ Status SortedDistinctRuns::Absorb(SortedDistinctRuns&& other) try {
   }
   staged.resize(max_levels + 1);
   for (size_t i = 0; i < levels_.size(); ++i) {
-    if (levels_[i]) {
-      staged[i].borrowed = &*levels_[i];
+    auto& level = levels_[i];
+    if (level.has_value()) {
+      staged[i].borrowed = &level.value();
     }
   }
   for (size_t i = 0; i < other.levels_.size(); ++i) {
-    if (!other.levels_[i]) {
+    auto& other_level = other.levels_[i];
+    if (!other_level.has_value()) {
       continue;
     }
-    Run* borrowed = &*other.levels_[i];
+    Run* borrowed = &other_level.value();
     std::optional<Run> carry;
     size_t level = i;
     while (staged[level].HasValue()) {
@@ -225,16 +227,22 @@ Status SortedDistinctRuns::ForEach(
     // merge then leaves the original runs intact for a retry.
     std::optional<Run> merged_run;
     size_t first_level = levels_.size();
+    const Run* first_run = nullptr;
     for (size_t i = 0; i < levels_.size(); ++i) {
-      if (!levels_[i]) {
+      auto& level = levels_[i];
+      if (!level.has_value()) {
         continue;
       }
       if (first_level == levels_.size()) {
         first_level = i;
+        first_run = &level.value();
         continue;
       }
-      const Run& left = merged_run ? *merged_run : *levels_[first_level];
-      ASSIGN_OR_RETURN(Run, merged, Merge(left, *levels_[i]));
+      const Run* left = first_run;
+      if (merged_run.has_value()) {
+        left = &merged_run.value();
+      }
+      ASSIGN_OR_RETURN(Run, merged, Merge(*left, level.value()));
       merged_run = std::move(merged);
     }
     if (merged_run) {

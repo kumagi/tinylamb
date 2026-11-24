@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "common/platform/process.hpp"
 #include "plan/optimizer.hpp"
 
 #include <algorithm>
@@ -3761,7 +3762,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   cascades::Memo memo;
   std::unordered_map<std::string, double> relation_rows;
   relation_rows.reserve(rule_context.statistics.size());
-  const bool plan_profile = std::getenv("TINYLAMB_PLAN_PROFILE") != nullptr;
+  const bool plan_profile = ::tinylamb::platform::GetEnv("TINYLAMB_PLAN_PROFILE") != nullptr;
   const auto memo_phase_begin = std::chrono::steady_clock::now();
   for (const auto& [relation, statistics] : rule_context.statistics) {
     const Schema& source = rule_context.tables.at(relation)->GetSchema();

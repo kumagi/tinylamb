@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
@@ -834,7 +835,7 @@ StatusOr<std::optional<Relation>> TryUnmatchedLeftJoin(
     }
   };
   const size_t workers =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_ANTI_PROBE") != nullptr
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_ANTI_PROBE") != nullptr
           ? 1
           : ParallelWorkerCount(left.rows.size() / 16384);
   if (workers == 1) {
@@ -872,7 +873,7 @@ StatusOr<std::optional<Relation>> TryUnmatchedLeftJoin(
   if (auto* runtime = result.runtime()) {
     runtime->join_ms += ElapsedMs(started);
   }
-  if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
+  if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr &&
       left.rows.size() >= 100000) {
     std::cerr << "[anti] left=" << left.rows.size()
               << " right=" << right.rows.size() << " out=" << result.TotalRows()
@@ -2299,7 +2300,7 @@ void ReduceUnmatchedOuterProbes(TransactionContext& context,
     }
     ++kept;
   }
-  if (std::getenv("TINYLAMB_DEBUG_ORDERED") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_ORDERED") != nullptr) {
     std::cerr << "[ordered] match-domain rows=" << rows.size()
               << " kept=" << kept << " build=" << build_rows << '\n';
   }

@@ -507,7 +507,7 @@ TEST(SpillStoreTest, WritePathAdvisoriesAreCounted) {
 // TINYLAMB_TEMP_DIR.  The env var is pointed at a missing directory so the
 // two paths are distinguishable: honored cwd succeeds, fallback fails.
 TEST(SpillStoreTest, ExplicitlyEmptyTempDirBeatsEnvironmentFallback) {
-  const char* saved = std::getenv("TINYLAMB_TEMP_DIR");
+  const char* saved = ::tinylamb::platform::GetEnv("TINYLAMB_TEMP_DIR");
   const std::string saved_copy = saved != nullptr ? saved : "";
   struct EnvRestore {  // NOLINT(cppcoreguidelines-special-member-functions)
     bool had;

@@ -283,7 +283,7 @@ inline std::vector<Row> RelationalRun(Database& database,
   std::vector<Row> rows;
   if (!prepared.HasValue()) {
     ADD_FAILURE() << sql << "\n" << engine.LastError();
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return rows;
   }
   Row row;
@@ -300,7 +300,7 @@ inline std::string RelationalThrow(Database& database, std::string_view sql) {
   SqlEngine engine(database);
   StatusOr<Executor> prepared = engine.Prepare(context, sql);
   if (!prepared.HasValue()) {
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return "<prepare: " + engine.LastError() + ">";
   }
   try {
@@ -309,14 +309,14 @@ inline std::string RelationalThrow(Database& database, std::string_view sql) {
     }
     const Status st = prepared.Value()->GetStatus();
     if (st != Status::kSuccess) {
-      context.Abort();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
       return st.GetMessage();
     }
   } catch (const std::exception& error) {
-    context.Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
     return error.what();
   }
-  context.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, context.Abort());
   return "";
 }
 

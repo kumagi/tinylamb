@@ -31,6 +31,7 @@
 
 #include "common/constants.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/runtime_filter.hpp"
 #include "common/status_or.hpp"
@@ -143,7 +144,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     BuildTimer(BuildTimer&&) = delete;
     BuildTimer& operator=(BuildTimer&&) = delete;
     ~BuildTimer() {
-      if (std::getenv("TINYLAMB_GROUP_PHASES") == nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") == nullptr) {
         return;
       }
       const double ms = std::chrono::duration<double, std::milli>(
@@ -883,7 +884,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // TINYLAMB_DISABLE_JOIN_REORDER=1 restores the strict syntactic visit
     // order (A/B hatch; results must be identical either way).
     static const bool disable_join_reorder =
-        std::getenv("TINYLAMB_DISABLE_JOIN_REORDER") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_JOIN_REORDER") !=
+        nullptr;
     const Schema ordered_all_schema = ConcatRelationSchemas(relations);
     std::vector<PredicateInfo> ordered_predicates =
         AnalyzePredicates(statement.WhereClause(), relations);
@@ -966,7 +968,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                               std::make_move_iterator(disjunct_edges.begin()),
                               std::make_move_iterator(disjunct_edges.end()));
     static const bool debug_ordered =
-        std::getenv("TINYLAMB_DEBUG_ORDERED") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_ORDERED") != nullptr;
     if (debug_ordered) {
       for (size_t p = 0; p < ordered_predicates.size(); ++p) {
         const PredicateInfo& predicate = ordered_predicates[p];
@@ -1057,7 +1059,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // no predicate is pushed through a null-supplying boundary.
     std::vector<bool> loaded(relations.size(), false);
     static const bool relative_filters_disabled =
-        std::getenv("TINYLAMB_DISABLE_RELATIVE_ORDERED_FILTERS") != nullptr;
+        ::tinylamb::platform::GetEnv(
+            "TINYLAMB_DISABLE_RELATIVE_ORDERED_FILTERS") != nullptr;
     std::vector<size_t> ordered_rows(relations.size());
     size_t largest_scan = 0;
     for (size_t i = 0; i < relations.size(); ++i) {
@@ -1795,7 +1798,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     Relation result = std::move(relations.front());
     std::unordered_set<size_t> available{0};
     static const bool prune_columns_disabled =
-        std::getenv("TINYLAMB_DISABLE_ORDERED_COLUMN_PRUNE") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_ORDERED_COLUMN_PRUNE") !=
+        nullptr;
     const bool can_prune_columns =
         !prune_columns_disabled && !statement.HasDistinctOn() &&
         !statement.ForUpdate() &&
@@ -2340,6 +2344,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 });
 
       std::vector<uint64_t> pair_bits;
+      // Lean proof:
+      // lean/TinylambOpt/ResearchProofs/PairBitmapDenseRemap.lean (sound)
       std::vector<uint32_t> pair_outer_dense;
       std::shared_ptr<QueryMemoryCharge> pair_charge;
       size_t pair_pa = 0;
@@ -2452,6 +2458,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           }
         }
       }
+      // Lean proof:
+      // lean/TinylambOpt/ResearchProofs/TwoProbePackedBloom.lean (sound)
       std::vector<uint64_t> packed_bloom;
       size_t packed_bloom_mask = 0;
       std::shared_ptr<QueryMemoryCharge> packed_bloom_charge;
@@ -2622,6 +2630,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               zm_p = p;
             }
           }
+          std::vector<uint8_t> part_pruned_none(parts.size(), 0);
           if (context.txn_.IsReadOnly() && !context.txn_.IsFailed() &&
               !table.Value()->RowsRewrittenInPlace() &&
               !context.txn_.HasAnyPageVersionChains()) {
@@ -2720,6 +2729,10 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 size_t best_surv = npages + 1;
                 for (size_t p = 0; p < parts.size(); ++p) {
                   if (cached_bounds[p] != nullptr &&
+                      part_surviving[p] == npages) {
+                    part_pruned_none[p] = 1;
+                  }
+                  if (cached_bounds[p] != nullptr &&
                       parts[p].set_bits <=
                           RuntimeFilterBuilder::kMaxTrackedKeys &&
                       part_surviving[p] < best_surv) {
@@ -2773,6 +2786,12 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             if (p_idx == zm_p) {
               continue;
             }
+            // Skip dense all-set keys that rejected 0% of pages (e.g.
+            // `inv_warehouse_sk` in TPC-DS Q72 where all 10 warehouses match):
+            // peeking them per-row in DecodeNextTypedBatch adds pure overhead.
+            if (parts[p_idx].all_set && part_pruned_none[p_idx] != 0) {
+              continue;
+            }
             auto eg = build_part_rf(p_idx);
             if (eg != nullptr) {
               const slot_t ecol = parts[p_idx].store_column;
@@ -2793,7 +2812,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               build_all_zm ? page_dir->page_ids.size() : morsels.size();
           size_t page_workers = std::min<size_t>(
               work_items,
-              QueryParallelWorkerLimit(std::min<size_t>(8, work_items)));
+              QueryParallelWorkerLimit(std::min<size_t>(16, work_items)));
           page_workers = std::max<size_t>(1, page_workers);
           std::atomic<size_t> next_morsel{0};
           std::vector<std::vector<ColumnarChunk>> worker_chunks(page_workers);
@@ -2961,6 +2980,108 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                     }
                   }
                   const uint64_t packed_u64 = (o0 << sh0) | (o1 << sh1);
+                  if (pbloom_ptr != nullptr) {
+                    const uint64_t kh = mix_hash64(packed_u64);
+                    const size_t b0 = static_cast<size_t>(kh) & pbloom_mask;
+                    const size_t b1 =
+                        static_cast<size_t>(kh >> 24) & pbloom_mask;
+                    if (((pbloom_ptr[b0 >> 6] >> (b0 & 63)) & 1ULL) == 0 ||
+                        ((pbloom_ptr[b1 >> 6] >> (b1 & 63)) & 1ULL) == 0) {
+                      continue;
+                    }
+                  }
+                  const uint32_t* head =
+                      pair_head.Find(static_cast<int64_t>(packed_u64));
+                  if (head == nullptr) {
+                    continue;
+                  }
+                  for (uint32_t lr = *head; lr != UINT32_MAX;
+                       lr = pair_next[lr]) {
+                    emit_match(lr, r);
+                  }
+                }
+                return;
+              }
+              if (parts.size() == 3 && use_packed_key && pmins_out == nullptr) {
+                const size_t p0 = check_order[0];
+                const size_t p1 = check_order[1];
+                const size_t p2 = check_order[2];
+                const size_t ps0 = part_proj_slot[p0];
+                const size_t ps1 = part_proj_slot[p1];
+                const size_t ps2 = part_proj_slot[p2];
+                const int64_t lo0 = parts[p0].lo;
+                const uint64_t span0 = parts[p0].span;
+                const bool all0 = parts[p0].all_set;
+                const uint64_t* __restrict__ w0 = parts[p0].words.data();
+                const unsigned sh0 = parts[p0].pack_shift;
+                const int64_t lo1 = parts[p1].lo;
+                const uint64_t span1 = parts[p1].span;
+                const bool all1 = parts[p1].all_set;
+                const uint64_t* __restrict__ w1 = parts[p1].words.data();
+                const unsigned sh1 = parts[p1].pack_shift;
+                const int64_t lo2 = parts[p2].lo;
+                const uint64_t span2 = parts[p2].span;
+                const bool all2 = parts[p2].all_set;
+                const uint64_t* __restrict__ w2 = parts[p2].words.data();
+                const unsigned sh2 = parts[p2].pack_shift;
+                const uint64_t* __restrict__ pb_ptr =
+                    use_exact_pair_bits ? pair_bits.data() : nullptr;
+                const uint32_t* __restrict__ pb_dense_ptr =
+                    pair_outer_dense.empty() ? nullptr
+                                             : pair_outer_dense.data();
+                const uint64_t stride = pair_stride1;
+                const uint64_t* __restrict__ pbloom_ptr =
+                    !packed_bloom.empty() ? packed_bloom.data() : nullptr;
+                const size_t pbloom_mask = packed_bloom_mask;
+                for (size_t r = 0; r < n; ++r) {
+                  const size_t base = r * right_width;
+                  if (nulls_ptr[base + ps0] != 0) {
+                    continue;
+                  }
+                  const uint64_t o0 =
+                      static_cast<uint64_t>(cells_ptr[base + ps0]) -
+                      static_cast<uint64_t>(lo0);
+                  if (o0 > span0 ||
+                      (!all0 && ((w0[o0 >> 6] >> (o0 & 63)) & 1ULL) == 0)) {
+                    continue;
+                  }
+                  if (nulls_ptr[base + ps1] != 0) {
+                    continue;
+                  }
+                  const uint64_t o1 =
+                      static_cast<uint64_t>(cells_ptr[base + ps1]) -
+                      static_cast<uint64_t>(lo1);
+                  if (o1 > span1 ||
+                      (!all1 && ((w1[o1 >> 6] >> (o1 & 63)) & 1ULL) == 0)) {
+                    continue;
+                  }
+                  if (nulls_ptr[base + ps2] != 0) {
+                    continue;
+                  }
+                  const uint64_t o2 =
+                      static_cast<uint64_t>(cells_ptr[base + ps2]) -
+                      static_cast<uint64_t>(lo2);
+                  if (o2 > span2 ||
+                      (!all2 && ((w2[o2 >> 6] >> (o2 & 63)) & 1ULL) == 0)) {
+                    continue;
+                  }
+                  if (pb_ptr != nullptr) {
+                    const uint64_t oa =
+                        (pair_pa == p0) ? o0 : ((pair_pa == p1) ? o1 : o2);
+                    const uint64_t ob =
+                        (pair_pb == p0) ? o0 : ((pair_pb == p1) ? o1 : o2);
+                    const uint64_t row_idx =
+                        pb_dense_ptr != nullptr ? pb_dense_ptr[oa] : oa;
+                    if (row_idx == UINT32_MAX) {
+                      continue;
+                    }
+                    const uint64_t bit = (row_idx * stride) + ob;
+                    if (((pb_ptr[bit >> 6] >> (bit & 63)) & 1ULL) == 0) {
+                      continue;
+                    }
+                  }
+                  const uint64_t packed_u64 =
+                      (o0 << sh0) | (o1 << sh1) | (o2 << sh2);
                   if (pbloom_ptr != nullptr) {
                     const uint64_t kh = mix_hash64(packed_u64);
                     const size_t b0 = static_cast<size_t>(kh) & pbloom_mask;
@@ -3172,7 +3293,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           if (out_col->total_rows > 0) {
             output.columnar = std::move(out_col);
           }
-          if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr) {
+          if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") !=
+              nullptr) {
             const auto t_m2 = std::chrono::steady_clock::now();
             const double bm_ms =
                 std::chrono::duration<double, std::milli>(t_m1 - t_m0).count();
@@ -3587,7 +3709,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         if (out_col->total_rows > 0) {
           output.columnar = std::move(out_col);
         }
-        if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr) {
+        if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr) {
           std::cerr << "[stream-tlcs] table=" << probed.table
                     << " left=" << total_left_rows
                     << " out=" << output.TotalRows() << "\n";
@@ -4415,7 +4537,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           }
         }
         output.SetColumnarTable(std::move(out_col), all_uniform);
-        if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr) {
+        if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr) {
           std::cerr << "[stream] table=" << probed.table
                     << " left=" << total_left_rows << " out=" << produced
                     << " columnar=1\n";
@@ -4431,7 +4553,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       if (produced == 0) {
         return std::optional<Relation>{};
       }
-      if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr) {
         std::cerr << "[stream] table=" << probed.table
                   << " left=" << total_left_rows << " out=" << produced << "\n";
       }
@@ -5677,7 +5799,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   std::unordered_map<RelColKey, size_t, RelColKeyHash> key_class_node;
   std::vector<size_t> key_class_parent;
   static const bool transitive_filter_disabled =
-      std::getenv("TINYLAMB_DISABLE_TRANSITIVE_KEY_FILTER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TRANSITIVE_KEY_FILTER") !=
+      nullptr;
   const auto key_class_find = [&](size_t node) {
     while (key_class_parent[node] != node) {
       key_class_parent[node] = key_class_parent[key_class_parent[node]];
@@ -5906,7 +6029,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     return static_cast<double>(estimated_rows[index]) * best_ratio;
   };
   static const bool pk_absorption_disabled =
-      std::getenv("TINYLAMB_DISABLE_PK_ABSORPTION") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PK_ABSORPTION") != nullptr;
   const auto is_large_fact = [&](size_t index) {
     if (!base_sources[index] || estimated_rows[index] < 16384) {
       return false;
@@ -5926,7 +6049,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         return is_large_fact(index) && estimated_rows[index] >= 65536;
       });
   static const bool dimension_preload_disabled =
-      std::getenv("TINYLAMB_DISABLE_DEFERRED_DIMENSION_PRELOAD") != nullptr;
+      ::tinylamb::platform::GetEnv(
+          "TINYLAMB_DISABLE_DEFERRED_DIMENSION_PRELOAD") != nullptr;
   size_t fact_rows = 0;
   for (size_t i : load_order) {
     if (is_large_fact(i)) {
@@ -6406,6 +6530,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 s.join_type == JoinType::kCross) &&
                s.join_condition == nullptr && !s.sample.has_value();
       });
+  const bool all_inner_equi_sources =
+      std::ranges::all_of(statement.Sources(), [](const SelectSource& s) {
+        return (s.join_type == JoinType::kInner ||
+                s.join_type == JoinType::kCross) &&
+               s.using_columns.empty() && !s.from_nested_join &&
+               !s.sample.has_value();
+      });
   std::unordered_set<ColumnName> outer_referenced;
   const auto collect_expr_cols = [&](const Expression& expr) {
     if (!expr) {
@@ -6472,7 +6603,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       return Status::kSuccess;
     }
     const size_t d_idx = *deferred_probe_rel;
-    if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+    if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
       std::cerr << "[deferred] materialize table="
                 << statement.Sources()[d_idx].table
                 << " rows=" << deferred_probe->store->total_rows
@@ -7138,7 +7269,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   // union of needed columns and splits surviving projected rows by each alias's
   // local predicates.
   static const bool self_join_shared_disabled =
-      std::getenv("TINYLAMB_DISABLE_SELF_JOIN_SHARED_SCAN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SELF_JOIN_SHARED_SCAN") !=
+      nullptr;
   if (!self_join_shared_disabled && outer == nullptr && ctes.empty() &&
       plain_inner_sources && !selects_star && *where_fully_applied &&
       relations.size() >= 2) {
@@ -7253,7 +7385,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         Relation rel_j(context.execution_runtime());
         rel_j.schema = schema_j;
         rel_i.rows.reserve((raw_scan.rows.size() / 2) + 16);
-        rel_j.rows.reserve(raw_scan.rows.size() / 2 + 16);
+        rel_j.rows.reserve((raw_scan.rows.size() / 2) + 16);
         const size_t wi = projections[i].size();
         const size_t wj = projections[j].size();
         Row cand_i(std::vector<Value>(wi, Value()));
@@ -8375,7 +8507,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       }
     }
     if (deferred_probe_rel.has_value()) {
-      if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
         std::cerr << "[deferred] interrupted by "
                   << statement.Sources()[idx].table << "\n";
       }
@@ -9345,7 +9477,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   bool deferred_multi_payload_pending =
       !pk_absorption_disabled && deferred_probe_rel && deferred_probe &&
       *where_fully_applied && plain_inner_sources && !selects_star &&
-      std::getenv("TINYLAMB_DISABLE_DEFERRED_MULTI_PAYLOAD") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_DEFERRED_MULTI_PAYLOAD") ==
+          nullptr;
   if (deferred_multi_payload_pending) {
     goto run_zero_payload_first;
   }
@@ -10838,14 +10971,40 @@ run_zero_payload_first:
       join_residual.clear();
     }
   }
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave9AnalyticsRemaining.lean
+  //   (SelfJoinBridgeBipartiteWeights_sound,
+  //    FilteredSemiJoinCountBeforeGroup_sound)
+  // Detect a 3..5-table self-join bridge/chain (e.g. posts p1 JOIN post_links
+  // pl JOIN posts p2 in STATS-CEB C3, or users u JOIN posts p JOIN comments c
+  // JOIN users u2 in STATS-CEB C2) so TryFactorizedJoinTreeAggregate collapses
+  // the chain without materializing large intermediate joins.
+  bool has_self_join_bridge = false;
+  if (all_inner_equi_sources && non_absorbed_count >= 3 &&
+      non_absorbed_count <= 5 && !deferred_probe_rel.has_value()) {
+    std::unordered_set<std::string> seen_tables;
+    for (size_t i = 0; i < relations.size(); ++i) {
+      if (i < absorbed.size() && absorbed[i] == 0U &&
+          !statement.Sources()[i].table.empty()) {
+        if (!seen_tables.insert(statement.Sources()[i].table).second) {
+          has_self_join_bridge = true;
+          break;
+        }
+      }
+    }
+  }
   // Factorized join tree (#9, #11, #12) and small-dim star direct scan (#14)
   // for 3+ table acyclic equality join trees with grouped or scalar aggregates.
   if (!star_joined && fusion != nullptr && fusion->eligible && !fusion->fired &&
-      plain_inner_sources && !selects_star && *where_fully_applied &&
-      outer == nullptr && ctes.empty() && non_absorbed_count >= 3 &&
-      non_absorbed_count <= 16 && !fusion->aggregates.empty() &&
-      fusion->aggregates.size() <= 8 && !fusion->rollup_count_distribution &&
-      !fusion->anti_unmatched_only &&
+      (plain_inner_sources ||
+       (all_inner_equi_sources &&
+        (non_absorbed_count >= 6 || has_self_join_bridge))) &&
+      (!deferred_probe_rel.has_value() ||
+       estimated_rows[*deferred_probe_rel] <= 1000000) &&
+      !selects_star && *where_fully_applied && outer == nullptr &&
+      ctes.empty() && non_absorbed_count >= 3 && non_absorbed_count <= 16 &&
+      !fusion->aggregates.empty() && fusion->aggregates.size() <= 8 &&
+      !fusion->rollup_count_distribution && !fusion->anti_unmatched_only &&
       std::ranges::all_of(join_residual, [&](const Expression& expression) {
         return std::ranges::any_of(predicates, [&](const PredicateInfo& p) {
           return p.resolved && !p.contains_query && p.sources.size() > 1 &&
@@ -10891,7 +11050,20 @@ run_zero_payload_first:
         std::ranges::all_of(fusion->group_keys, [](const Expression& gk) {
           return gk && gk->Type() == TypeTag::kColumnValue;
         });
-    if (all_binary_equi && aggs_simple && gkeys_simple) {
+    bool all_small_enough = true;
+    size_t max_active_rows = 0;
+    for (size_t i = 0; i < relations.size(); ++i) {
+      if (i < absorbed.size() && absorbed[i] == 0U) {
+        const size_t r = (deferred_probe_rel == i) ? estimated_rows[i]
+                                                   : relations[i].TotalRows();
+        max_active_rows = std::max(max_active_rows, r);
+        if (r > 1000000) {
+          all_small_enough = false;
+          break;
+        }
+      }
+    }
+    if (all_binary_equi && aggs_simple && gkeys_simple && all_small_enough) {
       if (deferred_probe_rel.has_value()) {
         RETURN_IF_FAIL(materialize_deferred());
       }
@@ -10900,7 +11072,7 @@ run_zero_payload_first:
           (TrySmallDimStarDirectAggregate(context, relations, absorbed,
                                           predicates, outer, ctes, fusion)));
       if (small_dim_star.has_value()) {
-        if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+        if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
           std::cerr << "[afj] small_dim_star fired n=" << non_absorbed_count
                     << "\n";
         }
@@ -10912,25 +11084,29 @@ run_zero_payload_first:
             (TryFactorizedJoinTreeAggregate(context, relations, absorbed,
                                             predicates, outer, ctes, fusion)));
         if (factorized_tree.has_value()) {
-          if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+          if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") !=
+              nullptr) {
             std::cerr << "[afj] factorized_tree fired n=" << non_absorbed_count
                       << "\n";
           }
           star_joined = std::move(*factorized_tree);
           join_residual.clear();
-        } else if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+        } else if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") !=
+                   nullptr) {
           std::cerr << "[afj] both declined n=" << non_absorbed_count << "\n";
         }
       }
-    } else if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+    } else if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") !=
+               nullptr) {
       std::cerr << "[afj] gate2 skip equi=" << all_binary_equi
                 << " agg=" << aggs_simple << " gk=" << gkeys_simple << "\n";
     }
-  } else if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr &&
+  } else if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr &&
              fusion != nullptr && non_absorbed_count >= 3) {
     std::cerr << "[afj] gate1 skip star=" << star_joined.has_value()
               << " elig=" << fusion->eligible << " fired=" << fusion->fired
-              << " plain=" << plain_inner_sources << " star_sel=" << selects_star
+              << " plain=" << plain_inner_sources
+              << " star_sel=" << selects_star
               << " where=" << *where_fully_applied
               << " n=" << non_absorbed_count
               << " aggs=" << fusion->aggregates.size()
@@ -11033,7 +11209,7 @@ run_zero_payload_first:
   // A truthy TINYLAMB_LEGACY_PLANNER restores per-call estimation behavior;
   // an explicit "0"/"false" must leave the optimized path active.
   static const bool legacy_planner = [] {
-    const char* env = std::getenv("TINYLAMB_LEGACY_PLANNER");
+    const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_PLANNER");
     return env != nullptr && env[0] != '\0' && std::string_view(env) != "0" &&
            std::string_view(env) != "false";
   }();
@@ -11490,7 +11666,7 @@ run_zero_payload_first:
     // relation.  Everything was already filtered locally, so no join output
     // ever exists.  A nullopt (shape not fusable) falls through to the
     // materializing join below.
-    if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+    if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
       // The spec is null for statements that never reached the shape gate;
       // reading `fusion->eligible` here would fault (oracle: any grouped
       // query with TINYLAMB_FUSION_DEBUG set).
@@ -11574,7 +11750,8 @@ run_zero_payload_first:
     // Lean proof: lean/TinylambOpt/ResearchProofs/PostJoinDeadColumnPrune.lean
     // (sound)
     static const bool post_join_prune_disabled =
-        std::getenv("TINYLAMB_DISABLE_POST_JOIN_DEAD_COL_PRUNE") != nullptr;
+        ::tinylamb::platform::GetEnv(
+            "TINYLAMB_DISABLE_POST_JOIN_DEAD_COL_PRUNE") != nullptr;
     if (!post_join_prune_disabled && !remaining.empty() && !selects_star &&
         !result.HasSpill() && result.using_columns == nullptr &&
         result.schema.ColumnCount() >= 6 && !statement.HasDistinctOn() &&

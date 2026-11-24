@@ -84,8 +84,9 @@ std::string_view ParserErrorLine(std::string_view output) {
     line.remove_prefix(first == std::string_view::npos ? line.size() : first);
     if (line.starts_with("ERROR:")) {
       return line;
-    } if (!line.empty() && !line.starts_with("WARNING:") &&
-               !line.starts_with("INFO:")) {
+    }
+    if (!line.empty() && !line.starts_with("WARNING:") &&
+        !line.starts_with("INFO:")) {
       // The first non-diagnostic line is the root node of the AST dump.
       break;
     }
@@ -114,7 +115,8 @@ constexpr std::chrono::seconds kParseTimeout{5};
 
 size_t MaxCachedStatementsPerShard() {
   static const size_t kPerShard = []() -> size_t {
-    if (const char* env = std::getenv("TINYLAMB_PARSE_CACHE_SIZE")) {
+    if (const char* env =
+            ::tinylamb::platform::GetEnv("TINYLAMB_PARSE_CACHE_SIZE")) {
       if (env[0] == '-' || env[0] == '+') {
         return kMaxCachedStatementsPerShard;
       }
@@ -138,7 +140,8 @@ size_t MaxCachedStatementsPerShard() {
 
 std::chrono::seconds NegativeCacheTtlSeconds() {
   static const std::chrono::seconds kTtl = []() {
-    if (const char* env = std::getenv("TINYLAMB_NEGATIVE_CACHE_TTL_SEC")) {
+    if (const char* env =
+            ::tinylamb::platform::GetEnv("TINYLAMB_NEGATIVE_CACHE_TTL_SEC")) {
       char* end = nullptr;
       errno = 0;
       const long val = std::strtol(env, &end, 10);
@@ -155,7 +158,8 @@ std::chrono::seconds NegativeCacheTtlSeconds() {
 // Tests that exercise EINTR retry on multi-MB inputs under sanitizer
 // slowdown need a larger round-trip budget than the production default.
 std::chrono::seconds ParseTimeoutSeconds() {
-  if (const char* env = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC")) {
+  if (const char* env =
+          ::tinylamb::platform::GetEnv("TINYLAMB_PARSE_TIMEOUT_SEC")) {
     char* end = nullptr;
     errno = 0;
     const long value = std::strtol(env, &end, 10);
@@ -223,7 +227,7 @@ ParseShard& ShardFor(std::string_view sql) {
 }
 
 std::filesystem::path ResolveGoogleSqlExecutable() {
-  if (const char* env = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+  if (const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_BIN");
       env != nullptr && *env != '\0') {
     return {env};
   }
@@ -430,7 +434,9 @@ class BlockedSigPipe {
 // Fork-safe (`owner_pid_ != getpid()` resets child tracking without reaping
 // the parent's daemon) and gracefully falls back to per-query spawn if the
 // configured binary is stock upstream `execute_query`.
-class AutoZygoteManager {
+class AutoZygoteManager {  // NOLINT(cppcoreguidelines-special-member-functions):
+                           // scope-owned cleanup.
+
  public:
   static AutoZygoteManager& Instance() {
     static AutoZygoteManager instance;
@@ -445,15 +451,18 @@ class AutoZygoteManager {
         std::chrono::steady_clock::now() < retry_after) {
       return {};
     }
-    if (const char* env_sock = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+    if (const char* env_sock =
+            ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
         env_sock != nullptr && *env_sock != '\0') {
       return {};
     }
-    if (const char* disable = std::getenv("TINYLAMB_DISABLE_AUTO_ZYGOTE");
+    if (const char* disable =
+            ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_AUTO_ZYGOTE");
         disable != nullptr && std::strcmp(disable, "1") == 0) {
       return {};
     }
-    if (const char* bin = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+    if (const char* bin =
+            ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_BIN");
         bin != nullptr && *bin != '\0') {
       return {};
     }
@@ -553,6 +562,7 @@ class AutoZygoteManager {
             dir_path_ = std::move(dir);
             static std::once_flag atexit_once;
             std::call_once(atexit_once, []() {
+              // NOLINTNEXTLINE(cert-err33-c): process cleanup registration is best effort.
               std::atexit(
                   []() { AutoZygoteManager::Instance().Shutdown(true); });
             });
@@ -670,7 +680,8 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
       std::chrono::steady_clock::now() < retry_after) {
     return -1;
   }
-  const char* sock_path = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const char* sock_path =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   std::string auto_sock;
   bool using_auto = false;
   if (sock_path == nullptr || *sock_path == '\0') {
@@ -748,12 +759,13 @@ GoogleSqlParseResult ParseRawSubprocess(
   // only the dup2'd std{in,out,err} survive exec.
   if (platform::OpenPipe(input_pipe, {}) != 0) {
     return RetryableParserFailure(
-        std::string("cannot create GoogleSQL pipe: ") + std::strerror(errno));
+        std::string("cannot create GoogleSQL pipe: ") +
+        ::tinylamb::platform::StrError(errno));
   }
   if (platform::OpenPipe(output_pipe, {}) != 0) {
     const std::string reason(errno == EMFILE || errno == ENFILE
                                  ? std::string("too many open files")
-                                 : std::strerror(errno));
+                                 : ::tinylamb::platform::StrError(errno));
     CloseAll(input_pipe);
     return RetryableParserFailure("cannot create GoogleSQL pipe: " + reason);
   }
@@ -794,7 +806,7 @@ GoogleSqlParseResult ParseRawSubprocess(
         posix_spawn_file_actions_destroy(&actions);
       }
       if (spawn_err != 0) {
-        const std::string reason(std::strerror(spawn_err));
+        const std::string reason(::tinylamb::platform::StrError(spawn_err));
         CloseAll(input_pipe);
         CloseAll(output_pipe);
         return RetryableParserFailure("cannot start GoogleSQL: " + reason);
@@ -807,7 +819,7 @@ GoogleSqlParseResult ParseRawSubprocess(
       const std::string resolved = ResolveGoogleSqlExecutable().string();
       child = fork();
       if (child < 0) {
-        const std::string reason(std::strerror(errno));
+        const std::string reason(::tinylamb::platform::StrError(errno));
         CloseAll(input_pipe);
         CloseAll(output_pipe);
         return RetryableParserFailure("cannot start GoogleSQL: " + reason);
@@ -2091,9 +2103,6 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
         line_start = line_end + 1;
       }
       if (limit_pos != std::string::npos) {
-        size_t node_line_start = res.ast.rfind('\n', limit_pos);
-        node_line_start =
-            (node_line_start == std::string::npos) ? 0 : node_line_start + 1;
         size_t limit_line_end = res.ast.find('\n', limit_pos);
         if (limit_line_end != std::string::npos) {
           res.ast.insert(limit_line_end + 1,

@@ -30,7 +30,8 @@ double ToMiB(uint64_t bytes) {
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-struct DatabaseCleanup {
+struct DatabaseCleanup {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
   Database* db;
   ~DatabaseCleanup() {
     if (db != nullptr) {
@@ -125,13 +126,15 @@ int main() {
       if (!res.HasValue()) {
         std::cerr << "SQL failed (" << sql << "): " << engine.LastError()
                   << "\n";
-        std::exit(1);
+        // This synchronous benchmark exits on a fatal CLI error.
+        std::exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       QueryResult qr = res.MoveValue();
       const size_t n = qr.Drain();
       if (const Status status = qr.GetStatus(); !status.ok()) {
         std::cerr << "SQL failed (" << sql << "): " << status << '\n';
-        std::exit(1);
+        // This synchronous benchmark exits on a fatal CLI error.
+        std::exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       return n;
     };
@@ -152,7 +155,7 @@ int main() {
     // Load 50,000 rows in batches to measure storage + query + RSS delta.
     for (int b = 0; b < 50; ++b) {
       std::string ins = "INSERT INTO t VALUES ";
-      ins.reserve(1000 * 80);
+      ins.reserve(size_t{1000} * 80);
       for (int i = 0; i < 1000; ++i) {
         const int64_t id = (static_cast<int64_t>(b) * 1000) + i;
         if (i > 0) {

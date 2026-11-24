@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/typed_stream_aggregate_internal.hpp"
 
 namespace tinylamb::relational_detail {
@@ -1358,7 +1359,8 @@ StatusOr<bool> TryBuildPackedGroupingSets(
   if (!dict_charge) {
     return false;
   }
-  const bool dbg_phases = std::getenv("TINYLAMB_GROUP_PHASES") != nullptr;
+  const bool dbg_phases =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr;
   const auto t_p0 = std::chrono::steady_clock::now();
 
   const size_t finest_workers =
@@ -2812,6 +2814,11 @@ struct NullIndicatorCaseSpec {
   int64_t then_int{0};
   bool else_is_null{true};
   int64_t else_int{0};
+  // Single-column NULL/NOT-NULL flag metadata for complementary split-count
+  // reuse (Wave9TpcdsRollupAndSetOps.lean: LeftJoinNullFlagSplitCount_sound).
+  bool is_single_col_null_flag{false};
+  bool flag_is_not_null{false};
+  slot_t flag_col{0};
 };
 
 bool CompileNullIndicatorBoolRpn(const Expression& expr, const Schema& schema,
@@ -2921,6 +2928,22 @@ NullIndicatorCaseSpec TryBuildNullIndicatorCaseSpec(
                                    &spec.rpn) ||
       spec.rpn.empty()) {
     return spec;
+  }
+  if (spec.rpn.size() == 1 &&
+      (spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNull ||
+       spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNotNull)) {
+    spec.is_single_col_null_flag = true;
+    spec.flag_is_not_null =
+        (spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNotNull);
+    spec.flag_col = spec.rpn[0].col;
+  } else if (spec.rpn.size() == 2 &&
+             spec.rpn[1].kind == NullIndicatorBoolOp::Kind::kNot &&
+             (spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNull ||
+              spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNotNull)) {
+    spec.is_single_col_null_flag = true;
+    spec.flag_is_not_null =
+        (spec.rpn[0].kind == NullIndicatorBoolOp::Kind::kColIsNull);
+    spec.flag_col = spec.rpn[0].col;
   }
   spec.valid = true;
   return spec;
@@ -3069,13 +3092,37 @@ Status AccumulateScalarChunkSlice(
     }
   }
   if (can_fast_tile) {
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+    //   (LeftJoinNullFlagSplitCount_sound)
+    // Cache the single-column IS NULL count across complementary
+    // `SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END)` and
+    // `SUM(CASE WHEN NOT col IS NULL THEN 1 ELSE 0 END)` aggregates (TPC-DS
+    // Q72) so the second aggregate reuses `take - null_cnt` in O(1) without
+    // rescanning the column slice.
+    bool has_cached_null_cnt = false;
+    slot_t cached_null_col = 0;
+    int64_t cached_null_cnt = 0;
     for (size_t a = 0; a < agg_count; ++a) {
       const auto& item = plan.aggregates[a];
       const SlimAggKind kind = plan.slim_kinds[a];
       if (a < null_indicator_specs.size() && null_indicator_specs[a].valid) {
         const NullIndicatorCaseSpec& spec = null_indicator_specs[a];
-        const int64_t m =
-            CountNullIndicatorTrueInSlice(spec, ch, lr_start, take);
+        int64_t m = 0;
+        if (spec.is_single_col_null_flag && has_cached_null_cnt &&
+            cached_null_col == spec.flag_col) {
+          m = spec.flag_is_not_null
+                  ? (static_cast<int64_t>(take) - cached_null_cnt)
+                  : cached_null_cnt;
+        } else {
+          m = CountNullIndicatorTrueInSlice(spec, ch, lr_start, take);
+          if (spec.is_single_col_null_flag && !has_cached_null_cnt) {
+            has_cached_null_cnt = true;
+            cached_null_col = spec.flag_col;
+            cached_null_cnt =
+                spec.flag_is_not_null ? (static_cast<int64_t>(take) - m) : m;
+          }
+        }
         const int64_t rem_false = static_cast<int64_t>(take) - m;
         if (kind == SlimAggKind::kCount) {
           target->SlimCount(0, a) +=
@@ -4617,7 +4664,8 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
       input.rows.size() > static_cast<size_t>(INT64_MAX) ||
       !statement.OrderBy().empty() || statement.Distinct() ||
       HasWindowFunctions(statement) ||
-      std::getenv("TINYLAMB_DISABLE_COMPACT_STATISTICS") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COMPACT_STATISTICS") !=
+          nullptr) {
     return std::optional<Relation>{};
   }
   std::vector<slot_t> keys;
@@ -4989,8 +5037,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     std::vector<size_t> out_to_agg(agg_count, SIZE_MAX);
     bool all_fast_cc = true;
     auto eval_const_i64 = [](const Expression& e, int64_t* out) -> bool {
-      if (!e) { return false;
-}
+      if (!e) {
+        return false;
+      }
       if (e->Type() == TypeTag::kConstantValue) {
         const Value& v = e->AsConstantValue().GetValue();
         if (v.IsNull() ||
@@ -5030,8 +5079,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     std::function<bool(const Expression&, std::vector<FastIntCmp>*)>
         parse_and_cmps =
             [&](const Expression& e, std::vector<FastIntCmp>* out) -> bool {
-      if (!e || e->Type() != TypeTag::kBinaryExp) { return false;
-}
+      if (!e || e->Type() != TypeTag::kBinaryExp) {
+        return false;
+      }
       const auto& b = e->AsBinaryExpression();
       if (b.Op() == BinaryOperation::kAnd) {
         return parse_and_cmps(b.Left(), out) && parse_and_cmps(b.Right(), out);
@@ -5045,8 +5095,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
         return false;
       }
       auto extract_col = [&](const Expression& ce, slot_t* slot_out) -> bool {
-        if (!ce || ce->Type() != TypeTag::kColumnValue) { return false;
-}
+        if (!ce || ce->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
         const auto off = LocalColumnOffset(input.schema,
                                            ce->AsColumnValue().GetColumnName());
         if (!off.has_value() ||
@@ -5077,7 +5128,7 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
           flipped = BinaryOperation::kLessThan;
         } else if (op == BinaryOperation::kGreaterThanEquals) {
           flipped = BinaryOperation::kLessThanEquals;
-}
+        }
         out->push_back({col, flipped, val});
         return true;
       }
@@ -5125,8 +5176,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     if (all_fast_cc && columnar_only) {
       const ColumnarTable& col_tbl = *input.columnar;
       for (const ColumnarChunk& ch : col_tbl.chunks) {
-        if (ch.rows == 0) { continue;
-}
+        if (ch.rows == 0) {
+          continue;
+        }
         for (size_t a = 0; a < agg_count && all_fast_cc; ++a) {
           for (const auto& cmp : fcases[a]) {
             if (cmp.col >= ch.columns.size() ||
@@ -5139,8 +5191,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
             }
           }
         }
-        if (!all_fast_cc) { break;
-}
+        if (!all_fast_cc) {
+          break;
+        }
       }
     }
     if (all_fast_cc) {
@@ -5176,8 +5229,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
                 ? std::min<size_t>(max_w, (total_rows + 4095) / 4096)
                 : 1;
         std::vector<std::array<int64_t, 16>> wcounts(workers);
-        for (auto& arr : wcounts) { arr.fill(0);
-}
+        for (auto& arr : wcounts) {
+          arr.fill(0);
+        }
         if (columnar_only) {
           const ColumnarTable& col_tbl = *input.columnar;
           std::vector<uint32_t> chunk_prefix;
@@ -5191,8 +5245,9 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
           auto run_w = [&](size_t w) {
             const size_t begin = (total_rows * w) / workers;
             const size_t end = (total_rows * (w + 1)) / workers;
-            if (begin >= end) { return;
-}
+            if (begin >= end) {
+              return;
+            }
             size_t ci_hint = 0;
             auto [ci, lr_start] = TypedWorkerGroups::LocateColumnarChunkRow(
                 chunk_prefix, static_cast<uint32_t>(begin), &ci_hint);
@@ -5420,7 +5475,8 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     return Status::kSuccess;
   };
   static const bool partition_disabled =
-      std::getenv("TINYLAMB_DISABLE_COMPACT_PARTITION_AGG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COMPACT_PARTITION_AGG") !=
+      nullptr;
   const size_t partitions = ParallelWorkerCount(input.rows.size() / 8192);
   const bool allow_scalar_parallel =
       scalar && !partition_disabled && plan.slim && partitions > 1 &&
@@ -5817,7 +5873,8 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
   }
   const auto started = std::chrono::steady_clock::now();
   const bool group_phases =
-      std::getenv("TINYLAMB_GROUP_PHASES") != nullptr && total_rows >= 100000;
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr &&
+      total_rows >= 100000;
   const auto phase = [&](const char* name) {
     if (!group_phases) {
       return;
@@ -6718,7 +6775,8 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     if (borrow_keys && !has_distinct_aggs && !plans[0].key_offsets.empty() &&
         (plans[0].key_offsets.size() != 1 || !groups[0].int_key) &&
         total_rows <= UINT32_MAX &&
-        std::getenv("TINYLAMB_DISABLE_PACKED_GROUPING_DICT") == nullptr) {
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PACKED_GROUPING_DICT") ==
+            nullptr) {
       auto packed_or = TryBuildPackedGroupingSets(
           input, chunk_prefix, plans, groups[0].mixed_numeric_sums, agg_workers,
           arg_chunk, argument_count, all_direct_args, worker_arguments,
@@ -8049,7 +8107,8 @@ StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     // rollup totals finish early. Schedule contiguous group ranges across
     // all sets, then concatenate each set in its original encounter order.
     static const bool split_disabled =
-        std::getenv("TINYLAMB_DISABLE_GROUPING_SET_EMIT_SPLIT") != nullptr;
+        ::tinylamb::platform::GetEnv(
+            "TINYLAMB_DISABLE_GROUPING_SET_EMIT_SPLIT") != nullptr;
     const size_t workers = split_disabled
                                ? std::min<size_t>(8, set_workers)
                                : ParallelWorkerCount(output_groups / 8192);

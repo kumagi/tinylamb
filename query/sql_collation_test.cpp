@@ -117,9 +117,12 @@ class SqlCollationTest : public ::testing::Test {
 
 TEST_F(SqlCollationTest, ConflictingOrderKeyCollationsReturnSqlError) {
   auto& budget = ProcessMemoryBudget::Global();
-  struct RestoreSpill {
+  struct RestoreSpill {  // NOLINT(cppcoreguidelines-special-member-functions):
+                         // scope-owned cleanup.
     bool previous;
-    ~RestoreSpill() { ProcessMemoryBudget::Global().SetTestAlwaysSpill(previous); }
+    ~RestoreSpill() {
+      ProcessMemoryBudget::Global().SetTestAlwaysSpill(previous);
+    }
   } restore{budget.AlwaysSpillEnabled()};
   for (bool spill : {false, true}) {
     budget.SetTestAlwaysSpill(spill);
@@ -128,13 +131,15 @@ TEST_F(SqlCollationTest, ConflictingOrderKeyCollationsReturnSqlError) {
       SqlEngine engine(database());
       const std::string sql =
           "SELECT id FROM words ORDER BY CASE WHEN id = 1 THEN "
-          "COLLATE(s, 'und:ci') ELSE s END" + std::string(suffix);
+          "COLLATE(s, 'und:ci') ELSE s END" +
+          std::string(suffix);
       SCOPED_TRACE(sql + (spill ? " (spill)" : " (resident)"));
       auto result = engine.Prepare(ctx, sql);
       Status status = result.GetStatus();
       if (result.HasValue()) {
         Row row;
-        while (result.Value()->Next(&row, nullptr)) {}
+        while (result.Value()->Next(&row, nullptr)) {
+        }
         status = result.Value()->GetStatus();
       }
       EXPECT_EQ(status, Status::kInvalidArgument) << engine.LastError();

@@ -420,8 +420,7 @@ void AppendMemcomparableValue(const Value& value, std::string* output) {
   }
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): intentional file-local helper.
 static void EncodeJoinKeyIntoBuffer(const Row& row,
                                     const std::vector<slot_t>& columns,
                                     bool null_safe, bool fold_zero,

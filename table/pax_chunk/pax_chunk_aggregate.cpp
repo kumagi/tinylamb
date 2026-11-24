@@ -2197,6 +2197,9 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
           continue;
         }
         if (all_match(minimum, maximum) && nulls == 0) {
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/UnconditionalBlockSumAvgReuse.lean
+          // (sound)
           const double block_sum = Chimp128Double(metadata.sum);
           // The block-sum shortcut recombines values in metadata order, which
           // can differ from row-by-row IEEE addition at overflow boundaries
@@ -8418,6 +8421,37 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
     return StatusError(StatusCode::kIsInfinity,
                        "integer overflow in PAX scan aggregate");
   };
+  const auto checked_add = [](platform::Int128 lhs, platform::Int128 rhs,
+                              platform::Int128* out) {
+    constexpr platform::Int128 kMin =
+        std::numeric_limits<platform::Int128>::min();
+    constexpr platform::Int128 kMax =
+        std::numeric_limits<platform::Int128>::max();
+    if ((rhs > 0 && lhs > kMax - rhs) || (rhs < 0 && lhs < kMin - rhs)) {
+      return false;
+    }
+    *out = lhs + rhs;
+    return true;
+  };
+  const auto checked_mul = [](platform::Int128 lhs, platform::Int128 rhs,
+                              platform::Int128* out) {
+    constexpr platform::Int128 kMin =
+        std::numeric_limits<platform::Int128>::min();
+    constexpr platform::Int128 kMax =
+        std::numeric_limits<platform::Int128>::max();
+    if (lhs == 0 || rhs == 0) {
+      *out = 0;
+      return true;
+    }
+    if ((lhs > 0 && rhs > 0 && lhs > kMax / rhs) ||
+        (lhs > 0 && rhs < 0 && rhs < kMin / lhs) ||
+        (lhs < 0 && rhs > 0 && lhs < kMin / rhs) ||
+        (lhs < 0 && rhs < 0 && lhs < kMax / rhs)) {
+      return false;
+    }
+    *out = lhs * rhs;
+    return true;
+  };
   auto agg_rg = [&](uint32_t g, AggResult& r, TermScratch& scratch) -> Status {
     const uint16_t rc = f.row_counts[g];
 
@@ -8529,15 +8563,15 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
         for (const auto& t : plan.terms) {
           platform::Int128 term = t.coeff;
           for (slot_t c : t.cols) {
-            if (__builtin_mul_overflow(term, tcol(c)[i], &term)) {
+            if (!checked_mul(term, tcol(c)[i], &term)) {
               return overflow();
             }
           }
-          if (__builtin_add_overflow(acc, term, &acc)) {
+          if (!checked_add(acc, term, &acc)) {
             return overflow();
           }
         }
-        if (__builtin_add_overflow(r.sum, acc, &r.sum)) {
+        if (!checked_add(r.sum, acc, &r.sum)) {
           return overflow();
         }
       }
@@ -8587,7 +8621,7 @@ StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
       }
     }
     for (const auto& r : res) {
-      if (__builtin_add_overflow(total.sum, r.sum, &total.sum)) {
+      if (!checked_add(total.sum, r.sum, &total.sum)) {
         return overflow();
       }
       total.count += r.count;
@@ -8830,9 +8864,6 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
         if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
           return std::vector<GroupByEntry>{};
         }
-        // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
-        // pattern in this code
-        sum_decoded = true;
       }
       platform::Int128 s = 0;
       for (int64_t v : sbuf) {
@@ -8896,9 +8927,6 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
             if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
               return std::vector<GroupByEntry>{};
             }
-            // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
-            // pattern in this code
-            sum_decoded = true;
           }
           for (uint32_t i = 0; i < rc; ++i) {
             acc[gcodes[i]] += sbuf[i];
@@ -8949,9 +8977,6 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
           } else if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
             return std::vector<GroupByEntry>{};
           }
-          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
-          // pattern in this code
-          sum_decoded = true;
         }
         const char* q = gr + 4;
         uint32_t pos = 0;
@@ -9020,9 +9045,6 @@ StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
           } else if (!TryDecodeInt64ColumnRg(chunk, sum_col, g, sbuf.data())) {
             return std::vector<GroupByEntry>{};
           }
-          // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores) intentional
-          // pattern in this code
-          sum_decoded = true;
         }
         const char* q = gruns_hdr + 4;
         uint64_t pos = 0;

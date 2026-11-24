@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 #include <poll.h>
+
+#include "common/platform/process.hpp"
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/SIGALRM
 #include <signal.h>
 #include <sys/resource.h>
@@ -11,6 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -123,28 +126,35 @@ TEST(GoogleSqlFrontendTest, DistinctCacheMissesCanParseOnOneShard) {
   }
   std::filesystem::permissions(stub, std::filesystem::perms::owner_exec,
                                std::filesystem::perm_options::add);
-  const char* old_bin = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+  const char* old_bin = ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_BIN");
   const std::optional<std::string> previous_bin =
       (old_bin != nullptr) ? std::optional<std::string>(old_bin) : std::nullopt;
-  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", stub.c_str(), 1), 0);
+  ASSERT_EQ(
+      ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_BIN", stub.c_str(), 1),
+      0);
   const UnwindGuard restore_bin([&] {
     if (previous_bin) {
-      setenv("TINYLAMB_GOOGLESQL_BIN", previous_bin->c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_BIN",
+                                   previous_bin->c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_GOOGLESQL_BIN");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_BIN");
     }
   });
-  const char* old_socket = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const char* old_socket =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   const std::optional<std::string> previous_socket =
-      (old_socket != nullptr) ? std::optional<std::string>(old_socket) : std::nullopt;
+      (old_socket != nullptr) ? std::optional<std::string>(old_socket)
+                              : std::nullopt;
   const UnwindGuard restore_socket([&] {
     if (previous_socket) {
-      setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous_socket->c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",
+                                   previous_socket->c_str(), 1);
     } else {
-      unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
     }
   });
-  ASSERT_EQ(unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK"), 0);
+  ASSERT_EQ(::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK"),
+            0);
   constexpr size_t shards = 16;
   const std::string slow_sql = "SELECT /* slow */ 1;\n";
   const auto shard = [](std::string_view sql) {
@@ -626,22 +636,26 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   // ceiling well under the 60-second ctest timeout: if SIGALRM fires before
   // Parse() enters its blocking I/O the alarm is disarmed by alarm(0), and a
   // 300-second budget would let a hung parse blow the test timeout.
-  struct RestoreParseTimeoutEnv {
+  struct
+      RestoreParseTimeoutEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
+                                // scope-owned cleanup.
     std::optional<std::string> previous;
     ~RestoreParseTimeoutEnv() {
       if (previous.has_value()) {
-        (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", previous->c_str(), 1);
+        (void)::tinylamb::platform::SetEnv("TINYLAMB_PARSE_TIMEOUT_SEC",
+                                           previous->c_str(), 1);
       } else {
-        (void)unsetenv("TINYLAMB_PARSE_TIMEOUT_SEC");
+        (void)::tinylamb::platform::UnsetEnv("TINYLAMB_PARSE_TIMEOUT_SEC");
       }
     }
   };
-  const char* previous = std::getenv("TINYLAMB_PARSE_TIMEOUT_SEC");
+  const char* previous =
+      ::tinylamb::platform::GetEnv("TINYLAMB_PARSE_TIMEOUT_SEC");
   const RestoreParseTimeoutEnv restore_parse_timeout_env{
       previous == nullptr ? std::nullopt
                           : std::optional<std::string>(previous)};
-  (void)setenv("TINYLAMB_PARSE_TIMEOUT_SEC", "30",
-               1);  // NOLINT(clang-diagnostic-error)
+  (void)::tinylamb::platform::SetEnv("TINYLAMB_PARSE_TIMEOUT_SEC", "30",
+                                     1);  // NOLINT(clang-diagnostic-error)
   // Arm a SIGALRM while Parse() is blocked reading a slow-to-parse query.
   // Without SA_RESTART the blocking read/write returns EINTR and must retry.
   struct sigaction saved = {};
@@ -686,24 +700,25 @@ TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
   ASSERT_EQ(listen(server, 1), 0);
   std::thread worker([&] {
     const int client = accept(server, nullptr, nullptr);
-    if (client < 0) { return;
-}
+    if (client < 0) {
+      return;
+    }
     char byte = 0;
     iovec io{.iov_base = &byte, .iov_len = 1};
-    alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
+    alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
     msghdr message{};
     message.msg_iov = &io;
     message.msg_iovlen = 1;
-    message.msg_control = control;
-    message.msg_controllen = sizeof(control);
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
     if (recvmsg(client, &message, 0) > 0) {
       auto* control_message = CMSG_FIRSTHDR(&message);
       if (control_message != nullptr) {
-        int fds[2];
-        std::memcpy(fds, CMSG_DATA(control_message), sizeof(fds));
+        std::array<int, 2> fds{};
+        std::memcpy(fds.data(), CMSG_DATA(control_message), sizeof(fds));
         close(fds[1]);
-        char buffer[256];
-        while (read(fds[0], buffer, sizeof(buffer)) > 0) {
+        std::array<char, 256> buffer{};
+        while (read(fds[0], buffer.data(), buffer.size()) > 0) {
         }
         close(fds[0]);
         const char status = 0;
@@ -712,30 +727,36 @@ TEST(GoogleSqlFrontendTest, SilentZygoteIsNotAcceptedAsParse) {
     }
     close(client);
   });
-  const char* old = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const char* old =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   const std::optional<std::string> previous =
       (old != nullptr) ? std::optional<std::string>(old) : std::nullopt;
   UnwindGuard cleanup([&] {
     if (previous) {
-      (void)setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+      (void)::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",
+                                         previous->c_str(), 1);
     } else {
-      (void)unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+      (void)::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
     }
     (void)shutdown(server, SHUT_RDWR);
     close(server);
-    if (worker.joinable()) { worker.join();
-}
+    if (worker.joinable()) {
+      worker.join();
+    }
     unlink(path.c_str());
   });
-  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1), 0);
+  ASSERT_EQ(::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",
+                                         path.c_str(), 1),
+            0);
   const auto parsed = GoogleSqlFrontend::Parse("SELECT 1054610546");
   worker.join();
   close(server);
   unlink(path.c_str());
   if (previous) {
-    (void)setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+    (void)::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",
+                                       previous->c_str(), 1);
   } else {
-    (void)unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+    (void)::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   }
   cleanup.Disarm();
   EXPECT_FALSE(parsed.ok);
@@ -770,18 +791,18 @@ TEST(GoogleSqlFrontendTest, RetriesZygoteAfterMissingExitStatus) {
       }
       char byte = 0;
       iovec io{.iov_base = &byte, .iov_len = 1};
-      alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
+      alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
       msghdr message{};
       message.msg_iov = &io;
       message.msg_iovlen = 1;
-      message.msg_control = control;
-      message.msg_controllen = sizeof(control);
+      message.msg_control = control.data();
+      message.msg_controllen = control.size();
       if (recvmsg(client, &message, 0) > 0) {
         if (const auto* header = CMSG_FIRSTHDR(&message); header != nullptr) {
-          int fds[2];
-          std::memcpy(fds, CMSG_DATA(header), sizeof(fds));
-          char input[128];
-          while (read(fds[0], input, sizeof(input)) > 0) {
+          std::array<int, 2> fds{};
+          std::memcpy(fds.data(), CMSG_DATA(header), sizeof(fds));
+          std::array<char, 128> input{};
+          while (read(fds[0], input.data(), input.size()) > 0) {
           }
           close(fds[0]);
           if (reply) {
@@ -799,10 +820,12 @@ TEST(GoogleSqlFrontendTest, RetriesZygoteAfterMissingExitStatus) {
     }
   });
 
-  const char* old = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  const char* old =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   const std::optional<std::string> previous =
       (old != nullptr) ? std::optional<std::string>(old) : std::nullopt;
-  setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(), 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", path.c_str(),
+                               1);
   const auto first = GoogleSqlFrontend::Parse("SELECT 122650001");
   const auto cooldown = GoogleSqlFrontend::Parse("SELECT 122650002");
   auto recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
@@ -814,9 +837,10 @@ TEST(GoogleSqlFrontendTest, RetriesZygoteAfterMissingExitStatus) {
     recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
   }
   if (previous) {
-    setenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK", previous->c_str(), 1);
+    ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",
+                                 previous->c_str(), 1);
   } else {
-    unsetenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+    ::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
   }
   worker.join();
   close(server);
@@ -833,15 +857,18 @@ TEST(GoogleSqlFrontendTest, SilentExitZeroBinaryIsNotAcceptedAsParse) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
   }
-  const char* previous = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+  const char* previous = ::tinylamb::platform::GetEnv("TINYLAMB_GOOGLESQL_BIN");
   const std::optional<std::string> restore =
       previous == nullptr ? std::nullopt : std::optional<std::string>(previous);
-  ASSERT_EQ(setenv("TINYLAMB_GOOGLESQL_BIN", "/bin/true", 1), 0);
+  ASSERT_EQ(
+      ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_BIN", "/bin/true", 1),
+      0);
   const UnwindGuard restore_bin([&] {
     if (restore) {
-      setenv("TINYLAMB_GOOGLESQL_BIN", restore->c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_BIN", restore->c_str(),
+                                   1);
     } else {
-      unsetenv("TINYLAMB_GOOGLESQL_BIN");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_GOOGLESQL_BIN");
     }
   });
   // Unique literal: the parse cache is keyed by text, and other tests in

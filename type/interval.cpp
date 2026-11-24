@@ -618,9 +618,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       const bool ym_shaped =
           part.find('-') != std::string::npos && !part.starts_with('-');
       if (time_shaped || ym_shaped) {
-        return fail("'" + s + "': Explicit unit '" +
-                    u +  // NOLINT(performance-inefficient-string-concatenation)
-                    "' is not valid for a composite INTERVAL literal");
+        std::string error = "'";
+        error += s;
+        error += "': Explicit unit '";
+        error += u;
+        error += "' is not valid for a composite INTERVAL literal";
+        return fail(error);
       }
     }
   }
@@ -788,7 +791,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       // the two-field H:M spelling gets its own pass.
       int consumed = 0;
       const int converted =
-          sscanf(time_part.c_str(),  // NOLINT(cert-err34-c)
+          sscanf(time_part.c_str(),  // NOLINT(cert-err34-c): checked count and %n.
                  "%" SCNd64 ":%" SCNd64 ":%lf%n", &th, &tm, &ts, &consumed);
       bool time_ok = converted == 3 && consumed > 0 &&
                      static_cast<size_t>(consumed) == time_part.size();
@@ -799,9 +802,9 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         double ms_seconds = 0.0;
         const int converted_hm =
             minute_to_second
-                ? sscanf(time_part.c_str(), "%" SCNd64 ":%lf%n", &hm_tm,
+                ? sscanf(time_part.c_str(), "%" SCNd64 ":%lf%n", &hm_tm,  // NOLINT(cert-err34-c): checked count and %n.
                          &ms_seconds, &consumed_hm)
-                : sscanf(time_part.c_str(), "%" SCNd64 ":%" SCNd64 "%n", &hm_th,
+                : sscanf(time_part.c_str(), "%" SCNd64 ":%" SCNd64 "%n", &hm_th,  // NOLINT(cert-err34-c): checked count and %n.
                          &hm_tm, &consumed_hm);
         if (converted_hm == 2 && consumed_hm > 0 &&
             static_cast<size_t>(consumed_hm) == time_part.size()) {
@@ -812,7 +815,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         }
       }
       if (!time_ok) {
-        return fail("'" + s + "': malformed time component '" + p + "'");
+        std::string error = "'";
+        error += s;
+        error += "': malformed time component '";
+        error += p;
+        error += "'";
+        return fail(error);
       }
       // sscanf happily yields inf/1e300 for e.g. "0:0:1e999"; converting a
       // value outside int64 range (or NaN) is UB, not a wrap (fuzz-found via
@@ -867,7 +875,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       if (dash == std::string::npos ||
           !parse_component(ym.substr(0, dash), &y) ||
           !parse_component(ym.substr(dash + 1), &m)) {
-        return fail("'" + s + "': malformed year-month component '" + p + "'");
+        std::string error = "'";
+        error += s;
+        error += "': malformed year-month component '";
+        error += p;
+        error += "'";
+        return fail(error);
       }
       const int64_t signed_y_months = checked_mul(checked_mul(y, sign), 12);
       const int64_t signed_m = checked_mul(m, sign);
@@ -882,7 +895,12 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       errno = 0;
       const long long parsed = std::strtoll(p.c_str(), &num_end, 10);
       if (num_end == p.c_str() || *num_end != '\0' || errno == ERANGE) {
-        return fail("'" + s + "': invalid numeric component '" + p + "'");
+        std::string error = "'";
+        error += s;
+        error += "': invalid numeric component '";
+        error += p;
+        error += "'";
+        return fail(error);
       }
       val = static_cast<int64_t>(parsed);
       if (parts.size() == 3) {

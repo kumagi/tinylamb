@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "expression/bytecode.hpp"
 
 #include <algorithm>
@@ -31,7 +32,10 @@ TEST(BytecodeTest, IsTrueAndFalseRejectNonBooleanIntegerValues) {
         UnaryOperation::kIsFalse, UnaryOperation::kIsNotFalse}) {
     const auto expression = UnaryExpressionExp(ColumnValueExp("x"), op);
     const auto program = BytecodeCompiler::Compile(expression, schema);
-    ASSERT_TRUE(program.has_value());
+    if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     for (const Value& value :
          {Value(), Value(0), Value(1), Value(-1), Value(2)}) {
       const Row row({value});
@@ -56,7 +60,10 @@ TEST(BytecodeTest, AuditBatchProjectionPreservesUnsignedValuesAfterNull) {
   input.Append(Row({Value(-1).WithUnsigned()}));
   const auto expression = ColumnValueExp("u");
   const auto program = BytecodeCompiler::Compile(expression, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   if (!program) {
     return;
   }
@@ -106,7 +113,10 @@ TEST(BytecodeTest, UnsignedInputsNeverTakeSignedFastMath) {
   };
   for (const auto& [name, expression] : cases) {
     const auto program = BytecodeCompiler::Compile(expression, schema);
-    ASSERT_TRUE(program.has_value()) << name;
+    if (!program.has_value()) {
+      ADD_FAILURE() << name;
+      return;
+    }
     const auto expected = expression->TryEvaluate(row, schema);
     const auto actual = program->TryEvaluateRow(
         row);  // NOLINT(bugprone-unchecked-optional-access)
@@ -380,7 +390,10 @@ TEST(BytecodeTest, OversizedSchemaNameFallsBackToUncachedCompilation) {
   const auto expression = ColumnValueExp("k");
   EXPECT_FALSE(ScalarExpressionCacheKey({expression}, schema));
   const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   ASSERT_SUCCESS_AND_EQ(TryEvaluateRowAuto(*program, Row({Value(7)})),
                         Value(7));
 }
@@ -774,7 +787,10 @@ TEST(BytecodeTest, StringSetRespectsRuntimeCollation) {
       ColumnValueExp("s"),
       {ConstantValueExp(Value("ABC")), ConstantValueExp(Value())});
   const auto program = BytecodeCompiler::Compile(expression, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   ASSERT_TRUE(std::ranges::any_of(program->Instructions(), [](const auto& op) {
     return op.opcode == BytecodeOp::kInStringSet;
   }));
@@ -801,7 +817,10 @@ TEST(BytecodeTest, InList_EvaluatesChildOnceAndMatchesAst) {
       {ColumnValueExp("j"), ConstantValueExp(Value(int64_t{7})),
        ConstantValueExp(Value(int64_t{9}))});
   const auto program = BytecodeCompiler::Compile(membership, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   const auto child_loads = static_cast<long>(std::ranges::count_if(
       // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer
       // assumes success
@@ -865,7 +884,10 @@ TEST(BytecodeTest, InList_ShortCircuitsLaterCandidates) {
        BinaryExpressionExp(ConstantValueExp(Value(10)),
                            BinaryOperation::kDivide, ColumnValueExp("j"))});
   const auto program = BytecodeCompiler::Compile(membership, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
 
   {
     DataChunk hit(schema);
@@ -909,7 +931,10 @@ TEST(BytecodeTest, ExtractDatePart_LowersToDedicatedOpcodeAndMatchesAst) {
   for (const auto& [name, expected] : parts) {
     const Expression expr = FunctionCallExp(name, {ColumnValueExp("d")});
     auto program = BytecodeCompiler::Compile(expr, schema);
-    ASSERT_TRUE(program.has_value()) << name;
+    if (!program.has_value()) {
+      ADD_FAILURE() << name;
+      return;
+    }
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     EXPECT_EQ(program->Instructions().back().opcode,
               BytecodeOp::kExtractDatePart)
@@ -928,7 +953,10 @@ TEST(BytecodeTest, ExtractDatePart_LowersToDedicatedOpcodeAndMatchesAst) {
   const Expression varchar_year =
       FunctionCallExp("extract_year", {ColumnValueExp("s")});
   auto varchar_program = BytecodeCompiler::Compile(varchar_year, schema);
-  ASSERT_TRUE(varchar_program.has_value());
+  if (!varchar_program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   const ColumnVector varchar_output = varchar_program->EvaluateBatch(clean);
   EXPECT_EQ(varchar_output.ValueAt(0), Value(1997));
@@ -940,7 +968,10 @@ TEST(BytecodeTest, ExtractDatePart_LowersToDedicatedOpcodeAndMatchesAst) {
   const Expression int_year =
       FunctionCallExp("extract_year", {ColumnValueExp("n")});
   auto int_program = BytecodeCompiler::Compile(int_year, schema);
-  ASSERT_TRUE(int_program.has_value());
+  if (!int_program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   auto int_result = int_program->TryEvaluateRow(input.RowAt(0));
   EXPECT_FALSE(int_result.HasValue());
@@ -994,7 +1025,10 @@ TEST(BytecodeTest, SearchedCase_LowersToConditionalJumpsAndMatchesAst) {
   // interpreter (conditional jumps are part of its opcode set) and every
   // shape above still matches the AST row for row.
   auto program = BytecodeCompiler::Compile(case_expr, schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   EXPECT_TRUE(program->FastInterpretable());
 }
@@ -1007,7 +1041,10 @@ TEST(BytecodeTest, CanonicalRowEvaluatorRejectsOutOfRangeLoadColumn) {
   Column column("a", ValueType::kInt64);
   const Schema schema("input", {column, Column("b", ValueType::kInt64)});
   const auto program = BytecodeCompiler::Compile(ColumnValueExp("b"), schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   if (!program) {
     return;
   }
@@ -1115,7 +1152,10 @@ TEST(BytecodeTest, ColumnarInt64BinaryLoopMatchesRowInterpreter) {
                             ColumnValueExp("b"))};
     for (const Expression& expression : shapes) {
       const auto program = BytecodeCompiler::Compile(expression, schema);
-      ASSERT_TRUE(program.has_value());
+      if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
       std::vector<int64_t> div_ints;
       std::vector<double> div_doubles;
       BytecodeColumnSink div_sink;
@@ -1152,12 +1192,12 @@ TEST(BytecodeTest, ColumnarInt64BinaryLoopMatchesRowInterpreter) {
     // Both paths must reject the same row.
     EXPECT_FALSE(
         program->TryEvaluateRow(Row({Value(left), Value(right)})).HasValue());
-    const int64_t lefts[] = {left, 5};
-    const int64_t rights[] = {right, 3};
+    const std::array<int64_t, 2> lefts{left, 5};
+    const std::array<int64_t, 2> rights{right, 3};
     const BytecodeColumnView left_view{.type = ValueType::kInt64,
-                                       .ints = lefts};
+                                       .ints = lefts.data()};
     const BytecodeColumnView right_view{.type = ValueType::kInt64,
-                                        .ints = rights};
+                                        .ints = rights.data()};
     const std::vector<BytecodeColumnView> error_cols{left_view, right_view};
     std::vector<int64_t> error_ints{11, 22};
     std::vector<double> error_doubles{11.0, 22.0};
@@ -1188,7 +1228,10 @@ TEST(BytecodeTest, ColumnarInt64BinaryLoopMatchesRowInterpreter) {
 TEST(BytecodeTest, DemotedFallbackStringsOwnTheirPayload) {
   const Schema schema("input", {Column("v", ValueType::kInt64)});
   const auto program = BytecodeCompiler::Compile(ColumnValueExp("v"), schema);
-  ASSERT_TRUE(program.has_value());
+  if (!program.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   if (!program) {
     return;
   }
@@ -1260,7 +1303,10 @@ TEST(BytecodeTest, SimdInRangeMatchesAstAndJitAcrossExtremes) {
                             ConstantValueExp(Value(c.hi))));
     auto prog = BytecodeCompiler::Compile(expr, schema,
                                           BytecodeCompiler::Context::kFilter);
-    ASSERT_TRUE(prog.has_value());
+    if (!prog.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     bool has_range_op = false;
     for (const auto& inst : prog->Instructions()) {
       if (inst.opcode == BytecodeOp::kInt64InRange) {
@@ -1439,7 +1485,10 @@ TEST(BytecodeTest, FilterEvalOrderReordersErrorFreeAndPreservesThrowingOrder) {
                           ConstantValueExp(Value(int64_t{5}))));
   auto safe_prog = BytecodeCompiler::Compile(
       safe_pred, schema, BytecodeCompiler::Context::kFilter);
-  ASSERT_TRUE(safe_prog.has_value());
+  if (!safe_prog.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   ASSERT_FALSE(safe_prog->Instructions().empty());
   EXPECT_EQ(safe_prog->Instructions()[0].opcode, BytecodeOp::kLoadColumn);
   EXPECT_EQ(safe_prog->Instructions()[0].operand, 0U);
@@ -1466,7 +1515,10 @@ TEST(BytecodeTest, FilterEvalOrderReordersErrorFreeAndPreservesThrowingOrder) {
           BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t{0}))));
   auto throw_prog = BytecodeCompiler::Compile(
       throwing_pred, schema, BytecodeCompiler::Context::kFilter);
-  ASSERT_TRUE(throw_prog.has_value());
+  if (!throw_prog.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   const Row zero_row({Value(int64_t{0}), Value("x")});
   auto ast_zero = throwing_pred->TryEvaluate(zero_row, schema);
   auto vm_zero = throw_prog->TryEvaluateRow(zero_row);
@@ -1581,7 +1633,10 @@ TEST(BytecodeTest, SubstrAcceptsUnsignedArgumentsLikeAst) {
   };
   for (const Expression& expression : expressions) {
     const auto program = BytecodeCompiler::Compile(expression, schema);
-    ASSERT_TRUE(program.has_value()) << expression->ToString();
+    if (!program.has_value()) {
+      ADD_FAILURE() << expression->ToString();
+      return;
+    }
     if (!program) {
       continue;
     }
@@ -1601,26 +1656,26 @@ TEST(BytecodeTest, SubstrAcceptsUnsignedArgumentsLikeAst) {
 
 // Lean proof: lean/TinylambOpt/ProposedProofs/RowInMask.lean (sound)
 TEST(BytecodeTest, RowInMaskMatchesAstAcrossNullsWideTuplesAndMultiWord) {
-  struct ScopedEnv {
+  struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;
     std::string prev;
     bool had_prev{false};
     ScopedEnv(const char* n, const char* val) : name(n) {
-      if (const char* cur = std::getenv(name)) {
+      if (const char* cur = ::tinylamb::platform::GetEnv(name)) {
         prev = cur;
         had_prev = true;
       }
       if (val != nullptr) {
-        ::setenv(name, val, 1);
+        ::tinylamb::platform::SetEnv(name, val, 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
     ~ScopedEnv() {
       if (had_prev) {
-        ::setenv(name, prev.c_str(), 1);
+        ::tinylamb::platform::SetEnv(name, prev.c_str(), 1);
       } else {
-        ::unsetenv(name);
+        ::tinylamb::platform::UnsetEnv(name);
       }
     }
   };
@@ -1666,7 +1721,10 @@ TEST(BytecodeTest, RowInMaskMatchesAstAcrossNullsWideTuplesAndMultiWord) {
     ScopedEnv enable("TINYLAMB_DISABLE_ROW_IN_MASK", nullptr);
     prog_on = BytecodeCompiler::Compile(expr, schema);
   }
-  ASSERT_TRUE(prog_on.has_value());
+  if (!prog_on.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   EXPECT_TRUE(has_row_in_mask_op(*prog_on));
 
   std::optional<BytecodeProgram> prog_off;

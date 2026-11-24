@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/parallel_hash_join.hpp"
 
 #include <algorithm>
@@ -378,7 +379,7 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
     }
   }
   static const bool int_keys_disabled =
-      std::getenv("TINYLAMB_DISABLE_INT_KEY_JOIN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INT_KEY_JOIN") != nullptr;
   // The int-key path stores exactly the key parts it is told, so it is only
   // valid for a key that fits the fixed width AND has the same arity on both
   // sides. A wider (or mismatched) key keeps the memcomparable byte encoding;

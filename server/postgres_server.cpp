@@ -92,7 +92,7 @@ thread_local const IoCpuMasks* current_io_masks = nullptr;
 class ScopedIoCpuAffinity {
  public:
   ScopedIoCpuAffinity() {
-    if (std::getenv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) {
+    if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) {
       return;
     }
     const std::optional<platform::CpuSet> available =
@@ -120,7 +120,7 @@ class ScopedIoCpuAffinity {
     if (!masks_.available.ApplyToCurrentThread()) {
       const int restore_errno = errno;
       LOG(WARN) << "could not restore I/O thread CPU affinity: "
-                << std::strerror(restore_errno);
+                << ::tinylamb::platform::StrError(restore_errno);
     }
   }
   ScopedIoCpuAffinity(const ScopedIoCpuAffinity&) = delete;
@@ -151,7 +151,7 @@ class ScopedSqlCpuAffinity {
     if (!masks_->io.ApplyToCurrentThread()) {
       const int restore_errno = errno;
       LOG(WARN) << "could not restore SQL thread CPU affinity: "
-                << std::strerror(restore_errno);
+                << ::tinylamb::platform::StrError(restore_errno);
     }
     current_io_masks = masks_;
   }
@@ -165,7 +165,7 @@ class ScopedSqlCpuAffinity {
 };
 
 std::string ErrnoMessage(std::string_view operation) {
-  return std::string(operation) + ": " + std::strerror(errno);
+  return std::string(operation) + ": " + ::tinylamb::platform::StrError(errno);
 }
 
 // Listen addresses that keep the unauthenticated server private: all of
@@ -469,10 +469,13 @@ Status DrainCommandResult(QueryResult& result, int64_t* affected_rows) {
 class PostgresServer::
     Impl {  // NOLINT(clang-analyzer-optin.performance.Padding)
  public:
+  // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp): RNG is entropy-seeded below.
   Impl(const std::string& database_path, PostgresServerOptions options)
       : options_(std::move(options)) {
     try {
-      secret_rng_.seed(std::random_device{}());
+      std::random_device entropy;
+      std::seed_seq seed{entropy(), entropy(), entropy(), entropy()};
+      secret_rng_.seed(seed);
     } catch (...) {
       // Entropy source unavailable: degrade to a time/address mix rather
       // than letting the exception escape the constructor.
@@ -504,7 +507,7 @@ class PostgresServer::
       // next COMMIT/ROLLBACK messages are queued. Keep admission nonblocking
       // even when writes run in workers, so the pool cannot starve its owners.
       database_->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
-      metrics_enabled_ = std::getenv("TINYLAMB_SERVER_METRICS") != nullptr;
+      metrics_enabled_ = ::tinylamb::platform::GetEnv("TINYLAMB_SERVER_METRICS") != nullptr;
       database_->SetTransactionMetricsEnabled(metrics_enabled_);
     } else {
       startup_error_ = "failed to open database " + database_path + ": " +
@@ -2350,7 +2353,7 @@ class PostgresServer::
                          "too many columns for PostgreSQL protocol");
     }
     static const bool disable_chunked_wire =
-        std::getenv("TINYLAMB_DISABLE_CHUNKED_PGWIRE") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CHUNKED_PGWIRE") != nullptr;
     if (!disable_chunked_wire) {
       // Lean proof:
       // lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
@@ -3974,7 +3977,8 @@ bool PostgresServer::RegistersTempObject(std::string_view sql) {
   }
   size_t index = 1;
   if (index < count && IdentifierEquals(words[index], "OR")) {
-    if (++index >= count || !IdentifierEquals(words[index], "REPLACE")) {
+    ++index;
+    if (index >= count || !IdentifierEquals(words[index], "REPLACE")) {
       return false;
     }
     ++index;

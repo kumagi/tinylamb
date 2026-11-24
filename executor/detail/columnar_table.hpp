@@ -42,8 +42,8 @@ inline constexpr size_t kColumnarChunkRows = 2048;
 struct ChunkStringArena {
   static constexpr size_t kDefaultSlabBytes = 16384;
   struct Slab {
-    std::unique_ptr<char[]>
-        data;  // NOLINT(modernize-avoid-c-arrays) dynamic slab size
+    std::unique_ptr<char[]> data;  // NOLINT(modernize-avoid-c-arrays):
+                                   // runtime-sized stable slab storage.
     size_t capacity{0};
   };
   std::deque<Slab> slabs;
@@ -1333,6 +1333,7 @@ struct CompiledColumnarProjection {
     kPassThrough,
     kConstant,
     kNullCoalesce,
+    kSubCoalesceConst,
     kBytecode,
     kSubstring,
     kFallback

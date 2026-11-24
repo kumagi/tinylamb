@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/topn.hpp"
 
 #include <algorithm>
@@ -64,7 +65,7 @@ Status TopNExecutor::Materialize() {
     // (sql_outer_fetch_ties_sound) Stream WITH TIES using a bounded heap of
     // size `capacity = offset + limit` plus `boundary_ties` holding rows equal
     // on sort keys to `heap.top()`.
-    const char* disable_ties = std::getenv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+    const char* disable_ties = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
     const bool use_streaming_ties =
         (disable_ties == nullptr || disable_ties[0] == '\0' ||
          disable_ties[0] == '0') &&

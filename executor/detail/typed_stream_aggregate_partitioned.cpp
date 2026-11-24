@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/typed_stream_aggregate_partitioned.hpp"
 
 #include <algorithm>
@@ -640,7 +641,7 @@ Relation FinalizePartitionedRelation(
           survivors.begin() + static_cast<std::ptrdiff_t>(emit_count),
           survivors.end(), cmp_rows);
     } else if (
-        std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
         fast_order_kind == PartOrderKind::kInt &&
         req.order_bindings.size() == 1 && survivors.size() >= 1024 &&
         // Lean proof:
@@ -692,7 +693,7 @@ Relation FinalizePartitionedRelation(
   }
   output.schema = Schema("", std::move(out_cols));
 
-  if (std::getenv("TINYLAMB_DEBUG_TLCS") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_TLCS") != nullptr) {
     (void)std::fprintf(stderr,
                        "[TLCS-AGG-OK] partitioned-%s dir=%.2fms scan=%.2fms "
                        "merge=%.2fms cands=%zu/%u rows=%zu/%zu groups=%zu\n",
@@ -2792,8 +2793,8 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
           const size_t mask = slots.size() - 1;
           size_t pos = static_cast<size_t>(kh) & mask;
           while (true) {
-            FixedSlot& sl = slots[pos];
-            if (sl.gid_plus_one == 0) {
+            FixedSlot& slot = slots[pos];
+            if (slot.gid_plus_one == 0) {
               if (ng >= reserved_groups_cap) {
                 const size_t next_cap = reserved_groups_cap * 2;
                 if (!ht_charge.TryAdd((next_cap - reserved_groups_cap) *
@@ -2816,12 +2817,12 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
               } else {
                 aggs_flat.resize(aggs_flat.size() + naggs);
               }
-              sl.hash = kh;
-              sl.gid_plus_one = gid + 1;
+              slot.hash = kh;
+              slot.gid_plus_one = gid + 1;
               return gid;
             }
-            if (sl.hash == kh) {
-              const uint32_t eg = sl.gid_plus_one - 1;
+            if (slot.hash == kh) {
+              const uint32_t eg = slot.gid_plus_one - 1;
               if (key_nulls[eg] == kmask) {
                 const int64_t* ek =
                     &keys_flat[static_cast<size_t>(eg) * n_phys];
@@ -3840,8 +3841,8 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
                     size_t pos = static_cast<size_t>(kh) & mask;
                     uint32_t gid = 0;
                     while (true) {
-                      MixedSlot& sl = slots[pos];
-                      if (sl.gid_plus_one == 0) {
+                      MixedSlot& slot = slots[pos];
+                      if (slot.gid_plus_one == 0) {
                         if (ng >= reserved_group_cap) {
                           const size_t next_cap = reserved_group_cap * 2;
                           if (!ht_charge.TryAdd(
@@ -3867,12 +3868,12 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
                           }
                         }
                         counts_flat.push_back(count_val);
-                        sl.hash = kh;
-                        sl.gid_plus_one = gid + 1;
+                        slot.hash = kh;
+                        slot.gid_plus_one = gid + 1;
                         break;
                       }
-                      if (sl.hash == kh) {
-                        const uint32_t eg = sl.gid_plus_one - 1;
+                      if (slot.hash == kh) {
+                        const uint32_t eg = slot.gid_plus_one - 1;
                         if (GroupKeySliceHasher::Equals(
                                 &keys_flat[static_cast<size_t>(eg) * n_phys],
                                 probe_keys.data(), km.phys_specs)) {
@@ -4371,8 +4372,12 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
 }
 
 // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
-// (unordered_group_by_key_fiber_subset_sound,
-// unordered_group_by_nonkey_filter_corrupts_count_bug)
+// Lean proofs:
+//   - lean/TinylambOpt/ClickBenchRound2.lean
+//     (unordered_group_by_key_fiber_subset_sound,
+//      unordered_group_by_nonkey_filter_corrupts_count_bug)
+//   - lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+//     (GroupByLimitAnyOrderEarlyStop_sound)
 // CB-2: Key-fiber subset aggregation for unordered `GROUP BY ... LIMIT K`
 // (ClickBench Q18: `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY
 // UserID, SearchPhrase LIMIT 10`). Filtering input rows by a predicate `P(k1)`
@@ -4864,7 +4869,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                              return item.kind ==
                                     OutputSlotBinding::Kind::kPostAgg;
                            }) &&
-      std::getenv("TINYLAMB_DISABLE_TLCS_DUPLICATE_SIEVE") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TLCS_DUPLICATE_SIEVE") == nullptr;
   bool near_unique = false;
   if (try_duplicate_sieve) {
     // The sampled column is sufficient to estimate pair uniqueness. A
@@ -4904,7 +4909,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   const bool try_numeric_quotient =
       numeric_pair && !near_unique && req.order_bindings.size() == 1 &&
       req.candidate_blocks.size() >= 512 &&
-      std::getenv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
   if (!any_varchar_key && !single_raw_int_key && !near_unique &&
       !try_numeric_quotient) {
     return std::optional<Relation>{};
@@ -4982,7 +4987,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                       sched.stage1c_cols.empty() && sched.stage2_cols.empty() &&
                       !sched.stage1b_cols.empty();
   const bool specialize =
-      direct && std::getenv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
+      direct && ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
   const auto string_fingerprint_jit =
       specialize && single_raw_varchar_key && input_bound >= (1U << 24)
           ? JitStringFingerprint::Compile()
@@ -5071,8 +5076,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       uint64_t scanned = 0;
       uint64_t matching = 0;
       constexpr size_t kHashBatch = 128;
-      std::array<uint64_t, kHashBatch> hashes;
-      std::array<int64_t, kHashBatch> date_parts;
+      std::array<uint64_t, kHashBatch> hashes{};
+      std::array<int64_t, kHashBatch> date_parts{};
 
       for (size_t i = next.fetch_add(1, std::memory_order_relaxed);
            i < blocks.size();
@@ -5169,23 +5174,23 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
             const auto& b = *columns[km.phys_specs[1].full_col];
             const auto visit_pair = [&]<bool Nullable>() -> Status {
               for (const uint32_t row : rows) {
-                const RuntimeKeyCell pair[]{
+                const std::array<RuntimeKeyCell, 2> pair{{
                     {.is_null = Nullable && a.IsNull(row),
                      .int_val = a.int_cells[row]},
                     {.is_null = Nullable && b.IsNull(row),
                      .int_val = b.int_cells[row]},
-                };
+                }};
                 // The first key alone is a sound bucket key. The resident
                 // table below still tests both cells for equality.
                 const uint64_t h =
                     !near_unique
-                        ? GroupKeySliceHasher::HashTyped(pair, km.phys_specs)
+                        ? GroupKeySliceHasher::HashTyped(pair.data(), km.phys_specs)
                     : pair[0].is_null
                         ? null_hash
                         : MixHash64(GroupKeySliceHasher::kSeed ^
                                     MixHash64(static_cast<uint64_t>(
                                         pair[0].int_val)));
-                RETURN_IF_FAIL(emit_row(pair, h, row));
+                RETURN_IF_FAIL(emit_row(pair.data(), h, row));
               }
               return Status::kSuccess;
             };
@@ -5261,7 +5266,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                 }
                 while (mask != 0) {
                   candidates.push_back(static_cast<uint32_t>(
-                      word * 64 + std::countr_zero(mask) - start));
+                      (word * 64) + std::countr_zero(mask) - start));
                   mask &= mask - 1;
                 }
               }
@@ -5325,12 +5330,14 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                         value.empty() ? empty : HashView64(value);
                     const uint64_t hash = MixHash64(
                         hashes[lane] ^ (entry + 2 * 0x9e3779b97f4a7c15ULL));
-                    const RuntimeKeyCell cells[]{
+                    const std::array<RuntimeKeyCell, 3> cells{{
                         {.int_val = a->int_cells[row]},
                         {.int_val = date_parts[lane]},
+                        // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): RuntimeKeyCell carries str_len.
                         {.str_ptr = value.data(),
-                         .str_len = static_cast<uint32_t>(value.size())}};
-                    status = emit_row(cells, hash, static_cast<uint32_t>(row));
+                         .str_len = static_cast<uint32_t>(value.size())}}};
+                    status = emit_row(cells.data(), hash,
+                                      static_cast<uint32_t>(row));
                     if (!status.ok()) {
                       break;
                     }
@@ -5355,11 +5362,11 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                     PrefetchBitmapWord(prefetch_words.data() + word);
                   }
                   const size_t row = base + lane;
-                  const RuntimeKeyCell pair[]{
+                  const std::array<RuntimeKeyCell, 2> pair{{
                       {.int_val = a->int_cells[row]},
-                      {.int_val = b == nullptr ? 0 : b->int_cells[row]}};
-                  status =
-                      emit_row(pair, hashes[lane], static_cast<uint32_t>(row));
+                      {.int_val = b == nullptr ? 0 : b->int_cells[row]}}};
+                  status = emit_row(pair.data(), hashes[lane],
+                                    static_cast<uint32_t>(row));
                   if (!status.ok()) {
                     break;
                   }
@@ -5444,8 +5451,10 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       for (size_t g = 0; g < ng; ++g) {
         all_cnts[g] = merged.AggsAt(g)[0].count;
       }
-      std::nth_element(all_cnts.begin(), all_cnts.begin() + (topk_cap - 1),
-                       all_cnts.end(), std::greater<int64_t>{});
+      std::nth_element(
+        all_cnts.begin(), std::next(all_cnts.begin(),
+                                    static_cast<std::ptrdiff_t>(topk_cap - 1)),
+        all_cnts.end(), std::greater<int64_t>{});
       tau = all_cnts[topk_cap - 1];
       // Soundness certificate (`quotient_bucket_topk_pruning_sound`): every
       // bucket outside `heavy_bits` has total row count `<= rest_max_bucket <
@@ -5472,7 +5481,9 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       for (size_t g = 0; g < ng; ++g) {
         shortlist[g] = g;
       }
-      std::nth_element(shortlist.begin(), shortlist.begin() + topk_cap,
+      std::nth_element(shortlist.begin(),
+                       std::next(shortlist.begin(),
+                                 static_cast<std::ptrdiff_t>(topk_cap)),
                        shortlist.end(), [&](size_t a, size_t b) {
                          return merged.AggsAt(a)[0].count >
                                 merged.AggsAt(b)[0].count;
@@ -5541,6 +5552,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
     const bool use_two_bits = req.preds.Empty();
     const size_t words = (bits / 64) * (use_two_bits ? 2 : 1);
     QueryMemoryCharge bitmap_charge;
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically sized uninitialized buffer is zeroed in parallel below.
     std::unique_ptr<uint64_t[]> bitmaps;
     const auto tag = [&](uint64_t hash) {
       const size_t word = (hash >> 16) & (words - 1);
@@ -5566,7 +5578,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
         group_hash_jit && input_bound >= (uint64_t{1} << 22) &&
         input_bound <= (uint64_t{1} << (64 - kTagBits)) &&
         sizeof(size_t) >= 8 &&
-        std::getenv("TINYLAMB_DISABLE_SHARDED_DUPLICATE_SIEVE") == nullptr &&
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SHARDED_DUPLICATE_SIEVE") == nullptr &&
         replay_charge.TryAdd(replay_words * sizeof(uint64_t)) &&
         shard_charge.TryAdd(
             (input_bound * 2 + workers * (kShards * 64 + 2 * shard_words)) *
@@ -5634,19 +5646,23 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       if (!bitmap_charge.TryAdd(2 * words * sizeof(uint64_t))) {
         return std::nullopt;
       }
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): uninitialized dynamic buffer is zeroed in parallel.
       bitmaps = std::make_unique_for_overwrite<uint64_t[]>(2 * words);
       RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
         const size_t size = 2 * words;
-        std::fill(bitmaps.get() + (size * w) / workers,
-                  bitmaps.get() + (size * (w + 1)) / workers, uint64_t{0});
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
+        std::fill(bitmaps.get() + ((size * w) / workers),
+                  bitmaps.get() + ((size * (w + 1)) / workers), uint64_t{0});
       }));
       RETURN_IF_FAIL(scan_keys(
           req.candidate_blocks, true,
           [&](size_t, const RuntimeKeyCell*, uint64_t hash) {
             const auto [word, mask] = tag(hash);
+            // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
             const uint64_t old = std::atomic_ref(bitmaps[word])
                                      .fetch_or(mask, std::memory_order_relaxed);
             if ((old & mask) != 0) {
+              // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
               std::atomic_ref(bitmaps[word + words])
                   .fetch_or(old & mask, std::memory_order_relaxed);
             }
@@ -5663,6 +5679,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
         [&](size_t w, const RuntimeKeyCell* keys, uint64_t hash) -> Status {
           if (!shard_sightings) {
             const auto [word, mask] = tag(hash);
+            // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
             const bool repeated = (bitmaps[word + words] & mask) == mask;
             // All dropped singleton groups tie on the only ORDER BY term.
             // Retain enough witnesses to supply LIMIT plus OFFSET.
@@ -5706,8 +5723,10 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   const auto choose_buckets = [&](const std::vector<uint32_t>& counts,
                                   size_t capacity) {
     auto ranked = counts;
-    std::nth_element(ranked.begin(), ranked.begin() + (capacity - 1),
-                     ranked.end(), std::greater<uint32_t>{});
+    std::nth_element(
+        ranked.begin(), std::next(ranked.begin(),
+                                  static_cast<std::ptrdiff_t>(capacity - 1)),
+        ranked.end(), std::greater<uint32_t>{});
     const uint32_t cutoff = ranked[capacity - 1];
     std::vector<uint64_t> mask(kNumBuckets / 64, 0);
     // Give strictly higher counts priority. Break ties by bucket index
@@ -5969,11 +5988,12 @@ struct VarCharLocalGroupTable {
   std::vector<uint64_t> hashes;
   std::vector<RuntimeAggState> aggs;
   size_t max_groups{65536};
+  bool freeze_new_keys{false};
   bool bail{false};
 
   RuntimeAggState* GetOrCreateNull(size_t naggs) {
     if (!has_null) {
-      const size_t need = naggs * sizeof(RuntimeAggState) + 64;
+      const size_t need = (naggs * sizeof(RuntimeAggState)) + 64;
       if (!charge.TryAdd(need)) {
         bail = true;
         return nullptr;
@@ -5990,13 +6010,16 @@ struct VarCharLocalGroupTable {
       if (has_empty) {
         return empty_gid;
       }
+      if (freeze_new_keys) {
+        return std::nullopt;
+      }
       const size_t new_gid = keys.size();
       if (new_gid >= max_groups) {
         bail = true;
         return std::nullopt;
       }
       const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
-                               naggs * sizeof(RuntimeAggState) + 48;
+                               (naggs * sizeof(RuntimeAggState)) + 48;
       if (!charge.TryAdd(row_bytes)) {
         bail = true;
         return std::nullopt;
@@ -6015,13 +6038,16 @@ struct VarCharLocalGroupTable {
       if (const uint32_t* found = short_map.Find(key)) {
         return *found;
       }
+      if (freeze_new_keys) {
+        return std::nullopt;
+      }
       const size_t new_gid = keys.size();
       if (new_gid >= max_groups) {
         bail = true;
         return std::nullopt;
       }
       const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
-                               naggs * sizeof(RuntimeAggState) + 48;
+                               (naggs * sizeof(RuntimeAggState)) + 48;
       if (!charge.TryAdd(row_bytes)) {
         bail = true;
         return std::nullopt;
@@ -6050,7 +6076,7 @@ struct VarCharLocalGroupTable {
       return std::nullopt;
     }
     const size_t row_bytes = sizeof(std::string_view) + sizeof(uint64_t) +
-                             naggs * sizeof(RuntimeAggState) + 64;
+                             (naggs * sizeof(RuntimeAggState)) + 64;
     if (!charge.TryAdd(row_bytes)) {
       bail = true;
       return std::nullopt;
@@ -6070,7 +6096,7 @@ struct VarCharLocalGroupTable {
 
   RuntimeAggState* GetOrCreate(std::string_view sv, size_t naggs) {
     const auto gid = FindOrInsertKey(sv, naggs);
-    return gid ? (aggs.data() + static_cast<size_t>(*gid) * naggs) : nullptr;
+    return gid ? (aggs.data() + (static_cast<size_t>(*gid) * naggs)) : nullptr;
   }
 };
 
@@ -6082,7 +6108,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   // Lean proof:
   // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
   // (sound)
-  if (std::getenv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
       req.candidate_blocks.empty() || req.key_specs.size() != 2 ||
       req.stmt.Distinct() || req.any_scalar_distinct) {
     return std::optional<Relation>{};
@@ -6102,14 +6128,15 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
     }
   }
   std::optional<KeyProjectionMap> owned_km;
-  if (precomputed_km == nullptr) {
+  const KeyProjectionMap* km_ptr = precomputed_km;
+  if (km_ptr == nullptr) {
     ASSIGN_OR_RETURN(
         KeyProjectionMap, built_km,
         BuildKeyProjectionMap(*req.tlcs, req.candidate_blocks, req.key_specs));
-    owned_km = std::move(built_km);
+    owned_km.emplace(std::move(built_km));
+    km_ptr = &owned_km.value();
   }
-  const KeyProjectionMap& km =
-      precomputed_km != nullptr ? *precomputed_km : *owned_km;
+  const KeyProjectionMap& km = *km_ptr;
   if (km.phys_specs.size() != 2) {
     return std::optional<Relation>{};
   }
@@ -6193,6 +6220,8 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   const size_t total_slots = s0 * s1;
   const size_t naggs = req.agg_specs.size();
   // Lean proofs:
+  //   - lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
+  //     (sound)
   //   - lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (EpochAverage_sound)
   //   - lean/TinylambOpt/ResearchProofs/TwoLevelPartitionedAggMerge.lean
   //     (sound)
@@ -6205,7 +6234,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
       (req.agg_specs[0].kind == ColAggKind::kCountStar ||
        req.agg_specs[0].kind == ColAggKind::kAvgDouble ||
        req.agg_specs[0].kind == ColAggKind::kSumDouble) &&
-      std::getenv("TINYLAMB_DISABLE_EPOCH_TWO_KEY_AGG") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_EPOCH_TWO_KEY_AGG") == nullptr;
 
   struct CompactEpochSlot {
     uint32_t stamp{0};
@@ -6248,10 +6277,18 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   };
   std::vector<TwoKeyWorkerState> states(workers_used);
   struct EpochPoolReturnGuard {
+    explicit EpochPoolReturnGuard(std::vector<TwoKeyWorkerState>* states)
+        : states_ptr(states) {}
+    EpochPoolReturnGuard(const EpochPoolReturnGuard&) = delete;
+    EpochPoolReturnGuard& operator=(const EpochPoolReturnGuard&) = delete;
+    EpochPoolReturnGuard(EpochPoolReturnGuard&&) = delete;
+    EpochPoolReturnGuard& operator=(EpochPoolReturnGuard&&) = delete;
     std::vector<TwoKeyWorkerState>* states_ptr{nullptr};
     ~EpochPoolReturnGuard() {
-      if (states_ptr == nullptr) return;
-      std::lock_guard<std::mutex> lock(epoch_pool_mu);
+      if (states_ptr == nullptr) {
+        return;
+      }
+      std::scoped_lock lock(epoch_pool_mu);
       for (auto& st : *states_ptr) {
         if (st.epoch_buf && epoch_pool.size() < 16) {
           epoch_pool.push_back(std::move(st.epoch_buf));
@@ -6260,7 +6297,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
     }
   } epoch_return_guard{use_compact_epoch ? &states : nullptr};
   if (use_compact_epoch) {
-    std::lock_guard<std::mutex> lock(epoch_pool_mu);
+    std::scoped_lock lock(epoch_pool_mu);
     for (size_t w = 0; w < workers_used; ++w) {
       if (!epoch_pool.empty()) {
         states[w].epoch_buf = std::move(epoch_pool.back());
@@ -6332,17 +6369,13 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             const int64_t* __restrict__ c1 = kch1->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
-                                      static_cast<uint64_t>(min0)) *
-                      s1 +
-                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
-                                      static_cast<uint64_t>(min1));
-              CompactEpochSlot& sl = eslots[gi];
-              if (sl.stamp != ep) {
-                sl.stamp = ep;
-                sl.count = 1;
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+              CompactEpochSlot& slot = eslots[gi];
+              if (slot.stamp != ep) {
+                slot.stamp = ep;
+                slot.count = 1;
               } else {
-                ++sl.count;
+                ++slot.count;
               }
             }
           } else {
@@ -6359,12 +6392,12 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
                       : static_cast<size_t>(
                             static_cast<uint64_t>(kch1->int_cells[r]) -
                             static_cast<uint64_t>(min1));
-              CompactEpochSlot& sl = eslots[idx0 * s1 + idx1];
-              if (sl.stamp != ep) {
-                sl.stamp = ep;
-                sl.count = 1;
+              CompactEpochSlot& slot = eslots[(idx0 * s1) + idx1];
+              if (slot.stamp != ep) {
+                slot.stamp = ep;
+                slot.count = 1;
               } else {
-                ++sl.count;
+                ++slot.count;
               }
             }
           }
@@ -6384,39 +6417,31 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             const int64_t* __restrict__ vals = vch->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
-                                      static_cast<uint64_t>(min0)) *
-                      s1 +
-                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
-                                      static_cast<uint64_t>(min1));
-              CompactEpochSlot& sl = eslots[gi];
-              if (sl.stamp != ep) {
-                sl.stamp = ep;
-                sl.count = 1;
-                sl.sum = static_cast<double>(vals[r]);
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+              CompactEpochSlot& slot = eslots[gi];
+              if (slot.stamp != ep) {
+                slot.stamp = ep;
+                slot.count = 1;
+                slot.sum = static_cast<double>(vals[r]);
               } else {
-                ++sl.count;
-                sl.sum += static_cast<double>(vals[r]);
+                ++slot.count;
+                slot.sum += static_cast<double>(vals[r]);
               }
             }
           } else {
             const int64_t* __restrict__ raw_vals = vch->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
-                                      static_cast<uint64_t>(min0)) *
-                      s1 +
-                  static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
-                                      static_cast<uint64_t>(min1));
-              const double dv = std::bit_cast<double>(raw_vals[r]);
-              CompactEpochSlot& sl = eslots[gi];
-              if (sl.stamp != ep) {
-                sl.stamp = ep;
-                sl.count = 1;
-                sl.sum = dv;
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+              const auto dv = std::bit_cast<double>(raw_vals[r]);
+              CompactEpochSlot& slot = eslots[gi];
+              if (slot.stamp != ep) {
+                slot.stamp = ep;
+                slot.count = 1;
+                slot.sum = dv;
               } else {
-                ++sl.count;
-                sl.sum += dv;
+                ++slot.count;
+                slot.sum += dv;
               }
             }
           }
@@ -6434,15 +6459,15 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
                     : static_cast<size_t>(
                           static_cast<uint64_t>(kch1->int_cells[r]) -
                           static_cast<uint64_t>(min1));
-            CompactEpochSlot& sl = eslots[idx0 * s1 + idx1];
-            if (sl.stamp != ep) {
-              sl.stamp = ep;
-              sl.count = 0;
-              sl.sum = 0.0;
+            CompactEpochSlot& slot = eslots[(idx0 * s1) + idx1];
+            if (slot.stamp != ep) {
+              slot.stamp = ep;
+              slot.count = 0;
+              slot.sum = 0.0;
             }
             if (!vch->IsNull(r)) {
-              ++sl.count;
-              sl.sum += is_int_v ? static_cast<double>(vch->int_cells[r])
+              ++slot.count;
+              slot.sum += is_int_v ? static_cast<double>(vch->int_cells[r])
                                  : std::bit_cast<double>(vch->int_cells[r]);
             }
           }
@@ -6471,11 +6496,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
         const int64_t* __restrict__ c0 = kch0->int_cells.data();
         const int64_t* __restrict__ c1 = kch1->int_cells.data();
         for (const uint32_t r : cand_rows) {
-          const size_t gi = static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
-                                                static_cast<uint64_t>(min0)) *
-                                s1 +
-                            static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
-                                                static_cast<uint64_t>(min1));
+          const size_t gi = ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
           pres[gi] = 1;
           ++aggs[gi].count;
           aggs[gi].has_value = true;
@@ -6492,11 +6513,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
           const int64_t* __restrict__ c1 = kch1->int_cells.data();
           const int64_t* __restrict__ vals = vch->int_cells.data();
           for (const uint32_t r : cand_rows) {
-            const size_t gi = static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
-                                                  static_cast<uint64_t>(min0)) *
-                                  s1 +
-                              static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
-                                                  static_cast<uint64_t>(min1));
+            const size_t gi = ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
             pres[gi] = 1;
             ++aggs[gi].count;
             aggs[gi].double_val += static_cast<double>(vals[r]);
@@ -6517,11 +6534,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
                             : static_cast<size_t>(
                                   static_cast<uint64_t>(kch1->int_cells[r]) -
                                   static_cast<uint64_t>(min1));
-        const size_t gi = idx0 * s1 + idx1;
+        const size_t gi = (idx0 * s1) + idx1;
         pres[gi] = 1;
         for (size_t a = 0; a < naggs; ++a) {
           Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
-                                           aggs[gi * naggs + a], wst.arena);
+                                           aggs[(gi * naggs) + a], wst.arena);
           if (fst != Status::kSuccess) {
             if (fst == StatusCode::kMemoryLimitExceeded) {
               budget_fallback.store(true, std::memory_order_relaxed);
@@ -6589,11 +6606,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
         double total_sum = 0.0;
         for (const size_t w : active_workers) {
           const CompactEpochBuffer& eb = *states[w].epoch_buf;
-          const CompactEpochSlot& sl = eb.slots[idx];
-          if (sl.stamp == eb.epoch) {
+          const CompactEpochSlot& slot = eb.slots[idx];
+          if (slot.stamp == eb.epoch) {
             any = true;
-            total_cnt += sl.count;
-            total_sum += sl.sum;
+            total_cnt += slot.count;
+            total_sum += slot.sum;
           }
         }
         if (!any) {
@@ -6625,7 +6642,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
           if (states[w].present[idx] == 0) {
             continue;
           }
-          RuntimeAggState* src_aggs = states[w].aggs.data() + idx * naggs;
+          RuntimeAggState* src_aggs = states[w].aggs.data() + (idx * naggs);
           for (size_t a = 0; a < naggs; ++a) {
             Status mst = MergeAggState(req.agg_specs[a], merged_aggs[a],
                                        src_aggs[a], merge_arena);
@@ -6693,11 +6710,13 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     const KeyProjectionMap* precomputed_km) {
   // Lean proofs:
   //   - lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean (sound)
+  //   - lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean
+  //     (sound)
   //   - lean/TinylambOpt/ResearchProofs/ShortStringPrefix7Bijection.lean
   //   (sound)
   //   - lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean
   //   (sound)
-  if (std::getenv("TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||
       req.candidate_blocks.empty() || req.candidate_blocks.size() > 256 ||
       req.key_specs.size() != 1 ||
       req.key_specs[0].kind != ColKeyKind::kColVarChar || req.stmt.Distinct() ||
@@ -6717,14 +6736,15 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     }
   }
   std::optional<KeyProjectionMap> owned_km;
-  if (precomputed_km == nullptr) {
+  const KeyProjectionMap* km_ptr = precomputed_km;
+  if (km_ptr == nullptr) {
     ASSIGN_OR_RETURN(
         KeyProjectionMap, built_km,
         BuildKeyProjectionMap(*req.tlcs, req.candidate_blocks, req.key_specs));
-    owned_km = std::move(built_km);
+    owned_km.emplace(std::move(built_km));
+    km_ptr = &owned_km.value();
   }
-  const KeyProjectionMap& km =
-      precomputed_km != nullptr ? *precomputed_km : *owned_km;
+  const KeyProjectionMap& km = *km_ptr;
   if (km.phys_specs.size() != 1) {
     return std::optional<Relation>{};
   }
@@ -6818,7 +6838,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
             ++local_aggs[code].count;
             local_aggs[code].has_value = true;
           } else {
-            RuntimeAggState* dst = local_aggs.data() + code * naggs;
+            RuntimeAggState* dst = local_aggs.data() + (code * naggs);
             for (size_t a = 0; a < naggs; ++a) {
               Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
                                                dst[a], ws.table.arena);
@@ -6846,7 +6866,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
               bail_fallback.store(true, std::memory_order_relaxed);
               return;
             }
-            RuntimeAggState* src = local_aggs.data() + c * naggs;
+            RuntimeAggState* src = local_aggs.data() + (c * naggs);
             for (size_t a = 0; a < naggs; ++a) {
               Status mst = MergeAggState(req.agg_specs[a], dst[a], src[a],
                                          ws.table.arena);
@@ -6885,7 +6905,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
             last_sv = ws.table.keys[gid];
             last_gid = gid;
           }
-          dst = ws.table.aggs.data() + static_cast<size_t>(gid) * naggs;
+          dst = ws.table.aggs.data() + (static_cast<size_t>(gid) * naggs);
         }
         if (ws.table.bail) {
           bail_fallback.store(true, std::memory_order_relaxed);
@@ -6962,7 +6982,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
       RETURN_IF_FAIL(emit_one(true, {}, wt.null_aggs.data()));
     }
     for (size_t g = 0; g < wt.keys.size(); ++g) {
-      RETURN_IF_FAIL(emit_one(false, wt.keys[g], wt.aggs.data() + g * naggs));
+      RETURN_IF_FAIL(emit_one(false, wt.keys[g], wt.aggs.data() + (g * naggs)));
     }
     return FinalizePartitionedRelation(
         req, single_surv, total_worker_groups, total_scanned, total_matching,
@@ -6989,7 +7009,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
           {.worker_id = static_cast<uint32_t>(w), .gid = 0, .is_null = true});
     }
     for (size_t g = 0; g < wt.keys.size(); ++g) {
-      const size_t s = static_cast<size_t>((wt.hashes[g] >> 32) & shard_mask);
+      const auto s = static_cast<size_t>((wt.hashes[g] >> 32) & shard_mask);
       shard_refs[s].push_back({.worker_id = static_cast<uint32_t>(w),
                                .gid = static_cast<uint32_t>(g),
                                .is_null = false});
@@ -7020,7 +7040,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
       RuntimeAggState* src =
           ref.is_null
               ? src_wt.null_aggs.data()
-              : (src_wt.aggs.data() + static_cast<size_t>(ref.gid) * naggs);
+              : (src_wt.aggs.data() + (static_cast<size_t>(ref.gid) * naggs));
       for (size_t a = 0; a < naggs; ++a) {
         Status mst =
             MergeAggState(req.agg_specs[a], dst[a], src[a], merged.arena);
@@ -7075,7 +7095,7 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     }
     for (size_t g = 0; g < merged.keys.size(); ++g) {
       Status est =
-          emit_merged(false, merged.keys[g], merged.aggs.data() + g * naggs);
+          emit_merged(false, merged.keys[g], merged.aggs.data() + (g * naggs));
       if (est != Status::kSuccess) {
         merge_status[s] = std::move(est);
         return;

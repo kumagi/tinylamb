@@ -36,6 +36,7 @@
 #include "common/platform/endian.hpp"
 #include "common/platform/hash.hpp"
 #include "common/platform/int128_conversion.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -727,7 +728,8 @@ std::vector<Expression> ResidualJoinPredicates(
     const Schema& left, const Schema& right,
     const std::vector<Expression>& predicates, bool allow_binary_varchar) {
   static const bool varchar_elision_disabled =
-      std::getenv("TINYLAMB_DISABLE_VARCHAR_KEY_ELISION") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_VARCHAR_KEY_ELISION") !=
+      nullptr;
   const bool elide_binary_varchar =
       allow_binary_varchar && !varchar_elision_disabled;
   const std::vector<EqualityKey> keys = EqualityKeys(left, right, predicates);
@@ -901,7 +903,8 @@ namespace {
 
 bool LegacyJoinEstimateEnabled() {
   static const bool enabled = [] {
-    const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+    const char* legacy =
+        ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_ESTIMATE");
     if (legacy == nullptr) {
       return false;
     }
@@ -925,12 +928,13 @@ void BuildJoinKeyFrequencyMaps(const Relation& right,
   maps->hashed_fallback = false;
   maps->composite_int = composite_int && !maps->hashed_key;
   maps->right_columns = right_columns;
+  maps->sampling_failed = false;
   maps->single_int_frequencies = FlatIntKeyMap<size_t>{};
   maps->frequencies.clear();
   maps->int_frequencies.clear();
   const size_t sample_target = JoinEstimateSampleTarget();
   static const bool build_sampling_disabled =
-      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_PLANNER") != nullptr;
   const size_t total = right.TotalRows();
   maps->build_stride = build_sampling_disabled || total <= sample_target
                            ? 1
@@ -1012,11 +1016,16 @@ void BuildJoinKeyFrequencyMaps(const Relation& right,
     // The spill stream is sequential with no row index, so strided
     // positions still cost a full decode per estimate. Sample a bounded
     // prefix of ~sample_rows rows instead; build_stride scaling is kept.
-    (void)right.ForEachRowBounded(sample_rows, [&](const Row& row) {
-      if (!hash_failed) {
-        add_row(row);
-      }
-    });
+    const Status sample_status =
+        right.ForEachRowBounded(sample_rows, [&](const Row& row) {
+          if (!hash_failed) {
+            add_row(row);
+          }
+        });
+    if (sample_status != Status::kSuccess) {
+      maps->sampling_failed = true;
+      return;
+    }
   } else if (maps->build_stride == 1) {
     for (const Row& row : right.rows) {
       add_row(row);
@@ -1042,6 +1051,9 @@ void BuildJoinKeyFrequencyMaps(const Relation& right,
 size_t ProbeJoinEstimate(const Relation& left,
                          const std::vector<slot_t>& left_columns,
                          const JoinKeyFrequencyMaps& maps) {
+  if (maps.sampling_failed) {
+    return std::numeric_limits<size_t>::max();
+  }
   size_t estimate = 0;
   // Planning-only cardinality estimation on multi-million-row probe sides
   // costs seconds per join level (TPC-H Q9 sweeps a 6M-row lineitem once per
@@ -1050,7 +1062,7 @@ size_t ProbeJoinEstimate(const Relation& left,
   // which is acceptable for a heuristic planner.
   const size_t sample_target = JoinEstimateSampleTarget();
   static const bool probe_sampling_disabled =
-      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_PLANNER") != nullptr;
   const size_t left_rows = left.TotalRows();
   const size_t stride = probe_sampling_disabled || left_rows <= sample_target
                             ? 1
@@ -1132,7 +1144,11 @@ size_t ProbeJoinEstimate(const Relation& left,
     // at ~ceil(left_rows/stride) prefix rows and keep the *stride scaling.
     const size_t probe_sample =
         std::min(left_rows, (left_rows + stride - 1) / stride);
-    (void)left.ForEachRowBounded(probe_sample, probe_row);
+    const Status sample_status =
+        left.ForEachRowBounded(probe_sample, probe_row);
+    if (sample_status != Status::kSuccess) {
+      return std::numeric_limits<size_t>::max();
+    }
   } else if (stride == 1) {
     for (const Row& row : left.rows) {
       probe_row(row);
@@ -1962,7 +1978,8 @@ namespace {
 std::optional<std::vector<BytecodeProgram>> CompileProbeResiduals(
     const std::vector<Expression>& predicates, const Schema& schema) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_JOIN_RESIDUAL") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_JOIN_RESIDUAL") !=
+      nullptr;
   if (predicates.empty() || disabled || !BytecodeEnabled()) {
     return std::nullopt;
   }
@@ -1998,7 +2015,8 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
     size_t fixed_row_bytes = 0) {
   const size_t total = left.rows.size();
   static const bool release_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE_RELEASE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_PROBE_RELEASE") !=
+      nullptr;
   const size_t num_chunks =
       (total + kParallelProbeChunk - 1) / kParallelProbeChunk;
   worker_count = std::min({worker_count, num_chunks, total});
@@ -3642,7 +3660,9 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
         auto extract_col = [&](const Expression& raw_e,
                                ColSideRef* out) -> bool {
           const Expression& e = unwrap_double_cast(raw_e);
-          if (!e || e->Type() != TypeTag::kColumnValue) return false;
+          if (!e || e->Type() != TypeTag::kColumnValue) {
+            return false;
+          }
           const auto off = LocalColumnOffset(
               result_schema, e->AsColumnValue().GetColumnName());
           if (!off.has_value() || *off >= result_schema.ColumnCount()) {
@@ -3663,11 +3683,17 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
         };
         auto extract_const = [&](const Expression& raw_e, double* out) -> bool {
           const Expression& e = unwrap_double_cast(raw_e);
-          if (!e || e->Type() != TypeTag::kConstantValue) return false;
+          if (!e || e->Type() != TypeTag::kConstantValue) {
+            return false;
+          }
           const Value& v = e->AsConstantValue().GetValue();
-          if (v.IsNull()) return false;
+          if (v.IsNull()) {
+            return false;
+          }
           if (v.type == ValueType::kDouble) {
-            if (!std::isfinite(v.value.double_value)) return false;
+            if (!std::isfinite(v.value.double_value)) {
+              return false;
+            }
             *out = v.value.double_value;
             return true;
           }
@@ -3771,7 +3797,8 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
   } else if (all_int_keys && build_cols.size() == 1) {
     mode = KeyMode::kSingleInt64;
   } else if (all_int_keys && build_cols.size() == 2 &&
-             std::getenv("TINYLAMB_DISABLE_PACKED2X32_HJ") == nullptr &&
+             ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PACKED2X32_HJ") ==
+                 nullptr &&
              JitPacked2x32HashProbe::Compile(false, false, false, false)
                  .has_value()) {
     mode = KeyMode::kPacked2x32;
@@ -3787,7 +3814,8 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
     uint32_t row_end{0};
   };
   static const bool probe_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_PROBE") !=
+      nullptr;
   const size_t max_w =
       QueryParallelWorkerLimit(std::thread::hardware_concurrency());
 
@@ -3904,7 +3932,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
       for (uint32_t bc = 0; bc < build_tbl->chunks.size(); ++bc) {
         const ColumnarChunk& ch = build_tbl->chunks[bc];
         extract_slice(ch, bc, 0, static_cast<uint32_t>(ch.rows), &lc,
-                      &worker_items[0]);
+                      worker_items.data());
         if (packed_overflow.load(std::memory_order_relaxed)) {
           break;
         }
@@ -4030,7 +4058,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                     __atomic_fetch_or(&packed_bloom_words[w1], m1,
                                       __ATOMIC_RELAXED);
                   }
-                  size_t slot = static_cast<size_t>(it.h & packed_ht_mask);
+                  auto slot = static_cast<size_t>(it.h & packed_ht_mask);
                   while (slot < r_end &&
                          packed_ht_heads[slot] != kColumnarEmptyBucket &&
                          packed_ht_keys[slot] != it.key) {
@@ -5130,7 +5158,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
           const bool has_n1 =
               prep_key_col(pcol1, r0, cnt, packed_tile_k1.data(),
                            packed_tile_n1.data(), &in_k1, &in_n1);
-          const size_t cache_idx = static_cast<size_t>(
+          const auto cache_idx = static_cast<size_t>(
               (has_n0 ? 1U : 0U) | (has_n1 ? 2U : 0U) |
               (packed_has_bloom ? 4U : 0U) | (has_bias ? 8U : 0U));
           if (!packed_probe_cache[cache_idx].has_value()) {
@@ -5163,7 +5191,7 @@ StatusOr<std::optional<Relation>> TryColumnarHashJoin(
                       static_cast<uint64_t>(
                           static_cast<uint32_t>(static_cast<int32_t>(v1)));
                   const uint64_t h = HashPacked2x32Key(packed);
-                  size_t slot = static_cast<size_t>(h & packed_ht_mask);
+                  auto slot = static_cast<size_t>(h & packed_ht_mask);
                   while (packed_ht_heads[slot] != kColumnarEmptyBucket) {
                     if (packed_ht_keys[slot] == packed) {
                       head = packed_ht_heads[slot];
@@ -5542,7 +5570,8 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
       left.using_columns == nullptr && right.using_columns == nullptr &&
       right.TotalRows() >= kFlipMinBuildRows &&
       right.TotalRows() > left.TotalRows() * kFlipRatio && !left.HasSpill() &&
-      std::getenv("TINYLAMB_DISABLE_ORDERED_INNER_FLIP") == nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_ORDERED_INNER_FLIP") ==
+          nullptr) {
     const auto predicates = SplitConjuncts(source.join_condition);
     const Schema flip_schema = left.schema + right.schema;
     if (std::ranges::all_of(predicates, [&](const Expression& pred) {
@@ -5652,7 +5681,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
         left.schema.GetColumn(left_columns.front()).IsUnsigned() ==
             right.schema.GetColumn(right_columns.front()).IsUnsigned();
     if (same_single_type) {
-      const EqualityKey key{left_columns.front(), right_columns.front(), false};
+      const EqualityKey key{.left=left_columns.front(), .right=right_columns.front(), .null_safe=false};
       ASSIGN_OR_RETURN(bool, collated,
                        RequiresCollatedJoinComparison(left, right, key));
       if (!collated) {
@@ -5847,7 +5876,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     const bool has_null_safe_key = std::ranges::any_of(
         equality_keys, [](const EqualityKey& key) { return key.null_safe; });
     static const bool flip_disabled =
-        std::getenv("TINYLAMB_DISABLE_JOIN_FLIP") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_JOIN_FLIP") != nullptr;
     const bool flip = !flip_disabled && !has_null_safe_key &&
                       using_residuals.empty() && source.using_columns.empty() &&
                       (source.join_type == JoinType::kFull ||
@@ -5975,7 +6004,8 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     // enough to amortize the threads. Unmatched build rows use private
     // per-worker bitmaps merged after probing.
     static const bool probe_disabled =
-        std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_PROBE") !=
+        nullptr;
     bool can_parallelize =
         !probe_disabled &&
         (residual.empty() || compiled_residuals.has_value()) &&
@@ -6459,7 +6489,7 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
     // probe does not require repartitioning when the smaller build still fits:
     // ForEachRow streams its resident prefix and spill files exactly once.
     static const bool flip_disabled =
-        std::getenv("TINYLAMB_DISABLE_JOIN_FLIP") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_JOIN_FLIP") != nullptr;
     const bool flip = !flip_disabled && !has_null_safe_key &&
                       right.TotalRows() >= kFlipMinBuildRows &&
                       right.TotalRows() > left.TotalRows() * kFlipRatio &&

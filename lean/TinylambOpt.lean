@@ -336,3 +336,56 @@ import TinylambOpt.ResearchGoals.AnalyticsWorkloads.H2o
 import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Ldbc
 import TinylambOpt.ResearchGoals.AnalyticsWorkloads.BigBench
 import TinylambOpt.ResearchGoals.AnalyticsWorkloads.PhysicalChoices
+
+-- 第九波の未証明提出型。
+import TinylambOpt.ResearchGoals.Wave9.AnalyticsRemaining
+import TinylambOpt.ResearchGoals.Wave9.ClickBenchHighCardAndFilter
+import TinylambOpt.ResearchGoals.Wave9.TpcdsMultiChannelAndTpch
+import TinylambOpt.ResearchGoals.Wave9.TpcdsRollupAndSetOps
+
+-- 第九波の証明。
+import TinylambOpt.ResearchProofs.Wave9AnalyticsRemaining
+import TinylambOpt.ResearchProofs.Wave9ClickBenchHighCardAndFilter
+import TinylambOpt.ResearchProofs.Wave9TpcdsMultiChannelAndTpch
+import TinylambOpt.ResearchProofs.Wave9TpcdsRollupAndSetOps
+
+-- 第七波・第八波の提出型に対する証明（反例登録を含む）。
+import TinylambOpt.ResearchProofs.Wave7BinaryText
+import TinylambOpt.ResearchProofs.Wave7CorrelatedProbes
+import TinylambOpt.ResearchProofs.Wave7DeltaMaintenance
+import TinylambOpt.ResearchProofs.Wave7EncodedBlocks
+import TinylambOpt.ResearchProofs.Wave7FrameIndexes
+import TinylambOpt.ResearchProofs.Wave7IndexPreimages
+import TinylambOpt.ResearchProofs.Wave7OrderedStreams
+import TinylambOpt.ResearchProofs.Wave7PairAggregates
+import TinylambOpt.ResearchProofs.Wave7PlaneKernels
+import TinylambOpt.ResearchProofs.Wave7RecursiveJoins
+import TinylambOpt.ResearchProofs.Wave7SearchBounds
+import TinylambOpt.ResearchProofs.Wave7VersionedIndexes
+import TinylambOpt.ResearchProofs.Wave8BigBench
+import TinylambOpt.ResearchProofs.Wave8Ceb
+import TinylambOpt.ResearchProofs.Wave8H2o
+import TinylambOpt.ResearchProofs.Wave8Job
+import TinylambOpt.ResearchProofs.Wave8PhysicalChoices
+
+-- Benchmark-grounded cloud and BI optimization goals (open propositions).
+import TinylambOpt.ResearchGoals.CloudBI.Quotes
+import TinylambOpt.ResearchGoals.CloudBI.NestedBI
+import TinylambOpt.ResearchGoals.CloudBI.DeleteFiles
+import TinylambOpt.ResearchGoals.CloudBI.PublicBI
+
+-- Proofs of the CloudBI research goals.
+import TinylambOpt.ResearchProofs.CloudBI.Common
+import TinylambOpt.ResearchProofs.CloudBI.Quotes
+import TinylambOpt.ResearchProofs.CloudBI.NestedBI
+import TinylambOpt.ResearchProofs.CloudBI.DeleteFiles
+import TinylambOpt.ResearchProofs.CloudBI.PublicBI
+
+-- Open research goals from measured tinylamb/DuckDB query gaps.
+import TinylambOpt.ResearchGoals.DuckDBGaps.Slices
+import TinylambOpt.ResearchGoals.DuckDBGaps.FileMasks
+import TinylambOpt.ResearchGoals.DuckDBGaps.Refresh
+import TinylambOpt.ResearchGoals.DuckDBGaps.Retail
+import TinylambOpt.ResearchGoals.DuckDBGaps.Hits
+import TinylambOpt.ResearchGoals.DuckDBGaps.Orders
+import TinylambOpt.ResearchGoals.DuckDBGaps.BridgeStates

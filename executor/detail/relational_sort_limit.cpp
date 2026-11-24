@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/relational_sort_limit.hpp"
 
 #include <algorithm>
@@ -518,6 +519,7 @@ struct ResolvedOrderByKeys {
   bool all_direct_keys{false};
 };
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): file-local helper.
 static StatusOr<ResolvedOrderByKeys> ResolveOrderByKeys(
     const SelectStatement& statement, const Schema& schema) {
   const std::vector<SelectStatement::OrderByTerm>& order_by =
@@ -591,7 +593,7 @@ StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
                                            const SelectStatement& statement,
                                            Relation* output, const Scope* outer,
                                            const CteMap& ctes) {
-  const char* disable_env = std::getenv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
+  const char* disable_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_DISTINCT_ON_TOP1");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
@@ -647,8 +649,9 @@ StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
     const Row& row = output->rows[ri];
     Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
     for (size_t k = 0; k < resolved.key_expressions.size(); ++k) {
-      if (resolved.direct_key_cols[k].has_value()) {
-        cur_order_keys[k] = row[*resolved.direct_key_cols[k]];
+      const auto direct_key_col = resolved.direct_key_cols[k];
+      if (direct_key_col.has_value()) {
+        cur_order_keys[k] = row[direct_key_col.value()];
       } else {
         ASSIGN_OR_RETURN(Value, kv,
                          (TryEvaluate(resolved.key_expressions[k], scope,
@@ -660,9 +663,10 @@ StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
     cur_distinct_keys.clear();
     cur_distinct_keys.reserve(distinct_on.size());
     for (size_t k = 0; k < distinct_on.size(); ++k) {
-      if (distinct_direct_cols[k].has_value()) {
+      const auto direct_key_col = distinct_direct_cols[k];
+      if (direct_key_col.has_value()) {
         cur_distinct_keys.push_back(
-            CanonicalDistinctValue(row[*distinct_direct_cols[k]]));
+            CanonicalDistinctValue(row[direct_key_col.value()]));
       } else {
         ASSIGN_OR_RETURN(
             Value, dv,
@@ -709,7 +713,8 @@ StatusOr<bool> TryDistinctOnOrderedWinners(TransactionContext& context,
     return a.row_idx < b.row_idx;
   });
 
-  std::vector<Row> old_rows = std::move(output->rows);
+  std::vector<Row> old_rows;
+  old_rows.swap(output->rows);
   output->ResetContents();
   output->rows.reserve(ordered_winners.size());
   for (const Winner& w : ordered_winners) {
@@ -756,9 +761,8 @@ Status ApplyOrderBy(TransactionContext& context,
     bool col_keys_ok = true;
     for (size_t i = 0; i < key_expressions.size(); ++i) {
       if (direct_key_cols[i].has_value()) {
-        // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-        // success
-        col_topn_keys.push_back(ColumnarTopNKey::Direct(*direct_key_cols[i]));
+        col_topn_keys.push_back(
+            ColumnarTopNKey::Direct(direct_key_cols[i].value()));
         continue;
       }
       const Expression& key = key_expressions[i];
@@ -825,6 +829,7 @@ Status ApplyOrderBy(TransactionContext& context,
        QueryMemoryBudget::Global().CanReserve(output->TotalRows() * 160))) {
     RETURN_IF_FAIL(output->EnsureRowsMaterializedChecked());
   }
+  // Lean proof: lean/TinylambOpt/ResearchProofs/SqlFetchWithTies.lean (sound)
   if (allow_bounded && statement.HasLimit() && statement.Limit() == 1 &&
       statement.Offset() == 0 && statement.WithTies() && !output->HasSpill() &&
       !output->HasColumnarOnly() && output->rows.size() > 1 &&
@@ -838,7 +843,7 @@ Status ApplyOrderBy(TransactionContext& context,
       Scope scope{.row = &row, .schema = &output->schema, .outer = outer};
       for (size_t k = 0; k < key_expressions.size(); ++k) {
         if (direct_key_cols[k].has_value()) {
-          cur_keys[k] = row[*direct_key_cols[k]];
+          cur_keys[k] = row[direct_key_cols[k].value()];
           continue;
         }
         ASSIGN_OR_RETURN(
@@ -867,7 +872,8 @@ Status ApplyOrderBy(TransactionContext& context,
         winner_indices.push_back(ri);
       }
     }
-    std::vector<Row> old_rows = std::move(output->rows);
+    std::vector<Row> old_rows;
+    old_rows.swap(output->rows);
     output->ResetContents();
     output->rows.reserve(winner_indices.size());
     for (const size_t wi : winner_indices) {
@@ -895,7 +901,11 @@ Status ApplyOrderBy(TransactionContext& context,
     }
     const std::vector<Row>& rows_ref = output->rows;
     for (size_t k = 0; k < order_specs.size(); ++k) {
-      const size_t col = *direct_key_cols[k];
+      if (!direct_key_cols[k].has_value()) {
+        return StatusError(StatusCode::kRuntimeError,
+                           "direct sort key column is missing");
+      }
+      const size_t col = direct_key_cols[k].value();
       for (const Row& row : rows_ref) {
         RETURN_IF_FAIL(order_specs[k].Observe(row[col]));
       }
@@ -1142,7 +1152,7 @@ Status ApplyOrderBy(TransactionContext& context,
                 entries.begin(),
                 entries.begin() + static_cast<std::ptrdiff_t>(keep),
                 entries.end(), entry_precedes);
-          } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+          } else if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
                      n >= 1024 && exact0) {
             // Lean proof:
             // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
@@ -1194,7 +1204,8 @@ Status ApplyOrderBy(TransactionContext& context,
     } else {
       std::ranges::stable_sort(order, idx_precedes);
     }
-    std::vector<Row> old_rows = std::move(output->rows);
+    std::vector<Row> old_rows;
+    old_rows.swap(output->rows);
     output->ResetContents();
     output->rows.reserve(keep);
     for (size_t i = 0; i < keep; ++i) {

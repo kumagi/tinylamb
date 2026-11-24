@@ -27,6 +27,7 @@
 #include "common/exception_status.hpp"
 #include "common/memory_budget.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 
 namespace tinylamb {
 
@@ -49,9 +50,9 @@ Status PwriteAllFd(int fd, const void* data, size_t len, uint64_t offset) {
       }
       // errno is not guaranteed to be updated when pwrite returns 0
       // (disk full / file-size limit / invalid fd); never print "Success".
-      const std::string reason = n == 0
-                                     ? "no progress (disk full or invalid fd)"
-                                     : std::string(std::strerror(errno));
+      const std::string reason =
+          n == 0 ? "no progress (disk full or invalid fd)"
+                 : std::string(::tinylamb::platform::StrError(errno));
       return StatusError(StatusCode::kIOError, "LSM pwrite failed: " + reason);
     }
     done += static_cast<size_t>(n);
@@ -74,7 +75,8 @@ Status PreadAllFd(int fd, void* dst, size_t len, uint64_t offset) {
       }
       return StatusError(
           StatusCode::kIOError,
-          "LSM pread failed: " + std::string(std::strerror(errno)));
+          "LSM pread failed: " +
+              std::string(::tinylamb::platform::StrError(errno)));
     }
     done += static_cast<size_t>(n);
   }
@@ -854,6 +856,7 @@ Status MergeLsmSourcesToFd(
 
   LsmRunStreamWriter writer(out_fd, out_file_mu, out_append_offset, blocks_out);
 
+  // NOLINTNEXTLINE(bugprone-use-after-move): next_mem_entry overwrites mem_cur.
   auto advance_source = [&](size_t src_id) -> Status {
     if (src_id == mem_source_id) {
       mem_valid = next_mem_entry(&mem_cur);

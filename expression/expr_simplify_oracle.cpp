@@ -1182,8 +1182,7 @@ std::string ConstantSql(const Value& v, GenType type) {
     return text;
   }
   if (v.type == ValueType::kVarChar) {
-    const std::string text =
-        SqlQuoteString(std::string(v.value.varchar_value));
+    std::string text = SqlQuoteString(std::string(v.value.varchar_value));
     const std::string_view collation = CollationName(CollationOf(v));
     if (collation.empty()) {
       return text;

@@ -515,14 +515,17 @@ Status OocSortSink::EnsureSorter(PipelineContext* ctx, size_t payload_cols) {
 
   size_t extra_idx = 0;
   for (size_t i = 0; i < keys_.size(); ++i) {
-    if (direct_slots_[i].has_value() && *direct_slots_[i] >= payload_cols_) {
+    const auto direct_slot = direct_slots_[i];
+    if (direct_slot.has_value() && direct_slot.value() >= payload_cols_) {
       return StatusError(StatusCode::kInvalidArgument,
                          "sort key column slot is out of range");
     }
-    const slot_t sort_slot =
-        direct_slots_[i].has_value()
-            ? *direct_slots_[i]
-            : static_cast<slot_t>(payload_cols_ + extra_idx++);
+    slot_t sort_slot = 0;
+    if (direct_slot.has_value()) {
+      sort_slot = direct_slot.value();
+    } else {
+      sort_slot = static_cast<slot_t>(payload_cols_ + extra_idx++);
+    }
     sorter_keys.push_back(OocSortKey{
         .column_index = sort_slot,
         .ascending = keys_[i].ascending,

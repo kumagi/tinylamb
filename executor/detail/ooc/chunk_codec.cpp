@@ -523,7 +523,7 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
                        "null argument in DecodeDataChunk");
   }
   std::string_view remaining = *src;
-  const Status decoded = DecodeDataChunkPayload(&remaining, chunk_out);
+  Status decoded = DecodeDataChunkPayload(&remaining, chunk_out);
   if (!decoded.ok()) {
     *chunk_out = DataChunk{};
     return decoded;
@@ -536,8 +536,7 @@ Status DecodeDataChunk(std::string_view* src, DataChunk* chunk_out) {
 // process-local temporaries, so format drift cannot mix readers/writers across
 // binaries; corruption relies on the payload decoder's own end checks.
 Status WriteDataChunk(SpillSegmentWriter* writer, const DataChunk& chunk,
-                      std::string* scratch_buffer,
-                      size_t max_frame_bytes) try {
+                      std::string* scratch_buffer, size_t max_frame_bytes) try {
   if (writer == nullptr) {
     return StatusError(StatusCode::kInvalidArgument,
                        "null writer in WriteDataChunk");
@@ -550,8 +549,8 @@ Status WriteDataChunk(SpillSegmentWriter* writer, const DataChunk& chunk,
     return WriteRowRange(writer, chunk, 0, chunk.Size(), max_frame_bytes, buf);
   }
   for (size_t begin = 0; begin < chunk.Size();) {
-    const size_t row_limit = begin + std::min<size_t>(
-                                         kMaxFrameRows, chunk.Size() - begin);
+    const size_t row_limit =
+        begin + std::min<size_t>(kMaxFrameRows, chunk.Size() - begin);
     size_t end = row_limit;
     if (max_frame_bytes != 0) {
       // Pack rows against the estimated size and split again if the encoded
@@ -564,8 +563,7 @@ Status WriteDataChunk(SpillSegmentWriter* writer, const DataChunk& chunk,
         const size_t row_bytes = EstimateEncodedRowBytes(chunk, end);
         // Leave 64B headroom for the frame/column headers; `WriteRowRange`
         // re-verifies the encoded size and re-splits on any misestimate.
-        if (end > begin &&
-            row_bytes > row_budget - std::min(acc, row_budget)) {
+        if (end > begin && row_bytes > row_budget - std::min(acc, row_budget)) {
           break;
         }
         acc += row_bytes;

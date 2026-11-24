@@ -1,5 +1,7 @@
 # tinylamb PostgreSQL MySQL Oracle Free DuckDB 比較ベンチマーク
 
+[CostBench・Snowset/PBench・Iceberg・Public BI の実測比較](reports/cloud-bi/README.md)には、3 エンジンの計測結果、Cloud の公開費用、再現手順を掲載しています。
+
 共通SQLをローカルTCP経由で実行し、OLAP、OLTP、読み書き混在の性能と結果の正しさを比較する。データベース本体の変更は不要。測定値はクライアントでのSQL送信から全結果の取得までを含む。
 
 ## TPC-Cの3製品比較

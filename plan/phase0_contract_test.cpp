@@ -393,9 +393,9 @@ TEST_F(Phase0ContractTest, SqlCascadesAndDirectExecutorShareExpectedRows) {
 // something the test may invent.  Read it and make the executed matrix answer
 // to the document, so dropping a todo or a semantic class from either side is
 // a real failure instead of a tautology.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
-static std::string_view SemanticDocName(Semantic semantic) {
+namespace {
+
+std::string_view SemanticDocName(Semantic semantic) {
   switch (semantic) {
     case Semantic::kSuccess:
       return "success";
@@ -413,9 +413,7 @@ static std::string_view SemanticDocName(Semantic semantic) {
   return {};
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
-static std::string LoadPhase0ManifestDoc() {
+std::string LoadPhase0ManifestDoc() {
   std::error_code ec;
   // The source tree is authoritative: this file lives in <root>/plan/, so
   // look there first (an out-of-tree build directory need not sit under the
@@ -457,9 +455,7 @@ static std::string LoadPhase0ManifestDoc() {
   return {};
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
-static std::optional<size_t> ParseTodoNumber(const std::string& text,
+std::optional<size_t> ParseTodoNumber(const std::string& text,
                                              size_t& pos, size_t limit) {
   while (pos < limit &&
          (std::isdigit(static_cast<unsigned char>(text[pos])) == 0)) {
@@ -482,9 +478,7 @@ struct ManifestClaim {
   std::optional<size_t> last_todo;
 };
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
-static ManifestClaim ParsePhase0Manifest(const std::string& doc) {
+ManifestClaim ParsePhase0Manifest(const std::string& doc) {
   constexpr std::string_view kIntro = "manifest repeats the ";
   constexpr std::string_view kRange = "cases for Phase 0 items ";
   ManifestClaim claim;
@@ -506,6 +500,8 @@ static ManifestClaim ParsePhase0Manifest(const std::string& doc) {
   return claim;
 }
 
+}  // namespace
+
 TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
   constexpr size_t kFirstTodo = 55;
   constexpr size_t kLastTodo = 59;
@@ -516,14 +512,12 @@ TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
   const ManifestClaim claim = ParsePhase0Manifest(doc);
   ASSERT_FALSE(claim.semantic_classes.empty())
       << "Phase 0 manifest sentence not found in docs/cascades_optimizer.md";
-  ASSERT_TRUE(claim.first_todo.has_value());
-  ASSERT_TRUE(claim.last_todo.has_value());
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes
-  // success
-  EXPECT_EQ(claim.first_todo.value(), kFirstTodo);
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)  // test/fuzzer assumes
-  // success
-  EXPECT_EQ(claim.last_todo.value(), kLastTodo);
+  if (!claim.first_todo.has_value() || !claim.last_todo.has_value()) {
+    ADD_FAILURE() << "phase 0 todo range is missing";
+    return;
+  }
+  EXPECT_EQ(*claim.first_todo, kFirstTodo);
+  EXPECT_EQ(*claim.last_todo, kLastTodo);
   // Six classes => five separators in the documented comma-separated list.
   EXPECT_EQ(std::count(claim.semantic_classes.begin(),
                        claim.semantic_classes.end(), ','),

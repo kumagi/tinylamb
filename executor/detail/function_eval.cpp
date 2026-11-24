@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/expression_eval.hpp"
 
 // The regexp_* branches below drive libstdc++'s <regex>, and under
@@ -515,8 +516,7 @@ std::string FormatTimeZoneOffset(int tz_offset_sec) {
 
 void ExpandNumericTimeZone(std::string& format, int offset_seconds) {
   const int64_t wide_seconds = offset_seconds;
-  const int64_t magnitude =
-      wide_seconds < 0 ? -wide_seconds : wide_seconds;
+  const int64_t magnitude = wide_seconds < 0 ? -wide_seconds : wide_seconds;
   const char sign = offset_seconds < 0 ? '-' : '+';
   for (size_t i = format.find('%');
        i != std::string::npos && i + 1 < format.size();
@@ -1302,8 +1302,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     TypeTag common = TypeTag::kInvalid;
     if (name_view == "coalesce") {
       static const Schema empty_schema;
-      const Schema& schema = (scope.schema != nullptr) ? *scope.schema : empty_schema;
-      const Schema* outer = (scope.outer != nullptr) ? scope.outer->schema : nullptr;
+      const Schema& schema =
+          (scope.schema != nullptr) ? *scope.schema : empty_schema;
+      const Schema* outer =
+          (scope.outer != nullptr) ? scope.outer->schema : nullptr;
       ASSIGN_OR_RETURN(TypeTag, resolved, (call.CoalesceType(schema, outer)));
       common = resolved;
     }
@@ -1582,9 +1584,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           yday < first_sunday
               ? 0
               : ((yday -
-                 first_sunday) /  // NOLINT(readability-math-missing-parentheses)
-                        7) +  // NOLINT(readability-math-missing-parentheses)
-                    1;       // NOLINT(readability-math-missing-parentheses)
+                  first_sunday) /  // NOLINT(readability-math-missing-parentheses)
+                 7) +   // NOLINT(readability-math-missing-parentheses)
+                    1;  // NOLINT(readability-math-missing-parentheses)
       return Value(static_cast<int64_t>(week_num));
     }
     if (name_view.starts_with("extract_week(")) {
@@ -1824,9 +1826,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     // No multi-user session layer exists yet; report the OS account, which
     // is the identity a tinylamb server process runs as.
-    const char* os_user = std::getenv("USER");
+    const char* os_user = ::tinylamb::platform::GetEnv("USER");
     if (os_user == nullptr || *os_user == '\0') {
-      os_user = std::getenv("LOGNAME");
+      os_user = ::tinylamb::platform::GetEnv("LOGNAME");
     }
     return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
   }
@@ -3486,7 +3488,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         const auto total_m =
             origin_month +
             (static_cast<platform::Int128>(floor_div(m_diff, step_m)) * step_m);
-        if (total_m < 12 || total_m >= static_cast<platform::Int128>(10000 * 12)) {
+        if (total_m < 12 ||
+            total_m >= static_cast<platform::Int128>(10000 * 12)) {
           return StatusError(StatusCode::kInvalidArgument,
                              name + ": bucket start out of range");
         }
@@ -3648,8 +3651,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             "Failed to parse input string " + Value(std::move(val)).AsString());
       }
       const int w = (10 * (val[0] - '0')) + (val[1] - '0');
-      const int y =
-          val.size() == 3 ? val[2] - '0' : (10 * (val[2] - '0')) + (val[3] - '0');
+      const int y = val.size() == 3 ? val[2] - '0'
+                                    : (10 * (val[2] - '0')) + (val[3] - '0');
       if (w > 53) {
         return StatusError(StatusCode::kIsInfinity,
                            "week out of range in PARSE_DATE: " + val);
@@ -4869,7 +4872,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     elements.reserve(arguments[0].value.varchar_value.size());
     for (const uint32_t cp :
          CodePointsOfBatch(arguments[0].value.varchar_value)) {
-      elements.emplace_back(static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
+      elements.emplace_back(
+          static_cast<int64_t>(cp));  // NOLINT(modernize-use-emplace)
     }
     return Value::Array(std::move(elements), "INT64");
   }
@@ -7314,8 +7318,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     static constexpr std::string_view kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    static constexpr size_t kPadChars[] = {
-        0, 6, 4, 3, 1};  // NOLINT(modernize-avoid-c-arrays)
+    static constexpr std::array<size_t, 5> kPadChars = {0, 6, 4, 3, 1};
     const std::string input = raw_str(arguments[0]);
     std::string out;
     out.reserve((input.size() + 4) / 5 * 8);

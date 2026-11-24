@@ -594,9 +594,10 @@ TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
     ASSERT_EQ(table.Reserve(64), Status::kSuccess);
     const size_t slot_bytes = charge.Bytes();
     for (int64_t i = 0; i < 64; ++i) {
-      const RuntimeKeyCell key[]{{.int_val = i}, {.int_val = i + 1}};
-      const uint64_t hash = GroupKeySliceHasher::HashTyped(key, keys);
-      auto group = table.FindOrInsert(key, hash);
+      const std::array<RuntimeKeyCell, 2> key{{{.int_val = i},
+                                                {.int_val = i + 1}}};
+      const uint64_t hash = GroupKeySliceHasher::HashTyped(key.data(), keys);
+      auto group = table.FindOrInsert(key.data(), hash);
       if (!group.HasValue()) {
         EXPECT_EQ(group.GetStatus(), StatusCode::kMemoryLimitExceeded);
         EXPECT_EQ(table.NumGroups(), static_cast<size_t>(i));
@@ -607,9 +608,10 @@ TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
     EXPECT_GT(table.NumGroups(), 0U);
     EXPECT_LT(table.NumGroups(), 64U);
     EXPECT_GT(charge.Bytes(), slot_bytes);
-    const RuntimeKeyCell first[]{{.int_val = 0}, {.int_val = 1}};
-    auto group =
-        table.FindOrInsert(first, GroupKeySliceHasher::HashTyped(first, keys));
+    const std::array<RuntimeKeyCell, 2> first{{{.int_val = 0},
+                                                {.int_val = 1}}};
+    auto group = table.FindOrInsert(
+        first.data(), GroupKeySliceHasher::HashTyped(first.data(), keys));
     ASSERT_TRUE(group.HasValue());
     EXPECT_EQ(table.AggsAt(group.Value())[0].count, 1);
   }
@@ -812,7 +814,10 @@ TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
         .any_scalar_distinct = true};
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res,
                           TryRunPartitionedColumnarTlcsAggregate(req));
-    ASSERT_TRUE(res.has_value());
+    if (!res.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     if (!res.has_value()) {
       return;
     }
@@ -869,7 +874,10 @@ TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
         .any_scalar_distinct = false};
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res,
                           TryRunPartitionedColumnarTlcsAggregate(req));
-    ASSERT_TRUE(res.has_value());
+    if (!res.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     if (!res.has_value()) {
       return;
     }
@@ -989,7 +997,10 @@ TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res,
                           TryRunPartitionedColumnarTlcsAggregate(req));
     budget.SetTestAlwaysSpill(false);
-    ASSERT_TRUE(res.has_value());
+    if (!res.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     if (res.has_value()) {
       ASSERT_EQ(res->rows.size(), 16U);
       int64_t total = 0;
@@ -1149,7 +1160,10 @@ TEST(ColumnarTlcsFastPathTest, DistinctAggregateSkipsAbsentDictionaryKeys) {
       .any_scalar_distinct = true};
   ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res,
                         TryRunPartitionedColumnarTlcsAggregate(req));
-  ASSERT_TRUE(res.has_value());
+  if (!res.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
   if (!res.has_value()) {
     return;
   }
@@ -1830,7 +1844,10 @@ TEST(ColumnarTlcsFastPathTest,
     TlcsFile::ResetDecodeCallsForTest();
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res_desc,
                           TryRunPartitionedColumnarTlcsAggregate(req));
-    ASSERT_TRUE(res_desc.has_value());
+    if (!res_desc.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     EXPECT_EQ(TlcsFile::DecodeCallsForTest(), 8U + blocks_129.size());
     ASSERT_EQ(res_desc->rows.size(),
               5U);  // NOLINT(bugprone-unchecked-optional-access)
@@ -1908,7 +1925,10 @@ TEST(ColumnarTlcsFastPathTest,
         .any_scalar_distinct = false};
     ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res_asc,
                           TryRunPartitionedColumnarTlcsAggregate(req));
-    ASSERT_TRUE(res_asc.has_value());
+    if (!res_asc.has_value()) {
+      ADD_FAILURE() << "expected optional value";
+      return;
+    }
     ASSERT_EQ(res_asc->rows.size(),
               5U);  // NOLINT(bugprone-unchecked-optional-access)
     for (size_t r = 0; r < 5; ++r) {

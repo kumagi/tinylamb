@@ -30,6 +30,7 @@
 
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -1134,7 +1135,7 @@ TypedAggregationPlan PlanTypedAggregation(
   // Operational escape hatch: TINYLAMB_DISABLE_TYPED_AGG=1 routes every
   // statement back through the generic stream-aggregation loop.
   static const bool typed_agg_disabled =
-      std::getenv("TINYLAMB_DISABLE_TYPED_AGG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TYPED_AGG") != nullptr;
   if (typed_agg_disabled) {
     return plan;
   }
@@ -1200,11 +1201,13 @@ TypedAggregationPlan PlanTypedAggregation(
   }
   // WHERE: every conjunct must compile to context-free bytecode.
   static const bool filter_peek_disabled =
-      std::getenv("TINYLAMB_DISABLE_AGG_FILTER_PEEK") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_AGG_FILTER_PEEK") !=
+      nullptr;
   // A/B hatch: TINYLAMB_DISABLE_TYPED_CONST_PEEK=1 keeps col-vs-constant
   // conjuncts in the bytecode programs (col-vs-col peeling stays on).
   static const bool const_peek_disabled =
-      std::getenv("TINYLAMB_DISABLE_TYPED_CONST_PEEK") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TYPED_CONST_PEEK") !=
+      nullptr;
   // Only a PREFIX of the conjunct list may peel to positional compares: the
   // typed path evaluates conjuncts in order and a raising program aborts the
   // aggregate, so reordering a peel past a raising conjunct could silently
@@ -1500,7 +1503,7 @@ TypedAggregationPlan PlanTypedAggregation(
   // chunked-accumulator layout (MIN/MAX need the extreme Value, DISTINCT
   // needs the set, UINT64 needs the unsigned domain — none are slim).
   static const bool slim_disabled =
-      std::getenv("TINYLAMB_DISABLE_SLIM_AGG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SLIM_AGG") != nullptr;
   plan.slim_kinds.reserve(plan.aggregates.size());
   bool all_slim = !plan.aggregates.empty() && !slim_disabled;
   for (const TypedAggregateInput& input : plan.aggregates) {
@@ -1869,7 +1872,7 @@ bool TryCompilePositionalHavingConjuncts(
 std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
     const std::vector<const SelectStatement*>& sets) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_EXACT_ROLLUP") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_EXACT_ROLLUP") != nullptr;
   if (disabled || sets.size() < 3 || sets.size() > 32 ||
       sets.front() == nullptr) {
     return std::nullopt;
@@ -1932,13 +1935,9 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
       if (e->Type() == TypeTag::kQueryExp) {
         return false;
       }
-      for (const Expression& sub :
-           ExpressionChildren(e)) {  // NOLINT(readability-use-anyofallof)
-        if (self(self, sub)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(ExpressionChildren(e), [&](const Expression& sub) {
+        return self(self, sub);
+      });
     };
     return !has_win(has_win, ch);
   };
@@ -2249,7 +2248,7 @@ bool CanUseExactIntegerGroupingSets(TransactionContext& context,
 GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
     const SelectStatement& statement) {
   GroupedJoinFusionSpec spec;
-  if (std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr) {
     std::cerr << "[fusion] spec: sources=" << statement.Sources().size()
               << " group_by=" << statement.GroupBy().size()
               << " distinct=" << statement.Distinct()
@@ -2257,9 +2256,10 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
               << " order=" << statement.OrderBy().size() << "\n";
   }
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_GROUPED_JOIN_FUSION") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_GROUPED_JOIN_FUSION") !=
+      nullptr;
   static const bool debug_fusion =
-      std::getenv("TINYLAMB_FUSION_DEBUG") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_FUSION_DEBUG") != nullptr;
   const auto bail = [&spec](const char* reason) {
     if (debug_fusion) {
       std::cerr << "[fusion] spec bail: " << reason << "\n";

@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/window_eval.hpp"
 
 #include <algorithm>
@@ -1997,9 +1998,11 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           if (consumed == text.size()) {
             parsed = candidate;
           }
-        } catch (const std::invalid_argument&) {
+        // NOLINTNEXTLINE(bugprone-empty-catch): keep nonnumeric text fallback.
+        } catch (const std::invalid_argument&) {  // NOLINT(bugprone-empty-catch)
           // Nonnumeric text keeps its text sort key.
-        } catch (const std::out_of_range&) {
+        // NOLINTNEXTLINE(bugprone-empty-catch): keep out-of-range text fallback.
+        } catch (const std::out_of_range&) {  // NOLINT(bugprone-empty-catch)
           // An unrepresentable number also keeps its text sort key.
         }
       }
@@ -2828,7 +2831,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
       layout.partitions[entry->second].ordered.push_back(i);
     }
   }
-  if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
+  if (::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr &&
       rows.size() >= 100000) {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - partition_started)
@@ -3773,12 +3776,13 @@ StatusOr<bool> TryComputeColumnPrefixWithSummary(
                                     });
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
 static StatusOr<bool> TryComputeSlidingDistinctRows(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
     std::span<const size_t> ordered, const WindowRuntime& runtime,
     std::vector<Value>* out) {
   const char* disable_env =
-      std::getenv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
@@ -4032,12 +4036,13 @@ static StatusOr<bool> TryComputeSlidingDistinctRows(
 }
 
 // Lean proof: lean/TinylambOpt/ResearchProofs/NthNonNullFrame.lean (sound)
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
 static StatusOr<bool> TryComputeNthNonNullFrame(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
     std::span<const size_t> ordered, const WindowOrderValues& order_values,
     const std::vector<size_t>& peer_end, const std::vector<size_t>& group_ends,
     const WindowRuntime& runtime, std::vector<Value>* out) {
-  const char* disable_env = std::getenv("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME");
+  const char* disable_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
@@ -4146,13 +4151,14 @@ static StatusOr<bool> TryComputeNthNonNullFrame(
 }
 
 // Lean proof: lean/TinylambOpt/ResearchProofs/RangeDistinctIndex.lean (sound)
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
 static StatusOr<bool> TryComputeRangeDistinctIndex(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
     std::span<const size_t> ordered, const WindowOrderValues& order_values,
     const std::vector<size_t>& peer_end, const std::vector<size_t>& group_ends,
     const WindowRuntime& runtime, std::vector<Value>* out) {
   const char* disable_env =
-      std::getenv("TINYLAMB_DISABLE_RANGE_DISTINCT_INDEX");
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RANGE_DISTINCT_INDEX");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
@@ -4992,7 +4998,7 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
 
   std::optional<size_t> rank_bound;
   static const bool rank_bound_disabled =
-      std::getenv("TINYLAMB_DISABLE_RANK_BOUND") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RANK_BOUND") != nullptr;
   if (!rank_bound_disabled && windows.size() == 1 && statement.Qualify()) {
     const auto* window = windows.begin()->first;
     std::unordered_map<std::string, Expression> aliases;
@@ -5038,7 +5044,7 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   // under a deterministic LIMIT/OFFSET, extract only the sorted halo slice
   // `[offset - max_preceding, min(n, offset + limit + max_following))` before
   // running window evaluation.
-  const char* disable_halo_env = std::getenv("TINYLAMB_DISABLE_WINDOW_HALO");
+  const char* disable_halo_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
   if ((disable_halo_env == nullptr || disable_halo_env[0] != '1') &&
       allow_window_halo && !rank_bound && !input.HasSpill() &&
       statement.HasLimit() && statement.Limit() > 0 && !statement.WithTies() &&

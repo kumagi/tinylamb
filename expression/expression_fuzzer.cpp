@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "expression/binary_expression.hpp"
@@ -308,7 +309,8 @@ Expression GenerateExpression(FuzzStream& stream, int depth) {
   if (depth <= 0 || stream.Exhausted()) {
     if (stream.NextBool()) {
       Value v = GenerateValue(stream);
-      if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_VERBOSE") !=
+          nullptr) {
         (void)fprintf(stderr, "  leaf const type=%d val=%s\n",
                       static_cast<int>(v.type), v.AsString().c_str());
       }
@@ -702,7 +704,7 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
     return result;
   }
 
-  if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
     (void)fprintf(stderr, "expr=%s row=%s\n", exp->ToString().c_str(),
                   row.ToString().c_str());
   }
@@ -735,7 +737,8 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
       bc_result = out.ValueAt(0);
     } catch (const std::exception& e) {
       bc_threw = true;
-      if (getenv("TINYLAMB_EXPR_FUZZ_VERBOSE") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_VERBOSE") !=
+          nullptr) {
         (void)fprintf(stderr, "bc throw reason: %s\n", e.what());
       }
     } catch (...) {
@@ -755,7 +758,8 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
         ((ast_threw != bc_threw) &&
          ContainsStaticallyMismatchedComparison(exp, schema));
     if (ast_threw != bc_threw && !fold_tolerated) {
-      if (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr) {
+      if (::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_PASSES") !=
+          nullptr) {
         const ExpressionRewriter pr(ExpressionRuleSet::Default());
         Expression cur = exp;
         for (int pass = 0; pass < 6 && cur; ++pass) {
@@ -803,12 +807,13 @@ ExpressionFuzzResult ExpressionFuzzRun(const uint8_t* data, size_t size) {
           static_cast<int>(ContainsNeutralArithmetic(exp)),
           exp->ToString().c_str(), fold_dump.c_str());
     }
-    FUZZ_REQUIRE(ast_threw == bc_threw ||
-                 fold_tolerated);  // NOLINT(readability-simplify-boolean-expr):
-                                   // FUZZ_REQUIRE negates its condition
+    // NOLINTBEGIN(readability-simplify-boolean-expr): retain macro's positive condition.
+    FUZZ_REQUIRE(ast_threw == bc_threw || fold_tolerated);
+    // NOLINTEND(readability-simplify-boolean-expr)
     if (!ast_threw && !bc_threw && !ValuesMatch(ast_result, bc_result) &&
         !PinnedIdentityPromotion(exp, ast_result, bc_result) &&
-        (getenv("TINYLAMB_EXPR_FUZZ_PASSES") != nullptr)) {
+        (::tinylamb::platform::GetEnv("TINYLAMB_EXPR_FUZZ_PASSES") !=
+         nullptr)) {
       const ExpressionRewriter pr(ExpressionRuleSet::Default());
       Expression cur = exp;
       for (int pass = 0; pass < 6 && cur; ++pass) {
@@ -984,9 +989,8 @@ StatusOr<std::vector<uint8_t>> DecodeExpressionFuzzRepro(
 void WriteExpressionFuzzRepro(const uint8_t* data, size_t size) {
   const std::string path =
       "expression_fuzzer_fuzz-repro-" + Fnv1aHex(data, size) + ".test";
-  std::FILE* file = std::fopen(
-      path.c_str(),
-      "wb");  // NOLINT(cppcoreguidelines-owning-memory): closed below
+  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): closed below.
+  std::FILE* file = std::fopen(path.c_str(), "wb");
   if (file == nullptr) {
     return;
   }

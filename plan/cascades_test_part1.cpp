@@ -532,8 +532,11 @@ TEST(CascadesTest, OrderingPenaltyUsesSelectiveJoinOutput) {
                                             {.plan = sorted, .local_cost = 1000,
                                              .estimated_rows = 10}};
       }, RuleContext{});
-  ASSERT_TRUE(best.has_value());
-  EXPECT_EQ(best->plan, source);
+  if (!best.has_value()) {
+    ADD_FAILURE() << "optimizer produced no best plan";
+    return;
+  }
+  EXPECT_EQ(best.value().plan, source);
 }
 
 TEST(CascadesTest, ProvidedSortPropertiesRequireMatchingNullPlacement) {

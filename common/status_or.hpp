@@ -136,6 +136,8 @@ inline void StatusOrAssertEq(const A& a, const B& b, const char* lhs,
 template <typename T>
 class StatusOr {
  public:
+  ~StatusOr() = default;
+
   // Constructors are intentionally implicit!
   StatusOr(Status s) : status_(s), value_(std::nullopt) {}            // NOLINT
   StatusOr(StatusCode code) : status_(code), value_(std::nullopt) {}  // NOLINT

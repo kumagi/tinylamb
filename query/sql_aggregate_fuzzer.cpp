@@ -1164,11 +1164,15 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         // aggregated argument, so DISTINCT orders by the value itself.
         const std::string order_key =
             aa.distinct ? ColName(aa.col) : std::string("u");
-        aa.sql =
-            base + " ORDER BY " + order_key + (aa.order_desc ? " DESC" : "") +
-            (aa.inner_limit != 0 ? " LIMIT " + std::to_string(aa.inner_limit)
-                                 : "") +
-            ")";
+        aa.sql = base;
+        aa.sql += " ORDER BY ";
+        aa.sql += order_key;
+        aa.sql += aa.order_desc ? " DESC" : "";
+        if (aa.inner_limit != 0) {
+          aa.sql += " LIMIT ";
+          aa.sql += std::to_string(aa.inner_limit);
+        }
+        aa.sql += ")";
         aggs.push_back(std::move(aa));
       }
       if (g.Chance(30)) {
@@ -2036,7 +2040,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
            std::string(pre.GetMessage()) + "\n";
   }
   ctx = db.BeginContext();
-  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   const int num_passes = large ? 2 : 4;
   for (int pass = 0; pass < num_passes; ++pass) {
@@ -2281,7 +2285,7 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       !rep.empty()) {
     return rep;
   }
-  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
   // Restore on every exit path (including exceptions) so the override cannot

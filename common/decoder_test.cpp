@@ -46,12 +46,15 @@ inline void CountAllocationIfActive() {
 
 }  // namespace
 
-// The replaceable global allocation functions delegate to malloc/free.
-// Replace the allocation and deallocation paths together to preserve pairing.
+// NOLINTBEGIN(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+// This test executable replaces the global allocation pair to count
+// allocations. The replaceable global allocation functions delegate to
+// malloc/free. Replace the allocation and deallocation paths together to
+// preserve pairing.
 void* operator new(std::size_t n) {
   CountAllocationIfActive();
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-  // raw-buffer codec test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // global operator new.
   void* p = std::malloc(n == 0 ? 1 : n);
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
   if (p == nullptr) {
@@ -61,8 +64,8 @@ void* operator new(std::size_t n) {
 }
 void* operator new[](std::size_t n) {
   CountAllocationIfActive();
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-  // raw-buffer codec test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // global operator new[].
   void* p = std::malloc(n == 0 ? 1 : n);
   if (p == nullptr) {
     // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
@@ -79,7 +82,8 @@ void* operator new(std::size_t n, std::align_val_t a) {
     throw std::bad_alloc();
   }
   size = (size + align - 1) & ~(align - 1);
-  // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)  // raw-buffer codec test
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // aligned operator new.
   void* p = std::aligned_alloc(align, size);
   if (p == nullptr) {
     throw std::bad_alloc();
@@ -89,54 +93,60 @@ void* operator new(std::size_t n, std::align_val_t a) {
 void* operator new[](std::size_t n, std::align_val_t a) {
   return operator new(n, a);
 }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
-void operator delete(void* p) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
-void operator delete[](void* p) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
-void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
+void operator delete(void* p) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // paired global delete.
+  std::free(p);
+}
+void operator delete[](void* p) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // paired global delete[].
+  std::free(p);
+}
+void operator delete(void* p, std::size_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // sized global delete.
+  std::free(p);
+}
 void operator delete[](void* p, std::size_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // sized global delete[].
   std::free(p);
 }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
 void operator delete(void* p, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // aligned global delete.
   std::free(p);
 }
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-// NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-// intentional in this code
 void operator delete[](void* p, std::align_val_t /*unused*/) noexcept {
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // aligned global delete[].
   std::free(p);
 }
 void operator delete(void* p, std::size_t /*unused*/,
                      std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-  // intentional in this code
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // aligned sized delete.
   std::free(p);
 }
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 void operator delete[](void* p, std::size_t /*unused*/,
                        std::align_val_t /*unused*/) noexcept {
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
-  // intentional in this code
+  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory):
+  // aligned sized delete[].
   std::free(p);
-  // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 }
+// NOLINTEND(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
 
 namespace tinylamb {
 
 // NOLINTNEXTLINE(cppcoreguidelines-no-malloc) raw-buffer test
 namespace {
 
-class ScopedAllocationCount {
+class
+    ScopedAllocationCount {  // NOLINT(cppcoreguidelines-special-member-functions):
+                             // scope-owned cleanup.
+
  public:
   ScopedAllocationCount() {
     g_alloc_count.store(0, std::memory_order_relaxed);
@@ -205,7 +215,8 @@ TEST(DecoderTest, TryEncodeChecksStringLengthWithoutTruncation) {
   ASSERT_TRUE(decoded.HasValue());
   EXPECT_EQ(decoded.Value(), supported);
   const std::string oversized(limit + 1, 'a');
-  EXPECT_EQ(TryEncode(oversized).GetStatus().GetCode(), StatusCode::kTooBigData);
+  EXPECT_EQ(TryEncode(oversized).GetStatus().GetCode(),
+            StatusCode::kTooBigData);
 }
 
 TEST(DecoderTest, EncodedVectorLengthMatchesDecoderLimit) {

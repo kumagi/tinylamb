@@ -210,7 +210,7 @@ TEST(FlatIntSetAuditTest, WideDenseMembershipKeepsHolesAndSignedEndpoints) {
           base + i * 1000));  // NOLINT(readability-math-missing-parentheses)
       if (i != span / 1000) {
         EXPECT_FALSE(
-            set.Contains(base + i * 1000 +
+            set.Contains(base + (i * 1000) +
                          1));  // NOLINT(readability-math-missing-parentheses)
       }
     }
@@ -237,7 +237,10 @@ TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
     const auto expression =
         BinaryExpressionExp(ColumnValueExp("d"), op, ConstantValueExp(literal));
     const auto compiled = TryCompileSimpleCompare(expression, schema);
-    ASSERT_TRUE(compiled.has_value()) << "date comparison did not compile";
+    if (!compiled.has_value()) {
+      ADD_FAILURE() << "date comparison did not compile";
+      return;
+    }
     EXPECT_TRUE(compiled->date_string_payload);
     EXPECT_EQ(compiled->constant, literal);
     for (const Value& value :
@@ -245,7 +248,10 @@ TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
           Value("2000-06-30"), Value("2001-01-01")}) {
       const Row row({value});
       auto expected = expression->TryEvaluate(row, schema);
-      ASSERT_TRUE(expected.HasValue());
+      if (!expected.HasValue()) {
+        ADD_FAILURE() << "expected value";
+        return;
+      }
       EXPECT_EQ(MatchSimpleCompare(row, *compiled), expected.Value().Truthy());
     }
   }
@@ -308,7 +314,10 @@ TEST(ScanFilterTest, FastLikeMatchAsciiAndWildcards) {
 TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
   const Expression true_const = ConstantValueExp(Value(true));
   auto decided_true = TryDecideConstantConjunct(true_const);
-  ASSERT_TRUE(decided_true.has_value());
+  if (!decided_true.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!decided_true.has_value()) {
     return;
   }
@@ -318,7 +327,10 @@ TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
       BinaryExpressionExp(ConstantValueExp(Value(10)), BinaryOperation::kEquals,
                           ConstantValueExp(Value(20)));
   auto decided_false = TryDecideConstantConjunct(false_math);
-  ASSERT_TRUE(decided_false.has_value());
+  if (!decided_false.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!decided_false.has_value()) {
     return;
   }
@@ -408,7 +420,10 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       ConstantValueExp(Value(42)));
   EXPECT_TRUE(IsNonThrowingScanComparison(eq_int, schema));
   auto compiled_int = TryCompileSimpleCompare(eq_int, schema);
-  ASSERT_TRUE(compiled_int.has_value());
+  if (!compiled_int.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!compiled_int.has_value()) {
     return;
   }
@@ -428,7 +443,10 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       ConstantValueExp(Value(10.0)), BinaryOperation::kLessThan,
       ColumnValueExp(ColumnName("price")));
   auto compiled_dbl = TryCompileSimpleCompare(lt_double, schema);
-  ASSERT_TRUE(compiled_dbl.has_value());
+  if (!compiled_dbl.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!compiled_dbl.has_value()) {
     return;
   }
@@ -445,7 +463,10 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       ColumnValueExp(ColumnName("id")), BinaryOperation::kLessThan,
       ColumnValueExp(ColumnName("alt_id")));
   auto compiled_col = TryCompileSimpleCompare(col_vs_col, schema);
-  ASSERT_TRUE(compiled_col.has_value());
+  if (!compiled_col.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!compiled_col.has_value()) {
     return;
   }
@@ -473,20 +494,29 @@ TEST(ScanFilterTest, CoalesceComparisonDropsOnlyRejectingFallbacks) {
                                     ? BinaryExpressionExp(zero, op, coalesce)
                                     : BinaryExpressionExp(coalesce, op, zero);
         auto missing = expression->TryEvaluate(Row({Value()}), schema);
-        ASSERT_TRUE(missing.HasValue());
+        if (!missing.HasValue()) {
+          ADD_FAILURE() << "expected value";
+          return;
+        }
         const auto compiled = TryCompileSimpleCompare(expression, schema);
         if (!missing.Value().IsNull() && missing.Value().Truthy()) {
           EXPECT_FALSE(compiled.has_value());
           continue;
         }
-        ASSERT_TRUE(compiled.has_value()) << expression->ToString();
+        if (!compiled.has_value()) {
+          ADD_FAILURE() << expression->ToString();
+          return;
+        }
         if (!compiled.has_value()) {
           continue;
         }
         for (const auto& value : {Value(), Value(-2), Value(0), Value(2)}) {
           const Row row({value});
           auto expected = expression->TryEvaluate(row, schema);
-          ASSERT_TRUE(expected.HasValue());
+          if (!expected.HasValue()) {
+            ADD_FAILURE() << "expected value";
+            return;
+          }
           EXPECT_EQ(MatchSimpleCompare(row, *compiled),
                     !expected.Value().IsNull() && expected.Value().Truthy());
         }
@@ -511,7 +541,10 @@ TEST(ScanFilterTest, TryCompileAndMatchPrefixIn) {
                                            ConstantValueExp(Value("23"))});
 
   auto prefix_in = TryCompilePrefixIn(in_expr, schema);
-  ASSERT_TRUE(prefix_in.has_value());
+  if (!prefix_in.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   if (!prefix_in.has_value()) {
     return;
   }
@@ -629,7 +662,10 @@ TEST(ScanFilterTest, EvaluateConjunctsTolerantSuppressesSiblingErrorsOnReject) {
   // Error + FALSE -> FALSE suppresses the error.
   StatusOr<bool> suppressed =
       EvaluateConjunctsTolerant({error_expr, reject_expr}, eval);
-  ASSERT_TRUE(suppressed.HasValue());
+  if (!suppressed.HasValue()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
   EXPECT_FALSE(suppressed.Value());
 
   // Error + TRUE -> error surfaces.
@@ -724,7 +760,10 @@ TEST(ScanFilterTest, SingletonInUsesComparisonWithCanonicalNullSemantics) {
       for (const Value& probe : {Value(), member, other}) {
         const Row row({probe});
         auto canonical = predicate->TryEvaluate(row, schema);
-        ASSERT_TRUE(canonical.HasValue());
+        if (!canonical.HasValue()) {
+          ADD_FAILURE() << "expected value";
+          return;
+        }
         EXPECT_EQ(MatchSimpleCompare(row, filter.simple.front()),
                   !canonical.Value().IsNull() && canonical.Value().Truthy());
       }
@@ -745,10 +784,14 @@ TEST(ScanFilterTest,
       BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("2000-01-01")));
   const auto compiled = TryCompileSimpleCompare(expression, schema);
-  ASSERT_TRUE(compiled.has_value());
-  ASSERT_TRUE(
-      compiled
-          ->date_string_payload);  // NOLINT(bugprone-unchecked-optional-access)
+  if (!compiled.has_value()) {
+    ADD_FAILURE() << "expected value";
+    return;
+  }
+  if (!compiled->date_string_payload) {
+    ADD_FAILURE() << "date comparison did not retain its string payload";
+    return;
+  }
   // A parameter rebind can replace the parsed literal with an unparsable
   // string after compilation; the failed coercion must surface as an error,
   // not a clean per-row reject.

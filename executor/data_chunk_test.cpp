@@ -730,12 +730,14 @@ TEST(DataChunkTest, ZoneMapStringExtremesStayCorrectUnderBufferReuse) {
   map.AddString("zz");
   map.AddString(long_hi);
   map.AddString("cc");
-  ASSERT_TRUE(map.Minimum().has_value());
-  ASSERT_TRUE(map.Maximum().has_value());
-  EXPECT_EQ(map.Minimum()->value.varchar_value,
-            "aa");  // NOLINT(bugprone-unchecked-optional-access)
-  EXPECT_EQ(map.Maximum()->value.varchar_value,
-            long_hi);  // NOLINT(bugprone-unchecked-optional-access)
+  const auto minimum = map.Minimum();
+  const auto maximum = map.Maximum();
+  if (!minimum.has_value() || !maximum.has_value()) {
+    ADD_FAILURE() << "string min/max were not computed";
+    return;
+  }
+  EXPECT_EQ(minimum->value.varchar_value, "aa");
+  EXPECT_EQ(maximum->value.varchar_value, long_hi);
   EXPECT_EQ(map.ValueCount(), 6U);
 }
 

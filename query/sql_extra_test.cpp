@@ -812,7 +812,11 @@ class WindowEvalDirectTest : public ::testing::Test {
                         *context_, statement, std::move(input), nullptr, {})
                         .MoveValue();
     std::vector<Row> out;
-    windowed.input.ForEachRow([&](const Row& row) { out.push_back(row); });
+    const Status row_status =
+        windowed.input.ForEachRow([&](const Row& row) { out.push_back(row); });
+    if (row_status != Status::kSuccess) {
+      throw std::runtime_error(row_status.GetMessage());
+    }
     return out;
   }
 
@@ -1117,10 +1121,14 @@ TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
 }
 
 TEST_F(AggregateHavingTest, MergeResolvesBothTableAliases) {
-  RunSql(engine_.get(), context_.get(), "CREATE TABLE merge_target(k INT64, v INT64)");
-  RunSql(engine_.get(), context_.get(), "CREATE TABLE merge_source(k INT64, v INT64)");
-  RunSql(engine_.get(), context_.get(), "INSERT INTO merge_target VALUES (1, 10)");
-  RunSql(engine_.get(), context_.get(), "INSERT INTO merge_source VALUES (1, 100), (2, 200)");
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE merge_target(k INT64, v INT64)");
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE merge_source(k INT64, v INT64)");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO merge_target VALUES (1, 10)");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO merge_source VALUES (1, 100), (2, 200)");
   const auto merged = RunSql(
       engine_.get(), context_.get(),
       "MERGE INTO merge_target AS t USING merge_source AS s ON t.k = s.k "
@@ -1130,7 +1138,7 @@ TEST_F(AggregateHavingTest, MergeResolvesBothTableAliases) {
   const auto rows = RunSql(engine_.get(), context_.get(),
                            "SELECT k, v FROM merge_target ORDER BY k");
   EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1), Value(110)}),
-                                   Row({Value(2), Value(200)})}));
+                                    Row({Value(2), Value(200)})}));
 }
 
 TEST_F(AggregateHavingTest, TimedOutEagerMergeCannotBeCommitted) {
@@ -1139,16 +1147,18 @@ TEST_F(AggregateHavingTest, TimedOutEagerMergeCannotBeCommitted) {
   // 1 ms must elapse during Prepare for the cancel to fire deterministically;
   // 2048 rows could plan under the deadline on fast machines, so size the
   // source so the eager merge cannot finish inside it.
-  RunSql(engine_.get(), context_.get(),
-         "INSERT INTO timeout_source SELECT value FROM GENERATE_SERIES(1, 65536)");
+  RunSql(
+      engine_.get(), context_.get(),
+      "INSERT INTO timeout_source SELECT value FROM GENERATE_SERIES(1, 65536)");
   ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
 
   auto timed = database_->BeginContext();
   timed.txn_.SetStatementTimeout(std::chrono::milliseconds(1));
   const auto prepared = engine_->Prepare(
-      timed, "MERGE INTO timeout_target USING timeout_source "
-             "ON timeout_target.k = timeout_source.k "
-             "WHEN NOT MATCHED THEN INSERT (k) VALUES (timeout_source.k)");
+      timed,
+      "MERGE INTO timeout_target USING timeout_source "
+      "ON timeout_target.k = timeout_source.k "
+      "WHEN NOT MATCHED THEN INSERT (k) VALUES (timeout_source.k)");
   ASSERT_EQ(prepared.GetStatus().GetCode(), StatusCode::kQueryCanceled)
       << engine_->LastError();
   EXPECT_GT(timed.txn_.WriteEpoch(), 0U);
@@ -1156,8 +1166,9 @@ TEST_F(AggregateHavingTest, TimedOutEagerMergeCannotBeCommitted) {
   EXPECT_NE(timed.PreCommit(), Status::kSuccess);
 
   auto reader = database_->BeginReadOnlyContext();
-  EXPECT_EQ(RunSql(engine_.get(), &reader, "SELECT COUNT(*) FROM timeout_target"),
-            (std::vector<Row>{Row({Value(0)})}));
+  EXPECT_EQ(
+      RunSql(engine_.get(), &reader, "SELECT COUNT(*) FROM timeout_target"),
+      (std::vector<Row>{Row({Value(0)})}));
 }
 
 // P440: EXPLAIN [ANALYZE] returns from Prepare without the

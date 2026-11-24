@@ -109,7 +109,8 @@ class ErrorExpression final : public ExpressionBase {
 TEST(BandJoinTest, RefusesOverBudgetMaterializationAndReleasesCharge) {
   auto& budget = QueryMemoryBudget::Global();
   const auto prior = budget.Limit();
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     size_t limit;
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore{prior};

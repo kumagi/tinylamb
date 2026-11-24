@@ -41,6 +41,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
+
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -73,7 +75,7 @@ constexpr page_id_t kDefaultFunctionRoot = 3;
 namespace {
 
 bool AutoTlcsEnabled() noexcept {
-  const char* env = std::getenv("TINYLAMB_AUTO_TLCS");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_AUTO_TLCS");
   if (env == nullptr || *env == '\0') {
     return true;
   }
@@ -92,8 +94,8 @@ bool AutoTlcsEnabled() noexcept {
 // non-glibc builds replace malloc entirely and ignore mallopt.
 struct MallocTuning {
   MallocTuning() {
-    mallopt(M_MMAP_THRESHOLD, 512 << 20);
-    mallopt(M_TRIM_THRESHOLD, 512 << 20);
+    mallopt(M_MMAP_THRESHOLD, 512 << 20);  // NOLINT(concurrency-mt-unsafe)
+    mallopt(M_TRIM_THRESHOLD, 512 << 20);  // NOLINT(concurrency-mt-unsafe)
   }
 };
 // Intentional static-initializer side effect: applies the heap tuning
@@ -1293,10 +1295,9 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
   // function.
   std::scoped_lock lock(catalog_mu_);
   std::string canonical_name(function_name);
-  std::transform(canonical_name.begin(), canonical_name.end(),
-                 canonical_name.begin(), [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
+  std::transform(
+      canonical_name.begin(), canonical_name.end(), canonical_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   StatusOr<std::string> val = functions_.Read(ctx.txn_, canonical_name);
   if (val.GetStatus() == Status::kNotExists) {
     for (BPlusTreeIterator iter = functions_.Begin(ctx.txn_); iter.IsValid();
@@ -1336,26 +1337,32 @@ StatusOr<Function> Database::GetOrAddFunction(TransactionContext& ctx,
 StatusOr<std::string> Database::ReadTableCatalogEntry(TransactionContext& ctx,
                                                       std::string_view name) {
   auto result = catalog_.ReadVisible(ctx.txn_, name);
-  if (result.HasValue() || result.GetStatus() != Status::kNotExists) { return result;
-}
+  if (result.HasValue() || result.GetStatus() != Status::kNotExists) {
+    return result;
+  }
   for (auto iter = catalog_.Begin(ctx.txn_); iter.IsValid(); ++iter) {
     const std::string& candidate = iter.Key();
     if (candidate.size() == name.size() &&
-        std::equal(candidate.begin(), candidate.end(), name.begin(), [](char a, char b) {
-          return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
-        })) {
+        std::equal(candidate.begin(), candidate.end(), name.begin(),
+                   [](char a, char b) {
+                     return std::tolower(static_cast<unsigned char>(a)) ==
+                            std::tolower(static_cast<unsigned char>(b));
+                   })) {
       return catalog_.ReadVisible(ctx.txn_, candidate);
     }
   }
   return Status::kNotExists;
 }
 
-StatusOr<bool> Database::TableExists(TransactionContext& ctx, std::string_view name) {
+StatusOr<bool> Database::TableExists(TransactionContext& ctx,
+                                     std::string_view name) {
   const auto entry = ReadTableCatalogEntry(ctx, name);
-  if (entry.HasValue()) { return true;
-}
-  if (entry.GetStatus() == Status::kNotExists) { return false;
-}
+  if (entry.HasValue()) {
+    return true;
+  }
+  if (entry.GetStatus() == Status::kNotExists) {
+    return false;
+  }
   return entry.GetStatus();
 }
 
@@ -1380,8 +1387,9 @@ StatusOr<Table> Database::GetTable(TransactionContext& ctx,
   };
   ASSIGN_OR_RETURN(std::string, entry, ReadTableCatalogEntry(ctx, schema_name));
   Table table;
-  if (!Deserialize(entry, &table)) { return Status::kCorrupt;
-}
+  if (!Deserialize(entry, &table)) {
+    return Status::kCorrupt;
+  }
   bind_incarnation(table);
   return table;
 }
@@ -1560,9 +1568,11 @@ Database::~Database() {
 void Database::EmulateCrash() { storage_->DiscardAllUpdates(); }
 
 StatusOr<lsn_t> Database::WriteCheckpoint(bool allow_auto_compaction) {
-  if (allow_auto_compaction && AutoTlcsEnabled() && storage_ != nullptr && storage_->pm_ != nullptr &&
+  if (allow_auto_compaction && AutoTlcsEnabled() && storage_ != nullptr &&
+      storage_->pm_ != nullptr &&
       !auto_tlcs_in_progress_.exchange(true, std::memory_order_acq_rel)) {
-    struct ResetGuard {
+    struct ResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                         // scope-owned cleanup.
       std::atomic<bool>& flag;
       ~ResetGuard() { flag.store(false, std::memory_order_release); }
     } guard{auto_tlcs_in_progress_};
@@ -2054,7 +2064,8 @@ bool Database::TryAutoCompactTable(TransactionContext& ctx,
 
 bool Database::AutoCompactTableForAnalyze(TransactionContext& ctx,
                                           std::string_view schema_name) {
-  const char* analyze_tlcs = std::getenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+  const char* analyze_tlcs =
+      ::tinylamb::platform::GetEnv("TINYLAMB_ANALYZE_AUTO_TLCS");
   if (analyze_tlcs == nullptr || analyze_tlcs[0] == '\0' ||
       analyze_tlcs[0] == '0') {
     return false;
@@ -2161,9 +2172,7 @@ void RemoveCompanionStorageFiles(const std::string& db_file_path) {
 }
 }  // namespace
 
-void Database::RemoveCreatedDatabaseFiles() {
-  RemoveCreatedDatabaseFiles({});
-}
+void Database::RemoveCreatedDatabaseFiles() { RemoveCreatedDatabaseFiles({}); }
 
 void Database::RemoveCreatedDatabaseFiles(
     const std::unordered_set<std::string>& preserve_bases) {

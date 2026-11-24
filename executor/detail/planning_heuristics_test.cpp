@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "executor/detail/columnar_table.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
@@ -184,10 +185,10 @@ TEST(PlanningHeuristicsTest, BuildAndProbeUseTheSameSamplingTarget) {
       ColumnValueExp(ColumnName("many", "k")), BinaryOperation::kEquals,
       ColumnValueExp(ColumnName("one", "k")));
 
-  const char* legacy = std::getenv("TINYLAMB_LEGACY_ESTIMATE");
+  const char* legacy = ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_ESTIMATE");
   const std::string_view value = legacy != nullptr ? legacy : "";
   const bool sampling_disabled =
-      std::getenv("TINYLAMB_LEGACY_PLANNER") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_LEGACY_PLANNER") != nullptr;
   const bool legacy_target = !value.empty() && value != "0" && value != "false";
   const size_t expected = sampling_disabled || legacy_target ? 1500U : 3000U;
   EXPECT_EQ(EstimateJoinRows(alternating, single, {predicate}), expected);
@@ -278,11 +279,12 @@ TEST(PlanningHeuristicsTest, HybridHashJoinResidentCapHonorsUnlimitedBudget) {
   const size_t prev_limit = budget.Limit();
   // Any ASSERT below returns early; restore the global budget on every exit
   // path so a failure cannot leave later tests isolated from the process.
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     QueryMemoryBudget& budget;
     size_t limit;
     ~RestoreBudget() { budget.ResetForTest(limit); }
-  } restore{.budget=budget, .limit=prev_limit};
+  } restore{.budget = budget, .limit = prev_limit};
   budget.ResetForTest(0, /*isolate_from_process=*/true);
   ASSERT_TRUE(budget.Unlimited());
 

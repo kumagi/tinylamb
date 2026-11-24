@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
@@ -37,11 +38,11 @@ namespace {
 
 bool TryShape(const Schema& sc, const StrCase& c, uint8_t shape,
               PaxChunk* out) {
-  setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", c.name, 1);
   PaxChunk chunk =
       PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRowsForScheme(shape, c.expected), sc), sc)
           .MoveValue();
-  unsetenv("TINYLAMB_FORCE_SCHEME");
+  ::tinylamb::platform::UnsetEnv("TINYLAMB_FORCE_SCHEME");
   const auto& enc = chunk.GetFooter().encodings;
   if (enc.size() > c.col && enc[c.col] == static_cast<uint8_t>(c.expected)) {
     *out = std::move(chunk);

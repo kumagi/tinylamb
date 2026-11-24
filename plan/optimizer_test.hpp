@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <random>
 #include <sstream>
 #include <string>
@@ -184,7 +185,7 @@ class OptimizerTest : public ::testing::Test {
     // a rewrite failure explicitly. Otherwise an Optimizer that tolerates the
     // un-rewritten QueryData would keep every DumpAll smoke test green even
     // when name resolution regressed.
-    const Status rewrite_status = qd_resolved.Rewrite(ctx);
+    Status rewrite_status = qd_resolved.Rewrite(ctx);
     if (rewrite_status != Status::kSuccess) {
       return rewrite_status;
     }
@@ -210,6 +211,9 @@ class OptimizerTest : public ::testing::Test {
 // gtest ASSERT_TRUE cannot be used in a non-void helper. value() keeps the
 // failure explicit in every build mode instead of relying on debug-only assert.
 inline const LookupSeek& SeekOf(const std::optional<LookupSeek>& probe) {
+  if (!probe.has_value()) {
+    throw std::logic_error("expected a lookup seek");
+  }
   return probe.value();
 }
 
@@ -282,7 +286,7 @@ inline std::vector<int64_t> RunTopNOneToOneJoin(Database* db, bool disable_rule,
   query.order_ascending_.push_back(true);
   query.limit_count_ = 5;
   TransactionContext context = db->BeginContext();
-  const Status rewrite_status = query.Rewrite(context);
+  Status rewrite_status = query.Rewrite(context);
   EXPECT_EQ(rewrite_status, Status::kSuccess);
   if (rewrite_status != Status::kSuccess) {
     return {};

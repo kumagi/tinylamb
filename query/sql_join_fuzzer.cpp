@@ -196,6 +196,7 @@ constexpr const char* kDimDdl = "CREATE TABLE dim (k INT64, tag VARCHAR(8));";
 }  // namespace
 
 // Setup failures must be findings in both generation and replay.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): fuzz helper is file-local.
 static std::string RunJoinSetup(SqlEngine& engine, TransactionContext& ctx,
                                 const std::vector<std::string>& setup) {
   for (const std::string& sql : setup) {
@@ -210,8 +211,7 @@ static std::string RunJoinSetup(SqlEngine& engine, TransactionContext& ctx,
       return "[JOIN FUZZ SETUP ERROR] " + sql +
              ": stream exception: " + std::string(e.what());
     } catch (...) {
-      return "[JOIN FUZZ SETUP ERROR] " + sql +
-             ": stream exception: unknown";
+      return "[JOIN FUZZ SETUP ERROR] " + sql + ": stream exception: unknown";
     }
     if (result.Value().GetStatus() != Status::kSuccess) {
       return "[JOIN FUZZ SETUP ERROR] " + sql + ": " +
@@ -296,9 +296,10 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
-  const std::string setup_error = RunJoinSetup(engine, ctx, t.setup);
-  if (!setup_error.empty()) { return setup_error;
-}
+  std::string setup_error = RunJoinSetup(engine, ctx, t.setup);
+  if (!setup_error.empty()) {
+    return setup_error;
+  }
   ctx = db.BeginContext();
 
   const int query_count = large ? g.Pick(1, 2) : g.Pick(2, 5);
@@ -1401,8 +1402,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
                      db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
       !ApplyIndexSpec(db, ctx,
                       "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);")) {
-    return std::string(
-        "[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");  // NOLINT(modernize-return-braced-init-list)
+    return {"[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n"};
   }
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     // Statistics collection is part of the indexed-mode setup: a silent
@@ -1431,7 +1431,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
            pre.GetMessage() + "\n";
   }
   ctx = db.BeginContext();
-  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   const int num_modes = large ? 3 : 4;
   for (const QueryExpect& qe : t.queries) {
@@ -1519,9 +1520,10 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
   Database& db = *db_owner;
   TransactionContext ctx = db.BeginContext();
   SqlEngine engine(db);
-  const std::string setup_error = RunJoinSetup(engine, ctx, trace.setup);
-  if (!setup_error.empty()) { return setup_error;
-}
+  std::string setup_error = RunJoinSetup(engine, ctx, trace.setup);
+  if (!setup_error.empty()) {
+    return setup_error;
+  }
   ctx = db.BeginContext();
   auto check_queries = [&](bool force_relational,
                            const char* tag) -> std::string {
@@ -1578,8 +1580,7 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
                        "CREATE UNIQUE INDEX idx_fact_u ON fact(u);")) ||
       !ApplyIndexSpec(db, ctx,
                       "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);")) {
-    return std::string(
-        "[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n");
+    return {"[JOIN-INDEXED SETUP FAILED] could not create secondary indexes\n"};
   }
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     // Statistics collection is part of the indexed-mode setup: a silent
@@ -1616,7 +1617,8 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
       !rep.empty()) {
     return rep;
   }
-  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
   std::string rep = check_queries(false, "[JOIN-CASCADES REPLAY MISMATCH]");

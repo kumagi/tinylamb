@@ -121,16 +121,15 @@ TEST(RegexGuardCompileTest, OneCacheMissPreservesOtherPrograms) {
   };
   const int before = compiles;
   for (int i = 0; i < 9; ++i) {
-    ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
-                    "cache-capacity-" + std::to_string(run) + "-" +
-                    std::to_string(i))
-                    .HasValue());
+    ASSERT_TRUE(
+        regex_guard_detail::CompileCheckedPattern<transform>(
+            "cache-capacity-" + std::to_string(run) + "-" + std::to_string(i))
+            .HasValue());
   }
   ASSERT_EQ(compiles, before + 9);
-  ASSERT_TRUE(
-      regex_guard_detail::CompileCheckedPattern<transform>(
-          "cache-capacity-" + std::to_string(run) + "-1")
-          .HasValue());
+  ASSERT_TRUE(regex_guard_detail::CompileCheckedPattern<transform>(
+                  "cache-capacity-" + std::to_string(run) + "-1")
+                  .HasValue());
   EXPECT_EQ(compiles, before + 9);
 }
 
@@ -321,7 +320,8 @@ TEST(RegexGuardTest, LargeReplacementTemplateCachedUnderBudget) {
 }
 
 TEST(RegexGuardTest, CheckedRegexContainsMatchesReferenceAcrossPatterns) {
-  struct FastRegexGuard {
+  struct FastRegexGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                           // scope-owned cleanup.
     ~FastRegexGuard() { SetFastRegexDisabledForTest(false); }
   } guard;
 

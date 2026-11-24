@@ -2197,8 +2197,7 @@ void PurgeUdfSessionDefinitions(uint64_t session_id) {
 // WITH clause, the set-operation wrapper and the nested-WITH wrapper: all
 // three build a recursive CTE but only the first used to carry the spec,
 // silently dropping the depth bounds and DEPTH column on those root shapes.
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared only within this TU.
 static Status ApplyRecursiveDepthFromAliased(SelectStatement* statement,
                                              const GoogleSqlAstNode& aliased,
                                              const std::string& cte_name) {
@@ -4179,8 +4178,7 @@ Status ValidateSelectAsProjections(
 
 using ViewRegistryMap = std::unordered_map<std::string, StoredViewDefinition>;
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace) static internal linkage is
-// intentional
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared only within this TU.
 static std::unordered_map<uint64_t, ViewRegistryMap>& AllViewRegistries() {
   static thread_local std::unordered_map<uint64_t, ViewRegistryMap> registries;
   return registries;

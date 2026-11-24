@@ -42,7 +42,7 @@ class Gen {
 
 struct ScopedEnv {
   ScopedEnv(const char* name, const char* value) : name_(name) {
-    if (const char* prev = std::getenv(name)) {
+    if (const char* prev = ::tinylamb::platform::GetEnv(name)) {
       had_ = true;
       prev_ = prev;
     }
@@ -611,7 +611,7 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
   bool skipped = false;
-  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  std::string report = ReplayDiffOracleTrace(t, false, &skipped);
   if (skipped) {
     // No database: nothing ran, so no query may be counted as agreed.
     ++out->skipped;
@@ -675,7 +675,7 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
                           "SELECT COUNT(*) FROM " + tab + " WHERE " + pred +
                           ";");
   bool skipped = false;
-  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  std::string report = ReplayDiffOracleTrace(t, false, &skipped);
   if (skipped) {
     // No database: no subset relation was evaluated on either side.
     if (stats != nullptr) {
@@ -688,8 +688,6 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
         t.subset_and.size() + t.subset_or.size() + t.subset_dis.size() +
         t.subset_eq.size() + t.subset_card.size());
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
-  // type
   return report;
 }
 
@@ -727,7 +725,7 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
   bool skipped = false;
-  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  std::string report = ReplayDiffOracleTrace(t, false, &skipped);
   if (skipped) {
     // No database: nothing ran, so neither the report nor the re-count pass
     // below may claim the query set executed.
@@ -747,8 +745,6 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
       }
     }
   }
-  // NOLINTNEXTLINE(performance-no-automatic-move) move not beneficial for this
-  // type
   return report;
 }
 
@@ -789,7 +785,7 @@ std::string RunRadarIteration(std::mt19937& rng, bool /*verbose*/,
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
   bool skipped = false;
-  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  std::string report = ReplayDiffOracleTrace(t, false, &skipped);
   if (skipped) {
     // The radar arm needs two databases; without them neither side ran.
     ++out->skipped;

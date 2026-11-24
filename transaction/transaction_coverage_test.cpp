@@ -666,7 +666,7 @@ TEST_F(TransactionCoverageTest, SnapshotSeesRowVisibleValueAndTombstone) {
     Transaction reader = tm_->Begin(true);
     // A visible deletion is a row that cannot be seen.
     EXPECT_FALSE(reader.SnapshotSeesRow(rp));
-    reader.PreCommit();
+    EXPECT_EQ(tinylamb::Status::kSuccess, reader.PreCommit());
   }
 }
 
@@ -729,7 +729,7 @@ TEST_F(TransactionCoverageTest,
   EXPECT_TRUE(tm_->DebugDumpVersionChains(pid).empty());
 
   Transaction t = tm_->Begin();
-  tm_->ReserveIndexUndoBytes(t, pid, 64);
+  ASSERT_SUCCESS(tm_->ReserveIndexUndoBytes(t, pid, 64));
   const std::string dump = tm_->DebugDumpIndexReservations(pid);
   EXPECT_NE(dump.find("txn"), std::string::npos);
   EXPECT_NE(dump.find(":64"), std::string::npos);
@@ -845,7 +845,7 @@ TEST_F(TransactionCoverageTest, MetricsCountersObserveIntentAndCommitPath) {
   EXPECT_GE(stats.write_intent_attempts, 1U);
   EXPECT_GE(stats.write_intent_conflicts, 1U);
   EXPECT_GE(stats.wal_wait_count, 1U);
-  contender.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, contender.Abort());
 }
 
 TEST_F(TransactionCoverageTest, CommitWaitReturnsOnceRecordsAreFlushed) {
@@ -1022,7 +1022,7 @@ TEST_F(TransactionCoverageTest, WaitDieOlderWaitsThenProceedsWhenHolderAborts) {
     // The older transaction is allowed to wait for the younger holder.
     acquired = older.AddWriteSet(rp);
   });
-  younger.Abort();
+  EXPECT_EQ(tinylamb::Status::kSuccess, younger.Abort());
   waiter.join();
   EXPECT_TRUE(acquired.load());
   ASSERT_EQ(tm_->Abort(older), Status::kSuccess);
@@ -1167,17 +1167,17 @@ namespace {
 class WaitLimitEnv {
  public:
   WaitLimitEnv(const char* name, const std::string& value) : name_(name) {
-    const char* old = std::getenv(name);
+    const char* old = ::tinylamb::platform::GetEnv(name);
     if (old != nullptr) {
       old_ = old;
     }
-    setenv(name, value.c_str(), 1);
+    ::tinylamb::platform::SetEnv(name, value.c_str(), 1);
   }
   ~WaitLimitEnv() {
     if (old_.has_value()) {
-      setenv(name_, old_->c_str(), 1);
+      ::tinylamb::platform::SetEnv(name_, old_->c_str(), 1);
     } else {
-      unsetenv(name_);
+      ::tinylamb::platform::UnsetEnv(name_);
     }
   }
   WaitLimitEnv(const WaitLimitEnv&) = delete;
@@ -1227,7 +1227,7 @@ TEST_F(TransactionCoverageTest, IndexReservationDrainSemantics) {
                 waiter.ID(), std::chrono::milliseconds(50)),
             Status::kSuccess);
 
-  tm_->ReserveIndexUndoBytes(holder, kPage, 128);
+  ASSERT_SUCCESS(tm_->ReserveIndexUndoBytes(holder, kPage, 128));
   // A foreign reservation past the deadline is an honest give-up.
   EXPECT_EQ(tm_->WaitForAllIndexReservationsDrain(
                 waiter.ID(), std::chrono::milliseconds(40)),
@@ -1242,7 +1242,7 @@ TEST_F(TransactionCoverageTest, IndexReservationDrainSemantics) {
   // the holder runs ForgetTransaction, which drops its reservations.
   std::thread releaser([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    static_cast<void>(holder.Abort());
+    EXPECT_EQ(tinylamb::Status::kSuccess, holder.Abort());
   });
   EXPECT_EQ(tm_->WaitForAllIndexReservationsDrain(waiter.ID(),
                                                   std::chrono::seconds(5)),
@@ -1250,7 +1250,7 @@ TEST_F(TransactionCoverageTest, IndexReservationDrainSemantics) {
   releaser.join();
   EXPECT_FALSE(waiter.IsFailed());
 
-  static_cast<void>(waiter.PreCommit());
+  EXPECT_EQ(tinylamb::Status::kSuccess, waiter.PreCommit());
 }
 
 TEST_F(TransactionCoverageTest, DeadlockDetectGrantsAfterHolderMovesOn) {

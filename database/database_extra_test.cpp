@@ -63,8 +63,8 @@ TEST(TableIncarnationTest, UnknownOwnerCannotReleaseLastLease) {
 }
 
 TEST(TableIncarnationTest, UnrepresentableWaitSettingUsesDefaultTimeout) {
-  constexpr char kTimeout[] = "TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS";
-  const char* old = std::getenv(kTimeout);
+  constexpr const char* kTimeout = "TINYLAMB_DDL_QUIESCENCE_TIMEOUT_MS";
+  const char* old = ::tinylamb::platform::GetEnv(kTimeout);
   const std::optional<std::string> saved =
       old == nullptr ? std::nullopt : std::optional<std::string>(old);
   const UnwindGuard restore([&] {
@@ -480,13 +480,14 @@ TEST_F(DatabaseExtraTest,
   struct AnalyzeTlcsEnvGuard {
     std::optional<std::string> prev;
     explicit AnalyzeTlcsEnvGuard(const char* value) {
-      if (const char* cur = std::getenv("TINYLAMB_ANALYZE_AUTO_TLCS")) {
+      if (const char* cur =
+              ::tinylamb::platform::GetEnv("TINYLAMB_ANALYZE_AUTO_TLCS")) {
         prev = cur;
       }
       if (value != nullptr) {
-        setenv("TINYLAMB_ANALYZE_AUTO_TLCS", value, 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_ANALYZE_AUTO_TLCS", value, 1);
       } else {
-        unsetenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_ANALYZE_AUTO_TLCS");
       }
     }
     AnalyzeTlcsEnvGuard(const AnalyzeTlcsEnvGuard&) = delete;
@@ -495,9 +496,10 @@ TEST_F(DatabaseExtraTest,
     AnalyzeTlcsEnvGuard& operator=(AnalyzeTlcsEnvGuard&&) = delete;
     ~AnalyzeTlcsEnvGuard() {
       if (prev.has_value()) {
-        setenv("TINYLAMB_ANALYZE_AUTO_TLCS", prev->c_str(), 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_ANALYZE_AUTO_TLCS",
+                                     prev->c_str(), 1);
       } else {
-        unsetenv("TINYLAMB_ANALYZE_AUTO_TLCS");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_ANALYZE_AUTO_TLCS");
       }
     }
   };

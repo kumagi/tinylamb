@@ -957,11 +957,10 @@ StatusOr<std::optional<Relation>> TryComputeFlatColumnarWindows(
           spec.frame_mode == PrefixFrameMode::kRows ||
           (spec.prefix_op != PrefixOp::kSum &&
            spec.prefix_op != PrefixOp::kAvg &&
-           spec.prefix_op != PrefixOp::kCount)) {
-        can_dense_part_agg = false;
-      } else if (spec.prefix_op != PrefixOp::kCount &&
-                 spec.arg_type != ValueType::kDouble &&
-                 spec.arg_type != ValueType::kInt64) {
+           spec.prefix_op != PrefixOp::kCount) ||
+          (spec.prefix_op != PrefixOp::kCount &&
+           spec.arg_type != ValueType::kDouble &&
+           spec.arg_type != ValueType::kInt64)) {
         can_dense_part_agg = false;
       }
     }

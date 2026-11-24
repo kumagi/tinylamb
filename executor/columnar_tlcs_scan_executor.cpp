@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/columnar_tlcs_scan_executor.hpp"
 
 #include <algorithm>
@@ -1267,7 +1268,7 @@ bool TryBuildDirectColumnarScanSpec(
     const std::vector<OocSortSink::KeySpec>& sort_keys, bool has_limit,
     size_t limit, size_t offset, size_t visible_columns,
     DirectColumnarScanSpec* out) {
-  static const bool dbg = std::getenv("TINYLAMB_DEBUG_TLCS") != nullptr;
+  static const bool dbg = ::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_TLCS") != nullptr;
   auto dbg_bail = [&](const char* why) -> bool {
     if (dbg) {
       (void)std::fprintf(stderr, "[TLCS-SCAN-BAIL] %s\n", why);

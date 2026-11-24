@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -259,7 +260,7 @@ inline bool MergeAggSlot(AggSlotState* dst, const AggSlotState& src,
       return false;
     }
     if (src.numeric_mode == 1) {
-      const __int128 sc = static_cast<__int128>(scale);
+      const auto sc = static_cast<__int128>(scale);
       dst->sum_i128 += src.sum_i128 * sc;
       dst->pos_i128 += src.pos_i128 * sc;
       dst->neg_i128 += src.neg_i128 * sc;
@@ -500,7 +501,9 @@ inline bool ReadIntKeyFromEntry(const ColumnarChunk* chunk, const Row* row,
                                 int64_t* out, bool* invalid_cell) noexcept {
   if (row != nullptr) {
     const Value& v = (*row)[col];
-    if (v.IsNull()) return false;
+    if (v.IsNull()) {
+      return false;
+    }
     if (v.type != expected_type || v.IsUnsigned() || v.IsInterval()) {
       *invalid_cell = true;
       return false;
@@ -515,7 +518,9 @@ inline bool ReadIntKeyFromEntry(const ColumnarChunk* chunk, const Row* row,
   }
   Value tmp;
   cc.WriteValueInto(r, &tmp);
-  if (tmp.IsNull()) return false;
+  if (tmp.IsNull()) {
+    return false;
+  }
   if (tmp.type != expected_type || tmp.IsUnsigned() || tmp.IsInterval()) {
     *invalid_cell = true;
     return false;
@@ -524,13 +529,152 @@ inline bool ReadIntKeyFromEntry(const ColumnarChunk* chunk, const Row* row,
   return true;
 }
 
+struct DecodedIntColumnView {
+  const int64_t* values{nullptr};
+  const uint8_t* nulls{nullptr};
+  bool all_null{false};
+  bool is_const{false};
+  int64_t const_val{0};
+  bool ok{false};
+};
+
+inline DecodedIntColumnView DecodeIntColumnChunk(
+    const ColumnarColumn& cc, size_t n_rows, ValueType expected_type,
+    std::vector<int64_t>* val_scratch,
+    std::vector<uint8_t>* null_scratch) noexcept {
+  DecodedIntColumnView view;
+  if (!cc.is_uniform || cc.is_unsigned || cc.is_interval ||
+      cc.type != expected_type) {
+    return view;
+  }
+  switch (cc.encoding) {
+    case ColumnarColumn::Encoding::kFlat:
+      if (cc.ints.size() < n_rows) {
+        return view;
+      }
+      view.values = cc.ints.data();
+      view.nulls = (cc.has_null && cc.nulls.size() >= n_rows) ? cc.nulls.data()
+                                                              : nullptr;
+      view.ok = true;
+      return view;
+    case ColumnarColumn::Encoding::kConstant:
+      view.all_null = cc.const_is_null;
+      view.is_const = true;
+      view.const_val = cc.const_int;
+      view.ok = true;
+      return view;
+    case ColumnarColumn::Encoding::kFrameOfReference: {
+      const uint8_t* nulls = (cc.has_null && cc.borrowed_nulls != nullptr)
+                                 ? cc.borrowed_nulls
+                                 : nullptr;
+      if (cc.for_width == 0) {
+        if (nulls == nullptr) {
+          view.is_const = true;
+          view.const_val = cc.for_base;
+          view.ok = true;
+          return view;
+        }
+        val_scratch->assign(n_rows, cc.for_base);
+        view.values = val_scratch->data();
+        view.nulls = nulls;
+        view.ok = true;
+        return view;
+      }
+      if (cc.for_bytes == nullptr) {
+        return view;
+      }
+      val_scratch->resize(n_rows);
+      int64_t* dst = val_scratch->data();
+      const uint64_t base = static_cast<uint64_t>(cc.for_base);
+      const uint8_t* src = cc.for_bytes;
+      switch (cc.for_width) {
+        case 1:
+          for (size_t r = 0; r < n_rows; ++r) {
+            dst[r] = static_cast<int64_t>(base + src[r]);
+          }
+          break;
+        case 2:
+          for (size_t r = 0; r < n_rows; ++r) {
+            uint16_t v = 0;
+            std::memcpy(&v, src + (r * sizeof(v)), sizeof(v));
+            dst[r] = static_cast<int64_t>(base + v);
+          }
+          break;
+        case 4:
+          for (size_t r = 0; r < n_rows; ++r) {
+            uint32_t v = 0;
+            std::memcpy(&v, src + (r * sizeof(v)), sizeof(v));
+            dst[r] = static_cast<int64_t>(base + v);
+          }
+          break;
+        case 8:
+          std::memcpy(dst, src, n_rows * sizeof(int64_t));
+          break;
+        default:
+          return view;
+      }
+      view.values = dst;
+      view.nulls = nulls;
+      view.ok = true;
+      return view;
+    }
+    case ColumnarColumn::Encoding::kDictionary: {
+      if (cc.dict == nullptr) {
+        return view;
+      }
+      val_scratch->resize(n_rows);
+      int64_t* dst = val_scratch->data();
+      if (!cc.has_null && cc.borrowed_dict_u8 != nullptr &&
+          cc.borrowed_count >= n_rows) {
+        const uint8_t* codes = cc.borrowed_dict_u8;
+        for (size_t r = 0; r < n_rows; ++r) {
+          dst[r] = cc.dict->IntEntryAt(codes[r]);
+        }
+        view.values = dst;
+        view.ok = true;
+        return view;
+      }
+      if (!cc.has_null && cc.dict_codes.size() >= n_rows) {
+        const uint32_t* codes = cc.dict_codes.data();
+        for (size_t r = 0; r < n_rows; ++r) {
+          dst[r] = cc.dict->IntEntryAt(codes[r]);
+        }
+        view.values = dst;
+        view.ok = true;
+        return view;
+      }
+      null_scratch->assign(n_rows, 0);
+      uint8_t* ndst = null_scratch->data();
+      bool any_null = false;
+      for (size_t r = 0; r < n_rows; ++r) {
+        const uint32_t code = cc.CheckedDictCodeAt(r);
+        if (code == ColumnarColumn::kNullDictCode) {
+          ndst[r] = 1;
+          any_null = true;
+        } else {
+          dst[r] = cc.dict->IntEntryAt(code);
+        }
+      }
+      view.values = dst;
+      view.nulls = any_null ? ndst : nullptr;
+      view.ok = true;
+      return view;
+    }
+    case ColumnarColumn::Encoding::kGathered:
+    default:
+      return view;
+  }
+}
+
 inline bool ReadStringKeyFromEntry(const ColumnarChunk* chunk, const Row* row,
                                    size_t r, slot_t col, std::string_view* out,
                                    Value* owned_tmp,
                                    bool* invalid_cell) noexcept {
   if (row != nullptr) {
     const Value& v = (*row)[col];
-    if (v.IsNull()) return false;
+    if (v.IsNull()) {
+      return false;
+    }
     if (v.type != ValueType::kVarChar || v.IsCaseInsensitive() ||
         v.IsInterval()) {
       *invalid_cell = true;
@@ -549,7 +693,9 @@ inline bool ReadStringKeyFromEntry(const ColumnarChunk* chunk, const Row* row,
     }
   }
   cc.WriteValueInto(r, owned_tmp);
-  if (owned_tmp->IsNull()) return false;
+  if (owned_tmp->IsNull()) {
+    return false;
+  }
   if (owned_tmp->type != ValueType::kVarChar ||
       owned_tmp->IsCaseInsensitive() || owned_tmp->IsInterval()) {
     *invalid_cell = true;
@@ -593,12 +739,10 @@ bool AllNonAggColumnsAllowed(
     }
     return allowed_pred(col);
   }
-  for (const Expression& child : ExpressionChildren(expr)) {
-    if (!AllNonAggColumnsAllowed(child, allowed_pred)) {
-      return false;
-    }
-  }
-  return true;
+  return std::ranges::all_of(
+      ExpressionChildren(expr), [&](const Expression& child) {
+        return AllNonAggColumnsAllowed(child, allowed_pred);
+      });
 }
 
 bool HasSingleEquiKeyCompatible(const Column& lc, const Column& rc) noexcept {
@@ -625,28 +769,29 @@ std::string EncodeKeyTuple(const std::vector<Value>& vals) {
     switch (v.type) {
       case ValueType::kInt64:
       case ValueType::kDate: {
-        const uint64_t u = static_cast<uint64_t>(v.value.int_value);
+        const auto u = static_cast<uint64_t>(v.value.int_value);
         out.append(reinterpret_cast<const char*>(&u), sizeof(u));
         break;
       }
       case ValueType::kDouble: {
         double d = v.value.double_value;
-        if (d == 0.0) d = 0.0;  // normalize -0.0 == +0.0
+        if (d == 0.0) {
+          d = 0.0;  // normalize -0.0 == +0.0
+        }
         uint64_t u = 0;
         std::memcpy(&u, &d, sizeof(u));
         out.append(reinterpret_cast<const char*>(&u), sizeof(u));
         break;
       }
       case ValueType::kVarChar: {
-        const uint32_t len =
-            static_cast<uint32_t>(v.value.varchar_value.size());
+        const auto len = static_cast<uint32_t>(v.value.varchar_value.size());
         out.append(reinterpret_cast<const char*>(&len), sizeof(len));
         out.append(v.value.varchar_value);
         break;
       }
       default: {
         const std::string s = v.AsString();
-        const uint32_t len = static_cast<uint32_t>(s.size());
+        const auto len = static_cast<uint32_t>(s.size());
         out.append(reinterpret_cast<const char*>(&len), sizeof(len));
         out.append(s);
         break;
@@ -810,7 +955,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     const std::vector<BytecodeProgram>& child_programs, const Scope* outer,
     const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_COLLAPSED_RIGHT_JOIN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COLLAPSED_RIGHT_JOIN") !=
+      nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || !residuals.empty() ||
       left.HasSpill() || right.HasSpill() || left.using_columns != nullptr ||
@@ -868,9 +1014,13 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
 
   const Relation& probe_rel = probe_is_left ? left : right;
   const Relation& build_rel = probe_is_left ? right : left;
-  const slot_t probe_key_col =
+  if (probe_rel.TotalRows() > 4000000 ||
+      (probe_rel.TotalRows() > 1000000 && fusion->group_keys.size() > 1)) {
+    return std::optional<Relation>{};
+  }
+  const auto probe_key_col =
       static_cast<slot_t>(probe_is_left ? eq.left : eq.right);
-  const slot_t build_key_col =
+  const auto build_key_col =
       static_cast<slot_t>(probe_is_left ? eq.right : eq.left);
 
   // Classify aggregates and check side isolation.
@@ -948,11 +1098,13 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     if (!off.has_value()) {
       return false;
     }
-    const size_t co = static_cast<size_t>(*off);
+    const auto co = static_cast<size_t>(*off);
     const bool on_left = co < left_width;
     if (on_left == probe_is_left) {
       return std::ranges::any_of(fusion->group_keys, [&](const Expression& gk) {
-        if (!gk || gk->Type() != TypeTag::kColumnValue) return false;
+        if (!gk || gk->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
         return LocalColumnOffset(combined_schema,
                                  gk->AsColumnValue().GetColumnName()) ==
                static_cast<int>(co);
@@ -963,7 +1115,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       const size_t probe_eq_combined =
           probe_is_left ? eq.left : (left_width + eq.right);
       return std::ranges::any_of(fusion->group_keys, [&](const Expression& gk) {
-        if (!gk || gk->Type() != TypeTag::kColumnValue) return false;
+        if (!gk || gk->Type() != TypeTag::kColumnValue) {
+          return false;
+        }
         return LocalColumnOffset(combined_schema,
                                  gk->AsColumnValue().GetColumnName()) ==
                static_cast<int>(probe_eq_combined);
@@ -1058,8 +1212,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                                std::string_view skey) -> bool {
     if (is_int_join_key) {
       if (use_dense_int) {
-        const size_t off = static_cast<size_t>(
-            static_cast<uint64_t>(*ikey) - static_cast<uint64_t>(dense_min));
+        const auto off = static_cast<size_t>(static_cast<uint64_t>(*ikey) -
+                                             static_cast<uint64_t>(dense_min));
         uint32_t& ref = dense_slots[off];
         if (ref == kAbsentSlot) {
           ref = static_cast<uint32_t>(collapsed_cnt.size());
@@ -1125,7 +1279,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       use_pack7_str = false;
       str_key_to_slot.reserve(pack7_key_to_slot.size() + 64);
       for (const auto& [word, sid] : pack7_key_to_slot) {
-        const size_t len = static_cast<size_t>(word & 0xFFU);
+        const auto len = static_cast<size_t>(word & 0xFFU);
         std::string tmp(len, '\0');
         for (size_t i = 0; i < len; ++i) {
           tmp[i] = static_cast<char>((word >> ((7U - i) * 8U)) & 0xFFU);
@@ -1153,65 +1307,65 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   Value build_key_owned_tmp;
   bool build_invalid = false;
   Status build_status = Status::kSuccess;
-  ForEachRelationEntry(
-      build_rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
-        uint32_t sid = kAbsentSlot;
-        if (is_int_join_key) {
-          int64_t kv = 0;
-          if (!ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
-                                   &build_invalid)) {
-            return !build_invalid;
+  ForEachRelationEntry(build_rel, [&](const ColumnarChunk* chunk, const Row* r,
+                                      size_t ri) {
+    uint32_t sid = kAbsentSlot;
+    if (is_int_join_key) {
+      int64_t kv = 0;
+      if (!ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
+                               &build_invalid)) {
+        return !build_invalid;
+      }
+      get_or_alloc_slot(&sid, &kv, {});
+    } else {
+      std::string_view sv;
+      if (!ReadStringKeyFromEntry(chunk, r, ri, build_key_col, &sv,
+                                  &build_key_owned_tmp, &build_invalid)) {
+        return !build_invalid;
+      }
+      get_or_alloc_slot(&sid, nullptr, sv);
+    }
+    ++collapsed_cnt[sid];
+    if (n_build_aggs > 0) {
+      const size_t offset = probe_is_left ? left_width : 0;
+      for (size_t ba = 0; ba < n_build_aggs; ++ba) {
+        const slot_t ai = build_agg_indices[ba];
+        if (agg_direct_col[ai]) {
+          if (!AddEntryCellWithWeight(
+                  &collapsed_aggs[(sid * n_build_aggs) + ba], agg_kinds[ai],
+                  chunk, r, ri, agg_local_col[ai], 1)) {
+            build_invalid = true;
+            return false;
           }
-          get_or_alloc_slot(&sid, &kv, {});
         } else {
-          std::string_view sv;
-          if (!ReadStringKeyFromEntry(chunk, r, ri, build_key_col, &sv,
-                                      &build_key_owned_tmp, &build_invalid)) {
-            return !build_invalid;
-          }
-          get_or_alloc_slot(&sid, nullptr, sv);
-        }
-        ++collapsed_cnt[sid];
-        if (n_build_aggs > 0) {
-          const size_t offset = probe_is_left ? left_width : 0;
-          for (size_t ba = 0; ba < n_build_aggs; ++ba) {
-            const slot_t ai = build_agg_indices[ba];
-            if (agg_direct_col[ai]) {
-              if (!AddEntryCellWithWeight(
-                      &collapsed_aggs[sid * n_build_aggs + ba], agg_kinds[ai],
-                      chunk, r, ri, agg_local_col[ai], 1)) {
-                build_invalid = true;
-                return false;
-              }
-            } else {
-              if (r != nullptr) {
-                for (size_t c = 0; c < r->Count(); ++c) {
-                  build_eval_scratch.values_[offset + c] = (*r)[c];
-                }
-              } else {
-                for (size_t c = 0; c < build_rel.schema.ColumnCount(); ++c) {
-                  chunk->columns[c].WriteValueInto(
-                      ri, &build_eval_scratch.values_[offset + c]);
-                }
-              }
-              StatusOr<Value> eval_or =
-                  child_programs[ai].TryEvaluateRow(build_eval_scratch);
-              if (!eval_or.HasValue()) {
-                build_status = eval_or.GetStatus();
-                build_invalid = true;
-                return false;
-              }
-              Value val = eval_or.MoveValue();
-              if (!AddValueWithWeight(&collapsed_aggs[sid * n_build_aggs + ba],
-                                      agg_kinds[ai], val, 1)) {
-                build_invalid = true;
-                return false;
-              }
+          if (r != nullptr) {
+            for (size_t c = 0; c < r->Count(); ++c) {
+              build_eval_scratch.values_[offset + c] = (*r)[c];
+            }
+          } else {
+            for (size_t c = 0; c < build_rel.schema.ColumnCount(); ++c) {
+              chunk->columns[c].WriteValueInto(
+                  ri, &build_eval_scratch.values_[offset + c]);
             }
           }
+          StatusOr<Value> eval_or =
+              child_programs[ai].TryEvaluateRow(build_eval_scratch);
+          if (!eval_or.HasValue()) {
+            build_status = eval_or.GetStatus();
+            build_invalid = true;
+            return false;
+          }
+          Value val = eval_or.MoveValue();
+          if (!AddValueWithWeight(&collapsed_aggs[(sid * n_build_aggs) + ba],
+                                  agg_kinds[ai], val, 1)) {
+            build_invalid = true;
+            return false;
+          }
         }
-        return true;
-      });
+      }
+    }
+    return true;
+  });
   RETURN_IF_FAIL(build_status);
   if (build_invalid) {
     return std::optional<Relation>{};
@@ -1267,7 +1421,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       bool inv = false;
       if (!ReadIntKeyFromEntry(chunk, probe_row, r_idx, probe_key_col, key_type,
                                &kv, &inv)) {
-        if (inv) *out_invalid = true;
+        if (inv) {
+          *out_invalid = true;
+        }
         return false;
       }
       *matched_int_out = kv;
@@ -1292,7 +1448,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     bool inv = false;
     if (!ReadStringKeyFromEntry(chunk, probe_row, r_idx, probe_key_col, &sv,
                                 probe_key_tmp, &inv)) {
-      if (inv) *out_invalid = true;
+      if (inv) {
+        *out_invalid = true;
+      }
       return false;
     }
     *matched_str_out = sv;
@@ -1629,7 +1787,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
     bool any_scalar = false;
     std::vector<AggSlotState> merged_scalar(n_aggs);
     for (const WorkerLocal& wl : locals) {
-      if (!wl.has_scalar) continue;
+      if (!wl.has_scalar) {
+        continue;
+      }
       any_scalar = true;
       for (size_t ai = 0; ai < n_aggs; ++ai) {
         if (!MergeAggSlot(&merged_scalar[ai], wl.scalar_aggs[ai], agg_kinds[ai],
@@ -1707,13 +1867,23 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   return std::optional<Relation>(result_or.MoveValue());
 }
 
+// Lean proofs:
+//   -
+//   lean/TinylambOpt/ResearchProofs/BushyJoinAssociativityWithDeadKeyPrune.lean
+//     (sound)
+//   - lean/TinylambOpt/ResearchProofs/StarHubMultiwayWeightedProduct.lean
+//     (sound)
+//   - lean/TinylambOpt/ResearchProofs/Wave9AnalyticsRemaining.lean
+//     (SelfJoinBridgeBipartiteWeights_sound,
+//      FilteredSemiJoinCountBeforeGroup_sound)
 StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     TransactionContext& context, const std::vector<Relation>& relations,
     const std::vector<uint8_t>& absorbed,
     const std::vector<PredicateInfo>& predicates, const Scope* outer,
     const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_FACTORIZED_JOIN_TREE") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FACTORIZED_JOIN_TREE") !=
+      nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || fusion->rollup_count_distribution ||
       fusion->anti_unmatched_only || fusion->aggregates.empty() ||
@@ -1763,7 +1933,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   };
 
   for (const PredicateInfo& p : predicates) {
-    if (!p.resolved || p.sources.size() < 2) continue;
+    if (!p.resolved || p.sources.size() < 2) {
+      continue;
+    }
     if (p.contains_query || p.sources.size() != 2 ||
         !IsColumnEqualityPredicate(p.expression) ||
         p.expression->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
@@ -1776,8 +1948,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         rel_to_active[s0] < 0 || rel_to_active[s1] < 0) {
       return std::optional<Relation>{};
     }
-    const size_t a0 = static_cast<size_t>(rel_to_active[s0]);
-    const size_t a1 = static_cast<size_t>(rel_to_active[s1]);
+    const auto a0 = static_cast<size_t>(rel_to_active[s0]);
+    const auto a1 = static_cast<size_t>(rel_to_active[s1]);
     const BinaryExpression& bin = p.expression->AsBinaryExpression();
     const ColumnName& lhs = bin.Left()->AsColumnValue().GetColumnName();
     const ColumnName& rhs = bin.Right()->AsColumnValue().GetColumnName();
@@ -1814,7 +1986,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     get_node(e.r1, e.c1);
   }
   parent.resize(col_nodes.size());
-  for (size_t i = 0; i < parent.size(); ++i) parent[i] = i;
+  for (size_t i = 0; i < parent.size(); ++i) {
+    parent[i] = i;
+  }
   auto uf_find = [&](auto&& self, size_t x) -> size_t {
     return parent[x] == x ? x : (parent[x] = self(self, parent[x]));
   };
@@ -1823,7 +1997,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     const size_t n1 = get_node(e.r1, e.c1);
     const size_t rx = uf_find(uf_find, n0);
     const size_t ry = uf_find(uf_find, n1);
-    if (rx != ry) parent[ry] = rx;
+    if (rx != ry) {
+      parent[ry] = rx;
+    }
   }
 
   // Map equivalence-class roots to compact eq_class indices `0..E-1`.
@@ -1898,7 +2074,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       q.pop();
       ++visited;
       for (const size_t v : b_adj[u]) {
-        if (!vis[v]) {
+        if (vis[v] == 0) {
           vis[v] = 1;
           q.push(v);
         }
@@ -1912,7 +2088,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   // Also ensure every active relation's join-key VARCHAR columns carry no
   // collation/interval.
   for (size_t ec = 0; ec < n_eq; ++ec) {
-    if (eq_classes[ec].type != ValueType::kVarChar) continue;
+    if (eq_classes[ec].type != ValueType::kVarChar) {
+      continue;
+    }
     for (const auto& [ar, col] : eq_classes[ec].members) {
       const Relation& rel = relations[active_rels[ar]];
       bool bad = false;
@@ -1931,18 +2109,18 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               break;
             }
           }
-          if (bad) break;
+          if (bad) {
+            break;
+          }
         }
       } else {
-        ForEachRelationEntry(
-            rel, [&](const ColumnarChunk*, const Row* r, size_t) {
-              const Value& v = (*r)[col];
-              if (!v.IsNull() && (v.IsCaseInsensitive() || v.IsInterval())) {
-                bad = true;
-                return false;
-              }
-              return true;
-            });
+        for (const Row& row : rel.rows) {
+          const Value& v = row[col];
+          if (!v.IsNull() && (v.IsCaseInsensitive() || v.IsInterval())) {
+            bad = true;
+            break;
+          }
+        }
       }
       if (bad) {
         return std::optional<Relation>{};
@@ -1977,7 +2155,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   };
   auto eq_class_of = [&](size_t ar, slot_t col) -> std::optional<size_t> {
     auto it = col_to_node[ar].find(col);
-    if (it == col_to_node[ar].end()) return std::nullopt;
+    if (it == col_to_node[ar].end()) {
+      return std::nullopt;
+    }
     return uf_to_eq[uf_find(uf_find, it->second)];
   };
 
@@ -2048,11 +2228,17 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   // column or an equivalent column in the same equivalence class.
   const auto select_having_col_ok = [&](const ColumnName& cn) -> bool {
     auto res = resolve_to_ar_col(cn);
-    if (!res.has_value()) return false;
+    if (!res.has_value()) {
+      return false;
+    }
     const auto ec = eq_class_of(res->first, res->second);
     return std::ranges::any_of(gk_refs, [&](const GroupKeyRef& g) {
-      if (!g.is_col) return false;
-      if (g.orig_ar == res->first && g.orig_col == res->second) return true;
+      if (!g.is_col) {
+        return false;
+      }
+      if (g.orig_ar == res->first && g.orig_col == res->second) {
+        return true;
+      }
       return ec.has_value() && g.eq_cls.has_value() && *ec == *g.eq_cls;
     });
   };
@@ -2078,7 +2264,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   for (size_t cand_root = 0; cand_root < n_active; ++cand_root) {
     auto eq_col_on_ar = [&](size_t ec, size_t ar) -> std::optional<slot_t> {
       for (const auto& [m_ar, m_col] : eq_classes[ec].members) {
-        if (m_ar == ar) return m_col;
+        if (m_ar == ar) {
+          return m_col;
+        }
       }
       return std::nullopt;
     };
@@ -2090,7 +2278,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         break;
       }
     }
-    if (!ok) continue;
+    if (!ok) {
+      continue;
+    }
 
     // Identify direct neighbor relations of `cand_root` in the join tree
     // (those sharing any eq-class node adjacent to `cand_root`).
@@ -2104,8 +2294,12 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       }
     }
     for (const AggColRef& ar_ref : agg_refs) {
-      if (ar_ref.is_count_star) continue;
-      if (ar_ref.ar == cand_root) continue;
+      if (ar_ref.is_count_star) {
+        continue;
+      }
+      if (ar_ref.ar == cand_root) {
+        continue;
+      }
       if (ar_ref.eq_cls.has_value() &&
           eq_col_on_ar(*ar_ref.eq_cls, cand_root)) {
         continue;  // substituted onto cand_root!
@@ -2115,7 +2309,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         break;
       }
     }
-    if (!ok) continue;
+    if (!ok) {
+      continue;
+    }
     const size_t cand_rows = relations[active_rels[cand_root]].TotalRows();
     if (cand_rows < best_root_rows) {
       best_root_rows = cand_rows;
@@ -2148,7 +2344,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   // direct child ar -> list of agg indices it owns.
   std::unordered_map<size_t, std::vector<size_t>> child_owned_aggs;
   for (size_t ai = 0; ai < agg_refs.size(); ++ai) {
-    if (agg_refs[ai].is_count_star) continue;
+    if (agg_refs[ai].is_count_star) {
+      continue;
+    }
     if (agg_refs[ai].ar == root_ar) {
       agg_root_col[ai] = agg_refs[ai].col;
       continue;
@@ -2163,7 +2361,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
           break;
         }
       }
-      if (mapped) continue;
+      if (mapped) {
+        continue;
+      }
     }
     agg_is_root[ai] = false;
     child_owned_aggs[agg_refs[ai].ar].push_back(ai);
@@ -2190,20 +2390,28 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     for (size_t bi = 0; bi < bfs.size(); ++bi) {
       const size_t u = bfs[bi];
       for (const size_t v : b_adj[u]) {
-        if (b_parent[v] >= 0) continue;
+        if (b_parent[v] >= 0) {
+          continue;
+        }
         b_parent[v] = static_cast<int>(u);
         bfs.push_back(v);
       }
     }
     for (size_t ar = 0; ar < n_active; ++ar) {
-      if (ar == root_ar) continue;
-      const size_t ec_node = static_cast<size_t>(b_parent[ar]);
+      if (ar == root_ar) {
+        continue;
+      }
+      const auto ec_node = static_cast<size_t>(b_parent[ar]);
       const size_t ec = ec_node - n_active;
-      const size_t p_ar = static_cast<size_t>(b_parent[ec_node]);
+      const auto p_ar = static_cast<size_t>(b_parent[ec_node]);
       slot_t p_col = 0, c_col = 0;
       for (const auto& [m_ar, m_col] : eq_classes[ec].members) {
-        if (m_ar == p_ar) p_col = m_col;
-        if (m_ar == ar) c_col = m_col;
+        if (m_ar == p_ar) {
+          p_col = m_col;
+        }
+        if (m_ar == ar) {
+          c_col = m_col;
+        }
       }
       tree_children[p_ar].push_back(TreeChildLink{
           .child_ar = ar, .parent_col = p_col, .child_col = c_col, .ec = ec});
@@ -2217,12 +2425,24 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
 
   // Summary storage per non-root relation `ar`: maps non-null parent-join key
   // -> (weight_sum, optionally value_aggs).
+  struct DenseIntSumSlot {
+    uint64_t row_count{0};
+    uint64_t agg_count{0};
+    __int128 sum_i128{0};
+    __int128 pos_i128{0};
+    __int128 neg_i128{0};
+  };
   struct SubtreeSummary {
     ValueType key_type{ValueType::kInt64};
     bool is_int{true};
     bool use_dense{false};
+    bool use_dense_counts_only{false};
+    bool use_dense_int_agg{false};
+    bool has_any_entry{false};
     int64_t dense_min{0};
     std::vector<uint32_t> dense_slots;
+    std::vector<uint64_t> dense_counts;
+    std::vector<DenseIntSumSlot> dense_int_aggs;
     FlatIntKeyMap<uint32_t> int_map;
     bool use_pack7{false};
     std::unordered_map<uint64_t, uint32_t> pack7_map;
@@ -2230,6 +2450,54 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     std::vector<uint64_t> counts;
     std::vector<size_t> owned_aggs;        // global agg indices
     std::vector<AggSlotState> agg_states;  // [sid * owned_aggs.size() + k]
+
+    [[gnu::always_inline]] void LookupInt(int64_t kv, bool* found,
+                                          uint64_t* w_out,
+                                          uint32_t* sid_out) const noexcept {
+      *found = false;
+      *w_out = 0;
+      if (use_dense_counts_only) {
+        const uint64_t off =
+            static_cast<uint64_t>(kv) - static_cast<uint64_t>(dense_min);
+        if (off < dense_counts.size()) {
+          const uint64_t w = dense_counts[off];
+          if (w > 0) {
+            *sid_out = static_cast<uint32_t>(off);
+            *w_out = w;
+            *found = true;
+          }
+        }
+        return;
+      }
+      if (use_dense_int_agg) {
+        const uint64_t off =
+            static_cast<uint64_t>(kv) - static_cast<uint64_t>(dense_min);
+        if (off < dense_int_aggs.size()) {
+          const uint64_t w = dense_int_aggs[off].row_count;
+          if (w > 0) {
+            *sid_out = static_cast<uint32_t>(off);
+            *w_out = w;
+            *found = true;
+          }
+        }
+        return;
+      }
+      if (use_dense) {
+        const uint64_t off =
+            static_cast<uint64_t>(kv) - static_cast<uint64_t>(dense_min);
+        if (off < dense_slots.size() && dense_slots[off] != kAbsentSlot) {
+          *sid_out = dense_slots[off];
+          *w_out = counts[*sid_out];
+          *found = *w_out > 0;
+        }
+        return;
+      }
+      if (const uint32_t* s = int_map.Find(kv)) {
+        *sid_out = *s;
+        *w_out = counts[*sid_out];
+        *found = *w_out > 0;
+      }
+    }
 
     void Lookup(const ColumnarChunk* chunk, const Row* p_row, size_t r_idx,
                 slot_t p_col, Value* key_str_tmp, bool* found, uint64_t* w_out,
@@ -2242,21 +2510,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
                                  bad)) {
           return;
         }
-        if (use_dense) {
-          const uint64_t off =
-              static_cast<uint64_t>(kv) - static_cast<uint64_t>(dense_min);
-          if (off < dense_slots.size() && dense_slots[off] != kAbsentSlot) {
-            *sid_out = dense_slots[off];
-            *w_out = counts[*sid_out];
-            *found = *w_out > 0;
-          }
-          return;
-        }
-        if (const uint32_t* s = int_map.Find(kv)) {
-          *sid_out = *s;
-          *w_out = counts[*sid_out];
-          *found = *w_out > 0;
-        }
+        LookupInt(kv, found, w_out, sid_out);
         return;
       }
       std::string_view sv;
@@ -2266,7 +2520,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       }
       if (use_pack7) {
         auto p7 = PackShortString7(sv);
-        if (!p7) return;
+        if (!p7) {
+          return;
+        }
         auto it = pack7_map.find(*p7);
         if (it != pack7_map.end()) {
           *sid_out = it->second;
@@ -2294,11 +2550,37 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     }
   }
 
+  // Group non-root active relations by tree depth (deepest first) so sibling
+  // independent subtrees (e.g. both `posts` aliases in STATS-CEB C3 or
+  // `comments`/`votes` in C1) build their SubtreeSummary in parallel.
+  std::vector<size_t> ar_depth(n_active, 0);
+  size_t max_depth = 0;
+  {
+    std::queue<size_t> dq;
+    dq.push(root_ar);
+    while (!dq.empty()) {
+      const size_t u = dq.front();
+      dq.pop();
+      for (const TreeChildLink& lnk : tree_children[u]) {
+        ar_depth[lnk.child_ar] = ar_depth[u] + 1;
+        max_depth = std::max(max_depth, ar_depth[lnk.child_ar]);
+        dq.push(lnk.child_ar);
+      }
+    }
+  }
+  std::vector<std::vector<size_t>> depth_levels(max_depth + 1);
+  for (const size_t ar : post_order) {
+    if (ar != root_ar) {
+      depth_levels[ar_depth[ar]].push_back(ar);
+    }
+  }
+
   uint64_t total_comparisons = 0;
 
-  // Bottom-up post-order evaluation for all non-root relations (`#9` & `#11`).
-  for (const size_t ar : post_order) {
-    if (ar == root_ar) continue;
+  // Build one non-root relation's SubtreeSummary (thread-safe across sibling
+  // relations at the same tree depth).
+  auto build_one_summary = [&](size_t ar, bool allow_inner_parallel,
+                               uint64_t* comparisons_out) -> bool {
     const Relation& rel = relations[active_rels[ar]];
     SubtreeSummary& sum = summaries[ar];
     sum.key_type = rel_parent_key_type[ar];
@@ -2312,29 +2594,467 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     const slot_t up_col = rel_parent_col[ar];
     const auto& children = tree_children[ar];
 
+    uint64_t span = 0;
     if (sum.is_int && rel.TotalRows() > 0) {
       int64_t bmin = std::numeric_limits<int64_t>::max();
       int64_t bmax = std::numeric_limits<int64_t>::min();
       bool bad = false;
-      ForEachRelationEntry(
-          rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
-            int64_t kv = 0;
-            if (ReadIntKeyFromEntry(chunk, r, ri, up_col, sum.key_type, &kv,
-                                    &bad)) {
-              bmin = std::min(bmin, kv);
-              bmax = std::max(bmax, kv);
+      if (rel.HasColumnarOnly()) {
+        std::vector<int64_t> key_scratch;
+        std::vector<uint8_t> null_scratch;
+        for (const ColumnarChunk& chunk : rel.columnar->chunks) {
+          if (chunk.rows == 0) {
+            continue;
+          }
+          const DecodedIntColumnView kv_view =
+              DecodeIntColumnChunk(chunk.columns[up_col], chunk.rows,
+                                   sum.key_type, &key_scratch, &null_scratch);
+          if (kv_view.ok) {
+            if (kv_view.all_null) {
+              continue;
             }
-            return !bad;
-          });
-      if (bad) return std::optional<Relation>{};
+            if (kv_view.is_const) {
+              bmin = std::min(bmin, kv_view.const_val);
+              bmax = std::max(bmax, kv_view.const_val);
+            } else if (kv_view.nulls == nullptr) {
+              const int64_t* vals = kv_view.values;
+              for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                const int64_t v = vals[ri];
+                if (v < bmin) bmin = v;
+                if (v > bmax) bmax = v;
+              }
+            } else {
+              const int64_t* vals = kv_view.values;
+              const uint8_t* nulls = kv_view.nulls;
+              for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                if (nulls[ri] == 0) {
+                  const int64_t v = vals[ri];
+                  if (v < bmin) bmin = v;
+                  if (v > bmax) bmax = v;
+                }
+              }
+            }
+          } else {
+            for (size_t ri = 0; ri < chunk.rows; ++ri) {
+              int64_t kv = 0;
+              if (ReadIntKeyFromEntry(&chunk, nullptr, ri, up_col, sum.key_type,
+                                      &kv, &bad)) {
+                if (kv < bmin) bmin = kv;
+                if (kv > bmax) bmax = kv;
+              }
+              if (bad) {
+                return false;
+              }
+            }
+          }
+        }
+      } else {
+        ForEachRelationEntry(
+            rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+              int64_t kv = 0;
+              if (ReadIntKeyFromEntry(chunk, r, ri, up_col, sum.key_type, &kv,
+                                      &bad)) {
+                bmin = std::min(bmin, kv);
+                bmax = std::max(bmax, kv);
+              }
+              return !bad;
+            });
+      }
+      if (bad) {
+        return false;
+      }
       if (bmin <= bmax) {
-        const uint64_t span =
-            static_cast<uint64_t>(bmax) - static_cast<uint64_t>(bmin) + 1ULL;
-        if (span > 0 && span <= kMaxDenseKeySpan) {
+        span = static_cast<uint64_t>(bmax) - static_cast<uint64_t>(bmin) + 1ULL;
+        const size_t max_dense_span = std::min<size_t>(
+            4ULL * 1024ULL * 1024ULL,
+            std::max<size_t>(kMaxDenseKeySpan, rel.TotalRows() * 4ULL));
+        if (span > 0 && span <= max_dense_span) {
           sum.use_dense = true;
           sum.dense_min = bmin;
-          sum.dense_slots.assign(static_cast<size_t>(span), kAbsentSlot);
         }
+      }
+    }
+
+    // Fast path 1: dense count-only leaf (no owned aggregates, no children).
+    if (sum.use_dense && n_owned == 0 && children.empty() &&
+        rel.HasColumnarOnly()) {
+      sum.use_dense_counts_only = true;
+      sum.dense_counts.assign(static_cast<size_t>(span), 0);
+      uint64_t* dc = sum.dense_counts.data();
+      const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+      uint64_t local_cnt = 0;
+      bool bad = false;
+      std::vector<int64_t> key_scratch;
+      std::vector<uint8_t> null_scratch;
+      for (const ColumnarChunk& chunk : rel.columnar->chunks) {
+        if (chunk.rows == 0) {
+          continue;
+        }
+        const DecodedIntColumnView kv_view =
+            DecodeIntColumnChunk(chunk.columns[up_col], chunk.rows,
+                                 sum.key_type, &key_scratch, &null_scratch);
+        if (kv_view.ok) {
+          if (kv_view.all_null) {
+            continue;
+          }
+          if (kv_view.is_const) {
+            const auto off = static_cast<size_t>(
+                static_cast<uint64_t>(kv_view.const_val) - dmin);
+            dc[off] += chunk.rows;
+            local_cnt += chunk.rows;
+          } else if (kv_view.nulls == nullptr) {
+            const int64_t* vals = kv_view.values;
+            for (size_t ri = 0; ri < chunk.rows; ++ri) {
+              ++dc[static_cast<size_t>(static_cast<uint64_t>(vals[ri]) - dmin)];
+            }
+            local_cnt += chunk.rows;
+          } else {
+            const int64_t* vals = kv_view.values;
+            const uint8_t* nulls = kv_view.nulls;
+            for (size_t ri = 0; ri < chunk.rows; ++ri) {
+              if (nulls[ri] == 0) {
+                ++dc[static_cast<size_t>(static_cast<uint64_t>(vals[ri]) -
+                                         dmin)];
+                ++local_cnt;
+              }
+            }
+          }
+        } else {
+          for (size_t ri = 0; ri < chunk.rows; ++ri) {
+            int64_t kv = 0;
+            if (ReadIntKeyFromEntry(&chunk, nullptr, ri, up_col, sum.key_type,
+                                    &kv, &bad)) {
+              ++dc[static_cast<size_t>(static_cast<uint64_t>(kv) - dmin)];
+              ++local_cnt;
+            }
+            if (bad) {
+              return false;
+            }
+          }
+        }
+      }
+      sum.has_any_entry = (local_cnt > 0);
+      *comparisons_out = local_cnt;
+      return true;
+    }
+
+    // Fast path 1b: dense count-only single-child chain node (no owned
+    // aggregates, 1 INT64/DATE child, e.g. `comments` and `posts` in STATS-CEB
+    // C2). Decodes both parent-join key and child-join key per chunk and folds
+    // child weights directly into `dense_counts`.
+    if (sum.use_dense && n_owned == 0 && children.size() == 1 &&
+        summaries[children[0].child_ar].is_int && rel.HasColumnarOnly()) {
+      const TreeChildLink& ch = children[0];
+      const SubtreeSummary& ch_sum = summaries[ch.child_ar];
+      sum.use_dense_counts_only = true;
+      sum.dense_counts.assign(static_cast<size_t>(span), 0);
+      const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+      const auto& chunks = rel.columnar->chunks;
+      const size_t nchunks = chunks.size();
+      const size_t inner_workers =
+          (allow_inner_parallel && rel.TotalRows() >= 65536 &&
+           span <= 524288ULL && nchunks >= 2)
+              ? std::min<size_t>(ParallelWorkerCount(std::min<size_t>(
+                                     4, rel.TotalRows() / 32768)),
+                                 nchunks)
+              : 1;
+      auto run_chain_range = [&](size_t c_begin, size_t c_end,
+                                 uint64_t* __restrict__ dc,
+                                 uint64_t* local_cnt_out) -> bool {
+        uint64_t local_cnt = 0;
+        bool bad = false;
+        std::vector<int64_t> up_scratch;
+        std::vector<uint8_t> up_null_scratch;
+        std::vector<int64_t> ch_scratch;
+        std::vector<uint8_t> ch_null_scratch;
+        for (size_t chi = c_begin; chi < c_end; ++chi) {
+          const ColumnarChunk& chunk = chunks[chi];
+          if (chunk.rows == 0) {
+            continue;
+          }
+          const DecodedIntColumnView up_view =
+              DecodeIntColumnChunk(chunk.columns[up_col], chunk.rows,
+                                   sum.key_type, &up_scratch, &up_null_scratch);
+          const DecodedIntColumnView ch_view = DecodeIntColumnChunk(
+              chunk.columns[ch.parent_col], chunk.rows, ch_sum.key_type,
+              &ch_scratch, &ch_null_scratch);
+          if (up_view.ok && ch_view.ok) {
+            if (up_view.all_null || ch_view.all_null) {
+              continue;
+            }
+            if (!up_view.is_const && up_view.nulls == nullptr &&
+                !ch_view.is_const && ch_view.nulls == nullptr) {
+              const int64_t* uvals = up_view.values;
+              const int64_t* cvals = ch_view.values;
+              for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                bool found = false;
+                uint64_t cw = 0;
+                uint32_t dummy_sid = 0;
+                ch_sum.LookupInt(cvals[ri], &found, &cw, &dummy_sid);
+                if (!found || cw == 0) {
+                  continue;
+                }
+                const auto off = static_cast<size_t>(
+                    static_cast<uint64_t>(uvals[ri]) - dmin);
+                uint64_t next_cnt = 0;
+                if (__builtin_add_overflow(dc[off], cw, &next_cnt))
+                    [[unlikely]] {
+                  return false;
+                }
+                dc[off] = next_cnt;
+                ++local_cnt;
+              }
+            } else {
+              for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                if ((up_view.nulls != nullptr && up_view.nulls[ri] != 0) ||
+                    (ch_view.nulls != nullptr && ch_view.nulls[ri] != 0)) {
+                  continue;
+                }
+                const int64_t ckv =
+                    ch_view.is_const ? ch_view.const_val : ch_view.values[ri];
+                bool found = false;
+                uint64_t cw = 0;
+                uint32_t dummy_sid = 0;
+                ch_sum.LookupInt(ckv, &found, &cw, &dummy_sid);
+                if (!found || cw == 0) {
+                  continue;
+                }
+                const int64_t ukv =
+                    up_view.is_const ? up_view.const_val : up_view.values[ri];
+                const auto off =
+                    static_cast<size_t>(static_cast<uint64_t>(ukv) - dmin);
+                uint64_t next_cnt = 0;
+                if (__builtin_add_overflow(dc[off], cw, &next_cnt))
+                    [[unlikely]] {
+                  return false;
+                }
+                dc[off] = next_cnt;
+                ++local_cnt;
+              }
+            }
+          } else {
+            for (size_t ri = 0; ri < chunk.rows; ++ri) {
+              int64_t ckv = 0;
+              if (!ReadIntKeyFromEntry(&chunk, nullptr, ri, ch.parent_col,
+                                       ch_sum.key_type, &ckv, &bad)) {
+                if (bad) {
+                  return false;
+                }
+                continue;
+              }
+              bool found = false;
+              uint64_t cw = 0;
+              uint32_t dummy_sid = 0;
+              ch_sum.LookupInt(ckv, &found, &cw, &dummy_sid);
+              if (!found || cw == 0) {
+                continue;
+              }
+              int64_t ukv = 0;
+              if (!ReadIntKeyFromEntry(&chunk, nullptr, ri, up_col,
+                                       sum.key_type, &ukv, &bad)) {
+                if (bad) {
+                  return false;
+                }
+                continue;
+              }
+              const auto off =
+                  static_cast<size_t>(static_cast<uint64_t>(ukv) - dmin);
+              uint64_t next_cnt = 0;
+              if (__builtin_add_overflow(dc[off], cw, &next_cnt)) [[unlikely]] {
+                return false;
+              }
+              dc[off] = next_cnt;
+              ++local_cnt;
+            }
+          }
+        }
+        *local_cnt_out = local_cnt;
+        return true;
+      };
+      uint64_t total_local = 0;
+      if (inner_workers <= 1) {
+        if (!run_chain_range(0, nchunks, sum.dense_counts.data(),
+                             &total_local)) {
+          return false;
+        }
+      } else {
+        std::vector<std::vector<uint64_t>> w_dc(inner_workers);
+        std::vector<uint8_t> w_ok(inner_workers, 0);
+        std::vector<uint64_t> w_cnt(inner_workers, 0);
+        const Status pst = RunParallelTasks(inner_workers, [&](size_t w) {
+          const size_t cb = (nchunks * w) / inner_workers;
+          const size_t ce = (nchunks * (w + 1)) / inner_workers;
+          uint64_t* target_dc = nullptr;
+          if (w == 0) {
+            target_dc = sum.dense_counts.data();
+          } else {
+            w_dc[w].assign(static_cast<size_t>(span), 0);
+            target_dc = w_dc[w].data();
+          }
+          w_ok[w] = run_chain_range(cb, ce, target_dc, &w_cnt[w]) ? 1U : 0U;
+        });
+        if (!pst.ok()) {
+          return false;
+        }
+        for (size_t w = 0; w < inner_workers; ++w) {
+          if (w_ok[w] == 0U) {
+            return false;
+          }
+          total_local += w_cnt[w];
+        }
+        uint64_t* __restrict__ dst = sum.dense_counts.data();
+        const auto span_sz = static_cast<size_t>(span);
+        for (size_t w = 1; w < inner_workers; ++w) {
+          const uint64_t* __restrict__ src = w_dc[w].data();
+          for (size_t i = 0; i < span_sz; ++i) {
+            if (src[i] == 0) {
+              continue;
+            }
+            uint64_t next_cnt = 0;
+            if (__builtin_add_overflow(dst[i], src[i], &next_cnt))
+                [[unlikely]] {
+              return false;
+            }
+            dst[i] = next_cnt;
+          }
+        }
+      }
+      sum.has_any_entry = (total_local > 0);
+      *comparisons_out = total_local;
+      return true;
+    }
+
+    // Fast path 2: dense single INT64 SUM/AVG leaf (e.g. AVG(p.score) on
+    // `posts p` in STATS-CEB C3). Stores (row_count, agg_count, sum/pos/neg) in
+    // one cache-line-sized POD slot per key — zero indirect slot table, zero
+    // Value destructor overhead.
+    if (sum.use_dense && n_owned == 1 && children.empty() &&
+        rel.HasColumnarOnly() && span <= 2ULL * 1024ULL * 1024ULL) {
+      const size_t ai = sum.owned_aggs[0];
+      if (agg_kinds[ai] == SimpleAggKind::kSum ||
+          agg_kinds[ai] == SimpleAggKind::kAvg) {
+        const slot_t agg_col = agg_refs[ai].col;
+        bool all_chunks_int64 = true;
+        for (const ColumnarChunk& chunk : rel.columnar->chunks) {
+          if (chunk.rows == 0) {
+            continue;
+          }
+          const ColumnarColumn& acc = chunk.columns[agg_col];
+          if (!acc.is_uniform || acc.is_unsigned || acc.is_interval ||
+              acc.type != ValueType::kInt64) {
+            all_chunks_int64 = false;
+            break;
+          }
+        }
+        if (all_chunks_int64) {
+          sum.use_dense_int_agg = true;
+          sum.dense_int_aggs.resize(static_cast<size_t>(span));
+          DenseIntSumSlot* slots = sum.dense_int_aggs.data();
+          const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+          uint64_t local_cnt = 0;
+          bool bad = false;
+          std::vector<int64_t> key_scratch;
+          std::vector<uint8_t> key_null_scratch;
+          std::vector<int64_t> agg_scratch;
+          std::vector<uint8_t> agg_null_scratch;
+          for (const ColumnarChunk& chunk : rel.columnar->chunks) {
+            if (chunk.rows == 0) {
+              continue;
+            }
+            const DecodedIntColumnView kv_view = DecodeIntColumnChunk(
+                chunk.columns[up_col], chunk.rows, sum.key_type, &key_scratch,
+                &key_null_scratch);
+            const DecodedIntColumnView av_view = DecodeIntColumnChunk(
+                chunk.columns[agg_col], chunk.rows, ValueType::kInt64,
+                &agg_scratch, &agg_null_scratch);
+            if (kv_view.ok && av_view.ok) {
+              if (kv_view.all_null) {
+                continue;
+              }
+              if (!kv_view.is_const && kv_view.nulls == nullptr &&
+                  !av_view.is_const && av_view.nulls == nullptr) {
+                const int64_t* kvals = kv_view.values;
+                const int64_t* avals = av_view.values;
+                for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                  DenseIntSumSlot& st = slots[static_cast<size_t>(
+                      static_cast<uint64_t>(kvals[ri]) - dmin)];
+                  ++st.row_count;
+                  const int64_t v = avals[ri];
+                  ++st.agg_count;
+                  st.sum_i128 += v;
+                  if (v > 0) {
+                    st.pos_i128 += v;
+                  } else if (v < 0) {
+                    st.neg_i128 += v;
+                  }
+                }
+                local_cnt += chunk.rows;
+              } else {
+                for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                  if (kv_view.nulls != nullptr && kv_view.nulls[ri] != 0) {
+                    continue;
+                  }
+                  const int64_t kv =
+                      kv_view.is_const ? kv_view.const_val : kv_view.values[ri];
+                  DenseIntSumSlot& st = slots[static_cast<size_t>(
+                      static_cast<uint64_t>(kv) - dmin)];
+                  ++st.row_count;
+                  ++local_cnt;
+                  if (!av_view.all_null &&
+                      (av_view.nulls == nullptr || av_view.nulls[ri] == 0)) {
+                    const int64_t v = av_view.is_const ? av_view.const_val
+                                                       : av_view.values[ri];
+                    ++st.agg_count;
+                    st.sum_i128 += v;
+                    if (v > 0) {
+                      st.pos_i128 += v;
+                    } else if (v < 0) {
+                      st.neg_i128 += v;
+                    }
+                  }
+                }
+              }
+            } else {
+              for (size_t ri = 0; ri < chunk.rows; ++ri) {
+                int64_t kv = 0;
+                if (!ReadIntKeyFromEntry(&chunk, nullptr, ri, up_col,
+                                         sum.key_type, &kv, &bad)) {
+                  if (bad) {
+                    return false;
+                  }
+                  continue;
+                }
+                DenseIntSumSlot& st = slots[static_cast<size_t>(
+                    static_cast<uint64_t>(kv) - dmin)];
+                ++st.row_count;
+                ++local_cnt;
+                int64_t v = 0;
+                if (chunk.columns[agg_col].TryReadNonNullInt(ri, &v)) {
+                  ++st.agg_count;
+                  st.sum_i128 += v;
+                  if (v > 0) {
+                    st.pos_i128 += v;
+                  } else if (v < 0) {
+                    st.neg_i128 += v;
+                  }
+                }
+              }
+            }
+          }
+          sum.has_any_entry = (local_cnt > 0);
+          *comparisons_out = local_cnt;
+          return true;
+        }
+      }
+    }
+
+    if (sum.use_dense) {
+      sum.dense_slots.assign(static_cast<size_t>(span), kAbsentSlot);
+      const size_t est =
+          std::min<size_t>(static_cast<size_t>(span), rel.TotalRows());
+      sum.counts.reserve(est);
+      if (n_owned > 0) {
+        sum.agg_states.reserve(est * n_owned);
       }
     }
 
@@ -2349,13 +3069,15 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
           return std::nullopt;
         }
         if (sum.use_dense) {
-          const size_t off = static_cast<size_t>(
+          const auto off = static_cast<size_t>(
               static_cast<uint64_t>(kv) - static_cast<uint64_t>(sum.dense_min));
           uint32_t& ref = sum.dense_slots[off];
           if (ref == kAbsentSlot) {
             ref = static_cast<uint32_t>(sum.counts.size());
             sum.counts.push_back(0);
-            if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
+            if (n_owned > 0) {
+              sum.agg_states.resize(sum.counts.size() * n_owned);
+            }
           }
           return ref;
         }
@@ -2364,7 +3086,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         }
         const auto sid = static_cast<uint32_t>(sum.counts.size());
         sum.counts.push_back(0);
-        if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
+        if (n_owned > 0) {
+          sum.agg_states.resize(sum.counts.size() * n_owned);
+        }
         *sum.int_map.TryEmplace(kv) = sid;
         return sid;
       }
@@ -2379,14 +3103,16 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               *p7, static_cast<uint32_t>(sum.counts.size()));
           if (ins) {
             sum.counts.push_back(0);
-            if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
+            if (n_owned > 0) {
+              sum.agg_states.resize(sum.counts.size() * n_owned);
+            }
           }
           return it->second;
         }
         sum.use_pack7 = false;
         sum.str_map.reserve(sum.pack7_map.size() + 64);
         for (const auto& [word, sid] : sum.pack7_map) {
-          const size_t len = static_cast<size_t>(word & 0xFFU);
+          const auto len = static_cast<size_t>(word & 0xFFU);
           std::string tmp(len, '\0');
           for (size_t i = 0; i < len; ++i) {
             tmp[i] = static_cast<char>((word >> ((7U - i) * 8U)) & 0xFFU);
@@ -2401,12 +3127,15 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       }
       const auto sid = static_cast<uint32_t>(sum.counts.size());
       sum.counts.push_back(0);
-      if (n_owned > 0) sum.agg_states.resize(sum.counts.size() * n_owned);
+      if (n_owned > 0) {
+        sum.agg_states.resize(sum.counts.size() * n_owned);
+      }
       sum.str_map.emplace(std::string(sv), sid);
       return sid;
     };
 
     bool invalid = false;
+    uint64_t local_comparisons = 0;
     Value child_key_tmp;
     ForEachRelationEntry(rel, [&](const ColumnarChunk* chunk, const Row* r,
                                   size_t ri) {
@@ -2418,31 +3147,38 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
         summaries[ch.child_ar].Lookup(chunk, r, ri, ch.parent_col,
                                       &child_key_tmp, &found, &cw, &dummy_sid,
                                       &invalid);
-        if (invalid) return false;
-        if (!found) return true;  // semi-pruned by empty child
+        if (invalid) {
+          return false;
+        }
+        if (!found) {
+          return true;  // semi-pruned by empty child
+        }
         w *= static_cast<__int128>(cw);
-        if (w > static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+        if (std::cmp_greater(w, std::numeric_limits<uint64_t>::max())) {
           invalid = true;
           return false;
         }
       }
       auto sid = alloc_sum_slot(chunk, r, ri, &invalid);
-      if (invalid) return false;
-      if (!sid.has_value()) return true;
-      const uint64_t wu = static_cast<uint64_t>(w);
+      if (invalid) {
+        return false;
+      }
+      if (!sid.has_value()) {
+        return true;
+      }
+      const auto wu = static_cast<uint64_t>(w);
       __int128 next_cnt =
           static_cast<__int128>(sum.counts[*sid]) + static_cast<__int128>(wu);
-      if (next_cnt >
-          static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+      if (std::cmp_greater(next_cnt, std::numeric_limits<uint64_t>::max())) {
         invalid = true;
         return false;
       }
       sum.counts[*sid] = static_cast<uint64_t>(next_cnt);
-      ++total_comparisons;
+      ++local_comparisons;
       if (n_owned > 0) {
         for (size_t oi = 0; oi < n_owned; ++oi) {
           const size_t ai = sum.owned_aggs[oi];
-          if (!AddEntryCellWithWeight(&sum.agg_states[*sid * n_owned + oi],
+          if (!AddEntryCellWithWeight(&sum.agg_states[(*sid * n_owned) + oi],
                                       agg_kinds[ai], chunk, r, ri,
                                       agg_refs[ai].col, wu)) {
             invalid = true;
@@ -2453,29 +3189,74 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       return true;
     });
     if (invalid) {
-      return std::optional<Relation>{};
+      return false;
     }
-    if (sum.counts.empty()) {
-      // Any empty subtree annihilates an inner join!
-      std::optional<Row> empty_rep;
-      if (fusion->group_keys.empty()) {
-        empty_rep = Row(std::vector<Value>(full_active_schema.ColumnCount()));
+    sum.has_any_entry = !sum.counts.empty();
+    *comparisons_out = local_comparisons;
+    return true;
+  };
+
+  // Bottom-up level-parallel evaluation for all non-root relations (`#9` &
+  // `#11`).
+  for (size_t depth = max_depth; depth >= 1; --depth) {
+    const auto& level = depth_levels[depth];
+    if (level.empty()) {
+      continue;
+    }
+    size_t level_rows = 0;
+    for (const size_t ar : level) {
+      level_rows += relations[active_rels[ar]].TotalRows();
+    }
+    std::vector<uint8_t> ok_flags(level.size(), 0);
+    std::vector<uint64_t> comp_counts(level.size(), 0);
+    if (level.size() > 1 && level_rows >= 16384) {
+      RETURN_IF_FAIL(RunParallelTasks(level.size(), [&](size_t idx) {
+        ok_flags[idx] =
+            build_one_summary(level[idx], /*allow_inner_parallel=*/false,
+                              &comp_counts[idx])
+                ? 1U
+                : 0U;
+      }));
+    } else {
+      for (size_t idx = 0; idx < level.size(); ++idx) {
+        ok_flags[idx] =
+            build_one_summary(level[idx],
+                              /*allow_inner_parallel=*/(level.size() == 1),
+                              &comp_counts[idx])
+                ? 1U
+                : 0U;
       }
-      std::vector<const Relation*> keep_rels;
-      for (const size_t idx : active_rels) {
-        keep_rels.push_back(&relations[idx]);
-      }
-      auto res_or = EmitGroupedProjectionRelation(
-          context, full_active_schema, {}, {}, agg_kinds, empty_rep, *fusion,
-          n_active - 1, total_comparisons, keep_rels);
-      if (!res_or.HasValue()) {
-        if (!IsEagerFallbackStatus(res_or.GetStatus())) {
-          return res_or.GetStatus();
-        }
+    }
+    for (size_t idx = 0; idx < level.size(); ++idx) {
+      if (ok_flags[idx] == 0U) {
         return std::optional<Relation>{};
       }
-      fusion->fired = true;
-      return std::optional<Relation>(res_or.MoveValue());
+      total_comparisons += comp_counts[idx];
+    }
+    for (const size_t ar : level) {
+      if (!summaries[ar].has_any_entry) {
+        // Any empty subtree annihilates an inner join!
+        std::optional<Row> empty_rep;
+        if (fusion->group_keys.empty()) {
+          empty_rep = Row(std::vector<Value>(full_active_schema.ColumnCount()));
+        }
+        std::vector<const Relation*> keep_rels;
+        keep_rels.reserve(active_rels.size());
+        for (const size_t idx : active_rels) {
+          keep_rels.push_back(&relations[idx]);
+        }
+        auto res_or = EmitGroupedProjectionRelation(
+            context, full_active_schema, {}, {}, agg_kinds, empty_rep, *fusion,
+            n_active - 1, total_comparisons, keep_rels);
+        if (!res_or.HasValue()) {
+          if (!IsEagerFallbackStatus(res_or.GetStatus())) {
+            return res_or.GetStatus();
+          }
+          return std::optional<Relation>{};
+        }
+        fusion->fired = true;
+        return std::optional<Relation>(res_or.MoveValue());
+      }
     }
   }
 
@@ -2488,10 +3269,35 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       ParallelWorkerCount(std::max<size_t>(1, total_root / 16384));
   const size_t n_aggs = agg_kinds.size();
   const size_t n_gkeys = root_group_cols.size();
+  const ValueType gk0_type =
+      n_gkeys == 1 ? root_rel.schema.GetColumn(root_group_cols[0]).Type()
+                   : ValueType::kNull;
+  const bool single_int_gk =
+      (n_gkeys == 1 &&
+       (gk0_type == ValueType::kInt64 || gk0_type == ValueType::kDate) &&
+       !root_rel.schema.GetColumn(root_group_cols[0]).IsUnsigned());
+  bool all_root_children_int = true;
+  for (size_t ci = 0; ci < n_rc; ++ci) {
+    if (!summaries[root_children[ci].child_ar].is_int) {
+      all_root_children_int = false;
+      break;
+    }
+  }
+  bool any_root_non_count_star_agg = false;
+  for (size_t ai = 0; ai < n_aggs; ++ai) {
+    if (agg_kinds[ai] != SimpleAggKind::kCountStar && agg_is_root[ai]) {
+      any_root_non_count_star_agg = true;
+      break;
+    }
+  }
 
   struct RootWorkerLocal {
     bool has_scalar{false};
     std::vector<AggSlotState> scalar_aggs;
+    FlatIntKeyMap<uint32_t> int_map;
+    uint32_t null_group_slot{kAbsentSlot};
+    std::vector<int64_t> int_group_keys;
+    std::vector<uint8_t> int_group_is_null;
     std::unordered_map<std::string, uint32_t> str_map;
     std::vector<std::vector<Value>> group_keys;
     std::vector<std::vector<AggSlotState>> group_aggs;
@@ -2500,101 +3306,335 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
   };
   std::vector<RootWorkerLocal> locals(workers);
   for (auto& wl : locals) {
-    if (n_gkeys == 0) wl.scalar_aggs.resize(n_aggs);
+    if (n_gkeys == 0) {
+      wl.scalar_aggs.resize(n_aggs);
+    }
   }
 
-  RETURN_IF_FAIL(ParallelForEachRelationEntryRange(
-      root_rel, workers, [&](size_t w, auto&& iter_fn) {
-        RootWorkerLocal& wl = locals[w];
-        std::vector<uint64_t> cw(n_rc);
-        std::vector<uint32_t> csid(n_rc);
-        std::vector<Value> gk_vals(n_gkeys);
-        Value child_key_tmp;
-        iter_fn([&](const ColumnarChunk* chunk, const Row* r,
-                    size_t ri) -> bool {
-          __int128 w_total = 1;
-          for (size_t ci = 0; ci < n_rc; ++ci) {
-            bool found = false;
-            summaries[root_children[ci].child_ar].Lookup(
-                chunk, r, ri, root_children[ci].parent_col, &child_key_tmp,
-                &found, &cw[ci], &csid[ci], &wl.invalid);
-            if (wl.invalid) return false;
-            if (!found || cw[ci] == 0) return true;
-            w_total *= static_cast<__int128>(cw[ci]);
-            if (w_total >
-                static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+  const auto merge_child_owned_aggs =
+      [&](std::vector<AggSlotState>* dst, const uint64_t* cw,
+          const uint32_t* csid, uint64_t wt) noexcept -> bool {
+    // Star-hub child value branches (#11): scale by W_other = W_total /
+    // cw[ci].
+    for (size_t ci = 0; ci < n_rc; ++ci) {
+      const SubtreeSummary& ch_sum = summaries[root_children[ci].child_ar];
+      if (ch_sum.owned_aggs.empty()) {
+        continue;
+      }
+      const uint64_t w_other = wt / cw[ci];
+      if (ch_sum.use_dense_int_agg) {
+        const DenseIntSumSlot& ds = ch_sum.dense_int_aggs[csid[ci]];
+        if (ds.agg_count > 0) {
+          const size_t ai = ch_sum.owned_aggs[0];
+          AggSlotState& target = (*dst)[ai];
+          if (target.numeric_mode == 0) {
+            target.numeric_mode = 1;
+          } else if (target.numeric_mode != 1) {
+            target.invalid = true;
+            return false;
+          }
+          const auto sc = static_cast<__int128>(w_other);
+          target.sum_i128 += ds.sum_i128 * sc;
+          target.pos_i128 += ds.pos_i128 * sc;
+          target.neg_i128 += ds.neg_i128 * sc;
+          target.count += ds.agg_count * w_other;
+        }
+        continue;
+      }
+      const size_t n_owned = ch_sum.owned_aggs.size();
+      const size_t base = csid[ci] * n_owned;
+      for (size_t oi = 0; oi < n_owned; ++oi) {
+        const size_t ai = ch_sum.owned_aggs[oi];
+        if (!MergeAggSlot(&(*dst)[ai], ch_sum.agg_states[base + oi],
+                          agg_kinds[ai], w_other)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  const auto get_single_int_group =
+      [&](RootWorkerLocal& wl, bool is_null,
+          int64_t kv) -> std::vector<AggSlotState>* {
+    if (is_null) {
+      if (wl.null_group_slot == kAbsentSlot) {
+        wl.null_group_slot = static_cast<uint32_t>(wl.group_aggs.size());
+        wl.int_group_keys.push_back(0);
+        wl.int_group_is_null.push_back(1U);
+        wl.group_aggs.emplace_back(n_aggs);
+      }
+      return &wl.group_aggs[wl.null_group_slot];
+    }
+    if (const uint32_t* found = wl.int_map.Find(kv)) {
+      return &wl.group_aggs[*found];
+    }
+    const auto gid = static_cast<uint32_t>(wl.group_aggs.size());
+    *wl.int_map.TryEmplace(kv) = gid;
+    wl.int_group_keys.push_back(kv);
+    wl.int_group_is_null.push_back(0U);
+    wl.group_aggs.emplace_back(n_aggs);
+    return &wl.group_aggs[gid];
+  };
+
+  if (root_rel.HasColumnarOnly() && all_root_children_int &&
+      (n_gkeys == 0 || single_int_gk) && !any_root_non_count_star_agg) {
+    // Fast columnar chunk-batched root probe: decodes each child join key and
+    // optional single INT64/DATE group key once per chunk, avoiding per-row
+    // ColumnarColumn::IntAt dispatch and EncodeKeyTuple string allocations.
+    const auto& chunks = root_rel.columnar->chunks;
+    const size_t chunk_count = chunks.size();
+    const size_t actual_workers =
+        std::min(workers, std::max<size_t>(1, chunk_count));
+    const auto run_chunk_worker = [&](size_t w) {
+      RootWorkerLocal& wl = locals[w];
+      const size_t c_begin = (chunk_count * w) / actual_workers;
+      const size_t c_end = (chunk_count * (w + 1)) / actual_workers;
+      std::vector<uint64_t> cw(n_rc);
+      std::vector<uint32_t> csid(n_rc);
+      std::vector<std::vector<int64_t>> child_val_scratch(n_rc);
+      std::vector<std::vector<uint8_t>> child_null_scratch(n_rc);
+      std::vector<DecodedIntColumnView> child_views(n_rc);
+      std::vector<int64_t> gk_val_scratch;
+      std::vector<uint8_t> gk_null_scratch;
+      Value child_key_tmp;
+      for (size_t chi = c_begin; chi < c_end; ++chi) {
+        const ColumnarChunk& chunk = chunks[chi];
+        if (chunk.rows == 0) {
+          continue;
+        }
+        bool all_decoded = true;
+        bool any_all_null = false;
+        for (size_t ci = 0; ci < n_rc; ++ci) {
+          const SubtreeSummary& ch_sum = summaries[root_children[ci].child_ar];
+          child_views[ci] = DecodeIntColumnChunk(
+              chunk.columns[root_children[ci].parent_col], chunk.rows,
+              ch_sum.key_type, &child_val_scratch[ci], &child_null_scratch[ci]);
+          if (!child_views[ci].ok) {
+            all_decoded = false;
+            break;
+          }
+          if (child_views[ci].all_null) {
+            any_all_null = true;
+          }
+        }
+        if (all_decoded && any_all_null) {
+          continue;
+        }
+        DecodedIntColumnView gk_view;
+        if (all_decoded && single_int_gk) {
+          gk_view = DecodeIntColumnChunk(chunk.columns[root_group_cols[0]],
+                                         chunk.rows, gk0_type, &gk_val_scratch,
+                                         &gk_null_scratch);
+          if (!gk_view.ok) {
+            all_decoded = false;
+          }
+        }
+        if (all_decoded) {
+          for (size_t ri = 0; ri < chunk.rows; ++ri) {
+            __int128 w_total = 1;
+            bool matched = true;
+            for (size_t ci = 0; ci < n_rc; ++ci) {
+              const DecodedIntColumnView& cv = child_views[ci];
+              if (cv.nulls != nullptr && cv.nulls[ri] != 0) {
+                matched = false;
+                break;
+              }
+              const int64_t kv = cv.is_const ? cv.const_val : cv.values[ri];
+              bool found = false;
+              summaries[root_children[ci].child_ar].LookupInt(
+                  kv, &found, &cw[ci], &csid[ci]);
+              if (!found || cw[ci] == 0) {
+                matched = false;
+                break;
+              }
+              w_total *= static_cast<__int128>(cw[ci]);
+              if (std::cmp_greater(w_total,
+                                   std::numeric_limits<uint64_t>::max())) {
+                wl.invalid = true;
+                return;
+              }
+            }
+            if (!matched) {
+              continue;
+            }
+            const auto wt = static_cast<uint64_t>(w_total);
+            wl.comparisons += 1;
+            std::vector<AggSlotState>* dst = nullptr;
+            if (n_gkeys == 0) {
+              wl.has_scalar = true;
+              dst = &wl.scalar_aggs;
+            } else {
+              const bool is_null =
+                  gk_view.all_null ||
+                  (gk_view.nulls != nullptr && gk_view.nulls[ri] != 0);
+              const int64_t gk = is_null
+                                     ? 0
+                                     : (gk_view.is_const ? gk_view.const_val
+                                                         : gk_view.values[ri]);
+              dst = get_single_int_group(wl, is_null, gk);
+            }
+            for (size_t ai = 0; ai < n_aggs; ++ai) {
+              if (agg_kinds[ai] == SimpleAggKind::kCountStar) {
+                (*dst)[ai].count += wt;
+              }
+            }
+            if (!merge_child_owned_aggs(dst, cw.data(), csid.data(), wt)) {
+              wl.invalid = true;
+              return;
+            }
+          }
+        } else {
+          for (size_t ri = 0; ri < chunk.rows; ++ri) {
+            __int128 w_total = 1;
+            bool matched = true;
+            for (size_t ci = 0; ci < n_rc; ++ci) {
+              bool found = false;
+              summaries[root_children[ci].child_ar].Lookup(
+                  &chunk, nullptr, ri, root_children[ci].parent_col,
+                  &child_key_tmp, &found, &cw[ci], &csid[ci], &wl.invalid);
+              if (wl.invalid) {
+                return;
+              }
+              if (!found || cw[ci] == 0) {
+                matched = false;
+                break;
+              }
+              w_total *= static_cast<__int128>(cw[ci]);
+              if (std::cmp_greater(w_total,
+                                   std::numeric_limits<uint64_t>::max())) {
+                wl.invalid = true;
+                return;
+              }
+            }
+            if (!matched) {
+              continue;
+            }
+            const auto wt = static_cast<uint64_t>(w_total);
+            wl.comparisons += 1;
+            std::vector<AggSlotState>* dst = nullptr;
+            if (n_gkeys == 0) {
+              wl.has_scalar = true;
+              dst = &wl.scalar_aggs;
+            } else {
+              int64_t gk = 0;
+              const bool non_null =
+                  ReadIntKeyFromEntry(&chunk, nullptr, ri, root_group_cols[0],
+                                      gk0_type, &gk, &wl.invalid);
+              if (wl.invalid) {
+                return;
+              }
+              dst = get_single_int_group(wl, !non_null, gk);
+            }
+            for (size_t ai = 0; ai < n_aggs; ++ai) {
+              if (agg_kinds[ai] == SimpleAggKind::kCountStar) {
+                (*dst)[ai].count += wt;
+              }
+            }
+            if (!merge_child_owned_aggs(dst, cw.data(), csid.data(), wt)) {
+              wl.invalid = true;
+              return;
+            }
+          }
+        }
+      }
+    };
+    if (actual_workers <= 1) {
+      run_chunk_worker(0);
+    } else {
+      RETURN_IF_FAIL(RunParallelTasks(actual_workers, run_chunk_worker));
+    }
+  } else {
+    RETURN_IF_FAIL(ParallelForEachRelationEntryRange(
+        root_rel, workers, [&](size_t w, auto&& iter_fn) {
+          RootWorkerLocal& wl = locals[w];
+          std::vector<uint64_t> cw(n_rc);
+          std::vector<uint32_t> csid(n_rc);
+          std::vector<Value> gk_vals(n_gkeys);
+          Value child_key_tmp;
+          iter_fn([&](const ColumnarChunk* chunk, const Row* r,
+                      size_t ri) -> bool {
+            __int128 w_total = 1;
+            for (size_t ci = 0; ci < n_rc; ++ci) {
+              bool found = false;
+              summaries[root_children[ci].child_ar].Lookup(
+                  chunk, r, ri, root_children[ci].parent_col, &child_key_tmp,
+                  &found, &cw[ci], &csid[ci], &wl.invalid);
+              if (wl.invalid) return false;
+              if (!found || cw[ci] == 0) return true;
+              w_total *= static_cast<__int128>(cw[ci]);
+              if (std::cmp_greater(w_total,
+                                   std::numeric_limits<uint64_t>::max())) {
+                wl.invalid = true;
+                return false;
+              }
+            }
+            const auto wt = static_cast<uint64_t>(w_total);
+            wl.comparisons += 1;
+
+            std::vector<AggSlotState>* dst = nullptr;
+            if (n_gkeys == 0) {
+              wl.has_scalar = true;
+              dst = &wl.scalar_aggs;
+            } else if (single_int_gk) {
+              int64_t gk = 0;
+              const bool non_null = ReadIntKeyFromEntry(
+                  chunk, r, ri, root_group_cols[0], gk0_type, &gk, &wl.invalid);
+              if (wl.invalid) {
+                return false;
+              }
+              dst = get_single_int_group(wl, !non_null, gk);
+            } else {
+              for (size_t k = 0; k < n_gkeys; ++k) {
+                ReadColValueOrRow(chunk, r, ri, root_group_cols[k],
+                                  &gk_vals[k]);
+                if (gk_vals[k].IsCaseInsensitive() || gk_vals[k].IsInterval()) {
+                  wl.invalid = true;
+                  return false;
+                }
+              }
+              std::string enc = EncodeKeyTuple(gk_vals);
+              auto [it, ins] = wl.str_map.emplace(
+                  std::move(enc), static_cast<uint32_t>(wl.group_aggs.size()));
+              if (ins) {
+                std::vector<Value> owned = gk_vals;
+                for (Value& v : owned) {
+                  if (v.type == ValueType::kVarChar && v.owned_data.empty() &&
+                      !v.value.varchar_value.empty()) {
+                    v.owned_data.assign(v.value.varchar_value);
+                    v.value.varchar_value = v.owned_data;
+                  }
+                }
+                wl.group_keys.push_back(std::move(owned));
+                wl.group_aggs.emplace_back(n_aggs);
+              }
+              dst = &wl.group_aggs[it->second];
+            }
+
+            for (size_t ai = 0; ai < n_aggs; ++ai) {
+              if (agg_kinds[ai] == SimpleAggKind::kCountStar) {
+                (*dst)[ai].count += wt;
+              } else if (agg_is_root[ai]) {
+                if (!AddEntryCellWithWeight(&(*dst)[ai], agg_kinds[ai], chunk,
+                                            r, ri, agg_root_col[ai], wt)) {
+                  wl.invalid = true;
+                  return false;
+                }
+              }
+            }
+            if (!merge_child_owned_aggs(dst, cw.data(), csid.data(), wt)) {
               wl.invalid = true;
               return false;
             }
-          }
-          const uint64_t wt = static_cast<uint64_t>(w_total);
-          wl.comparisons += 1;
-
-          std::vector<AggSlotState>* dst = nullptr;
-          if (n_gkeys == 0) {
-            wl.has_scalar = true;
-            dst = &wl.scalar_aggs;
-          } else {
-            for (size_t k = 0; k < n_gkeys; ++k) {
-              ReadColValueOrRow(chunk, r, ri, root_group_cols[k], &gk_vals[k]);
-              if (gk_vals[k].IsCaseInsensitive() || gk_vals[k].IsInterval()) {
-                wl.invalid = true;
-                return false;
-              }
-            }
-            std::string enc = EncodeKeyTuple(gk_vals);
-            auto [it, ins] = wl.str_map.emplace(
-                std::move(enc), static_cast<uint32_t>(wl.group_aggs.size()));
-            if (ins) {
-              std::vector<Value> owned = gk_vals;
-              for (Value& v : owned) {
-                if (v.type == ValueType::kVarChar && v.owned_data.empty() &&
-                    !v.value.varchar_value.empty()) {
-                  v.owned_data.assign(v.value.varchar_value);
-                  v.value.varchar_value = v.owned_data;
-                }
-              }
-              wl.group_keys.push_back(std::move(owned));
-              wl.group_aggs.emplace_back(n_aggs);
-            }
-            dst = &wl.group_aggs[it->second];
-          }
-
-          for (size_t ai = 0; ai < n_aggs; ++ai) {
-            if (agg_kinds[ai] == SimpleAggKind::kCountStar) {
-              (*dst)[ai].count += wt;
-            } else if (agg_is_root[ai]) {
-              if (!AddEntryCellWithWeight(&(*dst)[ai], agg_kinds[ai], chunk, r,
-                                          ri, agg_root_col[ai], wt)) {
-                wl.invalid = true;
-                return false;
-              }
-            }
-          }
-          // Star-hub child value branches (#11): scale by W_other = W_total /
-          // cw[ci].
-          for (size_t ci = 0; ci < n_rc; ++ci) {
-            const SubtreeSummary& ch_sum =
-                summaries[root_children[ci].child_ar];
-            if (ch_sum.owned_aggs.empty()) continue;
-            const uint64_t w_other = wt / cw[ci];
-            const size_t n_owned = ch_sum.owned_aggs.size();
-            const size_t base = csid[ci] * n_owned;
-            for (size_t oi = 0; oi < n_owned; ++oi) {
-              const size_t ai = ch_sum.owned_aggs[oi];
-              if (!MergeAggSlot(&(*dst)[ai], ch_sum.agg_states[base + oi],
-                                agg_kinds[ai], w_other)) {
-                wl.invalid = true;
-                return false;
-              }
-            }
-          }
-          return true;
-        });
-      }));
+            return true;
+          });
+        }));
+  }
 
   for (const auto& wl : locals) {
-    if (wl.invalid) return std::optional<Relation>{};
+    if (wl.invalid) {
+      return std::optional<Relation>{};
+    }
     total_comparisons += wl.comparisons;
   }
 
@@ -2623,7 +3663,9 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
     bool any = false;
     std::vector<AggSlotState> merged(n_aggs);
     for (const auto& wl : locals) {
-      if (!wl.has_scalar) continue;
+      if (!wl.has_scalar) {
+        continue;
+      }
       any = true;
       for (size_t ai = 0; ai < n_aggs; ++ai) {
         if (!MergeAggSlot(&merged[ai], wl.scalar_aggs[ai], agg_kinds[ai], 1)) {
@@ -2635,6 +3677,52 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       final_rep_rows.emplace_back(
           std::vector<Value>(full_active_schema.ColumnCount()));
       final_group_aggs.push_back(std::move(merged));
+    }
+  } else if (single_int_gk) {
+    FlatIntKeyMap<size_t> global_int_groups;
+    std::optional<size_t> global_null_idx;
+    for (const auto& wl : locals) {
+      for (size_t gi = 0; gi < wl.int_group_keys.size(); ++gi) {
+        size_t dst_idx = 0;
+        bool is_new = false;
+        if (wl.int_group_is_null[gi] != 0U) {
+          if (!global_null_idx.has_value()) {
+            global_null_idx = final_rep_rows.size();
+            dst_idx = *global_null_idx;
+            is_new = true;
+          } else {
+            dst_idx = *global_null_idx;
+          }
+        } else {
+          const int64_t kv = wl.int_group_keys[gi];
+          if (const size_t* found = global_int_groups.Find(kv)) {
+            dst_idx = *found;
+          } else {
+            dst_idx = final_rep_rows.size();
+            *global_int_groups.TryEmplace(kv) = dst_idx;
+            is_new = true;
+          }
+        }
+        if (is_new) {
+          Row rep(std::vector<Value>(full_active_schema.ColumnCount()));
+          const Value v =
+              wl.int_group_is_null[gi] != 0U
+                  ? Value()
+                  : (gk0_type == ValueType::kDate
+                         ? Value::DateFromDays(wl.int_group_keys[gi])
+                         : Value(wl.int_group_keys[gi]));
+          populate_group_rep_row(&rep, {v});
+          final_rep_rows.push_back(std::move(rep));
+          final_group_aggs.push_back(wl.group_aggs[gi]);
+        } else {
+          for (size_t ai = 0; ai < n_aggs; ++ai) {
+            if (!MergeAggSlot(&final_group_aggs[dst_idx][ai],
+                              wl.group_aggs[gi][ai], agg_kinds[ai], 1)) {
+              return std::optional<Relation>{};
+            }
+          }
+        }
+      }
     }
   } else {
     std::unordered_map<std::string, size_t> global_groups;
@@ -2689,7 +3777,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     const std::vector<PredicateInfo>& predicates, const Scope* outer,
     const CteMap& ctes, GroupedJoinFusionSpec* fusion) {
   static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_SMALL_DIM_DENSE_LOOKUP") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SMALL_DIM_DENSE_LOOKUP") !=
+      nullptr;
   if (disabled || fusion == nullptr || !fusion->eligible || fusion->fired ||
       outer != nullptr || !ctes.empty() || fusion->rollup_count_distribution ||
       fusion->anti_unmatched_only || fusion->aggregates.empty() ||
@@ -2747,7 +3836,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   }
   std::vector<bool> dim_has_edge(dims.size(), false);
   for (const PredicateInfo& p : predicates) {
-    if (!p.resolved || p.sources.size() < 2) continue;
+    if (!p.resolved || p.sources.size() < 2) {
+      continue;
+    }
     if (p.contains_query || p.sources.size() != 2 ||
         !IsColumnEqualityPredicate(p.expression) ||
         p.expression->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
@@ -2760,8 +3851,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
         rel_to_active[s0] < 0 || rel_to_active[s1] < 0) {
       return std::optional<Relation>{};
     }
-    const size_t a0 = static_cast<size_t>(rel_to_active[s0]);
-    const size_t a1 = static_cast<size_t>(rel_to_active[s1]);
+    const auto a0 = static_cast<size_t>(rel_to_active[s0]);
+    const auto a1 = static_cast<size_t>(rel_to_active[s1]);
     if (a0 != fact_ar && a1 != fact_ar) {
       return std::optional<Relation>{};
     }
@@ -2809,7 +3900,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     dlk.key_type = fcol.Type();
   }
   for (bool h : dim_has_edge) {
-    if (!h) return std::optional<Relation>{};
+    if (!h) {
+      return std::optional<Relation>{};
+    }
   }
 
   // Validate dim PK uniqueness and bounded span <= 65536 (`#14`).
@@ -2854,8 +3947,8 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
                           &bad)) {
         continue;
       }
-      const size_t off = static_cast<size_t>(static_cast<uint64_t>(kv) -
-                                             static_cast<uint64_t>(dlk.min_pk));
+      const auto off = static_cast<size_t>(static_cast<uint64_t>(kv) -
+                                           static_cast<uint64_t>(dlk.min_pk));
       if (dlk.dense_row_idx[off] != kAbsentSlot) {
         return std::optional<Relation>{};  // NOT strictly unique -> bail!
       }
@@ -2872,7 +3965,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   auto resolve_to_ar_col =
       [&](const ColumnName& cn) -> std::optional<std::pair<size_t, slot_t>> {
     const auto off = LocalColumnOffset(full_active_schema, cn);
-    if (!off.has_value()) return std::nullopt;
+    if (!off.has_value()) {
+      return std::nullopt;
+    }
     for (size_t ar = n_active; ar-- > 0;) {
       if (static_cast<size_t>(*off) >= ar_schema_offset[ar]) {
         return std::make_pair(ar,
@@ -2895,8 +3990,10 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     }
     auto res = resolve_to_ar_col(
         fusion->group_keys[k]->AsColumnValue().GetColumnName());
-    if (!res.has_value()) return std::optional<Relation>{};
-    gk_sources[k] = {res->first, res->second};
+    if (!res.has_value()) {
+      return std::optional<Relation>{};
+    }
+    gk_sources[k] = {.ar = res->first, .col = res->second};
   }
 
   std::vector<SimpleAggKind> agg_kinds(fusion->aggregates.size());
@@ -2904,7 +4001,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   for (size_t ai = 0; ai < fusion->aggregates.size(); ++ai) {
     auto kind =
         ClassifySimpleAgg(fusion->aggregates[ai], fusion->count_star[ai]);
-    if (!kind.has_value()) return std::optional<Relation>{};
+    if (!kind.has_value()) {
+      return std::optional<Relation>{};
+    }
     agg_kinds[ai] = *kind;
     if (!fusion->count_star[ai]) {
       const Expression& ch = fusion->aggregates[ai]->Child();
@@ -2912,14 +4011,18 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
         return std::optional<Relation>{};
       }
       auto res = resolve_to_ar_col(ch->AsColumnValue().GetColumnName());
-      if (!res.has_value()) return std::optional<Relation>{};
-      agg_sources[ai] = {res->first, res->second};
+      if (!res.has_value()) {
+        return std::optional<Relation>{};
+      }
+      agg_sources[ai] = {.ar = res->first, .col = res->second};
     }
   }
 
   const auto allowed_fn = [&](const ColumnName& cn) -> bool {
     auto res = resolve_to_ar_col(cn);
-    if (!res.has_value()) return false;
+    if (!res.has_value()) {
+      return false;
+    }
     return std::ranges::any_of(gk_sources, [&](const ColSource& gs) {
       return gs.ar == res->first && gs.col == res->second;
     });
@@ -3077,7 +4180,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
 
   uint64_t total_comparisons = 0;
   for (const auto& wl : locals) {
-    if (wl.invalid) return std::optional<Relation>{};
+    if (wl.invalid) {
+      return std::optional<Relation>{};
+    }
     total_comparisons += wl.comparisons;
   }
 
@@ -3087,7 +4192,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     bool any = false;
     std::vector<AggSlotState> merged(n_aggs);
     for (const auto& wl : locals) {
-      if (!wl.has_scalar) continue;
+      if (!wl.has_scalar) {
+        continue;
+      }
       any = true;
       for (size_t ai = 0; ai < n_aggs; ++ai) {
         if (!MergeAggSlot(&merged[ai], wl.scalar_aggs[ai], agg_kinds[ai], 1)) {

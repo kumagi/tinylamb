@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
 #include "table/fuzz/fuzz_scheme_cases.hpp"
@@ -46,22 +47,27 @@ constexpr size_t kCaseCount = kSchemeCaseCount;
 // harness. The harness is single-threaded; the process environment is
 // deliberately global here, so the getenv/setenv/unsetenv calls carry
 // NOLINT(concurrency-mt-unsafe) annotations.
-class ScopedForcedScheme {
+class ScopedForcedScheme {  // NOLINT(cppcoreguidelines-special-member-functions):
+                            // scope-owned cleanup.
+
  public:
   explicit ScopedForcedScheme(const char* name) {
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char* prev = std::getenv("TINYLAMB_FORCE_SCHEME");
+    const char* prev = ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME");
     if (prev != nullptr) {
       previous_ = prev;
     }
-    setenv("TINYLAMB_FORCE_SCHEME", name, 1);  // NOLINT(concurrency-mt-unsafe)
+    ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", name,
+                                 1);  // NOLINT(concurrency-mt-unsafe)
   }
   ~ScopedForcedScheme() {
     if (previous_) {
       // NOLINTNEXTLINE(concurrency-mt-unsafe)
-      setenv("TINYLAMB_FORCE_SCHEME", previous_->c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", previous_->c_str(),
+                                   1);
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
+      ::tinylamb::platform::UnsetEnv(
+          "TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ScopedForcedScheme(const ScopedForcedScheme&) = delete;
@@ -85,8 +91,7 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
             sc)
             .MoveValue();
     const auto& enc = chunk.GetFooter().encodings;
-    if (c.col < enc.size() &&
-        enc[c.col] == static_cast<uint8_t>(c.expected)) {
+    if (c.col < enc.size() && enc[c.col] == static_cast<uint8_t>(c.expected)) {
       *ok = true;
       return chunk;
     }

@@ -100,7 +100,7 @@ class LateMaterializationPlanTest : public ::testing::Test {
 
   void TearDown() override {
     if (context_ != nullptr && !context_->IsFinished()) {
-      context_->txn_.PreCommit();
+      EXPECT_EQ(tinylamb::Status::kSuccess, context_->txn_.PreCommit());
     }
     database_->DeleteAll();
   }
@@ -142,7 +142,7 @@ TEST_F(LateMaterializationPlanTest, RulePublishesLogicalPlanForWideSmallBuild) {
     actual.emplace_back(row[0].value.int_value, row[1].value.int_value);
   }
   std::vector<std::pair<int64_t, int64_t>> expected;
-  expected.reserve(40 * 4);
+  expected.reserve(size_t{40} * 4);
   for (int64_t i = 0; i < 40; ++i) {
     for (int64_t key = 1; key <= 4; ++key) {
       if (i % 10 == key) {
@@ -237,7 +237,8 @@ TEST_F(LateMaterializationPlanTest, RuleRejectsRowPositionOuterAndArrayShapes) {
       IndexSchema("array_right_k", {0}, {}, IndexMode::kNonUnique)));
   ASSERT_SUCCESS(array_setup.txn_.PreCommit());
   TransactionContext array_statistics = database_->BeginContext();
-  database_->RefreshStatistics(array_statistics, "ArrayRight");
+  EXPECT_EQ(tinylamb::Status::kSuccess,
+            database_->RefreshStatistics(array_statistics, "ArrayRight"));
   ASSERT_SUCCESS(array_statistics.txn_.PreCommit());
   auto array_shared = array_statistics.GetTable("ArrayRight").MoveValue();
   auto array_stats = array_statistics.GetStats("ArrayRight").MoveValue();

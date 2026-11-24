@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/runtime_filter.hpp"
 #include "common/status_or.hpp"
@@ -74,24 +75,28 @@ namespace {
 
 // Restores the previous value on scope exit so a failed EXPECT/EXPLAIN cannot
 // leave TINYLAMB_DISABLE_PARALLEL_SCAN set for a concurrent or later test.
-class ScopedDisableParallelScan {
+class ScopedDisableParallelScan {  // NOLINT(cppcoreguidelines-special-member-functions):
+                                   // scope-owned cleanup.
+
  public:
   ScopedDisableParallelScan() {
-    const char* prev = ::getenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
+    const char* prev =
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_SCAN");
     if (prev != nullptr) {
       had_prev_ = true;
       prev_ = prev;
     }
-    ::setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
+    ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
   }
   ScopedDisableParallelScan(const ScopedDisableParallelScan&) = delete;
   ScopedDisableParallelScan& operator=(const ScopedDisableParallelScan&) =
       delete;
   ~ScopedDisableParallelScan() {
     if (had_prev_) {
-      ::setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", prev_.c_str(), 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_PARALLEL_SCAN",
+                                   prev_.c_str(), 1);
     } else {
-      ::unsetenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_PARALLEL_SCAN");
     }
   }
 
@@ -634,7 +639,7 @@ class DynamicFilterExecutorTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    context_->Abort();
+    EXPECT_EQ(tinylamb::Status::kSuccess, context_->Abort());
     context_.reset();
     database_->DeleteAll();
   }

@@ -92,11 +92,10 @@ TEST_F(SqlFunctionEdgeTest, FormatTimestampUsesDefaultTimeZoneOffset) {
   // path, including a thrown RunSql, so later tests (or a still-running
   // engine thread) never inherit the override.
   const std::string previous_zone = GetDefaultTimeZone();
-  struct RestoreZone {
-    explicit RestoreZone(std::string  zone) : zone_(std::move(zone)) {}
+  struct RestoreZone {  // NOLINT(cppcoreguidelines-special-member-functions):
+                        // scope-owned cleanup.
+    explicit RestoreZone(std::string zone) : zone_(std::move(zone)) {}
     ~RestoreZone() { SetDefaultTimeZone(zone_); }
-    RestoreZone(const RestoreZone&) = delete;
-    RestoreZone& operator=(const RestoreZone&) = delete;
     std::string zone_;
   } restore_zone(previous_zone);
   SetDefaultTimeZone("+05:45");

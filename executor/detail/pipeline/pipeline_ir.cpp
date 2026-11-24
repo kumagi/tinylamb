@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/pipeline/pipeline_ir.hpp"
 
 #include <algorithm>
@@ -157,7 +158,7 @@ StatusOr<bool> LegacySource::NextBatch(PipelineContext* ctx, DataChunk* out,
   // Timing a legacy batch costs two vDSO clock reads plus a shared atomic
   // RMW. Make that diagnostic opt-in so ordinary queries do not pay it.
   static const bool kTimeLegacySource =
-      std::getenv("TINYLAMB_PIPELINE_METRICS") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_PIPELINE_METRICS") != nullptr;
   const bool time_it = ctx != nullptr && kTimeLegacySource;
   const auto t0 = time_it ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};

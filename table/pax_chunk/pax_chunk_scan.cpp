@@ -18,6 +18,7 @@
 #include <cmath>
 #include <ranges>
 
+#include "common/platform/process.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -2377,17 +2378,20 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
   // / XorRgMask pass-safe), WASM returns ~0ULL (inv) or a pass-all mask
   // (xor), so skipping these sections is never wrong, only slower on the
   // queries they accelerate. Documented in docs/environment_variables.md.
-  const bool kNoInvIdx = std::getenv("TINYLAMB_NO_INV_IDX") != nullptr;
-  const bool kNoXor8 = std::getenv("TINYLAMB_NO_XOR8") != nullptr;
+  const bool kNoInvIdx =
+      ::tinylamb::platform::GetEnv("TINYLAMB_NO_INV_IDX") != nullptr;
+  const bool kNoXor8 =
+      ::tinylamb::platform::GetEnv("TINYLAMB_NO_XOR8") != nullptr;
   // Adaptive-encoder env knobs, read once per build (getenv per call, never
   // cached in a function-local static, so setenv toggles in tests and
   // benchmarks take effect on the next build) and threaded into every row
   // group's EncodeColumnAdaptive without re-probing the environment.
   const AdaptiveEnv env{
       .force_plain = ForcePlain(),
-      .no_new_schemes = std::getenv("TINYLAMB_NO_NEW_SCHEMES") != nullptr,
+      .no_new_schemes =
+          ::tinylamb::platform::GetEnv("TINYLAMB_NO_NEW_SCHEMES") != nullptr,
       .no_inv_idx = kNoInvIdx,
-      .forced_scheme = std::getenv("TINYLAMB_FORCE_SCHEME")};
+      .forced_scheme = ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME")};
 
   // Front-load the big allocations: the column region's PLAIN bound and the
   // serialized hash-index table dominate the final chunk size, and letting
@@ -2400,9 +2404,11 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
         (run.Size() * static_cast<size_t>(footer.column_count) * 8) +
         (64 << 10);
     if (footer.key_column_type == static_cast<uint8_t>(ValueType::kInt64) &&
-        std::getenv("TINYLAMB_NO_HASH_IDX") == nullptr) {
+        ::tinylamb::platform::GetEnv("TINYLAMB_NO_HASH_IDX") == nullptr) {
       const size_t slots_per_row =
-          std::getenv("TINYLAMB_SMALL_HASH_IDX") != nullptr ? 2 : 4;
+          ::tinylamb::platform::GetEnv("TINYLAMB_SMALL_HASH_IDX") != nullptr
+              ? 2
+              : 4;
       size_t slots = 1;
       while (slots < run.Size() * slots_per_row) {
         slots <<= 1;
@@ -2942,9 +2948,10 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
         // binary search serves point lookups instead (see PointLookup).
         // Read per call (see kNoNewSchemes): a function-local static would
         // latch the first build's env answer.
-        const bool kNoHashIdx = std::getenv("TINYLAMB_NO_HASH_IDX") != nullptr;
+        const bool kNoHashIdx =
+            ::tinylamb::platform::GetEnv("TINYLAMB_NO_HASH_IDX") != nullptr;
         const bool kSmallHashIdx =
-            std::getenv("TINYLAMB_SMALL_HASH_IDX") != nullptr;
+            ::tinylamb::platform::GetEnv("TINYLAMB_SMALL_HASH_IDX") != nullptr;
         if (!kNoHashIdx && !footer.hash_idx_present &&
             sc.GetColumn(sc.KeyColumnIndex()).Type() == ValueType::kInt64) {
           footer.hash_idx_present = true;
@@ -3213,7 +3220,8 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
   size_t footer_start = data.size();
   // Read per call (see kNoNewSchemes): a function-local static would latch
   // the first build's answer, silently ignoring later setenv toggles.
-  const bool kNoCrc = std::getenv("TINYLAMB_NO_CRC") != nullptr;
+  const bool kNoCrc =
+      ::tinylamb::platform::GetEnv("TINYLAMB_NO_CRC") != nullptr;
   footer.format_version = kNoCrc ? 1U : 2U;
   AppendBE64(data, footer.schema_version);
   AppendBE32(data, footer.format_version);
@@ -3806,7 +3814,8 @@ bool DecodableIntCacheScheme(Scheme scheme) {
 
 std::span<const int64_t> PaxChunk::DecodedIntCell(slot_t col,
                                                   uint32_t group) const {
-  const size_t index = (static_cast<size_t>(group) * footer_.column_count) + col;
+  const size_t index =
+      (static_cast<size_t>(group) * footer_.column_count) + col;
   if (group >= footer_.row_counts.size() || index >= footer_.encodings.size() ||
       !DecodableIntCacheScheme(static_cast<Scheme>(footer_.encodings[index]))) {
     return {};
@@ -4853,7 +4862,7 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
   // broken index behind a kNotExists / re-verified kSuccess.
   {
     size_t hidx = 0;
-    const Status hash_status = HashLookup(key_value, &hidx);
+    Status hash_status = HashLookup(key_value, &hidx);
     if (hash_status == Status::kCorruption) {
       return hash_status;
     }
@@ -5589,7 +5598,7 @@ struct WalkResult {
 };
 
 WalkResult ValidateWalk(const std::vector<char>& b) {
-  const bool dbg = std::getenv("TINYLAMB_VALDBG") != nullptr;
+  const bool dbg = ::tinylamb::platform::GetEnv("TINYLAMB_VALDBG") != nullptr;
   auto trace = [&](int stage, uint64_t v) {
     if (dbg) {
       std::cerr << "validate trace stage=" << stage << " val=" << v << "\n";

@@ -161,12 +161,12 @@ struct GroupingSetBranchContext {
 };
 
 // Branch contexts borrow these fingerprints for one synchronous expansion.
-class GroupingSetKeyTexts {
+class GroupingSetKeyTexts {  // NOLINT(cppcoreguidelines-special-member-functions):
+                             // scope-owned cleanup.
+
  public:
   explicit GroupingSetKeyTexts(
       const std::vector<std::vector<Expression>>& grouping_sets);
-  GroupingSetKeyTexts(const GroupingSetKeyTexts&) = delete;
-  GroupingSetKeyTexts& operator=(const GroupingSetKeyTexts&) = delete;
 
   [[nodiscard]] GroupingSetBranchContext ForBranch(
       const std::vector<Expression>& active) const;

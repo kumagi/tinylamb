@@ -44,6 +44,7 @@
 #include "common/exception_status.hpp"
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
 #include "page/page_manager.hpp"
@@ -106,7 +107,8 @@ void TransactionManager::WireDurabilityWaiter() {
 
 int64_t TransactionManager::WriteIntentWaitLimitMsFromEnv() {
   constexpr int64_t kDefaultMs = 5'000;
-  const char* env = std::getenv("TINYLAMB_WRITE_INTENT_WAIT_MS");
+  const char* env =
+      ::tinylamb::platform::GetEnv("TINYLAMB_WRITE_INTENT_WAIT_MS");
   if (env == nullptr || env[0] == '\0') {
     return kDefaultMs;
   }
@@ -1004,7 +1006,8 @@ bool TransactionManager::AcquireWriteIntent(
   // (diagnostic A/B: the escape hatch then counts wall clock from the first
   // wait, aborting deep-but-moving queues).
   static const bool kProgressResetDisabled =
-      std::getenv("TINYLAMB_INTENT_NO_PROGRESS_RESET") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_INTENT_NO_PROGRESS_RESET") !=
+      nullptr;
   auto check_holder_progress = [&]() {
     const txn_id_t current = holder_id();
     if (current != observed_holder) {
@@ -1784,7 +1787,8 @@ TransactionRuntimeStats TransactionManager::RuntimeStats() const {
   // closed. Operators distinguish "no WAL configured" from "WAL stalled" by
   // the manager's construction config, not by these zero gauges alone.
   const Logger::SyncStats sync =
-      logger_ == nullptr ? Logger::SyncStats{.count=0, .nanoseconds=0} : logger_->GetSyncStats();
+      logger_ == nullptr ? Logger::SyncStats{.count = 0, .nanoseconds = 0}
+                         : logger_->GetSyncStats();
   const lsn_t buffered_lsn = logger_ == nullptr ? 0 : logger_->BufferedLSN();
   const lsn_t durable_lsn = logger_ == nullptr ? 0 : logger_->DurableLSN();
   return {
@@ -2577,7 +2581,7 @@ Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
   const uint64_t commit_ts = AllocatePendingCommit();
   const size_t entry_count = txn.write_set_.size();
   size_t next = 0;
-  const Status iter_status =
+  Status iter_status =
       txn.write_set_.ForEach([&](const RowPosition& rp) -> Status {
         bool retried_bad_alloc = false;
         while (true) {
@@ -3521,7 +3525,8 @@ int TransactionManager::ReservationBisectMode() {
   // off, 5=discount on but the tree-level drain retry off.
   // Read per call: diagnostics toggle this env at runtime and a function-local
   // static would keep the startup value.
-  const char* env = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
+  const char* env =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_RESERVATION");
   if (env == nullptr) {
     return 0;
   }

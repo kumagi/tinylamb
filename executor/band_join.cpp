@@ -259,16 +259,18 @@ Status BandJoin::Materialize() {
     if (!key.HasValue()) {
       return key.GetStatus();
     }
-    if (!key.Value().has_value()) {
+    const auto& maybe_key = key.Value();
+    if (!maybe_key.has_value()) {
       continue;
     }
-    if (have_previous_key && key.Value().value() < previous_key) {
+    const int64_t key_value = maybe_key.value();
+    if (have_previous_key && key_value < previous_key) {
       return StatusError(StatusCode::kInvalidArgument,
                          "BandJoin right input is not ordered");
     }
-    previous_key = key.Value().value();
+    previous_key = key_value;
     have_previous_key = true;
-    right_keys_.push_back(RightKey{.value = *key.Value(), .row_index = i});
+    right_keys_.push_back(RightKey{.value = key_value, .row_index = i});
   }
 
   std::vector<char> right_matched(right_rows_.size(), 0);
@@ -301,19 +303,21 @@ Status BandJoin::Materialize() {
     if (!key.HasValue()) {
       return key.GetStatus();
     }
-    if (key.Value().has_value()) {
-      if (have_previous_key && key.Value().value() < previous_key) {
+    const auto& maybe_key = key.Value();
+    if (maybe_key.has_value()) {
+      const int64_t key_value = maybe_key.value();
+      if (have_previous_key && key_value < previous_key) {
         return StatusError(StatusCode::kInvalidArgument,
                            "BandJoin left input is not ordered");
       }
-      previous_key = key.Value().value();
+      previous_key = key_value;
       have_previous_key = true;
     }
 
     bool matched = false;
     size_t match_count = 0;
-    if (key.Value().has_value()) {
-      const auto [begin, end] = CandidateRange(*key.Value());
+    if (maybe_key.has_value()) {
+      const auto [begin, end] = CandidateRange(maybe_key.value());
       for (size_t right_index = begin; right_index < end; ++right_index) {
         const size_t row_index = right_keys_[right_index].row_index;
         StatusOr<bool> passes =

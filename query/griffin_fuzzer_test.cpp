@@ -2,6 +2,8 @@
 
 #include "query/griffin_fuzzer.hpp"
 
+#include <filesystem>
+#include <system_error>
 #include <dirent.h>
 
 #include <cstdint>
@@ -24,7 +26,7 @@ namespace {
 // every executed SELECT. A non-empty report is a logic bug in the bytecode
 // compiler, the JIT kernels, or the executor.
 TEST(GriffinFuzzer, SeededIterationsHoldOracles) {
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
+  const char* scale = ::tinylamb::platform::GetEnv("TINYLAMB_FUZZ_ITERS");
   int kIterations = 64;
   if (scale != nullptr) {
     char* end = nullptr;
@@ -102,7 +104,7 @@ TEST(GriffinFuzzer, BytecodeDisabledPathStillExecutes) {
   // Snapshot both *presence* and value: an inherited `=0` must be restored as
   // `0`, not unset. Copy the value before SetEnv may invalidate getenv's
   // pointer.
-  const char* prior_disable = std::getenv("TINYLAMB_DISABLE_BYTECODE");
+  const char* prior_disable = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_BYTECODE");
   const std::string prior_value =
       prior_disable == nullptr ? std::string() : std::string(prior_disable);
   platform::SetEnv("TINYLAMB_DISABLE_BYTECODE", "1");
@@ -127,20 +129,15 @@ TEST(GriffinFuzzer, BytecodeDisabledPathStillExecutes) {
 
 std::vector<std::string> ListTestFiles(const std::string& dir) {
   std::vector<std::string> files;
-  DIR* handle = opendir(dir.c_str());
-  if (handle == nullptr) {
-    return files;
-  }
-  while (const dirent* entry = readdir(handle)) {
-    const std::string name = entry->d_name;
-    if (name.size() > 5 && name.substr(name.size() - 5) == ".test") {
-      std::string path = dir;
-      path += "/";
-      path += name;
-      files.push_back(path);
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const std::filesystem::path path = it->path();
+    if (path.filename().string().ends_with(".test")) {
+      files.push_back(path.string());
     }
   }
-  closedir(handle);
   return files;
 }
 
@@ -148,7 +145,7 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 // under TINYLAMB_GRIFFIN_REGRESSION_DIR (mirrors the sql_oracle/session
 // regression-replay tests).  With no directory set the test skips.
 TEST(GriffinFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_GRIFFIN_REGRESSION_DIR");
+  const char* dir = ::tinylamb::platform::GetEnv("TINYLAMB_GRIFFIN_REGRESSION_DIR");
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }

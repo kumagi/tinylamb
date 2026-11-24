@@ -36,6 +36,8 @@ class LsmScanCursor;
 
 class LsmIndexIterator {
  public:
+  LsmIndexIterator(const LsmIndexIterator&) = delete;
+  LsmIndexIterator& operator=(const LsmIndexIterator&) = delete;
   LsmIndexIterator() = default;
   LsmIndexIterator(LsmIndex* tree, Transaction* txn,
                    std::string_view begin = "", std::string_view end = "",
@@ -61,7 +63,9 @@ class LsmIndexIterator {
 
   void EnableStableLeafCache() { stable_leaf_cache_ = true; }
   void DisableStableLeafCache() { stable_leaf_cache_ = false; }
-  [[nodiscard]] bool StableLeafCacheEnabled() const { return stable_leaf_cache_; }
+  [[nodiscard]] bool StableLeafCacheEnabled() const {
+    return stable_leaf_cache_;
+  }
   [[nodiscard]] bool EnsureLeafCache() const {
     return valid_ && EntryAt(idx_) != nullptr;
   }

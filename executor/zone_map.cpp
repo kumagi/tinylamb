@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/zone_map.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -366,14 +367,18 @@ KleeneMask BitFor(Val4 v) noexcept {
 
 KleeneMask KleeneNot(KleeneMask m) noexcept {
   KleeneMask out = kKleeneNone;
-  if ((m & kKleeneT) != 0) { out |= kKleeneF;
-}
-  if ((m & kKleeneF) != 0) { out |= kKleeneT;
-}
-  if ((m & kKleeneU) != 0) { out |= kKleeneU;
-}
-  if ((m & kKleeneE) != 0) { out |= kKleeneE;
-}
+  if ((m & kKleeneT) != 0) {
+    out |= kKleeneF;
+  }
+  if ((m & kKleeneF) != 0) {
+    out |= kKleeneT;
+  }
+  if ((m & kKleeneU) != 0) {
+    out |= kKleeneU;
+  }
+  if ((m & kKleeneE) != 0) {
+    out |= kKleeneE;
+  }
   return out;
 }
 
@@ -388,13 +393,15 @@ KleeneMask KleeneAnd(KleeneMask a, KleeneMask b) noexcept {
     }
   }
   KleeneMask out = kKleeneNone;
-  const Val4 vals[4] = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
+  const std::array<Val4, 4> vals = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
   for (Val4 va : vals) {
-    if ((a & BitFor(va)) == 0) { continue;
-}
+    if ((a & BitFor(va)) == 0) {
+      continue;
+    }
     for (Val4 vb : vals) {
-      if ((b & BitFor(vb)) == 0) { continue;
-}
+      if ((b & BitFor(vb)) == 0) {
+        continue;
+      }
       if (va == Val4::kE || vb == Val4::kE) {
         out |= kKleeneE;
       } else if (va == Val4::kF || vb == Val4::kF) {
@@ -411,13 +418,15 @@ KleeneMask KleeneAnd(KleeneMask a, KleeneMask b) noexcept {
 
 KleeneMask KleeneOr(KleeneMask a, KleeneMask b) noexcept {
   KleeneMask out = kKleeneNone;
-  const Val4 vals[4] = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
+  const std::array<Val4, 4> vals = {Val4::kT, Val4::kF, Val4::kU, Val4::kE};
   for (Val4 va : vals) {
-    if ((a & BitFor(va)) == 0) { continue;
-}
+    if ((a & BitFor(va)) == 0) {
+      continue;
+    }
     for (Val4 vb : vals) {
-      if ((b & BitFor(vb)) == 0) { continue;
-}
+      if ((b & BitFor(vb)) == 0) {
+        continue;
+      }
       if (va == Val4::kE || vb == Val4::kE) {
         out |= kKleeneE;
       } else if (va == Val4::kT || vb == Val4::kT) {
@@ -533,10 +542,12 @@ KleeneMask EvalColConstCompare(const LSTableColumnBlock& col,
       default:
         return kKleeneAll;
     }
-    if (may_t) { out |= kKleeneT;
-}
-    if (may_f) { out |= kKleeneF;
-}
+    if (may_t) {
+      out |= kKleeneT;
+    }
+    if (may_f) {
+      out |= kKleeneF;
+    }
     return out;
   }
   if (col.type == ValueType::kDouble) {
@@ -598,10 +609,12 @@ KleeneMask EvalColConstCompare(const LSTableColumnBlock& col,
       default:
         return kKleeneAll;
     }
-    if (may_t) { out |= kKleeneT;
-}
-    if (may_f) { out |= kKleeneF;
-}
+    if (may_t) {
+      out |= kKleeneT;
+    }
+    if (may_f) {
+      out |= kKleeneF;
+    }
     return out;
   }
   return kKleeneAll;
@@ -658,28 +671,36 @@ KleeneMask EvalKleeneImpl(  // NOLINT(misc-no-recursion)
       KleeneMask out = (inner & kKleeneE);
       switch (u.Op()) {
         case UnaryOperation::kIsTrue:
-          if ((inner & kKleeneT) != 0) { out |= kKleeneT;
-}
-          if ((inner & (kKleeneF | kKleeneU)) != 0) { out |= kKleeneF;
-}
+          if ((inner & kKleeneT) != 0) {
+            out |= kKleeneT;
+          }
+          if ((inner & (kKleeneF | kKleeneU)) != 0) {
+            out |= kKleeneF;
+          }
           return out;
         case UnaryOperation::kIsNotTrue:
-          if ((inner & (kKleeneF | kKleeneU)) != 0) { out |= kKleeneT;
-}
-          if ((inner & kKleeneT) != 0) { out |= kKleeneF;
-}
+          if ((inner & (kKleeneF | kKleeneU)) != 0) {
+            out |= kKleeneT;
+          }
+          if ((inner & kKleeneT) != 0) {
+            out |= kKleeneF;
+          }
           return out;
         case UnaryOperation::kIsFalse:
-          if ((inner & kKleeneF) != 0) { out |= kKleeneT;
-}
-          if ((inner & (kKleeneT | kKleeneU)) != 0) { out |= kKleeneF;
-}
+          if ((inner & kKleeneF) != 0) {
+            out |= kKleeneT;
+          }
+          if ((inner & (kKleeneT | kKleeneU)) != 0) {
+            out |= kKleeneF;
+          }
           return out;
         case UnaryOperation::kIsNotFalse:
-          if ((inner & (kKleeneT | kKleeneU)) != 0) { out |= kKleeneT;
-}
-          if ((inner & kKleeneF) != 0) { out |= kKleeneF;
-}
+          if ((inner & (kKleeneT | kKleeneU)) != 0) {
+            out |= kKleeneT;
+          }
+          if ((inner & kKleeneF) != 0) {
+            out |= kKleeneF;
+          }
           return out;
         default:
           return kKleeneAll;

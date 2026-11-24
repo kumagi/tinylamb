@@ -84,9 +84,9 @@ struct PrefixInPredicate {
 
   static constexpr uint64_t kEmptySlot = ~uint64_t{0};
 
-  static uint64_t PackPrefix(const char* data, size_t len) noexcept {
+  static uint64_t PackPrefix(std::string_view prefix) noexcept {
     uint64_t v = 0;
-    std::memcpy(&v, data, len);
+    std::memcpy(&v, prefix.data(), prefix.size());
     return v;
   }
 
@@ -106,7 +106,7 @@ struct PrefixInPredicate {
       packed_table.assign(cap, kEmptySlot);
       packed_mask = cap - 1;
       for (const std::string& p : prefixes) {
-        const uint64_t key = PackPrefix(p.data(), prefix_len);
+        const uint64_t key = PackPrefix(p);
         size_t pos = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 32U) &
                      packed_mask;
         while (packed_table[pos] != kEmptySlot && packed_table[pos] != key) {
@@ -127,7 +127,7 @@ struct PrefixInPredicate {
       return false;
     }
     if (!packed_table.empty()) {
-      const uint64_t key = PackPrefix(text.data(), prefix_len);
+      const uint64_t key = PackPrefix(text.substr(0, prefix_len));
       if (key == kEmptySlot) {
         return false;
       }

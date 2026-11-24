@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "query/select_rewrites.hpp"
 
 #include <gtest/gtest.h>
@@ -1479,9 +1480,9 @@ TEST_F(SelectRewritesTest, QualifyPushdownPartitionIntersectionAndAliasGuard) {
   // 4. End-to-end SQL parity: OFF vs ON across non-grouped and grouped QUALIFY.
   auto run_sql = [&](bool disable, const std::string& sql) {
     if (disable) {
-      ::setenv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN", "1", 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN", "1", 1);
     } else {
-      ::unsetenv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_QUALIFY_PUSHDOWN");
     }
     return collect_rows(sql);
   };
@@ -1518,9 +1519,9 @@ TEST_F(SelectRewritesTest, OuterJoinCountsFullLeftInnerNullsAndEmpties) {
   };
   auto run_sql = [&](bool disable, const std::string& sql) {
     if (disable) {
-      ::setenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", "1", 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", "1", 1);
     } else {
-      ::unsetenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
     }
     PreparedPlanCache::Instance().Clear();
     CurrentCompiledPlans().clear();
@@ -1588,7 +1589,7 @@ TEST_F(SelectRewritesTest, OuterJoinCountsFullLeftInnerNullsAndEmpties) {
   };
 
   for (const std::string& sql : queries) {
-    ::unsetenv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
+    ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
     auto parsed = ParseSelect(sql);
     ASSERT_NE(parsed, nullptr) << sql;
     EXPECT_TRUE(RewriteOuterJoinGroupedCountToHistograms(parsed.get(), *ctx_))
@@ -1612,9 +1613,9 @@ TEST_F(SelectRewritesTest, WindowHaloAndOuterFetchTiesSqlParity) {
   auto run_with_env = [&](const char* env_name, bool disable,
                           const std::string& sql) {
     if (disable) {
-      ::setenv(env_name, "1", 1);
+      ::tinylamb::platform::SetEnv(env_name, "1", 1);
     } else {
-      ::unsetenv(env_name);
+      ::tinylamb::platform::UnsetEnv(env_name);
     }
     PreparedPlanCache::Instance().Clear();
     CurrentCompiledPlans().clear();

@@ -115,7 +115,8 @@ class CompactTxnBitmap {
           // so a chronically exhausted budget cannot go silent after the
           // first chunk.
           untracked_bytes_ =
-              untracked_bytes_ > std::numeric_limits<size_t>::max() - kChunkBytes
+              untracked_bytes_ >
+                      std::numeric_limits<size_t>::max() - kChunkBytes
                   ? std::numeric_limits<size_t>::max()
                   : untracked_bytes_ + kChunkBytes;
           if (!emergency_warned_ ||
@@ -124,10 +125,10 @@ class CompactTxnBitmap {
                    emergency_warned_bytes_)) {
             emergency_warned_ = true;
             emergency_warned_bytes_ = untracked_bytes_;
-            LOG(WARN) << "Recovery committed bitmap emergency reserve rejected; "
-                      << "using untracked chunk (" << kChunkBytes
-                      << " bytes, " << untracked_bytes_
-                      << " bytes untracked so far)";
+            LOG(WARN)
+                << "Recovery committed bitmap emergency reserve rejected; "
+                << "using untracked chunk (" << kChunkBytes << " bytes, "
+                << untracked_bytes_ << " bytes untracked so far)";
           }
         }
       }
@@ -140,8 +141,7 @@ class CompactTxnBitmap {
         // the same total; showing only charge_.Bytes() would hide the bulk
         // of a bitmap that lives on the emergency budget.
         LOG(WARN) << "Recovery committed TXN bitmap exceeded "
-                  << (kWarnBytes >> 20)
-                  << " MiB (bytes="
+                  << (kWarnBytes >> 20) << " MiB (bytes="
                   << (charge_.Bytes() + emergency_bytes_ + untracked_bytes_)
                   << "); WAL replay window may need more frequent checkpoints";
       }
@@ -183,11 +183,11 @@ class CompactTxnBitmap {
 // window must not grow unaccounted the way the bitmap once did.
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
 // non-copyable by design
-class RecoveryMetaCharge {
+class RecoveryMetaCharge {  // NOLINT(cppcoreguidelines-special-member-functions):
+                            // scope-owned cleanup.
+
  public:
   explicit RecoveryMetaCharge(std::string_view what) : what_(what) {}
-  RecoveryMetaCharge(const RecoveryMetaCharge&) = delete;
-  RecoveryMetaCharge& operator=(const RecoveryMetaCharge&) = delete;
   ~RecoveryMetaCharge() {
     if (emergency_bytes_ > 0) {
       ProcessMemoryBudget::Global().ReleaseEmergency(MemoryPoolKind::kStorage,
@@ -280,10 +280,9 @@ std::shared_ptr<RecoveryManager::ReadFd> RecoveryManager::SegmentFdFor(
     // Skip the live writer's update window while keeping the same strict
     // validation for idle live segments and segments read during recovery.
     const auto logical =
-        logger_ != nullptr
-            ? logger_->ReadSegmentLogicalSize(index, allow_torn)
-            : Logger::SegmentLogicalSize(log_name_, index, segment_size_,
-                                         allow_torn);
+        logger_ != nullptr ? logger_->ReadSegmentLogicalSize(index, allow_torn)
+                           : Logger::SegmentLogicalSize(
+                                 log_name_, index, segment_size_, allow_torn);
     if (!logical.HasValue()) {
       platform::CloseFile(raw_fd);
       return {};
@@ -926,7 +925,8 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
     // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
     // non-copyable by design
-    struct FloorResetGuard {
+    struct FloorResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                              // scope-owned cleanup.
       PageManager* pm;
       ~FloorResetGuard() {
         if (pm != nullptr) {

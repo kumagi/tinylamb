@@ -37,6 +37,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -77,6 +78,14 @@ extern char** environ;  // NOLINT(readability-redundant-declaration)
 #endif
 
 namespace tinylamb::platform {
+namespace {
+
+std::mutex& ProcessEnvironmentMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+}  // namespace
 
 std::filesystem::path CurrentExecutablePath() {
 #ifdef TINYLAMB_OS_WINDOWS
@@ -135,14 +144,29 @@ int GetPid() {
 #endif
 }
 
+const char* GetEnv(const char* name) {
+  if (name == nullptr) {
+    return nullptr;
+  }
+  std::scoped_lock lock(ProcessEnvironmentMutex());
+  // Project environment reads and writes go through this lock. The pointer
+  // follows getenv's lifetime and must not be retained across SetEnv calls.
+  return std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
+}
+
+std::string StrError(int error) {
+  return std::error_code(error, std::generic_category()).message();
+}
+
 int SetEnv(const char* name, const char* value, int overwrite) {
+  std::scoped_lock lock(ProcessEnvironmentMutex());
 #ifdef TINYLAMB_OS_WINDOWS
   if (name == nullptr || *name == '\0' || std::strchr(name, '=') != nullptr ||
       value == nullptr) {
     errno = EINVAL;
     return -1;
   }
-  if (overwrite == 0 && std::getenv(name) != nullptr) {
+  if (overwrite == 0 && std::getenv(name) != nullptr) {  // NOLINT(concurrency-mt-unsafe)
     return 0;
   }
   const errno_t err = ::_putenv_s(name, value);
@@ -153,11 +177,12 @@ int SetEnv(const char* name, const char* value, int overwrite) {
   ::SetEnvironmentVariableA(name, value);
   return 0;
 #else
-  return ::setenv(name, value, overwrite);
+  return ::setenv(name, value, overwrite);  // NOLINT(concurrency-mt-unsafe)
 #endif
 }
 
 int UnsetEnv(const char* name) {
+  std::scoped_lock lock(ProcessEnvironmentMutex());
 #ifdef TINYLAMB_OS_WINDOWS
   if (name == nullptr || *name == '\0' || std::strchr(name, '=') != nullptr) {
     errno = EINVAL;
@@ -173,7 +198,7 @@ int UnsetEnv(const char* name) {
   ::SetEnvironmentVariableA(name, nullptr);
   return 0;
 #else
-  return ::unsetenv(name);
+  return ::unsetenv(name);  // NOLINT(concurrency-mt-unsafe)
 #endif
 }
 
@@ -438,7 +463,7 @@ int RunProcess(
 #endif
   if (spawned != 0) {
     if (error_out != nullptr) {
-      *error_out = "posix_spawn failed: " + std::string(std::strerror(spawned));
+      *error_out = "posix_spawn failed: " + StrError(spawned);
     }
     return -1;
   }

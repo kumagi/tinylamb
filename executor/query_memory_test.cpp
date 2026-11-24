@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <thread>
+
+#include "common/platform/process.hpp"
 // setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <stdlib.h>
@@ -97,33 +99,34 @@ TEST_F(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
 }
 
 TEST_F(QueryMemoryTest, ResetForTest_WithEnvVar_MaintainsCorrectLimit) {
-  const char* previous = std::getenv("TINYLAMB_QUERY_MEMORY_BYTES");
+  const char* previous =
+      ::tinylamb::platform::GetEnv("TINYLAMB_QUERY_MEMORY_BYTES");
   const std::string saved = previous != nullptr ? previous : "";
   // Restore the process-global env var even if an assertion below aborts the
   // test; a manual restore at the end would leak the value into later tests.
-  struct RestoreEnv {
-    explicit RestoreEnv(bool had_value, std::string  value)
+  struct RestoreEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
+    explicit RestoreEnv(bool had_value, std::string value)
         : had_value_(had_value), value_(std::move(value)) {}
-    RestoreEnv(const RestoreEnv&) = delete;
-    RestoreEnv& operator=(const RestoreEnv&) = delete;
     ~RestoreEnv() {
       if (had_value_) {
-        setenv("TINYLAMB_QUERY_MEMORY_BYTES", value_.c_str(), 1);
+        ::tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES",
+                                     value_.c_str(), 1);
       } else {
-        unsetenv("TINYLAMB_QUERY_MEMORY_BYTES");
+        ::tinylamb::platform::UnsetEnv("TINYLAMB_QUERY_MEMORY_BYTES");
       }
     }
     bool had_value_;
     std::string value_;
   } restore_env(previous != nullptr, saved);
   QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-  setenv("TINYLAMB_QUERY_MEMORY_BYTES", "424242", 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "424242", 1);
   budget.ResetForTest(1024);
   EXPECT_EQ(budget.Limit(), 1024U);
-  setenv("TINYLAMB_QUERY_MEMORY_BYTES", "", 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "", 1);
   budget.ResetForTest(1024);
   EXPECT_EQ(budget.Limit(), 1024U);
-  setenv("TINYLAMB_QUERY_MEMORY_BYTES", "0", 1);
+  ::tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "0", 1);
   budget.ResetForTest(1024);
   EXPECT_EQ(budget.Limit(), 1024U);
   budget.ResetForTest(0);

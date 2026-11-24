@@ -345,6 +345,130 @@ tie 共有順位計算で `incPage` をページ SQL と一致させた。`k = 0
 | multi-block-local-dict-two-stage-aggregate | `ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean` | `theorem sound : Goal` 証明 |
 | bilateral-eager-agg-join-pushdown | `ResearchProofs/BilateralEagerAggJoinPushdown.lean` | `theorem sound : Goal` 証明 |
 
+## 第九波（クラウド・BI の命題 42 件・完了）
+
+[cloud-bi.md](cloud-bi.md) の 42 件（Quotes 10 / NestedBI 10 / DeleteFiles 11 / PublicBI 11）
+すべてについて、`ResearchGoals/CloudBI/<モジュール>.lean` の提出型を一切変更せず、
+`ResearchProofs/CloudBI/<モジュール>.lean` に `theorem sound_<宣言名> : <宣言名>.Goal` を構成した。
+反例はなく、全命題が真だった。共通補題ライブラリ `ResearchProofs/CloudBI/Common.lean`
+（namespace `…CloudBI.Helpers`、`Totals`/`summarize` の和算、`countP`・`mergeSort`・
+`eraseDups` 補題群）を新設し、4 モジュールから import している。4 モジュールとも
+`TinylambOpt.lean` から import 済みで、`cd lean && ~/.elan/bin/lake build`（CheckProofs の
+`sorryAx` 検査込み）が成功すること、および全 42 定理の `#print axioms` が
+`propext` / `Classical.choice` / `Quot.sound` のみ（`sorryAx` なし）であることを確認した。
+
+| 仕様モジュール | 提出モジュール | 結果 |
+| --- | --- | --- |
+| `ResearchGoals/CloudBI/Quotes.lean` | `ResearchProofs/CloudBI/Quotes.lean` | 10/10 `theorem sound_* : *.Goal` 証明 |
+| `ResearchGoals/CloudBI/NestedBI.lean` | `ResearchProofs/CloudBI/NestedBI.lean` | 10/10 証明 |
+| `ResearchGoals/CloudBI/DeleteFiles.lean` | `ResearchProofs/CloudBI/DeleteFiles.lean` | 11/11 証明 |
+| `ResearchGoals/CloudBI/PublicBI.lean` | `ResearchProofs/CloudBI/PublicBI.lean` | 11/11 証明 |
+
+証明の要点（宣言名ごと）：
+
+### Quotes（CostBench の取り込み・維持・読者）
+
+- **StaleRollup**: 水位線で切った半開区間が hit-set の相互非交な被覆になることを
+  `filter` の論理合成で示し、`summarize_append` ＋ `summarize_perm` で部分和の和を
+  全体集計へ接続した。
+- **SparseRefresh**: `foldl` の不変条件をアキュムレータまで一般化して帰納し、稀疏キー列が
+  `Nodup` を保つこと・部分集計が到着順の `plus` 畳み込みと一致することを示した。
+- **CloseTournament**: `latest` が (ts, tie) の辞書式最大を返すことを折りの支配不変条件
+  （帰属＋全元素支配）として特徴づけ、関数従属性 `(同 ts・同 tie ⇒ 同 bid)` から勝者を
+  一通りに決めて、flatten 順列を候補集合への移動で transfer した。
+- **CandleFringe**: `whole` タイル id 列（`eraseDups` 由来で `Nodup`）のfoldと fringe 行の
+  `filter` に分割し、`p ∨ q` の被覆と `p ∧ q = false` の非交から和の再接合を証明した。
+- **SpreadMoments**: `filterMap` による bid/ask ペア抽出を列ごとの和へ書き換える補題
+  （`sum_getD_eq_filterMap`）を示し、Common の `summarize_cnt`/`summarize_nn`/
+  `summarize_sum` と組み合わせて件数・総和の一致を揃えた。
+- **FenceRead**: run 列帰納と `List.flatten_cons` ＋ `List.filter_append` で残余述語付き
+  読取りをフル読取りに接続。ヒット行は必ず fence を開くことを min/max の所属補題で示した。
+- **ReclusterSwap**: `pin < cut` の場合分けで新旧 run の選択を特徴づけ、flatten の
+  並べ替えと単調な被覆述語により二重計上・行欠落がないことを示した。
+- **RetryRefresh**: 配送列帰納で `seen = v.reverse ++ u`・`v.Nodup`・メンバシップ同値の
+  不変条件を保ち、最終的に重複なしキー列の並べ替え (`perm_of_nodup_mem`) と
+  flatMap 畳み込みの融合で「不変バッチの再配送は一度だけ集計」を証明した。
+- **ReclusterBudget**: `mergeSort` の降順性（pairwise）に対する帰納と先頭交換
+  （`perm_move_front` ＋ `map_sum_perm`）で「同一コストなら頻度上位 k 本選びが最大削減」
+  を示した。
+- **MaintenanceBreakEven**: `s ≤ time` を `time = s + d` に分解し、分配法則の
+  `simp` と `Nat.lt_of_add_lt_add_left` で score 減少条件へ閉じた。
+
+### NestedBI（Snowset/PBench 派生の巨大 SQL）
+
+- **BranchHistogram**: ネストした UNION ALL を枝 ID のヒストグラムに畳み、
+  `TSum (replicate n a) = scaleT a n` と部分集計の掛算で逐語一致を示した。
+- **JoinedLeafWeights**: 通常枝件数と結合枝重みを分離した私有集約（一キーに閉じた
+  fold 融合）を組み、重複次元・NULL 入りの袋でも `Nodup` 単一折りの補題で閉じた。
+- **FlattenSum**: 空入力のスカラー SUM が返す NULL 一行の規則を明示した畳み込みで、
+  複数列 flatten 後の総和とネストした SUM の最終値の一致を示した。
+- **ProjectionChain**: 射影の合成を列位置表へ落とし、`List.map` の交換と getD 境界で
+  重複列・並べ替え・NULL 拡張を処理した。
+- **RangeMultiplicity**: 重なり半開区間列を境界点のソート列へ置き換える写像を作り、
+  各値の寄与回数が `weighted` の畳み込みと一致することを接頭・接尾の分解で示した。
+- **MemoMisses**: 部分集計キャッシュ折りの四成分不変条件（出力・定義域・値・呼出し数）を
+  帰納で保ち、計算回数が相異なる枝 ID 数（`eraseDups.length`）に等しいことを証明した。
+- **SpoolBudget**: 直接読み・保存再読のコスト式の場合分けを `Nat.succ_mul` ＋ `omega` で
+  整理し、最小コスト選択が正しく下界になることを示した。
+- **GroupSignature**: GROUP BY キー列の重複位置を落としても NULL を含む同値類の写像が
+  保存されることを、キー比較の決定性と snoc 帰納で証明した。
+- **CanonicalFilters**: 正準化キー列のヒストグラムが `mergeSort` で不変であることと
+  多重度保存を示した（`histogram_foldl_add` の橋渡し経由）。
+- **SharedProjection**: 合成後位置表が同一の消費者を統合しても、異なる射影から同じ値が
+  出る場合を含め出現数（`filterMap` 列）が変わらないことを示した。
+
+### DeleteFiles（Iceberg Merge-on-Read）
+
+- **EqualityHorizon**: `eqIndex` HashMap 折りのステップ補題（(scope, key) の最新
+  sequence は global/local 最大）を delete 列帰納で示した。
+- **PositionMask**: `HashSet` 構築折りの `contains` 特徴づけ＋点ごとの Bool 書換えで、
+  ファイル確定済み位置集合の全行再利用を証明した。
+- **OverlapCount**: 2 種マスクの重なりを含む・引く の包除（`countP_add_split` ＋
+  `filter_not_countP`）で生存数をフッター行数から復元した。
+- **FooterCount**: `eraseDups` 経由の `filter` と `range` 経由の `filter` の並べ替えを
+  構成し、範囲外 ordinal・重複を除いた位置集合だけで COUNT が一致することを示した。
+- **ManifestHorizon**: synopsis が正しければヒットは必ず `mayOpen` を誘発することを示し、
+  マニフェスト折りへ帰納で持ち上げた。
+- **NullAwarePruning**: `any_filter` と「行にヒットする delete はその key を正確に運ぶ」
+  ことで、上下限＋NULL 可能性による絞り込みの安全性を証明した。
+- **FieldIdProbe**: `idxOf`/`find?` の zip 逐点一致を帰納で示し、field ID → 物理位置の
+  一括変換と欠落 optional 列の NULL 既定値を `map_map` で接続した。
+- **CompactOrdinal**: 削除適用後の生存行の新位置が、旧位置より前の生存数
+  （`countP keep` の接頭辞）に等しいことを行列帰納で証明した。
+- **DeleteAwareLimit**: 削除数上界での overfetch が `filter` と可換であることを直接の
+  補助ループ帰納で示し、打ち切り後の LIMIT 結果の保存を得た。
+- **SkippedOrdinalBase**: スキャン折りが `zipIdx` グループ flatten への単一 `filterMap` に
+  等しいことを示し、読み飛ばし後の ordinal が正しい位置に当たることを証明した。
+- **BitmapEpoch**: 関係ない delete は sequence を上げても不活性（ヒット集合不変）である
+  ことを示し、キー判定再利用の安全境界を導いた。
+
+### PublicBI（MLB_11 の軸列挙・属性・文字列計算）
+
+- **PartialExtrema**: ブロック部分 MIN/MAX（Option 極値）の併合結合と群の有無を NULL 列
+  状態から分離した不変条件で証明した。
+- **LiftedDecimals**: extrema 計算後の固定小数スケール揃えについて、負値・全 NULL を
+  含め場合分けで一致を示した。
+- **ConstantGroup**: 3 キー定数固定の一群実行が、該当なし（空）と全測定値 NULL の一群を
+  区別しつつ同一結果を返すことを示した。
+- **AttributeWitness**: MIN/MAX の状態だけで非 NULL 値の相違個数 0・1・複数 を判定する
+  規則を、極値と NULL 有無の場合分けで網羅した。
+- **OccupiedAxis**: 各ブロックで出現した辞書コードのみをデコードし、別ブロックの同名
+  ラベルを統合する軸の整列が完全一致であることを示した。
+- **AxisRetraction**: 表示範囲縮小時、最終出現が除去されたラベルだけを落とす写像が、
+  残すラベルの順序・内容を保存することを証明した。
+- **TripleBitmap**: 各リテラルの局所コード集合をすべて引いた位置マスクの交差が、
+  測定列読取り後に一致行集合と等しいことを示した。
+- **SliceBounds**: 年・ブロックの層別件数から三次元フィルタの上下界を作り、列間の独立性を
+  仮定せずに正しい包含を証明した。
+- **CodeExtrema**: 選択コード集合から全 NULL・単一値を検出し、混在時のみ占有辞書値の
+  MIN/MAX を使う規則を場合分けで示した。
+- **GroupBeforeSuffix**: (league, position) で先に数えてから接尾辞 CASE を適用する順序
+  交換が、最終ラベル別の件数袋を保存することを `countP` 系補題で証明した。
+- **ClassificationCache**: メモ折りを `(cache, out, calls)` 状態の 4 分不変条件
+  （出力＝復号済みラベル列・定義域＝処理済み前缀・キャッシュ値一致・
+  `calls = 前缀.eraseDups.length`）として帰納し、ヒット時 +0・ミス時 +1 を
+  `eraseDups` snoc 長補題で示して、`classify` の呼出し数比較を接続した。
+
 ## 検証範囲の注記
 
 - 提出型付き 6 件と `checked-aggregate-tree` は `ResearchGoals` の定義を変更せず、そのまま import して

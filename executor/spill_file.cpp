@@ -2,6 +2,7 @@
 #include "executor/spill_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 
@@ -56,7 +58,7 @@ SpillFile::SpillFile(SpillFile&& other) noexcept
       stream_(std::move(other.stream_)),
       count_(other.count_),
       file_bytes_(other.file_bytes_),
-      finish_error_(other.finish_error_),
+      finish_error_(std::move(other.finish_error_)),
       writing_(other.writing_),
       finished_(other.finished_),
       has_positions_(other.has_positions_) {
@@ -133,7 +135,8 @@ Status SpillWriteStatus(const char* context,
     return StatusError(StatusCode::kNoSpace, std::move(msg));
   }
   if (err != 0) {
-    msg += " (errno=" + std::to_string(err) + ": " + std::strerror(err) + ")";
+    msg += " (errno=" + std::to_string(err) + ": " +
+           ::tinylamb::platform::StrError(err) + ")";
   }
   return StatusError(StatusCode::kIOError, std::move(msg));
 }
@@ -158,9 +161,10 @@ Status SpillFile::OpenForWrite() {
   // Copy into a char buffer rather than reinterpret_casting the integer:
   // byte-wise memcpy avoids aliasing/alignment assumptions about the stream.
   const uint64_t zero = 0;
-  char zero_bytes[sizeof(zero)];
-  std::memcpy(zero_bytes, &zero, sizeof(zero));
-  stream_.write(zero_bytes, sizeof(zero_bytes));
+  std::array<char, sizeof(zero)> zero_bytes{};
+  std::memcpy(zero_bytes.data(), &zero, sizeof(zero));
+  stream_.write(zero_bytes.data(),
+                static_cast<std::streamsize>(zero_bytes.size()));
   if (!stream_) {
     return SpillWriteStatus("spill write failed", path_);
   }
@@ -209,7 +213,7 @@ Status SpillFile::Append(const Row& row, const RowPosition& position) {
   RETURN_IF_FAIL(OpenForWrite());
   Encoder enc(stream_);
   enc << row << position;
-  const Status encode_status = enc.GetStatus();
+  Status encode_status = enc.GetStatus();
   if (encode_status != Status::kSuccess) {
     finished_ = true;
     return encode_status;
@@ -252,9 +256,10 @@ Status SpillFile::FinishWriting() {
     return StatusError(StatusCode::kIOError,
                        "failed to seek spill file: " + path_.string());
   }
-  char count_bytes[sizeof(count_)];
-  std::memcpy(count_bytes, &count_, sizeof(count_));
-  stream_.write(count_bytes, sizeof(count_bytes));
+  std::array<char, sizeof(count_)> count_bytes{};
+  std::memcpy(count_bytes.data(), &count_, sizeof(count_));
+  stream_.write(count_bytes.data(),
+                static_cast<std::streamsize>(count_bytes.size()));
   stream_.flush();
   if (!stream_) {
     return StatusError(StatusCode::kIOError,
@@ -262,9 +267,8 @@ Status SpillFile::FinishWriting() {
   }
   stream_.close();
   if (!stream_) {
-    finish_error_ = StatusError(StatusCode::kIOError,
-                                "failed to close spill file: " +
-                                    path_.string());
+    finish_error_ = StatusError(
+        StatusCode::kIOError, "failed to close spill file: " + path_.string());
     writing_ = false;
     return finish_error_;
   }
@@ -327,14 +331,15 @@ StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
                        "failed to open spill file: " + path_.string());
   }
   uint64_t stored = 0;
-  char stored_bytes[sizeof(stored)];
-  reader.stream_->read(stored_bytes, sizeof(stored_bytes));
+  std::array<char, sizeof(stored)> stored_bytes{};
+  reader.stream_->read(stored_bytes.data(),
+                       static_cast<std::streamsize>(stored_bytes.size()));
   if (reader.stream_->gcount() !=
-      static_cast<std::streamsize>(sizeof(stored_bytes))) {
+      static_cast<std::streamsize>(stored_bytes.size())) {
     return StatusError(StatusCode::kCorrupt,
                        "truncated spill file header: " + path_.string());
   }
-  std::memcpy(&stored, stored_bytes, sizeof(stored));
+  std::memcpy(&stored, stored_bytes.data(), sizeof(stored));
   if (stored != count_) {
     return StatusError(StatusCode::kCorrupt,
                        "spill file header mismatch: " + path_.string());
@@ -395,13 +400,14 @@ Status SpillFile::EnsureReader() {
 
 StatusOr<uint64_t> SpillFile::ReadStoredCount() {
   uint64_t stored = 0;
-  char stored_bytes[sizeof(stored)];
-  stream_.read(stored_bytes, sizeof(stored_bytes));
-  if (stream_.gcount() != static_cast<std::streamsize>(sizeof(stored_bytes))) {
+  std::array<char, sizeof(stored)> stored_bytes{};
+  stream_.read(stored_bytes.data(),
+               static_cast<std::streamsize>(stored_bytes.size()));
+  if (stream_.gcount() != static_cast<std::streamsize>(stored_bytes.size())) {
     return StatusError(StatusCode::kCorrupt,
                        "truncated spill file header: " + path_.string());
   }
-  std::memcpy(&stored, stored_bytes, sizeof(stored));
+  std::memcpy(&stored, stored_bytes.data(), sizeof(stored));
   // The header was rewritten by this process; a mismatch means the file is
   // corrupt. It also bounds the loop below by a value we trust.
   if (stored != count_) {

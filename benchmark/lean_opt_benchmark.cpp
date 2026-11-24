@@ -31,7 +31,8 @@
 namespace {
 using namespace tinylamb;
 
-struct ScopedDbCleanup {
+struct ScopedDbCleanup {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
   std::string prefix;
   explicit ScopedDbCleanup(std::string p) : prefix(std::move(p)) {}
   ~ScopedDbCleanup() {
@@ -382,9 +383,11 @@ int main() {
               sql += '(';
               sql += std::to_string(i);
               sql += ',';
-              sql += std::to_string((i % 20 == 0) ? ((i * 3) + 1) : ((i * 3) + 2));
+              sql +=
+                  std::to_string((i % 20 == 0) ? ((i * 3) + 1) : ((i * 3) + 2));
               sql += ',';
-              sql += std::to_string((i % 25 == 0) ? ((i * 5) + 2) : ((i * 5) + 4));
+              sql +=
+                  std::to_string((i % 25 == 0) ? ((i * 5) + 2) : ((i * 5) + 4));
               sql += ')';
             });
       })) {
@@ -701,8 +704,9 @@ int main() {
   std::string rowin_list;
   rowin_list.reserve(1024);
   for (int i = 1; i <= 80; ++i) {
-    if (i > 1) { rowin_list += ',';
-}
+    if (i > 1) {
+      rowin_list += ',';
+    }
     rowin_list += '(' + std::to_string(i) + ',' + std::to_string(i * 11) + ')';
   }
 

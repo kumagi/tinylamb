@@ -76,8 +76,9 @@ TEST(SerdesStringTest, LargestLengthRoundTripsAndOverflowIsRejected) {
   const auto encoded = SerializeStringView(buffer.data(), payload);
   ASSERT_EQ(encoded, sizeof(uint16_t) + max_length);
   std::string_view decoded;
-  EXPECT_EQ(DeserializeStringView(buffer.data(), buffer.data() + encoded, &decoded),
-            encoded);
+  EXPECT_EQ(
+      DeserializeStringView(buffer.data(), buffer.data() + encoded, &decoded),
+      encoded);
   EXPECT_EQ(decoded, payload);
   payload.push_back('x');
   EXPECT_DEATH(SerializeStringView(buffer.data(), payload),
@@ -110,9 +111,10 @@ TEST(SerdesStringTest, DeserializeRejectsTruncatedPayload) {
 }
 
 TEST(SerdesStringTest, DeserializeRejectsReversedRange) {
-  constexpr char input[] = "abc";
+  constexpr std::string_view input = "abc";
   std::string_view out = "unchanged";
-  EXPECT_EQ(DeserializeStringView(input + 2, input + 1, &out), 0U);
+  EXPECT_EQ(DeserializeStringView(input.data() + 2, input.data() + 1, &out),
+            0U);
   EXPECT_EQ(out, "unchanged");
 }
 

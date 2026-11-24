@@ -884,6 +884,10 @@ StatusOr<const ReplacementProgram*> LookupOrCompileReplacement(
     // Evict the oldest entries only while a slot or bytes are needed.
     while (count == cache.size() || used + bytes > kProgramCacheBudget) {
       auto& slot = cache[head];
+      if (!slot.has_value()) {
+        return StatusError(StatusCode::kRuntimeError,
+                           "regex program cache count is inconsistent");
+      }
       used -= slot->bytes;
       slot.reset();
       head = (head + 1) % cache.size();
@@ -1732,18 +1736,22 @@ StatusOr<bool> CheckedRegexContains(std::string_view input,
   ContainsProgram built = BuildContainsProgram(pattern, std::move(re));
   if (pattern.size() <= 4096) {
     size_t victim = 0;
+    uint64_t oldest_stamp = std::numeric_limits<uint64_t>::max();
     for (size_t i = 0; i < cache.size(); ++i) {
-      if (!cache[i].has_value()) {
+      auto& candidate_slot = cache[i];
+      if (!candidate_slot.has_value()) {
         victim = i;
         break;
       }
-      if (cache[i]->stamp < cache[victim]->stamp) {
+      const auto& candidate = candidate_slot.value();
+      if (candidate.stamp < oldest_stamp) {
         victim = i;
+        oldest_stamp = candidate.stamp;
       }
     }
     built.stamp = ++clock;
-    cache[victim] = std::move(built);
-    return ExecuteContainsProgram(*cache[victim], input);
+    const ContainsProgram& cached = cache[victim].emplace(std::move(built));
+    return ExecuteContainsProgram(cached, input);
   }
   return ExecuteContainsProgram(built, input);
 } catch (const std::bad_alloc&) {

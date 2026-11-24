@@ -97,7 +97,7 @@ class CliMainTest : public ::testing::Test {
         "/bin/sh -c " +
         shell_quote(exe.string() + " " + args + " < " + input.string() + " > " +
                     stdout_path.string() + " 2> " + stderr_path.string());
-    // NOLINTNEXTLINE(cert-env33-c)
+    // NOLINTNEXTLINE(cert-env33-c,concurrency-mt-unsafe): synchronous child.
     const int status = std::system(command.c_str());
     // /dev/full READS back as an endless NUL stream (never EOF), so only
     // capture stdout when it was redirected to a regular file in dir_.
@@ -146,9 +146,9 @@ class CliMainTest : public ::testing::Test {
       return;
     }
     out->clear();
-    char buffer[4096];
-    while (in.read(buffer, sizeof(buffer)) || in.gcount() != 0) {
-      out->append(buffer, static_cast<size_t>(in.gcount()));
+    std::array<char, 4096> buffer{};
+    while (in.read(buffer.data(), buffer.size()) || in.gcount() != 0) {
+      out->append(buffer.data(), static_cast<size_t>(in.gcount()));
     }
     if (in.bad() || !in.eof()) {
       ADD_FAILURE() << "cannot read " << path;

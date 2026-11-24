@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "protocol.hpp"
 
 namespace fs = std::filesystem;
@@ -505,7 +506,7 @@ int main(int argc, char** argv) {
   int local_cap = 32;
   int remote_cap = 28;
   std::string trace_path;
-  const char* token_env = std::getenv("DISTCOMP_TOKEN");
+  const char* token_env = ::tinylamb::platform::GetEnv("DISTCOMP_TOKEN");
   std::string token = (token_env && *token_env) ? token_env : "";
 
   for (int i = 1; i < argc; ++i) {

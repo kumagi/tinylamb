@@ -145,9 +145,7 @@ TEST_F(IndexScanIteratorTest, DumpShowsModeAndColumnNames) {
   std::ostringstream broken;
   broken << IndexSchema(
       "Broken", {0}, {},
-      static_cast<IndexMode>(
-          200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange):
-                  // exercise unknown persisted mode
+      static_cast<IndexMode>(200));  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
   const std::string broken_text = broken.str();
   EXPECT_NE(broken_text.find("Invalid(200)"), std::string::npos) << broken_text;
   // "Invalid(200)" is a substring of "kInvalid(200)": pin the exact token so
@@ -302,7 +300,7 @@ TEST_F(IndexScanIteratorTest, NonUniqueAscending) {
     while (it.IsValid()) {
       Row row = *it;
       if (row[0].value.int_value % 5 == 0) {
-        table->Delete(ctx.txn_, it.Position());
+        ASSERT_SUCCESS(table->Delete(ctx.txn_, it.Position()));
       }
       ++it;
     }

@@ -166,7 +166,11 @@ StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
     return Value(negated_ ? !any : any);
   }
   if (test_) {
-    Value probe = std::move(*test_value);
+    if (!test_value.has_value()) {
+      return StatusError(StatusCode::kRuntimeError,
+                         "quantified comparison probe is missing");
+    }
+    Value probe = std::move(test_value.value());
     if (mode_ != QuantifierMode::kIn) {
       return TryEvaluateQuantifiedComparison(op_, mode_, probe, values);
     }

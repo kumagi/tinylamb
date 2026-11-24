@@ -212,10 +212,9 @@ TEST_F(LsmIndexTest, PartitionBoundariesPropagateScanFailure) {
   // The descriptor limit is process-global. Restore it by RAII so an ASSERT
   // or early return while it is lowered cannot poison every later test in
   // this binary (no fd can be opened at all).
-  struct LimitGuard {
+  struct LimitGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                       // scope-owned cleanup.
     explicit LimitGuard(const struct rlimit& saved) : saved_(saved) {}
-    LimitGuard(const LimitGuard&) = delete;
-    LimitGuard& operator=(const LimitGuard&) = delete;
     ~LimitGuard() { setrlimit(RLIMIT_NOFILE, &saved_); }
     struct rlimit saved_;
   } limit_guard(original);

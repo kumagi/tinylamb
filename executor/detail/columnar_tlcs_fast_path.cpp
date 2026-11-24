@@ -28,6 +28,7 @@
 #include "common/constants.hpp"
 #include "common/memory_budget.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/regex_guard.hpp"
 #include "common/status_or.hpp"
@@ -389,7 +390,8 @@ bool CompilePredicatesFromExpressions(
   out->inlists.clear();
   out->nulls.clear();
 
-  static const bool dbg_pred = std::getenv("TINYLAMB_DEBUG_TLCS") != nullptr;
+  static const bool dbg_pred =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_TLCS") != nullptr;
   for (const Expression& raw_predicate : predicates) {
     if (!raw_predicate) {
       continue;
@@ -622,6 +624,9 @@ bool MayTlcsBlockMatch(const TlcsFile::BlockDirEntry& blk,
     }
   }
 
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  //   (BlockConjunctionZoneBitmapPrune_sound)
   for (const TypedFilterCompare& cmp : preds.compares) {
     if (!cmp.constant_payload || cmp.left >= blk.columns.size()) {
       continue;
@@ -732,6 +737,9 @@ bool MayTlcsBlockMatch(const TlcsFile::BlockDirEntry& blk,
     }
   }
 
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave9AnalyticsRemaining.lean
+  //   (MultiKeyInRangeZoneBlockSkip_sound)
   for (const TypedInListCompare& in : preds.inlists) {
     if (in.column >= blk.columns.size()) {
       return false;
@@ -806,6 +814,9 @@ bool RowMatchesColPtrs(
       return false;
     }
   }
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  //   (BlockConjunctionZoneBitmapPrune_sound)
   for (const TypedFilterCompare& cmp : preds.compares) {
     const auto* lcol = col_ptrs[cmp.left];
     if (lcol == nullptr) {
@@ -884,6 +895,9 @@ bool RowMatchesColPtrs(
       continue;
     }
     if (cmp.string_payload) {
+      // Lean proof:
+      // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+      //   (NonEmptyStringFilterBeforeDictDecode_sound)
       if (cmp.string_match == TypedFilterCompare::StringMatchKind::kExact &&
           cmp.string_constant.empty() &&
           (cmp.op == BinaryOperation::kEquals ||
@@ -1172,6 +1186,8 @@ struct FastNumericPred {
   enum class Kind : uint8_t {
     kIntSingle = 0,
     kIntRange,
+    kIntInMask64,
+    kIntInList,
     kDoubleSingle,
     kDoubleRange,
   };
@@ -1181,6 +1197,9 @@ struct FastNumericPred {
   BinaryOperation op{BinaryOperation::kEquals};
   int64_t int_lo{0};
   int64_t int_hi{0};
+  uint64_t in_mask{0};
+  const int64_t* in_vals{nullptr};
+  size_t in_count{0};
   double dbl_lo{0.0};
   double dbl_hi{0.0};
   bool lo_inclusive{true};
@@ -1277,6 +1296,35 @@ void RunFastNumericPred(const FastNumericPred& p, uint32_t rc, bool is_first,
       }
       return;
     }
+    case FastNumericPred::Kind::kIntInMask64: {
+      const uint64_t lo = static_cast<uint64_t>(p.int_lo);
+      const uint64_t span = static_cast<uint64_t>(p.int_hi) - lo;
+      const uint64_t mask = p.in_mask;
+      dispatch([cells, lo, span, mask](uint32_t r) noexcept {
+        const uint64_t off = static_cast<uint64_t>(cells[r]) - lo;
+        return off <= span && ((mask >> off) & 1ULL) != 0ULL;
+      });
+      return;
+    }
+    case FastNumericPred::Kind::kIntInList: {
+      const int64_t* vals = p.in_vals;
+      const size_t n = p.in_count;
+      const int64_t lo = p.int_lo;
+      const int64_t hi = p.int_hi;
+      dispatch([cells, vals, n, lo, hi](uint32_t r) noexcept {
+        const int64_t v = cells[r];
+        if (v < lo || v > hi) {
+          return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+          if (vals[i] == v) {
+            return true;
+          }
+        }
+        return false;
+      });
+      return;
+    }
     case FastNumericPred::Kind::kDoubleSingle: {
       const double c = p.dbl_lo;
       switch (p.op) {
@@ -1347,9 +1395,22 @@ bool TryFilterBlockNumericColumnAtATime(
     const ColumnarPredicateSet& preds,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
     uint32_t rc, std::vector<uint32_t>* cand_rows) {
-  if (!preds.nulls.empty() || !preds.inlists.empty() ||
-      preds.compares.empty() || preds.compares.size() > 16) {
+  const size_t total_preds = preds.compares.size() + preds.inlists.size();
+  if (!preds.nulls.empty() || total_preds == 0 || total_preds > 16) {
     return false;
+  }
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (InRangeSynopsis_sound)
+  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  //   (MultiKeyInRangeZoneBlockSkip_sound,
+  //   BlockConjunctionZoneBitmapPrune_sound)
+  for (const TypedInListCompare& in : preds.inlists) {
+    if (in.is_string || in.is_double || in.int_values.empty() ||
+        col_ptrs[in.column] == nullptr || col_ptrs[in.column]->has_null ||
+        col_ptrs[in.column]->is_unsigned ||
+        col_ptrs[in.column]->int_cells.size() < rc) {
+      return false;
+    }
   }
   for (const TypedFilterCompare& cmp : preds.compares) {
     if (!cmp.constant_payload || cmp.string_payload ||
@@ -1371,6 +1432,69 @@ bool TryFilterBlockNumericColumnAtATime(
 
   std::array<FastNumericPred, 16> fps{};
   size_t nf = 0;
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (InRangeSynopsis_sound)
+  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  //   (MultiKeyInRangeZoneBlockSkip_sound,
+  //   BlockConjunctionZoneBitmapPrune_sound)
+  for (const TypedInListCompare& in : preds.inlists) {
+    const auto& column = *col_ptrs[in.column];
+    int64_t imin = in.int_values[0];
+    int64_t imax = in.int_values[0];
+    for (const int64_t v : in.int_values) {
+      if (v < imin) imin = v;
+      if (v > imax) imax = v;
+    }
+    if (column.has_min_max && !column.is_unsigned) {
+      if (column.max_int < imin || column.min_int > imax) {
+        cand_rows->clear();
+        return true;
+      }
+      if (column.min_int == column.max_int) {
+        bool hit = false;
+        for (const int64_t v : in.int_values) {
+          if (v == column.min_int) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) {
+          cand_rows->clear();
+          return true;
+        }
+        continue;
+      }
+    }
+    const uint64_t span =
+        static_cast<uint64_t>(imax) - static_cast<uint64_t>(imin);
+    if (span < 64ULL) {
+      uint64_t mask = 0;
+      for (const int64_t v : in.int_values) {
+        mask |= (uint64_t{1}
+                 << (static_cast<uint64_t>(v) - static_cast<uint64_t>(imin)));
+      }
+      fps[nf++] = FastNumericPred{
+          .kind = FastNumericPred::Kind::kIntInMask64,
+          .col = in.column,
+          .cells = column.int_cells.data(),
+          .int_lo = imin,
+          .int_hi = imax,
+          .in_mask = mask,
+          .priority = 0,
+      };
+    } else {
+      fps[nf++] = FastNumericPred{
+          .kind = FastNumericPred::Kind::kIntInList,
+          .col = in.column,
+          .cells = column.int_cells.data(),
+          .int_lo = imin,
+          .int_hi = imax,
+          .in_vals = in.int_values.data(),
+          .in_count = in.int_values.size(),
+          .priority = 1,
+      };
+    }
+  }
   for (const TypedFilterCompare& cmp : preds.compares) {
     const auto& column = *col_ptrs[cmp.left];
     if (!cmp.is_double) {
@@ -1873,7 +1997,7 @@ bool TryFoldBlockDenseGroupsFastAggs(
     double* dst = g_sum[a].data();
     const int64_t* c0 = p0[a];
     if (paired >= 0) {
-      const auto b = static_cast<size_t>(paired);
+      const auto b = static_cast<size_t>(static_cast<unsigned char>(paired));
       double* dst_b = g_sum[b].data();
       const int64_t* c1 = p1[a];
       const int64_t* c2 = p2[b];
@@ -1929,7 +2053,8 @@ bool TryFoldBlockDenseGroupsFastAggs(
           }
         }
         if (same_col_dup >= 0) {
-          const auto b = static_cast<size_t>(same_col_dup);
+          const auto b =
+              static_cast<size_t>(static_cast<unsigned char>(same_col_dup));
           std::copy(dst, dst + num_groups, g_sum[b].data());
           done[b] = true;
         }
@@ -2970,6 +3095,9 @@ bool TryClassifyAggregate(const AggregateExpression* agg,
           qualified_schema, fn.Args()[0]->AsColumnValue().GetColumnName());
       if (slot && *slot < qualified_schema.ColumnCount() &&
           qualified_schema.GetColumn(*slot).Type() == ValueType::kVarChar) {
+        // Lean proof:
+        // lean/TinylambOpt/ResearchProofs/VarcharOffsetOnlyLengthSum.lean
+        // (sound)
         out->full_col = MapSlot(*slot, proj_to_full);
         out->needs_lengths_only = true;
         switch (at) {
@@ -4190,7 +4318,8 @@ StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
     const std::vector<ColumnarOrderBinding>& order,
     std::span<const NamedExpression> output_names, ExecutionRuntime* runtime) {
   if (tlcs.TotalRows() > static_cast<uint64_t>(INT64_MAX) ||
-      std::getenv("TINYLAMB_DISABLE_TLCS_BOUNDARY_AGG") != nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TLCS_BOUNDARY_AGG") !=
+          nullptr) {
     return std::nullopt;
   }
   const bool extrema =
@@ -4453,7 +4582,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const LSTableStore* resident_store_hint, ExecutionRuntime* runtime,
     bool publish_lstable_marker, const std::string& fold_cache_key,
     std::chrono::steady_clock::time_point scan_begin) {
-  static const bool dbg = std::getenv("TINYLAMB_DEBUG_TLCS") != nullptr;
+  static const bool dbg =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DEBUG_TLCS") != nullptr;
   auto dbg_bail = [&](const char* why) -> std::optional<Relation> {
     if (dbg) {
       (void)std::fprintf(stderr, "[TLCS-AGG-BAIL] %s (typed=%d, ngroups=%zu)\n",
@@ -4462,7 +4592,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     }
     return std::optional<Relation>{};
   };
-  if (std::getenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG") != nullptr) {
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG") !=
+      nullptr) {
     return dbg_bail("disabled by env");
   }
   if (stmt.Distinct() || stmt.HasDistinctOn() || stmt.Qualify() ||
@@ -7751,20 +7882,19 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
             survivors.begin(),
             survivors.begin() + static_cast<std::ptrdiff_t>(emit_count),
             survivors.end(), cmp_rows);
-      } else if (std::getenv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
-                 !bounded_topk &&
-                 fast_order_kind == FastSingleOrderKind::kInt &&
-                 plan_order.size() == 1 && survivors.size() >= 1024 &&
-                 // Lean proof:
-                 // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
-                 // (sound)
-                 TryStableRadixSortNullableInt64(
-                     survivors, plan_order[0].order.Ascending(),
-                     plan_order[0].order.NullsFirst(),
-                     [](const FinalGroupRow& r) noexcept { return r.num_null; },
-                     [](const FinalGroupRow& r) noexcept {
-                       return r.num_int;
-                     })) {
+      } else if (
+          ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") ==
+              nullptr &&
+          !bounded_topk && fast_order_kind == FastSingleOrderKind::kInt &&
+          plan_order.size() == 1 && survivors.size() >= 1024 &&
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+          // (sound)
+          TryStableRadixSortNullableInt64(
+              survivors, plan_order[0].order.Ascending(),
+              plan_order[0].order.NullsFirst(),
+              [](const FinalGroupRow& r) noexcept { return r.num_null; },
+              [](const FinalGroupRow& r) noexcept { return r.num_int; })) {
       } else {
         std::sort(survivors.begin(), survivors.end(), cmp_rows);
       }
@@ -7905,7 +8035,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       markov_having_bounded && key_specs.size() == 1 &&
       key_specs[0].regex_capture_jit && tlcs->TotalRows() <= UINT32_MAX &&
       min_having_count <= UINT32_MAX && candidate_blocks.size() >= 128 &&
-      std::getenv("TINYLAMB_DISABLE_FUSED_CAPTURE_HAVING") == nullptr &&
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_FUSED_CAPTURE_HAVING") ==
+          nullptr &&
       std::ranges::all_of(agg_specs, [&](const ColAggSpec& agg) {
         return agg.kind == ColAggKind::kCountStar ||
                (agg.full_col == key_specs[0].full_col &&

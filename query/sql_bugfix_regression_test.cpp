@@ -126,8 +126,12 @@ TEST_F(SqlBugfixRegressionTest, JoinDiscardsOverflowingSumGroup) {
   EXPECT_EQ(Query(sql), (std::vector<std::string>{"2,7"}));
   Exec("INSERT INTO dim VALUES (1)");
   const auto error = ErrorOf(sql);
-  ASSERT_TRUE(error.has_value());
-  EXPECT_NE(error.value().find("overflow"), std::string::npos) << error.value();
+  if (!error.has_value()) {
+    ADD_FAILURE() << "expected SQL error";
+    return;
+  }
+  const std::string& error_text = *error;
+  EXPECT_NE(error_text.find("overflow"), std::string::npos) << error_text;
 }
 
 // Single-table aggregation compiled its scan filter against the unqualified
@@ -410,7 +414,7 @@ TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
   for (int base = 0; base < 4100; base += 820) {
     std::string insert = "INSERT INTO m17 VALUES ";
     // Each tuple contains a UINT64 literal plus punctuation and spacing.
-    insert.reserve(insert.size() + (24 * 820));
+    insert.reserve(insert.size() + (size_t{24} * 820));
     for (int k = 0; k < 820; ++k) {
       const uint64_t value =
           18446744073709551615ULL - static_cast<uint64_t>(base + k);

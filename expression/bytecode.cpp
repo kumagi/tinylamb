@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "expression/bytecode.hpp"
 
 #include <algorithm>
@@ -211,7 +212,7 @@ StatusOr<Value> TryExtractDatePart(const Value& value, uint16_t part) {
 }
 
 inline bool EnvDisabled(const char* name) noexcept {
-  const char* env = std::getenv(name);
+  const char* env = ::tinylamb::platform::GetEnv(name);
   return env != nullptr && env[0] == '1';
 }
 
@@ -288,10 +289,12 @@ Collation StaticCollationOf(const Expression& expr) {
 
 }  // namespace
 
+namespace {
+
 // Lean proof: lean/TinylambOpt/FilterEvalOrder.lean (filter_eval_order_sound)
 // Conservative error-free check: returns true only when evaluating `expr` on
 // any row conforming to `schema` cannot raise an error.
-static bool IsErrorFreePredicateForOrdering(  // NOLINT(misc-no-recursion)
+bool IsErrorFreePredicateForOrdering(  // NOLINT(misc-no-recursion)
     const Expression& expr, const Schema& schema) {
   if (!expr) {
     return false;
@@ -439,6 +442,8 @@ static bool IsErrorFreePredicateForOrdering(  // NOLINT(misc-no-recursion)
       return false;
   }
 }
+
+}  // namespace
 
 namespace {
 
@@ -828,14 +833,13 @@ bool TryExtractRowInMask(const InExpression& in, const Schema& schema,
           is_quoted_text = fv.Truthy();
         }
         const Value& vv = val_arg->AsConstantValue().GetValue();
-        if (vv.IsNull()) {
+        if (vv.IsNull() ||
+            (c_stride == 3 && !is_quoted_text &&
+             vv.type == ValueType::kVarChar && vv.Collation() == 0 &&
+             !vv.IsInterval() && vv.value.varchar_value == "null")) {
           parsed_row[c] = std::nullopt;
         } else if (vv.type == ValueType::kInt64 && !vv.IsUnsigned()) {
           parsed_row[c] = vv.value.int_value;
-        } else if (c_stride == 3 && !is_quoted_text &&
-                   vv.type == ValueType::kVarChar && vv.Collation() == 0 &&
-                   !vv.IsInterval() && vv.value.varchar_value == "null") {
-          parsed_row[c] = std::nullopt;
         } else {
           return false;
         }
@@ -858,9 +862,10 @@ bool TryExtractRowInMask(const InExpression& in, const Schema& schema,
     for (size_t slot = 0; slot < cnt; ++slot) {
       const uint64_t bit = uint64_t{1} << slot;
       for (size_t c = 0; c < k; ++c) {
-        if (candidates[offset + slot][c].has_value()) {
+        const auto& candidate = candidates[offset + slot][c];
+        if (candidate.has_value()) {
           chunk.columns[c].non_null_mask |= bit;
-          chunk.columns[c].values[slot] = *candidates[offset + slot][c];
+          chunk.columns[c].values[slot] = candidate.value();
         } else {
           chunk.columns[c].null_mask |= bit;
         }
@@ -2951,7 +2956,7 @@ namespace {
 // FastSlotFromValue and fall back to the AST path.
 struct FastSlot {
   int64_t bits{};
-  ValueType type;
+  ValueType type{ValueType::kNull};
   bool is_null{};
   std::string_view text;
   bool is_substring{false};
@@ -4552,7 +4557,9 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateColumnarBatch(
 // setenv/unsetenv while morsel workers call getenv is a data race (UB); this
 // atomic override gives them a thread-safe channel. The environment variable
 // remains the public, process-external switch.
-static std::atomic<bool> g_bytecode_disabled_override{false};
+namespace {
+std::atomic<bool> g_bytecode_disabled_override{false};
+}  // namespace
 
 // Lean proof: lean/TinylambOpt/ResearchProofs/PlanCacheToggleInvalidation.lean
 //   (sound)

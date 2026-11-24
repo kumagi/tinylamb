@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -211,7 +212,7 @@ class CascadesRulesCoverageTest : public ::testing::Test {
 
     auto stat_tx = database_->BeginContext();
     for (const char* name : {"Sc1", "Sc2", "Sc3", "Sc4", "Dim", "Fact"}) {
-      database_->RefreshStatistics(stat_tx, name);
+  ASSERT_SUCCESS(database_->RefreshStatistics(stat_tx, name));
     }
     ASSERT_SUCCESS(stat_tx.PreCommit());
   }
@@ -244,7 +245,7 @@ TEST_F(CascadesRulesCoverageTest, GroupedSqlSelectsHashAndStreamAlternatives) {
   // default grouped route is the relational interpreter (same rows,
   // different plan text), so the shapes only hold under the
   // TINYLAMB_GROUPED_ROUTE=cascades escape hatch.
-  const char* grouped_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const char* grouped_route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   if (grouped_route == nullptr ||
       std::string_view(grouped_route) != "cascades") {
     GTEST_SKIP() << "plan-shape pins require the cascades grouped route";

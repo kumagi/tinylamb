@@ -102,8 +102,9 @@ uint32_t RecursivePartitioner::RadixBucket(uint64_t hash, uint32_t depth,
 
 RecursivePartitioner::RecursivePartitioner(Options options, RowHashFn hash_fn)
     : options_(options),
-      store_alive_((options.spill_store != nullptr) ? options.spill_store->LifetimeToken()
-                                       : std::weak_ptr<const bool>{}),
+      store_alive_((options.spill_store != nullptr)
+                       ? options.spill_store->LifetimeToken()
+                       : std::weak_ptr<const bool>{}),
       hash_fn_(std::move(hash_fn)) {
   if (options_.grant != nullptr) {
     const size_t refill =
@@ -132,7 +133,8 @@ size_t RecursivePartitioner::EffectiveBudgetBytes() const noexcept {
 void RecursivePartitioner::CleanupInternal() noexcept {
   for (BucketWriter& bw : root_writers_) {
     if (bw.writer != nullptr) {
-      bw.writer->Abort();
+      bw.writer->Abort();  // NOLINT(bugprone-unused-return-value): best-effort
+                           // rollback preserves the primary error.
     }
   }
   root_writers_.clear();
@@ -218,9 +220,8 @@ Status RecursivePartitioner::TransitionToSpill() try {
     const size_t row_bytes = EstimateRowMemoryBytes(row);
     if (row_bytes >= kPartitionWriteBatchBytes) {
       RETURN_IF_FAIL(FlushBucket(&writer));
-      RETURN_IF_FAIL(WriteRowBlock(writer.writer.get(),
-                                  std::span<const Row>(&row, 1),
-                                  &writer.scratch));
+      RETURN_IF_FAIL(WriteRowBlock(
+          writer.writer.get(), std::span<const Row>(&row, 1), &writer.scratch));
       writer.estimated_bytes += row_bytes;
       ++writer.row_count;
     } else {
@@ -474,7 +475,8 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) try {
             static_cast<uint64_t>(static_cast<double>(part.parent_bytes) *
                                   0.80);
     const bool skew_fallback =
-        !fits_budget && (part.depth >= options_.max_depth || insufficient_shrink);
+        !fits_budget &&
+        (part.depth >= options_.max_depth || insufficient_shrink);
     if (fits_budget || skew_fallback) {
       completed_leaves_.leaves.push_back(PartitionLeaf{
           .memory_rows = {},

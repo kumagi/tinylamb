@@ -928,13 +928,15 @@ std::shared_ptr<const LSTableIntegerRuns> LSTableStore::IntegerRuns(
         return nullptr;
       }
       if (slot >= next) {
-        std::fill(index->offsets.begin() + next,
-                  index->offsets.begin() + slot + 1, row);
+        std::fill(
+            index->offsets.begin() + static_cast<std::ptrdiff_t>(next),
+            index->offsets.begin() + static_cast<std::ptrdiff_t>(slot + 1),
+            row);
         next = slot + 1;
       }
     }
-    std::fill(index->offsets.begin() + next, index->offsets.end(),
-              static_cast<uint32_t>(total_rows));
+    std::fill(index->offsets.begin() + static_cast<std::ptrdiff_t>(next),
+              index->offsets.end(), static_cast<uint32_t>(total_rows));
     index->max_run_rows = std::max(
         index->max_run_rows, static_cast<uint32_t>(total_rows) - run_begin);
     integer_runs_ = std::move(index);
@@ -1096,6 +1098,7 @@ StatusOr<ExecResult> LSTableStore::ExecuteFragment(const Fragment& fragment,
   return Execute(runtime, artifacts, fragment, *lstable_schema);
 }
 
+// NOLINTNEXTLINE(misc-use-anonymous-namespace): bridge helper is file-local.
 static std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
     Transaction& txn, const Table& table, const std::vector<slot_t>* projection,
     uint64_t max_bytes, bool cache_in_table,

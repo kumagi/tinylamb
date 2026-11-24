@@ -278,7 +278,7 @@ TEST_F(LoggerTest, ReopenExistingWalKeepsContent) {
   const std::string appended(64, 'y');
   const lsn_t lsn = second->AddLog(appended).Value();
   EXPECT_EQ(lsn, first.size());
-  second->WaitForDurable(first.size() + appended.size());
+  ASSERT_SUCCESS(second->WaitForDurable(first.size() + appended.size()));
   EXPECT_EQ(std::filesystem::file_size(log_name_),
             first.size() + appended.size());
 

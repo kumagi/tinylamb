@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
@@ -72,24 +73,24 @@ class ForceGuard {
  public:
   explicit ForceGuard(const char* name) {
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
-    const char* prev = std::getenv("TINYLAMB_FORCE_SCHEME");
+    const char* prev = ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_SCHEME");
     if (prev != nullptr) {
       had_prev_ = true;
       prev_ = prev;
     }
     if (name != nullptr) {
-      setenv("TINYLAMB_FORCE_SCHEME", name,
+      ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", name,
              1);  // NOLINT(concurrency-mt-unsafe)
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ~ForceGuard() {
     if (had_prev_) {
-      setenv("TINYLAMB_FORCE_SCHEME", prev_.c_str(),
+      ::tinylamb::platform::SetEnv("TINYLAMB_FORCE_SCHEME", prev_.c_str(),
              1);  // NOLINT(concurrency-mt-unsafe)
     } else {
-      unsetenv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
+      ::tinylamb::platform::UnsetEnv("TINYLAMB_FORCE_SCHEME");  // NOLINT(concurrency-mt-unsafe)
     }
   }
   ForceGuard(const ForceGuard&) = delete;

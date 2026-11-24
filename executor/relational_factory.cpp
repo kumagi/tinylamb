@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/platform/int128_conversion.hpp"
 #include "common/query_parallelism.hpp"
@@ -238,7 +239,7 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
   // (read per call, not cached) so tests can compare the serial and morsel
   // paths on one statement.
   const bool parallel_scan_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_SCAN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_SCAN") != nullptr;
   if (!lock_rows_ && !parallel_scan_disabled &&
       MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
@@ -278,7 +279,7 @@ Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
   // keeps the streaming serial Selection.
   auto* scan = dynamic_cast<ParallelScan*>(src.get());
   if (scan != nullptr && scan->CanTakeRowFilter() &&
-      std::getenv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
       !relational_detail::ContainsQuery(exp_) && BytecodeEnabled()) {
     std::vector<Expression> conjuncts = SplitConjuncts(exp_);
     auto filter = std::make_unique<relational_detail::CompiledScanFilter>(
@@ -1178,7 +1179,7 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
   // Read per call like TINYLAMB_DISABLE_PARALLEL_SCAN so interactive A/B and
   // regression tests can toggle the hatch after warm-up.
   const bool parallel_index_scan_disabled =
-      std::getenv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
   if (!parallel_index_scan_disabled && ascending_ && !lock_rows_ &&
       LimitHint() == std::numeric_limits<size_t>::max() &&
       EmitRowCount() >= kParallelIndexScanMinRows) {

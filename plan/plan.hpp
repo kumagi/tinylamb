@@ -158,7 +158,8 @@ class PlanBase {
         << "... (truncated at depth " << kMaxPlanDumpDepth << ")\n";
       return;
     }
-    struct DepthGuard {
+    struct DepthGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                         // scope-owned cleanup.
       int& depth;
       explicit DepthGuard(int& d) : depth(d) { ++depth; }
       ~DepthGuard() { --depth; }

@@ -802,7 +802,7 @@ TEST_F(RelationalFunctionSweepTest, PackedUtcTruncationKeysMatchReference) {
   using relational_detail::FormatUtcTimestampTruncKey;
   using relational_detail::TryUtcTimestampTruncKey;
   const std::string previous = GetDefaultTimeZone();
-  struct Restore {
+  struct Restore {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
     explicit Restore(std::string value) : zone(std::move(value)) {}
     Restore(const Restore&) = delete;
     Restore& operator=(const Restore&) = delete;
@@ -1132,7 +1132,7 @@ TEST_F(RelationalFunctionSweepTest, BucketRejectsOverflowingWidth) {
 }
 
 TEST_F(RelationalFunctionSweepTest, ExplicitTemporalZonesAreAppliedOnce) {
-  struct Restore {
+  struct Restore {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
     std::string zone = GetDefaultTimeZone();
     ~Restore() { SetDefaultTimeZone(zone); }
   } restore{};
@@ -1169,7 +1169,7 @@ TEST_F(RelationalFunctionSweepTest, ExplicitTemporalZonesAreAppliedOnce) {
 
 TEST_F(RelationalFunctionSweepTest, AuditTimestampArithmeticUsesAbsoluteTime) {
   const std::string previous = GetDefaultTimeZone();
-  struct Restore {
+  struct Restore {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
     explicit Restore(std::string saved) : zone(std::move(saved)) {}
     Restore(const Restore&) = delete;
     Restore& operator=(const Restore&) = delete;
@@ -1253,10 +1253,12 @@ TEST_F(RelationalFunctionSweepTest, AuditJsonExtractionMatchesAst) {
       const auto expected = call->TryEvaluate(Row(), Schema("t", {}));
       const auto actual = Evaluate(name, args);
       ASSERT_TRUE(expected.HasValue()) << name;
-      ASSERT_TRUE(actual.has_value()) << name;
-      // NOLINTNEXTLINE(bugprone-unchecked-optional-access) harness assumes
-      // success
-      EXPECT_EQ(*actual, expected.Value()) << name;
+      if (!actual.has_value()) {
+        ADD_FAILURE() << name << " returned no value";
+        return;
+      }
+      const Value& actual_value = actual.value();
+      EXPECT_EQ(actual_value, expected.Value()) << name;
     }
   }
 

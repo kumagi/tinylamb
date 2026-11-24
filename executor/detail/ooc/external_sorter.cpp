@@ -1,4 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#include "common/platform/process.hpp"
 #include "executor/detail/ooc/external_sorter.hpp"
 
 #include <algorithm>
@@ -170,7 +171,7 @@ int ExternalSorter::CompareRows(const Row& lhs, const Row& rhs) const noexcept {
 // Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
 // Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
 bool ExternalSorter::TrySortRowsPackedTwoKey(std::vector<Row>* rows) const {
-  const char* disable_env = std::getenv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
+  const char* disable_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");
   if (disable_env != nullptr && std::strcmp(disable_env, "1") == 0) {
     return false;
   }
@@ -1118,7 +1119,7 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     try {
       stream.block_rows.insert(stream.block_rows.begin(), std::move(emitted));
       stream.row_idx = 0;
-    } catch (const std::bad_alloc&) {
+    } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): keep the primary failure.
       // Best effort: even if the row cannot be restored, report the real
       // failure instead of leaking an exception across this Status path.
     }
@@ -1132,7 +1133,7 @@ StatusOr<bool> ExternalSorter::NextRow(Row* row_out) {
     try {
       stream.block_rows.insert(stream.block_rows.begin(), std::move(emitted));
       stream.row_idx = 0;
-    } catch (const std::bad_alloc&) {
+    } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): keep the primary failure.
       // Best effort, as above: report the real failure either way.
     }
     return key_status;

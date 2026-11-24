@@ -18,6 +18,7 @@
 // Created by kumagi on 22/05/04.
 //
 
+#include "common/platform/process.hpp"
 #include "page_storage.hpp"
 
 #include <algorithm>
@@ -45,7 +46,7 @@ namespace {
 // WAL segment size override for tests that exercise segment rollover or
 // recycling without writing tens of megabytes. 0 / unset keeps the default.
 size_t LogSegmentSizeFromEnv() {
-  const char* env = std::getenv("TINYLAMB_LOG_SEGMENT_BYTES");
+  const char* env = ::tinylamb::platform::GetEnv("TINYLAMB_LOG_SEGMENT_BYTES");
   if (env == nullptr || env[0] == '\0') {
     return Logger::kDefaultLogSegmentSize;
   }
@@ -91,7 +92,7 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
   auto tm =
       std::make_unique<TransactionManager>(pm.get(), logger.get(), rm.get());
   size_t checkpoint_interval = 10;
-  const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
+  const char* ckpt_env = ::tinylamb::platform::GetEnv("TINYLAMB_CHECKPOINT_SECONDS");
   if (ckpt_env != nullptr && ckpt_env[0] != '\0') {
     // strtoull wraps a leading '-' to ULLONG_MAX and accepts '+' and
     // leading whitespace; reject signs/space explicitly like
@@ -256,7 +257,7 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
       storage->rm_->RecoveryAnchorLSN() >= wal_end &&
       !storage->rm_->RecoveryTornTailTruncated();
   if (wal_end > 0 && !snapshot_already_current &&
-      std::getenv("TINYLAMB_DISABLE_EOR_CHECKPOINT") == nullptr) {
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_EOR_CHECKPOINT") == nullptr) {
     const StatusOr<lsn_t> anchored = storage->cm_->WriteCheckpoint();
     if (!anchored.HasValue()) {
       LOG(WARN)
