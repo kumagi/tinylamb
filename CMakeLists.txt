@@ -450,11 +450,21 @@ tinylamb_add_layer(tinylamb_table
         table/table.cpp
         table/full_scan_iterator.cpp
         table/lstable_bridge.cpp
+        table/tlcs_compression.cpp
         table/tlcs_file.cpp
         table/table_statistics.cpp
         index/index_scan_iterator.cpp
         ${TINYLAMB_PAX_SOURCES}
         DEPENDS tinylamb::index)
+
+find_library(TINYLAMB_ZSTD_LIBRARY NAMES zstd)
+find_path(TINYLAMB_ZSTD_INCLUDE_DIR NAMES zstd.h)
+if(TINYLAMB_ZSTD_LIBRARY AND TINYLAMB_ZSTD_INCLUDE_DIR)
+  message(STATUS "TLCS compression: Zstandard enabled (${TINYLAMB_ZSTD_LIBRARY})")
+  target_compile_definitions(tinylamb_table PRIVATE TINYLAMB_HAS_ZSTD=1)
+  target_include_directories(tinylamb_table PRIVATE "${TINYLAMB_ZSTD_INCLUDE_DIR}")
+  target_link_libraries(tinylamb_table PUBLIC "${TINYLAMB_ZSTD_LIBRARY}")
+endif()
 
 # Layer 6: catalog and database orchestration.
 tinylamb_add_layer(tinylamb_database
@@ -561,6 +571,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/detail/build_input.cpp
         executor/detail/build_input_joins.cpp
         executor/detail/analytics_factorized_join.cpp
+        executor/detail/execution_strategies.cpp
         executor/detail/fused_grouped_join.cpp
         executor/detail/fused_grouped_join_stream.cpp
         executor/detail/typed_column_eval.cpp
@@ -1136,6 +1147,7 @@ add_simple_test(executor/detail/planning_heuristics_test.cpp)
 add_simple_test(executor/detail/typed_stream_aggregate_test.cpp)
 add_simple_test(executor/detail/fused_grouped_join_test.cpp)
 add_simple_test(executor/detail/analytics_factorized_join_test.cpp)
+add_simple_test(executor/detail/execution_strategies_test.cpp)
 add_simple_test(executor/merge_append_test.cpp)
 add_simple_test(expression/function_call_test.cpp)
 add_simple_test(expression/json_text_test.cpp)
@@ -1185,6 +1197,7 @@ add_simple_test(plan/full_scan_plan_test.cpp)
 add_simple_test(plan/late_materialization_join_plan_test.cpp)
 add_simple_test(plan/plan_memo_oracle_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
+add_simple_test(table/tlcs_compression_test.cpp)
 add_simple_test(table/tlcs_file_test.cpp)
 add_simple_test(query/query_test_part1.cpp
         TARGET query_test

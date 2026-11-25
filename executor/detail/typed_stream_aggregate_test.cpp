@@ -851,7 +851,7 @@ TEST(TypedStreamAggregateTest, ScalarInRangeSynopsisMatchesCanonicalFold) {
     for (int64_t i = 0; i < 20000; ++i) {
       Value id1 = (i % 37 == 0) ? Value() : Value((i % 100) + 1);
       Value id2 = (i % 53 == 0) ? Value() : Value(i % 100);
-      Value v1 = (i % 29 == 0) ? Value() : Value((i * 17) % 1000 - 250);
+      Value v1 = (i % 29 == 0) ? Value() : Value(((i * 17) % 1000) - 250);
       if (i % 1000 == 0) {
         id1 = Value(int64_t{50000});
       }

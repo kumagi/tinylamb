@@ -3811,6 +3811,15 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
     plan_cache_fingerprint_.clear();
     plan_cache_parameters_.clear();
   }
+  // Flatten nested `SELECT SUM(col) FROM (... UNION ALL ...)` trees and fold
+  // identical leaf `SELECT SUM(expr)` branches with multiplicity m into
+  // `SUM(expr) * m` (Lean: CloudBI/NestedBI.lean sound_FlattenSum,
+  // sound_BranchHistogram).
+  if (FoldNestedSumUnionAllBranches(select.get())) {
+    dml_fold_applied_ = true;
+    plan_cache_fingerprint_.clear();
+    plan_cache_parameters_.clear();
+  }
   // A CTE that stays shared cannot take one consumer's filter, but it can
   // take the disjunction of every consumer's restriction: that keeps every
   // row any reference can emit and drops the rest before the cell is
@@ -3868,6 +3877,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
         DeferUniqueDimensionAttributesAfterTopN(select.get(), ctx);
     tpch_rewritten |= RewriteAffineLinearSums(select.get(), ctx);
     tpch_rewritten |= PreGroupBeforeExpressionGroupBy(select.get(), ctx);
+    tpch_rewritten |= CollapseConstantGroupBy(select.get(), ctx);
+    tpch_rewritten |= FactorDeleteAntiJoinSubquery(select.get());
     if (tpch_rewritten) {
       dml_fold_applied_ = true;
       plan_cache_fingerprint_.clear();

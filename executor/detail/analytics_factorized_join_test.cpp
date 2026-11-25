@@ -775,17 +775,17 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
             "CREATE TABLE s2 (yr INT64, k INT64, cnt INT64, amt DOUBLE)");
     {
       TransactionContext ctx = q75_db->BeginContext();
-      Table t1 = q75_db->GetTable(ctx, "s1").MoveValue();
-      Table t2 = q75_db->GetTable(ctx, "s2").MoveValue();
+      Table tbl1 = q75_db->GetTable(ctx, "s1").MoveValue();
+      Table tbl2 = q75_db->GetTable(ctx, "s2").MoveValue();
       for (int64_t yr : {2000, 2001, 2002}) {
         for (int64_t k = 1; k <= 8; ++k) {
           ASSERT_TRUE(
-              t1.Insert(ctx.txn_, Row({Value(yr), Value(k), Value(k * 2),
-                                       Value(static_cast<double>(k) * 10.0)}))
+              tbl1.Insert(ctx.txn_, Row({Value(yr), Value(k), Value(k * 2),
+                                         Value(static_cast<double>(k) * 10.0)}))
                   .HasValue());
           ASSERT_TRUE(
-              t2.Insert(ctx.txn_, Row({Value(yr), Value(k), Value(k + 1),
-                                       Value(static_cast<double>(k) * 5.0)}))
+              tbl2.Insert(ctx.txn_, Row({Value(yr), Value(k), Value(k + 1),
+                                         Value(static_cast<double>(k) * 5.0)}))
                   .HasValue());
         }
       }
@@ -810,7 +810,7 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
     const auto rows = RunQuery(&q75_eng, q75_db.get(), q75_sql);
     ASSERT_EQ(rows.size(), 8U);
     for (size_t i = 0; i < 8; ++i) {
-      const int64_t k = static_cast<int64_t>(i + 1);
+      const auto k = static_cast<int64_t>(i + 1);
       // For k=1, s1=(yr,1,2,10.0) and s2=(yr,1,2,5.0) are distinct -> sum=4.
       const int64_t expected_cnt = (k * 2) + (k + 1);
       EXPECT_EQ(rows[i][0].value.int_value, 2001);
@@ -837,7 +837,7 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
         ASSERT_TRUE(tp.Insert(ctx.txn_, Row({Value(p)})).HasValue());
       }
       for (int64_t i = 1; i <= 40; ++i) {
-        const Value psk = (i % 3 == 0) ? Value(i % 5 + 1) : Value(100 + i);
+        const Value psk = (i % 3 == 0) ? Value((i % 5) + 1) : Value(100 + i);
         ASSERT_TRUE(tf.Insert(ctx.txn_, Row({Value(i % 4), psk})).HasValue());
       }
       ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);

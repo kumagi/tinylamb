@@ -3861,10 +3861,8 @@ bool TryParallelTableScan(
                             StatusError(StatusCode::kIsInfinity,
                                         "integer overflow in subtraction"));
                         return false;
-                      } else {
-                        dst_col.AppendValue(Value(diff), nullptr,
-                                            prev_rows + i);
                       }
+                      dst_col.AppendValue(Value(diff), nullptr, prev_rows + i);
                     } else {
                       dst_col.AppendValue(
                           Value(a.value.double_value - rhs.value.double_value),

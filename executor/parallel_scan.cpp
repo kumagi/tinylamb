@@ -617,9 +617,8 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       // reallocates only when a block is strictly larger than every block
       // seen so far. Fluctuating (smaller) blocks reuse this one buffer, so
       // there is no per-block malloc/free churn at LSTable boundaries.
-      // NOLINTNEXTLINE(modernize-avoid-c-arrays): reusable runtime-sized
-      // scratch.
-      std::unique_ptr<uint32_t[]> simple_matches;  // NOLINT(modernize-avoid-c-arrays): reusable runtime-sized scratch.
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+      std::unique_ptr<uint32_t[]> simple_matches;
       size_t simple_capacity = 0;
       for (size_t b = b_begin; b < b_end; ++b) {
         if (failed.load(std::memory_order_acquire)) {
@@ -678,14 +677,20 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             }
           }
         }
+        // Lean-backed (DuckDBGaps/Hits.lean: DatePostings_sound): track per-
+        // predicate whole-block satisfaction so interior blocks skip redundant
+        // per-row date/integer range checks when other predicates remain.
+        uint64_t simple_all_pass_mask = 0;
         if (can_inline_simple && !kleene_all_pass) {
           bool zone_rejected = false;
-          for (const auto& pred : row_filter_->simple) {
+          for (size_t p_idx = 0; p_idx < row_filter_->simple.size(); ++p_idx) {
+            const auto& pred = row_filter_->simple[p_idx];
             const LSTableColumnBlock& col = blk.columns[pred.column];
             if (col.type == ValueType::kVarChar) {
               all_rows_pass = false;
               continue;
             }
+            bool pred_all_pass = true;
             const bool is_double_cmp = col.type == ValueType::kDouble;
             if (is_double_cmp) {
               if (col.has_nan ||
@@ -707,6 +712,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                   } else if (col.has_null || col.min_double != c ||
                              col.max_double != c) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kNotEquals:
@@ -715,6 +721,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                   } else if (col.has_null ||
                              (col.min_double <= c && c <= col.max_double)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kLessThan:
@@ -722,6 +729,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.max_double < c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kLessThanEquals:
@@ -729,6 +737,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.max_double <= c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kGreaterThan:
@@ -736,6 +745,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.min_double > c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kGreaterThanEquals:
@@ -743,10 +753,12 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.min_double >= c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 default:
                   all_rows_pass = false;
+                  pred_all_pass = false;
                   break;
               }
             } else {
@@ -762,6 +774,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                   } else if (col.has_null || col.min_int != c ||
                              col.max_int != c) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kNotEquals:
@@ -770,6 +783,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                   } else if (col.has_null ||
                              (col.min_int <= c && c <= col.max_int)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kLessThan:
@@ -777,6 +791,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.max_int < c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kLessThanEquals:
@@ -784,6 +799,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.max_int <= c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kGreaterThan:
@@ -791,6 +807,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.min_int > c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 case BinaryOperation::kGreaterThanEquals:
@@ -798,15 +815,20 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     zone_rejected = true;
                   } else if (col.has_null || !(col.min_int >= c)) {
                     all_rows_pass = false;
+                    pred_all_pass = false;
                   }
                   break;
                 default:
                   all_rows_pass = false;
+                  pred_all_pass = false;
                   break;
               }
             }
             if (zone_rejected) {
               break;
+            }
+            if (pred_all_pass && p_idx < 64) {
+              simple_all_pass_mask |= (uint64_t{1} << p_idx);
             }
           }
           if (zone_rejected) {
@@ -833,59 +855,111 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
               (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
             if (simple_capacity < blk.row_count) {
               // NOLINTNEXTLINE(modernize-avoid-c-arrays): reusable scratch.
-              simple_matches =
-                  std::make_unique_for_overwrite<uint32_t[]>(blk.row_count);  // NOLINT(modernize-avoid-c-arrays): runtime-sized scratch.
+              simple_matches = std::make_unique_for_overwrite<uint32_t[]>(
+                  blk.row_count);  // NOLINT(modernize-avoid-c-arrays):
+                                   // runtime-sized scratch.
               simple_capacity = blk.row_count;
             }
             uint32_t* __restrict out = simple_matches.get();
-            const int64_t* __restrict vals = col.int_cells.data();
             const int64_t c = pred.int_constant;
             const uint32_t n = blk.row_count;
             size_t out_idx = 0;
-            switch (pred.op) {
-              case BinaryOperation::kEquals:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] == c);
-                }
-                break;
-              case BinaryOperation::kNotEquals:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] != c);
-                }
-                break;
-              case BinaryOperation::kLessThan:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] < c);
-                }
-                break;
-              case BinaryOperation::kLessThanEquals:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] <= c);
-                }
-                break;
-              case BinaryOperation::kGreaterThan:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] > c);
-                }
-                break;
-              case BinaryOperation::kGreaterThanEquals:
-                for (uint32_t r = 0; r < n; ++r) {
-                  out[out_idx] = r;
-                  out_idx += static_cast<size_t>(vals[r] >= c);
-                }
-                break;
-              default:
-                for (uint32_t r = 0; r < n; ++r) {
-                  if (MatchIntegerCompare(vals[r], pred.op, c)) {
-                    out[out_idx++] = r;
+            // Lean-backed (DuckDBGaps/Hits.lean: StridedPoint_sound): when the
+            // column is FOR-encoded (1/2/4-byte packed offsets, no int_cells),
+            // reject out-of-frame targets before touching packed offsets and
+            // filter directly in the narrowed code domain.
+            if (pred.op == BinaryOperation::kEquals && col.int_cells.empty() &&
+                !col.for_bytes.empty() &&
+                (col.for_width == 1 || col.for_width == 2 ||
+                 col.for_width == 4)) {
+              const uint64_t diff = static_cast<uint64_t>(c) -
+                                    static_cast<uint64_t>(col.for_base);
+              const uint64_t max_off =
+                  col.for_width == 1
+                      ? uint64_t{0xFF}
+                      : (col.for_width == 2 ? uint64_t{0xFFFF}
+                                            : uint64_t{0xFFFFFFFF});
+              if (c >= col.for_base && diff <= max_off) {
+                if (col.for_width == 1) {
+                  const auto target_code = static_cast<uint8_t>(diff);
+                  const uint8_t* __restrict fb = col.for_bytes.data();
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(fb[r] == target_code);
+                  }
+                } else if (col.for_width == 2) {
+                  const auto target_code = static_cast<uint16_t>(diff);
+                  const uint8_t* __restrict fb = col.for_bytes.data();
+                  for (uint32_t r = 0; r < n; ++r) {
+                    uint16_t code = 0;
+                    std::memcpy(&code, fb + (static_cast<size_t>(r) * 2), 2);
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(code == target_code);
+                  }
+                } else {
+                  const auto target_code = static_cast<uint32_t>(diff);
+                  const uint8_t* __restrict fb = col.for_bytes.data();
+                  for (uint32_t r = 0; r < n; ++r) {
+                    uint32_t code = 0;
+                    std::memcpy(&code, fb + (static_cast<size_t>(r) * 4), 4);
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(code == target_code);
                   }
                 }
-                break;
+              }
+            } else if (!col.int_cells.empty()) {
+              const int64_t* __restrict vals = col.int_cells.data();
+              switch (pred.op) {
+                case BinaryOperation::kEquals:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] == c);
+                  }
+                  break;
+                case BinaryOperation::kNotEquals:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] != c);
+                  }
+                  break;
+                case BinaryOperation::kLessThan:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] < c);
+                  }
+                  break;
+                case BinaryOperation::kLessThanEquals:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] <= c);
+                  }
+                  break;
+                case BinaryOperation::kGreaterThan:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] > c);
+                  }
+                  break;
+                case BinaryOperation::kGreaterThanEquals:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    out[out_idx] = r;
+                    out_idx += static_cast<size_t>(vals[r] >= c);
+                  }
+                  break;
+                default:
+                  for (uint32_t r = 0; r < n; ++r) {
+                    if (MatchIntegerCompare(vals[r], pred.op, c)) {
+                      out[out_idx++] = r;
+                    }
+                  }
+                  break;
+              }
+            } else {
+              for (uint32_t r = 0; r < n; ++r) {
+                if (MatchIntegerCompare(col.IntAt(r), pred.op, c)) {
+                  out[out_idx++] = r;
+                }
+              }
             }
             if (out_idx == blk.row_count) {
               if (Status st = consume(w, blk, nullptr, blk.row_count);
@@ -922,7 +996,13 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           }
           if (can_inline_simple && !kleene_all_pass) {
             bool simple_ok = true;
-            for (const auto& pred : row_filter_->simple) {
+            for (size_t p_idx = 0; p_idx < row_filter_->simple.size();
+                 ++p_idx) {
+              if (p_idx < 64 &&
+                  (simple_all_pass_mask & (uint64_t{1} << p_idx)) != 0) {
+                continue;
+              }
+              const auto& pred = row_filter_->simple[p_idx];
               const LSTableColumnBlock& col = blk.columns[pred.column];
               if (col.IsNull(r)) {
                 simple_ok = false;

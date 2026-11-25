@@ -14,10 +14,10 @@
 #include <vector>
 
 #include "common/memory_budget.hpp"
-#include "common/test_util.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
+#include "common/test_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/columnar_tlcs_internal.hpp"
@@ -594,8 +594,8 @@ TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
     ASSERT_EQ(table.Reserve(64), Status::kSuccess);
     const size_t slot_bytes = charge.Bytes();
     for (int64_t i = 0; i < 64; ++i) {
-      const std::array<RuntimeKeyCell, 2> key{{{.int_val = i},
-                                                {.int_val = i + 1}}};
+      const std::array<RuntimeKeyCell, 2> key{
+          {{.int_val = i}, {.int_val = i + 1}}};
       const uint64_t hash = GroupKeySliceHasher::HashTyped(key.data(), keys);
       auto group = table.FindOrInsert(key.data(), hash);
       if (!group.HasValue()) {
@@ -608,8 +608,7 @@ TEST(ColumnarTlcsFastPathTest, MixedGroupTableRespectsQueryMemoryBudget) {
     EXPECT_GT(table.NumGroups(), 0U);
     EXPECT_LT(table.NumGroups(), 64U);
     EXPECT_GT(charge.Bytes(), slot_bytes);
-    const std::array<RuntimeKeyCell, 2> first{{{.int_val = 0},
-                                                {.int_val = 1}}};
+    const std::array<RuntimeKeyCell, 2> first{{{.int_val = 0}, {.int_val = 1}}};
     auto group = table.FindOrInsert(
         first.data(), GroupKeySliceHasher::HashTyped(first.data(), keys));
     ASSERT_TRUE(group.HasValue());
@@ -1161,9 +1160,9 @@ TEST(ColumnarTlcsFastPathTest, DistinctAggregateSkipsAbsentDictionaryKeys) {
   ASSIGN_OR_ASSERT_FAIL(std::optional<Relation>, res,
                         TryRunPartitionedColumnarTlcsAggregate(req));
   if (!res.has_value()) {
-      ADD_FAILURE() << "expected optional value";
-      return;
-    }
+    ADD_FAILURE() << "expected optional value";
+    return;
+  }
   if (!res.has_value()) {
     return;
   }
@@ -1456,8 +1455,8 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
       } else {
         const int64_t base =
             (static_cast<int64_t>(
-                blk) *   // NOLINT(readability-math-missing-parentheses)
-                10000) +  // NOLINT(readability-math-missing-parentheses)
+                 blk) *  // NOLINT(readability-math-missing-parentheses)
+             10000) +    // NOLINT(readability-math-missing-parentheses)
             static_cast<int64_t>((off / 4) * 2);
         const int64_t jitter = (off % 2 == 0) ? 1 : 0;
         okey = Value(std::min<int64_t>(base + jitter,
@@ -1470,8 +1469,8 @@ TEST(ColumnarTlcsFastPathTest, BlockMonotonicRunAggAndDoubleArithExpressions) {
       const double price =
           100.0 +
           (static_cast<double>(
-              r % 250) *  // NOLINT(readability-math-missing-parentheses)
-              1.25);       // NOLINT(readability-math-missing-parentheses)
+               r % 250) *  // NOLINT(readability-math-missing-parentheses)
+           1.25);          // NOLINT(readability-math-missing-parentheses)
       const double disc = static_cast<double>(r % 11) * 0.01;
       const double tax = static_cast<double>(r % 9) * 0.01;
       ASSERT_TRUE(
@@ -2212,6 +2211,91 @@ TEST(ColumnarTlcsFastPathTest, MonotonicRunCountDistinctMatchesRowStore) {
   }
   EXPECT_EQ(row_store[0][0], Row({Value(multi)}).ToString());
 
+  db->DeleteAll();
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//     (FrontCodedContains_sound, OrderedCodeMin_sound, OwnerDistinct_sound)
+//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+//     (sound_DominatedColumn)
+TEST(ColumnarTlcsFastPathTest,
+     FrontCodedDictContainsAndOrderedCodeMinMatchRowStore) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  const std::string prefix = "tlcs_hits_" + RandomString();
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  Schema schema("hits", {Column("SearchPhrase", ValueType::kVarChar),
+                         Column("URL", ValueType::kVarChar),
+                         Column("UserID", ValueType::kInt64)});
+  const std::vector<std::string> urls = {
+      "http://example.com/a/1",       "http://example.com/a/2",
+      "http://example.com/goo/1",     "http://example.com/google/1",
+      "http://example.com/google/2",  "http://example.com/google/3",
+      "http://google.com/search?q=a", "http://google.com/search?q=b",
+      "http://news.org/story",        "http://z.org/goo",
+      "http://z.org/google",
+  };
+  const std::vector<std::string> phrases = {
+      "", "alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+  };
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
+    Table tbl = db->GetTable(ctx, "hits").MoveValue();
+    for (int64_t i = 0; i < 6000; ++i) {
+      Value ph = (i % 41 == 0)
+                     ? Value()
+                     : Value(std::string(
+                           phrases[static_cast<size_t>(i % phrases.size())]));
+      Value url =
+          (i % 37 == 0)
+              ? Value()
+              : Value(std::string(urls[static_cast<size_t>(i % urls.size())]));
+      Value uid = (i % 29 == 0) ? Value() : Value((i * 13) % 500);
+      ASSERT_TRUE(tbl.Insert(ctx.txn_, Row(std::vector<Value>{ph, url, uid}))
+                      .HasValue());
+    }
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+
+  SqlEngine engine(*db);
+  const std::vector<std::string> queries = {
+      "SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'",
+      "SELECT SearchPhrase, MIN(URL), COUNT(*) AS c "
+      "FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' "
+      "GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase ASC LIMIT 5",
+      "SELECT SearchPhrase, MIN(URL), COUNT(DISTINCT UserID), COUNT(*) AS c "
+      "FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' "
+      "GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase ASC LIMIT 5",
+      "SELECT MIN(UserID), MAX(UserID) FROM hits",
+  };
+  auto run_all = [&]() {
+    std::vector<std::vector<std::string>> out;
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    for (const std::string& sql : queries) {
+      StatusOr<Executor> prep = engine.Prepare(ctx, sql);
+      EXPECT_TRUE(prep.HasValue()) << sql << ": " << prep.GetStatus();
+      std::vector<std::string> rows;
+      Row r;
+      while (prep.HasValue() && prep.Value()->Next(&r, nullptr)) {
+        rows.push_back(r.ToString());
+      }
+      out.push_back(std::move(rows));
+    }
+    return out;
+  };
+  const auto row_store = run_all();
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(ctx, "hits"), Status::kSuccess);
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  const auto tlcs = run_all();
+  for (size_t i = 0; i < queries.size(); ++i) {
+    EXPECT_EQ(tlcs[i], row_store[i]) << queries[i];
+  }
   db->DeleteAll();
 }
 

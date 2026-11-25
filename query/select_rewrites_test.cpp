@@ -1,5 +1,4 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "common/platform/process.hpp"
 #include "query/select_rewrites.hpp"
 
 #include <gtest/gtest.h>
@@ -12,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
@@ -93,7 +93,9 @@ class SelectRewritesTest : public ::testing::Test {
 };
 
 TEST_F(SelectRewritesTest, RewrittenBranchesRetainDifferentLocalCteBodies) {
-  auto stmt = ParseSelect("SELECT x FROM helper WHERE NOT (x IS NULL) UNION ALL SELECT x FROM helper");
+  auto stmt = ParseSelect(
+      "SELECT x FROM helper WHERE NOT (x IS NULL) UNION ALL SELECT x FROM "
+      "helper");
   ASSERT_TRUE(stmt && stmt->GetSetOperationTree());
   const auto& tree = stmt->GetSetOperationTree();
   ASSERT_EQ(tree->branches.size(), 1U);
@@ -104,7 +106,8 @@ TEST_F(SelectRewritesTest, RewrittenBranchesRetainDifferentLocalCteBodies) {
   auto result = relational_detail::ExecuteQuery(*ctx_, *stmt, nullptr, {});
   ASSERT_TRUE(result.HasValue()) << result.GetStatus();
   ASSERT_SUCCESS(result.Value().EnsureRowsMaterialized());
-  EXPECT_EQ(result.Value().rows, (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+  EXPECT_EQ(result.Value().rows,
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
 }
 
 TEST_F(SelectRewritesTest, InlineSingleUseCtesReplacesSingleReference) {
@@ -1519,7 +1522,8 @@ TEST_F(SelectRewritesTest, OuterJoinCountsFullLeftInnerNullsAndEmpties) {
   };
   auto run_sql = [&](bool disable, const std::string& sql) {
     if (disable) {
-      ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", "1", 1);
+      ::tinylamb::platform::SetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS", "1",
+                                   1);
     } else {
       ::tinylamb::platform::UnsetEnv("TINYLAMB_DISABLE_OUTER_JOIN_COUNTS");
     }
@@ -1735,6 +1739,366 @@ TEST_F(SelectRewritesTest, WindowHaloAndOuterFetchTiesSqlParity) {
     }
     EXPECT_EQ(fast, ref) << sql;
   }
+}
+
+// Lean proofs:
+//   Wave9TpcdsMultiChannelAndTpch.lean (CteVarianceCoeffSelfJoinPivot_sound,
+//                                       GroupAvgThresholdTwoPassSplit_sound)
+//   CloudBI/PublicBI.lean (sound_GroupBeforeSuffix)
+TEST_F(SelectRewritesTest, Wave9Q39Q65AndCloudBiPreGroupSuffixRewrites) {
+  auto exec_stmt = [&](const std::string& sql) {
+    auto r = engine_->Execute(*ctx_, sql);
+    ASSERT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    r.Value().Drain();
+    ASSERT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+  };
+  auto collect_rows = [&](const std::string& sql) {
+    auto r = engine_->Execute(*ctx_, sql);
+    EXPECT_TRUE(r.HasValue()) << engine_->LastError() << " for " << sql;
+    std::vector<Row> out;
+    if (r.HasValue()) {
+      Row row;
+      while (r.Value().Next(&row)) {
+        out.push_back(std::move(row));
+        row = Row();
+      }
+      EXPECT_EQ(r.Value().GetStatus(), Status::kSuccess) << sql;
+    }
+    return out;
+  };
+
+  // 1. Q39: PushSharedCteRestrictions into a wrapped inner-join GROUP BY CTE.
+  exec_stmt("CREATE TABLE q39_inv (item_sk INT64, d_sk INT64, qty INT64);");
+  exec_stmt("CREATE TABLE q39_dt (d_sk INT64, d_year INT64, d_moy INT64);");
+  exec_stmt(
+      "INSERT INTO q39_dt VALUES "
+      "(1, 2002, 1), (2, 2002, 2), (3, 2002, 3), (4, 2002, 4);");
+  exec_stmt(
+      "INSERT INTO q39_inv VALUES "
+      "(10, 1, 5), (10, 1, 50), (10, 2, 3), (10, 2, 40), (10, 3, 99);");
+  exec_stmt("ANALYZE q39_inv;");
+  exec_stmt("ANALYZE q39_dt;");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    auto stmt = ParseSelect(
+        "WITH inv AS ("
+        "  SELECT item_sk, d_moy, mean FROM ("
+        "    SELECT item_sk, d_moy, AVG(qty) AS mean "
+        "    FROM q39_inv, q39_dt "
+        "    WHERE q39_inv.d_sk = q39_dt.d_sk AND d_year = 2002 "
+        "    GROUP BY item_sk, d_moy"
+        "  ) foo WHERE mean > 1"
+        ") "
+        "SELECT inv1.item_sk, inv1.d_moy, inv2.d_moy "
+        "FROM inv inv1, inv inv2 "
+        "WHERE inv1.item_sk = inv2.item_sk "
+        "  AND inv1.d_moy = 1 AND inv2.d_moy = 1 + 1");
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_EQ(PushSharedCteRestrictions(stmt.get(), *ctx_), 1U);
+    const auto& inv_body = stmt->WithQueries().at("inv");
+    ASSERT_NE(inv_body, nullptr);
+    ASSERT_EQ(inv_body->Sources().size(), 1U);
+    ASSERT_NE(inv_body->Sources()[0].query, nullptr);
+    const std::string inner_where =
+        inv_body->Sources()[0].query->WhereClause()->ToString();
+    EXPECT_NE(inner_where.find("d_moy"), std::string::npos) << inner_where;
+  }
+
+  // 2. Q65: HoistDuplicateDerivedTablesToCte shares identical grouped deriveds.
+  exec_stmt("CREATE TABLE q65_s (s_sk INT64, i_sk INT64, price INT64);");
+  exec_stmt("INSERT INTO q65_s VALUES (1, 10, 100), (1, 11, 2), (2, 10, 50);");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    const std::string q65_sql =
+        "SELECT sc.s_sk, sc.i_sk, sc.rev "
+        "FROM (SELECT s_sk, AVG(rev) AS ave FROM "
+        "        (SELECT s_sk, i_sk, SUM(price) AS rev FROM q65_s "
+        "         GROUP BY s_sk, i_sk) sa "
+        "      GROUP BY s_sk) sb, "
+        "     (SELECT s_sk, i_sk, SUM(price) AS rev FROM q65_s "
+        "      GROUP BY s_sk, i_sk) sc "
+        "WHERE sb.s_sk = sc.s_sk AND sc.rev <= 0.1 * sb.ave";
+    auto stmt = ParseSelect(q65_sql);
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_TRUE(HoistDuplicateDerivedTablesToCte(stmt.get()));
+    EXPECT_EQ(stmt->WithQueries().size(), 1U);
+    const auto rows = collect_rows(q65_sql);
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+    EXPECT_EQ(rows[0][1], Value(int64_t{11}));
+    EXPECT_EQ(rows[0][2], Value(int64_t{2}));
+  }
+
+  // 3. Public BI: PreGroupBeforeExpressionGroupBy (sound_GroupBeforeSuffix).
+  exec_stmt("CREATE TABLE mlb_t (league VARCHAR, pos VARCHAR);");
+  exec_stmt(
+      "INSERT INTO mlb_t VALUES "
+      "('AL', 'Center Fielder'), ('AL', 'Left Fielder'), ('AL', 'Pitcher'), "
+      "('NL', 'Right Fielder'), ('NL', NULL), (NULL, 'Center Fielder');");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    const std::string mlb_sql =
+        "SELECT league, "
+        "  CASE WHEN pos LIKE '% Fielder' THEN 'outfield' ELSE 'other' END AS "
+        "  tag, COUNT(*) "
+        "FROM mlb_t "
+        "GROUP BY league, "
+        "  CASE WHEN pos LIKE '% Fielder' THEN 'outfield' ELSE 'other' END "
+        "ORDER BY league, tag";
+    auto stmt = ParseSelect(mlb_sql);
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_TRUE(PreGroupBeforeExpressionGroupBy(stmt.get(), *ctx_));
+    ASSERT_EQ(stmt->Sources().size(), 1U);
+    EXPECT_NE(stmt->Sources()[0].query, nullptr);
+
+    const auto rows = collect_rows(mlb_sql);
+    ASSERT_EQ(rows.size(), 5U);
+    // NULL league + outfield: 1, AL + other: 1, AL + outfield: 2,
+    // NL + other: 1, NL + outfield: 1.
+    int64_t total = 0;
+    for (const Row& r : rows) {
+      total += r[2].AsInt64();
+    }
+    EXPECT_EQ(total, 6);
+  }
+
+  // 4. Public BI Q108: CollapseConstantGroupBy (sound_ConstantGroup).
+  exec_stmt(
+      "CREATE TABLE mlb_q108 (league VARCHAR, pos VARCHAR, yr INT64, "
+      "hr INT64, rbi INT64);");
+  exec_stmt(
+      "INSERT INTO mlb_q108 VALUES "
+      "('PCL', 'Center Fielder', 2015, 10, 40), "
+      "('PCL', 'Center Fielder', 2015, 25, 80), "
+      "('PCL', 'Pitcher', 2015, 99, 99);");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    const std::string q108_sql =
+        "SELECT MAX(hr), MIN(hr), MAX(rbi), MIN(rbi), league, pos, yr "
+        "FROM mlb_q108 "
+        "WHERE league = 'PCL' AND pos = 'Center Fielder' AND yr = 2015 "
+        "GROUP BY league, pos, yr, yr";
+    auto stmt = ParseSelect(q108_sql);
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_TRUE(CollapseConstantGroupBy(stmt.get(), *ctx_));
+    EXPECT_TRUE(stmt->GroupBy().empty());
+    const auto rows = collect_rows(q108_sql);
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0][0], Value(int64_t{25}));
+    EXPECT_EQ(rows[0][1], Value(int64_t{10}));
+    EXPECT_EQ(rows[0][2], Value(int64_t{80}));
+    EXPECT_EQ(rows[0][3], Value(int64_t{40}));
+
+    // Empty match must emit 0 rows (preserved by outer WHERE __cg_cnt > 0).
+    const auto empty_rows = collect_rows(
+        "SELECT MAX(hr), league, pos, yr FROM mlb_q108 "
+        "WHERE league = 'NONE' AND pos = 'Center Fielder' AND yr = 2015 "
+        "GROUP BY league, pos, yr");
+    EXPECT_TRUE(empty_rows.empty());
+  }
+
+  // 5. Iceberg SQL equality: FactorDeleteAntiJoinSubquery
+  // (FileKeyAntiJoin_sound).
+  exec_stmt("CREATE TABLE ice_f (fid INT64, part INT64, seq INT64);");
+  exec_stmt("CREATE TABLE ice_r (rid INT64, fid INT64, k INT64);");
+  exec_stmt("CREATE TABLE ice_e (scope INT64, k INT64, seq INT64);");
+  exec_stmt("INSERT INTO ice_f VALUES (1, 0, 1), (2, 1, 2);");
+  exec_stmt(
+      "INSERT INTO ice_r VALUES "
+      "(10, 1, NULL), (11, 1, 7), (12, 1, 5), (20, 2, 7);");
+  exec_stmt("INSERT INTO ice_e VALUES (-1, NULL, 3), (0, 7, 2);");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    const std::string ice_sql =
+        "SELECT COUNT(*), SUM(x.rid) FROM ice_r x JOIN ice_f f ON x.fid=f.fid "
+        "WHERE x.rid NOT IN ("
+        "  SELECT x.rid FROM ice_r x JOIN ice_f f ON x.fid=f.fid "
+        "  JOIN ice_e e ON COALESCE(x.k,-1)=COALESCE(e.k,-1) "
+        "  WHERE f.seq<e.seq AND (f.part=e.scope OR e.scope=-1))";
+    auto stmt = ParseSelect(ice_sql);
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_TRUE(FactorDeleteAntiJoinSubquery(stmt.get()));
+    const auto rows = collect_rows(ice_sql);
+    ASSERT_EQ(rows.size(), 1U);
+    // Deleted: rid=10 (global NULL, seq 1<3), rid=11 (part 0, k=7, seq 1<2).
+    // Surviving: rid=12, rid=20 -> count=2, sum=32.
+    EXPECT_EQ(rows[0][0], Value(int64_t{2}));
+    EXPECT_EQ(rows[0][1], Value(int64_t{32}));
+  }
+
+  // 6. TPC-DS Q22: PreAggregateSurrogateKeyBeforeRollup
+  // (SurrogateKeyPreAggRollup_sound).
+  exec_stmt(
+      "CREATE TABLE q22_item (i_sk INT64, pname VARCHAR, brand VARCHAR);");
+  exec_stmt("CREATE TABLE q22_dt (d_sk INT64, mseq INT64);");
+  exec_stmt("CREATE TABLE q22_inv (d_sk INT64, i_sk INT64, qty INT64);");
+  exec_stmt(
+      "INSERT INTO q22_item VALUES (1, 'p1', 'b1'), (2, 'p2', 'b1'), "
+      "(3, 'p3', 'b2');");
+  exec_stmt("INSERT INTO q22_dt VALUES (10, 1200), (11, 1205), (12, 1300);");
+  exec_stmt(
+      "INSERT INTO q22_inv VALUES "
+      "(10, 1, 10), (11, 1, 20), (10, 2, 30), (10, 3, NULL), "
+      "(10, 999, 1000), (12, 1, 500);");
+  exec_stmt("ANALYZE q22_item;");
+  exec_stmt("ANALYZE q22_dt;");
+  exec_stmt("ANALYZE q22_inv;");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  {
+    const std::string q22_sql =
+        "SELECT pname, brand, AVG(qty) AS qoh "
+        "FROM q22_inv, q22_dt, q22_item "
+        "WHERE q22_inv.d_sk = q22_dt.d_sk "
+        "  AND q22_inv.i_sk = q22_item.i_sk "
+        "  AND mseq BETWEEN 1200 AND 1211 "
+        "GROUP BY ROLLUP (pname, brand) "
+        "ORDER BY qoh, pname, brand";
+    auto stmt = ParseSelect(q22_sql);
+    ASSERT_NE(stmt, nullptr);
+    EXPECT_TRUE(PreAggregateSurrogateKeyBeforeRollup(stmt.get(), *ctx_));
+    const bool has_pre_cte =
+        stmt->WithQueries().contains("__rollup_pre") ||
+        (!stmt->Sources().empty() && stmt->Sources()[0].query != nullptr &&
+         stmt->Sources()[0].query->WithQueries().contains("__rollup_pre"));
+    EXPECT_TRUE(has_pre_cte);
+    const auto rows = collect_rows(q22_sql);
+    // Detail groups: (p1,b1)=15.0, (p2,b1)=30.0, (p3,b2)=NULL
+    // Rollup (pname): (p1,NULL)=15.0, (p2,NULL)=30.0, (p3,NULL)=NULL
+    // Grand total: (NULL,NULL)=20.0 -> 7 rows total.
+    ASSERT_EQ(rows.size(), 7U);
+    int null_qoh = 0;
+    int grand_total = 0;
+    for (const Row& r : rows) {
+      if (r[2].IsNull()) {
+        ++null_qoh;
+      } else if (r[0].IsNull() && r[1].IsNull()) {
+        EXPECT_NEAR(r[2].value.double_value, 20.0, 1e-9);
+        ++grand_total;
+      }
+    }
+    EXPECT_EQ(null_qoh, 2);
+    EXPECT_EQ(grand_total, 1);
+  }
+}
+
+TEST_F(SelectRewritesTest, PushSharedCteRestrictionsThroughUnionGroupBy) {
+  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  //   (LeftJoinRightSideKeyFilterPushdown_sound)
+  SqlEngine engine(*db_);
+  auto exec_stmt = [&](const std::string& q) {
+    auto res = engine.Execute(*ctx_, q);
+    ASSERT_TRUE(res.HasValue()) << q << " -> " << res.GetStatus();
+  };
+  exec_stmt("CREATE TABLE u_date (d_sk INT64, d_year INT64);");
+  exec_stmt("CREATE TABLE u_s1 (s_d INT64, s_k INT64, s_v INT64);");
+  exec_stmt("CREATE TABLE u_r1 (r_k INT64, r_v INT64);");
+  exec_stmt("CREATE TABLE u_s2 (s_d INT64, s_k INT64, s_v INT64);");
+  exec_stmt("CREATE TABLE u_r2 (r_k INT64, r_v INT64);");
+  ASSERT_EQ(ctx_->txn_.PreCommit(), Status::kSuccess);
+  ctx_ = std::make_unique<TransactionContext>(db_->BeginContext());
+
+  const std::string sql =
+      "WITH all_sales AS ("
+      "  SELECT d_year, s_k, SUM(net_v) AS total_v "
+      "  FROM ("
+      "    SELECT d_year, u_s1.s_k, s_v - COALESCE(r_v, 0) AS net_v "
+      "    FROM u_s1 JOIN u_date ON d_sk = s_d "
+      "    LEFT JOIN u_r1 ON r_k = u_s1.s_k "
+      "    UNION DISTINCT "
+      "    SELECT d_year, u_s2.s_k, s_v - COALESCE(r_v, 0) AS net_v "
+      "    FROM u_s2 JOIN u_date ON d_sk = s_d "
+      "    LEFT JOIN u_r2 ON r_k = u_s2.s_k"
+      "  ) AS detail "
+      "  GROUP BY d_year, s_k"
+      ") "
+      "SELECT c.d_year, p.d_year, c.total_v, p.total_v "
+      "FROM all_sales AS c, all_sales AS p "
+      "WHERE c.s_k = p.s_k AND c.d_year = 2002 AND p.d_year = 2002 - 1";
+
+  auto stmt = ParseSelect(sql);
+  ASSERT_NE(stmt, nullptr);
+  const size_t pushed = PushSharedCteRestrictions(stmt.get(), *ctx_);
+  EXPECT_EQ(pushed, 1U);
+  const SelectStatement& body = *stmt->WithQueries().at("all_sales");
+  ASSERT_EQ(body.Sources().size(), 1U);
+  ASSERT_NE(body.Sources()[0].query, nullptr);
+  const SelectStatement& inner = *body.Sources()[0].query;
+  std::vector<const SelectStatement*> branches;
+  if (const auto& tree = inner.GetSetOperationTree(); tree != nullptr) {
+    branches.push_back(tree->first.get());
+    for (const auto& b : tree->branches) {
+      branches.push_back(b.get());
+    }
+  } else {
+    branches.push_back(&inner);
+    for (const auto& b : inner.UnionAll()) {
+      branches.push_back(b.get());
+    }
+  }
+  ASSERT_EQ(branches.size(), 2U);
+  for (const SelectStatement* br : branches) {
+    ASSERT_NE(br->WhereClause(), nullptr);
+    EXPECT_NE(br->WhereClause()->ToString().find("2002"), std::string::npos);
+    EXPECT_NE(br->WhereClause()->ToString().find("2001"), std::string::npos);
+  }
+}
+
+TEST_F(SelectRewritesTest, FoldNestedSumUnionAllBranchesDeduplicatesLeaves) {
+  // Lean proof: CloudBI/NestedBI.lean (sound_FlattenSum, sound_BranchHistogram)
+  const std::string sql =
+      "SELECT SUM(s) FROM ("
+      "  SELECT SUM(s) AS s FROM ("
+      "    SELECT SUM(v) AS s FROM t WHERE k = 1"
+      "    UNION ALL "
+      "    SELECT SUM(v) AS s FROM t WHERE k = 2"
+      "    UNION ALL "
+      "    SELECT SUM(v) AS s FROM t WHERE k = 1"
+      "  ) leaf1 "
+      "  UNION ALL "
+      "  SELECT SUM(s) AS s FROM ("
+      "    SELECT SUM(v) AS s FROM t WHERE k = 1"
+      "    UNION ALL "
+      "    SELECT SUM(v) AS s FROM t WHERE k = 2"
+      "  ) leaf2"
+      ") branches";
+  auto stmt = ParseSelect(sql);
+  ASSERT_NE(stmt, nullptr);
+  EXPECT_TRUE(FoldNestedSumUnionAllBranches(stmt.get()));
+  ASSERT_EQ(stmt->Sources().size(), 1U);
+  ASSERT_NE(stmt->Sources()[0].query, nullptr);
+  // 5 total nested leaves collapse into 2 unique branches (k=1 x3, k=2 x2).
+  const SelectStatement& inner = *stmt->Sources()[0].query;
+  EXPECT_EQ(inner.UnionAll().size(), 1U);
+  EXPECT_NE(inner.SelectList()[0].expression->ToString().find("3"),
+            std::string::npos);
+  EXPECT_NE(
+      inner.UnionAll()[0]->SelectList()[0].expression->ToString().find("2"),
+      std::string::npos);
+}
+
+TEST_F(SelectRewritesTest,
+       PreGroupBeforeExpressionGroupBySkipsLimitAndExtract) {
+  // ClickBench Q19 regression guard: `GROUP BY ..., EXTRACT(MINUTE FROM ts)
+  // ORDER BY COUNT(*) DESC LIMIT 10` must NOT pre-group by raw `ts`, which
+  // would explode cardinality and bypass CB-7 heavy-hitter pruning.
+  const std::string sql =
+      "SELECT a, CASE WHEN b LIKE '%x' THEN 'X' ELSE 'Y' END AS c, COUNT(*) "
+      "FROM t GROUP BY a, c ORDER BY COUNT(*) DESC LIMIT 10";
+  auto stmt = ParseSelect(sql);
+  ASSERT_NE(stmt, nullptr);
+  EXPECT_FALSE(PreGroupBeforeExpressionGroupBy(stmt.get(), *ctx_));
 }
 
 }  // namespace

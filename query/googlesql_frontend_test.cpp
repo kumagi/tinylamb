@@ -662,7 +662,7 @@ TEST(GoogleSqlFrontendTest, SignalInterruptedSubprocessIoRetries) {
   struct sigaction handler = {};
   static volatile sig_atomic_t signal_count = 0;
   signal_count = 0;
-  handler.sa_handler = [](int) { ++signal_count; };
+  handler.sa_handler = [](int) { signal_count = signal_count + 1; };
   ASSERT_EQ(sigaction(SIGALRM, &handler, &saved), 0);
 
   std::string big = "SELECT ";

@@ -110,7 +110,7 @@ private theorem push_getD (m : Groups) (xs : List Tick) (k : Key) :
         subst heq
         rw [getD_insert_same]
         unfold atKey
-        simp [hk, stats_cons, plus_assoc]
+        simp [stats_cons, plus_assoc]
       · have hget : (m.insert (r.batch, r.sym)
               (plus (m.getD (r.batch, r.sym) zero) (weighted 1 r.bid))).getD k zero =
               m.getD k zero := by
@@ -165,7 +165,7 @@ private theorem getD_eq_atKey_of_hm (old : List Tick) (m : Groups)
   rw [getD_of_getElem?, hm k]
   by_cases hc : (atKey old k).cnt == 0
   · have hz := atKey_eq_zero_of_cnt_zero old k hc
-    simp [hc, hz, zero]
+    simp [hz, zero]
   · simp [hc]
 
 theorem InsertSideState_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.InsertSideState.Goal := by
@@ -195,12 +195,12 @@ private theorem replace_plus (U B A : Totals) :
   by_cases h : U.cnt + A.cnt == 0
   · have heq : U.cnt + A.cnt = 0 := beq_iff_eq.mp h
     have hn : U.cnt + B.cnt - B.cnt + A.cnt = 0 := by omega
-    simp [h, hn]
+    simp [h]
   · have hn : U.cnt + B.cnt - B.cnt + A.cnt = U.cnt + A.cnt := by omega
     have hn0 : (U.cnt + B.cnt - B.cnt + A.cnt == 0) = false := by
       rw [hn]
       exact Bool.eq_false_of_ne_true h
-    simp [h, hn, hn0]
+    simp [h]
 
 theorem ChangedSymbols_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.ChangedSymbols.Goal := by
   intro before after unaffected k
@@ -249,7 +249,7 @@ private theorem atKey_filter_batch (xs : List Tick) (batch sym : Nat) :
     simp [hkey, hb]
   · have hkf : ((r.batch, r.sym) == (batch, sym)) = false :=
       Bool.eq_false_of_ne_true hkey
-    simp [hkey, hkf]
+    simp [hkey]
 
 private theorem atKey_singleton_zero (r : Tick) (k : Key)
     (h : (r.batch, r.sym) ≠ k) : atKey [r] k = zero := by
@@ -308,18 +308,19 @@ private theorem laneStep_inv (base width batch : Nat) (r : Tick) (hr : r.batch =
     have hLane : lane base width r.sym = .inl i := by simp [lane, hcond, i]
     constructor
     · intro j hj
+      dsimp [laneStep]
+      rw [hLane]
       change (lanes.modify i (fun t => plus t (weighted 1 r.bid)))[j]? =
         some (atKey (pre ++ [r]) (batch, base + j))
       rw [Array.getElem?_modify, hL j hj]
       by_cases hij : i = j
-      · rw [if_pos hij]
+      · rw [ite_eq_left hij]
         simp only [Option.map_some]
         congr 1
         rw [atKey_append pre [r] (batch, base + j)]
         have hs : base + j = r.sym := by omega
         rw [atKey_singleton_match base batch j r hr hs]
-        rfl
-      · rw [if_neg hij]
+      · rw [ite_eq_right hij]
         congr 1
         rw [atKey_append pre [r] (batch, base + j)]
         have hne : (r.batch, r.sym) ≠ (batch, base + j) := by
@@ -329,9 +330,10 @@ private theorem laneStep_inv (base width batch : Nat) (r : Tick) (hr : r.batch =
           exact hij this
         rw [atKey_singleton_zero r (batch, base + j) hne, plus_zero]
     · intro k hk
+      dsimp [laneStep]
+      rw [hLane]
       change spill.getD k zero = atKey (pre ++ [r]) (batch, k)
       rw [hS k hk]
-      congr 1
       rw [atKey_append pre [r] (batch, k)]
       have hne : (r.batch, r.sym) ≠ (batch, k) := by
         intro hp
@@ -348,6 +350,8 @@ private theorem laneStep_inv (base width batch : Nat) (r : Tick) (hr : r.batch =
     have hLane : lane base width r.sym = .inr r.sym := by simp [lane, hcondf]
     constructor
     · intro j hj
+      dsimp [laneStep]
+      rw [hLane]
       change lanes[j]? = some (atKey (pre ++ [r]) (batch, base + j))
       rw [hL j hj]
       congr 1
@@ -362,25 +366,25 @@ private theorem laneStep_inv (base width batch : Nat) (r : Tick) (hr : r.batch =
           omega
       rw [atKey_singleton_zero r (batch, base + j) hne, plus_zero]
     · intro k hk
+      dsimp [laneStep]
+      rw [hLane]
       change (spill.insert r.sym (plus (spill.getD r.sym zero) (weighted 1 r.bid))).getD k zero =
         atKey (pre ++ [r]) (batch, k)
       by_cases hkr : r.sym == k
       · have heq : r.sym = k := (beq_iff_eq (α := Nat)).mp hkr
         subst heq
-        rw [getD_insert_same]
+        rw [Std.HashMap.getD_insert]
+        simp
         rw [hS r.sym hk]
-        congr 1
         rw [atKey_append pre [r] (batch, r.sym)]
         rw [atKey_singleton_self batch r hr]
-        rfl
       · rw [Std.HashMap.getD_insert]
         simp [hkr]
         rw [hS k hk]
-        congr 1
         rw [atKey_append pre [r] (batch, k)]
         have hne : (r.batch, r.sym) ≠ (batch, k) := by
           intro hp
-          exact hkr ((beq_iff_eq (α := Nat)).mp (congrArg Prod.snd hp))
+          exact hkr ((beq_iff_eq (α := Nat)).mpr (congrArg Prod.snd hp))
         rw [atKey_singleton_zero r (batch, k) hne, plus_zero]
 
 private theorem lane_fold_spec_aux (base width batch : Nat) :
@@ -438,15 +442,11 @@ theorem LaneOrSpill_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.LaneOrS
     simp [atKey, stats_nil]
   have hres := lane_fold_spec_aux base width batch target [] init.1 init.2 hmem hL0 hS0
   dsimp only at hres
-  have hfold : target.foldl (fun (a, m) r =>
-      let v := weighted 1 r.bid
-      match lane base width r.sym with
-      | .inl i => (a.modify i (fun st => plus st v), m)
-      | .inr k => (a, m.insert k (plus (m.getD k zero) v)))
-      (Array.replicate width zero, ({} : Std.HashMap Nat Totals)) =
-      target.foldl (laneStep base width) init := by
-    rfl
-  rw [hfold]
+  change (match lane base width sym with
+    | .inl i => ((target.foldl (laneStep base width) init).1[i]?.getD zero)
+    | .inr k => ((target.foldl (laneStep base width) init).2.getD k zero)) =
+    atKey xs (batch, sym)
+  dsimp [init] at hres ⊢
   by_cases hcond : (base ≤ sym && sym < base + width) = true
   · have hblo : base ≤ sym := of_decide_eq_true (Bool.and_eq_true_iff.mp hcond).1
     have bhhi : sym < base + width := of_decide_eq_true (Bool.and_eq_true_iff.mp hcond).2
@@ -454,15 +454,17 @@ theorem LaneOrSpill_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.LaneOrS
     have hiw : i < width := by dsimp [i]; omega
     have heq : base + i = sym := by dsimp [i]; omega
     rw [show lane base width sym = .inl i by simp [lane, hcond, i]]
+    dsimp
     rw [hres.1 i hiw]
     simp only [Option.getD_some]
-    rw [show ([] : List Tick) ++ target = target from rfl, heq, atKey_filter_batch]
+    rw [heq, atKey_filter_batch]
   · have hcondf : (base ≤ sym && sym < base + width) = false :=
       Bool.eq_false_of_ne_true hcond
     have hout : outLane base width sym := outLane_of_false hcondf
     rw [show lane base width sym = .inr sym by simp [lane, hcondf]]
+    dsimp
     rw [hres.2 sym hout]
-    rw [show ([] : List Tick) ++ target = target from rfl, atKey_filter_batch]
+    rw [atKey_filter_batch]
 
 /-! ### VisibleFlush -/
 
@@ -514,15 +516,19 @@ private theorem visible_main : ∀ (chunks : List (Nat × List Tick)) (pin sym :
   induction chunks with
   | nil =>
       intro pin sym
-      simp [flushRHS]
+      rfl
   | cons c rest ih =>
       intro pin sym
       rcases c with ⟨version, rs⟩
-      dsimp only
       rw [flushRHS_cons]
       by_cases hv : version ≤ pin
-      · simp [hv]
-        exact ih pin sym
+      · rw [ite_eq_left hv]
+        simp [hv]
+        change plus (stats (rs.filter (fun r => r.sym == sym)))
+            (TSum ((rest.filter (fun c => c.1 ≤ pin)).map
+              (fun c => stats (c.2.filter (fun r => r.sym == sym))))) =
+          plus (stats (rs.filter (fun r => r.sym == sym))) (flushRHS rest pin sym)
+        rw [ih pin sym]
       · simp [hv, ih pin sym]
 
 theorem VisibleFlush_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.VisibleFlush.Goal := by
@@ -546,8 +552,8 @@ private theorem lookup_map_fst (k : Key) (f : Key → Totals) :
       by_cases hkx : k == x
       · have heq : k = x := (beq_iff_eq (α := Key)).mp hkx
         subst heq
-        simp [hkx]
-      · have hne : k ≠ x := fun h => hkx (by simpa [h])
+        simp
+      · have hne : k ≠ x := fun h => hkx (by simp [h])
         rw [List.map_cons, List.lookup_cons]
         simp [hkx, hne, ih hxs]
 
@@ -555,8 +561,14 @@ private theorem length_eraseDups_le [BEq α] : ∀ l : List α, l.eraseDups.leng
   | [] => by simp
   | a :: as => by
       rw [List.eraseDups_cons]
-      simp only [List.length_cons, List.length_filter]
-      exact Nat.succ_le_succ (Nat.le_trans (List.length_filter_le _ _) (length_eraseDups_le as))
+      have hf : (List.filter (fun b : α => ! b == a) as).length ≤ as.length :=
+        List.length_filter_le _ _
+      have her := length_eraseDups_le (List.filter (fun b : α => ! b == a) as)
+      exact Nat.succ_le_succ (Nat.le_trans her hf)
+termination_by l => l.length
+decreasing_by
+  exact Nat.lt_of_le_of_lt (List.length_filter_le (fun b : α => ! b == a) as)
+    (Nat.lt_succ_self as.length)
 
 theorem DirtyFlush_sound : TinylambOpt.ResearchGoals.DuckDBGaps.Refresh.DirtyFlush.Goal := by
   intro old xs k

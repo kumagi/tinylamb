@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans
+
+open TinylambOpt.ResearchGoals.StorageExecution
+open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
+open TinylambOpt.ResearchGoals.Compression.Wire
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+

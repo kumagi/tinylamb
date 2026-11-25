@@ -53,6 +53,22 @@ enum class TlcsColumnEncoding : uint8_t {
   kFor = 2,
   kRawDouble = 3,
   kVarChar = 4,
+  // Lean: Compression/TemporalText.lean (47-bit 6-byte UTC timestamp packing).
+  kTemporalText = 5,
+  // Lean: Compression/Text.lean + Wire.lean (sorted front-coded dict + packed
+  // IDs).
+  kVarCharFrontDict = 6,
+  // Lean: Compression/IntegerFrames.lean + Wire.lean (GCD-strided bit-packed
+  // FOR).
+  kBitPackedFor = 7,
+  // Lean: Compression/BitPatterns.lean (bit-exact Gorilla XOR-chain doubles).
+  kXorDouble = 8,
+  // Lean: Compression/PhraseTables.lean (FSST-style DP shortest-parse phrases).
+  kVarCharPhraseTable = 9,
+  // Lean: Compression/Container.lean (CRC32C-verified Zstd VARCHAR frame).
+  kZstdVarChar = 10,
+  // Lean: Compression/Container.lean (CRC32C-verified Zstd numeric frame).
+  kZstdNumeric = 11,
 };
 
 enum class TlcsDictKind : uint8_t {

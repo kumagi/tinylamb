@@ -73,8 +73,8 @@ ValidityBitmap ValidityBitmap::BitwiseAnd(const ValidityBitmap& other) const {
   const size_t min_size = std::min(size_, other.size_);
   const size_t word_count = (min_size + 63) / 64;
   std::vector<uint64_t> result(word_count);
-  const size_t available_words = std::min(
-      {word_count, words_.size(), other.words_.size()});
+  const size_t available_words =
+      std::min({word_count, words_.size(), other.words_.size()});
   for (size_t i = 0; i < available_words; ++i) {
     result[i] = words_[i] & other.words_[i];
   }
@@ -122,7 +122,13 @@ void ValidityBitmap::ToSelectionVector(SelectionVector* sel) const {
   sel->Reserve(CountValid());
   for (size_t word_idx = 0; word_idx < words_.size(); ++word_idx) {
     uint64_t w = words_[word_idx];
-    size_t base = word_idx * 64;
+    const size_t base = word_idx * 64;
+    if (w == ~uint64_t{0} && base + 64 <= size_) {
+      for (uint32_t i = 0; i < 64; ++i) {
+        sel->PushBack(static_cast<uint32_t>(base) + i);
+      }
+      continue;
+    }
     while (w != 0) {
       const int bit = std::countr_zero(w);
       const size_t index = base + static_cast<size_t>(bit);
@@ -132,6 +138,77 @@ void ValidityBitmap::ToSelectionVector(SelectionVector* sel) const {
       w &= w - 1;  // Clear lowest set bit
     }
   }
+}
+
+void ValidityBitmap::ToContiguousRanges(std::vector<RowRange>* out,
+                                        uint32_t base) const {
+  if (out == nullptr) {
+    return;
+  }
+  out->clear();
+  if (size_ == 0 || words_.empty()) {
+    return;
+  }
+  for (size_t word_idx = 0; word_idx < words_.size(); ++word_idx) {
+    uint64_t w = words_[word_idx];
+    if (w == 0) {
+      continue;
+    }
+    const uint32_t word_base = base + static_cast<uint32_t>(word_idx * 64);
+    const size_t valid_bits = std::min<size_t>(64, size_ - word_idx * 64);
+    if (valid_bits < 64) {
+      w &= (uint64_t{1} << valid_bits) - 1ULL;
+    }
+    if (w == ~uint64_t{0} && valid_bits == 64) {
+      if (!out->empty() &&
+          out->back().start + out->back().length == word_base) {
+        out->back().length += 64;
+      } else {
+        out->push_back(RowRange{word_base, 64});
+      }
+      continue;
+    }
+    uint32_t bit_offset = 0;
+    while (w != 0) {
+      const uint32_t zeros = static_cast<uint32_t>(std::countr_zero(w));
+      w >>= zeros;
+      bit_offset += zeros;
+      const uint32_t ones = static_cast<uint32_t>(std::countr_one(w));
+      const uint32_t run_start = word_base + bit_offset;
+      if (!out->empty() &&
+          out->back().start + out->back().length == run_start) {
+        out->back().length += ones;
+      } else {
+        out->push_back(RowRange{run_start, ones});
+      }
+      if (ones >= 64) {
+        break;
+      }
+      w >>= ones;
+      bit_offset += ones;
+    }
+  }
+}
+
+size_t ValidityBitmap::RankScatter(const uint32_t* src, uint32_t* dst) const {
+  if (src == nullptr || dst == nullptr || size_ == 0) {
+    return 0;
+  }
+  size_t out_pos = 0;
+  for (size_t word_idx = 0; word_idx < words_.size(); ++word_idx) {
+    uint64_t w = words_[word_idx];
+    const size_t base = word_idx * 64;
+    const size_t valid_bits = std::min<size_t>(64, size_ - base);
+    if (valid_bits < 64) {
+      w &= (uint64_t{1} << valid_bits) - 1ULL;
+    }
+    while (w != 0) {
+      const int bit = std::countr_zero(w);
+      dst[out_pos++] = src[base + static_cast<size_t>(bit)];
+      w &= w - 1;
+    }
+  }
+  return out_pos;
 }
 
 SelectionVector::SelectionVector(size_t capacity) {
@@ -185,6 +262,16 @@ SelectionVector SelectionVector::Slice(size_t offset, size_t count) const {
       indices_.begin() + static_cast<std::ptrdiff_t>(offset) +
           static_cast<std::ptrdiff_t>(actual_count));
   return SelectionVector(std::move(sliced));
+}
+
+ValidityBitmap SelectionVector::ToValidityBitmap(size_t batch_size) const {
+  ValidityBitmap bm(batch_size, false);
+  for (uint32_t idx : indices_) {
+    if (idx < batch_size) {
+      bm.SetBit(idx);
+    }
+  }
+  return bm;
 }
 
 }  // namespace tinylamb

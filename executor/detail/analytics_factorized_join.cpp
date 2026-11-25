@@ -585,7 +585,7 @@ inline DecodedIntColumnView DecodeIntColumnChunk(
       }
       val_scratch->resize(n_rows);
       int64_t* dst = val_scratch->data();
-      const uint64_t base = static_cast<uint64_t>(cc.for_base);
+      const auto base = static_cast<uint64_t>(cc.for_base);
       const uint8_t* src = cc.for_bytes;
       switch (cc.for_width) {
         case 1:
@@ -2620,8 +2620,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               const int64_t* vals = kv_view.values;
               for (size_t ri = 0; ri < chunk.rows; ++ri) {
                 const int64_t v = vals[ri];
-                if (v < bmin) bmin = v;
-                if (v > bmax) bmax = v;
+                bmin = std::min(v, bmin);
+                bmax = std::max(v, bmax);
               }
             } else {
               const int64_t* vals = kv_view.values;
@@ -2629,8 +2629,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               for (size_t ri = 0; ri < chunk.rows; ++ri) {
                 if (nulls[ri] == 0) {
                   const int64_t v = vals[ri];
-                  if (v < bmin) bmin = v;
-                  if (v > bmax) bmax = v;
+                  bmin = std::min(v, bmin);
+                  bmax = std::max(v, bmax);
                 }
               }
             }
@@ -2639,8 +2639,8 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
               int64_t kv = 0;
               if (ReadIntKeyFromEntry(&chunk, nullptr, ri, up_col, sum.key_type,
                                       &kv, &bad)) {
-                if (kv < bmin) bmin = kv;
-                if (kv > bmax) bmax = kv;
+                bmin = std::min(kv, bmin);
+                bmax = std::max(kv, bmax);
               }
               if (bad) {
                 return false;
@@ -2681,7 +2681,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       sum.use_dense_counts_only = true;
       sum.dense_counts.assign(static_cast<size_t>(span), 0);
       uint64_t* dc = sum.dense_counts.data();
-      const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+      const auto dmin = static_cast<uint64_t>(sum.dense_min);
       uint64_t local_cnt = 0;
       bool bad = false;
       std::vector<int64_t> key_scratch;
@@ -2748,7 +2748,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
       const SubtreeSummary& ch_sum = summaries[ch.child_ar];
       sum.use_dense_counts_only = true;
       sum.dense_counts.assign(static_cast<size_t>(span), 0);
-      const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+      const auto dmin = static_cast<uint64_t>(sum.dense_min);
       const auto& chunks = rel.columnar->chunks;
       const size_t nchunks = chunks.size();
       const size_t inner_workers =
@@ -2950,7 +2950,7 @@ StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
           sum.use_dense_int_agg = true;
           sum.dense_int_aggs.resize(static_cast<size_t>(span));
           DenseIntSumSlot* slots = sum.dense_int_aggs.data();
-          const uint64_t dmin = static_cast<uint64_t>(sum.dense_min);
+          const auto dmin = static_cast<uint64_t>(sum.dense_min);
           uint64_t local_cnt = 0;
           bool bad = false;
           std::vector<int64_t> key_scratch;

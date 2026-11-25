@@ -2113,11 +2113,31 @@ static std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
     extra_bytes = EstimateSecondaryStoreBytes(*store, schema);
     if (extra_bytes > 0 &&
         !store->memory_charge->TryAddWithReclaim(extra_bytes)) {
-      if (projection == nullptr && max_bytes == LSTableStore::kBuildByteLimit &&
-          table.LayoutGeneration() == generation) {
-        table.NoteLSTableCapacityRejected(generation);
+      // Wide-integer dictionaries are purely optional secondary encodings whose
+      // backing int_cells remain intact; drop them under pool pressure rather
+      // than discarding the already-charged base column blocks.
+      for (slot_t c = 0; c < col_count; ++c) {
+        LSTableColumnDictionary& dict = store->dictionaries[c];
+        if (!dict.wide_codes.empty()) {
+          dict = LSTableColumnDictionary{};
+          for (LSTablePageBlock& blk : store->blocks) {
+            LSTableColumnBlock& col = blk.columns[c];
+            col.dict = nullptr;
+            col.wide_code_begin = 0;
+            col.wide_code_count = 0;
+          }
+        }
       }
-      return nullptr;
+      extra_bytes = EstimateSecondaryStoreBytes(*store, schema);
+      if (extra_bytes > 0 &&
+          !store->memory_charge->TryAddWithReclaim(extra_bytes)) {
+        if (projection == nullptr &&
+            max_bytes == LSTableStore::kBuildByteLimit &&
+            table.LayoutGeneration() == generation) {
+          table.NoteLSTableCapacityRejected(generation);
+        }
+        return nullptr;
+      }
     }
   }
 
@@ -2892,8 +2912,8 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
         // The global pool usage only decides *whether* to reclaim; the
         // eviction itself walks this table's own incarnation columnar cache,
         // so it cannot drop another table's hot column entries.
-        table.EvictIdleColumnarHeadroom((budget.ColumnarUsed() + est_missing) -
-                                        col_limit);
+        static_cast<void>(table.EvictIdleColumnarHeadroom(
+            (budget.ColumnarUsed() + est_missing) - col_limit));
       }
     }
     std::shared_ptr<LSTableStore> mutable_built;
@@ -2905,7 +2925,7 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
       return built;
     }
     if (!mutable_built && req_cols.size() > missing_cols.size()) {
-      table.EvictIdleColumnarHeadroom(size_t{256} << 20);
+      static_cast<void>(table.EvictIdleColumnarHeadroom(size_t{256} << 20));
       built = BuildLSTableStoreImpl(txn, table, &missing_cols,
                                     LSTableStore::kBuildByteLimit,
                                     /*cache_in_table=*/false, &mutable_built);

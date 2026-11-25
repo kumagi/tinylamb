@@ -2,10 +2,12 @@
 #ifndef TINYLAMB_EXECUTOR_ZONE_MAP_HPP
 #define TINYLAMB_EXECUTOR_ZONE_MAP_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
@@ -39,6 +41,98 @@ inline constexpr KleeneMask kKleeneAll =
 
 [[nodiscard]] inline bool BlockKleeneAllPass(KleeneMask mask) noexcept {
   return mask == kKleeneT;
+}
+
+// Lean proof: lean/TinylambOpt/TrigramSkip.lean (trigram_skip_sound)
+// 256-bit block trigram summary for skipping LIKE blocks whose mandatory
+// 3-byte literal substrings are absent from every row in the block.
+struct TrigramBlockSummary {
+  std::array<uint64_t, 4> bits{};
+
+  static constexpr uint32_t HashTrigram(uint8_t a, uint8_t b,
+                                        uint8_t c) noexcept {
+    uint32_t h = (static_cast<uint32_t>(a) << 16U) ^
+                 (static_cast<uint32_t>(b) << 8U) ^ static_cast<uint32_t>(c);
+    h ^= h >> 11U;
+    h *= 2654435761U;
+    return (h >> 24U) & 255U;
+  }
+
+  void AddString(std::string_view s) noexcept {
+    if (s.size() < 3) {
+      return;
+    }
+    for (size_t i = 0; i + 2 < s.size(); ++i) {
+      const uint32_t bit = HashTrigram(static_cast<uint8_t>(s[i]),
+                                       static_cast<uint8_t>(s[i + 1]),
+                                       static_cast<uint8_t>(s[i + 2]));
+      bits[bit >> 6U] |= (uint64_t{1} << (bit & 63U));
+    }
+  }
+
+  [[nodiscard]] bool MayContainTrigram(uint8_t a, uint8_t b,
+                                       uint8_t c) const noexcept {
+    const uint32_t bit = HashTrigram(a, b, c);
+    return (bits[bit >> 6U] & (uint64_t{1} << (bit & 63U))) != 0;
+  }
+};
+
+// Returns true when the block cannot match `like_pattern` (binary collation,
+// optional escape char) because at least one mandatory 3-byte literal window
+// inside a wildcard-free segment is absent from `summary`.
+[[nodiscard]] bool CanSkipLikeBlockByTrigrams(
+    std::string_view like_pattern, const TrigramBlockSummary& summary,
+    char escape_char = '\\') noexcept;
+
+// Lean proof: lean/TinylambOpt/BloomBlockIntersection.lean
+//   (bloom_block_intersection_sound, bloomSkip_sound, nullSafeSkip_sound)
+// Per-block Bloom signature for inner equi-join / IN-list block pruning.
+struct BlockBloomSignature {
+  uint64_t seed{0};
+  std::vector<uint64_t> words;
+  bool has_null{false};
+
+  static constexpr uint64_t HashKey(uint64_t seed_val, int64_t key) noexcept {
+    uint64_t z = static_cast<uint64_t>(key) ^ seed_val;
+    z = (z ^ (z >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27U)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31U);
+  }
+
+  void Init(size_t num_words, uint64_t seed_val) {
+    seed = seed_val;
+    words.assign(num_words, 0ULL);
+    has_null = false;
+  }
+
+  void AddInt64(int64_t key) noexcept {
+    if (words.empty()) {
+      return;
+    }
+    const uint64_t bit_width = static_cast<uint64_t>(words.size()) * 64ULL;
+    const uint64_t h1 = HashKey(seed, key);
+    const uint64_t h2 = HashKey(seed ^ 0x9e3779b97f4a7c15ULL, key);
+    const uint64_t b1 = h1 % bit_width;
+    const uint64_t b2 = h2 % bit_width;
+    words[b1 >> 6U] |= (uint64_t{1} << (b1 & 63U));
+    words[b2 >> 6U] |= (uint64_t{1} << (b2 & 63U));
+  }
+
+  void AddNull() noexcept { has_null = true; }
+};
+
+[[nodiscard]] bool CanSkipBlockByBloomIntersection(
+    const BlockBloomSignature& build_sig, const BlockBloomSignature& probe_sig,
+    bool null_safe_eq = false) noexcept;
+
+// Lean proof: lean/TinylambOpt/SnapshotZoneMap.lean (snapshot_zone_map_sound)
+// Returns true iff a block's zone map is sound for pruning under `snapshot_lsn`
+// (i.e. all visible versions are covered and no unindexed uncommitted deltas
+// exist on the block).
+[[nodiscard]] inline bool SnapshotZoneMapValid(
+    uint64_t block_commit_lsn, uint64_t snapshot_lsn,
+    bool has_uncommitted_deltas) noexcept {
+  return !has_uncommitted_deltas && block_commit_lsn <= snapshot_lsn;
 }
 
 class ZoneMap {

@@ -469,6 +469,43 @@ tie 共有順位計算で `incPage` をページ SQL と一致させた。`k = 0
   `calls = 前缀.eraseDups.length`）として帰納し、ヒット時 +0・ミス時 +1 を
   `eraseDups` snoc 長補題で示して、`classify` の呼出し数比較を接続した。
 
+## DuckDB ギャップの 50 件（証明済み）
+
+[DuckDB との比較で遅かったクエリから登録した 50 件](duckdb-gaps.md)は、7 モジュールすべてで
+`theorem <Name>_sound : <Name>.Goal` を証明した。反例はなく、提出型・既存証明は変更していない。
+
+| 系統 | 証明モジュール | 主定理（50 件） |
+| --- | --- | --- |
+| Slices（7） | `ResearchProofs/DuckDBGaps/Slices.lean` | `sound_MinorityCodes`, `sound_AppendDictionary`, `sound_ComplementGroups`, `sound_PairwiseExtrema`, `sound_DominatedColumn`, `sound_WitnessedExtrema`, `sound_SparsePosting` |
+| FileMasks（7） | `ResearchProofs/DuckDBGaps/FileMasks.lean` | `ReferencedFiles_sound`, `FileKeyAntiJoin_sound`, `SharedDeleteTable_sound`, `PartitionSpecialization_sound`, `IncrementalSurvivors_sound`, `LateEqualityKey_sound`, `ArithmeticFooter_sound` |
+| Refresh（6） | `ResearchProofs/DuckDBGaps/Refresh.lean` | `InsertSideState_sound`, `ChangedSymbols_sound`, `OverlapReplay_sound`, `LaneOrSpill_sound`, `VisibleFlush_sound`, `DirtyFlush_sound` |
+| Retail（8） | `ResearchProofs/DuckDBGaps/Retail.lean` | `OrderedRollup_sound`, `AverageFence_sound`, `SuffixFlush_sound`, `ThresholdFanout_sound`, `PromoReturnCounts_sound`, `ShrinkingIntersect_sound`, `ExclusionErase_sound`, `NetPairSet_sound` |
+| Hits（8） | `ResearchProofs/DuckDBGaps/Hits.lean` | `CancellationDebt_sound`, `CertifiedWinners_sound`, `OwnerDistinct_sound`, `OrderedCodeMin_sound`, `FrontCodedContains_sound`, `OrderedFetch_sound`, `DatePostings_sound`, `StridedPoint_sound` |
+| Orders（7） | `ResearchProofs/DuckDBGaps/Orders.lean` | `MarketShareWeights_sound`, `YearRoutes_sound`, `DirectionBuckets_sound`, `LateSlack_sound`, `RetireWitness_sound`, `RebucketOrders_sound`, `RevenueRuns_sound` |
+| BridgeStates（7） | `ResearchProofs/DuckDBGaps/BridgeStates.lean` | `RightStateClasses_sound`, `ShardedHybrid_sound`, `SourceWeights_sound`, `EndpointDemand_sound`, `CommentQuotient_sound`, `CollisionBucket_sound`, `CountryProfiles_sound` |
+
+証明の要点：
+
+- **FileMasks**: 一意ファイル結合の `countP = 1` 特徴づけ、`keysByFile` の
+  `mem_flatMap`/`mem_eraseDups` による membership 同値、等差数列フッターの
+  `List.sum_range'` と線形和補題。
+- **Refresh**: `plus`/`summarize` の畳み込み代数、`replaceState` の非 NULL 群と空群の分離、
+  ordinal 区間の重なり除去。`lane` の境界は `base ≤ sym < base+width` で場合分け。
+- **Slices**: 辞書コードの `range` 分割による少数側の長さ上限、隣接ペア帰納による
+  MAX/MIN 候補、`eraseDups` を経由した posting スキャンの置換性。
+- **Retail**: ROLLUP の prefix run 帰納、`lowerRank` 二分探索の完全性、HashSet の
+  erase による除外集合、`NetPairSet` の組単位 dedup。
+- **Hits**: Misra–Gries の投票保存不変条件、非居住キーの頻度上界、ソート辞書の
+  最小コード、front coding の境界横断、`seekHits` の最初の k ヒット不変条件。
+- **Orders**: CASE ELSE 0 の非 NULL 寄与、方向ビットの二国対応、行ごとの
+  paired slack の最大、`mergeBoundary` の snoc 帰納。
+- **BridgeStates**: HashMap の再グループ化補題（`pfold_insert_add` / `regroup_cells`）、
+  `refGroup` のシャード分割恒等式と `finish` の加法性。H5 の状態共有と
+  radix 別戦略切替が同一結果を与えることを示した。
+
+全モジュールは `TinylambOpt.lean` から import され、`cd lean && lake build`
+（CheckProofs の `sorryAx` 検査込み）が成功する。
+
 ## 検証範囲の注記
 
 - 提出型付き 6 件と `checked-aggregate-tree` は `ResearchGoals` の定義を変更せず、そのまま import して

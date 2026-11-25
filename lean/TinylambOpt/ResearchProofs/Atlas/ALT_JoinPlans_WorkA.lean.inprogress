@@ -1,0 +1,3707 @@
+import TinylambOpt.ResearchGoals.Atlas.JoinPlans
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.Atlas.JoinPlans_WorkA
+
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans
+open TinylambOpt.ResearchGoals.Frontiers.Contractions (total dot)
+
+/-! ## Common finite-sum helpers -/
+
+private def rsum (n : Nat) (f : Nat → Int) : Int := ((List.range n).map f).sum
+
+private theorem rsum_succ (n : Nat) (f : Nat → Int) : rsum (n+1) f = rsum n f + f n := by
+  simp [rsum, List.range_succ, List.sum_append]
+
+private theorem rsum_zero (f : Nat → Int) : rsum 0 f = 0 := by simp [rsum]
+
+private theorem rsum_congr (n : Nat) {f g : Nat → Int} (h : ∀ i, i < n → f i = g i) :
+    rsum n f = rsum n g := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih =>
+      rw [rsum_succ, rsum_succ, ih (fun i hi => h i (Nat.lt_succ_of_lt hi)),
+        h n (Nat.lt_succ_self n)]
+
+private theorem sum_map_congr {α} (l : List α) (f g : α → Int) (h : ∀ x ∈ l, f x = g x) :
+    (l.map f).sum = (l.map g).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      rw [h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+
+private theorem sum_zero {α} (l : List α) : (l.map (fun _ => (0 : Int))).sum = 0 := by
+  induction l with
+  | nil => rfl
+  | cons a l ih => simp [ih]
+
+private theorem sum_add {α} (l : List α) (f g : α → Int) :
+    (l.map (fun x => f x + g x)).sum = (l.map f).sum + (l.map g).sum := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih, Int.add_assoc, Int.add_left_comm]
+
+private theorem sum_mul_left {α} (l : List α) (c : Int) (f : α → Int) :
+    (l.map (fun x => c * f x)).sum = c * (l.map f).sum := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih, Int.mul_add]
+
+private theorem sum_mul_right {α} (l : List α) (f : α → Int) (c : Int) :
+    (l.map (fun x => f x * c)).sum = (l.map f).sum * c := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih, Int.add_mul]
+
+private theorem rsum_add (n : Nat) (f g : Nat → Int) :
+    rsum n (fun i => f i + g i) = rsum n f + rsum n g := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih => rw [rsum_succ, rsum_succ, rsum_succ, ih]; omega
+
+private theorem rsum_const_mul (n : Nat) (c : Int) (f : Nat → Int) :
+    rsum n (fun i => c * f i) = c * rsum n f := sum_mul_left (List.range n) c f
+
+private theorem rsum_mul_const (n : Nat) (f : Nat → Int) (c : Int) :
+    rsum n (fun i => f i * c) = rsum n f * c := sum_mul_right (List.range n) f c
+
+private theorem rsum_neg (n : Nat) (f : Nat → Int) : rsum n (fun i => - f i) = - rsum n f := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih => rw [rsum_succ, rsum_succ, ih]; omega
+
+private theorem rsum_sub (n : Nat) (f g : Nat → Int) :
+    rsum n (fun i => f i - g i) = rsum n f - rsum n g := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih => rw [rsum_succ, rsum_succ, rsum_succ, ih]; omega
+
+private theorem rsum_const_zero (m : Nat) : rsum m (fun _ => (0 : Int)) = 0 := by
+  induction m with
+  | zero => simp [rsum]
+  | succ m ih => rw [rsum_succ, ih]; simp
+
+private theorem rsum_comm (n m : Nat) (f : Nat → Nat → Int) :
+    rsum n (fun i => rsum m (fun j => f i j)) = rsum m (fun j => rsum n (fun i => f i j)) := by
+  induction n with
+  | zero =>
+      rw [rsum_zero]
+      exact (rsum_const_zero m).symm
+  | succ n ih =>
+      rw [rsum_succ, ih]
+      rw [show rsum m (fun j => rsum (n+1) (fun i => f i j)) =
+          rsum m (fun j => rsum n (fun i => f i j) + f n j) by
+        apply rsum_congr; intro j hj; rw [rsum_succ]]
+      rw [rsum_add]
+
+private theorem rsum_nonneg (n : Nat) (f : Nat → Int) (h : ∀ i, i < n → 0 ≤ f i) :
+    0 ≤ rsum n f := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih =>
+      rw [rsum_succ]
+      exact Int.add_nonneg (ih (fun i hi => h i (Nat.lt_succ_of_lt hi))) (h n (Nat.lt_succ_self n))
+
+private theorem rsum_le (n : Nat) (f g : Nat → Int) (h : ∀ i, i < n → f i ≤ g i) :
+    rsum n f ≤ rsum n g := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih =>
+      rw [rsum_succ, rsum_succ]
+      exact Int.add_le_add (ih (fun i hi => h i (Nat.lt_succ_of_lt hi))) (h n (Nat.lt_succ_self n))
+
+private theorem rsum_product (n m : Nat) (f g : Nat → Int) :
+    rsum n (fun i => rsum m (fun j => f i * g j)) = rsum n f * rsum m g := by
+  calc
+    rsum n (fun i => rsum m (fun j => f i * g j))
+        = rsum n (fun i => f i * rsum m g) := by
+            apply rsum_congr; intro i hi; exact rsum_const_mul m (f i) g
+    _ = rsum n f * rsum m g := rsum_mul_const n f (rsum m g)
+
+private theorem rsum_eq_single (n a : Nat) (ha : a < n) (g : Nat → Int) :
+    rsum n (fun x => if x == a then g x else 0) = g a := by
+  induction n with
+  | zero => omega
+  | succ n ih =>
+      rw [rsum_succ]
+      by_cases h : n == a
+      · have hna : n = a := Nat.eq_of_beq_eq_true h
+        subst n
+        have hprev : rsum a (fun x => if x == a then g x else 0) = 0 := by
+          rw [show rsum a (fun x => if x == a then g x else 0) = rsum a (fun _ => (0:Int)) by
+            apply rsum_congr; intro x hx
+            have hxa : (x == a) = false := by
+              have : x ≠ a := by omega
+              simpa [beq_iff_eq] using this
+            simp [hxa]]
+          exact rsum_const_zero a
+        rw [hprev, show (if a == a then g a else 0) = g a by simp]
+        simp
+      · have ha' : a < n := by
+          have hne : n ≠ a := by intro hn; subst hn; simp at h
+          omega
+        rw [ih ha', if_neg h]
+        simp
+
+private theorem rsum_eq_single_pair (n a : Nat) (ha : a < n) (g : Nat → Nat → Int) :
+    rsum n (fun b => rsum n (fun d => if b == a && d == a then g b d else 0)) = g a a := by
+  calc
+    rsum n (fun b => rsum n (fun d => if b == a && d == a then g b d else 0))
+        = rsum n (fun b => if b == a then rsum n (fun d => if d == a then g b d else 0) else 0) := by
+            apply rsum_congr; intro b hb
+            by_cases hba : b == a
+            · simp [hba]
+            · simp [hba, rsum_const_zero]
+    _ = g a a := by
+        rw [rsum_eq_single n a ha (fun b => rsum n (fun d => if d == a then g b d else 0))]
+        rw [rsum_eq_single n a ha (fun d => g a d)]
+
+/-! ## Cast/count helpers for FractionalCap -/
+
+private theorem cast_list_sum {α} (l : List α) (f : α → Nat) :
+    ((l.map f).sum : Int) = ((l.map (fun x => (f x : Int))).sum) := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih]
+
+private theorem countP_eq_sum (l : List Nat) (p : Nat → Bool) :
+    ((l.countP p : Nat) : Int) = ((l.map (fun x => if p x then (1 : Int) else 0)).sum) := by
+  induction l with
+  | nil => simp
+  | cons a l ih => by_cases h : p a = true <;> simp [h, ih] <;> omega
+
+private theorem nat_pow_two (a : Nat) : a ^ 2 = a * a := by simp [Nat.pow_succ, Nat.pow_zero]
+
+/-! ## Generic support equality for all-free binary atoms -/
+
+private theorem ind_eq (z : Int) : (if z == 0 then (0 : Int) else 1) =
+    if z != 0 then 1 else 0 := by
+  by_cases h : z = 0 <;> simp [h]
+
+/-! BEGIN jpa-helpers: CollisionCorrection machinery (adapted from Round2 fleet patterns) -/
+
+private def headOf : List Nat → Nat
+  | h :: _ => h
+  | [] => 0
+
+private def Heads (bs : List (List Nat)) : List Nat := bs.filterMap List.head?
+
+private def Root (bs : List (List Nat)) (v : Nat) : Nat :=
+  ((bs.find? (fun bl => bl.contains v)).bind List.head?).getD v
+
+private def constOn (bs : List (List Nat)) (x : Bind) : Bool :=
+  bs.all (fun bl => bl.all (fun v => x v == x (headOf bl)))
+
+/-- Boolean structural spec of a partition of the variable list `V`. -/
+private def PSb (V : List Nat) (bs : List (List Nat)) : Bool :=
+  decide bs.Nodup &&
+  bs.all (fun bl => decide bl.Nodup && bl.all (fun v => V.contains v)) &&
+  bs.all (fun bl1 => bs.all (fun bl2 =>
+    bl1.all (fun v => if bl2.contains v then bl1 == bl2 else true))) &&
+  V.all (fun v => bs.any (fun bl => bl.contains v))
+
+private theorem find_eq_some_unique {α} (p : α → Bool) (l : List α) (a : α)
+    (ha : a ∈ l) (hp : p a = true) (huniq : ∀ b ∈ l, p b = true → b = a) :
+    l.find? p = some a := by
+  induction l with
+  | nil => simp at ha
+  | cons x xs ih =>
+      by_cases hxa : x = a
+      · subst x
+        simp [hp]
+      · have hax : a ≠ x := by intro h; exact hxa h.symm
+        have haxs : a ∈ xs := by simpa [hax] using ha
+        have hpx : p x = false := by
+          cases hpx' : p x with
+          | true =>
+              have hxeq : x = a := huniq x (by simp) hpx'
+              exact False.elim (hxa hxeq)
+          | false => rfl
+        simp [hpx, ih haxs (fun b hb hpb => huniq b (by simp [hb]) hpb)]
+
+private theorem root_eq_head (V : List Nat) (bs : List (List Nat))
+    (hPS : PSb V bs = true) :
+    ∀ bl ∈ bs, ∀ v ∈ bl, Root bs v = headOf bl := by
+  simp [PSb] at hPS
+  rcases hPS with ⟨⟨⟨hnd, hsub⟩, hdisj⟩, hcov⟩
+  intro bl hbl v hv
+  have hpbl : bl.contains v = true := by simpa using hv
+  have huniq : ∀ b ∈ bs, b.contains v = true → b = bl := by
+    intro b hb hbv
+    have hdeq := hdisj bl hbl b hb v hv
+    have hbmem : v ∈ b := by simpa using hbv
+    rcases hdeq with hnot | heq
+    · exact False.elim (hnot hbmem)
+    · exact heq.symm
+  have hfind : bs.find? (fun b : List Nat => b.contains v) = some bl :=
+    find_eq_some_unique (fun b : List Nat => b.contains v) bs bl hbl hpbl huniq
+  unfold Root
+  rw [hfind]
+  cases bl with
+  | nil => simp at hv
+  | cons h tl => rfl
+
+private theorem head_mem_heads_cons (bl : List Nat) (bs : List (List Nat))
+    (hs : bl.head?.isSome = true) : headOf bl ∈ Heads (bl :: bs) := by
+  cases bl with
+  | nil => simp at hs
+  | cons h tl => simp [Heads, headOf]
+
+private theorem head_mem_heads {bl : List Nat} {bs : List (List Nat)}
+    (hbl : bl ∈ bs) : bl.head?.isSome = true → headOf bl ∈ Heads bs := by
+  induction bs with
+  | nil => simp at hbl
+  | cons b bs ih =>
+      intro hs
+      rcases List.mem_cons.mp hbl with hbeq | hbl
+      · subst bl
+        exact head_mem_heads_cons b bs hs
+      · have htail := ih hbl hs
+        cases hb : b.head? with
+        | none => simpa [Heads, hb] using htail
+        | some h =>
+            simp [Heads, hb]
+            apply Or.inr
+            exact List.mem_filterMap.mp htail
+
+private def HPb (V : List Nat) (bs : List (List Nat)) : Bool :=
+  decide (Heads bs).Nodup && (Heads bs).all (fun h => V.contains h)
+
+private theorem heads_spec (V : List Nat) (hbs : List (List Nat))
+    (hhp : HPb V hbs = true) :
+    (Heads hbs).Nodup ∧ (∀ h ∈ Heads hbs, h ∈ V) := by
+  simp [HPb] at hhp
+  exact hhp
+
+private theorem find_none_of_all_false {α} (p : α → Bool) (l : List α)
+    (h : ∀ a ∈ l, p a = false) : l.find? p = none := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      simp [List.find?, h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+
+private theorem root_out {bs : List (List Nat)} {V : List Nat} (hPS : PSb V bs = true) :
+    ∀ v, v ∉ V → Root bs v = v := by
+  have hPS' := hPS
+  simp [PSb] at hPS'
+  rcases hPS' with ⟨⟨⟨hnd, hsub⟩, hdisj⟩, hcov⟩
+  intro v hv
+  have hfalse : ∀ bl ∈ bs, bl.contains v = false := by
+    intro bl hbl
+    have hbsub := hsub bl hbl
+    by_cases hne : bl.contains v = true
+    · have hvbl : v ∈ bl := by simpa using hne
+      exact False.elim (hv (hbsub.2 v hvbl))
+    · cases hne' : bl.contains v <;> simp_all
+  unfold Root
+  rw [find_none_of_all_false (fun bl : List Nat => bl.contains v) bs hfalse]
+  simp
+
+private theorem root_head {bs : List (List Nat)} {V : List Nat} (hPS : PSb V bs = true) :
+    ∀ h ∈ Heads bs, Root bs h = h := by
+  intro h hh
+  rcases List.mem_filterMap.mp hh with ⟨bl, hbl, hhbl⟩
+  have hhroot : headOf bl = h := by
+    cases bl with
+    | nil => simp at hhbl
+    | cons a t => simpa [headOf] using hhbl
+  have hvbl : headOf bl ∈ bl := by
+    cases bl with
+    | nil => simp at hhbl
+    | cons a t => simp [headOf]
+  rw [← hhroot]
+  exact root_eq_head V bs hPS bl hbl (headOf bl) hvbl
+
+private theorem root_mem_heads {bs : List (List Nat)} {V : List Nat} (hPS : PSb V bs = true) :
+    ∀ v ∈ V, Root bs v ∈ Heads bs := by
+  have hPS' := hPS
+  simp [PSb] at hPS'
+  rcases hPS' with ⟨⟨⟨hnd, hsub⟩, hdisj⟩, hcov⟩
+  intro v hv
+  rcases hcov v hv with ⟨bl, hbl, hvbl⟩
+  rw [root_eq_head V bs hPS bl hbl v hvbl]
+  exact head_mem_heads hbl (by cases bl with | nil => simp at hvbl | cons h t => simp)
+
+private theorem constOn_iff {bs : List (List Nat)} {V : List Nat} (hPS : PSb V bs = true)
+    (x : Bind) :
+    constOn bs x = true ↔ ∀ v ∈ V, x v = x (Root bs v) := by
+  have hPS' := hPS
+  simp [PSb] at hPS'
+  rcases hPS' with ⟨⟨⟨hnd, hsub⟩, hdisj⟩, hcov⟩
+  constructor
+  · intro hc v hv
+    rcases hcov v hv with ⟨bl, hbl, hvbl⟩
+    rw [root_eq_head V bs hPS bl hbl v hvbl]
+    have hbeq := List.all_eq_true.mp hc bl hbl
+    have hveq := List.all_eq_true.mp hbeq v hvbl
+    simpa using hveq
+  · intro hx
+    apply List.all_eq_true.mpr
+    intro bl hbl
+    apply List.all_eq_true.mpr
+    intro v hvbl
+    have hvV : v ∈ V := (hsub bl hbl).2 v hvbl
+    have hrv := hx v hvV
+    rw [root_eq_head V bs hPS bl hbl v hvbl] at hrv
+    simpa using hrv
+
+private theorem sum_eq_zero {α} (l : List α) (f : α → Int) (h : ∀ x ∈ l, f x = 0) :
+    (l.map f).sum = 0 := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      rw [h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+      simp
+
+private theorem put_self (b : Bind) (v x : Nat) : put b v x v = x := by simp [put]
+
+private theorem put_same (b : Bind) (v : Nat) : put b v (b v) = b := by
+  funext i
+  by_cases hi : i == v
+  · have hiv : i = v := Nat.eq_of_beq_eq_true hi
+    subst i
+    simp [put]
+  · simp [put, hi]
+
+private theorem put_comm_ne (b : Bind) (v w x y : Nat) (h : (v != w) = true) :
+    put (put b v x) w y = put (put b w y) v x := by
+  funext i
+  by_cases hv : i == v
+  · by_cases hw : i == w
+    · have hiv : i = v := Nat.eq_of_beq_eq_true hv
+      have hiw : i = w := Nat.eq_of_beq_eq_true hw
+      have hvw : v = w := by omega
+      simp [hvw] at h
+    · simp [put, hv, hw]
+  · by_cases hw : i == w <;> simp [put, hv, hw]
+
+private theorem integrate_swap (n v w : Nat) (vs : List Nat) (b : Bind) (f : Bind → Int) :
+    integrate n (v :: w :: vs) b f = integrate n (w :: v :: vs) b f := by
+  by_cases h : v == w
+  · have hvw : v = w := Nat.eq_of_beq_eq_true h
+    subst w
+    rfl
+  · have hne : (v != w) = true := by cases h' : (v == w) <;> simp_all
+    change ((List.range n).map (fun x =>
+        ((List.range n).map (fun y => integrate n vs (put (put b v x) w y) f)).sum)).sum =
+      ((List.range n).map (fun x =>
+        ((List.range n).map (fun y => integrate n vs (put (put b w x) v y) f)).sum)).sum
+    change rsum n (fun x => rsum n (fun y => integrate n vs (put (put b v x) w y) f)) =
+      rsum n (fun x => rsum n (fun y => integrate n vs (put (put b w x) v y) f))
+    rw [rsum_comm]
+    apply sum_map_congr
+    intro x hx
+    apply sum_map_congr
+    intro y hy
+    rw [put_comm_ne b v w y x hne]
+
+private theorem integrate_append (n : Nat) (xs ys : List Nat) (b : Bind) (f : Bind → Int) :
+    integrate n (xs ++ ys) b f = integrate n xs b (fun b' => integrate n ys b' f) := by
+  induction xs generalizing b with
+  | nil => rfl
+  | cons v vs ih =>
+      change ((List.range n).map (fun x => integrate n (vs ++ ys) (put b v x) f)).sum =
+        ((List.range n).map (fun x => integrate n vs (put b v x) (fun b' => integrate n ys b' f))).sum
+      apply sum_map_congr
+      intro x hx
+      exact ih (put b v x)
+
+private theorem integrate_perm (n : Nat) {xs ys : List Nat} (h : xs.Perm ys)
+    (b : Bind) (f : Bind → Int) : integrate n xs b f = integrate n ys b f := by
+  induction h generalizing b with
+  | nil => rfl
+  | cons x h ih =>
+      change ((List.range n).map (fun t => integrate n _ (put b x t) f)).sum =
+        ((List.range n).map (fun t => integrate n _ (put b x t) f)).sum
+      apply sum_map_congr
+      intro t ht
+      exact ih (put b x t)
+  | swap x y l => exact (integrate_swap n x y l b f).symm
+  | trans h1 h2 ih1 ih2 => exact (ih1 b).trans (ih2 b)
+
+private def bindings (n : Nat) : List Nat → Bind → List Bind
+  | [], b => [b]
+  | v :: vs, b => (List.range n).flatMap (fun x => bindings n vs (put b v x))
+
+private theorem map_flatMap_sum {α} (l : List α) (F : α → List Int) :
+    ((l.flatMap F).sum : Int) = (l.map (fun a => (F a).sum)).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih => rw [List.flatMap_cons, List.sum_append, List.map_cons, List.sum_cons, ih]
+
+private theorem bindings_sum (n : Nat) (vs : List Nat) (b : Bind) (f : Bind → Int) :
+    integrate n vs b f = ((bindings n vs b).map f).sum := by
+  induction vs generalizing b with
+  | nil => simp [integrate, bindings]
+  | cons v vs ih =>
+      change ((List.range n).map (fun x => integrate n vs (put b v x) f)).sum =
+        (((List.range n).flatMap (fun x => bindings n vs (put b v x))).map f).sum
+      rw [show ((List.range n).flatMap (fun x => bindings n vs (put b v x))).map f =
+          (List.range n).flatMap (fun x => (bindings n vs (put b v x)).map f) by
+            induction List.range n with
+            | nil => rfl
+            | cons a l ih2 => simp [List.map_append, ih2]]
+      rw [map_flatMap_sum]
+      apply sum_map_congr
+      intro x hx
+      exact ih (put b v x)
+
+private theorem bindings_fixed (n : Nat) (vs : List Nat) (b : Bind) :
+    ∀ y ∈ bindings n vs b, ∀ v ∉ vs, y v = b v := by
+  induction vs generalizing b with
+  | nil =>
+      intro y hy v hv
+      simp [bindings] at hy
+      subst y
+      rfl
+  | cons w ws ih =>
+      intro y hy v hv
+      rcases List.mem_flatMap.mp hy with ⟨x, hx, hy⟩
+      have hvw : v ≠ w := by intro h; subst v; exact hv (by simp)
+      have hvws : v ∉ ws := by intro h; exact hv (by simp [h])
+      rw [ih (put b w x) y hy v hvws]
+      simp [put, hvw]
+
+private theorem bindings_range (n : Nat) (vs : List Nat) (b : Bind) :
+    ∀ y ∈ bindings n vs b, ∀ v ∈ vs, y v ∈ List.range n := by
+  induction vs generalizing b with
+  | nil => simp
+  | cons w ws ih =>
+      intro y hy v hv
+      rcases List.mem_flatMap.mp hy with ⟨x, hx, hy⟩
+      by_cases hvw : w = v
+      · subst w
+        by_cases htail : v ∈ ws
+        · exact ih (put b v x) y hy v htail
+        · have heq := bindings_fixed n ws (put b v x) y hy v htail
+          rw [heq]
+          simpa [put] using hx
+      · have htail : v ∈ ws := by
+          rcases List.mem_cons.mp hv with h | h
+          · exact (hvw h.symm).elim
+          · exact h
+        exact ih (put b w x) y hy v htail
+
+private theorem integrate_congr_bindings (n : Nat) (vs : List Nat) (b : Bind) (f g : Bind → Int)
+    (h : ∀ y, y ∈ bindings n vs b → f y = g y) :
+    integrate n vs b f = integrate n vs b g := by
+  rw [bindings_sum, bindings_sum]
+  apply sum_map_congr
+  intro y hy
+  exact h y hy
+
+private theorem rsum_ite_eq_single (n a : Nat) (ha : a < n) (f : Nat → Int) :
+    rsum n (fun x => if x = a then f x else 0) = f a := by
+  induction n with
+  | zero => omega
+  | succ n ih =>
+      rw [rsum_succ]
+      by_cases h : a = n
+      · subst a
+        have hzero : rsum n (fun x => if x = n then f x else 0) = 0 := by
+          rw [show rsum n (fun x => if x = n then f x else 0) = rsum n (fun _ => (0 : Int)) by
+            apply rsum_congr
+            intro x hx
+            have hxn : x ≠ n := by omega
+            simp [hxn]]
+          exact rsum_const_zero n
+        rw [hzero]
+        simp
+      · have han : a < n := by omega
+        rw [ih han]
+        have hne : ¬ n = a := by omega
+        simp [hne]
+
+private theorem integrate_zero_of_false (n : Nat) (vs : List Nat) (b : Bind) (f : Bind → Int)
+    (h : ∀ y ∈ bindings n vs b, f y = 0) : integrate n vs b f = 0 := by
+  rw [bindings_sum]
+  apply sum_eq_zero
+  intro y hy
+  exact h y hy
+
+private theorem all_to_beq (l : List Nat) (f g : Nat → Nat)
+    (h : ∀ v ∈ l, f v = g v) : l.all (fun v => f v == g v) = true :=
+  List.all_eq_true.mpr (fun v hv => by simpa using h v hv)
+
+private theorem inner_collapse (n : Nat) (M : List Nat) (Root : Nat → Nat) (y : Bind) (C : Int)
+    (hM : M.Nodup) (hRnot : ∀ m ∈ M, Root m ∉ M)
+    (hy : ∀ m ∈ M, y (Root m) ∈ List.range n) :
+    integrate n M y (fun x => if M.all (fun m => x m == y (Root m)) then C else 0) = C := by
+  induction M generalizing y with
+  | nil => simp [integrate]
+  | cons m Ms ih =>
+      have hmMs : m ∉ Ms := (List.nodup_cons.mp hM).1
+      have hMnd : Ms.Nodup := (List.nodup_cons.mp hM).2
+      have hRnot' : ∀ v ∈ Ms, Root v ∉ Ms := by
+        intro v hv hmem
+        exact hRnot v (by simp [hv]) (by simp [hmem])
+      have hrootne : ∀ v ∈ Ms, Root v ≠ m := by
+        intro v hv h_eq
+        exact hRnot v (by simp [hv]) (by simp [h_eq])
+      have hpoint : ∀ t < n,
+          integrate n Ms (put y m t)
+            (fun x => if (m :: Ms).all (fun v => x v == y (Root v)) then C else 0) =
+          if t = y (Root m) then C else 0 := by
+        intro t ht
+        by_cases htm : t = y (Root m)
+        · subst t
+          have hyrange' : ∀ v ∈ Ms, (put y m (y (Root m))) (Root v) ∈ List.range n := by
+            intro v hv
+            have hne := hrootne v hv
+            simpa [put, hne] using hy v (by simp [hv])
+          calc
+            integrate n Ms (put y m (y (Root m)))
+                (fun x => if (m :: Ms).all (fun v => x v == y (Root v)) then C else 0)
+                = integrate n Ms (put y m (y (Root m)))
+                    (fun x => if Ms.all (fun v => x v == (put y m (y (Root m))) (Root v)) then C else 0) := by
+                    apply integrate_congr_bindings
+                    intro x hx
+                    have hxm : x m = y (Root m) := by
+                      rw [bindings_fixed n Ms (put y m (y (Root m))) x hx m hmMs]
+                      simp [put]
+                    simp [hxm]
+                    by_cases hleft : ∀ v ∈ Ms, x v = y (Root v)
+                    · have hright : ∀ v ∈ Ms, x v = (put y m (y (Root m))) (Root v) := by
+                        intro v hv
+                        have hv' := hleft v hv
+                        have hneq : (Root v == m) = false := by
+                          cases hb : Root v == m <;> simp_all
+                        simpa [put, hneq] using hv'
+                      rw [ite_eq_left hleft, ite_eq_left hright]
+                    · have hrightnot : ¬ (∀ v ∈ Ms, x v = (put y m (y (Root m))) (Root v)) := by
+                        intro hr
+                        apply hleft
+                        intro v hv
+                        have hv' := hr v hv
+                        have hneq : (Root v == m) = false := by
+                          cases hb : Root v == m <;> simp_all
+                        simpa [put, hneq] using hv'
+                      rw [ite_eq_right hleft, ite_eq_right hrightnot]
+            _ = C := ih (put y m (y (Root m))) hMnd hRnot' hyrange'
+            _ = (if y (Root m) = y (Root m) then C else 0) := by simp
+        · have hzero : integrate n Ms (put y m t)
+              (fun x => if (m :: Ms).all (fun v => x v == y (Root v)) then C else 0) = 0 := by
+            apply integrate_zero_of_false
+            intro x hx
+            have hxm : x m = t := by
+              rw [bindings_fixed n Ms (put y m t) x hx m hmMs]
+              simp [put]
+            simp [hxm, htm]
+          simpa [htm] using hzero
+      change rsum n (fun t => integrate n Ms (put y m t)
+        (fun x => if (m :: Ms).all (fun v => x v == y (Root v)) then C else 0)) = C
+      rw [show (fun t => integrate n Ms (put y m t)
+        (fun x => if (m :: Ms).all (fun v => x v == y (Root v)) then C else 0)) =
+        (fun t => if t = y (Root m) then C else 0) by
+          funext t
+          by_cases ht : t < n
+          · exact hpoint t ht
+          · have htn : y (Root m) < n := by
+              have := hy m (by simp)
+              simpa using this
+            have htne : t ≠ y (Root m) := by omega
+            simp [htne]
+            apply integrate_zero_of_false
+            intro x hx
+            have hxm : x m = t := by
+              rw [bindings_fixed n Ms (put y m t) x hx m hmMs]
+              simp [put]
+            simp [hxm, htne]]
+      rw [rsum_ite_eq_single n (y (Root m)) (by
+        have := hy m (by simp)
+        simpa using this)]
+
+private theorem perm_append_left {α} {l1 l2 : List α} (h : l1.Perm l2) (l3 : List α) :
+    (l1 ++ l3).Perm (l2 ++ l3) := by
+  induction h with
+  | nil => rfl
+  | cons x h ih => exact .cons x ih
+  | swap x y l => exact .swap x y (l ++ l3)
+  | trans h1 h2 ih1 ih2 => exact ih1.trans ih2
+
+private theorem perm_append_right {α} (l1 : List α) {l3 l4 : List α} (h : l3.Perm l4) :
+    (l1 ++ l3).Perm (l1 ++ l4) := by
+  induction l1 with
+  | nil => simpa using h
+  | cons a l1 ih => exact .cons a ih
+
+private theorem perm_append {α} {l1 l2 l3 l4 : List α} (h1 : l1.Perm l2) (h2 : l3.Perm l4) :
+    (l1 ++ l3).Perm (l2 ++ l4) := (perm_append_left h1 l3).trans (perm_append_right l2 h2)
+
+private theorem cons_append_perm (a : Nat) (l : List Nat) : (a :: l).Perm (l ++ [a]) := by
+  induction l with
+  | nil => simp
+  | cons x l ih => exact (List.Perm.swap x a l).trans (.cons x ih)
+
+private theorem filter_append_compl (p : Nat → Bool) (l : List Nat) :
+    l.Perm ((l.filter p) ++ (l.filter (fun x => !p x))) := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      by_cases ha : p a = true
+      · simpa [ha] using (List.Perm.cons a ih)
+      · have ha' : p a = false := by cases h : p a <;> simp_all
+        have hstep := (List.Perm.cons a ih).trans
+          (perm_append (cons_append_perm a (l.filter p))
+            (List.Perm.refl (l.filter (fun x => !p x))))
+        simpa [ha'] using hstep
+
+private theorem perm_filter_of_nodup {l l' : List Nat} (hnd : l.Nodup) (hnd' : l'.Nodup)
+    (hsub : ∀ x ∈ l, x ∈ l') : l.Perm (l'.filter (fun x => x ∈ l)) := by
+  induction l' generalizing l with
+  | nil =>
+      have hl : l = [] := by
+        cases l with
+        | nil => rfl
+        | cons a as => exact False.elim (by simpa using hsub a (by simp))
+      subst l
+      simp
+  | cons a l' ih =>
+      have hnot : a ∉ l' := (List.nodup_cons.mp hnd').1
+      by_cases ha : a ∈ l
+      · have htail := ih (hnd.erase a) (List.nodup_cons.mp hnd').2 (by
+          intro x hx
+          have hxa : x ≠ a := by intro h; subst x; exact hnd.not_mem_erase hx
+          have hxl := (List.mem_erase_of_ne hxa).mp hx
+          simpa [hxa] using hsub x hxl)
+        have hab : decide (a ∈ l) = true := by simp [ha]
+        have hfilter : (a :: l').filter (fun x => x ∈ l) =
+            a :: l'.filter (fun x : Nat => x ∈ l.erase a) := by
+          rw [List.filter_cons, ite_eq_left hab]
+          congr 1
+          apply List.filter_congr
+          intro x hx
+          have hxa : x ≠ a := by intro h; subst x; exact hnot hx
+          simp [List.mem_erase_of_ne hxa]
+        rw [hfilter]
+        exact (List.perm_cons_erase ha).trans (.cons a htail)
+      · rw [List.filter_cons]
+        simp [ha]
+        apply ih hnd (List.nodup_cons.mp hnd').2
+        intro x hx
+        have hxa : x ≠ a := by intro h; subst x; exact ha hx
+        simpa [hxa] using hsub x hx
+
+private theorem collapse_sum (p : Pattern)
+    (hPSall : (partitions p.freeVars).all (fun bs => PSb p.freeVars bs) = true)
+    (hHPall : (partitions p.freeVars).all (HPb p.freeVars) = true)
+    (hVnd : p.freeVars.Nodup)
+    (n : Nat) (b : Bind) (F : Bind → Int)
+    (bs : List (List Nat)) (hbs : bs ∈ partitions p.freeVars)
+    (hF : ∀ x y, (∀ v ∈ p.freeVars, x v = y v) →
+      (∀ v, v ∉ p.freeVars → x v = b v) → (∀ v, v ∉ p.freeVars → y v = b v) → F x = F y) :
+    integrate n (Heads bs) b (fun y => F (fun v => y (Root bs v))) =
+      integrate n p.freeVars b (fun x => if constOn bs x then F x else 0) := by
+  have hPS := List.all_eq_true.mp hPSall bs hbs
+  have hspec := heads_spec p.freeVars bs (List.all_eq_true.mp hHPall bs hbs)
+  have hVnd' := hVnd
+  let H := Heads bs
+  let M := p.freeVars.filter (fun v => !H.contains v)
+  have hHsub : ∀ v ∈ H, v ∈ p.freeVars := hspec.2
+  have hrootV : ∀ v ∈ p.freeVars, Root bs v ∈ H := by
+    intro v hv
+    exact root_mem_heads hPS v hv
+  have hrootH : ∀ h ∈ H, Root bs h = h := by
+    intro h hh
+    exact root_head hPS h hh
+  have hrootOut : ∀ v, v ∉ p.freeVars → Root bs v = v := root_out hPS
+  have hconst : ∀ x, constOn bs x = true ↔ ∀ v ∈ p.freeVars, x v = x (Root bs v) :=
+    constOn_iff hPS
+  have hfilt : (p.freeVars.filter (fun v => H.contains v)).Perm H := by
+    have hp := perm_filter_of_nodup hspec.1 hVnd' hHsub
+    simpa using hp.symm
+  have hpermV : p.freeVars.Perm (H ++ M) := by
+    have h1 := filter_append_compl H.contains p.freeVars
+    have h2 : (p.freeVars.filter (fun v => H.contains v) ++
+        p.freeVars.filter (fun v => !H.contains v)).Perm
+        (H ++ M) := perm_append hfilt (List.Perm.refl _)
+    exact h1.trans h2
+  rw [integrate_perm n hpermV b (fun x => if constOn bs x then F x else 0)]
+  rw [integrate_append]
+  apply integrate_congr_bindings
+  intro y hy
+  have hyH : ∀ h ∈ H, y h ∈ List.range n := by
+    intro h hh
+    exact bindings_range n H b y hy h hh
+  have hyfixed : ∀ v ∉ H, y v = b v := by
+    intro v hv
+    exact bindings_fixed n H b y hy v hv
+  let x0 : Bind := fun v => y (Root bs v)
+  have hx0V : ∀ v ∈ p.freeVars, x0 v ∈ List.range n := by
+    intro v hv
+    have hr := hrootV v hv
+    simpa [x0] using hyH (Root bs v) hr
+  have hMsub : ∀ v ∈ M, v ∈ p.freeVars := by
+    intro v hv
+    exact (List.mem_filter.mp hv).1
+  have hMnotH : ∀ v ∈ M, v ∉ H := by
+    intro v hv
+    have hnot := (List.mem_filter.mp hv).2
+    simpa using hnot
+  have hMnd : M.Nodup := hVnd'.filter _
+  have hRnot : ∀ m ∈ M, Root bs m ∉ M := by
+    intro m hm hmem
+    have hr := hrootV m (hMsub m hm)
+    exact hMnotH (Root bs m) hmem hr
+  have hyrange : ∀ m ∈ M, y (Root bs m) ∈ List.range n := by
+    intro m hm
+    exact hyH (Root bs m) (hrootV m (hMsub m hm))
+  have hridem : ∀ v ∈ p.freeVars, Root bs (Root bs v) = Root bs v := by
+    intro v hv
+    exact hrootH (Root bs v) (hrootV v hv)
+  have hinner : integrate n M y (fun x => if constOn bs x then F x else 0) = F x0 := by
+    calc
+      integrate n M y (fun x => if constOn bs x then F x else 0)
+          = integrate n M y (fun x => if M.all (fun m => x m == y (Root bs m)) then F x0 else 0) := by
+            apply integrate_congr_bindings
+            intro x hx
+            by_cases hall : M.all (fun m => x m == y (Root bs m)) = true
+            · have hall' : ∀ m ∈ M, x m = y (Root bs m) :=
+                fun m hm => by simpa using List.all_eq_true.mp hall m hm
+              have hxV : ∀ v ∈ p.freeVars, x v = x0 v := by
+                intro v hv
+                by_cases hvH : v ∈ H
+                · have hvM : v ∉ M := by
+                    intro h
+                    exact hMnotH v h hvH
+                  have hxy : x v = y v := bindings_fixed n M y x hx v hvM
+                  have hx0v : x0 v = y v := by
+                    have hv' : Root bs v = v := hrootH v hvH
+                    simpa [x0, hv']
+                  rw [hxy, hx0v]
+                · have hvM : v ∈ M := List.mem_filter.mpr ⟨hv, by simpa using hvH⟩
+                  have h1 := hall' v hvM
+                  have h2 : x0 v = y (Root bs v) := rfl
+                  rw [h2, h1]
+              have hconstx : constOn bs x = true := (hconst x).2 (by
+                intro v hv
+                have e2 := hxV (Root bs v) (hHsub (Root bs v) (hrootV v hv))
+                rw [hxV v hv, e2]
+                simp [x0, hridem v hv])
+              rw [ite_eq_left hconstx, ite_eq_left hall]
+              exact hF x x0 hxV
+                (fun v hv => by
+                  rw [bindings_fixed n M y x hx v (fun hm => hv (hMsub v hm))]
+                  exact hyfixed v (fun hh => hv (hHsub v hh)))
+                (fun v hv => by
+                  show y (Root bs v) = b v
+                  rw [hrootOut v hv]
+                  exact hyfixed v (fun hh => hv (hHsub v hh)))
+            · have hconstnot : ¬ constOn bs x = true := by
+                intro hx'
+                have hc := (hconst x).1 hx'
+                have h' : M.all (fun m => x m == y (Root bs m)) = true :=
+                  all_to_beq M (fun m => x m) (fun m => y (Root bs m))
+                    (fun m hm => (hc m (hMsub m hm)).trans
+          (bindings_fixed n M y x hx (Root bs m)
+            (hRnot m hm)))
+                exact hall h'
+              rw [ite_eq_right hall, ite_eq_right hconstnot]
+      _ = F x0 := inner_collapse n M (fun v => Root bs v) y (F x0) hMnd hRnot hyrange
+  rw [hinner]
+
+private theorem map_flatMap {α β} (l : List α) (F : α → List β) (g : β → Int) :
+    ((l.flatMap F).map g).sum = (l.map (fun a => ((F a).map g).sum)).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      rw [List.flatMap_cons, List.map_append, List.sum_append, List.map_cons,
+        List.sum_cons, ih]
+
+private theorem sum_swap {α β} (l : List α) (l' : List β) (F : α → β → Int) :
+    (l.map (fun a => (l'.map (F a)).sum)).sum =
+      (l'.map (fun b => (l.map (fun a => F a b)).sum)).sum := by
+  induction l' with
+  | nil =>
+      change (l.map (fun _ => (0 : Int))).sum = 0
+      exact sum_zero l
+  | cons b l' ih =>
+      rw [show (fun a => (List.map (F a) (b :: l')).sum) =
+          (fun a => F a b + (l'.map (F a)).sum) by funext a; rfl]
+      rw [sum_add, ih]
+      simp
+
+private theorem list_map_congr {α β} (l : List α) (f g : α → β) (h : ∀ x ∈ l, f x = g x) :
+    l.map f = l.map g := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      show f a :: l.map f = g a :: l.map g
+      rw [h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+
+/-- Möbius assembly: given the pointwise partition identity `hsum` for `p`,
+rewrite the injective count as the signed sum of collapsed counts. -/
+private theorem collision_general (p : Pattern)
+    (hPSall : (partitions p.freeVars).all (fun bs => PSb p.freeVars bs) = true)
+    (hHPall : (partitions p.freeVars).all (HPb p.freeVars) = true)
+    (hVnd : p.freeVars.Nodup)
+    (hsum : ∀ (x : Bind), ((partitions p.freeVars).map
+        (fun bs => mobius bs * (if constOn bs x then (1 : Int) else 0))).sum =
+        (if (p.freeVars.map x).Nodup then (1 : Int) else 0))
+    (n : Nat) (db : DB) (b : Bind) :
+    injective p n db b =
+      ((partitions p.freeVars).map (fun bs => mobius bs * collapsed p n db b bs)).sum := by
+  let Φ : Bind → Int := fun x => (p.atoms.map (fun a => value db a x)).prod
+  have hF : ∀ x y, (∀ v ∈ p.freeVars, x v = y v) →
+      (∀ v, v ∉ p.freeVars → x v = b v) → (∀ v, v ∉ p.freeVars → y v = b v) → Φ x = Φ y := by
+    intro x y hxy hx hy
+    show (p.atoms.map (fun a => value db a x)).prod =
+      (p.atoms.map (fun a => value db a y)).prod
+    refine congrArg List.prod (list_map_congr _ _ _ (fun a ha => ?_))
+    unfold value
+    by_cases hs : a.src ∈ p.freeVars
+    · by_cases hd : a.dst ∈ p.freeVars
+      · rw [hxy a.src hs, hxy a.dst hd]
+      · rw [hxy a.src hs, hx a.dst hd, hy a.dst hd]
+    · by_cases hd : a.dst ∈ p.freeVars
+      · rw [hx a.src hs, hy a.src hs, hxy a.dst hd]
+      · rw [hx a.src hs, hy a.src hs, hx a.dst hd, hy a.dst hd]
+  have hA : ∀ bs ∈ partitions p.freeVars,
+      collapsed p n db b bs =
+        integrate n p.freeVars b (fun x => if constOn bs x then Φ x else 0) := by
+    intro bs hbs
+    have key : collapsed p n db b bs =
+        integrate n (Heads bs) b (fun y => Φ (fun v => y (Root bs v))) := rfl
+    rw [key, collapse_sum p hPSall hHPall hVnd n b Φ bs hbs hF]
+  have hB : ((partitions p.freeVars).map
+      (fun bs => mobius bs * collapsed p n db b bs)).sum =
+      integrate n p.freeVars b (fun x => ((partitions p.freeVars).map
+        (fun bs => mobius bs * (if constOn bs x then Φ x else 0))).sum) := by
+    rw [sum_map_congr _ _ _ (fun bs hbs => congrArg (fun t => mobius bs * t) (hA bs hbs))]
+    have h1 : ∀ bs ∈ partitions p.freeVars,
+        mobius bs * integrate n p.freeVars b (fun x => if constOn bs x then Φ x else 0) =
+          ((bindings n p.freeVars b).map
+            (fun x => mobius bs * (if constOn bs x then Φ x else 0))).sum := by
+      intro bs hbs
+      rw [bindings_sum, ← sum_mul_left]
+    rw [sum_map_congr _ _ _ h1, sum_swap, ← bindings_sum]
+  have hC : ∀ x, (partitions p.freeVars).map
+      (fun bs => mobius bs * (if constOn bs x then Φ x else 0)) =
+      (partitions p.freeVars).map
+        (fun bs => (mobius bs * (if constOn bs x then (1 : Int) else 0)) * Φ x) := by
+    intro x
+    apply list_map_congr
+    intro bs _
+    cases hcb : constOn bs x with
+    | true => simp [hcb]
+    | false => simp [hcb]
+  have hD : ∀ x, ((partitions p.freeVars).map
+      (fun bs => mobius bs * (if constOn bs x then Φ x else 0))).sum =
+      (if (p.freeVars.map x).Nodup then Φ x else 0) := by
+    intro x
+    rw [hC x, sum_mul_right, hsum x]
+    by_cases hd : (p.freeVars.map x).Nodup <;> simp [hd]
+  have h0 : injective p n db b =
+      integrate n p.freeVars b (fun x => if (p.freeVars.map x).Nodup then Φ x else 0) := rfl
+  rw [h0, hB]
+  refine congrArg (integrate n p.freeVars b) (funext (fun x => (hD x).symm))
+
+private theorem rsum_mul_le_mul_rsum (n : Nat) (f g : Nat → Int)
+    (hf : ∀ i, i < n → 0 ≤ f i) (hg : ∀ i, i < n → 0 ≤ g i) :
+    rsum n (fun i => f i * g i) ≤ rsum n f * rsum n g := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih =>
+      rw [rsum_succ, rsum_succ, rsum_succ]
+      have hfn : 0 ≤ f n := hf n (Nat.lt_succ_self n)
+      have hgn : 0 ≤ g n := hg n (Nat.lt_succ_self n)
+      have hi := ih (fun i hi => hf i (Nat.lt_succ_of_lt hi)) (fun i hi => hg i (Nat.lt_succ_of_lt hi))
+      have hsf : 0 ≤ rsum n f := rsum_nonneg n f (fun i hi => hf i (Nat.lt_succ_of_lt hi))
+      have hsg : 0 ≤ rsum n g := rsum_nonneg n g (fun i hi => hg i (Nat.lt_succ_of_lt hi))
+      calc
+        rsum n (fun i => f i * g i) + f n * g n ≤ rsum n f * rsum n g + f n * g n :=
+          Int.add_le_add hi (by omega)
+        _ ≤ (rsum n f * rsum n g + rsum n f * g n) + (f n * rsum n g + f n * g n) := by
+            have hcross1 : 0 ≤ rsum n f * g n := Int.mul_nonneg hsf hgn
+            have hcross2 : 0 ≤ f n * rsum n g := Int.mul_nonneg hfn hsg
+            have hnon : 0 ≤ rsum n f * g n + f n * rsum n g := by omega
+            omega
+        _ = (rsum n f + f n) * (rsum n g + g n) := by
+            simp [Int.add_mul, Int.mul_add, Int.add_assoc, Int.add_comm, Int.add_left_comm]
+
+private theorem list_pairs_sum (l : List Nat) (n : Nat) (f : Nat → Nat → Int) :
+    (l.map (fun i => rsum n (fun j => f i j))).sum =
+      ((l.flatMap (fun i => (List.range n).map (fun j => (i,j)))).map
+        (fun p => f p.1 p.2)).sum := by
+  induction l with
+  | nil => simp
+  | cons i l ih =>
+      simp only [List.map_cons, List.sum_cons, List.flatMap_cons]
+      rw [ih]
+      simp [rsum, List.map_append, List.sum_append, Function.comp_def]
+
+private theorem rsum_pairs (n : Nat) (f : Nat → Nat → Int) :
+    rsum n (fun i => rsum n (fun j => f i j)) =
+      (((List.range n).flatMap (fun i => (List.range n).map (fun j => (i,j)))).map
+        (fun p => f p.1 p.2)).sum := by
+  exact list_pairs_sum (List.range n) n f
+
+/-! ---------- Cauchy-Schwarz for lists ---------- -/
+
+private theorem cs_aux (l : List (Int × Int)) (a b : Int) :
+  (l.map (fun p => p.1*p.1)).sum * (b*b) + (l.map (fun p => p.2*p.2)).sum * (a*a) -
+    2*(l.map (fun p => p.1*p.2)).sum*a*b =
+  (l.map (fun p => (a*p.2 - p.1*b)^2)).sum := by
+  induction l with
+  | nil => simp
+  | cons p l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      grind
+
+private theorem cs_sum_sq_nonneg (l : List (Int × Int)) (a b : Int) :
+    0 ≤ (l.map (fun p => (a*p.2 - p.1*b)^2)).sum := by
+  induction l with
+  | nil => simp
+  | cons p l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      have hp : 0 ≤ (a*p.2 - p.1*b)^2 := Int.sq_nonneg _
+      omega
+
+private theorem cs_list : ∀ l : List (Int × Int),
+    (l.map (fun p => p.1 * p.2)).sum ^ 2 ≤
+      (l.map (fun p => p.1 * p.1)).sum * (l.map (fun p => p.2 * p.2)).sum
+  | [] => by simp
+  | (a,b)::l => by
+      simp only [List.map_cons, List.sum_cons]
+      have ih := cs_list l
+      have hdiff : 0 ≤ (a*a + (l.map (fun p => p.1*p.1)).sum) *
+              (b*b + (l.map (fun p => p.2*p.2)).sum) -
+            (a*b + (l.map (fun p => p.1*p.2)).sum)^2 := by
+        rw [show (a*a + (l.map (fun p => p.1*p.1)).sum) *
+              (b*b + (l.map (fun p => p.2*p.2)).sum) -
+              (a*b + (l.map (fun p => p.1*p.2)).sum)^2 =
+            ((l.map (fun p => p.1*p.1)).sum * (l.map (fun p => p.2*p.2)).sum -
+              (l.map (fun p => p.1*p.2)).sum^2) +
+            ((l.map (fun p => p.1*p.1)).sum * (b*b) + (l.map (fun p => p.2*p.2)).sum * (a*a) -
+              2*(l.map (fun p => p.1*p.2)).sum*a*b) by grind]
+        rw [cs_aux]
+        have h1 : 0 ≤ (l.map (fun p => p.1*p.1)).sum * (l.map (fun p => p.2*p.2)).sum -
+              (l.map (fun p => p.1*p.2)).sum^2 := by omega
+        have h2 : 0 ≤ (l.map (fun p => (a*p.2 - p.1*b)^2)).sum := cs_sum_sq_nonneg l a b
+        omega
+      omega
+
+/-! ---------- finite-support injection machinery ---------- -/
+
+private theorem sum_congr {α} (l : List α) (f g : α → Int)
+    (h : ∀ x ∈ l, f x = g x) : (l.map f).sum = (l.map g).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      rw [h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+
+
+private theorem put_get_other (b : Bind) (v w x : Nat) (h : w ≠ v) :
+    put b v x w = b w := by
+  have h' : (w == v) = false := by
+    cases hw : w == v <;> simp_all
+  simp [put, h']
+
+private theorem nodup_map {α β} (l : List α) (f : α → β)
+    (hinj : ∀ a ∈ l, ∀ b ∈ l, f a = f b → a = b) (hnd : l.Nodup) : (l.map f).Nodup := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      rw [List.nodup_cons] at hnd
+      rw [List.map_cons, List.nodup_cons]
+      constructor
+      · intro hm
+        rcases List.mem_map.mp hm with ⟨b, hb, hfb⟩
+        have hab : a = b := hinj a (by simp) b (by simp [hb]) hfb.symm
+        subst b
+        exact hnd.1 hb
+      · exact ih (fun x hx y hy => hinj x (by simp [hx]) y (by simp [hy])) hnd.2
+
+private theorem nodup_filter {α} (p : α → Bool) (l : List α) (hnd : l.Nodup) :
+    (l.filter p).Nodup := hnd.filter p
+
+private theorem nodup_flatMap {α β} (l : List α) (f : α → List β)
+    (hnd : l.Nodup) (hf : ∀ a ∈ l, (f a).Nodup)
+    (hd : ∀ a ∈ l, ∀ b ∈ l, a ≠ b → ∀ x ∈ f a, ∀ y ∈ f b, x ≠ y) :
+    (l.flatMap f).Nodup := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      rw [List.flatMap_cons, List.nodup_append]
+      refine ⟨hf a (by simp), ih (List.nodup_cons.mp hnd).2
+        (fun b hb => hf b (by simp [hb]))
+        (fun b hb c hc hbc x hx y hy => hd b (by simp [hb]) c (by simp [hc]) hbc x hx y hy), ?_⟩
+      intro x hx y hy hxy
+      rcases List.mem_flatMap.mp hy with ⟨c, hc, hyc⟩
+      have hac : a ≠ c := by
+        intro h
+        subst c
+        exact (List.nodup_cons.mp hnd).1 hc
+      exact hd a (by simp) c (by simp [hc]) hac x hx y hyc hxy
+
+private theorem bindings_nodup (n : Nat) (vs : List Nat) (b : Bind) (hnd : vs.Nodup) :
+    (bindings n vs b).Nodup := by
+  induction vs generalizing b with
+  | nil => simp [bindings]
+  | cons v vs ih =>
+      have hv : v ∉ vs := (List.nodup_cons.mp hnd).1
+      apply nodup_flatMap
+      · exact List.nodup_range
+      · intro x hx
+        exact ih (put b v x) (List.nodup_cons.mp hnd).2
+      · intro x hx y hy hxy u hu z hz heq
+        have haa := bindings_fixed n vs (put b v x) u hu v hv
+        have hbb := bindings_fixed n vs (put b v y) z hz v hv
+        simp only [put_self] at haa hbb
+        subst z
+        exact hxy (haa.symm.trans hbb)
+
+private theorem sum_flatMap {α β} (l : List α) (f : α → List β) (g : β → Int) :
+    ((l.flatMap f).map g).sum = (l.map (fun a => ((f a).map g).sum)).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih => simp only [List.flatMap_cons, List.map_append, List.sum_append, List.map_cons,
+      List.sum_cons, ih]
+
+private theorem nat_sum_const {α} (l : List α) (c : Nat) :
+    (l.map (fun _ => c)).sum = l.length * c := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih, Nat.add_mul, Nat.add_comm]
+
+private theorem nat_sum_congr {α} (l : List α) (f g : α → Nat)
+    (h : ∀ x ∈ l, f x = g x) : (l.map f).sum = (l.map g).sum := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+      simp only [List.map_cons, List.sum_cons]
+      rw [h a (by simp), ih (fun x hx => h x (by simp [hx]))]
+
+private def domain (p : Pattern) (n : Nat) (b : Bind) (v : Nat) : List Nat :=
+  if p.freeVars.contains v then List.range n else [b v]
+
+private theorem domain_nodup (p : Pattern) (n : Nat) (b : Bind) (v : Nat) :
+    (domain p n b v).Nodup := by
+  by_cases h : p.freeVars.contains v = true
+  · rw [domain, if_pos h]
+    exact List.nodup_range
+  · have hf : p.freeVars.contains v = false := by cases h' : p.freeVars.contains v <;> simp_all
+    rw [domain, if_neg h]
+    simp
+
+private def supportList (p : Pattern) (n : Nat) (db : DB) (b : Bind) (a : Atom) : List (Nat × Nat) :=
+  (domain p n b a.src).flatMap (fun x =>
+    ((domain p n b a.dst).filter (fun y => db a.rel x y != 0)).map (fun y => (x, y)))
+
+private theorem supportList_length (p : Pattern) (n : Nat) (db : DB) (b : Bind) (a : Atom) :
+    (supportList p n db b a).length = support n db a p b := by
+  unfold supportList support domain
+  rw [List.length_flatMap]
+  apply nat_sum_congr
+  intro x hx
+  rw [List.length_map, ← List.countP_eq_length_filter]
+
+private theorem supportList_nodup (p : Pattern) (n : Nat) (db : DB) (b : Bind) (a : Atom) :
+    (supportList p n db b a).Nodup := by
+  apply nodup_flatMap
+  · exact domain_nodup p n b a.src
+  · intro x hx
+    apply nodup_map
+    · intro y hy z hz h
+      exact Prod.mk.inj h |>.2
+    · exact nodup_filter _ _ (domain_nodup p n b a.dst)
+  · intro x hx y hy hxy u hu v hv huv
+    rcases List.mem_map.mp hu with ⟨uy, _, huy⟩
+    rcases List.mem_map.mp hv with ⟨vy, _, hvy⟩
+    rw [← huy, ← hvy] at huv
+    exact hxy (Prod.mk.inj huv).1
+
+private def carts {α} : List (List α) → List (List α)
+  | [] => [[]]
+  | l :: ls => l.flatMap (fun x => (carts ls).map (fun xs => x :: xs))
+
+private theorem carts_length {α} (ls : List (List α)) :
+    (carts ls).length = (ls.map List.length).prod := by
+  induction ls with
+  | nil => simp [carts]
+  | cons l ls ih =>
+      rw [carts, List.length_flatMap]
+      rw [show l.map (fun a => ((carts ls).map (fun xs => a :: xs)).length) =
+          l.map (fun _ => (carts ls).length) by
+        apply List.map_congr_left
+        intro a ha
+        exact List.length_map _]
+      rw [nat_sum_const, ih, List.map_cons, List.prod_cons]
+
+private theorem carts_mem_cons {α} (l : List α) (ls : List (List α)) (x : α) (xs : List α)
+    (hx : x ∈ l) (hxs : xs ∈ carts ls) : x :: xs ∈ carts (l :: ls) := by
+  rw [carts]
+  exact List.mem_flatMap.mpr ⟨x, hx, List.mem_map.mpr ⟨xs, hxs, rfl⟩⟩
+
+private theorem binding_domain_mem (p : Pattern) (n : Nat) (b : Bind) :
+    ∀ y ∈ bindings n p.freeVars b, ∀ v, y v ∈ domain p n b v := by
+  intro y hy v
+  by_cases h : p.freeVars.contains v = true
+  · have hv : v ∈ p.freeVars := by simpa using h
+    rw [domain, if_pos h]
+    exact bindings_range n p.freeVars b y hy v hv
+  · have hf : p.freeVars.contains v = false := by cases h' : p.freeVars.contains v <;> simp_all
+    have hv : v ∉ p.freeVars := by simpa using hf
+    rw [domain, if_neg h]
+    simp [bindings_fixed n p.freeVars b y hy v hv]
+
+private def bin (db : DB) : DB := fun r x y => if db r x y == 0 then 0 else 1
+
+private def satisfies (p : Pattern) (db : DB) (x : Bind) : Bool :=
+  p.atoms.all (fun a => value db a x != 0)
+
+private theorem prod_indicator {α} (l : List α) (q : α → Bool) :
+    (l.map (fun a => if q a then (1 : Int) else 0)).prod = if l.all q then 1 else 0 := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      by_cases ha : q a = true <;> simp [ha, ih]
+
+private theorem sum_filter_indicator {α} (l : List α) (q : α → Bool) :
+    ((l.filter q).map (fun _ => (1 : Int))).sum = (l.filter q).length := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      by_cases ha : q a = true <;> simp [ha, ih] <;> omega
+
+private def satBindings (p : Pattern) (n : Nat) (db : DB) (b : Bind) : List Bind :=
+  (bindings n p.freeVars b).filter (satisfies p (bin db))
+
+private theorem reference_bin_count (p : Pattern) (n : Nat) (db : DB) (b : Bind) :
+    reference p n (bin db) b = (satBindings p n db b).length := by
+  rw [reference, bindings_sum]
+  change ((bindings n p.freeVars b).map
+    (fun x => (p.atoms.map (fun a => value (bin db) a x)).prod)).sum = _
+  rw [show (bindings n p.freeVars b).map
+      (fun x => (p.atoms.map (fun a => value (bin db) a x)).prod) =
+      (bindings n p.freeVars b).map (fun x => if satisfies p (bin db) x then 1 else 0) by
+    apply List.map_congr_left
+    intro x hx
+    simpa [value, bin, satisfies, beq_iff_eq] using
+      prod_indicator p.atoms (fun a => value (bin db) a x != 0)]
+  rw [show ((bindings n p.freeVars b).map
+      (fun x => if satisfies p (bin db) x then 1 else 0)).sum =
+      ((satBindings p n db b).map (fun _ => (1 : Int))).sum by
+    unfold satBindings
+    induction bindings n p.freeVars b with
+    | nil => simp
+    | cons a l ih => by_cases ha : satisfies p (bin db) a = true <;> simp [ha, ih]]
+  exact sum_filter_indicator _ _
+
+private theorem supportList_mem (p : Pattern) (n : Nat) (db : DB) (b : Bind) (a : Atom)
+    (x : Bind) (hx : x ∈ bindings n p.freeVars b) (hnz : db a.rel (x a.src) (x a.dst) != 0) :
+    (x a.src, x a.dst) ∈ supportList p n db b a := by
+  unfold supportList
+  apply List.mem_flatMap.mpr
+  refine ⟨x a.src, binding_domain_mem p n b x hx a.src, ?_⟩
+  apply List.mem_map.mpr
+  refine ⟨x a.dst, ?_, rfl⟩
+  exact List.mem_filter.mpr ⟨binding_domain_mem p n b x hx a.dst, hnz⟩
+
+private def encode (C : List Atom) (x : Bind) : List (Nat × Nat) :=
+  C.map (fun a => (x a.src, x a.dst))
+
+private theorem encode_mem_carts (p : Pattern) (n : Nat) (db : DB) (b : Bind)
+    (C : List Atom) :
+    (∀ a ∈ C, a ∈ p.atoms) → ∀ x, x ∈ satBindings p n db b →
+      encode C x ∈ carts (C.map (supportList p n db b)) := by
+  induction C with
+  | nil => intro hCp x hx; simp [encode, carts]
+  | cons a C ih =>
+      intro hCp x hx
+      have hsat : satisfies p (bin db) x = true := (List.mem_filter.mp hx).2
+      have hb : x ∈ bindings n p.freeVars b := (List.mem_filter.mp hx).1
+      have hsat' : p.atoms.all (fun t => value (bin db) t x != 0) = true := hsat
+      have ha : value (bin db) a x != 0 :=
+        List.all_eq_true.mp hsat' a (hCp a (by simp))
+      have hnz : db a.rel (x a.src) (x a.dst) != 0 := by
+        simpa [value, bin, beq_iff_eq] using ha
+      rw [encode, List.map_cons, carts]
+      exact carts_mem_cons _ _ _ _ (supportList_mem p n db b a x hb hnz)
+        (ih (fun t ht => hCp t (by simp [ht])) x hx)
+
+private theorem map_eq_on_mem {α β} {C : List α} {f g : α → β}
+    (h : C.map f = C.map g) : ∀ a ∈ C, f a = g a := by
+  induction C with
+  | nil => simp
+  | cons a C ih =>
+      simp only [List.map_cons, List.cons.injEq] at h
+      intro x hx
+      rcases List.mem_cons.mp hx with rfl | hx
+      · exact h.1
+      · exact ih h.2 x hx
+
+private theorem encode_injective (p : Pattern) (n : Nat) (b : Bind) (C : List Atom)
+    (hcov : ∀ v ∈ p.freeVars, ∃ a ∈ C, a.src = v ∨ a.dst = v) :
+    ∀ x ∈ bindings n p.freeVars b, ∀ y ∈ bindings n p.freeVars b,
+      encode C x = encode C y → x = y := by
+  intro x hx y hy heq
+  funext v
+  by_cases hv : v ∈ p.freeVars
+  · rcases hcov v hv with ⟨a, ha, hend⟩
+    have hp := map_eq_on_mem heq a ha
+    rcases hend with rfl | rfl
+    · exact Prod.mk.inj hp |>.1
+    · exact Prod.mk.inj hp |>.2
+  · rw [bindings_fixed n p.freeVars b x hx v hv, bindings_fixed n p.freeVars b y hy v hv]
+
+private theorem ordinary_cover_bound (p : Pattern) (n : Nat) (db : DB) (b : Bind)
+    (C : List Atom) (hcov : ∀ v ∈ p.freeVars, ∃ a ∈ C, a.src = v ∨ a.dst = v)
+    (hCp : ∀ a ∈ C, a ∈ p.atoms) (hnd : p.freeVars.Nodup) :
+    (satBindings p n db b).length ≤ (C.map (fun a => support n db a p b)).prod := by
+  have hsnd : (satBindings p n db b).Nodup :=
+    nodup_filter _ _ (bindings_nodup n p.freeVars b hnd)
+  have hemb : (satBindings p n db b).map (encode C) ⊆
+      carts (C.map (supportList p n db b)) := by
+    intro z hz
+    rcases List.mem_map.mp hz with ⟨x, hx, rfl⟩
+    exact encode_mem_carts p n db b C hCp x hx
+  have hmapnd : ((satBindings p n db b).map (encode C)).Nodup := by
+    apply nodup_map
+    · intro x hx y hy heq
+      exact encode_injective p n b C hcov x (List.mem_filter.mp hx).1 y
+        (List.mem_filter.mp hy).1 heq
+    · exact hsnd
+  have hle := hmapnd.length_le_of_subset hemb
+  rw [List.length_map, carts_length, List.map_map] at hle
+  rw [show C.map (List.length ∘ supportList p n db b) =
+      C.map (fun a => (supportList p n db b a).length) by
+    apply List.map_congr_left
+    intro a ha
+    rfl] at hle
+  rw [show (C.map (fun a => (supportList p n db b a).length)) =
+      C.map (fun a => support n db a p b) by
+    apply List.map_congr_left
+    intro a ha
+    exact supportList_length p n db b a] at hle
+  exact hle
+
+/-! ---------- triangle Cauchy-Schwarz bound ---------- -/
+
+private theorem bin_nonneg (db : DB) (r x y : Nat) : 0 ≤ bin db r x y := by
+  simp [bin]
+  split <;> omega
+
+private theorem bin_le_one (db : DB) (r x y : Nat) : bin db r x y ≤ 1 := by
+  simp [bin]
+  split <;> omega
+
+private theorem bin_sq (db : DB) (r x y : Nat) : bin db r x y * bin db r x y = bin db r x y := by
+  by_cases h : db r x y == 0 <;> simp [bin, h]
+
+private def triE (n : Nat) (db : DB) (r : Nat) : Int :=
+  rsum n (fun x => rsum n (fun y => bin db r x y))
+
+private def triT (n : Nat) (db : DB) (r s t : Nat) : Int :=
+  rsum n (fun x => rsum n (fun y => rsum n (fun z =>
+    bin db t z x * (bin db r x y * bin db s y z))))
+
+private theorem triangle_sq (n : Nat) (db : DB) (r s t : Nat) :
+    (triT n db r s t)^2 ≤ triE n db r * triE n db s * triE n db t := by
+  let P : Nat → Nat → Int := fun x z => rsum n (fun y => bin db r x y * bin db s y z)
+  have hT : triT n db r s t = rsum n (fun x => rsum n (fun z => P x z * bin db t z x)) := by
+    dsimp only [triT, P]
+    calc
+      rsum n (fun x => rsum n (fun y => rsum n (fun z =>
+          bin db t z x * (bin db r x y * bin db s y z))))
+          = rsum n (fun x => rsum n (fun z => rsum n (fun y =>
+              bin db t z x * (bin db r x y * bin db s y z)))) := by
+              apply rsum_congr; intro x hx; rw [rsum_comm]
+      _ = rsum n (fun x => rsum n (fun z =>
+              (rsum n (fun y => bin db r x y * bin db s y z)) * bin db t z x)) := by
+              apply rsum_congr; intro x hx
+              apply rsum_congr; intro z hz
+              rw [show (fun y => bin db t z x * (bin db r x y * bin db s y z)) =
+                  (fun y => (bin db r x y * bin db s y z) * bin db t z x) by
+                funext y
+                ac_rfl]
+              rw [rsum_mul_const]
+  let pairs : List (Nat × Nat) :=
+    (List.range n).flatMap (fun x => (List.range n).map (fun z => (x, z)))
+  have hcs := cs_list (pairs.map (fun p => (P p.1 p.2, bin db t p.2 p.1)))
+  have hmap1 : (pairs.map (fun p => (P p.1 p.2, bin db t p.2 p.1))).map
+        (fun q : Int × Int => q.1 * q.2) =
+      pairs.map (fun p => P p.1 p.2 * bin db t p.2 p.1) := by
+    simp [List.map_map]
+  have hmap2 : (pairs.map (fun p => (P p.1 p.2, bin db t p.2 p.1))).map
+        (fun q : Int × Int => q.1 * q.1) =
+      pairs.map (fun p => P p.1 p.2 * P p.1 p.2) := by
+    simp [List.map_map]
+  have hmap3 : (pairs.map (fun p => (P p.1 p.2, bin db t p.2 p.1))).map
+        (fun q : Int × Int => q.2 * q.2) =
+      pairs.map (fun p => bin db t p.2 p.1 * bin db t p.2 p.1) := by
+    simp [List.map_map]
+  rw [hmap1, hmap2, hmap3] at hcs
+  have hsumP : (pairs.map (fun p => P p.1 p.2 * bin db t p.2 p.1)).sum =
+      rsum n (fun x => rsum n (fun z => P x z * bin db t z x)) := by
+    rw [← rsum_pairs n (fun x z => P x z * bin db t z x)]
+  have hPpoint : ∀ x z y y' : Nat,
+      (bin db r x y * bin db s y z) * (bin db r x y' * bin db s y' z) ≤
+        bin db r x y * bin db s y' z := by
+    intro x z y y'
+    have hr0 : 0 ≤ bin db r x y := bin_nonneg db r x y
+    have hs0 : 0 ≤ bin db s y z := bin_nonneg db s y z
+    have hs1 : bin db s y z ≤ 1 := bin_le_one db s y z
+    have hr0' : 0 ≤ bin db r x y' := bin_nonneg db r x y'
+    have hr1' : bin db r x y' ≤ 1 := bin_le_one db r x y'
+    have hs0' : 0 ≤ bin db s y' z := bin_nonneg db s y' z
+    have hprod : bin db s y z * bin db r x y' ≤ 1 := by
+      have hh := Int.mul_le_mul hs1 hr1' hr0' (by omega : (0 : Int) ≤ 1)
+      simpa using hh
+    have hprod0 : 0 ≤ bin db s y z * bin db r x y' := Int.mul_nonneg hs0 hr0'
+    have hbase0 : 0 ≤ bin db r x y * bin db s y' z := Int.mul_nonneg hr0 hs0'
+    have hh := Int.mul_le_mul (Int.le_refl (bin db r x y * bin db s y' z)) hprod
+      hprod0 hbase0
+    calc
+      (bin db r x y * bin db s y z) * (bin db r x y' * bin db s y' z)
+          = (bin db r x y * bin db s y' z) * (bin db s y z * bin db r x y') := by ac_rfl
+      _ ≤ (bin db r x y * bin db s y' z) * 1 := hh
+      _ = bin db r x y * bin db s y' z := by rw [Int.mul_one]
+  have hsumP2le : (pairs.map (fun p => P p.1 p.2 * P p.1 p.2)).sum ≤
+      triE n db r * triE n db s := by
+    rw [← rsum_pairs n (fun x z => P x z * P x z)]
+    dsimp only [P]
+    calc
+      rsum n (fun x => rsum n (fun z =>
+          (rsum n (fun y => bin db r x y * bin db s y z)) *
+          (rsum n (fun y' => bin db r x y' * bin db s y' z))))
+          = rsum n (fun x => rsum n (fun z =>
+              rsum n (fun y => rsum n (fun y' =>
+                (bin db r x y * bin db s y z) * (bin db r x y' * bin db s y' z))))) := by
+              apply rsum_congr; intro x hx
+              apply rsum_congr; intro z hz
+              rw [rsum_product]
+      _ ≤ rsum n (fun x => rsum n (fun z =>
+              rsum n (fun y => rsum n (fun y' => bin db r x y * bin db s y' z)))) := by
+              apply rsum_le; intro x hx
+              apply rsum_le; intro z hz
+              apply rsum_le; intro y hy
+              apply rsum_le; intro y' hy'
+              exact hPpoint x z y y'
+      _ = rsum n (fun x => rsum n (fun z =>
+              (rsum n (fun y => bin db r x y)) * (rsum n (fun y' => bin db s y' z)))) := by
+              apply rsum_congr; intro x hx
+              apply rsum_congr; intro z hz
+              rw [rsum_product]
+      _ = rsum n (fun x => (rsum n (fun y => bin db r x y)) *
+            (rsum n (fun z => rsum n (fun y' => bin db s y' z)))) := by
+            apply rsum_congr; intro x hx
+            rw [rsum_const_mul]
+      _ = (rsum n (fun x => rsum n (fun y => bin db r x y))) *
+          (rsum n (fun z => rsum n (fun y' => bin db s y' z))) := by
+            rw [rsum_mul_const]
+      _ = triE n db r * triE n db s := by
+            dsimp only [triE]
+            rw [show rsum n (fun x => rsum n (fun y => bin db s x y)) =
+                rsum n (fun z => rsum n (fun y' => bin db s y' z)) by rw [rsum_comm]]
+  have hsumC2 : (pairs.map (fun p => bin db t p.2 p.1 * bin db t p.2 p.1)).sum = triE n db t := by
+    rw [← rsum_pairs n (fun x z => bin db t z x * bin db t z x)]
+    calc
+      rsum n (fun x => rsum n (fun z => bin db t z x * bin db t z x))
+          = rsum n (fun x => rsum n (fun z => bin db t z x)) := by
+              apply rsum_congr; intro x hx
+              apply rsum_congr; intro z hz
+              exact bin_sq db t z x
+      _ = triE n db t := by
+              dsimp only [triE]
+              rw [rsum_comm]
+  rw [hT, ← hsumP]
+  calc
+    ((pairs.map (fun p => P p.1 p.2 * bin db t p.2 p.1)).sum) ^ 2
+        ≤ (pairs.map (fun p => P p.1 p.2 * P p.1 p.2)).sum *
+          (pairs.map (fun p => bin db t p.2 p.1 * bin db t p.2 p.1)).sum := hcs
+    _ ≤ (triE n db r * triE n db s) * triE n db t := by
+          have hCnon : 0 ≤ (pairs.map (fun p => bin db t p.2 p.1 * bin db t p.2 p.1)).sum := by
+            rw [← rsum_pairs n (fun x z => bin db t z x * bin db t z x)]
+            apply rsum_nonneg; intro x hx
+            apply rsum_nonneg; intro z hz
+            exact Int.mul_nonneg (bin_nonneg db t z x) (bin_nonneg db t z x)
+          have hE : 0 ≤ triE n db t := by
+            dsimp only [triE]
+            apply rsum_nonneg; intro x hx
+            apply rsum_nonneg; intro y hy
+            exact bin_nonneg db t x y
+          have hErEs : 0 ≤ triE n db r * triE n db s := by
+            apply Int.mul_nonneg
+            · dsimp only [triE]
+              apply rsum_nonneg; intro x hx
+              apply rsum_nonneg; intro y hy
+              exact bin_nonneg db r x y
+            · dsimp only [triE]
+              apply rsum_nonneg; intro x hx
+              apply rsum_nonneg; intro y hy
+              exact bin_nonneg db s x y
+          exact Int.mul_le_mul hsumP2le (by rw [hsumC2]; omega) hCnon hErEs
+    _ = triE n db r * triE n db s * triE n db t := rfl
+private theorem countP_eq_rsum (n : Nat) (p : Nat → Bool) :
+    ((List.range n).countP p : Int) = rsum n (fun x => if p x then (1 : Int) else 0) := by
+  induction n with
+  | zero => simp [rsum]
+  | succ n ih =>
+      rw [List.range_succ, List.countP_append, List.countP_singleton]
+      rw [Int.natCast_add, ih, rsum_succ]
+      by_cases h : p n = true <;> simp [h]
+
+private theorem nat_sum_cast {α} (l : List α) (f : α → Nat) :
+    ((l.map f).sum : Int) = (l.map (fun x => (f x : Int))).sum := by
+  induction l with
+  | nil => simp
+  | cons a l ih => simp [ih]
+
+private theorem support_eq_triE (p : Pattern) (n : Nat) (db : DB) (b : Bind) (r src dst : Nat)
+    (hs : p.freeVars.contains src = true) (hd : p.freeVars.contains dst = true) :
+    (support n db ⟨r, src, dst⟩ p b : Int) = triE n db r := by
+  have hsm : src ∈ p.freeVars := by simpa using hs
+  have hdm : dst ∈ p.freeVars := by simpa using hd
+  rw [show support n db ⟨r, src, dst⟩ p b =
+      ((List.range n).map (fun x => (List.range n).countP (fun y => db r x y != 0))).sum by
+    simp [support, domain, hsm, hdm]]
+  rw [nat_sum_cast]
+  rw [show ((List.range n).map
+      (fun x => ((List.range n).countP (fun y => db r x y != 0) : Int))).sum =
+      rsum n (fun x => rsum n (fun y => if db r x y == 0 then (0 : Int) else 1)) by
+    apply sum_congr
+    intro x hx
+    rw [countP_eq_rsum]
+    apply rsum_congr
+    intro y hy
+    by_cases h : db r x y = 0 <;> simp [h, beq_iff_eq]]
+  rfl
+
+private theorem pow_mono_of_pos {x a b : Nat} (hx : 0 < x) (hab : a ≤ b) : x^a ≤ x^b := by
+  have hs : b = a + (b - a) := by omega
+  rw [hs, Nat.pow_add]
+  exact Nat.le_mul_of_pos_right (x^a) (show 0 < x ^ (b - a) from Nat.pow_pos hx)
+
+
+private theorem int_coe_nonneg (x : Nat) : (0 : Int) ≤ (x : Int) :=
+  Int.ofNat_le.mpr (Nat.zero_le x)
+
+private theorem triE_nonneg (n : Nat) (db : DB) (r : Nat) : 0 ≤ triE n db r := by
+  dsimp only [triE]
+  apply rsum_nonneg; intro x hx
+  apply rsum_nonneg; intro y hy
+  exact bin_nonneg db r x y
+
+
+private theorem triT_nonneg (n : Nat) (db : DB) (r s t : Nat) : 0 ≤ triT n db r s t := by
+  dsimp only [triT]
+  apply rsum_nonneg; intro x hx
+  apply rsum_nonneg; intro y hy
+  apply rsum_nonneg; intro z hz
+  refine Int.mul_nonneg (bin_nonneg db t z x) ?_
+  exact Int.mul_nonneg (bin_nonneg db r x y) (bin_nonneg db s y z)
+
+private theorem triT_le_triE_mul (n : Nat) (db : DB) (r s t : Nat) :
+    triT n db r s t ≤ triE n db r * triE n db s := by
+  have hA0 (x y z : Nat) : 0 ≤ bin db r x y * bin db s y z :=
+    Int.mul_nonneg (bin_nonneg db r x y) (bin_nonneg db s y z)
+  have hpoint (x y z : Nat) :
+      bin db t z x * (bin db r x y * bin db s y z) ≤ bin db r x y * bin db s y z := by
+    calc bin db t z x * (bin db r x y * bin db s y z)
+        ≤ 1 * (bin db r x y * bin db s y z) :=
+          Int.mul_le_mul (bin_le_one db t z x) (Int.le_refl _) (hA0 x y z) (by omega)
+      _ = bin db r x y * bin db s y z := by simp
+  have hrow (y : Nat) (hy : y < n) : rsum n (fun z => bin db s y z) ≤ triE n db s := by
+    have he : rsum n (fun w => if w == y then rsum n (fun z => bin db s y z) else 0) =
+        rsum n (fun z => bin db s y z) := rsum_eq_single n y hy (fun _ => rsum n (fun z => bin db s y z))
+    rw [← he]
+    dsimp only [triE]
+    refine rsum_le n _ _ ?_
+    intro w hw
+    by_cases hw' : w == y
+    · rw [if_pos hw']
+      have hw : w = y := by simpa using hw'
+      rw [hw]
+      exact Int.le_refl _
+    · rw [if_neg hw']
+      apply rsum_nonneg
+      intro z hz
+      exact bin_nonneg db s w z
+  calc triT n db r s t
+      ≤ rsum n (fun x => rsum n (fun y => rsum n (fun z => bin db r x y * bin db s y z))) := by
+        dsimp only [triT]
+        exact rsum_le n _ _ fun x hx => rsum_le n _ _ fun y hy =>
+          rsum_le n _ _ fun z hz => hpoint x y z
+    _ = rsum n (fun x => rsum n (fun y => bin db r x y * rsum n (fun z => bin db s y z))) := by
+        apply rsum_congr; intro x hx
+        apply rsum_congr; intro y hy
+        exact rsum_const_mul n (bin db r x y) (fun z => bin db s y z)
+    _ ≤ rsum n (fun x => rsum n (fun y => bin db r x y * triE n db s)) := by
+        refine rsum_le n _ _ (fun x hx => rsum_le n _ _ (fun y hy => ?_))
+        refine Int.mul_le_mul (Int.le_refl _) (hrow y hy) ?_ (bin_nonneg db r x y)
+        · apply rsum_nonneg
+          intro z hz
+          exact bin_nonneg db s y z
+    _ = rsum n (fun x => rsum n (fun y => bin db r x y) * triE n db s) := by
+        apply rsum_congr; intro x hx
+        exact rsum_mul_const n (fun y => bin db r x y) (triE n db s)
+    _ = triE n db r * triE n db s := by
+        dsimp only [triE]
+        exact rsum_mul_const n (fun x => rsum n (fun y => bin db r x y)) (triE n db s)
+
+private theorem triT_cycle (n : Nat) (db : DB) (r s t : Nat) :
+    triT n db r s t = triT n db s t r := by
+  unfold triT
+  rw [rsum_comm n n (fun x y => rsum n (fun z =>
+    bin db t z x * (bin db r x y * bin db s y z)))]
+  have h2 : (fun y => rsum n (fun x => rsum n (fun z =>
+      bin db t z x * (bin db r x y * bin db s y z)))) =
+      (fun y => rsum n (fun z => rsum n (fun x =>
+        bin db t z x * (bin db r x y * bin db s y z)))) := by
+    funext y
+    exact rsum_comm n n (fun x z => bin db t z x * (bin db r x y * bin db s y z))
+  rw [h2]
+  have h3 : (fun y => rsum n (fun z => rsum n (fun x =>
+      bin db t z x * (bin db r x y * bin db s y z)))) =
+      (fun y => rsum n (fun z => rsum n (fun x =>
+        bin db r x y * (bin db s y z * bin db t z x)))) := by
+    funext y
+    apply rsum_congr; intro z hz
+    apply rsum_congr; intro x hx
+    ac_rfl
+  rw [h3]
+
+
+private theorem list3_of_length3 {α : Type} (l : List α) (h : l.length = 3) :
+    ∃ a b c, l = [a, b, c] := by
+  cases l with
+  | nil => simp at h
+  | cons a l =>
+    cases l with
+    | nil => simp at h
+    | cons b l =>
+      cases l with
+      | nil => simp at h
+      | cons c l =>
+        cases l with
+        | nil => exact ⟨a, b, c, rfl⟩
+        | cons d l => simp at h
+
+private theorem pow_prod_ge_one (S0 S1 S2 a b c : Nat)
+    (h0 : 1 ≤ S0) (h1 : 1 ≤ S1) (h2 : 1 ≤ S2) :
+    1 ≤ S0 ^ a * (S1 ^ b * S2 ^ c) := by
+  have ha : 1 ≤ S0 ^ a := Nat.one_le_pow a S0 h0
+  have hb : 1 ≤ S1 ^ b := Nat.one_le_pow b S1 h1
+  have hc : 1 ≤ S2 ^ c := Nat.one_le_pow c S2 h2
+  have hbc : 1 ≤ S1 ^ b * S2 ^ c := by
+    have := Nat.mul_le_mul hb hc
+    simpa using this
+  have := Nat.mul_le_mul ha hbc
+  simpa using this
+
+private theorem fc_drop12 (L S0 S1 S2 d a b c : Nat) (h : L ≤ S0 * S1)
+    (hih : L ^ d ≤ S0 ^ a * (S1 ^ b * S2 ^ c)) :
+    L ^ (d + 1) ≤ S0 ^ (a + 1) * (S1 ^ (b + 1) * S2 ^ c) := by
+  have e1 : S0 ^ (a + 1) = S0 ^ a * S0 := by rw [Nat.pow_add, Nat.pow_one]
+  have e2 : S1 ^ (b + 1) = S1 ^ b * S1 := by rw [Nat.pow_add, Nat.pow_one]
+  refine Nat.le_trans (Nat.mul_le_mul hih h) (Nat.le_of_eq ?_)
+  rw [e1, e2]
+  ac_rfl
+
+private theorem fc_drop23 (L S0 S1 S2 d a b c : Nat) (h : L ≤ S1 * S2)
+    (hih : L ^ d ≤ S0 ^ a * (S1 ^ b * S2 ^ c)) :
+    L ^ (d + 1) ≤ S0 ^ a * (S1 ^ (b + 1) * S2 ^ (c + 1)) := by
+  have e2 : S1 ^ (b + 1) = S1 ^ b * S1 := by rw [Nat.pow_add, Nat.pow_one]
+  have e3 : S2 ^ (c + 1) = S2 ^ c * S2 := by rw [Nat.pow_add, Nat.pow_one]
+  refine Nat.le_trans (Nat.mul_le_mul hih h) (Nat.le_of_eq ?_)
+  rw [e2, e3]
+  ac_rfl
+
+private theorem fc_drop31 (L S0 S1 S2 d a b c : Nat) (h : L ≤ S2 * S0)
+    (hih : L ^ d ≤ S0 ^ a * (S1 ^ b * S2 ^ c)) :
+    L ^ (d + 1) ≤ S0 ^ (a + 1) * (S1 ^ b * S2 ^ (c + 1)) := by
+  have e1 : S0 ^ (a + 1) = S0 ^ a * S0 := by rw [Nat.pow_add, Nat.pow_one]
+  have e3 : S2 ^ (c + 1) = S2 ^ c * S2 := by rw [Nat.pow_add, Nat.pow_one]
+  refine Nat.le_trans (Nat.mul_le_mul hih h) (Nat.le_of_eq ?_)
+  rw [e1, e3]
+  ac_rfl
+
+private theorem fc_cs (L S0 S1 S2 d a b c : Nat) (h : L ^ 2 ≤ S0 * S1 * S2)
+    (hih : L ^ d ≤ S0 ^ a * (S1 ^ b * S2 ^ c)) :
+    L ^ (d + 2) ≤ S0 ^ (a + 1) * (S1 ^ (b + 1) * S2 ^ (c + 1)) := by
+  have e1 : S0 ^ (a + 1) = S0 ^ a * S0 := by rw [Nat.pow_add, Nat.pow_one]
+  have e2 : S1 ^ (b + 1) = S1 ^ b * S1 := by rw [Nat.pow_add, Nat.pow_one]
+  have e3 : S2 ^ (c + 1) = S2 ^ c * S2 := by rw [Nat.pow_add, Nat.pow_one]
+  calc L ^ (d + 2) = L ^ d * L ^ 2 := by rw [Nat.pow_add]
+    _ ≤ (S0 ^ a * (S1 ^ b * S2 ^ c)) * (S0 * S1 * S2) := Nat.mul_le_mul hih h
+    _ ≤ S0 ^ (a + 1) * (S1 ^ (b + 1) * S2 ^ (c + 1)) := by
+        rw [e1, e2, e3]
+        refine Nat.le_of_eq ?_
+        ac_rfl
+
+private theorem fc_mc (L S0 S1 S2 : Nat)
+    (h12 : L ≤ S0 * S1) (h23 : L ≤ S1 * S2) (h31 : L ≤ S2 * S0) (hcs : L ^ 2 ≤ S0 * S1 * S2) :
+    ∀ den w0 w1 w2 : Nat, 0 < den → den ≤ w0 + w2 → den ≤ w0 + w1 → den ≤ w1 + w2 →
+      L ^ den ≤ S0 ^ w0 * (S1 ^ w1 * S2 ^ w2) := by
+  intro den
+  induction den using Nat.strongRecOn with
+  | ind den ih =>
+      intro w0 w1 w2 hden hv1 hv2 hv3
+      rcases Nat.eq_zero_or_pos L with hL0 | hLp
+      · rw [hL0, Nat.zero_pow (by omega)]
+        exact Nat.zero_le _
+      · have hge0 : 1 ≤ S0 := by
+          rcases Nat.eq_zero_or_pos S0 with hz | hz
+          · rw [hz, Nat.zero_mul] at h12; omega
+          · omega
+        have hge1 : 1 ≤ S1 := by
+          rcases Nat.eq_zero_or_pos S1 with hz | hz
+          · rw [hz, Nat.mul_zero] at h12; omega
+          · omega
+        have hge2 : 1 ≤ S2 := by
+          rcases Nat.eq_zero_or_pos S2 with hz | hz
+          · rw [hz, Nat.mul_zero] at h23; omega
+          · omega
+        by_cases hA : 0 < w0 ∧ 0 < w1 ∧ den + 1 ≤ w0 + w1
+        · obtain ⟨ha0, ha1, haS⟩ := hA
+          have hih : L ^ (den - 1) ≤ S0 ^ (w0 - 1) * (S1 ^ (w1 - 1) * S2 ^ w2) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              exact pow_prod_ge_one _ _ _ _ _ _ hge0 hge1 hge2
+            · exact ih (den - 1) (by omega) (w0 - 1) (w1 - 1) w2
+                (by omega) (by omega) (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega]
+          refine Nat.le_trans (fc_drop12 _ _ _ _ _ _ _ _ h12 hih) ?_
+          simp only [Nat.sub_add_cancel (by omega : 1 ≤ w0),
+            Nat.sub_add_cancel (by omega : 1 ≤ w1)]
+          omega
+        · by_cases hB : 0 < w1 ∧ 0 < w2 ∧ den + 1 ≤ w1 + w2
+          · obtain ⟨hb1, hb2, hbS⟩ := hB
+            have hih : L ^ (den - 1) ≤ S0 ^ w0 * (S1 ^ (w1 - 1) * S2 ^ (w2 - 1)) := by
+              rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+              · rw [hz, Nat.pow_zero]
+                exact pow_prod_ge_one _ _ _ _ _ _ hge0 hge1 hge2
+              · exact ih (den - 1) (by omega) w0 (w1 - 1) (w2 - 1)
+                  (by omega) (by omega) (by omega) (by omega)
+            rw [show den = (den - 1) + 1 by omega]
+            refine Nat.le_trans (fc_drop23 _ _ _ _ _ _ _ _ h23 hih) ?_
+            simp only [Nat.sub_add_cancel (by omega : 1 ≤ w1),
+              Nat.sub_add_cancel (by omega : 1 ≤ w2)]
+            omega
+          · by_cases hC : 0 < w2 ∧ 0 < w0 ∧ den + 1 ≤ w2 + w0
+            · obtain ⟨hc2, hc0, hcS⟩ := hC
+              have hih : L ^ (den - 1) ≤ S0 ^ (w0 - 1) * (S1 ^ w1 * S2 ^ (w2 - 1)) := by
+                rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+                · rw [hz, Nat.pow_zero]
+                  exact pow_prod_ge_one _ _ _ _ _ _ hge0 hge1 hge2
+                · exact ih (den - 1) (by omega) (w0 - 1) w1 (w2 - 1)
+                    (by omega) (by omega) (by omega) (by omega)
+              rw [show den = (den - 1) + 1 by omega]
+              refine Nat.le_trans (fc_drop31 _ _ _ _ _ _ _ _ h31 hih) ?_
+              simp only [Nat.sub_add_cancel (by omega : 1 ≤ w0),
+                Nat.sub_add_cancel (by omega : 1 ≤ w2)]
+              omega
+            · have hp0 : 0 < w0 := by omega
+              have hp1 : 0 < w1 := by omega
+              have hp2 : 0 < w2 := by omega
+              have hih : L ^ (den - 2) ≤ S0 ^ (w0 - 1) * (S1 ^ (w1 - 1) * S2 ^ (w2 - 1)) := by
+                rcases Nat.eq_zero_or_pos (den - 2) with hz | hz
+                · rw [hz, Nat.pow_zero]
+                  exact pow_prod_ge_one _ _ _ _ _ _ hge0 hge1 hge2
+                · exact ih (den - 2) (by omega) (w0 - 1) (w1 - 1) (w2 - 1)
+                    (by omega) (by omega) (by omega) (by omega)
+              rw [show den = (den - 2) + 2 by omega]
+              refine Nat.le_trans (fc_cs _ _ _ _ _ _ _ _ hcs hih) ?_
+              simp only [Nat.sub_add_cancel (by omega : 1 ≤ w0),
+                Nat.sub_add_cancel (by omega : 1 ≤ w1),
+                Nat.sub_add_cancel (by omega : 1 ≤ w2)]
+              omega
+
+private theorem pow_pred_mul (x a : Nat) (h : 1 ≤ a) : x ^ a = x ^ (a - 1) * x :=
+  ((congrArg (fun t => x ^ t) (show a = a - 1 + 1 by omega)).trans
+      (Nat.pow_add x (a - 1) 1)).trans (by rw [Nat.pow_one])
+
+private theorem rsum_ge_single (n j : Nat) (f : Nat → Int) (hj : j < n)
+    (hnon : ∀ i, i < n → 0 ≤ f i) : f j ≤ rsum n f := by
+  have he : rsum n (fun i => if i == j then f i else 0) = f j := rsum_eq_single n j hj f
+  have hle : rsum n (fun i => if i == j then f i else 0) ≤ rsum n f :=
+    rsum_le n _ _ fun i hi => by
+      by_cases h : i == j
+      · rw [if_pos h]
+        exact Int.le_refl _
+      · rw [if_neg h]
+        exact hnon i hi
+  rw [← he]
+  exact hle
+
+private theorem list4_of_length4 {α : Type} (l : List α) (h : l.length = 4) :
+    ∃ a b c d, l = [a, b, c, d] := by
+  cases l with
+  | nil => simp at h
+  | cons a l =>
+    cases l with
+    | nil => simp at h
+    | cons b l =>
+      cases l with
+      | nil => simp at h
+      | cons c l =>
+        cases l with
+        | nil => simp at h
+        | cons d l =>
+          cases l with
+          | nil => exact ⟨a, b, c, d, rfl⟩
+          | cons e l => simp at h
+
+
+private theorem support_eq_pin (p : Pattern) (n : Nat) (db : DB) (b : Bind) (r pv dv : Nat)
+    (hp : p.freeVars.contains pv = false) (hd : p.freeVars.contains dv = true) :
+    (support n db ⟨r, pv, dv⟩ p b : Int) = rsum n (fun y => bin db r (b pv) y) := by
+  have hdm : dv ∈ p.freeVars := by simpa using hd
+  simp only [support]
+  rw [show (if p.freeVars.contains dv = true then List.range n else [b dv]) = List.range n
+      from if_pos hd]
+  rw [show (if p.freeVars.contains pv = true then List.range n else [b pv]) = [b pv]
+      from if_neg (by simpa using hp)]
+  simp only [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil, Nat.add_zero, Nat.zero_add]
+  rw [countP_eq_rsum]
+  refine congrArg (rsum n) (funext fun y => ?_)
+  by_cases h : db r (b pv) y = 0 <;> simp [h, beq_iff_eq, bin]
+
+
+private theorem fc_pd (T C E : Nat) (h12 : T ≤ C * E) (h23 : T ≤ E * E) :
+    ∀ den a b : Nat, 0 < den → den ≤ b → 2 * den ≤ a + b → T ^ den ≤ C ^ a * E ^ b := by
+  intro den
+  induction den using Nat.strongRecOn with
+  | ind den ih =>
+      intro a b hden hb hs
+      rcases Nat.eq_zero_or_pos T with hT0 | hTp
+      · rw [hT0, Nat.zero_pow (by omega)]
+        exact Nat.zero_le _
+      · have hC1 : 1 ≤ C := by
+          rcases Nat.eq_zero_or_pos C with hz | hz
+          · rw [hz, Nat.zero_mul] at h12; omega
+          · omega
+        have hE1 : 1 ≤ E := by
+          rcases Nat.eq_zero_or_pos E with hz | hz
+          · rw [hz, Nat.zero_mul] at h23; omega
+          · omega
+        rcases Nat.eq_zero_or_pos a with ha0 | ha1
+        · -- a = 0: E-square move
+          have hih : T ^ (den - 1) ≤ E ^ (b - 2) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              exact Nat.one_le_pow _ _ (by omega)
+            · have := ih (den - 1) (by omega) 0 (b - 2) (by omega) (by omega) (by omega)
+              simpa [Nat.pow_zero, Nat.one_mul] using this
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih h23) (Nat.le_of_eq ?_)
+          have hb2 : b - 2 + 2 = b := by omega
+          have e2 : E ^ 2 = E * E := by
+            rw [show (2 : Nat) = 1 + 1 from rfl, Nat.pow_add]
+            simp only [Nat.pow_one]
+          calc E ^ (b - 2) * (E * E)
+              = E ^ (b - 2) * E ^ 2 := by rw [e2]
+            _ = E ^ (b - 2 + 2) := (Nat.pow_add E (b - 2) 2).symm
+            _ = E ^ b := by rw [hb2]
+            _ = C ^ 0 * E ^ b := by rw [Nat.pow_zero, Nat.one_mul]
+            _ = C ^ a * E ^ b := by rw [ha0]
+        · -- a >= 1: CE move
+          have hih : T ^ (den - 1) ≤ C ^ (a - 1) * E ^ (b - 1) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have h1 : 1 ≤ C ^ (a - 1) := Nat.one_le_pow _ _ (by omega)
+              have h2 : 1 ≤ E ^ (b - 1) := Nat.one_le_pow _ _ (by omega)
+              have := Nat.mul_le_mul h1 h2
+              simpa using this
+            · exact ih (den - 1) (by omega) (a - 1) (b - 1) (by omega) (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih h12) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul C a (by omega), pow_pred_mul E b (by omega)]
+          ac_rfl
+
+
+
+private theorem countP_one (p : Nat → Bool) (c : Nat) :
+    (([c].countP p : Nat) : Int) = if p c then (1 : Int) else 0 := by
+  rw [List.countP_singleton]
+  split <;> simp
+
+private theorem support_eq_pindst (p : Pattern) (n : Nat) (db : DB) (b : Bind) (r dv pv : Nat)
+    (hd : p.freeVars.contains dv = true) (hp : p.freeVars.contains pv = false) :
+    (support n db ⟨r, dv, pv⟩ p b : Int) = rsum n (fun x => bin db r x (b pv)) := by
+  simp only [support]
+  rw [show (if p.freeVars.contains dv = true then List.range n else [b dv]) = List.range n
+      from if_pos hd]
+  rw [show (if p.freeVars.contains pv = true then List.range n else [b pv]) = [b pv]
+      from if_neg (by simpa using hp)]
+  rw [nat_sum_cast]
+  rw [show (fun x => (([b pv]).countP (fun y => db r x y != 0) : Int)) =
+      (fun x => if db r x (b pv) == 0 then (0 : Int) else 1) by
+        funext x
+        rw [countP_one]
+        by_cases h : db r x (b pv) = 0 <;> simp [h]]
+  rw [show (fun x => if db r x (b pv) == 0 then (0 : Int) else 1) =
+      (fun x => bin db r x (b pv)) from rfl]
+  rfl
+
+/-! END jpa-helpers -/
+
+/-! ## CollisionCorrection: 3-var patterns -/
+
+namespace KeywordCompany
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.KeywordCompany
+
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> omega)
+    n db b
+
+end KeywordCompany
+
+namespace PostDiamond
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.PostDiamond
+
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> omega)
+    n db b
+
+end PostDiamond
+
+namespace FriendBridge
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.FriendBridge
+
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> omega)
+    n db b
+
+end FriendBridge
+
+/-! ## Remaining goals -/
+
+namespace MovieCredits
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.MovieCredits
+private theorem mc_reference_eq (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b = triT n db 0 1 2 := by
+  have hshape : reference pattern n (bin db) b = rsum n (fun v2 => rsum n (fun v3 =>
+      rsum n (fun v1 => bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) := by
+    simp [reference, pattern, integrate, value, put, rsum, bin]
+  rw [hshape]
+  rw [rsum_comm n n (fun v2 v3 => rsum n (fun v1 =>
+    bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))]
+  have h2 : (fun v3 => rsum n (fun v2 => rsum n (fun v1 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) =
+      (fun v3 => rsum n (fun v1 => rsum n (fun v2 =>
+        bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) := by
+    funext v3
+    exact rsum_comm n n (fun v2 v1 => bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1))
+  rw [h2]
+  have hc1 : rsum n (fun v3 => rsum n (fun v1 => rsum n (fun v2 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1))))
+      = rsum n (fun v1 => rsum n (fun v3 => rsum n (fun v2 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) :=
+    rsum_comm n n (fun v3 v1 => rsum n (fun v2 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))
+  have hc2 : rsum n (fun v1 => rsum n (fun v3 => rsum n (fun v2 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1))))
+      = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) :=
+    congrArg (rsum n) (funext fun v1 => rsum_comm n n (fun v3 v2 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))
+  have hc3 : (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 v1 v2 * (bin db 1 v2 v3 * bin db 2 v3 v1)))) =
+      (fun x => rsum n (fun y => rsum n (fun z =>
+        bin db 2 z x * (bin db 0 x y * bin db 1 y z)))) := by
+    funext v1
+    refine congrArg (rsum n) (funext fun v2 => congrArg (rsum n) (funext fun v3 => ?_))
+    ac_rfl
+  dsimp only [triT]
+  exact hc1.trans (hc2.trans (congrArg (rsum n) hc3))
+
+theorem sound_FractionalCap : FractionalCap.Goal := by
+  intro n db b weights den hcover
+  obtain ⟨hpos, hlen, hv⟩ := hcover
+  obtain ⟨w0, w1, w2, rfl⟩ := list3_of_length3 weights hlen
+  have hzip : pattern.atoms.zip [w0, w1, w2] =
+      [(⟨0, 1, 2⟩, w0), (⟨1, 2, 3⟩, w1), (⟨2, 3, 1⟩, w2)] := by
+    simp [pattern, List.zip]
+  have hv1 := hv 1 (by simp [pattern])
+  have hv2 := hv 2 (by simp [pattern])
+  have hv3 := hv 3 (by simp [pattern])
+  rw [hzip] at hv1 hv2 hv3
+  simp at hv1 hv2 hv3
+  rw [show (fun r x y => if db r x y == 0 then 0 else 1) = bin db from rfl]
+  have hcount : (reference pattern n (bin db) b).toNat = (satBindings pattern n db b).length := by
+    rw [reference_bin_count pattern n db b]
+    exact Int.ofNat_inj.mp (Int.toNat_of_nonneg (int_coe_nonneg _))
+  rw [hcount]
+  have hrhs : ((pattern.atoms.zip [w0, w1, w2]).map (fun (a, w) =>
+      support n db a pattern b ^ w)).prod =
+      support n db ⟨0, 1, 2⟩ pattern b ^ w0 *
+        (support n db ⟨1, 2, 3⟩ pattern b ^ w1 * support n db ⟨2, 3, 1⟩ pattern b ^ w2) := by
+    rw [hzip]
+    simp
+  rw [hrhs]
+  have hL : ((satBindings pattern n db b).length : Int) = triT n db 0 1 2 :=
+    ((mc_reference_eq n db b).symm.trans (reference_bin_count pattern n db b)).symm
+  have hS0 : (support n db ⟨0, 1, 2⟩ pattern b : Int) = triE n db 0 :=
+    support_eq_triE pattern n db b 0 1 2 (by simp [pattern]) (by simp [pattern])
+  have hS1 : (support n db ⟨1, 2, 3⟩ pattern b : Int) = triE n db 1 :=
+    support_eq_triE pattern n db b 1 2 3 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (support n db ⟨2, 3, 1⟩ pattern b : Int) = triE n db 2 :=
+    support_eq_triE pattern n db b 2 3 1 (by simp [pattern]) (by simp [pattern])
+  have h12 : (satBindings pattern n db b).length ≤
+      support n db ⟨0, 1, 2⟩ pattern b * support n db ⟨1, 2, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS0, hS1]
+    exact triT_le_triE_mul n db 0 1 2
+  have h23 : (satBindings pattern n db b).length ≤
+      support n db ⟨1, 2, 3⟩ pattern b * support n db ⟨2, 3, 1⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS1, hS2]
+    rw [triT_cycle n db 0 1 2]
+    exact triT_le_triE_mul n db 1 2 0
+  have h31 : (satBindings pattern n db b).length ≤
+      support n db ⟨2, 3, 1⟩ pattern b * support n db ⟨0, 1, 2⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS2, hS0]
+    rw [triT_cycle n db 0 1 2, triT_cycle n db 1 2 0]
+    exact triT_le_triE_mul n db 2 0 1
+  have hcs : (satBindings pattern n db b).length ^ 2 ≤
+      support n db ⟨0, 1, 2⟩ pattern b * support n db ⟨1, 2, 3⟩ pattern b *
+        support n db ⟨2, 3, 1⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    simp only [Int.natCast_pow, Int.natCast_mul]
+    rw [hL, hS0, hS1, hS2]
+    exact triangle_sq n db 0 1 2
+  refine fc_mc _ _ _ _ h12 h23 h31 hcs _ w0 w1 w2 hpos ?_ ?_ ?_
+  · omega
+  · omega
+  · omega
+end MovieCredits
+
+namespace KeywordCompany
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.KeywordCompany
+private def kcA (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun y => bin db 0 (b 0) y)
+
+private def kcB (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun y => bin db 1 (b 0) y)
+
+private theorem kc_hshape (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))))) := by
+  simp [reference, pattern, integrate, value, put, rsum, bin]
+
+-- R ≤ kcB * triE 2
+private theorem kc_R_le_BC (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ kcB n db b * triE n db 2 := by
+  rw [kc_hshape]
+  -- drop the a-factor (≤ 1), the d-factor (≤ 1); collapse v3 sum, then v2, then v1
+  refine Int.le_trans (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))))
+    (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))))
+    (fun v1 _ => rsum_le n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))))
+      (fun v2 => rsum n (fun v3 =>
+        bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))
+      (fun v2 _ => rsum_le n (fun v3 =>
+          bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))
+        (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+        (fun v3 _ => ?_)))) ?_
+  · have hbc0 : 0 ≤ (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3) : Int) :=
+      Int.mul_nonneg (bin_nonneg db 1 (b 0) v2)
+        (Int.mul_nonneg (bin_nonneg db 2 v1 v3) (bin_nonneg db 3 v2 v3))
+    calc bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+        ≤ 1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)) :=
+          Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (Int.le_refl _) hbc0 (by omega)
+      _ = bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3) := by simp
+  · -- rsum v1 rsum v2 rsum v3 b·(c·d) ≤ rsum v1 o2 v1 · kcB = triE2 · kcB → kcB·triE2
+    have hs3 (v1 v2 : Nat) : rsum n (fun v3 =>
+        bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+        ≤ bin db 1 (b 0) v2 * rsum n (fun v3 => bin db 2 v1 v3) := by
+      refine Int.le_trans
+        (rsum_le n (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+          (fun v3 => bin db 1 (b 0) v2 * bin db 2 v1 v3) fun v3 _ => ?_) ?_
+      · have hcb : 0 ≤ (bin db 2 v1 v3 : Int) := bin_nonneg db 2 v1 v3
+        have hb0 : 0 ≤ (bin db 1 (b 0) v2 : Int) := bin_nonneg db 1 (b 0) v2
+        calc bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)
+            = (bin db 1 (b 0) v2 * bin db 2 v1 v3) * bin db 3 v2 v3 := by rw [Int.mul_assoc]
+          _ ≤ (bin db 1 (b 0) v2 * bin db 2 v1 v3) * 1 :=
+              Int.mul_le_mul (Int.le_refl _) (bin_le_one db 3 v2 v3)
+                (bin_nonneg db 3 v2 v3) (Int.mul_nonneg hb0 hcb)
+          _ = bin db 1 (b 0) v2 * bin db 2 v1 v3 := by simp
+      · exact Int.le_of_eq (rsum_const_mul n (bin db 1 (b 0) v2) (fun v3 => bin db 2 v1 v3))
+    have hs2 (v1 : Nat) : rsum n (fun v2 =>
+        rsum n (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))
+        ≤ rsum n (fun v2 => bin db 1 (b 0) v2 * rsum n (fun v3 => bin db 2 v1 v3)) :=
+      rsum_le n _ _ fun v2 _ => hs3 v1 v2
+    calc rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+          bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))) )
+        ≤ rsum n (fun v1 => rsum n (fun v2 =>
+            bin db 1 (b 0) v2 * rsum n (fun v3 => bin db 2 v1 v3))) :=
+          rsum_le n _ _ fun v1 _ => hs2 v1
+      _ = rsum n (fun v1 => rsum n (fun v3 => bin db 2 v1 v3) * kcB n db b) := by
+          refine congrArg (rsum n) (funext fun v1 => ?_)
+          rw [rsum_mul_const n (fun v2 => bin db 1 (b 0) v2) (rsum n fun v3 => bin db 2 v1 v3)]
+          rw [show rsum n (fun v2 => bin db 1 (b 0) v2) = kcB n db b from rfl, Int.mul_comm]
+      _ = (rsum n (fun v1 => rsum n (fun v3 => bin db 2 v1 v3))) * kcB n db b :=
+          rsum_mul_const n (fun v1 => rsum n (fun v3 => bin db 2 v1 v3)) (kcB n db b)
+      _ = triE n db 2 * kcB n db b := rfl
+      _ = kcB n db b * triE n db 2 := by rw [Int.mul_comm]
+
+-- R ≤ kcA * triE 3
+private theorem kc_R_le_AD (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ kcA n db b * triE n db 3 := by
+  rw [kc_hshape]
+  have hcd (v1 v2 v3 : Nat) :
+      bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3) ≤ bin db 3 v2 v3 := by
+    have h1 : 0 ≤ (bin db 2 v1 v3 * bin db 3 v2 v3 : Int) :=
+      Int.mul_nonneg (bin_nonneg db 2 v1 v3) (bin_nonneg db 3 v2 v3)
+    calc bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)
+        ≤ 1 * (bin db 2 v1 v3 * bin db 3 v2 v3) :=
+          Int.mul_le_mul (bin_le_one db 1 (b 0) v2) (Int.le_refl _) h1 (by omega)
+      _ = bin db 2 v1 v3 * bin db 3 v2 v3 := by simp
+      _ ≤ 1 * bin db 3 v2 v3 :=
+          Int.mul_le_mul (bin_le_one db 2 v1 v3) (Int.le_refl _) (bin_nonneg db 3 v2 v3) (by omega)
+      _ = bin db 3 v2 v3 := by simp
+  have hbr (v1 : Nat) : rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))
+      ≤ triE n db 3 := by
+    refine Int.le_trans (rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => hcd v1 v2 v3) ?_
+    exact Int.le_of_eq rfl
+  refine Int.le_trans (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))))
+    (fun v1 => bin db 0 (b 0) v1 * triE n db 3) fun v1 _ => ?_) ?_
+  · have h1 : (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))))
+        = (fun v2 => bin db 0 (b 0) v1 * rsum n (fun v3 =>
+          bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))) := by
+      funext v2
+      exact rsum_const_mul n (bin db 0 (b 0) v1)
+        (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+    rw [h1]
+    have hS0 : 0 ≤ rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))) :=
+      rsum_nonneg n (fun v2 => rsum n (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))
+        fun v2 _ => rsum_nonneg n (fun v3 => bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+          fun v3 _ => Int.mul_nonneg (bin_nonneg db 1 (b 0) v2)
+            (Int.mul_nonneg (bin_nonneg db 2 v1 v3) (bin_nonneg db 3 v2 v3))
+    refine Int.le_trans (Int.le_of_eq
+        (rsum_const_mul n (bin db 0 (b 0) v1) (fun v2 => rsum n (fun v3 =>
+          bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))))) ?_
+    exact Int.mul_le_mul (Int.le_refl _) (hbr v1) hS0 (bin_nonneg db 0 (b 0) v1)
+  · rw [rsum_mul_const]
+    exact Int.le_refl _
+
+-- R ≤ triE 2 * triE 3
+private theorem kc_R_le_CD (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ triE n db 2 * triE n db 3 := by
+  rw [kc_hshape]
+  have hcd (v1 v2 v3 : Nat) :
+      bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+      ≤ bin db 2 v1 v3 * bin db 3 v2 v3 := by
+    have h1 : 0 ≤ (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3) : Int) :=
+      Int.mul_nonneg (bin_nonneg db 1 (b 0) v2)
+        (Int.mul_nonneg (bin_nonneg db 2 v1 v3) (bin_nonneg db 3 v2 v3))
+    have h2 : 0 ≤ (bin db 2 v1 v3 * bin db 3 v2 v3 : Int) :=
+      Int.mul_nonneg (bin_nonneg db 2 v1 v3) (bin_nonneg db 3 v2 v3)
+    calc bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3))
+        ≤ 1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)) :=
+          Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (Int.le_refl _) h1 (by omega)
+      _ = bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3) := by simp
+      _ ≤ 1 * (bin db 2 v1 v3 * bin db 3 v2 v3) :=
+          Int.mul_le_mul (bin_le_one db 1 (b 0) v2) (Int.le_refl _) h2 (by omega)
+      _ = bin db 2 v1 v3 * bin db 3 v2 v3 := by simp
+  refine Int.le_trans (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 (b 0) v2 * (bin db 2 v1 v3 * bin db 3 v2 v3)))))
+    (fun v1 => rsum n (fun v2 => rsum n (fun v3 => bin db 2 v1 v3 * bin db 3 v2 v3)))
+    fun v1 _ => rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => hcd v1 v2 v3) ?_
+  have hcol (v3 : Nat) (hv3 : v3 < n) : rsum n (fun v2 => bin db 3 v2 v3) ≤ triE n db 3 := by
+    refine Int.le_trans (rsum_le n (fun v2 => bin db 3 v2 v3)
+      (fun v2 => rsum n (fun u => bin db 3 v2 u))
+      fun v2 _ => rsum_ge_single n v3 (fun u => bin db 3 v2 u) hv3
+        fun u _ => bin_nonneg db 3 v2 u) ?_
+    exact Int.le_of_eq rfl
+  have hswap : (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 2 v1 v3 * bin db 3 v2 v3)))
+      = (fun v1 => rsum n (fun v3 => bin db 2 v1 v3 * rsum n (fun v2 => bin db 3 v2 v3))) := by
+    funext v1
+    refine (rsum_comm n n (fun v2 v3 => bin db 2 v1 v3 * bin db 3 v2 v3)).trans <|
+      congrArg (rsum n) (funext fun v3 =>
+        rsum_const_mul n (bin db 2 v1 v3) (fun v2 => bin db 3 v2 v3))
+  calc rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 2 v1 v3 * bin db 3 v2 v3)))
+      = rsum n (fun v1 => rsum n (fun v3 =>
+          bin db 2 v1 v3 * rsum n (fun v2 => bin db 3 v2 v3))) := congrArg (rsum n) hswap
+    _ ≤ rsum n (fun v1 => rsum n (fun v3 => bin db 2 v1 v3 * triE n db 3)) :=
+        rsum_le n _ _ fun v1 _ => rsum_le n _ _ fun v3 hv3 =>
+          Int.mul_le_mul (Int.le_refl _) (hcol v3 hv3)
+            (rsum_nonneg n (fun v2 => bin db 3 v2 v3) fun v2 _ => bin_nonneg db 3 v2 v3)
+            (bin_nonneg db 2 v1 v3)
+    _ = rsum n (fun v1 => rsum n (fun v3 => bin db 2 v1 v3) * triE n db 3) := by
+        refine congrArg (rsum n) (funext fun v1 => ?_)
+        exact rsum_mul_const n (fun v3 => bin db 2 v1 v3) (triE n db 3)
+    _ = triE n db 2 * triE n db 3 := by rw [rsum_mul_const]; try rfl
+
+private theorem fc_kc (T A B C D : Nat) (hBC : T ≤ B * C) (hAD : T ≤ A * D) (hCD : T ≤ C * D) :
+    ∀ den w0 w1 w2 w3 : Nat, 0 < den → den ≤ w0 + w2 → den ≤ w1 + w3 → den ≤ w2 + w3 →
+      T ^ den ≤ A ^ w0 * B ^ w1 * C ^ w2 * D ^ w3 := by
+  intro den
+  induction den using Nat.strongRecOn with
+  | ind den ih =>
+      intro w0 w1 w2 w3 hden h1 h2 h3
+      rcases Nat.eq_zero_or_pos T with hT0 | hTp
+      · rw [hT0, Nat.zero_pow (by omega)]
+        exact Nat.zero_le _
+      · have hA1 : 1 ≤ A := by
+          rcases Nat.eq_zero_or_pos A with hz | hz
+          · rw [hz, Nat.zero_mul] at hAD; omega
+          · omega
+        have hB1 : 1 ≤ B := by
+          rcases Nat.eq_zero_or_pos B with hz | hz
+          · rw [hz, Nat.zero_mul] at hBC; omega
+          · omega
+        have hC1 : 1 ≤ C := by
+          rcases Nat.eq_zero_or_pos C with hz | hz
+          · rw [hz, Nat.mul_zero] at hBC; omega
+          · omega
+        have hD1 : 1 ≤ D := by
+          rcases Nat.eq_zero_or_pos D with hz | hz
+          · rw [hz, Nat.mul_zero] at hAD; omega
+          · omega
+        have hcase :
+            (w1 > 0 ∧ w2 > 0) ∨ (w0 > 0 ∧ w3 > 0) ∨ (w2 > 0 ∧ w3 > 0 ∧ w2 + w3 > den) := by omega
+        rcases hcase with ⟨hw1, hw2⟩ | ⟨hw0, hw3⟩ | ⟨hw2, hw3, hsl⟩
+        · -- BC move
+          have hih : T ^ (den - 1) ≤ A ^ w0 * B ^ (w1 - 1) * C ^ (w2 - 1) * D ^ w3 := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ w0 := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ (w1 - 1) := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ (w2 - 1) := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ w3 := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ w0 * B ^ (w1 - 1) := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ (w2 - 1) * D ^ w3 := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) w0 (w1 - 1) (w2 - 1) w3 (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hBC) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul B w1 (by omega), pow_pred_mul C w2 (by omega)]
+          ac_rfl
+        · -- AD move
+          have hih : T ^ (den - 1) ≤ A ^ (w0 - 1) * B ^ w1 * C ^ w2 * D ^ (w3 - 1) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ (w0 - 1) := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ w1 := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ w2 := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ (w3 - 1) := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ (w0 - 1) * B ^ w1 := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ w2 * D ^ (w3 - 1) := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) (w0 - 1) w1 w2 (w3 - 1) (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hAD) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul A w0 (by omega), pow_pred_mul D w3 (by omega)]
+          ac_rfl
+        · -- CD move
+          have hih : T ^ (den - 1) ≤ A ^ w0 * B ^ w1 * C ^ (w2 - 1) * D ^ (w3 - 1) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ w0 := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ w1 := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ (w2 - 1) := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ (w3 - 1) := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ w0 * B ^ w1 := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ (w2 - 1) * D ^ (w3 - 1) := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) w0 w1 (w2 - 1) (w3 - 1) (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hCD) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul C w2 (by omega), pow_pred_mul D w3 (by omega)]
+          ac_rfl
+
+theorem sound_FractionalCap : FractionalCap.Goal := by
+  intro n db b weights den hcover
+  obtain ⟨hpos, hlen, hv⟩ := hcover
+  obtain ⟨w0, w1, w2, w3, rfl⟩ := list4_of_length4 weights hlen
+  have hzip : pattern.atoms.zip [w0, w1, w2, w3] =
+      [(⟨0, 0, 1⟩, w0), (⟨1, 0, 2⟩, w1), (⟨2, 1, 3⟩, w2), (⟨3, 2, 3⟩, w3)] := by
+    simp [pattern, List.zip]
+  have hv1 := hv 1 (by simp [pattern])
+  have hv2 := hv 2 (by simp [pattern])
+  have hv3 := hv 3 (by simp [pattern])
+  rw [hzip] at hv1 hv2 hv3
+  simp at hv1 hv2 hv3
+  rw [show (fun r x y => if db r x y == 0 then 0 else 1) = bin db from rfl]
+  have hcount : (reference pattern n (bin db) b).toNat = (satBindings pattern n db b).length := by
+    rw [reference_bin_count pattern n db b]
+    exact Int.ofNat_inj.mp (Int.toNat_of_nonneg (int_coe_nonneg _))
+  rw [hcount]
+  have hrhs : ((pattern.atoms.zip [w0, w1, w2, w3]).map (fun (a, w) =>
+      support n db a pattern b ^ w)).prod =
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 *
+        (support n db ⟨1, 0, 2⟩ pattern b ^ w1 *
+          (support n db ⟨2, 1, 3⟩ pattern b ^ w2 * support n db ⟨3, 2, 3⟩ pattern b ^ w3)) := by
+    rw [hzip]
+    simp
+  rw [hrhs]
+  have hL : ((satBindings pattern n db b).length : Int) = reference pattern n (bin db) b :=
+    (reference_bin_count pattern n db b).symm
+  have hS0 : (support n db ⟨0, 0, 1⟩ pattern b : Int) = kcA n db b :=
+    support_eq_pin pattern n db b 0 0 1 (by simp [pattern]) (by simp [pattern])
+  have hS1 : (support n db ⟨1, 0, 2⟩ pattern b : Int) = kcB n db b :=
+    support_eq_pin pattern n db b 1 0 2 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (support n db ⟨2, 1, 3⟩ pattern b : Int) = triE n db 2 :=
+    support_eq_triE pattern n db b 2 1 3 (by simp [pattern]) (by simp [pattern])
+  have hS3 : (support n db ⟨3, 2, 3⟩ pattern b : Int) = triE n db 3 :=
+    support_eq_triE pattern n db b 3 2 3 (by simp [pattern]) (by simp [pattern])
+  have hp1 : (satBindings pattern n db b).length ≤
+      support n db ⟨1, 0, 2⟩ pattern b * support n db ⟨2, 1, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS1, hS2]
+    exact kc_R_le_BC n db b
+  have hp2 : (satBindings pattern n db b).length ≤
+      support n db ⟨0, 0, 1⟩ pattern b * support n db ⟨3, 2, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS0, hS3]
+    exact kc_R_le_AD n db b
+  have hp3 : (satBindings pattern n db b).length ≤
+      support n db ⟨2, 1, 3⟩ pattern b * support n db ⟨3, 2, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS2, hS3]
+    exact kc_R_le_CD n db b
+  have hmain : (satBindings pattern n db b).length ^ den ≤
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 * support n db ⟨1, 0, 2⟩ pattern b ^ w1 *
+        support n db ⟨2, 1, 3⟩ pattern b ^ w2 * support n db ⟨3, 2, 3⟩ pattern b ^ w3 := by
+    refine fc_kc _ _ _ _ _ hp1 hp2 hp3 den w0 w1 w2 w3 hpos ?_ ?_ ?_
+    · omega
+    · omega
+    · omega
+  refine Nat.le_trans hmain (Nat.le_of_eq ?_)
+  ac_rfl
+end KeywordCompany
+
+namespace CastOverlap
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.CastOverlap
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> omega)
+    n db b
+end CastOverlap
+
+namespace PostDiamond
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.PostDiamond
+private def pdC (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun v => bin db 0 (b 0) v)
+
+private theorem pd_hshape (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3))))) := by
+  simp [reference, pattern, integrate, value, put, rsum, bin]
+
+private theorem pd_ref_le_CE (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ pdC n db b * triE n db 0 := by
+  rw [pd_hshape]
+  refine Int.le_trans (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3)))))
+    (fun v1 => rsum n (fun v2 => rsum n (fun v3 => bin db 0 (b 0) v1 * bin db 0 v2 v3)))
+    fun v1 _ => rsum_le n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3))))
+      (fun v2 => rsum n (fun v3 => bin db 0 (b 0) v1 * bin db 0 v2 v3))
+      fun v2 _ => rsum_le n (fun v3 =>
+          bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3)))
+        (fun v3 => bin db 0 (b 0) v1 * bin db 0 v2 v3) fun v3 _ => ?_) ?_
+  · have hbc : (bin db 0 (b 0) v2 * bin db 0 v1 v3 : Int) ≤ 1 := by
+      refine Int.le_trans (Int.mul_le_mul (bin_le_one db 0 (b 0) v2)
+        (bin_le_one db 0 v1 v3) (bin_nonneg db 0 v1 v3) (by omega)) ?_
+      simp
+    have hA : 0 ≤ (bin db 0 (b 0) v1 : Int) := bin_nonneg db 0 (b 0) v1
+    have hD : 0 ≤ (bin db 0 v2 v3 : Int) := bin_nonneg db 0 v2 v3
+    have hBCD : 0 ≤ ((bin db 0 (b 0) v2 * bin db 0 v1 v3 : Int) * bin db 0 v2 v3) :=
+      Int.mul_nonneg (Int.mul_nonneg (bin_nonneg db 0 (b 0) v2) (bin_nonneg db 0 v1 v3)) hD
+    calc bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3))
+        = bin db 0 (b 0) v1 * ((bin db 0 (b 0) v2 * bin db 0 v1 v3) * bin db 0 v2 v3) := by
+            rw [Int.mul_assoc]
+      _ ≤ bin db 0 (b 0) v1 * (1 * bin db 0 v2 v3) :=
+          Int.mul_le_mul (Int.le_refl _)
+            (Int.mul_le_mul hbc (Int.le_refl _) hD (by omega)) hBCD hA
+      _ = bin db 0 (b 0) v1 * bin db 0 v2 v3 := by simp
+  · have h1 : (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * bin db 0 v2 v3))) =
+        (fun v1 => bin db 0 (b 0) v1 * rsum n (fun v2 => rsum n (fun v3 => bin db 0 v2 v3))) := by
+      funext v1
+      have h11 : (fun v2 => rsum n (fun v3 => bin db 0 (b 0) v1 * bin db 0 v2 v3))
+          = (fun v2 => bin db 0 (b 0) v1 * rsum n (fun v3 => bin db 0 v2 v3)) := by
+        funext v2
+        exact rsum_const_mul n (bin db 0 (b 0) v1) (fun v3 => bin db 0 v2 v3)
+      rw [h11]
+      exact rsum_const_mul n (bin db 0 (b 0) v1) (fun v2 => rsum n (fun v3 => bin db 0 v2 v3))
+    have h2 : rsum n (fun v2 => rsum n (fun v3 => bin db 0 v2 v3)) = triE n db 0 := rfl
+    have h3 : rsum n (fun v1 => bin db 0 (b 0) v1) = pdC n db b := rfl
+    calc rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+          bin db 0 (b 0) v1 * bin db 0 v2 v3)))
+        = rsum n (fun v1 => bin db 0 (b 0) v1 * rsum n (fun v2 => rsum n (fun v3 =>
+            bin db 0 v2 v3))) := congrArg (rsum n) h1
+      _ = rsum n (fun v1 => bin db 0 (b 0) v1 * triE n db 0) :=
+          congrArg (rsum n) (funext fun v1 => congrArg (fun t => bin db 0 (b 0) v1 * t) h2)
+      _ = pdC n db b * triE n db 0 := by rw [rsum_mul_const, h3]
+      _ ≤ pdC n db b * triE n db 0 := Int.le_refl _
+
+private theorem pd_ref_le_EE (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ triE n db 0 * triE n db 0 := by
+  rw [pd_hshape]
+  refine Int.le_trans (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3)))))
+    (fun v1 => rsum n (fun v2 => rsum n (fun v3 => bin db 0 v1 v3 * bin db 0 v2 v3)))
+    fun v1 _ => rsum_le n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3))))
+      (fun v2 => rsum n (fun v3 => bin db 0 v1 v3 * bin db 0 v2 v3))
+      fun v2 _ => rsum_le n (fun v3 =>
+          bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3)))
+        (fun v3 => bin db 0 v1 v3 * bin db 0 v2 v3) fun v3 _ => ?_) ?_
+  · have h12 : (bin db 0 (b 0) v1 * bin db 0 (b 0) v2 : Int) ≤ 1 := by
+      refine Int.le_trans (Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (bin_le_one db 0 (b 0) v2)
+        (bin_nonneg db 0 (b 0) v2) (by omega)) ?_
+      simp
+    have h34 : 0 ≤ (bin db 0 v1 v3 * bin db 0 v2 v3 : Int) :=
+      Int.mul_nonneg (bin_nonneg db 0 v1 v3) (bin_nonneg db 0 v2 v3)
+    calc bin db 0 (b 0) v1 * (bin db 0 (b 0) v2 * (bin db 0 v1 v3 * bin db 0 v2 v3))
+        = (bin db 0 (b 0) v1 * bin db 0 (b 0) v2) * (bin db 0 v1 v3 * bin db 0 v2 v3) := by
+            rw [Int.mul_assoc]
+      _ ≤ 1 * (bin db 0 v1 v3 * bin db 0 v2 v3) :=
+          Int.mul_le_mul h12 (Int.le_refl _) h34 (by omega)
+      _ = bin db 0 v1 v3 * bin db 0 v2 v3 := by simp
+  · have hRle (v2 : Nat) (hv2 : v2 < n) :
+      rsum n (fun w => bin db 0 w v2) ≤ triE n db 0 := by
+      refine Int.le_trans (rsum_le n (fun w => bin db 0 w v2)
+        (fun w => rsum n (fun u => bin db 0 w u))
+        fun w _ => rsum_ge_single n v2 (fun u => bin db 0 w u) hv2 fun u _ => bin_nonneg db 0 w u) ?_
+      exact Int.le_of_eq rfl
+    have h1 : rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 v1 v3 * bin db 0 v2 v3)))
+        = rsum n (fun v1 => rsum n (fun v3 =>
+        bin db 0 v1 v3 * rsum n (fun v2 => bin db 0 v2 v3))) := by
+      refine congrArg (rsum n) (funext fun v1 => ?_)
+      exact (rsum_comm n n (fun v2 v3 => bin db 0 v1 v3 * bin db 0 v2 v3)).trans <|
+        congrArg (rsum n) (funext fun v3 =>
+          rsum_const_mul n (bin db 0 v1 v3) (fun v2 => bin db 0 v2 v3))
+    have h2 : rsum n (fun v1 => rsum n (fun v3 => bin db 0 v1 v3 * rsum n (fun v2 => bin db 0 v2 v3)))
+        ≤ rsum n (fun v1 => rsum n (fun v3 => bin db 0 v1 v3 * triE n db 0)) :=
+      rsum_le n _ _ fun v1 h1 => rsum_le n _ _ fun v3 h3 =>
+        Int.mul_le_mul (Int.le_refl _) (hRle v3 h3)
+          (rsum_nonneg n (fun v2 => bin db 0 v2 v3) fun v2 _ => bin_nonneg db 0 v2 v3)
+          (bin_nonneg db 0 v1 v3)
+    have h3 : rsum n (fun v1 => rsum n (fun v3 => bin db 0 v1 v3 * triE n db 0))
+        = triE n db 0 * triE n db 0 := by
+      have h31 : (fun v1 => rsum n (fun v3 => bin db 0 v1 v3 * triE n db 0))
+          = (fun v1 => rsum n (fun v3 => bin db 0 v1 v3) * triE n db 0) := by
+        funext v1
+        exact rsum_mul_const n (fun v3 => bin db 0 v1 v3) (triE n db 0)
+      rw [h31, rsum_mul_const]
+      have h32 : rsum n (fun v1 => rsum n (fun v3 => bin db 0 v1 v3)) = triE n db 0 := rfl
+      rw [h32]
+    rw [h1]
+    refine Int.le_trans h2 (Int.le_of_eq h3)
+
+theorem sound_FractionalCap : FractionalCap.Goal := by
+  intro n db b weights den hcover
+  obtain ⟨hpos, hlen, hv⟩ := hcover
+  obtain ⟨w0, w1, w2, w3, rfl⟩ := list4_of_length4 weights hlen
+  have hzip : pattern.atoms.zip [w0, w1, w2, w3] =
+      [(⟨0, 0, 1⟩, w0), (⟨0, 0, 2⟩, w1), (⟨0, 1, 3⟩, w2), (⟨0, 2, 3⟩, w3)] := by
+    simp [pattern, List.zip]
+  have hv1 := hv 1 (by simp [pattern])
+  have hv2 := hv 2 (by simp [pattern])
+  have hv3 := hv 3 (by simp [pattern])
+  rw [hzip] at hv1 hv2 hv3
+  simp at hv1 hv2 hv3
+  rw [show (fun r x y => if db r x y == 0 then 0 else 1) = bin db from rfl]
+  have hcount : (reference pattern n (bin db) b).toNat = (satBindings pattern n db b).length := by
+    rw [reference_bin_count pattern n db b]
+    exact Int.ofNat_inj.mp (Int.toNat_of_nonneg (int_coe_nonneg _))
+  rw [hcount]
+  have hrhs : ((pattern.atoms.zip [w0, w1, w2, w3]).map (fun (a, w) =>
+      support n db a pattern b ^ w)).prod =
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 *
+        (support n db ⟨0, 0, 2⟩ pattern b ^ w1 *
+          (support n db ⟨0, 1, 3⟩ pattern b ^ w2 * support n db ⟨0, 2, 3⟩ pattern b ^ w3)) := by
+    rw [hzip]
+    simp
+  rw [hrhs]
+  rw [show support n db ⟨0, 0, 2⟩ pattern b = support n db ⟨0, 0, 1⟩ pattern b from rfl,
+      show support n db ⟨0, 2, 3⟩ pattern b = support n db ⟨0, 1, 3⟩ pattern b from rfl]
+  have hL : ((satBindings pattern n db b).length : Int) = reference pattern n (bin db) b :=
+    (reference_bin_count pattern n db b).symm
+  have hS0 : (support n db ⟨0, 0, 1⟩ pattern b : Int) = pdC n db b :=
+    support_eq_pin pattern n db b 0 0 1 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (support n db ⟨0, 1, 3⟩ pattern b : Int) = triE n db 0 :=
+    support_eq_triE pattern n db b 0 1 3 (by simp [pattern]) (by simp [pattern])
+  have hp1 : (satBindings pattern n db b).length ≤
+      support n db ⟨0, 0, 1⟩ pattern b * support n db ⟨0, 1, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS0, hS2]
+    exact pd_ref_le_CE n db b
+  have hp2 : (satBindings pattern n db b).length ≤
+      support n db ⟨0, 1, 3⟩ pattern b * support n db ⟨0, 1, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS2]
+    exact pd_ref_le_EE n db b
+  have hmain : (satBindings pattern n db b).length ^ den ≤
+      (support n db ⟨0, 0, 1⟩ pattern b) ^ (w0 + w1) *
+        (support n db ⟨0, 1, 3⟩ pattern b) ^ (w2 + w3) := by
+    refine fc_pd _ _ _ hp1 hp2 den (w0 + w1) (w2 + w3) hpos ?_ ?_
+    · omega
+    · omega
+  refine Nat.le_trans hmain (Nat.le_of_eq ?_)
+  rw [Nat.pow_add, Nat.pow_add]
+  ac_rfl
+
+end PostDiamond
+
+namespace VoteBadge
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.VoteBadge
+private theorem rsum_eq_zero_imp (n : Nat) (f : Nat → Int) (hnon : ∀ i, i < n → 0 ≤ f i)
+    (h : rsum n f = 0) (i : Nat) (hi : i < n) : f i = 0 := by
+  have hle : f i ≤ rsum n f := rsum_ge_single n i f hi hnon
+  rw [h] at hle
+  have hge : 0 ≤ f i := hnon i hi
+  omega
+
+private theorem list5_of_length5 {α : Type} (l : List α) (h : l.length = 5) :
+    ∃ a b c d e, l = [a, b, c, d, e] := by
+  cases l with
+  | nil => simp at h
+  | cons a l =>
+    cases l with
+    | nil => simp at h
+    | cons b l =>
+      cases l with
+      | nil => simp at h
+      | cons c l =>
+        cases l with
+        | nil => simp at h
+        | cons d l =>
+          cases l with
+          | nil => simp at h
+          | cons e l =>
+            cases l with
+            | nil => exact ⟨a, b, c, d, e, rfl⟩
+            | cons f l => simp at h
+
+private def vbA (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun y => bin db 0 (b 0) y)
+
+private def vbD (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun y => bin db 3 (b 0) y)
+
+private theorem vb_hshape (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b =
+    rsum n (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 => rsum n (fun v1 =>
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v1 v3 *
+        (bin db 3 (b 0) v4 * bin db 3 v4 v5)))))))) := by
+  simp [reference, pattern, integrate, value, put, rsum, bin]
+
+-- R ≤ triE 1 * triE 2 * triE 3
+private theorem vb_R_le_K (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ triE n db 1 * triE n db 2 * triE n db 3 := by
+  rw [vb_hshape]
+  have hpt (v1 v2 v3 v4 v5 : Nat) :
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v1 v3 *
+          (bin db 3 (b 0) v4 * bin db 3 v4 v5)))
+      ≤ bin db 1 v1 v2 * (bin db 2 v1 v3 * bin db 3 v4 v5) := by
+    have hc : 0 ≤ (bin db 1 v1 v2 : Int) := bin_nonneg db 1 v1 v2
+    have he : 0 ≤ (bin db 2 v1 v3 : Int) := bin_nonneg db 2 v1 v3
+    have hg : 0 ≤ (bin db 3 (b 0) v4 : Int) := bin_nonneg db 3 (b 0) v4
+    have hh : 0 ≤ (bin db 3 v4 v5 : Int) := bin_nonneg db 3 v4 v5
+    have hin : bin db 2 v1 v3 * (bin db 3 (b 0) v4 * bin db 3 v4 v5)
+        ≤ bin db 2 v1 v3 * (1 * bin db 3 v4 v5) :=
+      Int.mul_le_mul (Int.le_refl _)
+        (Int.mul_le_mul (bin_le_one db 3 (b 0) v4) (Int.le_refl _) hh (by omega))
+        (Int.mul_nonneg hg hh) he
+    calc bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v1 v3 *
+            (bin db 3 (b 0) v4 * bin db 3 v4 v5)))
+        ≤ 1 * (bin db 1 v1 v2 * (bin db 2 v1 v3 * (bin db 3 (b 0) v4 * bin db 3 v4 v5))) :=
+          Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (Int.le_refl _)
+            (Int.mul_nonneg hc (Int.mul_nonneg he (Int.mul_nonneg hg hh))) (by omega)
+      _ = bin db 1 v1 v2 * (bin db 2 v1 v3 * (bin db 3 (b 0) v4 * bin db 3 v4 v5)) := by simp
+      _ ≤ bin db 1 v1 v2 * (bin db 2 v1 v3 * (1 * bin db 3 v4 v5)) :=
+          Int.mul_le_mul (Int.le_refl _) hin
+            (Int.mul_nonneg he (Int.mul_nonneg hg hh)) hc
+      _ = bin db 1 v1 v2 * (bin db 2 v1 v3 * bin db 3 v4 v5) := by simp
+  have hstep : rsum n (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 =>
+        rsum n (fun v1 => bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v1 v3 *
+          (bin db 3 (b 0) v4 * bin db 3 v4 v5)))))))) ≤
+      rsum n (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 =>
+          rsum n (fun v1 => bin db 1 v1 v2 * (bin db 2 v1 v3 * bin db 3 v4 v5)))))) :=
+    rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => rsum_le n _ _ fun v5 _ =>
+      rsum_le n _ _ fun v4 _ => rsum_le n _ _ fun v1 _ => hpt v1 v2 v3 v4 v5
+  refine Int.le_trans hstep ?_
+  refine Int.le_trans (Int.le_of_eq ?_) ?_
+  · -- Σ_{v1} c·(e·h) = h · Σ_{v1} c·e ; pull h through Σ_{v4}, Σ_{v5}; ΣΣ h = triE3;
+    -- pull triE3 through Σ_{v3}, Σ_{v2}
+    rw [show (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 => rsum n (fun v1 =>
+          bin db 1 v1 v2 * (bin db 2 v1 v3 * bin db 3 v4 v5))))))
+        = (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 =>
+            bin db 3 v4 v5 * rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3))))) by
+          refine congrArg (rsum n) (funext fun v2 => congrArg (rsum n) (funext fun v3 =>
+            congrArg (rsum n) (funext fun v5 => congrArg (rsum n) (funext fun v4 => ?_))))
+          rw [show (fun v1 => bin db 1 v1 v2 * (bin db 2 v1 v3 * bin db 3 v4 v5))
+              = (fun v1 => bin db 3 v4 v5 * (bin db 1 v1 v2 * bin db 2 v1 v3)) by
+                funext v1
+                simp [Int.mul_assoc, Int.mul_comm, Int.mul_left_comm]]
+          exact rsum_const_mul n (bin db 3 v4 v5)
+            (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)]
+    rw [show (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 =>
+          bin db 3 v4 v5 * rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)))))
+        = (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 => bin db 3 v4 v5) *
+            rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)))) by
+          refine congrArg (rsum n) (funext fun v2 => congrArg (rsum n) (funext fun v3 =>
+            congrArg (rsum n) (funext fun v5 => ?_)))
+          exact rsum_mul_const n (fun v4 => bin db 3 v4 v5)
+            (rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)))]
+    rw [show (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 => bin db 3 v4 v5) *
+          rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3))))
+        = (fun v2 => rsum n (fun v3 => rsum n (fun v5 => rsum n (fun v4 => bin db 3 v4 v5)) *
+            rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3))) by
+          refine congrArg (rsum n) (funext fun v2 => congrArg (rsum n) (funext fun v3 => ?_))
+          exact rsum_mul_const n (fun v5 => rsum n (fun v4 => bin db 3 v4 v5))
+            (rsum n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)))]
+    rw [show rsum n (fun v5 => rsum n (fun v4 => bin db 3 v4 v5)) = triE n db 3 from
+        (rsum_comm n n (fun v4 v5 => bin db 3 v4 v5)).symm]
+    rw [show (fun v2 => rsum n (fun v3 => triE n db 3 * rsum n (fun v1 =>
+          bin db 1 v1 v2 * bin db 2 v1 v3)))
+        = (fun v2 => triE n db 3 * rsum n (fun v3 => rsum n (fun v1 =>
+            bin db 1 v1 v2 * bin db 2 v1 v3))) by
+          funext v2
+          exact rsum_const_mul n (triE n db 3) (fun v3 => rsum n (fun v1 =>
+            bin db 1 v1 v2 * bin db 2 v1 v3))]
+    rw [rsum_const_mul n (triE n db 3) (fun v2 => rsum n (fun v3 => rsum n (fun v1 =>
+      bin db 1 v1 v2 * bin db 2 v1 v3)))]
+  · -- triE3 · ΣΣ Σ c·e ≤ triE3 · (triE1 · triE2) = triE1 · triE2 · triE3
+    have h7 : rsum n (fun v2 => rsum n (fun v3 => rsum n (fun v1 =>
+        bin db 1 v1 v2 * bin db 2 v1 v3)))
+        ≤ triE n db 1 * triE n db 2 := by
+      refine Int.le_trans (rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ =>
+          rsum_mul_le_mul_rsum n (fun v1 => bin db 1 v1 v2) (fun v1 => bin db 2 v1 v3)
+            (fun v1 _ => bin_nonneg db 1 v1 v2) (fun v1 _ => bin_nonneg db 2 v1 v3)) ?_
+      refine Int.le_of_eq ?_
+      rw [show (fun v2 => rsum n (fun v3 => rsum n (fun v1 => bin db 1 v1 v2) *
+            rsum n (fun v1 => bin db 2 v1 v3)))
+          = (fun v2 => rsum n (fun v1 => bin db 1 v1 v2) * rsum n (fun v3 =>
+              rsum n (fun v1 => bin db 2 v1 v3))) by
+            funext v2
+            exact rsum_const_mul n (rsum n (fun v1 => bin db 1 v1 v2))
+              (fun v3 => rsum n (fun v1 => bin db 2 v1 v3))]
+      rw [rsum_mul_const n (fun v2 => rsum n (fun v1 => bin db 1 v1 v2))
+        (rsum n (fun v3 => rsum n (fun v1 => bin db 2 v1 v3)))]
+      rw [show rsum n (fun v2 => rsum n (fun v1 => bin db 1 v1 v2)) = triE n db 1 from
+          (rsum_comm n n (fun v1 v2 => bin db 1 v1 v2)).symm,
+        show rsum n (fun v3 => rsum n (fun v1 => bin db 2 v1 v3)) = triE n db 2 from
+          (rsum_comm n n (fun v1 v3 => bin db 2 v1 v3)).symm]
+    refine Int.le_trans (Int.mul_le_mul (Int.le_refl (triE n db 3)) h7
+      (rsum_nonneg n (fun v2 => rsum n (fun v3 => rsum n (fun v1 =>
+          bin db 1 v1 v2 * bin db 2 v1 v3)))
+        fun v2 _ => rsum_nonneg n (fun v3 => rsum n (fun v1 =>
+          bin db 1 v1 v2 * bin db 2 v1 v3))
+          fun v3 _ => rsum_nonneg n (fun v1 => bin db 1 v1 v2 * bin db 2 v1 v3)
+            fun v1 _ => Int.mul_nonneg (bin_nonneg db 1 v1 v2) (bin_nonneg db 2 v1 v3))
+      (triE_nonneg n db 3)) (Int.le_of_eq (Int.mul_comm _ _))
+
+private theorem rsum_eq_zero_of (n : Nat) (f : Nat → Int) (h : ∀ i, i < n → f i = 0) :
+    rsum n f = 0 := by
+  apply Int.le_antisymm
+  · rw [← rsum_const_zero n]
+    exact rsum_le n f (fun _ => 0) fun i hi => Int.le_of_eq (h i hi)
+  · exact rsum_nonneg n f fun i hi => Int.le_of_eq (h i hi).symm
+
+private theorem vb_R_eq_zero_of_A (n : Nat) (db : DB) (b : Bind)
+    (h : rsum n (fun y => bin db 0 (b 0) y) = 0) :
+    (reference pattern n (bin db) b : Int) = 0 := by
+  have hz : ∀ y, y < n → bin db 0 (b 0) y = 0 :=
+    rsum_eq_zero_imp n _ (fun i hi => bin_nonneg db 0 (b 0) i) h
+  rw [vb_hshape]
+  refine rsum_eq_zero_of n _ fun v2 _ => rsum_eq_zero_of n _ fun v3 _ =>
+    rsum_eq_zero_of n _ fun v5 _ => rsum_eq_zero_of n _ fun v4 _ =>
+      rsum_eq_zero_of n _ fun v1 hv => by
+        rw [hz v1 hv]
+        simp
+
+private theorem vb_R_eq_zero_of_D (n : Nat) (db : DB) (b : Bind)
+    (h : rsum n (fun y => bin db 3 (b 0) y) = 0) :
+    (reference pattern n (bin db) b : Int) = 0 := by
+  have hz : ∀ y, y < n → bin db 3 (b 0) y = 0 :=
+    rsum_eq_zero_imp n _ (fun i hi => bin_nonneg db 3 (b 0) i) h
+  rw [vb_hshape]
+  refine rsum_eq_zero_of n _ fun v2 _ => rsum_eq_zero_of n _ fun v3 _ =>
+    rsum_eq_zero_of n _ fun v5 _ => rsum_eq_zero_of n _ fun v4 hv =>
+      rsum_eq_zero_of n _ fun v1 _ => by
+        rw [hz v4 hv]
+        simp
+
+theorem sound_FractionalCap : FractionalCap.Goal := by
+  intro n db b weights den hcover
+  obtain ⟨hpos, hlen, hv⟩ := hcover
+  obtain ⟨w0, w1, w2, w3, w4, rfl⟩ := list5_of_length5 weights hlen
+  have hzip : pattern.atoms.zip [w0, w1, w2, w3, w4] =
+      [(⟨0, 0, 1⟩, w0), (⟨1, 1, 2⟩, w1), (⟨2, 1, 3⟩, w2), (⟨3, 0, 4⟩, w3),
+        (⟨3, 4, 5⟩, w4)] := by
+    simp [pattern, List.zip]
+  have hv1 := hv 1 (by simp [pattern])
+  have hv2 := hv 2 (by simp [pattern])
+  have hv3 := hv 3 (by simp [pattern])
+  have hv4 := hv 4 (by simp [pattern])
+  have hv5 := hv 5 (by simp [pattern])
+  rw [hzip] at hv1 hv2 hv3 hv4 hv5
+  simp at hv1 hv2 hv3 hv4 hv5
+  have hd1 : den ≤ w1 := by omega
+  have hd2 : den ≤ w2 := by omega
+  have hd4 : den ≤ w4 := by omega
+  rw [show (fun r x y => if db r x y == 0 then 0 else 1) = bin db from rfl]
+  have hcount : (reference pattern n (bin db) b).toNat = (satBindings pattern n db b).length := by
+    rw [reference_bin_count pattern n db b]
+    exact Int.ofNat_inj.mp (Int.toNat_of_nonneg (int_coe_nonneg _))
+  rw [hcount]
+  have hrhs : ((pattern.atoms.zip [w0, w1, w2, w3, w4]).map (fun (a, w) =>
+      support n db a pattern b ^ w)).prod =
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 *
+        (support n db ⟨1, 1, 2⟩ pattern b ^ w1 *
+          (support n db ⟨2, 1, 3⟩ pattern b ^ w2 *
+            (support n db ⟨3, 0, 4⟩ pattern b ^ w3 * support n db ⟨3, 4, 5⟩ pattern b ^ w4))) := by
+    rw [hzip]
+    simp
+  rw [hrhs]
+  have hL : ((satBindings pattern n db b).length : Int) = reference pattern n (bin db) b :=
+    (reference_bin_count pattern n db b).symm
+  have hS0 : (support n db ⟨0, 0, 1⟩ pattern b : Int) = vbA n db b :=
+    support_eq_pin pattern n db b 0 0 1 (by simp [pattern]) (by simp [pattern])
+  have hS1 : (support n db ⟨1, 1, 2⟩ pattern b : Int) = triE n db 1 :=
+    support_eq_triE pattern n db b 1 1 2 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (support n db ⟨2, 1, 3⟩ pattern b : Int) = triE n db 2 :=
+    support_eq_triE pattern n db b 2 1 3 (by simp [pattern]) (by simp [pattern])
+  have hS3 : (support n db ⟨3, 0, 4⟩ pattern b : Int) = vbD n db b :=
+    support_eq_pin pattern n db b 3 0 4 (by simp [pattern]) (by simp [pattern])
+  have hS4 : (support n db ⟨3, 4, 5⟩ pattern b : Int) = triE n db 3 :=
+    support_eq_triE pattern n db b 3 4 5 (by simp [pattern]) (by simp [pattern])
+  have hKNat : (satBindings pattern n db b).length ≤
+      support n db ⟨1, 1, 2⟩ pattern b * support n db ⟨2, 1, 3⟩ pattern b *
+        support n db ⟨3, 4, 5⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, Int.natCast_mul, hL, hS1, hS2, hS4]
+    exact vb_R_le_K n db b
+  by_cases hL0 : (satBindings pattern n db b).length = 0
+  · rw [hL0, Nat.zero_pow hpos]
+    exact Nat.zero_le _
+  · have hLp : 0 < (satBindings pattern n db b).length := Nat.pos_of_ne_zero hL0
+    have hS1p : 0 < support n db ⟨1, 1, 2⟩ pattern b := by
+      by_cases h : support n db ⟨1, 1, 2⟩ pattern b = 0
+      · rw [h, Nat.zero_mul, Nat.zero_mul] at hKNat
+        omega
+      exact Nat.pos_of_ne_zero h
+    have hS2p : 0 < support n db ⟨2, 1, 3⟩ pattern b := by
+      by_cases h : support n db ⟨2, 1, 3⟩ pattern b = 0
+      · rw [h, Nat.mul_zero, Nat.zero_mul] at hKNat
+        omega
+      exact Nat.pos_of_ne_zero h
+    have hS4p : 0 < support n db ⟨3, 4, 5⟩ pattern b := by
+      by_cases h : support n db ⟨3, 4, 5⟩ pattern b = 0
+      · rw [h, Nat.mul_zero] at hKNat
+        omega
+      exact Nat.pos_of_ne_zero h
+    have hA0p : support n db ⟨0, 0, 1⟩ pattern b ≠ 0 := by
+      intro hz
+      have h0 : vbA n db b = 0 := by
+        rw [← hS0, hz]
+        simp
+      have hRe : (reference pattern n (bin db) b : Int) = 0 := vb_R_eq_zero_of_A n db b h0
+      exact hL0 (Int.ofNat_inj.mp (hL.trans hRe))
+    have hD3p : support n db ⟨3, 0, 4⟩ pattern b ≠ 0 := by
+      intro hz
+      have h0 : vbD n db b = 0 := by
+        rw [← hS3, hz]
+        simp
+      have hRe : (reference pattern n (bin db) b : Int) = 0 := vb_R_eq_zero_of_D n db b h0
+      exact hL0 (Int.ofNat_inj.mp (hL.trans hRe))
+    have ht1 : (support n db ⟨1, 1, 2⟩ pattern b)^den ≤ (support n db ⟨1, 1, 2⟩ pattern b)^w1 :=
+      pow_mono_of_pos hS1p hd1
+    have ht2 : (support n db ⟨2, 1, 3⟩ pattern b)^den ≤ (support n db ⟨2, 1, 3⟩ pattern b)^w2 :=
+      pow_mono_of_pos hS2p hd2
+    have ht4 : (support n db ⟨3, 4, 5⟩ pattern b)^den ≤ (support n db ⟨3, 4, 5⟩ pattern b)^w4 :=
+      pow_mono_of_pos hS4p hd4
+    have h2 : (support n db ⟨1, 1, 2⟩ pattern b * support n db ⟨2, 1, 3⟩ pattern b *
+        support n db ⟨3, 4, 5⟩ pattern b)^den =
+        (support n db ⟨1, 1, 2⟩ pattern b)^den * (support n db ⟨2, 1, 3⟩ pattern b)^den *
+          (support n db ⟨3, 4, 5⟩ pattern b)^den := by
+      rw [Nat.mul_pow, Nat.mul_pow]
+    have h3 : (support n db ⟨1, 1, 2⟩ pattern b)^den * (support n db ⟨2, 1, 3⟩ pattern b)^den *
+        (support n db ⟨3, 4, 5⟩ pattern b)^den ≤
+        (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+          ((support n db ⟨2, 1, 3⟩ pattern b)^w2 * (support n db ⟨3, 4, 5⟩ pattern b)^w4) := by
+      rw [Nat.mul_assoc]
+      exact Nat.mul_le_mul ht1 (Nat.mul_le_mul ht2 ht4)
+    have h5 : (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+        ((support n db ⟨2, 1, 3⟩ pattern b)^w2 * (support n db ⟨3, 4, 5⟩ pattern b)^w4) ≤
+        (support n db ⟨0, 0, 1⟩ pattern b)^w0 *
+          ((support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+            ((support n db ⟨2, 1, 3⟩ pattern b)^w2 *
+              ((support n db ⟨3, 0, 4⟩ pattern b)^w3 * (support n db ⟨3, 4, 5⟩ pattern b)^w4))) := by
+      have hA : 0 < (support n db ⟨0, 0, 1⟩ pattern b)^w0 := by
+        refine Nat.pos_of_ne_zero ?_
+        intro hz0
+        rw [Nat.pow_eq_zero] at hz0
+        exact hA0p hz0.1
+      have hD : 1 ≤ (support n db ⟨3, 0, 4⟩ pattern b)^w3 :=
+        Nat.one_le_pow w3 (support n db ⟨3, 0, 4⟩ pattern b) (Nat.pos_of_ne_zero hD3p)
+      calc (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+            ((support n db ⟨2, 1, 3⟩ pattern b)^w2 * (support n db ⟨3, 4, 5⟩ pattern b)^w4)
+          _ = (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+              ((support n db ⟨2, 1, 3⟩ pattern b)^w2 *
+                (1 * (support n db ⟨3, 4, 5⟩ pattern b)^w4)) := by simp
+          _ ≤ (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+              ((support n db ⟨2, 1, 3⟩ pattern b)^w2 *
+                ((support n db ⟨3, 0, 4⟩ pattern b)^w3 * (support n db ⟨3, 4, 5⟩ pattern b)^w4)) :=
+              Nat.mul_le_mul (Nat.le_refl _)
+                (Nat.mul_le_mul (Nat.le_refl _) (Nat.mul_le_mul hD (Nat.le_refl _)))
+          _ ≤ (support n db ⟨0, 0, 1⟩ pattern b)^w0 *
+              ((support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+                ((support n db ⟨2, 1, 3⟩ pattern b)^w2 *
+                  ((support n db ⟨3, 0, 4⟩ pattern b)^w3 * (support n db ⟨3, 4, 5⟩ pattern b)^w4))) :=
+              Nat.le_mul_of_pos_left _ hA
+    have hsub : (satBindings pattern n db b).length ^ den ≤
+        (support n db ⟨1, 1, 2⟩ pattern b)^w1 *
+          ((support n db ⟨2, 1, 3⟩ pattern b)^w2 * (support n db ⟨3, 4, 5⟩ pattern b)^w4) := by
+      refine Nat.le_trans (Nat.pow_le_pow_left hKNat den) ?_
+      rw [h2]
+      exact h3
+    exact Nat.le_trans hsub h5
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> by_cases h0 : x 2 = x 3 <;> by_cases h1 : x 2 = x 5 <;> by_cases h2 : x 2 = x 4 <;> by_cases h3 : x 2 = x 1 <;> by_cases h4 : x 3 = x 5 <;> by_cases h5 : x 3 = x 4 <;> by_cases h6 : x 3 = x 1 <;> by_cases h7 : x 5 = x 4 <;> by_cases h8 : x 5 = x 1 <;> by_cases h9 : x 4 = x 1 <;> simp_all (config := {decide := true}) [eq_comm])
+    n db b
+end VoteBadge
+
+namespace ReplyCycle
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.ReplyCycle
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> omega)
+    n db b
+end ReplyCycle
+
+namespace FriendBridge
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.FriendBridge
+private def fbA (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun y => bin db 0 (b 0) y)
+
+private def fbD (n : Nat) (db : DB) (b : Bind) : Int :=
+  rsum n (fun x => bin db 3 x (b 4))
+
+private theorem fb_hshape (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))))) := by
+  simp [reference, pattern, integrate, value, put, rsum, bin]
+
+-- R ≤ fbA * triE 2
+private theorem fb_R_le_AC (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ fbA n db b * triE n db 2 := by
+  rw [fb_hshape]
+  have hpt (v1 v2 v3 : Nat) :
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+      ≤ bin db 0 (b 0) v1 * bin db 2 v2 v3 := by
+    have ha : 0 ≤ (bin db 0 (b 0) v1 : Int) := bin_nonneg db 0 (b 0) v1
+    have hc : 0 ≤ (bin db 1 v1 v2 : Int) := bin_nonneg db 1 v1 v2
+    have he : 0 ≤ (bin db 2 v2 v3 : Int) := bin_nonneg db 2 v2 v3
+    have hg : 0 ≤ (bin db 3 v3 (b 4) : Int) := bin_nonneg db 3 v3 (b 4)
+    have h1 : bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))
+        ≤ 1 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)) :=
+      Int.mul_le_mul (bin_le_one db 1 v1 v2) (Int.le_refl _)
+        (Int.mul_nonneg he hg) (by omega)
+    have h2 : bin db 2 v2 v3 * bin db 3 v3 (b 4) ≤ bin db 2 v2 v3 * 1 :=
+      Int.mul_le_mul (Int.le_refl _) (bin_le_one db 3 v3 (b 4)) hg he
+    have h3 : bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)) ≤ bin db 2 v2 v3 := by
+      calc bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))
+          ≤ 1 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)) := h1
+        _ = bin db 2 v2 v3 * bin db 3 v3 (b 4) := by simp
+        _ ≤ bin db 2 v2 v3 * 1 := h2
+        _ = bin db 2 v2 v3 := by simp
+    exact Int.mul_le_mul (Int.le_refl _) h3
+      (Int.mul_nonneg hc (Int.mul_nonneg he hg)) ha
+  have hstep : rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))))) ≤
+      rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * bin db 2 v2 v3))) :=
+    rsum_le n _ _ fun v1 _ => rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => hpt v1 v2 v3
+  refine Int.le_trans hstep ?_
+  refine Int.le_of_eq ?_
+  calc rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * bin db 2 v2 v3)))
+      = rsum n (fun v1 => rsum n (fun v2 =>
+          bin db 0 (b 0) v1 * rsum n (fun v3 => bin db 2 v2 v3))) := by
+          refine congrArg (rsum n) (funext fun v1 => congrArg (rsum n) (funext fun v2 =>
+            rsum_const_mul n (bin db 0 (b 0) v1) (fun v3 => bin db 2 v2 v3)))
+    _ = rsum n (fun v1 => triE n db 2 * bin db 0 (b 0) v1) := by
+          refine congrArg (rsum n) (funext fun v1 => ?_)
+          rw [show (fun v2 => bin db 0 (b 0) v1 * rsum n (fun v3 => bin db 2 v2 v3))
+              = (fun v2 => rsum n (fun v3 => bin db 2 v2 v3) * bin db 0 (b 0) v1) by
+                funext v2; exact Int.mul_comm _ _]
+          rw [rsum_mul_const n (fun v2 => rsum n (fun v3 => bin db 2 v2 v3))
+            (bin db 0 (b 0) v1)]
+          try rfl
+    _ = triE n db 2 * fbA n db b :=
+        rsum_const_mul n (triE n db 2) (fun v1 => bin db 0 (b 0) v1)
+    _ = fbA n db b * triE n db 2 := by rw [Int.mul_comm]
+
+-- R ≤ fbD * triE 1
+private theorem fb_R_le_BD (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ fbD n db b * triE n db 1 := by
+  rw [fb_hshape]
+  have hpt (v1 v2 v3 : Nat) :
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+      ≤ bin db 1 v1 v2 * bin db 3 v3 (b 4) := by
+    have ha : 0 ≤ (bin db 0 (b 0) v1 : Int) := bin_nonneg db 0 (b 0) v1
+    have hc : 0 ≤ (bin db 1 v1 v2 : Int) := bin_nonneg db 1 v1 v2
+    have he : 0 ≤ (bin db 2 v2 v3 : Int) := bin_nonneg db 2 v2 v3
+    have hg : 0 ≤ (bin db 3 v3 (b 4) : Int) := bin_nonneg db 3 v3 (b 4)
+    have h0 : bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+        ≤ 1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))) :=
+      Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (Int.le_refl _)
+        (Int.mul_nonneg hc (Int.mul_nonneg he hg)) (by omega)
+    have h2 : bin db 2 v2 v3 * bin db 3 v3 (b 4) ≤ 1 * bin db 3 v3 (b 4) :=
+      Int.mul_le_mul (bin_le_one db 2 v2 v3) (Int.le_refl _) hg (by omega)
+    calc bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+        ≤ 1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))) := h0
+      _ = bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)) := by simp
+      _ ≤ bin db 1 v1 v2 * (1 * bin db 3 v3 (b 4)) :=
+          Int.mul_le_mul (Int.le_refl _) h2 (Int.mul_nonneg he hg) hc
+      _ = bin db 1 v1 v2 * bin db 3 v3 (b 4) := by simp
+  refine Int.le_trans
+    (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))))))
+      (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 1 v1 v2 * bin db 3 v3 (b 4))))
+      (fun v1 _ => rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => hpt v1 v2 v3)) ?_
+  refine Int.le_of_eq ?_
+  rw [show (fun v1 => rsum n (fun v2 => rsum n (fun v3 => bin db 1 v1 v2 * bin db 3 v3 (b 4))))
+      = (fun v1 => rsum n (fun v2 => bin db 1 v1 v2 * fbD n db b)) by
+        funext v1
+        refine congrArg (rsum n) (funext fun v2 =>
+          rsum_const_mul n (bin db 1 v1 v2) (fun v3 => bin db 3 v3 (b 4)))]
+  rw [show (fun v1 => rsum n (fun v2 => bin db 1 v1 v2 * fbD n db b))
+      = (fun v1 => rsum n (fun v2 => bin db 1 v1 v2) * fbD n db b) by
+        funext v1
+        exact rsum_mul_const n (fun v2 => bin db 1 v1 v2) (fbD n db b)]
+  rw [rsum_mul_const n (fun v1 => rsum n (fun v2 => bin db 1 v1 v2)) (fbD n db b)]
+  rw [Int.mul_comm]
+  try rfl
+
+private theorem fb_R_le_BC (n : Nat) (db : DB) (b : Bind) :
+    (reference pattern n (bin db) b : Int) ≤ triE n db 1 * triE n db 2 := by
+  rw [fb_hshape]
+  have hpt (v1 v2 v3 : Nat) :
+      bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+      ≤ bin db 1 v1 v2 * bin db 2 v2 v3 := by
+    have ha : 0 ≤ (bin db 0 (b 0) v1 : Int) := bin_nonneg db 0 (b 0) v1
+    have hc : 0 ≤ (bin db 1 v1 v2 : Int) := bin_nonneg db 1 v1 v2
+    have he : 0 ≤ (bin db 2 v2 v3 : Int) := bin_nonneg db 2 v2 v3
+    have hg : 0 ≤ (bin db 3 v3 (b 4) : Int) := bin_nonneg db 3 v3 (b 4)
+    have h0 : bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+        ≤ 1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))) :=
+      Int.mul_le_mul (bin_le_one db 0 (b 0) v1) (Int.le_refl _)
+        (Int.mul_nonneg hc (Int.mul_nonneg he hg)) (by omega)
+    have h2 : bin db 2 v2 v3 * bin db 3 v3 (b 4) ≤ bin db 2 v2 v3 * 1 :=
+      Int.mul_le_mul (Int.le_refl _) (bin_le_one db 3 v3 (b 4)) hg he
+    calc bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)))
+        ≤ 1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))) := h0
+      _ = bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4)) := by simp
+      _ ≤ bin db 1 v1 v2 * (bin db 2 v2 v3 * 1) :=
+          Int.mul_le_mul (Int.le_refl _) h2 (Int.mul_nonneg he hg) hc
+      _ = bin db 1 v1 v2 * bin db 2 v2 v3 := by simp
+  refine Int.le_trans
+    (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 0 (b 0) v1 * (bin db 1 v1 v2 * (bin db 2 v2 v3 * bin db 3 v3 (b 4))))))
+      (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 1 v1 v2 * bin db 2 v2 v3)))
+      (fun v1 _ => rsum_le n _ _ fun v2 _ => rsum_le n _ _ fun v3 _ => hpt v1 v2 v3)) ?_
+  have hrow (v2 : Nat) (hv2 : v2 < n) :
+      rsum n (fun v3 => bin db 2 v2 v3) ≤ triE n db 2 :=
+    rsum_ge_single n v2 (fun u => rsum n (fun v3 => bin db 2 u v3)) hv2
+      fun u _ => rsum_nonneg n (fun v3 => bin db 2 u v3) fun v3 _ => bin_nonneg db 2 u v3
+  refine Int.le_trans
+    (rsum_le n (fun v1 => rsum n (fun v2 => rsum n (fun v3 =>
+        bin db 1 v1 v2 * bin db 2 v2 v3)))
+      (fun v1 => rsum n (fun v2 => bin db 1 v1 v2 * triE n db 2))
+      (fun v1 _ => rsum_le n _ _ fun v2 hv2 =>
+        Int.le_trans (Int.le_of_eq
+          (rsum_const_mul n (bin db 1 v1 v2) (fun v3 => bin db 2 v2 v3)))
+          (Int.mul_le_mul (Int.le_refl _) (hrow v2 hv2)
+            (rsum_nonneg n (fun v3 => bin db 2 v2 v3) fun v3 _ => bin_nonneg db 2 v2 v3)
+            (bin_nonneg db 1 v1 v2)))) ?_
+  refine Int.le_of_eq ?_
+  rw [show (fun v1 => rsum n (fun v2 => bin db 1 v1 v2 * triE n db 2))
+      = (fun v1 => rsum n (fun v2 => bin db 1 v1 v2) * triE n db 2) by
+        funext v1; exact rsum_mul_const n (fun v2 => bin db 1 v1 v2) (triE n db 2)]
+  rw [rsum_mul_const n (fun v1 => rsum n (fun v2 => bin db 1 v1 v2)) (triE n db 2)]
+  try rfl
+
+private theorem fc_fb (T A B C D : Nat) (hAC : T ≤ A * C) (hBD : T ≤ B * D) (hBC : T ≤ B * C) :
+    ∀ den w0 w1 w2 w3 : Nat, 0 < den → den ≤ w0 + w1 → den ≤ w1 + w2 → den ≤ w2 + w3 →
+      T ^ den ≤ A ^ w0 * B ^ w1 * C ^ w2 * D ^ w3 := by
+  intro den
+  induction den using Nat.strongRecOn with
+  | ind den ih =>
+      intro w0 w1 w2 w3 hden h1 h2 h3
+      rcases Nat.eq_zero_or_pos T with hT0 | hTp
+      · rw [hT0, Nat.zero_pow (by omega)]
+        exact Nat.zero_le _
+      · have hA1 : 1 ≤ A := by
+          rcases Nat.eq_zero_or_pos A with hz | hz
+          · rw [hz, Nat.zero_mul] at hAC; omega
+          · omega
+        have hB1 : 1 ≤ B := by
+          rcases Nat.eq_zero_or_pos B with hz | hz
+          · rw [hz, Nat.zero_mul] at hBD; omega
+          · omega
+        have hC1 : 1 ≤ C := by
+          rcases Nat.eq_zero_or_pos C with hz | hz
+          · rw [hz, Nat.mul_zero] at hAC; omega
+          · omega
+        have hD1 : 1 ≤ D := by
+          rcases Nat.eq_zero_or_pos D with hz | hz
+          · rw [hz, Nat.mul_zero] at hBD; omega
+          · omega
+        have hcase :
+            (w0 > 0 ∧ w2 > 0) ∨ (w1 > 0 ∧ w3 > 0) ∨ (w1 > 0 ∧ w2 > 0 ∧ w1 + w2 > den) := by omega
+        rcases hcase with ⟨hw0, hw2⟩ | ⟨hw1, hw3⟩ | ⟨hw1, hw2, hsl⟩
+        · -- AC move
+          have hih : T ^ (den - 1) ≤
+              A ^ (w0 - 1) * B ^ w1 * C ^ (w2 - 1) * D ^ w3 := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ (w0 - 1) := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ w1 := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ (w2 - 1) := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ w3 := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ (w0 - 1) * B ^ w1 := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ (w2 - 1) * D ^ w3 := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) (w0 - 1) w1 (w2 - 1) w3 (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hAC) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul A w0 (by omega), pow_pred_mul C w2 (by omega)]
+          ac_rfl
+        · -- BD move
+          have hih : T ^ (den - 1) ≤
+              A ^ w0 * B ^ (w1 - 1) * C ^ w2 * D ^ (w3 - 1) := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ w0 := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ (w1 - 1) := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ w2 := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ (w3 - 1) := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ w0 * B ^ (w1 - 1) := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ w2 * D ^ (w3 - 1) := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) w0 (w1 - 1) w2 (w3 - 1) (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hBD) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul B w1 (by omega), pow_pred_mul D w3 (by omega)]
+          ac_rfl
+        · -- BC move
+          have hih : T ^ (den - 1) ≤
+              A ^ w0 * B ^ (w1 - 1) * C ^ (w2 - 1) * D ^ w3 := by
+            rcases Nat.eq_zero_or_pos (den - 1) with hz | hz
+            · rw [hz, Nat.pow_zero]
+              have ha : 1 ≤ A ^ w0 := Nat.one_le_pow _ _ hA1
+              have hb : 1 ≤ B ^ (w1 - 1) := Nat.one_le_pow _ _ hB1
+              have hc : 1 ≤ C ^ (w2 - 1) := Nat.one_le_pow _ _ hC1
+              have hd : 1 ≤ D ^ w3 := Nat.one_le_pow _ _ hD1
+              have h0 : (1 : Nat) * 1 ≤ A ^ w0 * B ^ (w1 - 1) := Nat.mul_le_mul ha hb
+              have h20 : (1 : Nat) * 1 ≤ C ^ (w2 - 1) * D ^ w3 := Nat.mul_le_mul hc hd
+              have := Nat.mul_le_mul h0 h20
+              simpa [Nat.mul_assoc] using this
+            · exact ih (den - 1) (by omega) w0 (w1 - 1) (w2 - 1) w3 (by omega) (by omega)
+                (by omega) (by omega)
+          rw [show den = (den - 1) + 1 by omega, Nat.pow_add, Nat.pow_one]
+          refine Nat.le_trans (Nat.mul_le_mul hih hBC) (Nat.le_of_eq ?_)
+          rw [pow_pred_mul B w1 (by omega), pow_pred_mul C w2 (by omega)]
+          ac_rfl
+
+theorem sound_FractionalCap : FractionalCap.Goal := by
+  intro n db b weights den hcover
+  obtain ⟨hpos, hlen, hv⟩ := hcover
+  obtain ⟨w0, w1, w2, w3, rfl⟩ := list4_of_length4 weights hlen
+  have hzip : pattern.atoms.zip [w0, w1, w2, w3] =
+      [(⟨0, 0, 1⟩, w0), (⟨1, 1, 2⟩, w1), (⟨2, 2, 3⟩, w2), (⟨3, 3, 4⟩, w3)] := by
+    simp [pattern, List.zip]
+  have hv1 := hv 1 (by simp [pattern])
+  have hv2 := hv 2 (by simp [pattern])
+  have hv3 := hv 3 (by simp [pattern])
+  rw [hzip] at hv1 hv2 hv3
+  simp at hv1 hv2 hv3
+  rw [show (fun r x y => if db r x y == 0 then 0 else 1) = bin db from rfl]
+  have hcount : (reference pattern n (bin db) b).toNat = (satBindings pattern n db b).length := by
+    rw [reference_bin_count pattern n db b]
+    exact Int.ofNat_inj.mp (Int.toNat_of_nonneg (int_coe_nonneg _))
+  rw [hcount]
+  have hrhs : ((pattern.atoms.zip [w0, w1, w2, w3]).map (fun (a, w) =>
+      support n db a pattern b ^ w)).prod =
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 *
+        (support n db ⟨1, 1, 2⟩ pattern b ^ w1 *
+          (support n db ⟨2, 2, 3⟩ pattern b ^ w2 * support n db ⟨3, 3, 4⟩ pattern b ^ w3)) := by
+    rw [hzip]
+    simp
+  rw [hrhs]
+  have hL : ((satBindings pattern n db b).length : Int) = reference pattern n (bin db) b :=
+    (reference_bin_count pattern n db b).symm
+  have hS0 : (support n db ⟨0, 0, 1⟩ pattern b : Int) = fbA n db b :=
+    support_eq_pin pattern n db b 0 0 1 (by simp [pattern]) (by simp [pattern])
+  have hS1 : (support n db ⟨1, 1, 2⟩ pattern b : Int) = triE n db 1 :=
+    support_eq_triE pattern n db b 1 1 2 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (support n db ⟨2, 2, 3⟩ pattern b : Int) = triE n db 2 :=
+    support_eq_triE pattern n db b 2 2 3 (by simp [pattern]) (by simp [pattern])
+  have hS3 : (support n db ⟨3, 3, 4⟩ pattern b : Int) = fbD n db b :=
+    support_eq_pindst pattern n db b 3 3 4 (by simp [pattern]) (by simp [pattern])
+  have hp1 : (satBindings pattern n db b).length ≤
+      support n db ⟨0, 0, 1⟩ pattern b * support n db ⟨2, 2, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS0, hS2]
+    exact fb_R_le_AC n db b
+  have hp2 : (satBindings pattern n db b).length ≤
+      support n db ⟨1, 1, 2⟩ pattern b * support n db ⟨3, 3, 4⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS1, hS3]
+    have hbd := fb_R_le_BD n db b
+    rw [Int.mul_comm] at hbd
+    exact hbd
+  have hp3 : (satBindings pattern n db b).length ≤
+      support n db ⟨1, 1, 2⟩ pattern b * support n db ⟨2, 2, 3⟩ pattern b := by
+    apply Int.ofNat_le.mp
+    rw [Int.natCast_mul, hL, hS1, hS2]
+    exact fb_R_le_BC n db b
+  have hmain : (satBindings pattern n db b).length ^ den ≤
+      support n db ⟨0, 0, 1⟩ pattern b ^ w0 * support n db ⟨1, 1, 2⟩ pattern b ^ w1 *
+        support n db ⟨2, 2, 3⟩ pattern b ^ w2 * support n db ⟨3, 3, 4⟩ pattern b ^ w3 := by
+    refine fc_fb _ _ _ _ _ hp1 hp2 hp3 den w0 w1 w2 w3 hpos ?_ ?_ ?_
+    · omega
+    · omega
+    · omega
+  refine Nat.le_trans hmain (Nat.le_of_eq ?_)
+  ac_rfl
+end FriendBridge
+
+namespace ForumBowtie
+open TinylambOpt.ResearchGoals.Atlas.JoinPlans.ForumBowtie
+private theorem cover_decomp : ∀ den w0 w1 w2 w3 w4 w5 : Nat,
+    den ≤ w0 + w1 → den ≤ w1 + w2 → den ≤ w3 + w4 → den ≤ w4 + w5 →
+    den ≤ w0 + w2 + w3 + w5 →
+    ∃ t1 t2 t3 t4 t5 t6 t7 s1 s4 : Nat,
+      t1 + t2 + t3 + t4 + t5 + t6 + t7 + 2 * (s1 + s4) = den ∧
+      (t1 + t6 + t7) + s4 ≤ w0 ∧
+      (t1 + t2 + t3 + t4 + t5) + 2*s1 ≤ w1 ∧
+      (t2 + t6 + t7) + s4 ≤ w2 ∧
+      (t3 + t5 + t7) + s1 ≤ w3 ∧
+      (t1 + t2 + t3 + t4 + t6) + 2*s4 ≤ w4 ∧
+      (t4 + t5 + t7) + s1 ≤ w5 := by
+  intro den
+  induction den using Nat.strongRecOn with
+  | ind den ih =>
+      intro w0 w1 w2 w3 w4 w5 h0 h1 h3 h4 h5
+      by_cases hden : den = 0
+      · subst den
+        exact ⟨0,0,0,0,0,0,0,0,0, by simp⟩
+      by_cases hC1 : 0 < w0 ∧ 0 < w1 ∧ 0 < w4 ∧ den + 1 ≤ w0 + w1
+      · rcases ih (den-1) (by omega) (w0-1) (w1-1) w2 w3 (w4-1) w5
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1+1,t2,t3,t4,t5,t6,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC2 : 0 < w1 ∧ 0 < w4 ∧ 0 < w2 ∧ den + 1 ≤ w1 + w2
+      · rcases ih (den-1) (by omega) w0 (w1-1) (w2-1) w3 (w4-1) w5
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2+1,t3,t4,t5,t6,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC3 : 0 < w1 ∧ 0 < w4 ∧ 0 < w3 ∧ den + 1 ≤ w3 + w4
+      · rcases ih (den-1) (by omega) w0 (w1-1) w2 (w3-1) (w4-1) w5
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3+1,t4,t5,t6,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC4 : 0 < w1 ∧ 0 < w4 ∧ 0 < w5 ∧ den + 1 ≤ w4 + w5
+      · rcases ih (den-1) (by omega) w0 (w1-1) w2 w3 (w4-1) (w5-1)
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4+1,t5,t6,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC5 : 0 < w1 ∧ 0 < w3 ∧ 0 < w5 ∧ den + 1 ≤ w0 + w2 + w3 + w5
+      · rcases ih (den-1) (by omega) w0 (w1-1) w2 (w3-1) w4 (w5-1)
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4,t5+1,t6,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC6 : 0 < w0 ∧ 0 < w2 ∧ 0 < w4 ∧ den + 1 ≤ w0 + w2 + w3 + w5
+      · rcases ih (den-1) (by omega) (w0-1) w1 (w2-1) w3 (w4-1) w5
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4,t5,t6+1,t7,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hC7 : 0 < w0 ∧ 0 < w2 ∧ 0 < w3 ∧ 0 < w5 ∧ den + 3 ≤ w0 + w2 + w3 + w5
+      · rcases ih (den-1) (by omega) (w0-1) w1 (w2-1) (w3-1) w4 (w5-1)
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4,t5,t6,t7+1,s1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hS1 : 2 ≤ den ∧ 2 ≤ w1 ∧ 0 < w3 ∧ 0 < w4 ∧ 0 < w5
+      · rcases ih (den-2) (by omega) w0 (w1-2) w2 (w3-1) (w4-1) (w5-1)
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4,t5,t6,t7,s1+1,s4,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hS4 : 2 ≤ den ∧ 2 ≤ w4 ∧ 0 < w0 ∧ 0 < w1 ∧ 0 < w2
+      · rcases ih (den-2) (by omega) (w0-1) (w1-1) (w2-1) w3 (w4-2) w5
+          (by omega) (by omega) (by omega) (by omega) (by omega)
+          with ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4,hs,hu0,hu1,hu2,hu3,hu4,hu5⟩
+        refine ⟨t1,t2,t3,t4,t5,t6,t7,s1,s4+1,?_,?_,?_,?_,?_,?_,?_⟩ <;> omega
+      by_cases hp0 : 0 < w0 <;>
+      by_cases hp1 : 0 < w1 <;>
+      by_cases hp2 : 0 < w2 <;>
+      by_cases hp3 : 0 < w3 <;>
+      by_cases hp4 : 0 < w4 <;>
+      by_cases hp5 : 0 < w5 <;>
+      simp [hp0, hp1, hp2, hp3, hp4, hp5] at hC1 hC2 hC3 hC4 hC5 hC6 hC7 hS1 hS4 <;> omega
+
+/-! ---------- finite sums ---------- -/
+
+private theorem reference_shape (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b =
+      rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v3 => rsum n (fun v0 =>
+        bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+        (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))))) := by
+  simp [reference, pattern, integrate, value, put, rsum, bin]
+
+private def T1 (n : Nat) (db : DB) (u : Nat) : Int :=
+  rsum n (fun x => rsum n (fun y => bin db 0 u x * (bin db 1 x y * bin db 2 y u)))
+
+private def T2 (n : Nat) (db : DB) (u : Nat) : Int :=
+  rsum n (fun v => rsum n (fun w => bin db 0 u v * (bin db 1 v w * bin db 2 w u)))
+
+private def Nbow (n : Nat) (db : DB) : Int := rsum n (fun u => T1 n db u * T2 n db u)
+
+private theorem factor_four (n : Nat) (A B : Nat → Nat → Int) :
+    rsum n (fun a => rsum n (fun b => rsum n (fun c => rsum n (fun d => A a b * B c d)))) =
+      (rsum n (fun a => rsum n (fun b => A a b))) *
+      (rsum n (fun c => rsum n (fun d => B c d))) := by
+  let K : Int := rsum n (fun c => rsum n (fun d => B c d))
+  have hinner : ∀ a b, rsum n (fun c => rsum n (fun d => A a b * B c d)) = A a b * K := by
+    intro a b
+    dsimp only [K]
+    calc
+      rsum n (fun c => rsum n (fun d => A a b * B c d))
+          = rsum n (fun c => A a b * rsum n (fun d => B c d)) := by
+              apply rsum_congr; intro c hc
+              rw [rsum_const_mul]
+      _ = A a b * rsum n (fun c => rsum n (fun d => B c d)) := by
+              rw [rsum_const_mul]
+  have h1 : rsum n (fun a => rsum n (fun b => rsum n (fun c => rsum n (fun d => A a b * B c d)))) =
+      rsum n (fun a => rsum n (fun b => A a b * K)) := by
+    apply rsum_congr; intro a ha
+    apply rsum_congr; intro b hb
+    exact hinner a b
+  rw [h1]
+  have h2 : rsum n (fun a => rsum n (fun b => A a b * K)) =
+      rsum n (fun a => (rsum n (fun b => A a b)) * K) := by
+    apply rsum_congr; intro a ha
+    rw [rsum_mul_const]
+  rw [h2]
+  rw [rsum_mul_const]
+
+private theorem sum_T2_eq_triT (n : Nat) (db : DB) :
+    rsum n (fun u => T2 n db u) = triT n db 0 1 2 := by
+  dsimp only [T2, triT]
+  apply rsum_congr
+  intro u hu
+  apply rsum_congr
+  intro v hv
+  apply rsum_congr
+  intro w hw
+  ac_rfl
+
+private theorem reference_bin_bow (n : Nat) (db : DB) (b : Bind) :
+    reference pattern n (bin db) b = Nbow n db := by
+  rw [reference_shape n db b]
+  dsimp only [Nbow, T1, T2]
+  calc
+    rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v3 => rsum n (fun v0 =>
+        bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+        (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0)))))))))
+      = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v0 => rsum n (fun v3 =>
+          bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+          (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))))) := by
+          apply rsum_congr; intro v1 h1
+          apply rsum_congr; intro v2 h2
+          apply rsum_congr; intro v4 h4
+          rw [rsum_comm]
+    _ = rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v0 => rsum n (fun v4 => rsum n (fun v3 =>
+          bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+          (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))))) := by
+          apply rsum_congr; intro v1 h1
+          apply rsum_congr; intro v2 h2
+          rw [rsum_comm]
+    _ = rsum n (fun v1 => rsum n (fun v0 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v3 =>
+          bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+          (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))))) := by
+          apply rsum_congr; intro v1 h1
+          rw [rsum_comm]
+    _ = rsum n (fun v0 => rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v3 =>
+          bin db 0 v0 v1 * (bin db 1 v1 v2 * (bin db 2 v2 v0 *
+          (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))))) := by
+          rw [rsum_comm]
+    _ = rsum n (fun v0 => rsum n (fun v1 => rsum n (fun v2 => rsum n (fun v4 => rsum n (fun v3 =>
+          (bin db 0 v0 v1 * (bin db 1 v1 v2 * bin db 2 v2 v0)) *
+          (bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))))) := by
+          apply rsum_congr; intro v0 h0
+          apply rsum_congr; intro v1 h1
+          apply rsum_congr; intro v2 h2
+          apply rsum_congr; intro v4 h4
+          apply rsum_congr; intro v3 h3
+          ac_rfl
+    _ = rsum n (fun v0 =>
+          (rsum n (fun v1 => rsum n (fun v2 => bin db 0 v0 v1 * (bin db 1 v1 v2 * bin db 2 v2 v0)))) *
+          (rsum n (fun v4 => rsum n (fun v3 => bin db 0 v0 v3 * (bin db 1 v3 v4 * bin db 2 v4 v0))))) := by
+          apply rsum_congr; intro v0 h0
+          rw [factor_four]
+    _ = rsum n (fun v0 => T1 n db v0 * T2 n db v0) := by
+          apply rsum_congr; intro v0 h0
+          congr 1
+          dsimp only [T2]
+          rw [rsum_comm]
+
+private theorem T1_nonneg (n : Nat) (db : DB) (u : Nat) : 0 ≤ T1 n db u := by
+  dsimp only [T1]
+  apply rsum_nonneg; intro x hx
+  apply rsum_nonneg; intro y hy
+  exact Int.mul_nonneg (bin_nonneg db 0 u x)
+    (Int.mul_nonneg (bin_nonneg db 1 x y) (bin_nonneg db 2 y u))
+
+private theorem T2_nonneg (n : Nat) (db : DB) (u : Nat) : 0 ≤ T2 n db u := by
+  dsimp only [T2]
+  apply rsum_nonneg; intro v hv
+  apply rsum_nonneg; intro w hw
+  exact Int.mul_nonneg (bin_nonneg db 0 u v)
+    (Int.mul_nonneg (bin_nonneg db 1 v w) (bin_nonneg db 2 w u))
+
+private theorem Nbow_nonneg (n : Nat) (db : DB) : 0 ≤ Nbow n db := by
+  dsimp only [Nbow]
+  apply rsum_nonneg; intro u hu
+  exact Int.mul_nonneg (T1_nonneg n db u) (T2_nonneg n db u)
+
+private theorem T1_le_triE1 (n : Nat) (db : DB) (u : Nat) : T1 n db u ≤ triE n db 1 := by
+  have hpt : ∀ x y, bin db 0 u x * (bin db 1 x y * bin db 2 y u) ≤ bin db 1 x y := by
+    intro x y
+    have h0 : 0 ≤ bin db 0 u x := bin_nonneg db 0 u x
+    have h0le : bin db 0 u x ≤ 1 := bin_le_one db 0 u x
+    have h2 : 0 ≤ bin db 2 y u := bin_nonneg db 2 y u
+    have h2le : bin db 2 y u ≤ 1 := bin_le_one db 2 y u
+    have h1 : 0 ≤ bin db 1 x y := bin_nonneg db 1 x y
+    have hprod : bin db 0 u x * bin db 2 y u ≤ 1 := by
+      have hh := Int.mul_le_mul h0le h2le h2 (by omega : (0 : Int) ≤ 1)
+      simpa using hh
+    have hprod0 : 0 ≤ bin db 0 u x * bin db 2 y u := Int.mul_nonneg h0 h2
+    have hh := Int.mul_le_mul (Int.le_refl (bin db 1 x y)) hprod hprod0 h1
+    calc
+      bin db 0 u x * (bin db 1 x y * bin db 2 y u)
+          = bin db 1 x y * (bin db 0 u x * bin db 2 y u) := by ac_rfl
+      _ ≤ bin db 1 x y * 1 := hh
+      _ = bin db 1 x y := by rw [Int.mul_one]
+  dsimp only [T1, triE]
+  calc
+    rsum n (fun x => rsum n (fun y => bin db 0 u x * (bin db 1 x y * bin db 2 y u)))
+        ≤ rsum n (fun x => rsum n (fun y => bin db 1 x y)) := by
+            apply rsum_le; intro x hx
+            apply rsum_le; intro y hy
+            exact hpt x y
+    _ = rsum n (fun x => rsum n (fun y => bin db 1 x y)) := rfl
+
+private theorem T2_le_triE1 (n : Nat) (db : DB) (u : Nat) : T2 n db u ≤ triE n db 1 := by
+  have hpt : ∀ v w, bin db 0 u v * (bin db 1 v w * bin db 2 w u) ≤ bin db 1 v w := by
+    intro v w
+    have h0 : 0 ≤ bin db 0 u v := bin_nonneg db 0 u v
+    have h0le : bin db 0 u v ≤ 1 := bin_le_one db 0 u v
+    have h2 : 0 ≤ bin db 2 w u := bin_nonneg db 2 w u
+    have h2le : bin db 2 w u ≤ 1 := bin_le_one db 2 w u
+    have h1 : 0 ≤ bin db 1 v w := bin_nonneg db 1 v w
+    have hprod : bin db 0 u v * bin db 2 w u ≤ 1 := by
+      have hh := Int.mul_le_mul h0le h2le h2 (by omega : (0 : Int) ≤ 1)
+      simpa using hh
+    have hprod0 : 0 ≤ bin db 0 u v * bin db 2 w u := Int.mul_nonneg h0 h2
+    have hh := Int.mul_le_mul (Int.le_refl (bin db 1 v w)) hprod hprod0 h1
+    calc
+      bin db 0 u v * (bin db 1 v w * bin db 2 w u)
+          = bin db 1 v w * (bin db 0 u v * bin db 2 w u) := by ac_rfl
+      _ ≤ bin db 1 v w * 1 := hh
+      _ = bin db 1 v w := by rw [Int.mul_one]
+  dsimp only [T2, triE]
+  apply rsum_le; intro v hv
+  apply rsum_le; intro w hw
+  exact hpt v w
+
+private theorem bow_sq (n : Nat) (db : DB) :
+    Nbow n db ^ 2 ≤ triE n db 0 * triE n db 1 ^ 3 * triE n db 2 := by
+  have htri := triangle_sq n db 0 1 2
+  let Tri : Int := triT n db 0 1 2
+  have hTri_nonneg : 0 ≤ Tri := by
+    dsimp only [Tri]
+    rw [← sum_T2_eq_triT n db]
+    apply rsum_nonneg; intro u hu
+    exact T2_nonneg n db u
+  have hNle : Nbow n db ≤ triE n db 1 * Tri := by
+    calc
+      Nbow n db = rsum n (fun u => T1 n db u * T2 n db u) := rfl
+      _ ≤ rsum n (fun u => triE n db 1 * T2 n db u) := by
+          apply rsum_le; intro u hu
+          exact Int.mul_le_mul (T1_le_triE1 n db u) (Int.le_refl (T2 n db u))
+            (T2_nonneg n db u) (triE_nonneg n db 1)
+      _ = triE n db 1 * rsum n (fun u => T2 n db u) := by
+          rw [rsum_const_mul]
+      _ = triE n db 1 * Tri := by
+          dsimp only [Tri]
+          rw [sum_T2_eq_triT]
+  have hNle2 : Nbow n db ^ 2 ≤ (triE n db 1 * Tri) ^ 2 := by
+    have hn := Nbow_nonneg n db
+    have hr : 0 ≤ triE n db 1 * Tri := Int.mul_nonneg (triE_nonneg n db 1) hTri_nonneg
+    have h := Int.mul_le_mul hNle hNle hn hr
+    have hp1 : Nbow n db ^ 2 = Nbow n db * Nbow n db := by
+      rw [Int.pow_succ, Int.pow_one]
+    have hp2 : (triE n db 1 * Tri) ^ 2 = (triE n db 1 * Tri) * (triE n db 1 * Tri) := by
+      rw [Int.pow_succ, Int.pow_one]
+    rw [hp1, hp2]
+    exact h
+  have htri' : Tri ^ 2 ≤ triE n db 0 * triE n db 1 * triE n db 2 := by
+    dsimp only [Tri]
+    exact htri
+  have hE1sq_nonneg : 0 ≤ triE n db 1 ^ 2 := Int.sq_nonneg _
+  have hmul := Int.mul_le_mul (Int.le_refl (triE n db 1 ^ 2)) htri'
+    (Int.sq_nonneg Tri) hE1sq_nonneg
+  calc
+    Nbow n db ^ 2 ≤ (triE n db 1 * Tri) ^ 2 := hNle2
+    _ = (triE n db 1 ^ 2) * (Tri ^ 2) := by grind
+    _ ≤ (triE n db 1 ^ 2) * (triE n db 0 * triE n db 1 * triE n db 2) := hmul
+    _ = triE n db 0 * triE n db 1 ^ 3 * triE n db 2 := by grind
+
+
+private def a0 : Atom := ⟨0, 0, 1⟩
+private def a1 : Atom := ⟨1, 1, 2⟩
+private def a2 : Atom := ⟨2, 2, 0⟩
+private def a3 : Atom := ⟨0, 0, 3⟩
+private def a4 : Atom := ⟨1, 3, 4⟩
+private def a5 : Atom := ⟨2, 4, 0⟩
+
+private def C1 : List Atom := [a0, a1, a4]
+private def C2 : List Atom := [a1, a4, a2]
+private def C3 : List Atom := [a1, a4, a3]
+private def C4 : List Atom := [a1, a4, a5]
+private def C5 : List Atom := [a1, a3, a5]
+private def C6 : List Atom := [a0, a2, a4]
+private def C7 : List Atom := [a0, a2, a3, a5]
+
+private theorem cover_C1 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C1, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C2 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C2, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C3 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C3, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C4 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C4, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C5 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C5, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C6 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C6, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem cover_C7 : ∀ v ∈ pattern.freeVars, ∃ a ∈ C7, a.src = v ∨ a.dst = v := by
+  native_decide
+private theorem atoms_C1 : ∀ a ∈ C1, a ∈ pattern.atoms := by
+  intro a ha; simp [C1, a0, a1, a4] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C2 : ∀ a ∈ C2, a ∈ pattern.atoms := by
+  intro a ha; simp [C2, a1, a4, a2] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C3 : ∀ a ∈ C3, a ∈ pattern.atoms := by
+  intro a ha; simp [C3, a1, a4, a3] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C4 : ∀ a ∈ C4, a ∈ pattern.atoms := by
+  intro a ha; simp [C4, a1, a4, a5] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C5 : ∀ a ∈ C5, a ∈ pattern.atoms := by
+  intro a ha; simp [C5, a1, a3, a5] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C6 : ∀ a ∈ C6, a ∈ pattern.atoms := by
+  intro a ha; simp [C6, a0, a2, a4] at ha ⊢
+  rcases ha with rfl | rfl | rfl <;> simp [pattern]
+private theorem atoms_C7 : ∀ a ∈ C7, a ∈ pattern.atoms := by
+  intro a ha; simp [C7, a0, a2, a3, a5] at ha ⊢
+  rcases ha with rfl | rfl | rfl | rfl <;> simp [pattern]
+private theorem fv_nodup : pattern.freeVars.Nodup := by native_decide
+
+private theorem list6_of_length6 {α : Type} (l : List α) (h : l.length = 6) :
+    ∃ a b c d e f, l = [a, b, c, d, e, f] := by
+  cases l with
+  | nil => simp at h
+  | cons a l =>
+    cases l with
+    | nil => simp at h
+    | cons b l =>
+      cases l with
+      | nil => simp at h
+      | cons c l =>
+        cases l with
+        | nil => simp at h
+        | cons d l =>
+          cases l with
+          | nil => simp at h
+          | cons e l =>
+            cases l with
+            | nil => simp at h
+            | cons f l =>
+              cases l with
+              | nil => exact ⟨a, b, c, d, e, f, rfl⟩
+              | cons g l => simp at h
+
+
+private theorem bow_sq_nat (n : Nat) (db : DB) (b : Bind) :
+    let L : Nat := (satBindings pattern n db b).length
+    let S0 := support n db a0 pattern b
+    let S1 := support n db a1 pattern b
+    let S2 := support n db a2 pattern b
+    let S3 := support n db a3 pattern b
+    let S4 := support n db a4 pattern b
+    let S5 := support n db a5 pattern b
+    L ^ 2 ≤ S1 ^ 2 * S3 * S4 * S5 ∧ L ^ 2 ≤ S0 * S1 * S2 * S4 ^ 2 := by
+  dsimp only
+  let L : Nat := (satBindings pattern n db b).length
+  let S0 := support n db a0 pattern b
+  let S1 := support n db a1 pattern b
+  let S2 := support n db a2 pattern b
+  let S3 := support n db a3 pattern b
+  let S4 := support n db a4 pattern b
+  let S5 := support n db a5 pattern b
+  change L ^ 2 ≤ S1 ^ 2 * S3 * S4 * S5 ∧ L ^ 2 ≤ S0 * S1 * S2 * S4 ^ 2
+  have hL : (L : Int) = Nbow n db := by
+    dsimp only [L]
+    rw [← reference_bin_count pattern n db b, reference_bin_bow]
+  have hS0 : (S0 : Int) = triE n db 0 := by
+    dsimp only [S0, a0]
+    exact support_eq_triE pattern n db b 0 0 1 (by simp [pattern]) (by simp [pattern])
+  have hS1 : (S1 : Int) = triE n db 1 := by
+    dsimp only [S1, a1]
+    exact support_eq_triE pattern n db b 1 1 2 (by simp [pattern]) (by simp [pattern])
+  have hS2 : (S2 : Int) = triE n db 2 := by
+    dsimp only [S2, a2]
+    exact support_eq_triE pattern n db b 2 2 0 (by simp [pattern]) (by simp [pattern])
+  have hS3 : (S3 : Int) = triE n db 0 := by
+    dsimp only [S3, a3]
+    exact support_eq_triE pattern n db b 0 0 3 (by simp [pattern]) (by simp [pattern])
+  have hS4 : (S4 : Int) = triE n db 1 := by
+    dsimp only [S4, a4]
+    exact support_eq_triE pattern n db b 1 3 4 (by simp [pattern]) (by simp [pattern])
+  have hS5 : (S5 : Int) = triE n db 2 := by
+    dsimp only [S5, a5]
+    exact support_eq_triE pattern n db b 2 4 0 (by simp [pattern]) (by simp [pattern])
+  have hbsq := bow_sq n db
+  rw [← hL] at hbsq
+  have hnat : L ^ 2 ≤ S0 * S1 * S2 * S4 ^ 2 := by
+    apply Int.ofNat_le.mp
+    simp only [Int.natCast_pow, Int.natCast_mul]
+    rw [hS0, hS1, hS2, hS4]
+    grind
+  have hnat' : L ^ 2 ≤ S1 ^ 2 * S3 * S4 * S5 := by
+    apply Int.ofNat_le.mp
+    simp only [Int.natCast_pow, Int.natCast_mul]
+    rw [hS1, hS3, hS4, hS5]
+    grind
+  exact ⟨hnat', hnat⟩
+
+
+theorem sound_FractionalCap :
+    TinylambOpt.ResearchGoals.Atlas.JoinPlans.ForumBowtie.FractionalCap.Goal := by
+  intro n db b weights den hcov
+  rcases hcov with ⟨hdenpos, hlen, hc⟩
+  rcases list6_of_length6 weights (by simpa [pattern] using hlen) with
+    ⟨w0, w1, w2, w3, w4, w5, rfl⟩
+  have h0 : den ≤ w0 + w2 + w3 + w5 := by
+    have hh := hc 0 (by simp [pattern])
+    simp [pattern] at hh
+    omega
+  have h1 : den ≤ w0 + w1 := by
+    have hh := hc 1 (by simp [pattern])
+    simp [pattern] at hh
+    omega
+  have h2 : den ≤ w1 + w2 := by
+    have hh := hc 2 (by simp [pattern])
+    simp [pattern] at hh
+    omega
+  have h3 : den ≤ w3 + w4 := by
+    have hh := hc 3 (by simp [pattern])
+    simp [pattern] at hh
+    omega
+  have h4 : den ≤ w4 + w5 := by
+    have hh := hc 4 (by simp [pattern])
+    simp [pattern] at hh
+    omega
+  rcases cover_decomp den w0 w1 w2 w3 w4 w5 h1 h2 h3 h4 h0 with
+    ⟨t1, t2, t3, t4, t5, t6, t7, s1, s4, hs, hu0, hu1, hu2, hu3, hu4, hu5⟩
+  let S0 := support n db a0 pattern b
+  let S1 := support n db a1 pattern b
+  let S2 := support n db a2 pattern b
+  let S3 := support n db a3 pattern b
+  let S4 := support n db a4 pattern b
+  let S5 := support n db a5 pattern b
+  let L := (satBindings pattern n db b).length
+  have hb1 : L ≤ S0 * S1 * S4 := by
+    dsimp only [L, S0, S1, S4]
+    simpa [C1, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C1 cover_C1 atoms_C1 fv_nodup)
+  have hb2 : L ≤ S1 * S4 * S2 := by
+    dsimp only [L, S1, S4, S2]
+    simpa [C2, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C2 cover_C2 atoms_C2 fv_nodup)
+  have hb3 : L ≤ S1 * S4 * S3 := by
+    dsimp only [L, S1, S4, S3]
+    simpa [C3, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C3 cover_C3 atoms_C3 fv_nodup)
+  have hb4 : L ≤ S1 * S4 * S5 := by
+    dsimp only [L, S1, S4, S5]
+    simpa [C4, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C4 cover_C4 atoms_C4 fv_nodup)
+  have hb5 : L ≤ S1 * S3 * S5 := by
+    dsimp only [L, S1, S3, S5]
+    simpa [C5, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C5 cover_C5 atoms_C5 fv_nodup)
+  have hb6 : L ≤ S0 * S2 * S4 := by
+    dsimp only [L, S0, S2, S4]
+    simpa [C6, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C6 cover_C6 atoms_C6 fv_nodup)
+  have hb7 : L ≤ S0 * S2 * S3 * S5 := by
+    dsimp only [L, S0, S2, S3, S5]
+    simpa [C7, Nat.mul_assoc] using
+      (ordinary_cover_bound pattern n db b C7 cover_C7 atoms_C7 fv_nodup)
+  have hsq := bow_sq_nat n db b
+  dsimp only at hsq
+  have hsq1 : L ^ 2 ≤ S1 ^ 2 * S3 * S4 * S5 := by
+    simpa [L, S1, S3, S4, S5] using hsq.1
+  have hsq4 : L ^ 2 ≤ S0 * S1 * S2 * S4 ^ 2 := by
+    simpa [L, S0, S1, S2, S4] using hsq.2
+  have href : (reference pattern n (fun r x y => if db r x y == 0 then 0 else 1) b).toNat = L := by
+    have hbin : (fun r x y : Nat => if db r x y == 0 then (0 : Int) else 1) = bin db := by
+      funext r x y
+      simp [bin, beq_iff_eq]
+    rw [hbin]
+    dsimp only [L]
+    exact congrArg Int.toNat (reference_bin_count pattern n db b)
+  have hRHS :
+      ((pattern.atoms.zip [w0, w1, w2, w3, w4, w5]).map
+        (fun (a, w) => support n db a pattern b ^ w)).prod =
+      S0 ^ w0 * S1 ^ w1 * S2 ^ w2 * S3 ^ w3 * S4 ^ w4 * S5 ^ w5 := by
+    simp [pattern, S0, S1, S2, S3, S4, S5, a0, a1, a2, a3, a4, a5, Nat.mul_assoc]
+  rw [href, hRHS]
+  by_cases hL0 : L = 0
+  · rw [hL0]
+    simp [Nat.zero_pow hdenpos]
+  · have hLpos : 0 < L := Nat.pos_of_ne_zero hL0
+    have hSpos : ∀ a ∈ pattern.atoms, 0 < support n db a pattern b := by
+      intro a ha
+      have hlenpos : 0 < (satBindings pattern n db b).length := by simpa [L] using hLpos
+      obtain ⟨x, hx⟩ := List.exists_mem_of_ne_nil _ ((List.length_pos_iff).mp hlenpos)
+      have hxbind : x ∈ bindings n pattern.freeVars b := (List.mem_filter.mp hx).1
+      have hsat : satisfies pattern (bin db) x = true := (List.mem_filter.mp hx).2
+      have hnz : db a.rel (x a.src) (x a.dst) != 0 := by
+        have hall : pattern.atoms.all (fun t => value (bin db) t x != 0) = true := hsat
+        simpa [value, bin, beq_iff_eq] using (List.all_eq_true.mp hall a ha)
+      have hmemsl := supportList_mem pattern n db b a x hxbind hnz
+      have hslne : supportList pattern n db b a ≠ [] := by
+        intro hnil
+        have hnot : (x a.src, x a.dst) ∉ supportList pattern n db b a := by simp [hnil]
+        exact hnot hmemsl
+      have hslpos : 0 < (supportList pattern n db b a).length :=
+        (List.length_pos_iff).mpr hslne
+      rw [supportList_length] at hslpos
+      exact hslpos
+    have hS0p : 0 < S0 := by dsimp only [S0]; exact hSpos a0 (by simp [a0, pattern])
+    have hS1p : 0 < S1 := by dsimp only [S1]; exact hSpos a1 (by simp [a1, pattern])
+    have hS2p : 0 < S2 := by dsimp only [S2]; exact hSpos a2 (by simp [a2, pattern])
+    have hS3p : 0 < S3 := by dsimp only [S3]; exact hSpos a3 (by simp [a3, pattern])
+    have hS4p : 0 < S4 := by dsimp only [S4]; exact hSpos a4 (by simp [a4, pattern])
+    have hS5p : 0 < S5 := by dsimp only [S5]; exact hSpos a5 (by simp [a5, pattern])
+    let U0 := (t1 + t6 + t7) + s4
+    let U1 := (t1 + t2 + t3 + t4 + t5) + 2*s1
+    let U2 := (t2 + t6 + t7) + s4
+    let U3 := (t3 + t5 + t7) + s1
+    let U4 := (t1 + t2 + t3 + t4 + t6) + 2*s4
+    let U5 := (t4 + t5 + t7) + s1
+    have hU0 : U0 ≤ w0 := by dsimp only [U0]; exact hu0
+    have hU1 : U1 ≤ w1 := by dsimp only [U1]; exact hu1
+    have hU2 : U2 ≤ w2 := by dsimp only [U2]; exact hu2
+    have hU3 : U3 ≤ w3 := by dsimp only [U3]; exact hu3
+    have hU4 : U4 ≤ w4 := by dsimp only [U4]; exact hu4
+    have hU5 : U5 ≤ w5 := by dsimp only [U5]; exact hu5
+    have hbig : L ^ den ≤ S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 := by
+      have h1p := Nat.pow_le_pow_left hb1 t1
+      have h2p := Nat.pow_le_pow_left hb2 t2
+      have h3p := Nat.pow_le_pow_left hb3 t3
+      have h4p := Nat.pow_le_pow_left hb4 t4
+      have h5p := Nat.pow_le_pow_left hb5 t5
+      have h6p := Nat.pow_le_pow_left hb6 t6
+      have h7p := Nat.pow_le_pow_left hb7 t7
+      have hsp1 := Nat.pow_le_pow_left hsq1 s1
+      have hsp4 := Nat.pow_le_pow_left hsq4 s4
+      have hpoweq : L ^ den = L ^ (t1 + t2 + t3 + t4 + t5 + t6 + t7) * (L ^ 2) ^ s1 * (L ^ 2) ^ s4 := by
+        rw [show den = (t1 + t2 + t3 + t4 + t5 + t6 + t7) + 2*s1 + 2*s4 by omega]
+        rw [Nat.pow_add, Nat.pow_add]
+        rw [Nat.pow_mul, Nat.pow_mul]
+      rw [hpoweq]
+      have hm1 := Nat.mul_le_mul h1p h2p
+      have hm2 := Nat.mul_le_mul hm1 h3p
+      have hm3 := Nat.mul_le_mul hm2 h4p
+      have hm4 := Nat.mul_le_mul hm3 h5p
+      have hm5 := Nat.mul_le_mul hm4 h6p
+      have hm6 := Nat.mul_le_mul hm5 h7p
+      have hm7 := Nat.mul_le_mul hm6 hsp1
+      have hm8 := Nat.mul_le_mul hm7 hsp4
+      have hR : (S0 * S1 * S4) ^ t1 * (S1 * S4 * S2) ^ t2 * (S1 * S4 * S3) ^ t3 *
+          (S1 * S4 * S5) ^ t4 * (S1 * S3 * S5) ^ t5 * (S0 * S2 * S4) ^ t6 *
+          (S0 * S2 * S3 * S5) ^ t7 * (S1 ^ 2 * S3 * S4 * S5) ^ s1 *
+          (S0 * S1 * S2 * S4 ^ 2) ^ s4 =
+        S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 := by
+        dsimp only [U0, U1, U2, U3, U4, U5]
+        simp only [Nat.mul_pow, Nat.pow_add]
+        ac_rfl
+      rw [hR] at hm8
+      exact hm8
+    have hfinal : S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 ≤
+        S0 ^ w0 * S1 ^ w1 * S2 ^ w2 * S3 ^ w3 * S4 ^ w4 * S5 ^ w5 := by
+      have hp0 := pow_mono_of_pos hS0p hU0
+      have hp1 := pow_mono_of_pos hS1p hU1
+      have hp2 := pow_mono_of_pos hS2p hU2
+      have hp3 := pow_mono_of_pos hS3p hU3
+      have hp4 := pow_mono_of_pos hS4p hU4
+      have hp5 := pow_mono_of_pos hS5p hU5
+      have hm1 := Nat.mul_le_mul hp0 hp1
+      have hm2 := Nat.mul_le_mul hm1 hp2
+      have hm3 := Nat.mul_le_mul hm2 hp3
+      have hm4 := Nat.mul_le_mul hm3 hp4
+      exact Nat.mul_le_mul hm4 hp5
+    exact Nat.le_trans hbig hfinal
+
+theorem sound_CollisionCorrection : CollisionCorrection.Goal :=
+  fun n db b => collision_general pattern
+    (by native_decide) (by native_decide) (by decide)
+    (by intro x; simp [pattern, partitions, mobius, factorial, constOn, headOf] <;> by_cases h0 : x 1 = x 2 <;> by_cases h1 : x 1 = x 4 <;> by_cases h2 : x 1 = x 3 <;> by_cases h3 : x 1 = x 0 <;> by_cases h4 : x 2 = x 4 <;> by_cases h5 : x 2 = x 3 <;> by_cases h6 : x 2 = x 0 <;> by_cases h7 : x 4 = x 3 <;> by_cases h8 : x 4 = x 0 <;> by_cases h9 : x 3 = x 0 <;> simp_all (config := {decide := true}) [eq_comm])
+    n db b
+end ForumBowtie
+
+end TinylambOpt.ResearchProofs.Atlas.JoinPlans_WorkA

@@ -901,8 +901,8 @@ TEST(ExpressionTest, CaseExpression_NullClauseNodesDoNotCrash) {
   Expression damaged = CaseExpressionExp(
       {{nullptr, value}, {truthy, nullptr}, {nullptr, nullptr}}, value);
 
-  EXPECT_NO_THROW(damaged->TouchedColumns());
-  EXPECT_NO_THROW(damaged->ToString());
+  EXPECT_NO_THROW(static_cast<void>(damaged->TouchedColumns()));
+  EXPECT_NO_THROW(static_cast<void>(damaged->ToString()));
   EXPECT_EQ(damaged->ToString(),
             "CASE WHEN <null> THEN 7 WHEN 1 THEN <null> WHEN <null> THEN "
             "<null> ELSE 7 END");
@@ -1191,7 +1191,8 @@ TEST(ExpressionTest, FunctionCall_CoalesceAndConcat_EvaluatesCorrectly) {
   Expression concat_null = FunctionCallExp(
       "concat", {ConstantValueExp(Value("a")), ConstantValueExp(Value())});
 
-  EXPECT_EQ(coalesce->TryEvaluate(row, schema).GetStatus(), Status::kInvalidArgument);
+  EXPECT_EQ(coalesce->TryEvaluate(row, schema).GetStatus(),
+            Status::kInvalidArgument);
   EXPECT_TRUE(all_null->Evaluate(row, schema).IsNull());
   EXPECT_EQ(concat->Evaluate(row, schema), Value("abc"));
   EXPECT_TRUE(concat_null->Evaluate(row, schema).IsNull());
@@ -1826,7 +1827,8 @@ TEST(ExpressionTest, ExpressionBase_DefaultEvaluationAndTypeInference) {
   Row row;
   Schema schema;
 
-  EXPECT_EQ(bare.Evaluate(&row, schema, &row, schema), bare.Evaluate(row, schema));
+  EXPECT_EQ(bare.Evaluate(&row, schema, &row, schema),
+            bare.Evaluate(row, schema));
   EXPECT_TRUE(bare.Evaluate(nullptr, schema, &row, schema).IsNull());
   EXPECT_EQ(bare.ResultType(schema).GetType(), TypeTag::kInvalid);
   EXPECT_EQ(bare.ResultType(schema, schema).GetType(), TypeTag::kInvalid);
@@ -2483,14 +2485,14 @@ TEST(ExpressionTest, FunctionCall_VariousBuiltinFunctions_EvaluatesCorrectly) {
       eval("parse_timestamp", {Value("%Y-%m-%d %H:%M:%S"),
                                Value("2023-06-15 10:00:00"), Value("UTC")}),
       Value("2023-06-15 10:00:00+00"));
-  EXPECT_EQ(eval("parse_timestamp", {Value("%%%z %Y-%m-%d"),
-                                     Value("%+0000 2000-01-01"),
-                                     Value("Asia/Tokyo")}),
+  EXPECT_EQ(eval("parse_timestamp",
+                 {Value("%%%z %Y-%m-%d"), Value("%+0000 2000-01-01"),
+                  Value("Asia/Tokyo")}),
             Value("2000-01-01 00:00:00+00"));
-  EXPECT_EQ(eval("parse_timestamp", {Value("%%z %Y-%m-%d"),
-                                     Value("%z 2000-01-01"),
-                                     Value("Asia/Tokyo")}),
-            Value("1999-12-31 15:00:00+00"));
+  EXPECT_EQ(
+      eval("parse_timestamp", {Value("%%z %Y-%m-%d"), Value("%z 2000-01-01"),
+                               Value("Asia/Tokyo")}),
+      Value("1999-12-31 15:00:00+00"));
 }
 
 TEST(ExpressionTest,
@@ -3198,9 +3200,10 @@ TEST(ExpressionTest, WindowFunctionResultTypeDeclaredFromFunctionName) {
   // static type must be kArray, not the element type or VARCHAR.
   EXPECT_EQ(win("ARRAY_AGG", ColumnValueExp("x"))->ResultType(schema).GetType(),
             TypeTag::kArray);
-  EXPECT_EQ(
-      win("ARRAY_CONCAT_AGG", ColumnValueExp("x"))->ResultType(schema).GetType(),
-      TypeTag::kArray);
+  EXPECT_EQ(win("ARRAY_CONCAT_AGG", ColumnValueExp("x"))
+                ->ResultType(schema)
+                .GetType(),
+            TypeTag::kArray);
   EXPECT_EQ(win("APPROX_QUANTILES")->ResultType(schema).GetType(),
             TypeTag::kArray);
   // The two-schema overload stays in sync.

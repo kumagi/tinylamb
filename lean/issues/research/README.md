@@ -1,6 +1,14 @@
 # 次の SQL 最適化の未証明課題
 
-[DuckDB より遅かったクエリに対する未証明命題 50 件](duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。
+[圧縮と SQL 実行の未証明命題 1,000 件](storage-execution.md)。100 モデルの索引と、ClickBench の選択ビットマップの実測を収録。
+
+[可逆圧縮の研究課題 228 件と DuckDB との保存サイズ比較](compression.md)。ClickBench・TPC-H・TPC-DS の全列ファイルで試作形式の復元を検証。
+
+[SQL エンジンの高速化仮説 500 件](atlas.md)。提出型、具体的な反例、H5・C1 の基数上界を収録。
+
+[大胆な高速化仮説 110 件と反例 12 件](frontiers.md)。H2O H5 で行列のランクと集約ごとの圧縮粒度も調べました。
+
+[DuckDB より遅かったクエリから登録した命題 50 件](duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。7 モジュールすべてで `theorem sound_* : Goal` を証明済み（[RESULTS.md](RESULTS.md)）。
 
 [クラウド・BI の命題 42 件](cloud-bi.md)（第九波）は、CostBench、Snowset/PBench、Iceberg、Public BI の比較結果から、書き換え条件と実行方式の検証課題を定めています。42 件すべて `theorem sound_* : *.Goal` を証明済み（[RESULTS.md](RESULTS.md)）。
 
@@ -8,7 +16,14 @@
 
 各 Issue は独立した研究課題。課題の作成側で参照計算・入力条件・観測結果を定め、証明担当者へ渡す前に提出型を固定する。計算量の結論にはコストを数える評価器を用いる。
 
-証明・反例の登録結果は [RESULTS.md](RESULTS.md) を参照（初回 26 件＋型検査済み提出型 1 件、差し戻し後・新規の 7 件（第二波）、追加第三波 6 件、第四波 36 件（jit-skip 16 + engine-opt 20）、第五波 27 件、第六波 18 件、第二波からの複合提出型 1 件、第九波（クラウド・BI）42 件をすべて証明または反例登録し、`lake build`（CheckProofs の `sorryAx` 検査込み）成功）。
+証明・反例の登録結果は [RESULTS.md](RESULTS.md) を参照（初回 26 件＋型検査済み提出型 1 件、差し戻し後・新規の 7 件（第二波）、追加第三波 6 件、第四波 36 件（jit-skip 16 + engine-opt 20）、第五波 27 件、第六波 18 件、第二波からの複合提出型 1 件、第九波（クラウド・BI）42 件、DuckDB ギャップ 50 件をすべて証明または反例登録し、`lake build`（CheckProofs の `sorryAx` 検査込み）成功）。
+
+## DuckDB ギャップの命題（50 件・証明済み）
+
+[50 件の Issue と提出型](duckdb-gaps.md)。Cloud/BI 6 件、TPC-DS 8 件、ClickBench 8 件、
+TPC-H 7 件、Slices/FileMasks/Refresh/BridgeStates の派生 21 件。全 50 件
+`theorem sound_* : *.Goal` 証明済み（反例なし）。対応する証明は
+`ResearchProofs/DuckDBGaps/` の 7 モジュール。
 
 ## クラウド・BI ワークロードの命題（第九波・証明済み）
 

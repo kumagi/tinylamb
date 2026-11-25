@@ -1337,6 +1337,339 @@ TEST_F(RelationalRegressionTest, ExactIntegerRollupReusesWeightedFineGroups) {
   }
 }
 
+TEST_F(RelationalRegressionTest,
+       SurrogateKeyPreAggRollupMatchesCanonicalAndHandlesDuplicates) {
+  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+  //   (SurrogateKeyPreAggRollup_sound)
+  RelationalRun(*rs_,
+                "CREATE TABLE SurrInv (inv_date_sk INT64, inv_item_sk INT64, "
+                "inv_qty INT64)");
+  RelationalRun(*rs_, "CREATE TABLE SurrDate (d_date_sk INT64, d_month INT64)");
+  RelationalRun(
+      *rs_,
+      "CREATE TABLE SurrItem (i_item_sk INT64, i_prod STRING, i_brand STRING)");
+  RelationalRun(
+      *rs_,
+      "CREATE TABLE SurrItemDup (i_item_sk INT64, i_prod STRING, i_brand "
+      "STRING)");
+
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, inv,
+                          setup.GetTable("SurrInv"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dt,
+                          setup.GetTable("SurrDate"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, it,
+                          setup.GetTable("SurrItem"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, it_dup,
+                          setup.GetTable("SurrItemDup"));
+
+    for (int64_t d = 1; d <= 10; ++d) {
+      ASSERT_SUCCESS(
+          dt->Insert(setup.txn_, Row({Value(d), Value(d <= 6 ? 1 : 2)}))
+              .GetStatus());
+    }
+    // Distinct i_item_sk 1 and 2 share identical (i_prod, i_brand) to verify
+    // finest_keys_unique=false merges colliding attribute tuples.
+    // i_item_sk 3 has all-NULL inv_qty. NULL PK row must be skipped cleanly.
+    const std::vector<Row> item_rows = {
+        Row({Value(int64_t{1}), Value(std::string("pA")),
+             Value(std::string("b1"))}),
+        Row({Value(int64_t{2}), Value(std::string("pA")),
+             Value(std::string("b1"))}),
+        Row({Value(int64_t{3}), Value(std::string("pB")),
+             Value(std::string("b2"))}),
+        Row({Value(int64_t{4}), Value(std::string("pA")),
+             Value(std::string("b2"))}),
+        Row({Value(), Value(std::string("pNull")),
+             Value(std::string("bNull"))}),
+    };
+    for (const Row& r : item_rows) {
+      ASSERT_SUCCESS(it->Insert(setup.txn_, r).GetStatus());
+      ASSERT_SUCCESS(it_dup->Insert(setup.txn_, r).GetStatus());
+    }
+    // Add duplicate non-NULL PK to SurrItemDup to verify safe fallback.
+    ASSERT_SUCCESS(it_dup
+                       ->Insert(setup.txn_, Row({Value(int64_t{1}),
+                                                 Value(std::string("pA_dup")),
+                                                 Value(std::string("b1_dup"))}))
+                       .GetStatus());
+
+    for (int64_t i = 0; i < 400; ++i) {
+      const int64_t d = (i % 10) + 1;
+      const int64_t item_sk =
+          (i % 6);  // includes 0 (unmatched) and 5 (unmatched)
+      Value fk = (i % 17 == 0) ? Value() : Value(item_sk);
+      Value qty = (item_sk == 3 || i % 7 == 0) ? Value() : Value((i % 25) + 1);
+      ASSERT_SUCCESS(
+          inv->Insert(setup.txn_, Row({Value(d), fk, qty})).GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  for (const std::string& dim_table : {"SurrItem", "SurrItemDup"}) {
+    for (const int month_filter : {1, 999}) {
+      const std::string from_where =
+          " FROM SurrInv, SurrDate, " + dim_table +
+          " WHERE inv_date_sk = d_date_sk AND inv_item_sk = i_item_sk"
+          " AND d_month = " +
+          std::to_string(month_filter);
+      const std::string rollup_sql =
+          "SELECT i_prod, i_brand, AVG(inv_qty) AS qoh" + from_where +
+          " GROUP BY ROLLUP (i_prod, i_brand)";
+      const auto got = RelationalRun(*rs_, rollup_sql);
+
+      std::vector<Row> expected =
+          RelationalRun(*rs_, "SELECT i_prod, i_brand, AVG(inv_qty) AS qoh" +
+                                  from_where + " GROUP BY i_prod, i_brand");
+      const auto sub =
+          RelationalRun(*rs_, "SELECT i_prod, NULL, AVG(inv_qty) AS qoh" +
+                                  from_where + " GROUP BY i_prod");
+      const auto grand = RelationalRun(
+          *rs_, "SELECT NULL, NULL, AVG(inv_qty) AS qoh" + from_where);
+      expected.insert(expected.end(), sub.begin(), sub.end());
+      expected.insert(expected.end(), grand.begin(), grand.end());
+
+      ASSERT_EQ(got.size(), expected.size())
+          << "dim=" << dim_table << " month=" << month_filter;
+      std::vector<bool> matched(expected.size(), false);
+      for (const Row& row : got) {
+        size_t idx = 0;
+        while (idx < expected.size() &&
+               (matched[idx] || row != expected[idx])) {
+          ++idx;
+        }
+        ASSERT_LT(idx, expected.size())
+            << "dim=" << dim_table << " month=" << month_filter
+            << " unmatched row: " << row;
+        matched[idx] = true;
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, MultiBucketScalarCrossJoinMatchesCanonical) {
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+  //   (SingleScanConditionalCountDistinct_sound)
+  RelationalRun(*rs_,
+                "CREATE TABLE BucketSales (qty INT64, lp FLOAT64, "
+                "cp FLOAT64, wc FLOAT64)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          setup.GetTable("BucketSales"));
+    for (int64_t i = 0; i < 600; ++i) {
+      Value qty = (i % 29 == 0) ? Value() : Value((i % 20) + 1);
+      Value lp = (i % 19 == 0)
+                     ? Value()
+                     : Value(i % 41 == 0 ? -0.0 : static_cast<double>(i % 30));
+      Value cp = (i % 23 == 0) ? Value() : Value(static_cast<double>(i % 100));
+      Value wc = (i % 31 == 0) ? Value() : Value(static_cast<double>(i % 50));
+      ASSERT_SUCCESS(
+          tbl->Insert(setup.txn_, Row({qty, lp, cp, wc})).GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  const std::string query =
+      "SELECT * FROM "
+      "(SELECT AVG(lp) AS b1_lp, COUNT(lp) AS b1_cnt, "
+      "  COUNT(DISTINCT lp) AS b1_cntd FROM BucketSales "
+      " WHERE qty BETWEEN 1 AND 5 AND (lp BETWEEN 0 AND 10 OR cp BETWEEN 10 "
+      " AND 10 + 20 OR wc BETWEEN 5 AND 5 + 10)) AS B1, "
+      "(SELECT AVG(lp) AS b2_lp, COUNT(lp) AS b2_cnt, "
+      "  COUNT(DISTINCT lp) AS b2_cntd FROM BucketSales "
+      " WHERE qty BETWEEN 6 AND 10 AND (lp BETWEEN 15 AND 25 OR cp BETWEEN 50 "
+      " AND 70 OR wc BETWEEN 20 AND 30)) AS B2, "
+      "(SELECT AVG(lp) AS b3_lp, COUNT(lp) AS b3_cnt, "
+      "  COUNT(DISTINCT lp) AS b3_cntd FROM BucketSales "
+      " WHERE qty BETWEEN 90 AND 95 AND (lp BETWEEN 0 AND 10 OR cp BETWEEN 0 "
+      " AND 10)) AS B3 "
+      "LIMIT 100";
+
+  const auto got = RelationalRun(*rs_, query);
+  ASSERT_EQ(got.size(), 1U);
+  const auto b1 = RelationalRun(
+      *rs_,
+      "SELECT AVG(lp), COUNT(lp), COUNT(DISTINCT lp) FROM BucketSales "
+      "WHERE qty BETWEEN 1 AND 5 AND (lp BETWEEN 0 AND 10 OR cp BETWEEN 10 "
+      "AND 10 + 20 OR wc BETWEEN 5 AND 5 + 10)");
+  const auto b2 = RelationalRun(
+      *rs_,
+      "SELECT AVG(lp), COUNT(lp), COUNT(DISTINCT lp) FROM BucketSales "
+      "WHERE qty BETWEEN 6 AND 10 AND (lp BETWEEN 15 AND 25 OR cp BETWEEN 50 "
+      "AND 70 OR wc BETWEEN 20 AND 30)");
+  const auto b3 = RelationalRun(
+      *rs_,
+      "SELECT AVG(lp), COUNT(lp), COUNT(DISTINCT lp) FROM BucketSales "
+      "WHERE qty BETWEEN 90 AND 95 AND (lp BETWEEN 0 AND 10 OR cp BETWEEN 0 "
+      "AND 10)");
+  ASSERT_EQ(b1.size(), 1U);
+  ASSERT_EQ(b2.size(), 1U);
+  ASSERT_EQ(b3.size(), 1U);
+  EXPECT_EQ(got[0][0], b1[0][0]);
+  EXPECT_EQ(got[0][1], b1[0][1]);
+  EXPECT_EQ(got[0][2], b1[0][2]);
+  EXPECT_EQ(got[0][3], b2[0][0]);
+  EXPECT_EQ(got[0][4], b2[0][1]);
+  EXPECT_EQ(got[0][5], b2[0][2]);
+  EXPECT_TRUE(got[0][6].IsNull());
+  EXPECT_EQ(got[0][7], Value(int64_t{0}));
+  EXPECT_EQ(got[0][8], Value(int64_t{0}));
+}
+
+TEST_F(RelationalRegressionTest,
+       LexicographicDimPrefixTopKMatchesCanonicalWithTies) {
+  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  //   (LexicographicDimPrefixTopK_sound)
+  RelationalRun(*rs_, "CREATE TABLE LexStore (s_sk INT64, s_name STRING)");
+  RelationalRun(*rs_, "CREATE TABLE LexItem (i_sk INT64, i_desc STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE LexSales (ss_s INT64, ss_i INT64, ss_p FLOAT64)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, st,
+                          setup.GetTable("LexStore"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, it,
+                          setup.GetTable("LexItem"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, sl,
+                          setup.GetTable("LexSales"));
+    // 30 stores (>= 24 cost-gate threshold) with ties on s_name.
+    for (int64_t s = 1; s <= 30; ++s) {
+      const std::string nm =
+          std::string("grp_") + static_cast<char>('a' + ((s - 1) % 5));
+      ASSERT_SUCCESS(
+          st->Insert(setup.txn_, Row({Value(s), Value(std::string(nm))}))
+              .GetStatus());
+    }
+    for (int64_t i = 1; i <= 20; ++i) {
+      ASSERT_SUCCESS(
+          it->Insert(setup.txn_,
+                     Row({Value(i), Value("item_" + std::to_string(21 - i))}))
+              .GetStatus());
+    }
+    for (int64_t s = 1; s <= 30; ++s) {
+      for (int64_t i = 1; i <= 20; ++i) {
+        ASSERT_SUCCESS(
+            sl->Insert(
+                  setup.txn_,
+                  Row({Value(s), Value(i),
+                       Value(static_cast<double>((s * 7 + i * 3) % 50) + 1.0)}))
+                .GetStatus());
+      }
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  const std::string query =
+      "SELECT s_name, i_desc, sc.rev, s_sk, i_sk "
+      "FROM LexStore, LexItem, "
+      "(SELECT ss_s, ss_i, rev, AVG(rev) OVER (PARTITION BY ss_s) AS ave "
+      " FROM (SELECT ss_s, ss_i, SUM(ss_p) AS rev FROM LexSales "
+      "       GROUP BY ss_s, ss_i) AS inner_agg) AS sc "
+      "WHERE sc.rev <= 0.8 * sc.ave AND s_sk = sc.ss_s AND i_sk = sc.ss_i "
+      "ORDER BY s_name, i_desc, s_sk, i_sk "
+      "LIMIT 15";
+
+  const auto got = RelationalRun(*rs_, query);
+  ASSERT_EQ(got.size(), 15U);
+
+  // Compare against full-table execution (OFFSET 0 and OFFSET 5) without
+  // prefix cutoff by ordering on an expression (s_name || '') which bypasses
+  // the bare-column prefix gate while preserving identical sort order.
+  const std::string canonical =
+      "SELECT s_name, i_desc, sc.rev, s_sk, i_sk "
+      "FROM LexStore, LexItem, "
+      "(SELECT ss_s, ss_i, rev, AVG(rev) OVER (PARTITION BY ss_s) AS ave "
+      " FROM (SELECT ss_s, ss_i, SUM(ss_p) AS rev FROM LexSales "
+      "       GROUP BY ss_s, ss_i) AS inner_agg) AS sc "
+      "WHERE sc.rev <= 0.8 * sc.ave AND s_sk = sc.ss_s AND i_sk = sc.ss_i "
+      "ORDER BY CONCAT(s_name, ''), i_desc, s_sk, i_sk "
+      "LIMIT 15";
+  const auto expected = RelationalRun(*rs_, canonical);
+  ASSERT_EQ(got.size(), expected.size());
+  for (size_t i = 0; i < got.size(); ++i) {
+    EXPECT_EQ(got[i], expected[i]) << "row " << i;
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       MultiChannelExistsBitsetPushdownOrdersConjuncts) {
+  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  //   (MultiChannelExistsBitsetPushdown_sound,
+  //    MultiChannelAntiExistsBitsetPushdown_sound)
+  RelationalRun(*rs_,
+                "CREATE TABLE McCust (c_sk INT64, c_addr INT64, c_tag STRING)");
+  RelationalRun(*rs_, "CREATE TABLE McAddr (a_sk INT64, a_state STRING)");
+  RelationalRun(*rs_, "CREATE TABLE McStore (s_csk INT64, s_yr INT64)");
+  RelationalRun(*rs_, "CREATE TABLE McWeb (w_csk INT64, w_yr INT64)");
+  RelationalRun(*rs_, "CREATE TABLE McCat (k_csk INT64, k_yr INT64)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, cu, setup.GetTable("McCust"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, ad, setup.GetTable("McAddr"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, st,
+                          setup.GetTable("McStore"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, wb, setup.GetTable("McWeb"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, ct, setup.GetTable("McCat"));
+    for (int64_t a = 1; a <= 5; ++a) {
+      ASSERT_SUCCESS(
+          ad->Insert(setup.txn_,
+                     Row({Value(a), Value("ST" + std::to_string(a))}))
+              .GetStatus());
+    }
+    for (int64_t c = 1; c <= 100; ++c) {
+      ASSERT_SUCCESS(
+          cu->Insert(setup.txn_, Row({Value(c), Value((c % 5) + 1),
+                                      Value(c % 2 == 0 ? std::string("E")
+                                                       : std::string("O"))}))
+              .GetStatus());
+      if (c % 3 == 0) {
+        ASSERT_SUCCESS(
+            st->Insert(setup.txn_, Row({Value(c), Value(int64_t{2002})}))
+                .GetStatus());
+      }
+      if (c % 5 == 0) {
+        ASSERT_SUCCESS(
+            wb->Insert(setup.txn_, Row({Value(c), Value(int64_t{2002})}))
+                .GetStatus());
+      }
+      if (c % 7 == 0) {
+        ASSERT_SUCCESS(
+            ct->Insert(setup.txn_, Row({Value(c), Value(int64_t{2002})}))
+                .GetStatus());
+      }
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  // Reversed conjunct order: `(EXISTS(W) OR EXISTS(C)) AND EXISTS(S)` must
+  // match `EXISTS(S) AND (EXISTS(W) OR EXISTS(C))` identically.
+  const std::string q_fwd =
+      "SELECT a_state, c_tag, COUNT(*) "
+      "FROM McCust, McAddr "
+      "WHERE c_addr = a_sk "
+      "  AND EXISTS (SELECT 1 FROM McStore WHERE s_csk = c_sk AND s_yr = 2002) "
+      "  AND (EXISTS (SELECT 1 FROM McWeb WHERE w_csk = c_sk AND w_yr = 2002) "
+      "       OR EXISTS (SELECT 1 FROM McCat WHERE k_csk = c_sk AND k_yr = "
+      "2002)) "
+      "GROUP BY a_state, c_tag ORDER BY a_state, c_tag";
+  const std::string q_rev =
+      "SELECT a_state, c_tag, COUNT(*) "
+      "FROM McCust, McAddr "
+      "WHERE c_addr = a_sk "
+      "  AND (EXISTS (SELECT 1 FROM McWeb WHERE w_csk = c_sk AND w_yr = 2002) "
+      "       OR EXISTS (SELECT 1 FROM McCat WHERE k_csk = c_sk AND k_yr = "
+      "2002)) "
+      "  AND EXISTS (SELECT 1 FROM McStore WHERE s_csk = c_sk AND s_yr = 2002) "
+      "GROUP BY a_state, c_tag ORDER BY a_state, c_tag";
+  const auto fwd = RelationalRun(*rs_, q_fwd);
+  const auto rev = RelationalRun(*rs_, q_rev);
+  ASSERT_FALSE(fwd.empty());
+  EXPECT_EQ(fwd, rev);
+}
+
 TEST_F(RelationalRegressionTest, ExactPartialTotalsCheckActualValues) {
   auto context = rs_->BeginContext();
   relational_detail::Relation left, right;
@@ -3660,6 +3993,781 @@ TEST_F(RelationalRegressionTest,
       Row({Value(9), Value("three"), Value("ten")}),
       Row({Value(11), Value("one"), Value("twenty")})};
   EXPECT_EQ(materialized, expected);
+}
+
+TEST_F(RelationalRegressionTest, PromoReturnThresholdCountsMatchesCanonical) {
+  // Verifies PromoReturnCounts_sound + ThresholdFanout_sound
+  // (DuckDBGaps/Retail.lean) against the canonical plan across:
+  //   - NULL cs_promo_sk (no_promo)
+  //   - duplicate p_promo_sk rows (multiplies promo and total_cnt)
+  //   - duplicate (cr_item_sk, cr_order_number) rows (ret_mult = max(1, cnt))
+  //   - NULL inv_quantity_on_hand and boundary inv_qoh == cs_qty vs < cs_qty
+  //   - duplicate i_item_desc across distinct i_item_sk
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_cs (cs_sold_date_sk INT64, "
+                "cs_ship_date_sk INT64, cs_item_sk INT64, "
+                "cs_bill_cdemo_sk INT64, cs_bill_hdemo_sk INT64, "
+                "cs_promo_sk INT64, cs_order_number INT64, "
+                "cs_quantity INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_inv (inv_date_sk INT64, inv_item_sk INT64, "
+                "inv_warehouse_sk INT64, inv_quantity_on_hand INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_wh (w_warehouse_sk INT64, "
+                "w_warehouse_name STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_item (i_item_sk INT64, i_item_desc STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_cd (cd_demo_sk INT64, "
+                "cd_marital_status STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_hd (hd_demo_sk INT64, "
+                "hd_buy_potential STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_dt (d_date_sk INT64, d_date DATE, "
+                "d_week_seq INT64, d_year INT64)");
+  RelationalRun(*rs_, "CREATE TABLE q72_promo (p_promo_sk INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q72_cr (cr_item_sk INT64, "
+                "cr_order_number INT64)");
+
+  RelationalRun(*rs_,
+                "INSERT INTO q72_dt VALUES "
+                "(1, DATE '2001-01-01', 100, 2001), "
+                "(2, DATE '2001-01-02', 100, 2001), "
+                "(10, DATE '2001-01-06', 100, 2001), "
+                "(11, DATE '2001-01-07', 101, 2001), "
+                "(20, DATE '2002-01-01', 200, 2002)");
+  RelationalRun(*rs_, "INSERT INTO q72_cd VALUES (1, 'D'), (2, 'M'), (3, 'D')");
+  RelationalRun(*rs_, "INSERT INTO q72_hd VALUES (1, '>10000'), (2, '0-500')");
+  RelationalRun(*rs_, "INSERT INTO q72_wh VALUES (1, 'W1'), (2, 'W2')");
+  RelationalRun(*rs_,
+                "INSERT INTO q72_item VALUES "
+                "(1, 'SharedDesc'), (2, 'SharedDesc'), (3, 'Other')");
+  // Duplicate p_promo_sk = 10 to test promo multiplicity = 2.
+  RelationalRun(*rs_, "INSERT INTO q72_promo VALUES (10), (10), (20)");
+  // Duplicate (cr_item_sk, cr_order_number) = (1, 100) to test ret_mult = 2.
+  RelationalRun(*rs_, "INSERT INTO q72_cr VALUES (1, 100), (1, 100), (2, 200)");
+  RelationalRun(*rs_,
+                "INSERT INTO q72_cs VALUES "
+                // d1=1 (2001-01-01), d3=11 (2001-01-07 > +5): passes!
+                // promo=10 (dup x2), cr=(1,100) (dup x2) -> promo+=4, total+=4
+                "(1, 11, 1, 1, 1, 10, 100, 10), "
+                // promo=NULL, no return -> no_promo+=1, total+=1
+                "(1, 11, 1, 3, 1, NULL, 101, 5), "
+                // d3=10 (2001-01-06 == +5, NOT > +5): filtered out
+                "(1, 10, 1, 1, 1, 20, 102, 50), "
+                // item=2 shares i_item_desc='SharedDesc', promo=20 (x1),
+                // cr=(2,200) (x1) -> promo+=1, total+=1
+                "(1, 11, 2, 1, 1, 20, 200, 8), "
+                // cd=2 ('M'): filtered out
+                "(1, 11, 3, 2, 1, 20, 300, 100)");
+  RelationalRun(*rs_,
+                "INSERT INTO q72_inv VALUES "
+                // inv_qoh=4 < 5 and < 10: matches BOTH item=1 sales
+                "(2, 1, 1, 4), "
+                // inv_qoh=5: boundary! NOT < 5, YES < 10 -> matches only qty=10
+                "(2, 1, 1, 5), "
+                // inv_qoh=10: NOT < 10 -> matches neither
+                "(2, 1, 1, 10), "
+                // inv_qoh=NULL: filtered out
+                "(2, 1, 1, NULL), "
+                // item=2, inv_qoh=7 < 8: merges into ('SharedDesc', 'W1', 100)
+                "(1, 2, 1, 7), "
+                // wrong week (d2=20 -> week 200): filtered out
+                "(20, 1, 2, 1)");
+
+  const std::string sql =
+      "SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, "
+      "SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) no_promo, "
+      "SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) promo, "
+      "COUNT(*) total_cnt "
+      "FROM q72_cs "
+      "JOIN q72_inv ON (cs_item_sk = inv_item_sk) "
+      "JOIN q72_wh ON (w_warehouse_sk = inv_warehouse_sk) "
+      "JOIN q72_item ON (i_item_sk = cs_item_sk) "
+      "JOIN q72_cd ON (cs_bill_cdemo_sk = cd_demo_sk) "
+      "JOIN q72_hd ON (cs_bill_hdemo_sk = hd_demo_sk) "
+      "JOIN q72_dt d1 ON (cs_sold_date_sk = d1.d_date_sk) "
+      "JOIN q72_dt d2 ON (inv_date_sk = d2.d_date_sk) "
+      "JOIN q72_dt d3 ON (cs_ship_date_sk = d3.d_date_sk) "
+      "LEFT OUTER JOIN q72_promo ON (cs_promo_sk = p_promo_sk) "
+      "LEFT OUTER JOIN q72_cr ON (cr_item_sk = cs_item_sk AND "
+      "cr_order_number = cs_order_number) "
+      "WHERE d1.d_week_seq = d2.d_week_seq "
+      "AND inv_quantity_on_hand < cs_quantity "
+      "AND d3.d_date > d1.d_date + 5 "
+      "AND hd_buy_potential = '>10000' "
+      "AND d1.d_year = 2001 "
+      "AND cd_marital_status = 'D' "
+      "GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq "
+      "ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d1.d_week_seq";
+
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_PROMO_RETURN_THRESHOLD", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  EXPECT_EQ(fast_rows, canonical_rows);
+  ASSERT_EQ(fast_rows.size(), 1U);
+  // inv_qoh=4: no_promo=1, promo=4, total=5
+  // inv_qoh=5: no_promo=0, promo=4, total=4
+  // item=2 inv_qoh=7: no_promo=0, promo=1, total=1
+  // merged ('SharedDesc', 'W1', 100): no_promo=1, promo=9, total=10
+  EXPECT_EQ(fast_rows[0], Row({Value("SharedDesc"), Value("W1"), Value(100),
+                               Value(1), Value(9), Value(10)}));
+}
+
+TEST_F(RelationalRegressionTest, MarketShareYearRoutesMatchesCanonical) {
+  // Verifies MarketShareWeights_sound + YearRoutes_sound
+  // (DuckDBGaps/Orders.lean) against the canonical 8-way join across:
+  //   - duplicate part, supplier, customer, and orders keys (including an
+  //     o_orderkey appearing in two distinct years)
+  //   - NULL volume (CASE ELSE 0 still contributes non-NULL 0 to numerator)
+  RelationalRun(*rs_, "CREATE TABLE q8_part (p_partkey INT64, p_type STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_supplier (s_suppkey INT64, "
+                "s_nationkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_lineitem (l_orderkey INT64, l_partkey INT64, "
+                "l_suppkey INT64, l_extendedprice FLOAT64, "
+                "l_discount FLOAT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_orders (o_orderkey INT64, o_custkey INT64, "
+                "o_orderdate DATE)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_customer (c_custkey INT64, "
+                "c_nationkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_nation (n_nationkey INT64, n_name STRING, "
+                "n_regionkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q8_region (r_regionkey INT64, r_name STRING)");
+
+  RelationalRun(*rs_,
+                "INSERT INTO q8_region VALUES (1, 'AMERICA'), (2, 'ASIA')");
+  RelationalRun(*rs_,
+                "INSERT INTO q8_nation VALUES "
+                "(10, 'PERU', 1), (20, 'BRAZIL', 1), (30, 'JAPAN', 2)");
+  // Duplicate c_custkey=1 (multiplicity 2).
+  RelationalRun(*rs_,
+                "INSERT INTO q8_customer VALUES (1, 10), (1, 20), (2, 30)");
+  // Duplicate p_partkey=100 (multiplicity 2).
+  RelationalRun(*rs_,
+                "INSERT INTO q8_part VALUES "
+                "(100, 'STANDARD POLISHED TIN'), "
+                "(100, 'STANDARD POLISHED TIN'), "
+                "(200, 'OTHER')");
+  // Duplicate s_suppkey=500 across PERU and BRAZIL (all=2, chosen=1).
+  RelationalRun(*rs_,
+                "INSERT INTO q8_supplier VALUES "
+                "(500, 10), (500, 20), (600, 30)");
+  // o_orderkey=1000 appears in both 1995 and 1996 (tests YearRoutes_sound).
+  RelationalRun(*rs_,
+                "INSERT INTO q8_orders VALUES "
+                "(1000, 1, DATE '1995-06-15'), "
+                "(1000, 1, DATE '1996-03-10'), "
+                "(1001, 1, DATE '1996-08-20'), "
+                "(1002, 2, DATE '1995-07-01'), "
+                "(1003, 1, DATE '1998-01-01')");
+  RelationalRun(*rs_,
+                "INSERT INTO q8_lineitem VALUES "
+                "(1000, 100, 500, 100.0, 0.1), "
+                "(1000, 100, 600, 200.0, 0.2), "
+                "(1001, 100, 500, NULL, 0.1), "
+                "(1001, 100, 500, 50.0, 0.0), "
+                "(1000, 200, 500, 999.0, 0.0)");
+
+  const std::string sql =
+      "SELECT o_year, "
+      "SUM(CASE WHEN nation = 'PERU' THEN volume ELSE 0 END) / SUM(volume) "
+      "AS mkt_share "
+      "FROM (SELECT EXTRACT(year FROM o_orderdate) AS o_year, "
+      "             l_extendedprice * (1 - l_discount) AS volume, "
+      "             n2.n_name AS nation "
+      "      FROM q8_part, q8_supplier, q8_lineitem, q8_orders, q8_customer, "
+      "           q8_nation n1, q8_nation n2, q8_region "
+      "      WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey "
+      "        AND l_orderkey = o_orderkey AND o_custkey = c_custkey "
+      "        AND c_nationkey = n1.n_nationkey "
+      "        AND n1.n_regionkey = r_regionkey AND r_name = 'AMERICA' "
+      "        AND s_nationkey = n2.n_nationkey "
+      "        AND o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31' "
+      "        AND p_type = 'STANDARD POLISHED TIN') all_nations "
+      "GROUP BY o_year ORDER BY o_year";
+
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_MARKET_SHARE_ROUTES", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  ASSERT_EQ(fast_rows.size(), canonical_rows.size());
+  ASSERT_EQ(fast_rows.size(), 2U);
+  for (size_t i = 0; i < fast_rows.size(); ++i) {
+    EXPECT_EQ(fast_rows[i][0], canonical_rows[i][0]);
+    EXPECT_NEAR(fast_rows[i][1].value.double_value,
+                canonical_rows[i][1].value.double_value, 1e-12);
+  }
+}
+
+TEST_F(RelationalRegressionTest, OrderedFetchTopNMatchesCanonical) {
+  // Verifies OrderedFetch_sound (DuckDBGaps/Hits.lean) against canonical
+  // execution across:
+  //   - SELECT * wide-row late materialization (kInt64, kDate, kDouble,
+  //     kVarChar)
+  //   - LIKE '%google%' substring filter + ORDER BY string timestamp
+  //     ASC NULLS LAST / DESC NULLS FIRST + LIMIT + OFFSET
+  //   - Integer ORDER BY with NULLs and range filter
+  RelationalRun(*rs_,
+                "CREATE TABLE of_hits (id INT64, event_time STRING, "
+                "url STRING, d DATE, score FLOAT64, payload STRING)");
+  RelationalRun(*rs_,
+                "INSERT INTO of_hits VALUES "
+                "(1, '2013-07-15 10:00:05', 'https://google.com/a', "
+                "DATE '2013-07-15', 1.5, 'wide-1'), "
+                "(2, '2013-07-15 10:00:01', 'https://example.org/', "
+                "DATE '2013-07-15', 2.5, 'wide-2'), "
+                "(3, '2013-07-15 10:00:02', 'https://mail.google.com/b', "
+                "DATE '2013-07-15', NULL, 'wide-3'), "
+                "(4, NULL, 'https://google.com/null-ts', "
+                "DATE '2013-07-15', 4.5, 'wide-4'), "
+                "(5, '2013-07-15 10:00:04', 'https://maps.google.com/c', "
+                "DATE '2013-07-15', 5.5, 'wide-5'), "
+                "(6, '2013-07-15 10:00:03', NULL, "
+                "DATE '2013-07-15', 6.5, 'wide-6'), "
+                "(7, '2013-07-15 10:00:00', 'https://google.com/earliest', "
+                "DATE '2013-07-14', 7.5, 'wide-7')");
+
+  const std::vector<std::string> queries{
+      "SELECT * FROM of_hits WHERE url LIKE '%google%' "
+      "ORDER BY event_time ASC NULLS LAST LIMIT 3",
+      "SELECT * FROM of_hits WHERE url LIKE '%google%' "
+      "ORDER BY event_time DESC NULLS FIRST LIMIT 3 OFFSET 1",
+      "SELECT id, payload FROM of_hits WHERE url <> '' "
+      "ORDER BY id ASC LIMIT 4",
+      "SELECT id, d, score FROM of_hits WHERE id >= 3 "
+      "ORDER BY id DESC LIMIT 2 OFFSET 1",
+  };
+  for (const std::string& sql : queries) {
+    const auto fast_rows = RelationalRun(*rs_, sql);
+    std::vector<Row> canonical_rows;
+    {
+      ScopedEnvVar disable("TINYLAMB_DISABLE_ORDERED_FETCH", "1");
+      canonical_rows = RelationalRun(*rs_, sql);
+    }
+    EXPECT_EQ(fast_rows, canonical_rows) << sql;
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       SurrogateIntersectAndExceptCountMatchesCanonical) {
+  // Verifies SurrogateIntersectSetCount_sound (Wave9TpcdsRollupAndSetOps.lean)
+  // for both INTERSECT DISTINCT (TPC-DS Q38) and EXCEPT DISTINCT (TPC-DS Q87),
+  // including:
+  //   - two distinct customer_sk rows sharing the exact same (last, first) name
+  //   - NULL last/first names (NULL == NULL under DISTINCT/INTERSECT/EXCEPT)
+  //   - duplicate fact rows per channel
+  RelationalRun(*rs_,
+                "CREATE TABLE si_dt (d_date_sk INT64, d_date DATE, "
+                "d_month_seq INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE si_cust (c_customer_sk INT64, "
+                "c_last_name STRING, c_first_name STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE si_ss (ss_sold_date_sk INT64, "
+                "ss_customer_sk INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE si_cs (cs_sold_date_sk INT64, "
+                "cs_bill_customer_sk INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE si_ws (ws_sold_date_sk INT64, "
+                "ws_bill_customer_sk INT64)");
+
+  RelationalRun(*rs_,
+                "INSERT INTO si_dt VALUES "
+                "(1, DATE '2001-01-01', 1188), "
+                "(2, DATE '2001-01-02', 1189), "
+                "(3, DATE '2005-01-01', 1250)");
+  // c_customer_sk=1 and 2 share ('Smith', 'Alice'); 3 has (NULL, 'Bob').
+  RelationalRun(*rs_,
+                "INSERT INTO si_cust VALUES "
+                "(1, 'Smith', 'Alice'), "
+                "(2, 'Smith', 'Alice'), "
+                "(3, NULL, 'Bob'), "
+                "(4, 'Jones', 'Carol')");
+  RelationalRun(*rs_,
+                "INSERT INTO si_ss VALUES "
+                "(1, 1), (1, 1), (1, 3), (2, 4), (3, 1)");
+  // cs uses c_customer_sk=2 (same name as 1!) and c_customer_sk=3 (NULL name).
+  RelationalRun(*rs_, "INSERT INTO si_cs VALUES (1, 2), (1, 3), (2, 1)");
+  RelationalRun(*rs_, "INSERT INTO si_ws VALUES (1, 1), (1, 3)");
+
+  const std::string q38 =
+      "SELECT COUNT(*) FROM ("
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_ss, si_dt, si_cust "
+      "  WHERE ss_sold_date_sk = d_date_sk AND ss_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199 "
+      "  INTERSECT DISTINCT "
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_cs, si_dt, si_cust "
+      "  WHERE cs_sold_date_sk = d_date_sk "
+      "    AND cs_bill_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199 "
+      "  INTERSECT DISTINCT "
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_ws, si_dt, si_cust "
+      "  WHERE ws_sold_date_sk = d_date_sk "
+      "    AND ws_bill_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199"
+      ") hot_cust LIMIT 100";
+
+  const std::string q87 =
+      "SELECT COUNT(*) FROM ("
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_ss, si_dt, si_cust "
+      "  WHERE ss_sold_date_sk = d_date_sk AND ss_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199 "
+      "  EXCEPT DISTINCT "
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_cs, si_dt, si_cust "
+      "  WHERE cs_sold_date_sk = d_date_sk "
+      "    AND cs_bill_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199 "
+      "  EXCEPT DISTINCT "
+      "  SELECT DISTINCT c_last_name, c_first_name, d_date "
+      "  FROM si_ws, si_dt, si_cust "
+      "  WHERE ws_sold_date_sk = d_date_sk "
+      "    AND ws_bill_customer_sk = c_customer_sk "
+      "    AND d_month_seq BETWEEN 1188 AND 1199"
+      ") cool_cust";
+
+  for (const auto& [sql, expected_cnt] :
+       {std::pair{q38, int64_t{2}}, std::pair{q87, int64_t{1}}}) {
+    const auto fast_rows = RelationalRun(*rs_, sql);
+    std::vector<Row> canonical_rows;
+    {
+      ScopedEnvVar disable("TINYLAMB_DISABLE_SURROGATE_INTERSECT", "1");
+      canonical_rows = RelationalRun(*rs_, sql);
+    }
+    EXPECT_EQ(fast_rows, canonical_rows) << sql;
+    ASSERT_EQ(fast_rows.size(), 1U);
+    EXPECT_EQ(fast_rows[0], Row({Value(expected_cnt)}));
+  }
+}
+
+TEST_F(RelationalRegressionTest, TwoPassGroupAvgThresholdMatchesCanonical) {
+  // Verifies TwoPassGroupAvgThreshold_sound (IndividualQueryGaps.lean) on the
+  // TPC-DS Q65 self-join shape, including NULL sales prices, NULL store keys,
+  // and exact boundary revenue == 0.1 * avg(revenue).
+  RelationalRun(*rs_,
+                "CREATE TABLE tp_store (s_store_sk INT64, "
+                "s_store_name STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE tp_item (i_item_sk INT64, i_item_desc STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE tp_sales (ss_store_sk INT64, ss_item_sk INT64, "
+                "ss_sales_price FLOAT64)");
+
+  RelationalRun(*rs_,
+                "INSERT INTO tp_store VALUES (1, 'StoreA'), (2, 'StoreB')");
+  RelationalRun(*rs_,
+                "INSERT INTO tp_item VALUES "
+                "(10, 'Cheap'), (20, 'Mid'), (30, 'Expensive'), "
+                "(40, 'NullItem')");
+  // Store 1: item 10 = 10.0, item 20 = 90.0, item 30 = 200.0 -> avg = 100.0,
+  // 0.1 * avg = 10.0 -> item 10 (10.0 <= 10.0) qualifies!
+  // item 40 has NULL price -> skipped by AVG and by <= comparison.
+  // Store 2: item 10 = 5.0, item 20 = 95.0 -> avg = 50.0, 0.1 * avg = 5.0 ->
+  // item 10 qualifies!
+  RelationalRun(*rs_,
+                "INSERT INTO tp_sales VALUES "
+                "(1, 10, 4.0), (1, 10, 6.0), "
+                "(1, 20, 90.0), (1, 30, 200.0), (1, 40, NULL), "
+                "(2, 10, 5.0), (2, 20, 95.0), "
+                "(NULL, 10, 1.0)");
+
+  const std::string sql =
+      "SELECT s_store_name, i_item_desc, sc.revenue "
+      "FROM tp_store, tp_item, ("
+      "  SELECT ss_store_sk, AVG(revenue) AS ave "
+      "  FROM ("
+      "    SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue "
+      "    FROM tp_sales GROUP BY ss_store_sk, ss_item_sk"
+      "  ) AS sa GROUP BY ss_store_sk"
+      ") AS sb, ("
+      "  SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue "
+      "  FROM tp_sales GROUP BY ss_store_sk, ss_item_sk"
+      ") AS sc "
+      "WHERE sb.ss_store_sk = sc.ss_store_sk "
+      "  AND sc.revenue <= 0.1 * sb.ave "
+      "  AND s_store_sk = sc.ss_store_sk "
+      "  AND i_item_sk = sc.ss_item_sk "
+      "ORDER BY s_store_name, i_item_desc";
+
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_TWO_PASS_GROUP_AVG", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  EXPECT_EQ(fast_rows, canonical_rows);
+  ASSERT_EQ(fast_rows.size(), 2U);
+  EXPECT_EQ(fast_rows[0], Row({Value("StoreA"), Value("Cheap"), Value(10.0)}));
+  EXPECT_EQ(fast_rows[1], Row({Value("StoreB"), Value("Cheap"), Value(5.0)}));
+}
+
+TEST_F(RelationalRegressionTest,
+       FrequencyUpperBoundHavingPruneMatchesCanonical) {
+  // Verifies FrequencyUpperBoundHavingPrune_sound (IndividualQueryGaps.lean)
+  // on GROUP BY key HAVING COUNT(*) > T / >= T with secondary AVG/MIN/MAX.
+  RelationalRun(*rs_, "CREATE TABLE hfp_t (k INT64, v FLOAT64, tag INT64)");
+  std::string ins = "INSERT INTO hfp_t VALUES ";
+  bool first = true;
+  for (int k = 1; k <= 120; ++k) {
+    const int reps = (k <= 3) ? 15 : 2;
+    for (int r = 0; r < reps; ++r) {
+      if (!first) {
+        ins += ", ";
+      }
+      first = false;
+      ins += "(" + std::to_string(k) + ", " +
+             (r == 0 && k == 2 ? std::string("NULL")
+                               : std::to_string((k * 10) + r)) +
+             ", " + std::to_string(r) + ")";
+    }
+  }
+  RelationalRun(*rs_, ins);
+  for (const std::string& sql : {
+           "SELECT k, COUNT(*) AS c, AVG(v) AS av, MIN(tag) AS mn "
+           "FROM hfp_t GROUP BY k HAVING COUNT(*) > 10 ORDER BY k",
+           "SELECT k, COUNT(*) AS c, AVG(v) AS av, MAX(tag) AS mx "
+           "FROM hfp_t GROUP BY k HAVING COUNT(*) >= 15 ORDER BY k",
+       }) {
+    const auto fast_rows = RelationalRun(*rs_, sql);
+    std::vector<Row> canonical_rows;
+    {
+      ScopedEnvVar disable("TINYLAMB_DISABLE_HAVING_FREQ_PRUNE", "1");
+      canonical_rows = RelationalRun(*rs_, sql);
+    }
+    EXPECT_EQ(fast_rows, canonical_rows) << sql;
+    ASSERT_EQ(fast_rows.size(), 3U);
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       CompositeKeySemiJoinChainReductionMatchesCanonical) {
+  // Verifies CompositeKeySemiJoinChainReduction_sound
+  // (IndividualQueryGaps.lean) on a 3-table composite-key join chain
+  // A ⋈_{(a1,a2)} B ⋈_{(b1,b2)} C with duplicates and NULLs.
+  RelationalRun(*rs_, "CREATE TABLE ck_a (a1 INT64, a2 INT64, va INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE ck_b (b1 INT64, b2 INT64, j1 INT64, j2 INT64)");
+  RelationalRun(*rs_, "CREATE TABLE ck_c (c1 INT64, c2 INT64, vc INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO ck_a VALUES (1, 10, 100), (2, 20, 200), "
+                "(1, NULL, 999)");
+  std::string ins_b =
+      "INSERT INTO ck_b VALUES (1, 10, 7, 70), (1, 10, 7, 70), "
+      "(2, 20, 8, 80), (1, NULL, 7, 70)";
+  for (int i = 10; i < 120; ++i) {
+    ins_b += ", (" + std::to_string(i) + ", " + std::to_string(i * 10) + ", " +
+             std::to_string(i) + ", " + std::to_string(i * 100) + ")";
+  }
+  RelationalRun(*rs_, ins_b);
+  std::string ins_c =
+      "INSERT INTO ck_c VALUES (7, 70, 5), (8, 80, 6), (7, NULL, 9)";
+  for (int i = 10; i < 200; ++i) {
+    ins_c += ", (" + std::to_string(i) + ", " + std::to_string(i * 100) + ", " +
+             std::to_string(i) + ")";
+  }
+  RelationalRun(*rs_, ins_c);
+
+  const std::string sql =
+      "SELECT a.a1, a.va, c.vc "
+      "FROM ck_a a "
+      "JOIN ck_b b ON a.a1 = b.b1 AND a.a2 = b.b2 "
+      "JOIN ck_c c ON b.j1 = c.c1 AND b.j2 = c.c2 "
+      "ORDER BY a.a1, a.va, c.vc";
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_COMPOSITE_SEMIJOIN", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  EXPECT_EQ(fast_rows, canonical_rows);
+  ASSERT_EQ(fast_rows.size(), 3U);
+}
+
+TEST_F(RelationalRegressionTest, DirectionBucketsMatchesCanonical) {
+  // Verifies DirectionBuckets_sound (DuckDBGaps/Orders.lean) on TPC-H Q7
+  // including duplicate keys, NULL volume, and opposite nation routes.
+  RelationalRun(*rs_, "CREATE TABLE q7_nat (n_nationkey INT64, n_name STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q7_sup (s_suppkey INT64, s_nationkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q7_cust (c_custkey INT64, c_nationkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q7_ord (o_orderkey INT64, o_custkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q7_line (l_orderkey INT64, l_suppkey INT64, "
+                "l_shipdate DATE, l_extendedprice FLOAT64, "
+                "l_discount FLOAT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO q7_nat VALUES (1, 'FRANCE'), (2, 'GERMANY'), "
+                "(3, 'JAPAN'), (4, NULL)");
+  RelationalRun(*rs_, "INSERT INTO q7_sup VALUES (10, 1), (20, 2), (30, 3)");
+  RelationalRun(*rs_,
+                "INSERT INTO q7_cust VALUES (100, 2), (200, 1), (300, 4)");
+  RelationalRun(*rs_,
+                "INSERT INTO q7_ord VALUES (1000, 100), (2000, 200), "
+                "(3000, 300)");
+  RelationalRun(*rs_,
+                "INSERT INTO q7_line VALUES "
+                "(1000, 10, DATE '1995-05-01', 100.0, 0.1), "
+                "(1000, 10, DATE '1995-06-01', NULL, 0.1), "
+                "(2000, 20, DATE '1996-02-01', 200.0, 0.2), "
+                "(1000, 20, DATE '1995-05-01', 999.0, 0.0), "
+                "(3000, 10, DATE '1995-05-01', 500.0, 0.0), "
+                "(1000, 10, DATE '1997-01-01', 700.0, 0.0)");
+
+  const std::string sql =
+      "SELECT supp_nation, cust_nation, l_year, SUM(volume) AS revenue "
+      "FROM (SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation, "
+      "             EXTRACT(year FROM l_shipdate) AS l_year, "
+      "             l_extendedprice * (1 - l_discount) AS volume "
+      "      FROM q7_sup, q7_line, q7_ord, q7_cust, q7_nat n1, q7_nat n2 "
+      "      WHERE s_suppkey = l_suppkey AND o_orderkey = l_orderkey "
+      "        AND c_custkey = o_custkey AND s_nationkey = n1.n_nationkey "
+      "        AND c_nationkey = n2.n_nationkey "
+      "        AND ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') "
+      "          OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')) "
+      "        AND l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31') "
+      "     shipping "
+      "GROUP BY supp_nation, cust_nation, l_year "
+      "ORDER BY supp_nation, cust_nation, l_year";
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_DIRECTION_BUCKETS", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  ASSERT_EQ(fast_rows.size(), canonical_rows.size());
+  ASSERT_EQ(fast_rows.size(), 2U);
+  for (size_t i = 0; i < fast_rows.size(); ++i) {
+    EXPECT_EQ(fast_rows[i][0], canonical_rows[i][0]);
+    EXPECT_EQ(fast_rows[i][1], canonical_rows[i][1]);
+    EXPECT_EQ(fast_rows[i][2], canonical_rows[i][2]);
+    EXPECT_NEAR(fast_rows[i][3].value.double_value,
+                canonical_rows[i][3].value.double_value, 1e-12);
+  }
+}
+
+TEST_F(RelationalRegressionTest, RetireWitnessExistsMatchesCanonical) {
+  // Verifies LateSlack_sound + RetireWitness_sound (DuckDBGaps/Orders.lean)
+  // on TPC-H Q4 including duplicate outer orders and paired-date checks.
+  RelationalRun(*rs_,
+                "CREATE TABLE q4_ord (o_orderkey INT64, o_orderdate DATE, "
+                "o_orderpriority STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q4_line (l_orderkey INT64, l_commitdate DATE, "
+                "l_receiptdate DATE)");
+  // Duplicate o_orderkey=1 in '1-URGENT' must both be counted once retired.
+  RelationalRun(*rs_,
+                "INSERT INTO q4_ord VALUES "
+                "(1, DATE '1993-07-10', '1-URGENT'), "
+                "(1, DATE '1993-07-11', '1-URGENT'), "
+                "(2, DATE '1993-08-01', '2-HIGH'), "
+                "(3, DATE '1993-08-15', '2-HIGH'), "
+                "(4, DATE '1994-01-01', '1-URGENT')");
+  // Order 1 has two late lines (must only retire once, retaining multiplicity
+  // 2); Order 2 has commit == receipt (NOT late); Order 3 has NULL commitdate
+  // on one line and late on another.
+  RelationalRun(*rs_,
+                "INSERT INTO q4_line VALUES "
+                "(1, DATE '1993-07-12', DATE '1993-07-15'), "
+                "(1, DATE '1993-07-13', DATE '1993-07-20'), "
+                "(2, DATE '1993-08-05', DATE '1993-08-05'), "
+                "(2, DATE '1993-08-10', DATE '1993-08-09'), "
+                "(3, NULL, DATE '1993-09-01'), "
+                "(3, DATE '1993-08-20', DATE '1993-08-25')");
+
+  const std::string sql =
+      "SELECT o_orderpriority, COUNT(*) AS order_count FROM q4_ord "
+      "WHERE o_orderdate >= DATE '1993-07-01' "
+      "  AND o_orderdate < DATE_ADD(DATE '1993-07-01', INTERVAL 3 MONTH) "
+      "  AND EXISTS (SELECT * FROM q4_line "
+      "              WHERE l_orderkey = o_orderkey "
+      "                AND l_commitdate < l_receiptdate) "
+      "GROUP BY o_orderpriority ORDER BY o_orderpriority";
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_RETIRE_WITNESS", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  EXPECT_EQ(fast_rows, canonical_rows);
+  ASSERT_EQ(fast_rows.size(), 2U);
+  EXPECT_EQ(fast_rows[0], Row({Value("1-URGENT"), Value(2)}));
+  EXPECT_EQ(fast_rows[1], Row({Value("2-HIGH"), Value(1)}));
+}
+
+TEST_F(RelationalRegressionTest, RebucketLeftJoinHistMatchesCanonical) {
+  // Verifies RebucketOrders_sound (DuckDBGaps/Orders.lean) on TPC-H Q13,
+  // including 0-order customers, excluded comments, and NULL comments.
+  RelationalRun(*rs_, "CREATE TABLE q13_cust (c_custkey INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q13_ord (o_orderkey INT64, o_custkey INT64, "
+                "o_comment STRING)");
+  RelationalRun(*rs_, "INSERT INTO q13_cust VALUES (1), (2), (3), (4), (5)");
+  RelationalRun(*rs_,
+                "INSERT INTO q13_ord VALUES "
+                "(10, 1, 'normal order'), "
+                "(11, 1, 'very unusual big packages here'), "
+                "(12, 2, 'ok one'), "
+                "(13, 2, 'ok two'), "
+                "(14, 3, NULL), "
+                "(15, 4, 'unusual packages')");
+
+  const std::string sql =
+      "SELECT c_count, COUNT(*) AS custdist "
+      "FROM (SELECT c_custkey, COUNT(o_orderkey) AS c_count "
+      "      FROM q13_cust LEFT OUTER JOIN q13_ord "
+      "        ON c_custkey = o_custkey "
+      "       AND o_comment NOT LIKE '%unusual%packages%' "
+      "      GROUP BY c_custkey) c_orders "
+      "GROUP BY c_count ORDER BY custdist DESC, c_count DESC";
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_REBUCKET_ORDERS", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  EXPECT_EQ(fast_rows, canonical_rows);
+  // c_custkey 3, 4, 5 have 0 qualifying orders; 1 has 1; 2 has 2.
+  ASSERT_EQ(fast_rows.size(), 3U);
+  EXPECT_EQ(fast_rows[0], Row({Value(0), Value(3)}));
+  EXPECT_EQ(fast_rows[1], Row({Value(2), Value(1)}));
+  EXPECT_EQ(fast_rows[2], Row({Value(1), Value(1)}));
+}
+
+TEST_F(RelationalRegressionTest, ContiguousRevenueRunsMatchesCanonical) {
+  // Verifies RevenueRuns_sound (DuckDBGaps/Orders.lean) on TPC-H Q3,
+  // including contiguous runs, NULL prices, and Top-K tie-breaking by date.
+  RelationalRun(*rs_,
+                "CREATE TABLE q3_cust (c_custkey INT64, c_mktsegment STRING)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q3_ord (o_orderkey INT64, o_custkey INT64, "
+                "o_orderdate DATE, o_shippriority INT64)");
+  RelationalRun(*rs_,
+                "CREATE TABLE q3_line (l_orderkey INT64, l_shipdate DATE, "
+                "l_extendedprice FLOAT64, l_discount FLOAT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO q3_cust VALUES (1, 'BUILDING'), (2, 'AUTO'), "
+                "(3, 'BUILDING')");
+  RelationalRun(*rs_,
+                "INSERT INTO q3_ord VALUES "
+                "(10, 1, DATE '1995-03-01', 0), "
+                "(20, 1, DATE '1995-03-10', 1), "
+                "(30, 2, DATE '1995-03-05', 0), "
+                "(40, 3, DATE '1995-03-02', 2)");
+  RelationalRun(*rs_,
+                "INSERT INTO q3_line VALUES "
+                "(10, DATE '1995-03-20', 100.0, 0.1), "
+                "(10, DATE '1995-03-25', 50.0, 0.0), "
+                "(20, DATE '1995-03-20', 200.0, 0.25), "
+                "(30, DATE '1995-03-20', 999.0, 0.0), "
+                "(40, DATE '1995-03-20', 140.0, 0.0), "
+                "(40, DATE '1995-03-10', 500.0, 0.0)");
+
+  const std::string sql =
+      "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue, "
+      "       o_orderdate, o_shippriority "
+      "FROM q3_cust, q3_ord, q3_line "
+      "WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey "
+      "  AND l_orderkey = o_orderkey "
+      "  AND o_orderdate < DATE '1995-03-15' "
+      "  AND l_shipdate > DATE '1995-03-15' "
+      "GROUP BY l_orderkey, o_orderdate, o_shippriority "
+      "ORDER BY revenue DESC, o_orderdate LIMIT 2";
+  const auto fast_rows = RelationalRun(*rs_, sql);
+  std::vector<Row> canonical_rows;
+  {
+    ScopedEnvVar disable("TINYLAMB_DISABLE_REVENUE_RUNS", "1");
+    canonical_rows = RelationalRun(*rs_, sql);
+  }
+  ASSERT_EQ(fast_rows.size(), canonical_rows.size());
+  ASSERT_EQ(fast_rows.size(), 2U);
+  for (size_t i = 0; i < fast_rows.size(); ++i) {
+    EXPECT_EQ(fast_rows[i][0], canonical_rows[i][0]);
+    EXPECT_NEAR(fast_rows[i][1].value.double_value,
+                canonical_rows[i][1].value.double_value, 1e-12);
+    EXPECT_EQ(fast_rows[i][2], canonical_rows[i][2]);
+    EXPECT_EQ(fast_rows[i][3], canonical_rows[i][3]);
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       HitsDatePostingsAndStridedPointMatchCanonical) {
+  // Verifies DatePostings_sound (whole-block interior predicate skip) and
+  // StridedPoint_sound (FOR code-domain point equality) from
+  // DuckDBGaps/Hits.lean.
+  RelationalRun(*rs_,
+                "CREATE TABLE hits_dp (counter_id INT64, event_date DATE, "
+                "user_id INT64, url STRING)");
+  std::string ins = "INSERT INTO hits_dp VALUES ";
+  bool first = true;
+  for (int i = 0; i < 600; ++i) {
+    if (!first) {
+      ins += ", ";
+    }
+    first = false;
+    const int cid = (i % 3 == 0) ? 62 : 10;
+    const std::string dt =
+        (i < 200) ? "DATE '2013-07-01'"
+                  : (i < 400 ? "DATE '2013-07-10'" : "DATE '2013-07-20'");
+    const int64_t uid = 1000000LL + ((i % 50) * 4LL);
+    const std::string url = (i % 4 == 0) ? "''" : "'https://example.com'";
+    ins += "(";
+    ins += std::to_string(cid);
+    ins += ", ";
+    ins += dt;
+    ins += ", ";
+    ins += std::to_string(uid);
+    ins += ", ";
+    ins += url;
+    ins += ")";
+  }
+  RelationalRun(*rs_, ins);
+
+  // DatePostings: interior block (2013-07-10) satisfies both date bounds while
+  // boundary/outside blocks are filtered per row or rejected.
+  const auto dp =
+      RelationalRun(*rs_,
+                    "SELECT COUNT(*) FROM hits_dp "
+                    "WHERE counter_id = 62 AND event_date >= DATE '2013-07-05' "
+                    "  AND event_date <= DATE '2013-07-15' AND url <> ''");
+  ASSERT_EQ(dp.size(), 1U);
+  int64_t expected_dp = 0;
+  for (int i = 200; i < 400; ++i) {
+    if ((i % 3 == 0) && (i % 4 != 0)) {
+      ++expected_dp;
+    }
+  }
+  EXPECT_EQ(dp[0], Row({Value(expected_dp)}));
+
+  // StridedPoint: congruent hit vs non-congruent miss.
+  const auto sp_hit = RelationalRun(
+      *rs_, "SELECT COUNT(*) FROM hits_dp WHERE user_id = 1000040");
+  ASSERT_EQ(sp_hit.size(), 1U);
+  EXPECT_EQ(sp_hit[0], Row({Value(12)}));
+
+  const auto sp_miss = RelationalRun(
+      *rs_, "SELECT COUNT(*) FROM hits_dp WHERE user_id = 1000041");
+  ASSERT_EQ(sp_miss.size(), 1U);
+  EXPECT_EQ(sp_miss[0], Row({Value(0)}));
 }
 
 }  // namespace

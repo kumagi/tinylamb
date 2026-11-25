@@ -519,9 +519,10 @@ TEST(CascadesTest, RepeatedTryBuildRebuildsLogicalProperties) {
                                       Constraint(Constraint::kPrimaryKey)),
                                Column("name", ValueType::kVarChar)});
   memo.SetTableSchemas({{"users", users}});
-  const ConjunctInfo by_name{.conjunct=UnaryExpressionExp(ColumnValueExp("users.name"),
-                                                UnaryOperation::kIsNotNull),
-                             .relations={"users"}};
+  const ConjunctInfo by_name{
+      .conjunct = UnaryExpressionExp(ColumnValueExp("users.name"),
+                                     UnaryOperation::kIsNotNull),
+      .relations = {"users"}};
   const GroupId group = memo.Build({"users"}, {by_name});
   ASSERT_FALSE(memo.Get(group).logical_properties_stale);
 
@@ -529,10 +530,11 @@ TEST(CascadesTest, RepeatedTryBuildRebuildsLogicalProperties) {
   // filter. The stale flag alone is not observed by the rules that read
   // logical_properties directly, so the rebuild must happen here (as it does
   // in MergeScanFilter/AddExpression) instead of being deferred to Explore.
-  const ConjunctInfo by_id{.conjunct=UnaryExpressionExp(ColumnValueExp("users.id"),
-                                              UnaryOperation::kIsNotNull),
-                           .relations={"users"}};
-  memo.Build({"users"}, {by_id});
+  const ConjunctInfo by_id{
+      .conjunct = UnaryExpressionExp(ColumnValueExp("users.id"),
+                                     UnaryOperation::kIsNotNull),
+      .relations = {"users"}};
+  EXPECT_EQ(memo.Build({"users"}, {by_id}), group);
   EXPECT_FALSE(memo.Get(group).logical_properties_stale);
   EXPECT_EQ(memo.Get(group).logical_properties_expression_count,
             memo.Get(group).expressions.size());

@@ -57,7 +57,7 @@ def QuotientWalk.Goal : Prop := ∀ n m (a reduced : Mat) (cls : Nat → Nat) (e
   ∀ depth i, i < n → walk n a (fun j => endWeight (cls j)) depth i =
     walk m reduced endWeight depth (cls i)
 
-/-- 強仮説。クラス別の行和が一致する二つのグラフの三角結合数も一致するとして実体を破棄できるか。 -/
+/-- 強仮説。クラス別の行和が一致する二つのグラフでは、始点に戻る長さ 3 の経路数も同じとしてよいか。 -/
 def QuotientCycles.Goal : Prop := ∀ n (a b : Mat) (cls : Nat → Nat),
   (∀ i < n, ∀ c, total n (fun j => if cls j == c then a i j else 0) =
                 total n (fun j => if cls j == c then b i j else 0)) →
@@ -75,9 +75,10 @@ def LatentBridge.Goal : Prop := ∀ n h k (l r s t : Mat) i j,
   total n (fun x => dot h (l i) (fun p => r p x) * dot k (s x) (fun q => t q j)) =
   total h (fun p => total k (fun q => l i p * dot n (r p) (fun x => s x q) * t q j))
 
-private def loops : Mat := fun i j => if i == j then 1 else 0
-private def swaps : Mat := fun i j => if i != j then 1 else 0
-#guard cycle 2 loops loops loops == 2 && cycle 2 swaps swaps swaps == 0
-#guard (List.range 2).all (fun i => total 2 (loops i) == total 2 (swaps i))
+-- Simple undirected graphs: two disjoint triangles and a ring on six vertices.
+private def triangles : Mat := fun i j => if i != j && i/3 == j/3 then 1 else 0
+private def ring : Mat := fun i j => if (i+1)%6 == j || (j+1)%6 == i then 1 else 0
+#guard cycle 6 triangles triangles triangles == 12 && cycle 6 ring ring ring == 0
+#guard (List.range 6).all (fun i => total 6 (triangles i) == 2 && total 6 (ring i) == 2)
 
 end TinylambOpt.ResearchGoals.Frontiers.Contractions

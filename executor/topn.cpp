@@ -1,5 +1,4 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "common/platform/process.hpp"
 #include "executor/topn.hpp"
 
 #include <algorithm>
@@ -13,6 +12,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/parallel_scan.hpp"
@@ -65,7 +65,8 @@ Status TopNExecutor::Materialize() {
     // (sql_outer_fetch_ties_sound) Stream WITH TIES using a bounded heap of
     // size `capacity = offset + limit` plus `boundary_ties` holding rows equal
     // on sort keys to `heap.top()`.
-    const char* disable_ties = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
+    const char* disable_ties =
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_OUTER_FETCH_TIES");
     const bool use_streaming_ties =
         (disable_ties == nullptr || disable_ties[0] == '\0' ||
          disable_ties[0] == '0') &&
@@ -387,49 +388,68 @@ Status TopNExecutor::Materialize() {
             },
             nullptr,
             [&](size_t w, const LSTablePageBlock& block) {
+              // Lean proof: lean/TinylambOpt/TopNBlockFence.lean
+              //   (termWiseBest_is_bound, blockCannotImprove_sound,
+              //    topn_block_fence_sound)
+              // Multi-key lexicographic block fence over mixed ASC/DESC and
+              // NULLS FIRST/LAST order terms. Computes each term's optimistic
+              // best bound on the block and compares lexicographically against
+              // the worker's current K-th watermark `boundary`.
               const auto& local = partials[w];
               if (local.size() < capacity || keys_.empty()) {
                 return true;
               }
-              const auto slot = scan->TableColumnSlot(direct_columns.front());
-              const auto& column = block.columns[slot];
-              // A NULL might precede the current boundary; leave these blocks
-              // to the normal comparator. Equality also stays for later keys
-              // and stable encounter-order ties.
-              if (column.has_null) {
-                return true;
-              }
               const auto& boundary = local.top();
-              Value best;
-              if (column.type == ValueType::kVarChar) {
-                // A code bound is a bound under the canonical order only when
-                // the codes follow CompareVarCharForOrderBy(..., false) and the
-                // key does not fold; both are checked here, and stored strings
-                // carry no tag of their own that could resurrect the fold. The
-                // comparison below then runs in the very order the bound was
-                // taken in, so a skipped block cannot hold a winner.
-                if (!column.dict || !column.dict->codes_follow_string_order ||
-                    !column.has_code_min_max ||
-                    orders.front().KeyCollation() ==
-                        Collation::kCaseInsensitive) {
+              for (size_t k = 0; k < keys_.size(); ++k) {
+                const auto slot = scan->TableColumnSlot(direct_columns[k]);
+                const auto& column = block.columns[slot];
+                const auto& ord = orders[k];
+                Value best;
+                if (column.has_null && ord.NullsFirst()) {
+                  // NULL is strictly best under NULLS FIRST; optimistic bound
+                  // is NULL.
+                  best = Value();
+                } else if (column.type == ValueType::kVarChar) {
+                  if (!column.dict || !column.dict->codes_follow_string_order ||
+                      !column.has_code_min_max ||
+                      ord.KeyCollation() == Collation::kCaseInsensitive) {
+                    return true;
+                  }
+                  const auto code =
+                      ord.Ascending() ? column.min_code : column.max_code;
+                  best.type = ValueType::kVarChar;
+                  best.value.varchar_value = column.dict->StringEntryAt(code);
+                } else if ((column.type == ValueType::kInt64 ||
+                            column.type == ValueType::kDate) &&
+                           !column.is_unsigned && column.has_min_max) {
+                  best =
+                      Value(ord.Ascending() ? column.min_int : column.max_int);
+                  best.type = column.type;
+                } else if (column.type == ValueType::kDouble &&
+                           !column.has_nan && column.has_double_min_max) {
+                  best = Value(ord.Ascending() ? column.min_double
+                                               : column.max_double);
+                } else {
                   return true;
                 }
-                const auto code = orders.front().Ascending() ? column.min_code
-                                                             : column.max_code;
-                best.type = ValueType::kVarChar;
-                best.value.varchar_value = column.dict->StringEntryAt(code);
-              } else if ((column.type == ValueType::kInt64 ||
-                          column.type == ValueType::kDate) &&
-                         !column.is_unsigned && column.has_min_max) {
-                best = Value(orders.front().Ascending() ? column.min_int
-                                                        : column.max_int);
-                best.type = column.type;
-              } else {
-                return true;
+                const int cmp = ord.Compare(
+                    best,
+                    value_at(boundary.block->columns[slot], boundary.row));
+                if (cmp > 0) {
+                  // Optimistic bound is strictly worse than K-th watermark:
+                  // no row in this block can improve the Top-K heap.
+                  return false;
+                }
+                if (cmp < 0) {
+                  return true;
+                }
+                // cmp == 0: tie on key k; advance to key k + 1.
               }
-              return orders.front().Compare(
-                         best, value_at(boundary.block->columns[slot],
-                                        boundary.row)) <= 0;
+              // All keys tied with boundary: only skip if every row in `block`
+              // has a strictly larger encounter sequence than `boundary`.
+              const size_t block_prefix =
+                  prefixes[static_cast<size_t>(&block - store->blocks.data())];
+              return block_prefix <= boundary.sequence;
             });
         if (!fold.HasValue()) {
           return fold.GetStatus();

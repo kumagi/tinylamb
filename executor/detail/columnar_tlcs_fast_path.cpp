@@ -999,8 +999,11 @@ bool RowMatchesColPtrs(
   });
 }
 
-// Lean proof: lean/TinylambOpt/PhysicalJitFusion.lean
-// (first_hit_decides_row, refine_candidates_sound)
+// Lean proofs:
+//   lean/TinylambOpt/PhysicalJitFusion.lean
+//     (first_hit_decides_row, refine_candidates_sound)
+//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//     (FrontCodedContains_sound)
 bool TryJitContainsRows(
     const ColumnarPredicateSet& preds,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
@@ -1009,8 +1012,89 @@ bool TryJitContainsRows(
   // regular evaluator handles the remaining conjuncts on surviving rows.
   for (const auto& precheck : preds.contains_prechecks) {
     const auto* chunk = col_ptrs[precheck.full_col];
-    if (!precheck.kernel || chunk == nullptr || chunk->dict_encoded ||
-        row_count == 0 || chunk->varchar_ends.size() != row_count ||
+    if (chunk == nullptr || row_count == 0 || precheck.needle.empty()) {
+      continue;
+    }
+    if (chunk->dict_encoded && chunk->dict != nullptr &&
+        chunk->dict_codes.size() == row_count) {
+      // FrontCodedContains_sound: evaluate `LIKE '%needle%'` once per
+      // dictionary entry using adjacent common prefixes, then filter rows via
+      // a 1-byte code table lookup.
+      const size_t n_entries =
+          std::min<size_t>(chunk->dict->StringEntryCount(), 256);
+      const std::string_view needle = precheck.needle;
+      const size_t needle_len = needle.size();
+      std::array<uint8_t, 256> code_match{};
+      bool any_match = false;
+      std::string_view prev;
+      size_t prev_hit_end = 0;
+      for (size_t c = 0; c < n_entries; ++c) {
+        const std::string_view cur = chunk->dict->StringEntryAt(c);
+        const size_t min_len = std::min(prev.size(), cur.size());
+        size_t lcp = 0;
+        while (lcp < min_len && prev[lcp] == cur[lcp]) {
+          ++lcp;
+        }
+        if (prev_hit_end > 0 && prev_hit_end <= lcp) {
+          code_match[c] = 1;
+          any_match = true;
+          prev = cur;
+          continue;
+        }
+        const size_t start =
+            (lcp + 1 >= needle_len) ? (lcp + 1 - needle_len) : 0;
+        size_t pos = std::string_view::npos;
+        if (start + needle_len <= cur.size()) {
+          if (precheck.kernel) {
+            const auto tail = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(cur.data() + start),
+                cur.size() - start);
+            const size_t rel = precheck.kernel->Find(tail);
+            if (rel < tail.size()) {
+              pos = start + rel;
+            }
+          } else {
+            pos = cur.find(needle, start);
+          }
+        }
+        if (pos != std::string_view::npos) {
+          code_match[c] = 1;
+          any_match = true;
+          prev_hit_end = pos + needle_len;
+        } else {
+          prev_hit_end = 0;
+        }
+        prev = cur;
+      }
+      if (!any_match) {
+        rows->clear();
+        return true;
+      }
+      const bool only_literal = preds.compares.size() == 1 &&
+                                preds.nulls.empty() && preds.inlists.empty();
+      const uint8_t* __restrict codes = chunk->dict_codes.data();
+      if (refine) {
+        size_t write = 0;
+        for (const uint32_t row : *rows) {
+          if (!chunk->IsNull(row) && code_match[codes[row]] != 0 &&
+              (only_literal || RowMatchesColPtrs(preds, col_ptrs, row))) {
+            (*rows)[write++] = row;
+          }
+        }
+        rows->resize(write);
+      } else {
+        rows->clear();
+        for (uint32_t row = 0; row < row_count; ++row) {
+          if (!chunk->IsNull(row) && code_match[codes[row]] != 0 &&
+              (only_literal || RowMatchesColPtrs(preds, col_ptrs, row))) {
+            rows->push_back(row);
+          }
+        }
+      }
+      return true;
+    }
+    if (!precheck.kernel || chunk->dict_encoded ||
+        chunk->varchar_ends.size() != row_count ||
         chunk->varchar_ends.back() != chunk->varchar_bytes.size()) {
       continue;
     }
@@ -1297,7 +1381,7 @@ void RunFastNumericPred(const FastNumericPred& p, uint32_t rc, bool is_first,
       return;
     }
     case FastNumericPred::Kind::kIntInMask64: {
-      const uint64_t lo = static_cast<uint64_t>(p.int_lo);
+      const auto lo = static_cast<uint64_t>(p.int_lo);
       const uint64_t span = static_cast<uint64_t>(p.int_hi) - lo;
       const uint64_t mask = p.in_mask;
       dispatch([cells, lo, span, mask](uint32_t r) noexcept {
@@ -1442,8 +1526,8 @@ bool TryFilterBlockNumericColumnAtATime(
     int64_t imin = in.int_values[0];
     int64_t imax = in.int_values[0];
     for (const int64_t v : in.int_values) {
-      if (v < imin) imin = v;
-      if (v > imax) imax = v;
+      imin = std::min(v, imin);
+      imax = std::max(v, imax);
     }
     if (column.has_min_max && !column.is_unsigned) {
       if (column.max_int < imin || column.min_int > imax) {
@@ -6367,6 +6451,12 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
               continue;
             }
             const auto& cm = blk_meta.columns[as.full_col];
+            const bool col_signed_int_or_date =
+                table_schema.GetColumn(as.full_col).Type() !=
+                    ValueType::kDouble &&
+                table_schema.GetColumn(as.full_col).Type() !=
+                    ValueType::kVarChar &&
+                !table_schema.GetColumn(as.full_col).IsUnsigned();
             const bool is_const_int_or_date =
                 (as.kind == ColAggKind::kCountCol ||
                  as.kind == ColAggKind::kSumInt64 ||
@@ -6381,7 +6471,20 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                     ValueType::kVarChar &&
                 (cm.encoding == TlcsColumnEncoding::kConstNull ||
                  (!cm.has_null && cm.has_min_max && cm.min_int == cm.max_int));
-            if (!is_const_int_or_date &&
+            // Lean proof:
+            // lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+            //   (sound_DominatedColumn).
+            // On an all-pass block, signed INT64/DATE MIN/MAX can be answered
+            // directly from block metadata (cm.min_int / cm.max_int) without
+            // decoding the column even when the block is non-constant or has
+            // NULLs (has_min_max summarizes non-NULL values).
+            const bool is_meta_extrema_int_or_date =
+                col_signed_int_or_date && cm.has_min_max &&
+                (as.kind == ColAggKind::kMinInt64 ||
+                 as.kind == ColAggKind::kMaxInt64 ||
+                 as.kind == ColAggKind::kMinDate ||
+                 as.kind == ColAggKind::kMaxDate);
+            if (!is_const_int_or_date && !is_meta_extrema_int_or_date &&
                 std::ranges::find(dyn_scalar_cols, as.full_col) ==
                     dyn_scalar_cols.end()) {
               dyn_scalar_cols.push_back(as.full_col);
@@ -6437,8 +6540,8 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   break;
                 case ColAggKind::kMaxInt64:
                 case ColAggKind::kMaxDate:
-                  if (!sa[a].has_value || cv > sa[a].int_val) {
-                    sa[a].int_val = cv;
+                  if (!sa[a].has_value || cm.max_int > sa[a].int_val) {
+                    sa[a].int_val = cm.max_int;
                     sa[a].has_value = true;
                   }
                   break;
@@ -8867,10 +8970,78 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                   }
                 }
 
+                // Lean proofs:
+                //   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+                //     (OwnerDistinct_sound, OrderedCodeMin_sound)
                 auto& my_aggs = p2_worker_aggs[tid];
+                // OrderedCodeMin_sound: for dictionary-encoded VARCHAR
+                // MIN/MAX late aggregates where the local dictionary is sorted
+                // in binary string order, track only the extreme code per
+                // winner in this block and decode/fold at most 1 row per
+                // winner.
+                std::vector<uint8_t> la_ordered_code_done(n_late, 0);
+                for (size_t la = 0; la < n_late; ++la) {
+                  const ColAggSpec& ls = late_aggs[la];
+                  if (ls.kind != ColAggKind::kMinVarChar &&
+                      ls.kind != ColAggKind::kMaxVarChar) {
+                    continue;
+                  }
+                  const auto* vch = col_ptrs[ls.full_col];
+                  if (vch == nullptr || !vch->dict_encoded ||
+                      vch->dict == nullptr || vch->dict_codes.empty()) {
+                    continue;
+                  }
+                  const size_t n_dict = vch->dict->StringEntryCount();
+                  if (n_dict == 0 || n_dict > 255) {
+                    continue;
+                  }
+                  bool sorted_dict = true;
+                  for (size_t c = 1; c < n_dict; ++c) {
+                    if (vch->dict->StringEntryAt(c - 1) >
+                        vch->dict->StringEntryAt(c)) {
+                      sorted_dict = false;
+                      break;
+                    }
+                  }
+                  if (!sorted_dict) {
+                    continue;
+                  }
+                  const bool is_min = (ls.kind == ColAggKind::kMinVarChar);
+                  std::vector<uint16_t> best_code(n_win, 0xFFFF);
+                  std::vector<uint32_t> best_row(n_win, 0);
+                  const uint8_t* __restrict codes = vch->dict_codes.data();
+                  for (const auto& [r, w] : matched_wins) {
+                    if (vch->IsNull(r)) {
+                      continue;
+                    }
+                    const uint16_t code = codes[r];
+                    if (best_code[w] == 0xFFFF ||
+                        (is_min ? (code < best_code[w])
+                                : (code > best_code[w]))) {
+                      best_code[w] = code;
+                      best_row[w] = r;
+                    }
+                  }
+                  for (size_t w = 0; w < n_win; ++w) {
+                    if (best_code[w] == 0xFFFF) {
+                      continue;
+                    }
+                    Status fst = FoldRowIntoAggState(ls, col_ptrs, best_row[w],
+                                                     my_aggs[(w * n_late) + la],
+                                                     *p2_arenas[tid]);
+                    if (fst != Status::kSuccess) {
+                      p2_status[tid] = std::move(fst);
+                      return;
+                    }
+                  }
+                  la_ordered_code_done[la] = 1;
+                }
                 for (const auto& [r, w] : matched_wins) {
                   RuntimeAggState* base_st = &my_aggs[w * n_late];
                   for (size_t la = 0; la < n_late; ++la) {
+                    if (la_ordered_code_done[la] != 0) {
+                      continue;
+                    }
                     if (la == int_dist_la) {
                       const ColAggSpec& ds = late_aggs[la];
                       const auto* dch = col_ptrs[ds.full_col];

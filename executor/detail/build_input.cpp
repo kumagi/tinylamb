@@ -9384,7 +9384,20 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     RETURN_IF_FAIL(relations[idx].GetStatus());
     if (!post_load_exists_predicates[idx].empty() &&
         relations[idx].TotalRows() > 0) {
-      for (const Expression& ep : post_load_exists_predicates[idx]) {
+      // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+      //   (MultiChannelExistsBitsetPushdown_sound,
+      //    MultiChannelAntiExistsBitsetPushdown_sound)
+      // Evaluate plain single-EXISTS conjuncts before disjunctive OR-EXISTS
+      // trees so the reduced outer-key domain from `EXISTS(S)` automatically
+      // seeds the semi-filter for `EXISTS(W) OR EXISTS(C)`.
+      std::vector<Expression> ordered_exists = post_load_exists_predicates[idx];
+      std::ranges::stable_sort(
+          ordered_exists, [](const Expression& a, const Expression& b) {
+            const bool a_simple = a && a->Type() == TypeTag::kQueryExp;
+            const bool b_simple = b && b->Type() == TypeTag::kQueryExp;
+            return a_simple && !b_simple;
+          });
+      for (const Expression& ep : ordered_exists) {
         RETURN_IF_FAIL(
             FilterRelation(context, &relations[idx], {ep}, outer, ctes));
         if (relations[idx].TotalRows() == 0) {
@@ -11111,6 +11124,147 @@ run_zero_payload_first:
               << " n=" << non_absorbed_count
               << " aggs=" << fusion->aggregates.size()
               << " res=" << join_residual.size() << "\n";
+  }
+
+  // Lean-backed (IndividualQueryGaps.lean:
+  // CompositeKeySemiJoinChainReduction_sound): for all-INNER multi-way join
+  // chains with composite (2+ column) int64 equijoins `A ⋈_{k1=k2} B ⋈_{j2=j3}
+  // C`, propagate composite-key semi-joins from smaller relations to larger
+  // neighbors (2 passes) before the greedy join loop.
+  if (!star_joined && all_inner_equi_sources && non_absorbed_count >= 2 &&
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COMPOSITE_SEMIJOIN") ==
+          nullptr) {
+    struct CompEdge {
+      size_t s1{0};
+      size_t s2{0};
+      std::vector<std::pair<slot_t, slot_t>> cols;
+    };
+    std::map<std::pair<size_t, size_t>, std::vector<std::pair<slot_t, slot_t>>>
+        edge_map;
+    for (const PredicateInfo& p : predicates) {
+      if (!p.resolved || p.contains_query || p.sources.size() != 2 ||
+          !IsColumnEqualityPredicate(p.expression) ||
+          p.expression->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+        continue;
+      }
+      auto it = p.sources.begin();
+      const size_t sa = *it++;
+      const size_t sb = *it;
+      if (sa >= relations.size() || sb >= relations.size() ||
+          absorbed[sa] != 0U || absorbed[sb] != 0U ||
+          deferred_probe_rel == sa || deferred_probe_rel == sb ||
+          relations[sa].HasSpill() || relations[sb].HasSpill()) {
+        continue;
+      }
+      const auto& be = p.expression->AsBinaryExpression();
+      const ColumnName& ln = be.Left()->AsColumnValue().GetColumnName();
+      const ColumnName& rn = be.Right()->AsColumnValue().GetColumnName();
+      auto la = LocalColumnOffset(relations[sa].schema, ln);
+      auto rb = LocalColumnOffset(relations[sb].schema, rn);
+      if (!la || !rb) {
+        la = LocalColumnOffset(relations[sa].schema, rn);
+        rb = LocalColumnOffset(relations[sb].schema, ln);
+      }
+      if (!la || !rb) {
+        continue;
+      }
+      const ValueType ta = relations[sa].schema.GetColumn(*la).Type();
+      const ValueType tb = relations[sb].schema.GetColumn(*rb).Type();
+      if ((ta != ValueType::kInt64 && ta != ValueType::kDate) || ta != tb) {
+        continue;
+      }
+      const auto key = sa < sb ? std::pair{sa, sb} : std::pair{sb, sa};
+      const auto cols = sa < sb ? std::pair{*la, *rb} : std::pair{*rb, *la};
+      edge_map[key].emplace_back(cols);
+    }
+    std::vector<CompEdge> comp_edges;
+    for (auto& [pair_idx, cols] : edge_map) {
+      if (cols.size() >= 2) {
+        comp_edges.push_back(CompEdge{
+            .s1 = pair_idx.first,
+            .s2 = pair_idx.second,
+            .cols = std::move(cols),
+        });
+      }
+    }
+    if (!comp_edges.empty()) {
+      struct VecIntHash {
+        size_t operator()(const std::vector<int64_t>& v) const noexcept {
+          uint64_t h = 14695981039346656037ULL;
+          for (int64_t x : v) {
+            uint64_t z = static_cast<uint64_t>(x) + 0x9e3779b97f4a7c15ULL;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            h ^= z ^ (z >> 31);
+            h *= 1099511628211ULL;
+          }
+          return static_cast<size_t>(h);
+        }
+      };
+      for (int pass = 0; pass < 2; ++pass) {
+        bool any_reduced = false;
+        for (const CompEdge& e : comp_edges) {
+          const size_t n1 = rel_row_count(e.s1);
+          const size_t n2 = rel_row_count(e.s2);
+          if (n1 == 0 || n2 == 0) {
+            continue;
+          }
+          const bool s1_smaller = (n1 <= n2);
+          const size_t small_i = s1_smaller ? e.s1 : e.s2;
+          const size_t large_i = s1_smaller ? e.s2 : e.s1;
+          const size_t n_small = s1_smaller ? n1 : n2;
+          const size_t n_large = s1_smaller ? n2 : n1;
+          if (n_small > 200000 || n_large < 64 || n_small * 2 > n_large ||
+              (relations[large_i].columnar && n_large > 500000)) {
+            continue;
+          }
+          RETURN_IF_FAIL(relations[small_i].EnsureRowsMaterialized());
+          RETURN_IF_FAIL(relations[large_i].EnsureRowsMaterialized());
+          std::unordered_set<std::vector<int64_t>, VecIntHash> keys;
+          keys.reserve(n_small);
+          std::vector<int64_t> kbuf(e.cols.size());
+          for (const Row& r : relations[small_i].rows) {
+            bool has_null = false;
+            for (size_t k = 0; k < e.cols.size(); ++k) {
+              const slot_t c = s1_smaller ? e.cols[k].first : e.cols[k].second;
+              if (r[c].IsNull()) {
+                has_null = true;
+                break;
+              }
+              kbuf[k] = r[c].value.int_value;
+            }
+            if (!has_null) {
+              keys.insert(kbuf);
+            }
+          }
+          std::vector<Row> kept;
+          kept.reserve(std::min(n_large, (keys.size() * 2) + 16));
+          for (Row& r : relations[large_i].rows) {
+            bool has_null = false;
+            for (size_t k = 0; k < e.cols.size(); ++k) {
+              const slot_t c = s1_smaller ? e.cols[k].second : e.cols[k].first;
+              if (r[c].IsNull()) {
+                has_null = true;
+                break;
+              }
+              kbuf[k] = r[c].value.int_value;
+            }
+            if (!has_null && keys.contains(kbuf)) {
+              kept.push_back(std::move(r));
+            }
+          }
+          const bool reduced = kept.size() < relations[large_i].rows.size();
+          relations[large_i].rows = std::move(kept);
+          if (reduced) {
+            relations[large_i].columnar.reset();
+            any_reduced = true;
+          }
+        }
+        if (!any_reduced) {
+          break;
+        }
+      }
+    }
   }
 
   // Pick the best starting table.  The naive approach (smallest row

@@ -1,5 +1,4 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "common/platform/process.hpp"
 #include "executor/detail/typed_stream_aggregate_partitioned.hpp"
 
 #include <algorithm>
@@ -27,6 +26,7 @@
 #include <vector>
 
 #include "common/parallel_work.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
@@ -641,7 +641,8 @@ Relation FinalizePartitionedRelation(
           survivors.begin() + static_cast<std::ptrdiff_t>(emit_count),
           survivors.end(), cmp_rows);
     } else if (
-        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") ==
+            nullptr &&
         fast_order_kind == PartOrderKind::kInt &&
         req.order_bindings.size() == 1 && survivors.size() >= 1024 &&
         // Lean proof:
@@ -4817,10 +4818,14 @@ StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
 //    quotient_bucket_asc_order_pruning_bug)
 // CB-7: Exact heavy-hitter pruning via quotient hash-bucket upper bounds for
 // `GROUP BY keys ORDER BY COUNT(*) DESC LIMIT K` (ClickBench Q13, Q15, Q17,
-// Q19, Q34, Q35). Eliminates multi-GB VARCHAR slab serialization and disk
-// spilling by counting 2^20 quotient buckets in L3 cache first, then
+// Q19, Q34, Q35, Q37, Q38). Eliminates multi-GB VARCHAR slab serialization and
+// disk spilling by counting quotient buckets in L2/L3 cache first (2^16 buckets
+// for 16..127 filtered blocks, 2^20 buckets for >= 128 blocks), then
 // aggregating exact key tuples only for the <= 2,048 heaviest buckets and
 // certifying `tau > max_bucket_outside_S` before returning!
+// Lean proofs:
+//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//     (CancellationDebt_sound, CertifiedWinners_sound)
 StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
     const PartitionedColumnarAggRequest& req, const KeyProjectionMap& km) {
   if (!req.stmt.HasLimit() || req.stmt.Limit() == 0 ||
@@ -4831,7 +4836,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       req.order_bindings[0].binding.kind != OutputSlotBinding::Kind::kAgg ||
       req.order_bindings[0].binding.index != 0 ||
       req.order_bindings[0].order.Ascending() ||
-      req.candidate_blocks.size() < 128) {
+      req.candidate_blocks.size() < 16) {
     return std::optional<Relation>{};
   }
   if (req.stmt.Offset() >
@@ -4869,7 +4874,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                              return item.kind ==
                                     OutputSlotBinding::Kind::kPostAgg;
                            }) &&
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TLCS_DUPLICATE_SIEVE") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TLCS_DUPLICATE_SIEVE") ==
+          nullptr;
   bool near_unique = false;
   if (try_duplicate_sieve) {
     // The sampled column is sufficient to estimate pair uniqueness. A
@@ -4909,15 +4915,16 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   const bool try_numeric_quotient =
       numeric_pair && !near_unique && req.order_bindings.size() == 1 &&
       req.candidate_blocks.size() >= 512 &&
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUOTIENT_FUSION") ==
+          nullptr;
   if (!any_varchar_key && !single_raw_int_key && !near_unique &&
       !try_numeric_quotient) {
     return std::optional<Relation>{};
   }
 
-  static constexpr size_t kBucketBits = 20;
-  static constexpr size_t kNumBuckets = size_t{1} << kBucketBits;
-  static constexpr size_t kBucketMask = kNumBuckets - 1;
+  const size_t bucket_bits = (req.candidate_blocks.size() < 128) ? 16U : 20U;
+  const size_t num_buckets = size_t{1} << bucket_bits;
+  const size_t bucket_mask = num_buckets - 1;
   static constexpr size_t kHeavyBuckets = 2048;
 
   const size_t workers = std::max<size_t>(
@@ -4926,9 +4933,9 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
               req.candidate_blocks.size(), size_t{16}}));
 
   QueryMemoryCharge sketch_charge;
-  const size_t reserve_bytes = (workers * kNumBuckets * sizeof(uint32_t)) +
-                               (kNumBuckets * sizeof(uint64_t)) +
-                               (kNumBuckets / 8);
+  const size_t reserve_bytes = (workers * num_buckets * sizeof(uint32_t)) +
+                               (num_buckets * sizeof(uint64_t)) +
+                               (num_buckets / 8);
   if (!sketch_charge.TryAdd(reserve_bytes)) {
     return std::optional<Relation>{};
   }
@@ -4979,15 +4986,16 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   const auto has_bucket = [](std::span<const uint64_t> mask, size_t bucket) {
     return ((mask[bucket / 64] >> (bucket % 64)) & 1) != 0;
   };
-  const auto bucket_of = [](uint64_t hash) {
-    return static_cast<size_t>((hash >> 32U) ^ hash) & kBucketMask;
+  const auto bucket_of = [bucket_mask](uint64_t hash) {
+    return static_cast<size_t>((hash >> 32U) ^ hash) & bucket_mask;
   };
   const bool direct = req.preds.Empty() && sched.cond_cols.empty() &&
                       sched.stage1a_cols.empty() &&
                       sched.stage1c_cols.empty() && sched.stage2_cols.empty() &&
                       !sched.stage1b_cols.empty();
   const bool specialize =
-      direct && ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
+      direct && ::tinylamb::platform::GetEnv(
+                    "TINYLAMB_DISABLE_QUOTIENT_FUSION") == nullptr;
   const auto string_fingerprint_jit =
       specialize && single_raw_varchar_key && input_bound >= (1U << 24)
           ? JitStringFingerprint::Compile()
@@ -5183,8 +5191,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                 // The first key alone is a sound bucket key. The resident
                 // table below still tests both cells for equality.
                 const uint64_t h =
-                    !near_unique
-                        ? GroupKeySliceHasher::HashTyped(pair.data(), km.phys_specs)
+                    !near_unique ? GroupKeySliceHasher::HashTyped(pair.data(),
+                                                                  km.phys_specs)
                     : pair[0].is_null
                         ? null_hash
                         : MixHash64(GroupKeySliceHasher::kSeed ^
@@ -5330,12 +5338,13 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                         value.empty() ? empty : HashView64(value);
                     const uint64_t hash = MixHash64(
                         hashes[lane] ^ (entry + 2 * 0x9e3779b97f4a7c15ULL));
-                    const std::array<RuntimeKeyCell, 3> cells{{
-                        {.int_val = a->int_cells[row]},
-                        {.int_val = date_parts[lane]},
-                        // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): RuntimeKeyCell carries str_len.
-                        {.str_ptr = value.data(),
-                         .str_len = static_cast<uint32_t>(value.size())}}};
+                    const std::array<RuntimeKeyCell, 3> cells{
+                        {{.int_val = a->int_cells[row]},
+                         {.int_val = date_parts[lane]},
+                         // RuntimeKeyCell carries str_len.
+                         // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
+                         {.str_ptr = value.data(),
+                          .str_len = static_cast<uint32_t>(value.size())}}};
                     status = emit_row(cells.data(), hash,
                                       static_cast<uint32_t>(row));
                     if (!status.ok()) {
@@ -5362,9 +5371,9 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                     PrefetchBitmapWord(prefetch_words.data() + word);
                   }
                   const size_t row = base + lane;
-                  const std::array<RuntimeKeyCell, 2> pair{{
-                      {.int_val = a->int_cells[row]},
-                      {.int_val = b == nullptr ? 0 : b->int_cells[row]}}};
+                  const std::array<RuntimeKeyCell, 2> pair{
+                      {{.int_val = a->int_cells[row]},
+                       {.int_val = b == nullptr ? 0 : b->int_cells[row]}}};
                   status = emit_row(pair.data(), hashes[lane],
                                     static_cast<uint32_t>(row));
                   if (!status.ok()) {
@@ -5451,10 +5460,10 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       for (size_t g = 0; g < ng; ++g) {
         all_cnts[g] = merged.AggsAt(g)[0].count;
       }
-      std::nth_element(
-        all_cnts.begin(), std::next(all_cnts.begin(),
-                                    static_cast<std::ptrdiff_t>(topk_cap - 1)),
-        all_cnts.end(), std::greater<int64_t>{});
+      std::nth_element(all_cnts.begin(),
+                       std::next(all_cnts.begin(),
+                                 static_cast<std::ptrdiff_t>(topk_cap - 1)),
+                       all_cnts.end(), std::greater<int64_t>{});
       tau = all_cnts[topk_cap - 1];
       // Soundness certificate (`quotient_bucket_topk_pruning_sound`): every
       // bucket outside `heavy_bits` has total row count `<= rest_max_bucket <
@@ -5481,13 +5490,12 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       for (size_t g = 0; g < ng; ++g) {
         shortlist[g] = g;
       }
-      std::nth_element(shortlist.begin(),
-                       std::next(shortlist.begin(),
-                                 static_cast<std::ptrdiff_t>(topk_cap)),
-                       shortlist.end(), [&](size_t a, size_t b) {
-                         return merged.AggsAt(a)[0].count >
-                                merged.AggsAt(b)[0].count;
-                       });
+      std::nth_element(
+          shortlist.begin(),
+          std::next(shortlist.begin(), static_cast<std::ptrdiff_t>(topk_cap)),
+          shortlist.end(), [&](size_t a, size_t b) {
+            return merged.AggsAt(a)[0].count > merged.AggsAt(b)[0].count;
+          });
       shortlist.resize(topk_cap);
     }
     const size_t emit_count = shortlist.empty() ? ng : shortlist.size();
@@ -5552,7 +5560,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
     const bool use_two_bits = req.preds.Empty();
     const size_t words = (bits / 64) * (use_two_bits ? 2 : 1);
     QueryMemoryCharge bitmap_charge;
-    // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically sized uninitialized buffer is zeroed in parallel below.
+    // Dynamically sized uninitialized buffer is zeroed in parallel below.
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     std::unique_ptr<uint64_t[]> bitmaps;
     const auto tag = [&](uint64_t hash) {
       const size_t word = (hash >> 16) & (words - 1);
@@ -5578,7 +5587,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
         group_hash_jit && input_bound >= (uint64_t{1} << 22) &&
         input_bound <= (uint64_t{1} << (64 - kTagBits)) &&
         sizeof(size_t) >= 8 &&
-        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_SHARDED_DUPLICATE_SIEVE") == nullptr &&
+        ::tinylamb::platform::GetEnv(
+            "TINYLAMB_DISABLE_SHARDED_DUPLICATE_SIEVE") == nullptr &&
         replay_charge.TryAdd(replay_words * sizeof(uint64_t)) &&
         shard_charge.TryAdd(
             (input_bound * 2 + workers * (kShards * 64 + 2 * shard_words)) *
@@ -5646,11 +5656,13 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
       if (!bitmap_charge.TryAdd(2 * words * sizeof(uint64_t))) {
         return std::nullopt;
       }
-      // NOLINTNEXTLINE(modernize-avoid-c-arrays): uninitialized dynamic buffer is zeroed in parallel.
+      // Uninitialized dynamic buffer is zeroed in parallel.
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays)
       bitmaps = std::make_unique_for_overwrite<uint64_t[]>(2 * words);
       RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
         const size_t size = 2 * words;
-        // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
+        // Dynamically indexed raw bitmap.
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays)
         std::fill(bitmaps.get() + ((size * w) / workers),
                   bitmaps.get() + ((size * (w + 1)) / workers), uint64_t{0});
       }));
@@ -5658,11 +5670,13 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
           req.candidate_blocks, true,
           [&](size_t, const RuntimeKeyCell*, uint64_t hash) {
             const auto [word, mask] = tag(hash);
-            // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
+            // Dynamically indexed raw bitmap.
+            // NOLINTNEXTLINE(modernize-avoid-c-arrays)
             const uint64_t old = std::atomic_ref(bitmaps[word])
                                      .fetch_or(mask, std::memory_order_relaxed);
             if ((old & mask) != 0) {
-              // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
+              // Dynamically indexed raw bitmap.
+              // NOLINTNEXTLINE(modernize-avoid-c-arrays)
               std::atomic_ref(bitmaps[word + words])
                   .fetch_or(old & mask, std::memory_order_relaxed);
             }
@@ -5679,7 +5693,8 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
         [&](size_t w, const RuntimeKeyCell* keys, uint64_t hash) -> Status {
           if (!shard_sightings) {
             const auto [word, mask] = tag(hash);
-            // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically indexed raw bitmap.
+            // Dynamically indexed raw bitmap.
+            // NOLINTNEXTLINE(modernize-avoid-c-arrays)
             const bool repeated = (bitmaps[word + words] & mask) == mask;
             // All dropped singleton groups tie on the only ORDER BY term.
             // Retain enough witnesses to supply LIMIT plus OFFSET.
@@ -5706,15 +5721,15 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   }
 
   std::vector<std::vector<uint32_t>> worker_buckets(
-      workers, std::vector<uint32_t>(kNumBuckets, 0));
+      workers, std::vector<uint32_t>(num_buckets, 0));
   const auto sketch = [&](size_t worker, const RuntimeKeyCell*, uint64_t hash) {
     ++worker_buckets[worker][bucket_of(hash)];
     return Status::kSuccess;
   };
   const auto sum_buckets = [&] {
-    std::vector<uint32_t> result(kNumBuckets, 0);
+    std::vector<uint32_t> result(num_buckets, 0);
     for (const auto& local : worker_buckets) {
-      for (size_t b = 0; b < kNumBuckets; ++b) {
+      for (size_t b = 0; b < num_buckets; ++b) {
         result[b] += local[b];
       }
     }
@@ -5724,22 +5739,22 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
                                   size_t capacity) {
     auto ranked = counts;
     std::nth_element(
-        ranked.begin(), std::next(ranked.begin(),
-                                  static_cast<std::ptrdiff_t>(capacity - 1)),
+        ranked.begin(),
+        std::next(ranked.begin(), static_cast<std::ptrdiff_t>(capacity - 1)),
         ranked.end(), std::greater<uint32_t>{});
     const uint32_t cutoff = ranked[capacity - 1];
-    std::vector<uint64_t> mask(kNumBuckets / 64, 0);
+    std::vector<uint64_t> mask(num_buckets / 64, 0);
     // Give strictly higher counts priority. Break ties by bucket index
     // only when building the speculative mask.
     size_t remaining = capacity;
-    for (size_t b = 0; b < kNumBuckets; ++b) {
+    for (size_t b = 0; b < num_buckets; ++b) {
       if (counts[b] > cutoff) {
         mask[b >> 6U] |= uint64_t{1} << (b & 63U);
         --remaining;
       }
     }
     if (cutoff != 0) {
-      for (size_t b = 0; remaining != 0 && b < kNumBuckets; ++b) {
+      for (size_t b = 0; remaining != 0 && b < num_buckets; ++b) {
         if (counts[b] == cutoff) {
           mask[b >> 6U] |= uint64_t{1} << (b & 63U);
           --remaining;
@@ -5751,7 +5766,7 @@ StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
   const auto outside_max = [&](const std::vector<uint32_t>& counts,
                                std::span<const uint64_t> mask) {
     uint32_t result = 0;
-    for (size_t b = 0; b < kNumBuckets; ++b) {
+    for (size_t b = 0; b < num_buckets; ++b) {
       if (!has_bucket(mask, b)) {
         result = std::max(result, counts[b]);
       }
@@ -6108,7 +6123,8 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   // Lean proof:
   // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
   // (sound)
-  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") != nullptr ||
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") !=
+          nullptr ||
       req.candidate_blocks.empty() || req.key_specs.size() != 2 ||
       req.stmt.Distinct() || req.any_scalar_distinct) {
     return std::optional<Relation>{};
@@ -6220,7 +6236,8 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   const size_t total_slots = s0 * s1;
   const size_t naggs = req.agg_specs.size();
   // Lean proofs:
-  //   - lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
+  //   -
+  //   lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
   //     (sound)
   //   - lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (EpochAverage_sound)
   //   - lean/TinylambOpt/ResearchProofs/TwoLevelPartitionedAggMerge.lean
@@ -6234,7 +6251,8 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
       (req.agg_specs[0].kind == ColAggKind::kCountStar ||
        req.agg_specs[0].kind == ColAggKind::kAvgDouble ||
        req.agg_specs[0].kind == ColAggKind::kSumDouble) &&
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_EPOCH_TWO_KEY_AGG") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_EPOCH_TWO_KEY_AGG") ==
+          nullptr;
 
   struct CompactEpochSlot {
     uint32_t stamp{0};
@@ -6369,7 +6387,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             const int64_t* __restrict__ c1 = kch1->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                        static_cast<uint64_t>(min0)) *
+                    s1) +
+                   static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                       static_cast<uint64_t>(min1)));
               CompactEpochSlot& slot = eslots[gi];
               if (slot.stamp != ep) {
                 slot.stamp = ep;
@@ -6417,7 +6439,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             const int64_t* __restrict__ vals = vch->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                        static_cast<uint64_t>(min0)) *
+                    s1) +
+                   static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                       static_cast<uint64_t>(min1)));
               CompactEpochSlot& slot = eslots[gi];
               if (slot.stamp != ep) {
                 slot.stamp = ep;
@@ -6432,7 +6458,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             const int64_t* __restrict__ raw_vals = vch->int_cells.data();
             for (const uint32_t r : cand_rows) {
               const size_t gi =
-                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+                  ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                        static_cast<uint64_t>(min0)) *
+                    s1) +
+                   static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                       static_cast<uint64_t>(min1)));
               const auto dv = std::bit_cast<double>(raw_vals[r]);
               CompactEpochSlot& slot = eslots[gi];
               if (slot.stamp != ep) {
@@ -6468,7 +6498,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
             if (!vch->IsNull(r)) {
               ++slot.count;
               slot.sum += is_int_v ? static_cast<double>(vch->int_cells[r])
-                                 : std::bit_cast<double>(vch->int_cells[r]);
+                                   : std::bit_cast<double>(vch->int_cells[r]);
             }
           }
         }
@@ -6496,7 +6526,11 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
         const int64_t* __restrict__ c0 = kch0->int_cells.data();
         const int64_t* __restrict__ c1 = kch1->int_cells.data();
         for (const uint32_t r : cand_rows) {
-          const size_t gi = ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+          const size_t gi = ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                                  static_cast<uint64_t>(min0)) *
+                              s1) +
+                             static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                                 static_cast<uint64_t>(min1)));
           pres[gi] = 1;
           ++aggs[gi].count;
           aggs[gi].has_value = true;
@@ -6513,7 +6547,12 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
           const int64_t* __restrict__ c1 = kch1->int_cells.data();
           const int64_t* __restrict__ vals = vch->int_cells.data();
           for (const uint32_t r : cand_rows) {
-            const size_t gi = ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) - static_cast<uint64_t>(min0)) * s1) + static_cast<size_t>(static_cast<uint64_t>(c1[r]) - static_cast<uint64_t>(min1)));
+            const size_t gi =
+                ((static_cast<size_t>(static_cast<uint64_t>(c0[r]) -
+                                      static_cast<uint64_t>(min0)) *
+                  s1) +
+                 static_cast<size_t>(static_cast<uint64_t>(c1[r]) -
+                                     static_cast<uint64_t>(min1)));
             pres[gi] = 1;
             ++aggs[gi].count;
             aggs[gi].double_val += static_cast<double>(vals[r]);
@@ -6710,13 +6749,15 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     const KeyProjectionMap* precomputed_km) {
   // Lean proofs:
   //   - lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean (sound)
-  //   - lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean
+  //   -
+  //   lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean
   //     (sound)
   //   - lean/TinylambOpt/ResearchProofs/ShortStringPrefix7Bijection.lean
   //   (sound)
   //   - lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean
   //   (sound)
-  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||
+  if (::tinylamb::platform::GetEnv(
+          "TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||
       req.candidate_blocks.empty() || req.candidate_blocks.size() > 256 ||
       req.key_specs.size() != 1 ||
       req.key_specs[0].kind != ColKeyKind::kColVarChar || req.stmt.Distinct() ||
@@ -7158,12 +7199,12 @@ StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
   }
 
   // CB-7: Quotient hash-bucket upper-bound exact heavy-hitter pruning
-  // (`ClickBench Q13, Q15, Q17, Q19, Q34, Q35`).
+  // (`ClickBench Q13, Q15, Q17, Q19, Q34, Q35, Q37, Q38`).
   if (!req.order_bindings.empty() && req.stmt.HasLimit() &&
       req.positional_having.empty() && !req.any_scalar_distinct &&
       req.agg_specs.size() == 1 &&
       req.agg_specs[0].kind == ColAggKind::kCountStar &&
-      req.candidate_blocks.size() >= 128) {
+      req.candidate_blocks.size() >= 16) {
     ASSIGN_OR_RETURN(std::optional<Relation>, hh_res,
                      TryRunQuotientBucketHeavyHittersTopK(req, km));
     if (hh_res.has_value()) {

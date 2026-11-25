@@ -5,8 +5,8 @@ namespace TinylambOpt.ResearchGoals.Frontiers.SparseRecovery
 /-! Iceberg deletes and mixed refresh. Ordinals denote identities within a pinned file.
 Order-independent exact summaries use unbounded integers. Multiplicity is intentional. -/
 def moment (xs : List Nat) (k : Nat) := (xs.map (fun x => x^k)).sum
-def poly (xs : List Nat) (z : Int) := (xs.map (fun x => z-(x:Int))).prod
-def probes (n : Nat) (xs : List Nat) := (List.range n).map (fun z => poly xs z)
+def poly (xs : List Nat) (z : Int) := (xs.map (fun (x : Nat) => z-(x:Int))).prod
+def probes (n : Nat) (xs : List Nat) := (List.range n).map (fun (z : Nat) => poly xs z)
 
 /-- 最大 d 個の削除 ID の袋を d 次までのべき和で一意に復元できるか。0 次は件数を担う。 -/
 def BoundedMoments.Goal : Prop := ∀ (a b : List Nat) d, a.length ≤ d → b.length ≤ d →
@@ -41,8 +41,9 @@ def UniformBucket.Goal : Prop := ∀ (xs : List Nat), xs ≠ [] →
 def ThreeFromTwo.Goal : Prop := ∀ (a b : List Nat), a.length = 3 → b.length = 3 →
   moment a 1 = moment b 1 → moment a 2 = moment b 2 → ∀ p, a.contains p = b.contains p
 
-/-- 大きな ordinal 空間を複数の小さい辞書へ射影し、各候補の混同行数の最小値を削除数の上界にする。 -/
 def buckets (xs : List Nat) (h : Nat → Nat) (key : Nat) := xs.countP (fun x => h x == h key)
+
+/-- 大きな ordinal 空間を複数の小さい辞書へ射影し、各候補の混同行数の最小値を削除数の上界にする。 -/
 def IsolatedHash.Goal : Prop := ∀ xs (hashes : List (Nat → Nat)) key,
   (∃ h ∈ hashes, ∀ x ∈ xs, h x = h key → x = key) →
   (hashes.map (fun h => buckets xs h key)).min? = some (xs.count key)
@@ -57,9 +58,10 @@ def PeelingVariance.Goal : Prop := ∀ (known live : List Nat), live ≠ [] →
 
 /-- 小さな二表の積結合でキー一致が存在するかを、片方の特性多項式の他方全キーでの積で判定する。 -/
 def DisjointResultant.Goal : Prop := ∀ (a b : List Nat),
-  (b.map (fun x => poly a x)).prod = 0 ↔ ∃ x ∈ a, x ∈ b
+  (b.map (fun (x : Nat) => poly a x)).prod = 0 ↔ ∃ x ∈ a, x ∈ b
 
 #guard moment [0,4,5] 1 == moment [1,2,6] 1 && moment [0,4,5] 2 == moment [1,2,6] 2
+#guard [0,4,5].contains 4 && ![1,2,6].contains (4 : Nat)
 #guard probes 2 [0,0] != probes 2 [0,1] && poly [] 0 == 1
 
 end TinylambOpt.ResearchGoals.Frontiers.SparseRecovery

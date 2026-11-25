@@ -118,11 +118,13 @@ TEST(CascadesTest, JoinCommutativityPreservesInheritedPredicate) {
 TEST(CascadesTest, SubsetRebuildOnlyRefreshesItsOwnScanFilters) {
   const auto predicate = [](const char* relation) {
     return BinaryExpressionExp(ColumnValueExp(ColumnName(relation, "id")),
-                               BinaryOperation::kEquals, ConstantValueExp(Value(1)));
+                               BinaryOperation::kEquals,
+                               ConstantValueExp(Value(1)));
   };
   Memo memo;
-  (void)memo.Build({"a","b"}, {{.conjunct=predicate("a"), .relations={"a"}},
-                                {.conjunct=predicate("b"), .relations={"b"}}});
+  (void)memo.Build({"a", "b"},
+                   {{.conjunct = predicate("a"), .relations = {"a"}},
+                    {.conjunct = predicate("b"), .relations = {"b"}}});
   const auto a = memo.EnsureGroup({"a"});
   const auto b = memo.EnsureGroup({"b"});
   ASSERT_TRUE(memo.Get(a).filter);
@@ -494,9 +496,9 @@ TEST(CascadesTest, PhysicalPropertiesKeysKeepColumnComponentsDistinct) {
   const ColumnName catalog_with_period("catalog.schema", "column");
   const ColumnName name_with_period("catalog", "schema.column");
   const ColumnName unqualified("", "catalog.schema.column");
-  for (auto member : {&PhysicalProperties::ordering,
-                      &PhysicalProperties::partition_by,
-                      &PhysicalProperties::bloom_filter_keys}) {
+  for (auto member :
+       {&PhysicalProperties::ordering, &PhysicalProperties::partition_by,
+        &PhysicalProperties::bloom_filter_keys}) {
     PhysicalProperties first;
     PhysicalProperties second;
     PhysicalProperties third;
@@ -520,18 +522,24 @@ TEST(CascadesTest, OrderingPenaltyUsesSelectiveJoinOutput) {
   auto source = std::make_shared<ValuesPlan>(
       Schema("a", {Column("k", ValueType::kInt64)}), std::vector<Row>{});
   auto sorted = std::make_shared<SortPlan>(
-      source, std::vector<SortKey>{{.expression = ColumnValueExp(key)}});
-  const auto best = search.Optimize(root, required,
-      [&](GroupId group, const Memo&, const LogicalExpression&, const std::vector<BestPlan>&,
-          const PhysicalProperties&, const RuleContext&) {
+      source, std::vector<SortKey>{{.expression = ColumnValueExp(key),
+                                    .ascending = true,
+                                    .nulls_first = std::nullopt,
+                                    .collation = Collation::kNone}});
+  const auto best = search.Optimize(
+      root, required,
+      [&](GroupId group, const Memo&, const LogicalExpression&,
+          const std::vector<BestPlan>&, const PhysicalProperties&,
+          const RuleContext&) {
         if (group != root) {
-          return std::vector<PlanAlternative>{{.plan = source, .estimated_rows = 1000000}};
+          return std::vector<PlanAlternative>{
+              {.plan = source, .estimated_rows = 1000000}};
         }
-        return std::vector<PlanAlternative>{{.plan = source, .local_cost = 1,
-                                             .estimated_rows = 10},
-                                            {.plan = sorted, .local_cost = 1000,
-                                             .estimated_rows = 10}};
-      }, RuleContext{});
+        return std::vector<PlanAlternative>{
+            {.plan = source, .local_cost = 1, .estimated_rows = 10},
+            {.plan = sorted, .local_cost = 1000, .estimated_rows = 10}};
+      },
+      RuleContext{});
   if (!best.has_value()) {
     ADD_FAILURE() << "optimizer produced no best plan";
     return;
@@ -546,8 +554,8 @@ TEST(CascadesTest, ProvidedSortPropertiesRequireMatchingNullPlacement) {
   PlanAlternative alternative{
       .plan = std::make_shared<SortPlan>(
           source, std::vector<SortKey>{{.expression = ColumnValueExp(column),
-                                       .ascending = true,
-                                       .nulls_first = false}})};
+                                        .ascending = true,
+                                        .nulls_first = false}})};
   PhysicalProperties required;
   required.ordering = {column};
   required.sort_nulls_first = {true};

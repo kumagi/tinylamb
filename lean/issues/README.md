@@ -1,6 +1,14 @@
 # SQL 最適化の証明課題
 
-[DuckDB より遅かったクエリに対する未証明命題 50 件](research/duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。
+[圧縮と SQL 実行の未証明命題 1,000 件](research/storage-execution.md)。100 モデルの索引と、ClickBench の選択ビットマップの実測を収録。
+
+[可逆圧縮の研究課題 228 件と DuckDB との保存サイズ比較](research/compression.md)。ClickBench・TPC-H・TPC-DS の全列ファイルで試作形式の復元を検証。
+
+[SQL エンジンの高速化仮説 500 件](research/atlas.md)。提出型、具体的な反例、H5・C1 の基数上界を収録。
+
+[大胆な高速化仮説 110 件と反例 12 件](research/frontiers.md)。H2O H5 で行列のランクと集約ごとの圧縮粒度も調べました。
+
+[DuckDB より遅かったクエリから登録した命題 50 件](research/duckdb-gaps.md)に、比較値、SQL の追試、適用条件をまとめています。7 モジュールの全命題を証明済み（[RESULTS.md](research/RESULTS.md)）。
 
 [クラウド・BI ワークロードの未証明命題 42 件](research/cloud-bi.md)を、4 系統の実測と対応づけました。
 

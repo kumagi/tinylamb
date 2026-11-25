@@ -660,10 +660,12 @@ TEST_F(LoggerTest, FixedSegmentsRetainLogicalEndAndPersistedGeometry) {
                         Logger::Create(log_name_, 32, 60'000, kSegment, true));
   ASSERT_TRUE(fixed->FixedSizeSegments());
   EXPECT_EQ(std::filesystem::file_size(log_name_), kSegment + 64);
-  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment), 0);
-  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("durable-prefix"), 0);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment),
+                        size_t{0});
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("durable-prefix"), size_t{0});
   ASSERT_SUCCESS(fixed->WaitForDurable(14));
-  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment), 14);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment),
+                        size_t{14});
   ASSERT_SUCCESS(fixed->Finish());
   fixed.reset();
   ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, reopened,
@@ -671,7 +673,7 @@ TEST_F(LoggerTest, FixedSegmentsRetainLogicalEndAndPersistedGeometry) {
   EXPECT_TRUE(reopened->FixedSizeSegments());
   EXPECT_EQ(reopened->SegmentSize(), kSegment);
   EXPECT_EQ(reopened->DurableLSN(), 14);
-  ASSERT_SUCCESS_AND_EQ(reopened->AddLog("-more"), 14);
+  ASSERT_SUCCESS_AND_EQ(reopened->AddLog("-more"), size_t{14});
   ASSERT_SUCCESS(reopened->WaitForDurable(19));
   ASSERT_SUCCESS(reopened->Finish());
   std::ifstream input(log_name_, std::ios::binary);
@@ -688,19 +690,19 @@ TEST_F(LoggerTest, FixedSegmentsRollAndLogicalTruncateWithoutChangingSize) {
   ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
                         Logger::Create(log_name_, 32, 60'000, kSegment, true));
   const std::string payload(100, 'x');
-  ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 0);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), size_t{0});
   ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), kSegment);
   ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 2 * kSegment);
   ASSERT_SUCCESS(fixed->WaitForDurable(fixed->BufferedLSN()));
   ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment),
-                        100);
+                        size_t{100});
   ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 1, kSegment),
-                        100);
+                        size_t{100});
   ASSERT_SUCCESS(fixed->TruncateTo(130));
   EXPECT_FALSE(std::filesystem::exists(Logger::SegmentPath(log_name_, 2)));
   EXPECT_EQ(std::filesystem::file_size(Logger::SegmentPath(log_name_, 1)),
             kSegment + 64);
-  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("replacement"), 130);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("replacement"), size_t{130});
   ASSERT_SUCCESS(fixed->WaitForDurable(141));
   ASSERT_SUCCESS(fixed->Finish());
   fixed.reset();
@@ -723,7 +725,7 @@ TEST_F(LoggerTest, ZeroLengthSegmentFromCrashedInitReopensWithoutForce) {
     ASSIGN_OR_ASSERT_FAIL(
         std::unique_ptr<Logger>, fixed,
         Logger::Create(log_name_, 32, 60'000, kSegment, true));
-    ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 0);
+    ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), size_t{0});
     ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), kSegment);
     ASSERT_SUCCESS(fixed->WaitForDurable(fixed->BufferedLSN()));
     ASSERT_SUCCESS(fixed->Finish());
@@ -740,7 +742,8 @@ TEST_F(LoggerTest, ZeroLengthSegmentFromCrashedInitReopensWithoutForce) {
   // corpse segment, so the next append LSN (and durable position) is the
   // segment-2 base, skipping segment 1's unused tail.
   EXPECT_EQ(reopened->DurableLSN(), 2 * kSegment);
-  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 2, kSegment), 0);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 2, kSegment),
+                        size_t{0});
   EXPECT_EQ(std::filesystem::file_size(corpse), kSegment + 64);
   ASSERT_SUCCESS_AND_EQ(reopened->AddLog("post-crash"), 2 * kSegment);
   ASSERT_SUCCESS(reopened->WaitForDurable((2 * kSegment) + 10));

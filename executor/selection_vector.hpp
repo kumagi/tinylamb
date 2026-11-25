@@ -74,6 +74,23 @@ class ValidityBitmap {
 
   void ToSelectionVector(SelectionVector* sel) const;
 
+  // Lean proof: lean/TinylambOpt/MaskToRanges.lean
+  //   (runsGo_sound, mask_to_ranges_sound, mask_to_ranges_sound_values,
+  //    physical_ranges_sound)
+  // Decodes set bits into maximal contiguous [start, length) physical row
+  // ranges starting at `base`. Expanding the ranges reproduces the exact
+  // ordered physical row numbers of all set bits.
+  struct RowRange {
+    uint32_t start{0};
+    uint32_t length{0};
+  };
+  void ToContiguousRanges(std::vector<RowRange>* out, uint32_t base = 0) const;
+
+  // Lean proof: lean/TinylambOpt/RankScatter.lean (rank_scatter_sound)
+  // Stable SIMD-friendly compression by prefix popcount: copies `src[i]` for
+  // each set bit `i` into `dst` in ascending order and returns the count.
+  size_t RankScatter(const uint32_t* src, uint32_t* dst) const;
+
  private:
   void MaskTrailingBits();
 
@@ -123,6 +140,17 @@ class SelectionVector {
               SelectionVector* output) const;
 
   [[nodiscard]] SelectionVector Slice(size_t offset, size_t count) const;
+
+  // Lean proof: lean/TinylambOpt/AdaptiveSelection.lean
+  //   (adaptive_selection_sound, adaptive_selection_sound_from_dense)
+  // Mid-batch switching between a sparse selection list and a dense validity
+  // bitmap. Switching to dense preserves the exact active row set when
+  // selectivity exceeds the threshold (default: >= 25% of batch_size).
+  [[nodiscard]] static bool ShouldUseDenseMask(size_t selected_count,
+                                               size_t batch_size) noexcept {
+    return batch_size >= 64 && selected_count * 4 >= batch_size;
+  }
+  [[nodiscard]] ValidityBitmap ToValidityBitmap(size_t batch_size) const;
 
  private:
   std::vector<uint32_t> indices_;

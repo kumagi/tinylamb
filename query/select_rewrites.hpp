@@ -385,6 +385,32 @@ bool HoistDuplicateDerivedTablesToCte(SelectStatement* select);
 bool PreGroupBeforeExpressionGroupBy(SelectStatement* select,
                                      TransactionContext& ctx);
 
+// Collapses a single-table GROUP BY whose every grouping key is pinned to a
+// type-matching non-NULL constant by WHERE equalities into an ungrouped scalar
+// aggregate wrapped by `WHERE __cg_cnt > 0` (Public BI MLB Q108).
+// Lean: CloudBI/PublicBI.lean (sound_ConstantGroup).
+bool CollapseConstantGroupBy(SelectStatement* select, TransactionContext& ctx);
+
+// Factors a 3-table `(X, F, E)` IN/NOT IN subquery with an expression equijoin
+// between X and E and a predicate between F and E into `X JOIN (SELECT DISTINCT
+// f_keys, expr_e FROM F JOIN E WHERE pred_fe)` so the small (F x E) delete-key
+// table is built and deduplicated before hash-probing X (Iceberg equality).
+// Lean: DuckDBGaps/FileMasks.lean (FileKeyAntiJoin_sound).
+bool FactorDeleteAntiJoinSubquery(SelectStatement* select);
+
+// Pre-aggregates a shared-scan ROLLUP / GROUPING SETS UNION ALL query by the
+// surrogate foreign key before joining a runtime-verified unique non-null
+// dimension table when all ROLLUP keys come from that dimension (TPC-DS Q22).
+// Lean: Wave9TpcdsRollupAndSetOps.lean (SurrogateKeyPreAggRollup_sound).
+bool PreAggregateSurrogateKeyBeforeRollup(SelectStatement* outer,
+                                          TransactionContext& ctx);
+
+// Flattens nested `SELECT SUM(col) FROM (... UNION ALL ...)` trees and folds
+// structurally identical leaf `SELECT SUM(expr)` branches with multiplicity
+// `m >= 2` into a single branch `SUM(expr) * m` (Snowflake BI / PBench).
+// Lean: CloudBI/NestedBI.lean (sound_FlattenSum, sound_BranchHistogram).
+bool FoldNestedSumUnionAllBranches(SelectStatement* select);
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_SELECT_REWRITES_HPP

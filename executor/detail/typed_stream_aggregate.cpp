@@ -802,10 +802,11 @@ struct CompiledLSTableBlockFilter {
             const int64_t* __restrict cells = col.cells;
             for (uint32_t r = 0; r < count; ++r) {
               const uint64_t d = static_cast<uint64_t>(cells[r]) - lo_u;
-              const bool hit =
-                  (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+              const uint32_t hit =
+                  static_cast<uint32_t>(d < 64ULL) &
+                  static_cast<uint32_t>(((mask >> (d & 63ULL)) & 1ULL) != 0);
               (*sel)[out_m] = r;
-              out_m += static_cast<uint32_t>(hit);
+              out_m += hit;
             }
           } else {
             for (uint32_t r = 0; r < count; ++r) {
@@ -813,20 +814,22 @@ struct CompiledLSTableBlockFilter {
                 continue;
               }
               const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
-              const bool hit =
-                  (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+              const uint32_t hit =
+                  static_cast<uint32_t>(d < 64ULL) &
+                  static_cast<uint32_t>(((mask >> (d & 63ULL)) & 1ULL) != 0);
               (*sel)[out_m] = r;
-              out_m += static_cast<uint32_t>(hit);
+              out_m += hit;
             }
           }
         } else if (!col.has_null) {
           for (uint32_t idx = 0; idx < count; ++idx) {
             const uint32_t r = (*sel)[idx];
             const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
-            const bool hit =
-                (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+            const uint32_t hit =
+                static_cast<uint32_t>(d < 64ULL) &
+                static_cast<uint32_t>(((mask >> (d & 63ULL)) & 1ULL) != 0);
             (*sel)[out_m] = r;
-            out_m += static_cast<uint32_t>(hit);
+            out_m += hit;
           }
         } else {
           for (uint32_t idx = 0; idx < count; ++idx) {
@@ -835,10 +838,11 @@ struct CompiledLSTableBlockFilter {
               continue;
             }
             const uint64_t d = static_cast<uint64_t>(col.Int(r)) - lo_u;
-            const bool hit =
-                (d < 64ULL) & (((mask >> (d & 63ULL)) & 1ULL) != 0);
+            const uint32_t hit =
+                static_cast<uint32_t>(d < 64ULL) &
+                static_cast<uint32_t>(((mask >> (d & 63ULL)) & 1ULL) != 0);
             (*sel)[out_m] = r;
-            out_m += static_cast<uint32_t>(hit);
+            out_m += hit;
           }
         }
       } else {
@@ -846,12 +850,8 @@ struct CompiledLSTableBlockFilter {
           if (v < il->lo || v > il->hi) {
             return false;
           }
-          for (const int64_t item : il->values) {
-            if (v == item) {
-              return true;
-            }
-          }
-          return false;
+          return std::ranges::any_of(
+              il->values, [v](const int64_t item) { return v == item; });
         };
         for (uint32_t idx = 0; idx < count; ++idx) {
           const uint32_t r = initialized_sel ? (*sel)[idx] : idx;
@@ -3247,6 +3247,20 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
               b.kind == SlimAggKind::kMaxDate) {
             const bool is_min = (b.kind == SlimAggKind::kMinInt64 ||
                                  b.kind == SlimAggKind::kMinDate);
+            // Lean proof:
+            // lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+            //   (sound_DominatedColumn).
+            // A block whose non-NULL range cannot improve the current extremum
+            // is skipped regardless of which rows survived the filter.
+            if (!coalesce && st.counts[a] > 0) {
+              const LSTableColumnBlock& raw_col = blk.columns[*b.full_col];
+              if (raw_col.has_min_max && !raw_col.is_unsigned) {
+                if (is_min ? (raw_col.min_int >= st.int_totals[a])
+                           : (raw_col.max_int <= st.int_totals[a])) {
+                  continue;
+                }
+              }
+            }
             int64_t best = st.int_totals[a];
             int64_t cnt = st.counts[a];
             int64_t added = 0;
@@ -3288,6 +3302,18 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
           }
           // kMinDouble / kMaxDouble
           const bool is_min = (b.kind == SlimAggKind::kMinDouble);
+          // Lean proof: lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+          //   (sound_DominatedColumn).
+          if (!coalesce && st.counts[a] > 0 && (st.flags[a] & 1) == 0 &&
+              !std::isnan(st.double_totals[a])) {
+            const LSTableColumnBlock& raw_col = blk.columns[*b.full_col];
+            if (raw_col.has_double_min_max && !raw_col.has_nan) {
+              if (is_min ? (raw_col.min_double >= st.double_totals[a])
+                         : (raw_col.max_double <= st.double_totals[a])) {
+                continue;
+              }
+            }
+          }
           double best = st.double_totals[a];
           int64_t cnt = st.counts[a];
           uint8_t flags = st.flags[a];
@@ -4296,6 +4322,52 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
                                workers_used > 1 && !active_workers.empty())
                                   ? workers_used
                                   : 1;
+  // Lean-backed (IndividualQueryGaps.lean:
+  // FrequencyUpperBoundHavingPrune_sound): when HAVING enforces `COUNT(...) >
+  // T` or `COUNT(...) >= T` and no sibling aggregate can raise a SUM(INT64)
+  // overflow error, check the group's exact count first before
+  // merging/finishing remaining aggregates or decoding keys.
+  std::optional<size_t> having_freq_agg;
+  int64_t having_min_freq = 0;
+  if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_HAVING_FREQ_PRUNE") ==
+          nullptr &&
+      !positional_having.empty() && naggs > 1) {
+    bool has_int_sum = false;
+    for (size_t a = 0; a < naggs; ++a) {
+      if (bindings[a].kind == SlimAggKind::kSumInt64) {
+        has_int_sum = true;
+        break;
+      }
+    }
+    if (!has_int_sum) {
+      for (const PositionalHaving& clause : positional_having) {
+        if (clause.rhs_is_agg || !clause.has_constant ||
+            clause.constant.IsNull() ||
+            clause.constant.type != ValueType::kInt64 ||
+            clause.agg_index >= naggs ||
+            bindings[clause.agg_index].kind != SlimAggKind::kCount) {
+          continue;
+        }
+        int64_t req = 0;
+        if (clause.op == BinaryOperation::kGreaterThan) {
+          if (clause.constant.value.int_value ==
+              std::numeric_limits<int64_t>::max()) {
+            continue;
+          }
+          req = clause.constant.value.int_value + 1;
+        } else if (clause.op == BinaryOperation::kGreaterThanEquals) {
+          req = clause.constant.value.int_value;
+        } else {
+          continue;
+        }
+        if (!having_freq_agg || req > having_min_freq) {
+          having_freq_agg = clause.agg_index;
+          having_min_freq = req;
+        }
+      }
+    }
+  }
+
   std::vector<std::vector<Row>> emit_rows(emit_workers);
   std::vector<size_t> emit_groups(emit_workers, 0);
   std::vector<Status> emit_errors(emit_workers, Status::kSuccess);
@@ -4324,6 +4396,16 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
           continue;
         }
         ++emit_groups[ew];
+        if (having_freq_agg) {
+          int64_t freq = 0;
+          const size_t fa = *having_freq_agg;
+          for (const size_t w : active_workers) {
+            freq += states[w].counts[fa][idx];
+          }
+          if (freq < having_min_freq) {
+            continue;
+          }
+        }
         for (size_t a = 0; a < naggs; ++a) {
           const SlimAggKind kind = bindings[a].kind;
           int64_t total_cnt = 0;
@@ -5905,7 +5987,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const TypedInListCompare& inlist = plan.inlist_compares[0];
     if (inlist.is_string || inlist.is_double || inlist.int_values.empty() ||
         inlist.column >= qualified_schema.ColumnCount() ||
-        proj_unsigned[inlist.column] ||
+        proj_unsigned[inlist.column] != 0 ||
         (proj_types[inlist.column] != ValueType::kInt64 &&
          proj_types[inlist.column] != ValueType::kDate)) {
       scalar_in_range_sum = false;
@@ -5985,17 +6067,15 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
         if (kind == SlimAggKind::kCount && IsCountStar(*input.aggregate)) {
           in_range_aggs.push_back({kind, std::nullopt});
-        } else if (kind == SlimAggKind::kSumInt64 && input.column.has_value() &&
+        } else if (input.column.has_value() &&
                    *input.column < qualified_schema.ColumnCount() &&
-                   !proj_unsigned[*input.column] &&
-                   (proj_types[*input.column] == ValueType::kInt64 ||
-                    proj_types[*input.column] == ValueType::kDate)) {
-          in_range_aggs.push_back({kind, proj_to_full[*input.column]});
-        } else if ((kind == SlimAggKind::kSumDouble ||
-                    kind == SlimAggKind::kAvgDouble) &&
-                   input.column.has_value() &&
-                   *input.column < qualified_schema.ColumnCount() &&
-                   proj_types[*input.column] == ValueType::kDouble) {
+                   ((kind == SlimAggKind::kSumInt64 &&
+                     proj_unsigned[*input.column] == 0 &&
+                     (proj_types[*input.column] == ValueType::kInt64 ||
+                      proj_types[*input.column] == ValueType::kDate)) ||
+                    ((kind == SlimAggKind::kSumDouble ||
+                      kind == SlimAggKind::kAvgDouble) &&
+                     proj_types[*input.column] == ValueType::kDouble))) {
           in_range_aggs.push_back({kind, proj_to_full[*input.column]});
         } else {
           scalar_in_range_sum = false;
@@ -7139,12 +7219,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             if (v < in_range_in_min || v > in_range_in_max) {
               return false;
             }
-            for (const int64_t item : in_range_in_vals) {
-              if (v == item) {
-                return true;
-              }
-            }
-            return false;
+            return std::ranges::any_of(
+                in_range_in_vals,
+                [v](const int64_t item) { return v == item; });
           };
 
           for (size_t bi = blk_begin; bi < blk_end; ++bi) {

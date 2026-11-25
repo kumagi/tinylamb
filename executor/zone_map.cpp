@@ -10,9 +10,11 @@
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "executor/detail/execution_strategies.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "table/lstable_bridge.hpp"
@@ -729,6 +731,116 @@ KleeneMask EvalKleeneImpl(  // NOLINT(misc-no-recursion)
         const_expr = bin.Left();
         op = FlipOp(op);
       } else {
+        // Lean-backed (ExecutionStrategies/IndexPreimages.lean:
+        // CheckedDistanceBand, TruncBucket): derive exact integer preimage
+        // intervals for `ABS(col - center) <= rad` (or `< rad`) and
+        // `col / d = q` so zone maps prune blocks without row evaluation.
+        auto eval_int_band =
+            [&](const ColumnName& cn,
+                const execution_strategies::IntInterval& iv) -> KleeneMask {
+          const int off = schema.Offset(cn);
+          if (off < 0 || !blk.columns.Contains(static_cast<size_t>(off))) {
+            return kKleeneAll;
+          }
+          const LSTableColumnBlock& col = blk.columns[static_cast<size_t>(off)];
+          if (col.type != ValueType::kInt64 || col.is_unsigned) {
+            return kKleeneAll;
+          }
+          KleeneMask out = col.has_null ? kKleeneU : kKleeneNone;
+          if (!col.has_min_max) {
+            return out;
+          }
+          if (iv.empty || col.max_int < iv.lo || col.min_int > iv.hi) {
+            return out | kKleeneF;
+          }
+          if (col.min_int >= iv.lo && col.max_int <= iv.hi) {
+            return out | kKleeneT;
+          }
+          return out | kKleeneT | kKleeneF;
+        };
+        Expression lhs = bin.Left();
+        Expression rhs = bin.Right();
+        BinaryOperation bop = bin.Op();
+        if (lhs && lhs->Type() == TypeTag::kConstantValue && rhs &&
+            rhs->Type() != TypeTag::kConstantValue) {
+          std::swap(lhs, rhs);
+          bop = FlipOp(bop);
+        }
+        if (lhs && rhs && rhs->Type() == TypeTag::kConstantValue) {
+          const Value& rv = rhs->AsConstantValue().GetValue();
+          if (!rv.IsNull() && rv.type == ValueType::kInt64 &&
+              !rv.IsUnsigned()) {
+            // Case 1: ABS(col - center) <= rad (or < rad).
+            if ((bop == BinaryOperation::kLessThanEquals ||
+                 bop == BinaryOperation::kLessThan) &&
+                lhs->Type() == TypeTag::kFunctionCallExp) {
+              const auto& fc = lhs->AsFunctionCallExpression();
+              if ((fc.FuncName() == "abs" || fc.FuncName() == "ABS") &&
+                  fc.Args().size() == 1 && fc.Args()[0] &&
+                  fc.Args()[0]->Type() == TypeTag::kBinaryExp &&
+                  fc.Args()[0]->AsBinaryExpression().Op() ==
+                      BinaryOperation::kSubtract) {
+                const auto& sub = fc.Args()[0]->AsBinaryExpression();
+                if (sub.Left() && sub.Left()->Type() == TypeTag::kColumnValue &&
+                    sub.Right() &&
+                    sub.Right()->Type() == TypeTag::kConstantValue) {
+                  const Value& cv = sub.Right()->AsConstantValue().GetValue();
+                  if (!cv.IsNull() && cv.type == ValueType::kInt64 &&
+                      !cv.IsUnsigned()) {
+                    const int64_t rad =
+                        bop == BinaryOperation::kLessThanEquals
+                            ? rv.value.int_value
+                            : (rv.value.int_value ==
+                                       std::numeric_limits<int64_t>::min()
+                                   ? -1
+                                   : rv.value.int_value - 1);
+                    const auto iv = execution_strategies::CheckedDistanceBand(
+                        cv.value.int_value, rad);
+                    // Guard against signed overflow in `col - center` when
+                    // min/max could overflow int64.
+                    const int off = schema.Offset(
+                        sub.Left()->AsColumnValue().GetColumnName());
+                    if (off >= 0 &&
+                        blk.columns.Contains(static_cast<size_t>(off))) {
+                      const auto& col = blk.columns[static_cast<size_t>(off)];
+                      int64_t tmp1 = 0;
+                      int64_t tmp2 = 0;
+                      if (col.has_min_max &&
+                          !__builtin_sub_overflow(col.min_int,
+                                                  cv.value.int_value, &tmp1) &&
+                          !__builtin_sub_overflow(col.max_int,
+                                                  cv.value.int_value, &tmp2) &&
+                          tmp1 != std::numeric_limits<int64_t>::min() &&
+                          tmp2 != std::numeric_limits<int64_t>::min()) {
+                        return eval_int_band(
+                            sub.Left()->AsColumnValue().GetColumnName(), iv);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            // Case 2: DIV(col, d) = q (exact integer truncation toward zero).
+            if (bop == BinaryOperation::kEquals &&
+                lhs->Type() == TypeTag::kFunctionCallExp) {
+              const auto& fc = lhs->AsFunctionCallExpression();
+              if ((fc.FuncName() == "div" || fc.FuncName() == "DIV") &&
+                  fc.Args().size() == 2 && fc.Args()[0] &&
+                  fc.Args()[0]->Type() == TypeTag::kColumnValue &&
+                  fc.Args()[1] &&
+                  fc.Args()[1]->Type() == TypeTag::kConstantValue) {
+                const Value& dv = fc.Args()[1]->AsConstantValue().GetValue();
+                if (!dv.IsNull() && dv.type == ValueType::kInt64 &&
+                    !dv.IsUnsigned() && dv.value.int_value > 0) {
+                  const auto iv = execution_strategies::TruncBucketPreimage(
+                      dv.value.int_value, rv.value.int_value);
+                  return eval_int_band(
+                      fc.Args()[0]->AsColumnValue().GetColumnName(), iv);
+                }
+              }
+            }
+          }
+        }
         return kKleeneAll;
       }
       if (op != BinaryOperation::kEquals && op != BinaryOperation::kNotEquals &&
@@ -780,6 +892,62 @@ KleeneMask EvalKleeneImpl(  // NOLINT(misc-no-recursion)
 KleeneMask EvaluateBlockKleene(const Expression& expr, const Schema& schema,
                                const LSTablePageBlock& blk) {
   return EvalKleeneImpl(expr, schema, blk);
+}
+
+bool CanSkipLikeBlockByTrigrams(std::string_view like_pattern,
+                                const TrigramBlockSummary& summary,
+                                char escape_char) noexcept {
+  // Parse literal runs between `%` and `_` wildcards (honoring escape_char).
+  // Any literal run of length >= 3 yields mandatory trigrams that MUST appear
+  // in every matching row (`TrigramSkip.trigram_skip_sound`).
+  uint8_t win[3] = {0, 0, 0};
+  size_t run_len = 0;
+  for (size_t i = 0; i < like_pattern.size(); ++i) {
+    char ch = like_pattern[i];
+    if (escape_char != '\0' && ch == escape_char) {
+      if (i + 1 < like_pattern.size()) {
+        ch = like_pattern[++i];
+      } else {
+        // Trailing bare escape char: treat as literal.
+      }
+    } else if (ch == '%' || ch == '_') {
+      run_len = 0;
+      continue;
+    }
+    const uint8_t b = static_cast<uint8_t>(ch);
+    if (run_len < 3) {
+      win[run_len++] = b;
+    } else {
+      win[0] = win[1];
+      win[1] = win[2];
+      win[2] = b;
+    }
+    if (run_len == 3 && !summary.MayContainTrigram(win[0], win[1], win[2])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CanSkipBlockByBloomIntersection(const BlockBloomSignature& build_sig,
+                                     const BlockBloomSignature& probe_sig,
+                                     bool null_safe_eq) noexcept {
+  // (H1) Seed and bit-width must match; otherwise skipping is unsound.
+  if (build_sig.seed != probe_sig.seed || build_sig.words.empty() ||
+      build_sig.words.size() != probe_sig.words.size()) {
+    return false;
+  }
+  // `nullSafeSkip_sound`: NULL-safe equality (`IS NOT DISTINCT FROM`) matches
+  // when both sides contain NULL even if non-NULL signatures are disjoint.
+  if (null_safe_eq && build_sig.has_null && probe_sig.has_null) {
+    return false;
+  }
+  for (size_t i = 0; i < build_sig.words.size(); ++i) {
+    if ((build_sig.words[i] & probe_sig.words[i]) != 0ULL) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace tinylamb

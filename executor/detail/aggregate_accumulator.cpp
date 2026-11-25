@@ -167,8 +167,9 @@ constexpr bool IsIdempotentDistinctInsensitive(AggregationType type) noexcept {
 AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
     const AggregateExpression* aggregate, const Schema* input_schema) {
   Shape shape;
-  if (aggregate == nullptr) { return shape;  // Placeholder for an empty aggregate slot.
-}
+  if (aggregate == nullptr) {
+    return shape;  // Placeholder for an empty aggregate slot.
+  }
   // The DISTINCT hash set is allocated lazily (EnsureDistinctSet): INT64/DATE
   // distinct tracking never needs it, and per-group allocation dominated
   // multi-million-group COUNT(DISTINCT) builds.
@@ -221,7 +222,8 @@ AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
 AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
                                            const Shape& shape)
     : expression(aggregate),
-      core_type_((aggregate != nullptr) ? aggregate->GetType() : AggregationType::kCount),
+      core_type_((aggregate != nullptr) ? aggregate->GetType()
+                                        : AggregationType::kCount),
       sum_is_uint64(shape.sum_is_uint64),
       distinct_mode_(shape.distinct_mode),
       resolved_element_type_(shape.resolved_element_type) {
@@ -1392,31 +1394,31 @@ size_t AggregateAccumulator::DistinctRetainedBytes() const {
   // already includes VARCHAR/ARRAY heap payloads; add unordered_set node
   // overhead for the promoted (overflow) sets.
   constexpr size_t kSetNodeOverhead = 32;
-  size_t total = 0;
+  size_t bytes = 0;
   const size_t n_int = DistinctIntCount();
   if (n_int > std::numeric_limits<size_t>::max() /
                   (sizeof(int64_t) + kSetNodeOverhead)) {
     return std::numeric_limits<size_t>::max();
   }
-  total += n_int * (sizeof(int64_t) + kSetNodeOverhead);
+  bytes += n_int * (sizeof(int64_t) + kSetNodeOverhead);
   if (distinct != nullptr) {
     for (const Value& v : *distinct) {
       const size_t vbytes = EstimateValueMemoryBytes(v) + kSetNodeOverhead;
-      if (vbytes > std::numeric_limits<size_t>::max() - total) {
+      if (vbytes > std::numeric_limits<size_t>::max() - bytes) {
         return std::numeric_limits<size_t>::max();
       }
-      total += vbytes;
+      bytes += vbytes;
     }
   } else {
     for (size_t i = 0; i < inline_distinct_value_count; ++i) {
       const size_t vbytes = EstimateValueMemoryBytes(inline_distinct_values[i]);
-      if (vbytes > std::numeric_limits<size_t>::max() - total) {
+      if (vbytes > std::numeric_limits<size_t>::max() - bytes) {
         return std::numeric_limits<size_t>::max();
       }
-      total += vbytes;
+      bytes += vbytes;
     }
   }
-  return total;
+  return bytes;
 }
 
 bool AggregateAccumulator::InsertDistinctValue(Value canonical) {
@@ -1893,8 +1895,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() {
         return Value();
       }
       if (sum_is_uint64 && !total_is_double) {
-        return Value(static_cast<int64_t>(uint_total))
-            .WithUnsigned();
+        return Value(static_cast<int64_t>(uint_total)).WithUnsigned();
       }
       if (!total_is_double && total == 0.0) {
         return Value(int_total);
