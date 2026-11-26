@@ -1018,13 +1018,16 @@ void WriteMinimalTlcsFile(const std::string& path, bool out_of_bounds,
   du64(1);  // max_pid
   du8(1);   // pids_monotonic
   du32(0);  // stats size
+  du32(0);  // four one-byte synopsis flags
+  du64(0);  // min_int
+  du64(0);  // max_int
   const uint32_t dir_crc = Crc32C(dir.data(), dir.size());
 
   // --- header ---
   for (const char* p = "TLCS0001"; *p != '\0'; ++p) {
     u8(static_cast<uint8_t>(*p));
   }
-  u32(2);                                         // version
+  u32(TlcsFile::kFormatVersion);                  // version
   u32(0);                                         // flags
   u64(1);                                         // layout generation
   u64(1);                                         // first pid
@@ -1179,6 +1182,9 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
     du8(0);         // pids_monotonic = false
   }
   du32(0);  // stats size
+  du32(0);  // four one-byte synopsis flags
+  du64(0);  // min_int
+  du64(0);  // max_int
   const uint32_t dir_crc = Crc32C(dir.data(), dir.size());
 
   std::vector<uint8_t> f;
@@ -1196,7 +1202,7 @@ void WriteOverlappingPidTlcsFile(const std::string& path) {
   for (const char* p = "TLCS0001"; *p != '\0'; ++p) {
     u8(static_cast<uint8_t>(*p));
   }
-  u32(2);                                   // version
+  u32(TlcsFile::kFormatVersion);            // version
   u32(0);                                   // flags
   u64(1);                                   // layout generation
   u64(1);                                   // first pid
@@ -1888,6 +1894,8 @@ TEST(TlcsFileTest, IndexScanOnStubHydratesForNonReadTransaction) {
 }
 
 TEST(TlcsFileTest, EvictReclaimDropsResidentMmapAndSkipsOversizedMap) {
+  // Direct mmap gathers require fixed-width column payloads.
+  ScopedEnvVar uncompressed("TINYLAMB_DISABLE_TLCS_COMPRESSION", "1");
   TlcsBudgetResetGuard budget_guard;
   auto& budget = ProcessMemoryBudget::Global();
   const std::string prefix = "tlcs_mmap_evict_" + RandomString();
@@ -1930,7 +1938,7 @@ TEST(TlcsFileTest, EvictReclaimDropsResidentMmapAndSkipsOversizedMap) {
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TlcsFile>, tlcs,
                           TlcsFile::Open(tlcs_path, schema));
     TlcsFile::DecodedBlock gather_blk;
-    EXPECT_TRUE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
+    ASSERT_TRUE(tlcs->TryGatherMmapFixedColumns(0, proj, sample_rows, schema,
                                                 &gather_blk));
     EXPECT_EQ(gather_blk.columns[0].int_cells[1], 17);
     EXPECT_EQ(gather_blk.columns[1].int_cells[1], (17 * 7) ^ 0x5555);

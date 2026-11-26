@@ -808,6 +808,7 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
     }
   };
   int depth = 0;
+  int type_depth = 0;
   bool in_string = false;
   char quote = '\0';
   for (size_t i = 0; i < text.size(); ++i) {
@@ -827,6 +828,27 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
       quote = c;
       continue;
     }
+    if (c == '<') {
+      // A comma in STRUCT<a INT64, b INT64> belongs to the type. A
+      // comparison such as x < y must still allow a following separator.
+      size_t end = i;
+      while (end > 0 &&
+             std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+        --end;
+      }
+      size_t begin = end;
+      while (begin > 0 &&
+             (std::isalnum(static_cast<unsigned char>(text[begin - 1])) != 0 ||
+              text[begin - 1] == '_')) {
+        --begin;
+      }
+      const auto word = ToLower(std::string(text.substr(begin, end - begin)));
+      if (word == "array" || word == "struct" || word == "range") {
+        ++type_depth;
+      }
+    } else if (c == '>' && type_depth > 0) {
+      --type_depth;
+    }
     if (c == '[' || c == '{' || c == '(') {
       ++depth;
       continue;
@@ -837,7 +859,7 @@ std::vector<std::string> SplitTopLevel(std::string_view text) {
       }
       continue;
     }
-    if (c == ',' && depth == 0) {
+    if (c == ',' && depth == 0 && type_depth == 0) {
       append_part(i);
       start = i + 1;
     }
@@ -1713,26 +1735,20 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     // would match a truncated INT64 value and hide a real rounding bug.
     size_t consumed = 0;
     try {
+      if (actual.IsUnsigned()) {
+        if (want.starts_with('-')) {
+          return false;
+        }
+        const uint64_t parsed = std::stoull(want, &consumed);
+        return consumed == want.size() &&
+               std::cmp_equal(static_cast<uint64_t>(actual.value.int_value),
+                              parsed);
+      }
       const int64_t parsed = std::stoll(want, &consumed);
-      if (consumed == want.size()) {
-        return actual.value.int_value == parsed;
-      }
-    } catch (...) {
-      // Overflow (a UINT64 magnitude) or a non-numeric golden: retry below.
-      consumed = 0;
-    }
-    // Goldens may carry UINT64 magnitudes (2^63 .. 2^64-1) that engines
-    // storing every integer as INT64 keep as their two's-complement bit
-    // pattern; compare those on the unsigned bit representation.
-    try {
-      const uint64_t parsed = std::stoull(want, &consumed);
-      if (consumed == want.size()) {
-        return std::cmp_equal(actual.value.int_value, parsed);
-      }
-    } catch (...) {
+      return consumed == want.size() && actual.value.int_value == parsed;
+    } catch (const std::exception&) {
       return false;
     }
-    return false;
   }
   if (actual.type == ValueType::kDouble) {
     const std::string lower_want = ToLower(want);

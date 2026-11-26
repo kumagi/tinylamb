@@ -206,7 +206,8 @@ TEST(PostgresProtocolTest, ErrorResponseUsesPositionInOriginalQuery) {
   ASSERT_NE(message_start, std::string::npos);
   const size_t message_end = no_position.find('\0', message_start);
   ASSERT_NE(message_end, std::string::npos);
-  EXPECT_EQ(message_end, no_position.size() - 1);
+  // The message field and the field list each have a NUL terminator.
+  EXPECT_EQ(no_position.substr(message_end), std::string(2, '\0'));
   EXPECT_EQ(SqlErrorPosition("ERROR: syntax error [at x:y]", statement, 0),
             std::nullopt);
   EXPECT_EQ(SqlErrorPosition("ERROR: syntax error [at 2:7]", statement, 0),

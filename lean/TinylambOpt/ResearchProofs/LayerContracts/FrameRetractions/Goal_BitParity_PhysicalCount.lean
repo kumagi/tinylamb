@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+set_option linter.unnecessarySimpa false
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_BitParity_PhysicalCount
+
+open TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+open TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common
+
+-- [some 1, none, none]: xor of non-NULL values is 1, so 1 ^ 1 = 0 is accepted,
+-- but retracting the only non-NULL row yields an empty frame (NULL, not 0).
+theorem refute : ¬ BitParity.PhysicalCount.Goal := by
+  exact physicalCount_refute 1 0 (by simp [BitParity.model]) (by decide)
+
+end TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_BitParity_PhysicalCount

@@ -38,7 +38,9 @@
 #include "common/exception_status.hpp"
 #include "common/log_message.hpp"
 #include "common/memory_budget.hpp"
+#include "common/parallel_work.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/log_record.hpp"
@@ -183,8 +185,9 @@ class CompactTxnBitmap {
 // window must not grow unaccounted the way the bitmap once did.
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
 // non-copyable by design
-class RecoveryMetaCharge {  // NOLINT(cppcoreguidelines-special-member-functions):
-                            // scope-owned cleanup.
+class
+    RecoveryMetaCharge {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
 
  public:
   explicit RecoveryMetaCharge(std::string_view what) : what_(what) {}
@@ -837,55 +840,120 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   }
   const lsn_t filesize = std::min(on_disk, valid_end);
 
-  // Pass 1: discover all committed transactions and maximum transaction ID
-  // from scan_start (compacted prefix below scan_start is already persisted).
+  // Pass 1: discover all committed transactions, maximum transaction ID, and
+  // per-(owner, page) maximum destroy LSNs from scan_start (compacted prefix
+  // below scan_start is already persisted).
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/RestartRaces/Goal_Recovery_DestroySummary.lean
+  // (sound): independent per-segment Pass-1 summaries (max owner, commits, and
+  // per-(owner, page) max destroy LSN even when the owner's commit is in
+  // another segment) compose to the exact global max owner and committed
+  // destroy floor.
   CompactTxnBitmap committed_txns;
-  struct DestroyEvent {
+  struct DestroyOwnerPageKey {
     txn_id_t owner{0};
     page_id_t pid{0};
-    lsn_t lsn{0};
+    bool operator==(const DestroyOwnerPageKey& other) const noexcept = default;
   };
-  std::vector<DestroyEvent> destroy_events;
-  // Pass-1 events and the Pass-2 floor map share one kStorage charge with
-  // the same emergency fallback as committed_txns.
+  struct DestroyOwnerPageHash {
+    size_t operator()(const DestroyOwnerPageKey& key) const noexcept {
+      const uint64_t h1 = std::hash<txn_id_t>{}(key.owner);
+      const uint64_t h2 = std::hash<page_id_t>{}(key.pid);
+      return static_cast<size_t>(
+          h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6U) + (h1 >> 2U)));
+    }
+  };
+  struct Pass1SegmentSummary {
+    txn_id_t max_seen_txn{0};
+    std::vector<txn_id_t> committed_owners;
+    std::unordered_map<DestroyOwnerPageKey, lsn_t, DestroyOwnerPageHash>
+        destroy_max;
+    Status error{Status::kSuccess};
+  };
   RecoveryMetaCharge destroy_meta{"destroy-floor"};
   txn_id_t max_seen_txn = pm_ != nullptr ? pm_->MaxCommittedTxnId() : 0;
-  {
-    lsn_t offset = scan_start;
-    LogRecord log;
-    while (offset < filesize) {
-      const LogReadResult read = ReadLogDetailed(offset, &log);
-      if (read.status != LogReadStatus::kComplete) {
-        if (const auto next = PreRollPaddingEnd(offset); next.has_value()) {
-          offset = *next;
-          continue;
+  std::vector<Pass1SegmentSummary> summaries;
+  if (scan_start < filesize) {
+    const size_t first_seg = Logger::SegmentIndex(scan_start, segment_size_);
+    const size_t last_seg = Logger::SegmentIndex(filesize - 1, segment_size_);
+    const size_t num_segs = last_seg - first_seg + 1;
+    summaries.resize(num_segs);
+
+    auto scan_segment = [&](size_t idx) {
+      Pass1SegmentSummary& out = summaries[idx];
+      const size_t seg = first_seg + idx;
+      const lsn_t seg_begin =
+          (idx == 0) ? scan_start : (static_cast<lsn_t>(seg) * segment_size_);
+      const lsn_t seg_end =
+          std::min(filesize, static_cast<lsn_t>(seg + 1) * segment_size_);
+      lsn_t offset = seg_begin;
+      LogRecord log;
+      try {
+        while (offset < seg_end) {
+          const LogReadResult read = ReadLogDetailed(offset, &log);
+          if (read.status != LogReadStatus::kComplete) {
+            if (const auto next = PreRollPaddingEnd(offset); next.has_value()) {
+              offset = *next;
+              continue;
+            }
+            break;
+          }
+          // owner==0 is the default of a LogRecord whose decode failed; it is
+          // not a real transaction id (TransactionManager starts at 1).
+          // Ignoring it prevents a corrupt record from seeding id 1, which
+          // could alias an old committed transaction after a crash.
+          if (log.type != LogType::kBeginCheckpoint &&
+              log.type != LogType::kEndCheckpoint && log.owner != 0) {
+            out.max_seen_txn = std::max(out.max_seen_txn, log.owner);
+          }
+          if (log.type == LogType::kCommit) {
+            out.committed_owners.push_back(log.owner);
+          } else if (log.type == LogType::kSystemDestroyPage &&
+                     pm_ != nullptr) {
+            const DestroyOwnerPageKey key{.owner = log.owner, .pid = log.pid};
+            auto [it, inserted] = out.destroy_max.emplace(key, offset);
+            if (!inserted && offset > it->second) {
+              it->second = offset;
+            }
+          }
+          offset += log.Size();
         }
-        break;
+      } catch (...) {
+        out.error = StatusFromCurrentException("recovery pass-1 segment scan");
       }
-      // owner==0 is the default of a LogRecord whose decode failed; it is not
-      // a real transaction id (TransactionManager starts at 1). Ignoring it
-      // prevents a corrupt record from seeding id 1, which could alias an old
-      // committed transaction after a crash.
-      if (log.type != LogType::kBeginCheckpoint &&
-          log.type != LogType::kEndCheckpoint && log.owner != 0) {
-        max_seen_txn = std::max(max_seen_txn, log.owner);
-      }
-      if (log.type == LogType::kCommit) {
-        RETURN_IF_FAIL(committed_txns.Insert(log.owner));
-      } else if (log.type == LogType::kSystemDestroyPage && pm_ != nullptr) {
-        const size_t capacity = destroy_events.capacity();
-        try {
-          destroy_events.push_back(
-              DestroyEvent{.owner = log.owner, .pid = log.pid, .lsn = offset});
-        } catch (...) {
-          return StatusFromCurrentException("recovery destroy event");
-        }
-        if (destroy_events.capacity() != capacity) {
-          destroy_meta.Add((destroy_events.capacity() - capacity) *
-                           sizeof(DestroyEvent));
+    };
+
+    if (num_segs > 1) {
+      const size_t workers = std::min(
+          num_segs,
+          QueryParallelWorkerLimit(std::thread::hardware_concurrency()));
+      if (workers > 1) {
+        RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
+          for (size_t i = w; i < num_segs; i += workers) {
+            scan_segment(i);
+          }
+        }));
+      } else {
+        for (size_t i = 0; i < num_segs; ++i) {
+          scan_segment(i);
         }
       }
-      offset += log.Size();
+    } else {
+      scan_segment(0);
+    }
+
+    constexpr size_t kDestroySummaryEntryBytes =
+        sizeof(std::pair<const DestroyOwnerPageKey, lsn_t>) +
+        (2 * sizeof(void*));
+    for (const Pass1SegmentSummary& s : summaries) {
+      RETURN_IF_FAIL(s.error);
+      max_seen_txn = std::max(max_seen_txn, s.max_seen_txn);
+      for (const txn_id_t owner : s.committed_owners) {
+        RETURN_IF_FAIL(committed_txns.Insert(owner));
+      }
+      if (!s.destroy_max.empty()) {
+        destroy_meta.Add(s.destroy_max.size() * kDestroySummaryEntryBytes);
+      }
     }
   }
 
@@ -902,19 +970,24 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
 
   // Pass 2: replay only committed transactions from scan_start.
   if (pm_ != nullptr) {
-    if (!destroy_events.empty()) {
+    const bool has_destroy_events = std::ranges::any_of(
+        summaries,
+        [](const Pass1SegmentSummary& s) { return !s.destroy_max.empty(); });
+    if (has_destroy_events) {
       std::unordered_map<page_id_t, lsn_t> destroy_floors;
       // ~unordered_map node footprint per distinct destroyed page.
       constexpr size_t kFloorEntryBytes =
           sizeof(std::pair<const page_id_t, lsn_t>) + (2 * sizeof(void*));
       try {
-        for (const DestroyEvent& ev : destroy_events) {
-          if (committed_txns.Contains(ev.owner)) {
-            auto [it, inserted] = destroy_floors.emplace(ev.pid, ev.lsn);
-            if (inserted) {
-              destroy_meta.Add(kFloorEntryBytes);
-            } else if (ev.lsn > it->second) {
-              it->second = ev.lsn;
+        for (const Pass1SegmentSummary& s : summaries) {
+          for (const auto& [key, lsn] : s.destroy_max) {
+            if (committed_txns.Contains(key.owner)) {
+              auto [it, inserted] = destroy_floors.emplace(key.pid, lsn);
+              if (inserted) {
+                destroy_meta.Add(kFloorEntryBytes);
+              } else if (lsn > it->second) {
+                it->second = lsn;
+              }
             }
           }
         }
@@ -925,8 +998,9 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
     }
     // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
     // non-copyable by design
-    struct FloorResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
-                              // scope-owned cleanup.
+    struct
+        FloorResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                           // scope-owned cleanup.
       PageManager* pm;
       ~FloorResetGuard() {
         if (pm != nullptr) {

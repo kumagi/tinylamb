@@ -32,6 +32,18 @@ namespace tinylamb::tlcs_compression {
 [[nodiscard]] bool DecodeCompactNulls(std::span<const uint8_t> encoded,
                                       uint32_t n, std::vector<uint8_t>* out);
 
+// O(|rows|) / O(|rows| log k) sparse random-access gather directly from a raw
+// or compact nullmap without materializing all `n` null flags.
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/BitLayoutsA.lean
+//     (RowMajor.SparseGather, RowMajor.PointSpan)
+//   lean/TinylambOpt/ResearchProofs/Compression/Nullable.lean
+//     (sound_ValidityBits, sound_MinorityRoundTrip)
+[[nodiscard]] bool GatherCompactNulls(std::span<const uint8_t> encoded,
+                                      uint32_t n,
+                                      std::span<const uint32_t> rows,
+                                      uint8_t* out);
+
 // ============================================================================
 // 2. TemporalText 47-bit Timestamp Packing (Compression/TemporalText.lean:
 //    sound_LexicalInverse, sound_CodeDomain, sound_LexicalOrder,
@@ -98,6 +110,16 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                       uint32_t n, int64_t min_int,
                                       int64_t* out);
 
+// O(|rows|) sparse random-access gather directly from bit-packed FOR payload
+// without decompressing the entire block.
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/BitLayoutsA.lean
+//     (RowMajor.Lossless, RowMajor.SparseGather, RowMajor.PointSpan)
+[[nodiscard]] bool GatherBitPackedFor(std::span<const uint8_t> encoded,
+                                      uint32_t n, int64_t min_int,
+                                      std::span<const uint32_t> rows,
+                                      int64_t* out);
+
 // ============================================================================
 // 5. Bit-Exact XOR-Chain Compressed IEEE-754 Doubles
 //    (Compression/BitPatterns.lean: XorChain_sound, SignificantWindow_sound,
@@ -162,6 +184,49 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                      const uint8_t* nulls, uint32_t n,
                                      std::vector<char>* bytes_out,
                                      std::vector<uint32_t>* ends_out);
+
+// ============================================================================
+// 8. ClickBenchLayout.Storage: TieOrientation, ClockWindow, HashExceptions
+// Lean proofs:
+//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_TieOrientation.lean
+//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_ClockWindow.lean
+//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_HashExceptions.lean
+// ============================================================================
+struct TieOrientationPlan {
+  size_t min_bytes{0};
+  // Per-group orientation: false = forward, true = reversed.
+  std::vector<uint8_t> reversed;
+};
+
+// Two-state DP minimizing exact front-coded payload bytes (including varint
+// LCP/suffix lengths) across all tie-group forward/reverse orientations.
+[[nodiscard]] TieOrientationPlan ChooseOptimalTieOrientations(
+    std::span<const std::vector<std::string_view>> groups);
+
+struct ClockWindowPlan {
+  int64_t base{0};
+  size_t total_bytes{0};
+  size_t exception_count{0};
+};
+
+// Finds the globally optimal residual window base for fixed `bit_width`
+// (0 < bit_width < 63) by testing only `0` and `{d, d - span}` anchors,
+// pricing exact zigzag-varint base + packed slots + exception bytes.
+[[nodiscard]] ClockWindowPlan ChooseOptimalClockWindow(
+    std::span<const int64_t> deltas, unsigned bit_width,
+    size_t exception_bytes);
+
+struct HashExceptionsTable {
+  std::vector<uint64_t> mode_hash_by_code;
+  // Sorted by row_id ascending: (row_id, actual_hash) for non-mode rows.
+  std::vector<std::pair<uint32_t, uint64_t>> exceptions;
+
+  [[nodiscard]] uint64_t HashAt(uint32_t row, uint32_t code) const noexcept;
+};
+
+// Builds per-code mode hash predictor and minimal exception list.
+[[nodiscard]] HashExceptionsTable EncodeHashExceptions(
+    std::span<const uint32_t> codes, std::span<const uint64_t> hashes);
 
 }  // namespace tinylamb::tlcs_compression
 

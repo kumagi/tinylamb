@@ -2487,7 +2487,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const int64_t lhs = arguments[0].value.int_value;
     const int64_t rhs = arguments[1].value.int_value;
-    const bool is_u = arguments[0].IsUnsigned() || arguments[1].IsUnsigned();
+    const bool is_u = arguments[0].IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     if (name_view == "__bit_and") {
       return with_u(Value(lhs & rhs));
@@ -4549,8 +4549,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
       return ToInt64Exact(v, def);
     };
-    // Match SUBSTR's AST semantics for the shared INT64 storage of UINT64.
-    const int64_t start = arguments[1].value.int_value;
+    const int64_t start = to_i64(arguments[1], 0);
     if (arguments.size() == 3) {
       const int64_t len = to_i64(arguments[2], 0);
       if (len < 0) {

@@ -422,14 +422,14 @@ TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
   slot->Bind(Value(1));
   const auto conditional = CaseExpressionExp({{predicate, ColumnValueExp("d")}},
                                              ConstantValueExp(Value(0)));
-  EXPECT_FALSE(BytecodeCompiler::Compile(conditional, schema));
+  EXPECT_TRUE(BytecodeCompiler::Compile(conditional, schema));
   for (int repetition = 0; repetition < 2; ++repetition) {
     auto program = BytecodeCompiler::CompileRowCached(conditional, schema);
     ASSERT_TRUE(program);
     if (!program) {
       return;
     }
-    EXPECT_EQ(program->ResultType(), ValueType::kNull);
+    EXPECT_EQ(program->ResultType(), ValueType::kDouble);
     for (const Row& row :
          {Row({Value(5), Value(2.5)}), Row({Value(0), Value(7.5)}),
           Row({Value(), Value()})}) {
@@ -1547,10 +1547,14 @@ TEST(BytecodeTest, FilterOrderKeepsCollationConflictingInPredicate) {
                           static_cast<uint8_t>(Collation::kBinary)))});
   EXPECT_FALSE(AuditIsErrorFreePredicateForOrdering(conflicting_in, schema));
 
-  // Control: a plain VARCHAR IN is genuinely error-free.
+  // Untagged literals have a statically known collation. A VARCHAR column
+  // can carry per-value collation tags absent from the schema.
   Expression plain_in =
       InExpressionExp(ColumnValueExp("s"), {ConstantValueExp(Value("xyz"))});
-  EXPECT_TRUE(AuditIsErrorFreePredicateForOrdering(plain_in, schema));
+  EXPECT_FALSE(AuditIsErrorFreePredicateForOrdering(plain_in, schema));
+  auto literal_in = InExpressionExp(ConstantValueExp(Value("abc")),
+                                    {ConstantValueExp(Value("xyz"))});
+  EXPECT_TRUE(AuditIsErrorFreePredicateForOrdering(literal_in, schema));
 
   // The conflict is still an error at evaluation time.
   const Row row({Value(int64_t{7}), Value("abc")});

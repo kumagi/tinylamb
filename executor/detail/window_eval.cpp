@@ -1,5 +1,4 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
-#include "common/platform/process.hpp"
 #include "executor/detail/window_eval.hpp"
 
 #include <algorithm>
@@ -35,6 +34,7 @@
 #include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
 #include "common/platform/int128_conversion.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -1998,13 +1998,13 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
           if (consumed == text.size()) {
             parsed = candidate;
           }
-        // NOLINTNEXTLINE(bugprone-empty-catch): keep nonnumeric text fallback.
-        } catch (const std::invalid_argument&) {  // NOLINT(bugprone-empty-catch)
+          // NOLINTBEGIN(bugprone-empty-catch)
+        } catch (const std::invalid_argument&) {
           // Nonnumeric text keeps its text sort key.
-        // NOLINTNEXTLINE(bugprone-empty-catch): keep out-of-range text fallback.
-        } catch (const std::out_of_range&) {  // NOLINT(bugprone-empty-catch)
+        } catch (const std::out_of_range&) {
           // An unrepresentable number also keeps its text sort key.
         }
+        // NOLINTEND(bugprone-empty-catch)
       }
       sorted.push_back({std::move(value), parsed});
     }
@@ -3213,7 +3213,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
   }
   std::vector<SortKeyOrder> order_domains;
   order_domains.reserve(window.order_by.size());
-for (const auto& term : window.order_by) {
+  for (const auto& term : window.order_by) {
     order_domains.emplace_back(term.ascending, std::nullopt,
                                CollationOfExpression(term.expression));
   }
@@ -3776,24 +3776,29 @@ StatusOr<bool> TryComputeColumnPrefixWithSummary(
                                     });
 }
 
-// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
 static StatusOr<bool> TryComputeSlidingDistinctRows(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
-    std::span<const size_t> ordered, const WindowRuntime& runtime,
-    std::vector<Value>* out) {
+    std::span<const size_t> ordered, const std::vector<size_t>& peer_end,
+    const WindowRuntime& runtime, std::vector<Value>* out) {
   const char* disable_env =
       ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_DISTINCT_INVERSE");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
+  const bool is_exclude_ties = window.exclusion == WindowFrameExclusion::kTies;
   if (!window.distinct || window.args.size() != 1 || window.where_filter ||
       !window.inner_order_by.empty() || window.inner_limit.has_value() ||
       !window.has_frame || window.frame_unit != WindowFrameUnit::kRows ||
       (window.exclusion != WindowFrameExclusion::kNone &&
-       window.exclusion != WindowFrameExclusion::kCurrentRow)) {
+       window.exclusion != WindowFrameExclusion::kCurrentRow &&
+       !is_exclude_ties)) {
     return false;
   }
   if (window.function != "COUNT" && window.function != "SUM") {
+    return false;
+  }
+  if (is_exclude_ties && window.function != "COUNT") {
     return false;
   }
   const Expression& arg = window.args[0];
@@ -3846,8 +3851,36 @@ static StatusOr<bool> TryComputeSlidingDistinctRows(
     return true;
   }
 
-  // Lean proof: lean/TinylambOpt/Research/WindowDistinctInverse.lean
-  //   (window_distinct_inverse_sound, update_count_bound)
+  // Lean proof:
+  //   lean/TinylambOpt/Research/WindowDistinctInverse.lean
+  //     (window_distinct_inverse_sound, update_count_bound)
+  //   lean/TinylambOpt/ResearchProofs/EngineDecisions/Goal_Exec_DistinctExcludeTies.lean
+  //     (DistinctExcludeTies.Goal)
+  std::vector<size_t> peer_lo;
+  std::vector<size_t> peer_hi;
+  if (is_exclude_ties) {
+    if (!window.order_by.empty() && peer_end.size() != m) {
+      return false;
+    }
+    peer_lo.resize(m);
+    peer_hi.resize(m);
+    if (window.order_by.empty()) {
+      std::fill(peer_lo.begin(), peer_lo.end(), size_t{0});
+      std::fill(peer_hi.begin(), peer_hi.end(), m - 1);
+    } else {
+      for (size_t i = 0; i < m;) {
+        const size_t e = peer_end[i];
+        if (e < i || e >= m) {
+          return false;
+        }
+        for (size_t j = i; j <= e; ++j) {
+          peer_lo[j] = i;
+          peer_hi[j] = e;
+        }
+        i = e + 1;
+      }
+    }
+  }
   const bool is_sum = window.function == "SUM";
   // COUNT(DISTINCT) accepts general Value types, so normalize peer equality
   // with CanonicalDistinctValue. SUM(DISTINCT) takes the arithmetic path only
@@ -3971,6 +4004,34 @@ static StatusOr<bool> TryComputeSlidingDistinctRows(
   bool cur_valid = false;
   size_t cur_lo = 1;
   size_t cur_hi = 0;
+  // Peer-group frequency map for COUNT(DISTINCT) EXCLUDE TIES
+  // (EngineDecisions.Executor.DistinctExcludeTies).
+  std::unordered_map<Value, size_t, DistinctValueHash, DistinctValueEqual>
+      peer_mult;
+  size_t active_peer_lo = m;
+  bool peer_valid = false;
+  size_t peer_cur_lo = 1;
+  size_t peer_cur_hi = 0;
+  auto add_peer_pos = [&](size_t pos) {
+    const Value& v = vals[pos];
+    if (!v.IsNull()) {
+      ++peer_mult[v];
+    }
+  };
+  auto rem_peer_pos = [&](size_t pos) {
+    const Value& v = vals[pos];
+    if (v.IsNull()) {
+      return;
+    }
+    auto it = peer_mult.find(v);
+    if (it != peer_mult.end()) {
+      if (it->second > 1) {
+        --(it->second);
+      } else {
+        peer_mult.erase(it);
+      }
+    }
+  };
   for (size_t k = 0; k < m; ++k) {
     const auto [lo, hi] = compute_bounds(k);
     if (lo > hi) {
@@ -4005,6 +4066,67 @@ static StatusOr<bool> TryComputeSlidingDistinctRows(
       }
     }
 
+    if (is_exclude_ties) {
+      if (!cur_valid) {
+        (*out)[ordered[k]] = Value(int64_t{0});
+        continue;
+      }
+      const size_t p_lo = peer_lo[k];
+      const size_t p_hi = peer_hi[k];
+      if (p_lo != active_peer_lo) {
+        peer_mult.clear();
+        peer_valid = false;
+        active_peer_lo = p_lo;
+      }
+      const size_t ilo = std::max(lo, p_lo);
+      const size_t ihi = std::min(hi, p_hi);
+      if (ilo > ihi) {
+        if (peer_valid) {
+          peer_mult.clear();
+          peer_valid = false;
+        }
+        (*out)[ordered[k]] = Value(static_cast<int64_t>(distinct_non_null));
+        continue;
+      }
+      if (!peer_valid || ilo > peer_cur_hi || ilo < peer_cur_lo ||
+          ihi < peer_cur_hi) {
+        peer_mult.clear();
+        for (size_t p = ilo; p <= ihi; ++p) {
+          add_peer_pos(p);
+        }
+        peer_cur_lo = ilo;
+        peer_cur_hi = ihi;
+        peer_valid = true;
+      } else {
+        while (peer_cur_lo < ilo) {
+          rem_peer_pos(peer_cur_lo++);
+        }
+        while (peer_cur_hi < ihi) {
+          add_peer_pos(++peer_cur_hi);
+        }
+      }
+      size_t exclusive_cnt = 0;
+      for (const auto& [pv, pcnt] : peer_mult) {
+        const auto mit = mult.find(pv);
+        if (mit != mult.end() && mit->second == pcnt) {
+          ++exclusive_cnt;
+        }
+      }
+      bool keep_current = false;
+      if (lo <= k && k <= hi && !vals[k].IsNull()) {
+        const auto pit = peer_mult.find(vals[k]);
+        const auto mit = mult.find(vals[k]);
+        if (pit != peer_mult.end() && mit != mult.end() &&
+            pit->second == mit->second) {
+          keep_current = true;
+        }
+      }
+      const size_t ans =
+          distinct_non_null - exclusive_cnt + (keep_current ? 1U : 0U);
+      (*out)[ordered[k]] = Value(static_cast<int64_t>(ans));
+      continue;
+    }
+
     // EXCLUDE CURRENT ROW removes the current row only when it belongs to
     // this frame. If an offset frame excludes k, there is nothing to remove
     // or restore in the frame multiset.
@@ -4036,13 +4158,14 @@ static StatusOr<bool> TryComputeSlidingDistinctRows(
 }
 
 // Lean proof: lean/TinylambOpt/ResearchProofs/NthNonNullFrame.lean (sound)
-// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
 static StatusOr<bool> TryComputeNthNonNullFrame(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
     std::span<const size_t> ordered, const WindowOrderValues& order_values,
     const std::vector<size_t>& peer_end, const std::vector<size_t>& group_ends,
     const WindowRuntime& runtime, std::vector<Value>* out) {
-  const char* disable_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME");
+  const char* disable_env =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_NTH_NON_NULL_FRAME");
   if (disable_env != nullptr && disable_env[0] == '1') {
     return false;
   }
@@ -4150,8 +4273,307 @@ static StatusOr<bool> TryComputeNthNonNullFrame(
   return true;
 }
 
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/LayerContracts/FrameRetractions_All.lean
+//     (Sum.FastRetraction, Sum.PhysicalCount, Minimum.FastRetraction,
+//      Minimum.FallbackNecessary, Maximum.FastRetraction,
+//      Maximum.FallbackNecessary, Sum.TwoEvictions)
+// O(m) sliding-frame evaluation for non-DISTINCT COUNT/SUM/AVG/MIN/MAX over
+// `ROWS BETWEEN ... AND ...` frames. Retracts outgoing rows in O(1) for
+// COUNT/SUM/AVG and skips rescans for MIN/MAX whenever the expired value is
+// strictly non-extremal.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
+static StatusOr<bool> TryComputeSlidingRetractableRows(
+    const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+    std::span<const size_t> ordered, const WindowRuntime& runtime,
+    std::vector<Value>* out) {
+  if (window.distinct || window.where_filter ||
+      !window.inner_order_by.empty() || window.inner_limit.has_value() ||
+      !window.has_frame || window.frame_unit != WindowFrameUnit::kRows ||
+      window.exclusion != WindowFrameExclusion::kNone) {
+    return false;
+  }
+  const bool is_count = (window.function == "COUNT");
+  const bool is_sum = (window.function == "SUM");
+  const bool is_avg = (window.function == "AVG");
+  const bool is_min = (window.function == "MIN");
+  const bool is_max = (window.function == "MAX");
+  if (!is_count && !is_sum && !is_avg && !is_min && !is_max) {
+    return false;
+  }
+  const bool is_count_star =
+      is_count &&
+      (window.args.empty() ||
+       (window.args.size() == 1 && window.args[0] &&
+        window.args[0]->Type() == TypeTag::kColumnValue &&
+        window.args[0]->AsColumnValue().GetColumnName().name == "*"));
+  if (!is_count_star) {
+    if (window.args.size() != 1 || !window.args[0]) {
+      return false;
+    }
+    const Expression& arg = window.args[0];
+    const bool arg_is_col = arg->Type() == TypeTag::kColumnValue;
+    const bool arg_is_const =
+        arg->Type() == TypeTag::kConstantValue &&
+        dynamic_cast<const ParameterSlot*>(arg.get()) == nullptr;
+    if (!arg_is_col && !arg_is_const) {
+      return false;
+    }
+    if (arg_is_col && !LocalColumnOffset(*runtime.schema,
+                                         arg->AsColumnValue().GetColumnName())
+                           .has_value()) {
+      return false;
+    }
+  }
+
+  auto parse_const_offset = [](const WindowFrameBound& bound,
+                               bool* ok) -> int64_t {
+    if (bound.type == WindowFrameBoundType::kUnboundedPreceding ||
+        bound.type == WindowFrameBoundType::kUnboundedFollowing ||
+        bound.type == WindowFrameBoundType::kCurrentRow) {
+      return 0;
+    }
+    if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
+      *ok = false;
+      return 0;
+    }
+    const Value& val = bound.offset->AsConstantValue().GetValue();
+    if (val.IsNull() || val.type != ValueType::kInt64 || val.IsUnsigned() ||
+        val.value.int_value < 0) {
+      *ok = false;
+      return 0;
+    }
+    return val.value.int_value;
+  };
+  bool bounds_ok = true;
+  const int64_t start_off = parse_const_offset(window.frame_start, &bounds_ok);
+  const int64_t end_off = parse_const_offset(window.frame_end, &bounds_ok);
+  if (!bounds_ok) {
+    return false;
+  }
+
+  const size_t m = ordered.size();
+  if (m == 0) {
+    return true;
+  }
+
+  auto compute_bounds = [&](size_t pos) -> std::pair<size_t, size_t> {
+    std::optional<size_t> lo;
+    switch (window.frame_start.type) {
+      case WindowFrameBoundType::kUnboundedPreceding:
+        lo = size_t{0};
+        break;
+      case WindowFrameBoundType::kCurrentRow:
+        lo = pos;
+        break;
+      case WindowFrameBoundType::kOffsetPreceding: {
+        const auto off = static_cast<uint64_t>(start_off);
+        lo = (off <= pos) ? (pos - static_cast<size_t>(off)) : size_t{0};
+        break;
+      }
+      case WindowFrameBoundType::kOffsetFollowing: {
+        const auto off = static_cast<uint64_t>(start_off);
+        if (off <= m - 1 - pos) {
+          lo = pos + static_cast<size_t>(off);
+        }
+        break;
+      }
+      case WindowFrameBoundType::kUnboundedFollowing:
+        lo = m - 1;
+        break;
+    }
+    std::optional<size_t> hi;
+    switch (window.frame_end.type) {
+      case WindowFrameBoundType::kUnboundedFollowing:
+        hi = m - 1;
+        break;
+      case WindowFrameBoundType::kCurrentRow:
+        hi = pos;
+        break;
+      case WindowFrameBoundType::kOffsetFollowing: {
+        const auto off = static_cast<uint64_t>(end_off);
+        hi = (off <= m - 1 - pos) ? (pos + static_cast<size_t>(off)) : (m - 1);
+        break;
+      }
+      case WindowFrameBoundType::kOffsetPreceding: {
+        const auto off = static_cast<uint64_t>(end_off);
+        if (off <= pos) {
+          hi = pos - static_cast<size_t>(off);
+        }
+        break;
+      }
+      case WindowFrameBoundType::kUnboundedPreceding:
+        hi = size_t{0};
+        break;
+    }
+    if (!lo.has_value() || !hi.has_value() || *lo > *hi) {
+      return {1, 0};
+    }
+    return {*lo, *hi};
+  };
+
+  if (is_count_star) {
+    for (size_t k = 0; k < m; ++k) {
+      const auto [lo, hi] = compute_bounds(k);
+      const int64_t cnt = (lo > hi) ? 0 : static_cast<int64_t>(hi - lo + 1);
+      (*out)[ordered[k]] = Value(cnt);
+    }
+    return true;
+  }
+
+  std::vector<Value> vals;
+  vals.reserve(m);
+  ValueType elem_type = ValueType::kNull;
+  int64_t max_abs_int = 0;
+  for (size_t k = 0; k < m; ++k) {
+    ASSIGN_OR_RETURN(Value, v,
+                     (runtime.EvalAt(window.args[0], rows, ordered[k])));
+    if (!v.IsNull()) {
+      if (is_sum || is_avg) {
+        if (v.type != ValueType::kInt64 || v.IsUnsigned()) {
+          return false;
+        }
+        const int64_t raw = v.value.int_value;
+        if (raw == std::numeric_limits<int64_t>::min()) {
+          return false;
+        }
+        max_abs_int = std::max(max_abs_int, raw < 0 ? -raw : raw);
+      } else if (is_min || is_max) {
+        if (v.IsUnsigned() ||
+            (v.type != ValueType::kInt64 && v.type != ValueType::kDate)) {
+          return false;
+        }
+      }
+      if (elem_type == ValueType::kNull) {
+        elem_type = v.type;
+      } else if (elem_type != v.type && !is_count) {
+        return false;
+      }
+    }
+    vals.push_back(std::move(v));
+  }
+
+  if (is_sum && elem_type == ValueType::kInt64) {
+    const __int128 worst =
+        static_cast<__int128>(max_abs_int) * static_cast<__int128>(m);
+    if (worst > static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+      return false;
+    }
+  }
+
+  size_t cur_lo = 1;
+  size_t cur_hi = 0;
+  int64_t non_null_cnt = 0;
+  __int128 sum_acc = 0;
+  int64_t ext_val = 0;
+  bool ext_valid = false;
+
+  auto reset_state = [&]() {
+    cur_lo = 1;
+    cur_hi = 0;
+    non_null_cnt = 0;
+    sum_acc = 0;
+    ext_val = 0;
+    ext_valid = false;
+  };
+  auto add_idx = [&](size_t idx) {
+    const Value& v = vals[idx];
+    if (v.IsNull()) {
+      return;
+    }
+    ++non_null_cnt;
+    if (is_sum || is_avg) {
+      sum_acc += static_cast<__int128>(v.value.int_value);
+    } else if (is_min || is_max) {
+      const int64_t iv = v.value.int_value;
+      if (!ext_valid) {
+        ext_val = iv;
+        ext_valid = true;
+      } else if (is_min ? (iv < ext_val) : (iv > ext_val)) {
+        ext_val = iv;
+      }
+    }
+  };
+  auto remove_idx = [&](size_t idx, bool* need_rescan) {
+    const Value& v = vals[idx];
+    if (v.IsNull()) {
+      return;
+    }
+    --non_null_cnt;
+    if (is_sum || is_avg) {
+      sum_acc -= static_cast<__int128>(v.value.int_value);
+    } else if (is_min || is_max) {
+      // FrameRetractions.Minimum/Maximum.FastRetraction:
+      // keep ext_val in O(1) whenever expired value is strictly non-extremal.
+      if (non_null_cnt == 0) {
+        ext_valid = false;
+      } else if (v.value.int_value == ext_val) {
+        *need_rescan = true;
+      }
+    }
+  };
+
+  for (size_t k = 0; k < m; ++k) {
+    const auto [lo, hi] = compute_bounds(k);
+    if (lo > hi) {
+      reset_state();
+    } else if (cur_lo > cur_hi || lo > cur_hi || hi < cur_lo) {
+      reset_state();
+      for (size_t i = lo; i <= hi; ++i) {
+        add_idx(i);
+      }
+      cur_lo = lo;
+      cur_hi = hi;
+    } else {
+      bool need_rescan = false;
+      while (cur_lo < lo) {
+        remove_idx(cur_lo++, &need_rescan);
+      }
+      while (cur_hi > hi) {
+        remove_idx(cur_hi--, &need_rescan);
+      }
+      while (cur_lo > lo) {
+        add_idx(--cur_lo);
+      }
+      while (cur_hi < hi) {
+        add_idx(++cur_hi);
+      }
+      if (need_rescan && non_null_cnt > 0) {
+        ext_valid = false;
+        for (size_t i = cur_lo; i <= cur_hi; ++i) {
+          const Value& v = vals[i];
+          if (v.IsNull()) {
+            continue;
+          }
+          const int64_t iv = v.value.int_value;
+          if (!ext_valid || (is_min ? (iv < ext_val) : (iv > ext_val))) {
+            ext_val = iv;
+            ext_valid = true;
+          }
+        }
+      }
+    }
+
+    if (is_count) {
+      (*out)[ordered[k]] = Value(non_null_cnt);
+    } else if (non_null_cnt == 0) {
+      (*out)[ordered[k]] = Value();
+    } else if (is_sum) {
+      (*out)[ordered[k]] = Value(static_cast<int64_t>(sum_acc));
+    } else if (is_avg) {
+      (*out)[ordered[k]] = Value(static_cast<double>(sum_acc) /
+                                 static_cast<double>(non_null_cnt));
+    } else if (elem_type == ValueType::kDate) {
+      (*out)[ordered[k]] = Value::DateFromDays(ext_val);
+    } else {
+      (*out)[ordered[k]] = Value(ext_val);
+    }
+  }
+  return true;
+}
+
 // Lean proof: lean/TinylambOpt/ResearchProofs/RangeDistinctIndex.lean (sound)
-// NOLINTNEXTLINE(misc-use-anonymous-namespace): shared across this translation unit.
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
 static StatusOr<bool> TryComputeRangeDistinctIndex(
     const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
     std::span<const size_t> ordered, const WindowOrderValues& order_values,
@@ -4662,9 +5084,16 @@ Status ComputeOneWindowImpl(TransactionContext& context,
       continue;
     }
 
-    ASSIGN_OR_RETURN(
-        bool, distinct_done,
-        (TryComputeSlidingDistinctRows(window, rows, ordered, runtime, out)));
+    ASSIGN_OR_RETURN(bool, sliding_done,
+                     (TryComputeSlidingRetractableRows(window, rows, ordered,
+                                                       runtime, out)));
+    if (sliding_done) {
+      continue;
+    }
+
+    ASSIGN_OR_RETURN(bool, distinct_done,
+                     (TryComputeSlidingDistinctRows(window, rows, ordered,
+                                                    peer_end, runtime, out)));
     if (distinct_done) {
       continue;
     }
@@ -5044,7 +5473,8 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   // under a deterministic LIMIT/OFFSET, extract only the sorted halo slice
   // `[offset - max_preceding, min(n, offset + limit + max_following))` before
   // running window evaluation.
-  const char* disable_halo_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
+  const char* disable_halo_env =
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WINDOW_HALO");
   if ((disable_halo_env == nullptr || disable_halo_env[0] != '1') &&
       allow_window_halo && !rank_bound && !input.HasSpill() &&
       statement.HasLimit() && statement.Limit() > 0 && !statement.WithTies() &&

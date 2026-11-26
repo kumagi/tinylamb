@@ -15,6 +15,7 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
@@ -862,13 +863,14 @@ TEST(ExpressionRewriteTest,
 }
 
 TEST(ExpressionRewriteTest, FloatingIdentitiesKeepResultTypeAndSignedZero) {
-  const Schema schema("", {Column("i", ValueType::kInt64),
-                            Column("d", ValueType::kDouble)});
+  const Schema schema(
+      "", {Column("i", ValueType::kInt64), Column("d", ValueType::kDouble)});
   const Row row({Value(0), Value(-0.0)});
   ExpressionRewriter rewriter(ExpressionRuleSet::Default());
   rewriter.set_schema(&schema);
-  for (const auto operation : {BinaryOperation::kAdd, BinaryOperation::kSubtract,
-                                BinaryOperation::kMultiply}) {
+  for (const auto operation :
+       {BinaryOperation::kAdd, BinaryOperation::kSubtract,
+        BinaryOperation::kMultiply}) {
     const auto literal = operation == BinaryOperation::kMultiply ? 1.0 : 0.0;
     const Expression simplified = rewriter.Rewrite(BinaryExpressionExp(
         ColumnValueExp("i"), operation, ConstantValueExp(Value(literal))));
@@ -1484,7 +1486,9 @@ TEST(ExpressionRewriteTest, WildcardFreeLikeBecomesEquality) {
                           ConstantValueExp(Value("abc")));
   rewritten = rewrite(not_like_exact);
   ASSERT_EQ(rewritten->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten->AsBinaryExpression().Op(), BinaryOperation::kNotEquals);
+  EXPECT_EQ(
+      rewritten->AsBinaryExpression().Op(),
+      BinaryOperation::kNotLike);  // The column may carry an INTERVAL tag.
 
   // Wildcards keep the LIKE operator.
   Expression like_percent =
@@ -1613,8 +1617,9 @@ TEST(ExpressionRewriteTest, AbsorptionPreservesRaisingOperand) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
   };
-  Expression raise = CastExpressionExp(ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
-                                       "INT64");  // raises when evaluated
+  Expression raise = CastExpressionExp(
+      ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
+      "INT64");  // raises when evaluated
   Expression null_c = ConstantValueExp(Value());
   // (NULL AND raising) OR NULL  -- x = NULL, y = raising.
   Expression t = BinaryExpressionExp(
@@ -1632,8 +1637,9 @@ TEST(ExpressionRewriteTest, NullCheckOfNullCheckPreservesRaise) {
   auto rewrite = [](const Expression& expression) {
     return ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
   };
-  Expression raise = CastExpressionExp(ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
-                                       "INT64");  // raises when evaluated
+  Expression raise = CastExpressionExp(
+      ConstantValueExp(Value(-std::numeric_limits<double>::infinity())),
+      "INT64");  // raises when evaluated
   Expression t =
       UnaryExpressionExp(UnaryExpressionExp(raise, UnaryOperation::kIsNotNull),
                          UnaryOperation::kIsNotNull);
@@ -2966,6 +2972,48 @@ TEST(ExpressionRewriteTest, BooleanPredicateEqualityInvertsExactComplement) {
             eq_five->Evaluate(zero, schema));
   EXPECT_EQ(rewritten_five->Evaluate(one, schema),
             eq_five->Evaluate(one, schema));
+}
+
+TEST(ExpressionRewriteTest, IsNullOfIsNotFalsePreservesBoolDomainError) {
+  // Fuzz-found (expression_fuzzer): TryResolveSchemaBoundNonThrowingType
+  // previously treated any INT64 column as non-throwing for IS [NOT]
+  // TRUE/FALSE, letting IS NULL(IS NULL(IS NOT FALSE col_i)) fold away the
+  // "IS FALSE requires a BOOL operand" error when col_i is outside {0, 1}.
+  const Schema schema("s", {Column("i", ValueType::kInt64)});
+  const Expression expr = UnaryExpressionExp(
+      UnaryExpressionExp(
+          UnaryExpressionExp(ColumnValueExp("i"), UnaryOperation::kIsNotFalse),
+          UnaryOperation::kIsNull),
+      UnaryOperation::kIsNull);
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expr);
+  const Row non_bool({Value(int64_t{42})});
+  EXPECT_FALSE(expr->TryEvaluate(non_bool, schema).HasValue());
+  EXPECT_FALSE(rewritten->TryEvaluate(non_bool, schema).HasValue());
+  if (auto prog = BytecodeCompiler::Compile(expr, schema); prog.has_value()) {
+    EXPECT_FALSE(prog->TryEvaluateRow(non_bool).HasValue());
+  }
+}
+
+TEST(ExpressionRewriteTest, PredicatePushdownCaseRefusesTypeSensitiveUnaryOps) {
+  // Fuzz-found (expression_fuzzer): pushing unary `-` or `IS NOT FALSE` inside
+  // a mixed INT64/DOUBLE CASE bypassed CoerceCaseBranch's INT64 -> DOUBLE
+  // promotion, turning a throwing DOUBLE operand into a valid BOOL INT64 `1`.
+  const Schema schema(
+      "s", {Column("i", ValueType::kInt64), Column("d", ValueType::kDouble)});
+  const Expression case_expr = CaseExpressionExp(
+      {{ColumnValueExp("i"), ColumnValueExp("i")}}, ColumnValueExp("d"));
+  const Expression expr =
+      UnaryExpressionExp(UnaryExpressionExp(case_expr, UnaryOperation::kMinus),
+                         UnaryOperation::kIsNotFalse);
+  const Expression rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expr);
+  const Row row({Value(int64_t{-1}), Value(1.5)});
+  EXPECT_FALSE(expr->TryEvaluate(row, schema).HasValue());
+  EXPECT_FALSE(rewritten->TryEvaluate(row, schema).HasValue());
+  if (auto prog = BytecodeCompiler::Compile(expr, schema); prog.has_value()) {
+    EXPECT_FALSE(prog->TryEvaluateRow(row).HasValue());
+  }
 }
 
 TEST(ExpressionRewriteTest, LikeEqualityRefusesTimestampShapedPattern) {

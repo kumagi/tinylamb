@@ -1130,15 +1130,18 @@ TEST(GoogleSqlAstTest, MalformedDumpsAreRejectedWithoutCrashing) {
 TEST(GoogleSqlAstTest, LabelsWithoutRangeSuffixAreAcceptedLeniently) {
   // A location suffix only counts when the label ends in ']'; anything else
   // becomes the node's literal kind. Leniency pins from the fuzzer corpus:
-  // unparsable ranges and unbalanced parens survive as opaque nodes.
-  for (const std::string_view dump :
-       {"q [0-1] extra\n", "x [not-a-range]\n", "y(-\n"}) {
+  // unparsable ranges survive as opaque nodes.
+  for (const std::string_view dump : {"q [0-1] extra\n", "x [not-a-range]\n"}) {
     SCOPED_TRACE(testing::Message() << "dump=[" << dump << "]");
     const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
         GoogleSqlAstParser::Parse(dump);
     ASSERT_TRUE(ast.HasValue());
     EXPECT_EQ(ast.Value()->children.size(), 0U);
   }
+}
+
+TEST(GoogleSqlAstTest, RejectsUnterminatedContinuedLabel) {
+  EXPECT_FALSE(GoogleSqlAstParser::Parse("y(-\n").HasValue());
 }
 
 TEST(GoogleSqlAstTest, DeeplyIndentedDumpParsesIteratively) {

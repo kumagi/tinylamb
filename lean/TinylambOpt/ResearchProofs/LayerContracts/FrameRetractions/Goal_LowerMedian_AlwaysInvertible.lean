@@ -1,0 +1,22 @@
+import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+set_option linter.unnecessarySimpa false
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_LowerMedian_AlwaysInvertible
+
+open TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+open TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common
+
+theorem refute : ¬ LowerMedian.AlwaysInvertible.Goal := by
+  apply alwaysInvertible_refute [0, 0] [0, 1] 0
+  · simp
+  · native_decide
+  · simp
+  · simp
+  · native_decide
+
+end TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_LowerMedian_AlwaysInvertible

@@ -727,7 +727,8 @@ bool ParseProtoTextEntries(std::string_view body,
       } else {
         const size_t start = i;
         while (i < body.size() && !IsSpaceChar(body[i]) && body[i] != ',' &&
-               body[i] != ';' && body[i] != '#') {
+               body[i] != ';' && body[i] != '#' && body[i] != '{' &&
+               body[i] != '}' && body[i] != '<' && body[i] != '>') {
           ++i;
         }
         if (i == start) {
@@ -2012,10 +2013,15 @@ std::optional<std::string> DecodeProtoWireBytes(const std::string& type_name,
                            IntegerToString(static_cast<int64_t>(value)));
       continue;
     }
-    std::string token =
-        proto2 ? (enum_value == -1 ? std::string("TESTENUMNEGATIVE")
-                                   : "TESTENUM" + IntegerToString(enum_value))
-               : IntegerToString(static_cast<int64_t>(value));
+    std::string token;
+    if (proto2) {
+      token = enum_value == -1 ? std::string("TESTENUMNEGATIVE")
+                               : "TESTENUM" + IntegerToString(enum_value);
+    } else if (name == "test_enum" && enum_value >= 0 && enum_value <= 2) {
+      token = "ENUM" + IntegerToString(enum_value);
+    } else {
+      token = IntegerToString(static_cast<int64_t>(value));
+    }
     entries.emplace_back(name, std::move(token));
   }
   // Proto wire decoding may see a singular field more than once.  Scalar

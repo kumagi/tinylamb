@@ -22,6 +22,7 @@ cd lean
 ```
 
 - 既定ターゲットの `CheckProofs` は、インポートされたプロジェクトの定理が直接・間接に `sorryAx` に依存すると失敗します。各定理の保証範囲はその型と仮定で決まります。
+- 既定ターゲットの `CheckStorageExecutionProofs` は、圧縮・SQL 実行の固定 1,000 件の `Goal` すべてが証明または反証定理で覆われ、余分な公理に依存しないことを検査します。個別結果は [storage-execution-results](issues/research/storage-execution-results/README.md) にあります。
 - わざと誤った書き換えルールを `theorem` として書くと、コンパイルが通らず止まります。
 
 ### 2. 反例・書き換え比較デモを実行する

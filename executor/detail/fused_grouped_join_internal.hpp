@@ -33,6 +33,11 @@ namespace tinylamb::relational_detail {
 inline constexpr uint32_t kInvalidRightIdx =
     std::numeric_limits<uint32_t>::max();
 
+StatusOr<std::optional<Relation>> TryNullSignatureFullAggregate(
+    TransactionContext& context, const Relation& left, const Relation& right,
+    const std::vector<Expression>& predicates, const Scope* outer,
+    const CteMap& ctes, const GroupedJoinFusionSpec& fusion);
+
 struct UniqueIntSlot {
   int64_t key{0};
   uint32_t r_idx{std::numeric_limits<uint32_t>::max()};

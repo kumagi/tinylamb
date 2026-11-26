@@ -133,6 +133,27 @@ bool JitInt64Kernels::CanUseUncheckedSum(int64_t running_total,
          hi_env <= std::numeric_limits<int64_t>::max();
 }
 
+bool JitInt64Kernels::CanUseUncheckedSumWithEnvelope(
+    int64_t running_total, __int128 prefix_min, __int128 prefix_max) noexcept {
+  if (prefix_min > prefix_max) {
+    return false;
+  }
+  const __int128 lo_env = static_cast<__int128>(running_total) + prefix_min;
+  const __int128 hi_env = static_cast<__int128>(running_total) + prefix_max;
+  return lo_env >= std::numeric_limits<int64_t>::min() &&
+         hi_env <= std::numeric_limits<int64_t>::max();
+}
+
+bool JitInt64Kernels::CanUseUncheckedSumForInitialRange(
+    int64_t init_lo, int64_t init_hi, int64_t min_value, int64_t max_value,
+    size_t count) noexcept {
+  if (init_lo > init_hi) {
+    return false;
+  }
+  return CanUseUncheckedSum(init_lo, min_value, max_value, count) &&
+         CanUseUncheckedSum(init_hi, min_value, max_value, count);
+}
+
 // Lean proof: lean/TinylambOpt/FusedAggregateJit.lean
 // (affine_endpoints_bound, guarded_fused_sum)
 bool JitInt64Kernels::CanUseFilterProjectSum(int64_t min_value,
@@ -2253,16 +2274,25 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
     return std::nullopt;
   }
 
-  // Build deterministic cache key over dense-column-normalized bytecode +
-  // literal constants so identical shapes across tables/queries share one
-  // compiled LLJIT module.
+  // Build deterministic minimal specialization cache key over reachable,
+  // dense-column-normalized bytecode + literal constants so identical shapes
+  // across tables/queries share one compiled LLJIT module.
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/SpecializationCache/
+  //     (Goal_BoundComparison_UnusedScale, Goal_NullPolicy_DeadLiteral,
+  //      Goal_BoundComparison_CompileOnce, Goal_BoundComparison_Substitute)
   std::string key;
-  key.reserve((n * 16) + 32);
+  key.reserve((n * 12) + 32);
   key.append("cols=");
   key.append(std::to_string(out.referenced_columns.size()));
   key.push_back(';');
   for (size_t pc = 0; pc < n; ++pc) {
+    if (out.depths[pc] == ValidatedProgram::kUnreached) {
+      continue;
+    }
     const BytecodeInstruction& inst = out.instructions[pc];
+    key.append(std::to_string(pc));
+    key.push_back('@');
     key.append(std::to_string(static_cast<uint32_t>(inst.opcode)));
     key.push_back(':');
     if (inst.opcode == BytecodeOp::kLoadColumn) {
@@ -2286,14 +2316,18 @@ std::optional<ValidatedProgram> ValidateForBranchlessJit(
       const ReciprocalDivModSpec& rspec = out.reciprocals[inst.operand];
       key.push_back(inst.opcode == BytecodeOp::kDivInt64Const ? 'D' : 'M');
       key.append(std::to_string(rspec.divisor));
-    } else {
-      key.append(std::to_string(inst.operand));
-      key.push_back(',');
+    } else if (inst.opcode == BytecodeOp::kBinaryInt64) {
       key.append(std::to_string(static_cast<uint32_t>(inst.binary)));
-      key.push_back(',');
+    } else if (inst.opcode == BytecodeOp::kUnaryInt64) {
       key.append(std::to_string(static_cast<uint32_t>(inst.unary)));
-      key.push_back(',');
+    } else if (inst.opcode == BytecodeOp::kJump ||
+               inst.opcode == BytecodeOp::kJumpIfFalse ||
+               inst.opcode == BytecodeOp::kJumpIfTrue ||
+               inst.opcode == BytecodeOp::kJumpIfNotNull) {
       key.append(std::to_string(inst.jump_target));
+    } else if (inst.opcode == BytecodeOp::kPop ||
+               inst.opcode == BytecodeOp::kDup) {
+      key.append(std::to_string(inst.operand));
     }
     key.push_back(';');
   }
@@ -2445,6 +2479,16 @@ bool EmitBranchlessKernelPair(llvm::Module* module,
       llvm::Function::Create(inner_fn_ty, llvm::Function::InternalLinkage,
                              std::string(outer_name) + "_inner", *module);
   inner_fn->addFnAttr(llvm::Attribute::NoInline);
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/VectorMemory/
+  //     (ForwardCopy.DependenceGuard, ForwardCopy.DisjointDistance,
+  //      ForwardCopy.GatherCache)
+  // Input column buffers are strictly read-only and never escape; output
+  // buffers are disjoint (checked at the C++ entry boundary) and never escape.
+  const size_t input_ptr_count = nullable_cols ? 2 * k : k;
+  for (size_t p = 0; p < input_ptr_count; ++p) {
+    inner_fn->addParamAttr(static_cast<unsigned>(p), llvm::Attribute::ReadOnly);
+  }
   for (size_t p = first_out_param; p < inner_params.size(); ++p) {
     inner_fn->addParamAttr(static_cast<unsigned>(p), llvm::Attribute::NoAlias);
   }
@@ -2531,6 +2575,9 @@ bool EmitBranchlessKernelPair(llvm::Module* module,
   }
 
   const size_t num_insts = spec.instructions.size();
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/DemandSSA_All.lean
+  //     (IdenticalArms.Projection, IdenticalArms.ReuseBudget)
   auto select_stack = [&](llvm::Value* cond, const std::vector<SsaLane>& on_t,
                           const std::vector<SsaLane>& on_f) {
     // Defensive: keep the merged stack depth well-defined even if a future
@@ -2542,8 +2589,14 @@ bool EmitBranchlessKernelPair(llvm::Module* module,
     for (size_t s = 0; s < depth; ++s) {
       const SsaLane& t = s < on_t.size() ? on_t[s] : missing;
       const SsaLane& f = s < on_f.size() ? on_f[s] : missing;
-      merged[s] = {.bits = builder.CreateSelect(cond, t.bits, f.bits),
-                   .is_null = builder.CreateSelect(cond, t.is_null, f.is_null)};
+      llvm::Value* bits = (t.bits == f.bits)
+                              ? t.bits
+                              : builder.CreateSelect(cond, t.bits, f.bits);
+      llvm::Value* is_null =
+          (t.is_null == f.is_null)
+              ? t.is_null
+              : builder.CreateSelect(cond, t.is_null, f.is_null);
+      merged[s] = {.bits = bits, .is_null = is_null};
     }
     return merged;
   };
@@ -2564,6 +2617,9 @@ bool EmitBranchlessKernelPair(llvm::Module* module,
         for (size_t idx = edges->size(); idx-- > 0;) {
           SsaCutEdge& e = (*edges)[idx];
           if (e.target == pc) {
+            if (e.cond == builder.getFalse()) {
+              continue;
+            }
             if (first_hit) {
               acc_act = e.cond;
               acc_stk = std::move(e.stk);
@@ -2801,43 +2857,53 @@ bool EmitBranchlessKernelPair(llvm::Module* module,
         llvm::Value* neither_null = builder.CreateNot(either_null);
 
         switch (inst.binary) {
-          // Lean proof: `jit_3vl_lane_sound`
+          // Lean proof: `jit_3vl_lane_sound`,
+          //   lean/TinylambOpt/ResearchProofs/JitFrontiers/PredicateBallots_All.lean
+          //     (Conjunction: MaskedTruth, NullOutput, DisjointOutputs)
           case BinaryOperation::kAnd: {
-            llvm::Value* lt = builder.CreateAnd(
-                builder.CreateNot(left.is_null),
-                builder.CreateICmpNE(left.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* rt = builder.CreateAnd(
-                builder.CreateNot(right.is_null),
-                builder.CreateICmpNE(right.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* lf = builder.CreateAnd(
-                builder.CreateNot(left.is_null),
-                builder.CreateICmpEQ(left.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* rf = builder.CreateAnd(
-                builder.CreateNot(right.is_null),
-                builder.CreateICmpEQ(right.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* res_false = builder.CreateOr(lf, rf);
-            res = {.bits = builder.CreateZExt(builder.CreateAnd(lt, rt), i64),
-                   .is_null = builder.CreateAnd(builder.CreateNot(res_false),
-                                                either_null)};
+            llvm::Value* l_nz = builder.CreateICmpNE(
+                left.bits, const_cast<llvm::Value*>(i64_zero));
+            llvm::Value* r_nz = builder.CreateICmpNE(
+                right.bits, const_cast<llvm::Value*>(i64_zero));
+            if (left.is_null == builder.getFalse() &&
+                right.is_null == builder.getFalse()) {
+              res = {.bits = builder.CreateZExt(builder.CreateAnd(l_nz, r_nz),
+                                                i64),
+                     .is_null = builder.getFalse()};
+            } else {
+              llvm::Value* lt =
+                  builder.CreateAnd(builder.CreateNot(left.is_null), l_nz);
+              llvm::Value* rt =
+                  builder.CreateAnd(builder.CreateNot(right.is_null), r_nz);
+              llvm::Value* r_null_or_t = builder.CreateOr(right.is_null, r_nz);
+              llvm::Value* res_null = builder.CreateOr(
+                  builder.CreateAnd(left.is_null, r_null_or_t),
+                  builder.CreateAnd(lt, right.is_null));
+              res = {.bits = builder.CreateZExt(builder.CreateAnd(lt, rt), i64),
+                     .is_null = res_null};
+            }
             break;
           }
           case BinaryOperation::kOr: {
-            llvm::Value* lt = builder.CreateAnd(
-                builder.CreateNot(left.is_null),
-                builder.CreateICmpNE(left.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* rt = builder.CreateAnd(
-                builder.CreateNot(right.is_null),
-                builder.CreateICmpNE(right.bits,
-                                     const_cast<llvm::Value*>(i64_zero)));
-            llvm::Value* res_true = builder.CreateOr(lt, rt);
-            res = {.bits = builder.CreateZExt(res_true, i64),
-                   .is_null = builder.CreateAnd(builder.CreateNot(res_true),
-                                                either_null)};
+            llvm::Value* l_nz = builder.CreateICmpNE(
+                left.bits, const_cast<llvm::Value*>(i64_zero));
+            llvm::Value* r_nz = builder.CreateICmpNE(
+                right.bits, const_cast<llvm::Value*>(i64_zero));
+            if (left.is_null == builder.getFalse() &&
+                right.is_null == builder.getFalse()) {
+              res = {.bits =
+                         builder.CreateZExt(builder.CreateOr(l_nz, r_nz), i64),
+                     .is_null = builder.getFalse()};
+            } else {
+              llvm::Value* lt =
+                  builder.CreateAnd(builder.CreateNot(left.is_null), l_nz);
+              llvm::Value* rt =
+                  builder.CreateAnd(builder.CreateNot(right.is_null), r_nz);
+              llvm::Value* res_true = builder.CreateOr(lt, rt);
+              res = {.bits = builder.CreateZExt(res_true, i64),
+                     .is_null = builder.CreateAnd(builder.CreateNot(res_true),
+                                                  either_null)};
+            }
             break;
           }
           case BinaryOperation::kXor: {
@@ -3382,17 +3448,38 @@ bool JitBranchlessProgram::ProveOverflowFree(
         break;
       case BytecodeOp::kJumpIfFalse:
       case BytecodeOp::kJumpIfTrue: {
-        std::vector<AbstractSlot> taken = stk;
-        const int64_t norm = inst.opcode == BytecodeOp::kJumpIfTrue ? 1 : 0;
-        taken.back() = {.may_be_nonnull = true,
-                        .may_be_null = false,
-                        .lo = norm,
-                        .hi = norm};
-        edges.push_back({.target = pc + static_cast<size_t>(inst.jump_target),
-                         .may_be_active = true,
-                         .stk = std::move(taken)});
-        edges.push_back(
-            {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
+        // Lean proof:
+        //   lean/TinylambOpt/ResearchProofs/JitFrontiers/RelationalGuards/
+        //     (Goal_CorrelatedSub_DeadEdge, Goal_CorrelatedSub_OmitOverflow)
+        // Prune statically unreachable jump/fallthrough edges so dead fallible
+        // branches do not block the unchecked `nsw` SIMD fast path.
+        const AbstractSlot& top = stk.back();
+        const bool may_be_true =
+            top.may_be_nonnull && (top.lo != 0 || top.hi != 0);
+        const bool may_be_false =
+            top.may_be_nonnull && (top.lo <= 0 && 0 <= top.hi);
+        const bool may_jump =
+            inst.opcode == BytecodeOp::kJumpIfTrue ? may_be_true : may_be_false;
+        const bool may_fall =
+            top.may_be_null || (inst.opcode == BytecodeOp::kJumpIfTrue
+                                    ? may_be_false
+                                    : may_be_true);
+        if (may_jump) {
+          std::vector<AbstractSlot> taken = stk;
+          const int64_t norm = inst.opcode == BytecodeOp::kJumpIfTrue ? 1 : 0;
+          taken.back() = {.may_be_nonnull = true,
+                          .may_be_null = false,
+                          .lo = norm,
+                          .hi = norm};
+          edges.push_back(
+              {.target = pc + static_cast<size_t>(inst.jump_target),
+               .may_be_active = true,
+               .stk = std::move(taken)});
+        }
+        if (may_fall) {
+          edges.push_back(
+              {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
+        }
         break;
       }
       case BytecodeOp::kJumpIfNotNull: {
@@ -3452,13 +3539,25 @@ bool JitBranchlessProgram::ProveOverflowFree(
           }
         } else if (inst.unary == UnaryOperation::kNot) {
           if (child.may_be_nonnull) {
+            const bool always_zero = (child.lo == 0 && child.hi == 0);
+            const bool always_nonzero = (child.lo > 0 || child.hi < 0);
             stk.back() = {.may_be_nonnull = true,
                           .may_be_null = child.may_be_null,
-                          .lo = 0,
-                          .hi = 1};
+                          .lo = always_zero ? 1 : 0,
+                          .hi = always_nonzero ? 0 : 1};
           }
+        } else if (inst.unary == UnaryOperation::kIsNull) {
+          stk.back() = {.may_be_nonnull = true,
+                        .may_be_null = false,
+                        .lo = child.may_be_nonnull ? 0 : 1,
+                        .hi = child.may_be_null ? 1 : 0};
+        } else if (inst.unary == UnaryOperation::kIsNotNull) {
+          stk.back() = {.may_be_nonnull = true,
+                        .may_be_null = false,
+                        .lo = child.may_be_null ? 0 : 1,
+                        .hi = child.may_be_nonnull ? 1 : 0};
         } else {
-          // IS [NOT] NULL/TRUE/FALSE: always non-null boolean [0, 1].
+          // IS [NOT] TRUE/FALSE: always non-null boolean [0, 1].
           stk.back() = {
               .may_be_nonnull = true, .may_be_null = false, .lo = 0, .hi = 1};
         }
@@ -3551,6 +3650,59 @@ bool JitBranchlessProgram::ProveOverflowFree(
               res = {.may_be_nonnull = false, .may_be_null = true};
             }
             break;
+          case BinaryOperation::kEquals:
+          case BinaryOperation::kNotEquals:
+          case BinaryOperation::kLessThan:
+          case BinaryOperation::kLessThanEquals:
+          case BinaryOperation::kGreaterThan:
+          case BinaryOperation::kGreaterThanEquals: {
+            // Lean proof:
+            //   lean/TinylambOpt/ResearchProofs/JitFrontiers/RelationalGuards/
+            //     (Goal_CorrelatedSub_FoldCompare, Goal_CorrelatedSub_DeadEdge)
+            // Fold comparisons whose intervals statically prove constant 0 or 1
+            // so downstream kJumpIfFalse/True prunes dead fallible branches.
+            if (!both_nonnull) {
+              res = {.may_be_nonnull = false, .may_be_null = true};
+            } else {
+              bool always_true = false;
+              bool always_false = false;
+              switch (inst.binary) {
+                case BinaryOperation::kEquals:
+                  always_true = (left.lo == left.hi && right.lo == right.hi &&
+                                 left.lo == right.lo);
+                  always_false = (left.hi < right.lo || right.hi < left.lo);
+                  break;
+                case BinaryOperation::kNotEquals:
+                  always_true = (left.hi < right.lo || right.hi < left.lo);
+                  always_false = (left.lo == left.hi && right.lo == right.hi &&
+                                  left.lo == right.lo);
+                  break;
+                case BinaryOperation::kLessThan:
+                  always_true = (left.hi < right.lo);
+                  always_false = (left.lo >= right.hi);
+                  break;
+                case BinaryOperation::kLessThanEquals:
+                  always_true = (left.hi <= right.lo);
+                  always_false = (left.lo > right.hi);
+                  break;
+                case BinaryOperation::kGreaterThan:
+                  always_true = (left.lo > right.hi);
+                  always_false = (left.hi <= right.lo);
+                  break;
+                case BinaryOperation::kGreaterThanEquals:
+                  always_true = (left.lo >= right.hi);
+                  always_false = (left.hi < right.lo);
+                  break;
+                default:
+                  break;
+              }
+              res = {.may_be_nonnull = true,
+                     .may_be_null = res_may_null,
+                     .lo = always_true ? 1 : 0,
+                     .hi = always_false ? 0 : 1};
+            }
+            break;
+          }
           case BinaryOperation::kIsDistinctFrom:
           case BinaryOperation::kIsNotDistinctFrom:
             res = {
@@ -3570,10 +3722,18 @@ bool JitBranchlessProgram::ProveOverflowFree(
       }
       case BytecodeOp::kInt64InRange: {
         const AbstractSlot child = stk.back();
-        stk.back() = {.may_be_nonnull = true,
-                      .may_be_null = child.may_be_null,
-                      .lo = 0,
-                      .hi = 1};
+        const Int64RangeSpec& rspec = spec.int64_ranges[inst.operand];
+        if (!child.may_be_nonnull) {
+          stk.back() = {.may_be_nonnull = false, .may_be_null = true};
+        } else {
+          const bool always_in =
+              (child.lo >= rspec.lo && child.hi <= rspec.hi);
+          const bool always_out = (child.hi < rspec.lo || child.lo > rspec.hi);
+          stk.back() = {.may_be_nonnull = true,
+                        .may_be_null = child.may_be_null,
+                        .lo = always_in ? 1 : 0,
+                        .hi = always_out ? 0 : 1};
+        }
         edges.push_back(
             {.target = pc + 1, .may_be_active = true, .stk = std::move(stk)});
         break;
@@ -3621,6 +3781,27 @@ bool JitBranchlessProgram::ProveOverflowFree(
   return true;
 }
 
+namespace {
+
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/VectorMemory/
+//     (ForwardCopy.DisjointDistance)
+// Verifies two half-open byte intervals `[a, a + a_bytes)` and
+// `[b, b + b_bytes)` are disjoint so LLVM `noalias` preconditions hold.
+bool ByteSpansOverlap(const void* a, size_t a_bytes, const void* b,
+                      size_t b_bytes) noexcept {
+  if (a == nullptr || b == nullptr || a_bytes == 0 || b_bytes == 0) {
+    return false;
+  }
+  const auto a0 = reinterpret_cast<uintptr_t>(a);
+  const auto b0 = reinterpret_cast<uintptr_t>(b);
+  const uintptr_t a1 = a0 + a_bytes;
+  const uintptr_t b1 = b0 + b_bytes;
+  return a0 < b1 && b0 < a1;
+}
+
+}  // namespace
+
 TINYLAMB_JIT_CALL_BOUNDARY
 bool JitBranchlessProgram::Evaluate(std::span<const JitColumnInput> columns,
                                     size_t count, int64_t* out_values,
@@ -3637,6 +3818,16 @@ bool JitBranchlessProgram::Evaluate(std::span<const JitColumnInput> columns,
       *out_used_unchecked = true;
     }
     return true;
+  }
+  const size_t val_bytes = count * sizeof(int64_t);
+  for (const JitColumnInput& col : columns) {
+    if (ByteSpansOverlap(col.values, val_bytes, out_values, val_bytes) ||
+        ByteSpansOverlap(col.values, val_bytes, out_nulls, count) ||
+        (col.has_nulls &&
+         (ByteSpansOverlap(col.nulls, count, out_values, val_bytes) ||
+          ByteSpansOverlap(col.nulls, count, out_nulls, count)))) {
+      return false;
+    }
   }
 
   const size_t k = columns.size();
@@ -3711,6 +3902,14 @@ bool JitBranchlessProgram::Filter(std::span<const JitColumnInput> columns,
     }
     return true;
   }
+  const size_t val_bytes = count * sizeof(int64_t);
+  for (const JitColumnInput& col : columns) {
+    if (ByteSpansOverlap(col.values, val_bytes, out_keep, count) ||
+        (col.has_nulls &&
+         ByteSpansOverlap(col.nulls, count, out_keep, count))) {
+      return false;
+    }
+  }
 
   const size_t k = columns.size();
   bool any_input_nulls = false;
@@ -3758,6 +3957,81 @@ bool JitBranchlessProgram::Filter(std::span<const JitColumnInput> columns,
     }
     offset += slice;
   }
+  return true;
+}
+
+TINYLAMB_JIT_CALL_BOUNDARY
+bool JitBranchlessProgram::FilterFirstMatch(
+    std::span<const JitColumnInput> columns, size_t count,
+    size_t* out_match_row, bool* out_used_unchecked) const {
+  if (!impl_ || columns.size() != impl_->spec.referenced_columns.size() ||
+      out_match_row == nullptr) {
+    return false;
+  }
+  if (count == 0) {
+    *out_match_row = 0;
+    if (out_used_unchecked != nullptr) {
+      *out_used_unchecked = true;
+    }
+    return true;
+  }
+
+  const size_t k = columns.size();
+  bool any_input_nulls = false;
+  for (const JitColumnInput& col : columns) {
+    if (col.has_nulls) {
+      any_input_nulls = true;
+      break;
+    }
+  }
+  const bool unchecked = ProveOverflowFree(columns);
+  if (out_used_unchecked != nullptr) {
+    *out_used_unchecked = unchecked;
+  }
+
+  const Impl::FilterFn fn =
+      any_input_nulls
+          ? (unchecked ? impl_->filter_nullable_unchecked
+                       : impl_->filter_nullable_checked)
+          : (unchecked ? impl_->filter_nonnull_unchecked
+                       : impl_->filter_nonnull_checked);
+
+  std::array<const int64_t*, kMaxJitReferencedColumns> val_ptrs{};
+  std::array<const uint8_t*, kMaxJitReferencedColumns> null_ptrs{};
+  constexpr size_t kBallotLanes = 64;
+  std::array<uint8_t, kBallotLanes> keep_buf{};
+
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/PredicateBallots_All.lean
+  //     (LimitBeforeFault, TrapBallot, MaskedTruth)
+  // Process 64-lane ballot slices sequentially: a fault in a slice before an
+  // earlier confirmed match bails out cleanly so scalar evaluation picks the
+  // exact earliest event (match vs fault).
+  size_t offset = 0;
+  while (offset < count) {
+    const size_t slice = std::min(count - offset, kBallotLanes);
+    for (size_t u = 0; u < k; ++u) {
+      val_ptrs[u] = columns[u].values + offset;
+      if (any_input_nulls) {
+        null_ptrs[u] = columns[u].has_nulls ? (columns[u].nulls + offset)
+                                            : kZeroNullSlice.data();
+      }
+    }
+    uint8_t slice_err = 0;
+    fn(val_ptrs.data(), any_input_nulls ? null_ptrs.data() : nullptr,
+       static_cast<uint64_t>(slice), keep_buf.data(), &slice_err);
+    if (slice_err != 0) {
+      return false;
+    }
+    for (size_t i = 0; i < slice; ++i) {
+      if (keep_buf[i] != 0) {
+        *out_match_row = offset + i;
+        return true;
+      }
+    }
+    offset += slice;
+  }
+  *out_match_row = count;
   return true;
 }
 
@@ -5065,18 +5339,19 @@ JitPacked2x32RadixDedup::CompileOpenAddrDedup() {
     b.CreateCondBr(b.CreateICmpEQ(hk, k), latch, next_slot);
 
     b.SetInsertPoint(next_slot);
-    // max_load must bound the probe even when every visited slot carries
-    // cur_gen: a generation-only full table otherwise loops forever.
+    // Lean proof:
+    //   lean/TinylambOpt/ResearchProofs/JitFrontiers/BailoutState/
+    //     (Goal_CountRows_FullTableHit, Goal_CountRows_BailReason,
+    //      Goal_CountRows_RestartRow)
+    // At capacity (occ_phi == max_load), probing an existing key must NOT
+    // spuriously bail out on a hash collision; stop only if the linear probe
+    // wraps all the way back to init_slot (table completely full of cur_gen).
+    auto* next_s = b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask);
+    auto* wrapped = b.CreateICmpEQ(next_s, init_slot);
     full_preds.emplace_back(i_phi, next_slot);
     full_occ_preds.emplace_back(occ_phi, next_slot);
-    auto* has_room = b.CreateICmpULT(occ_phi, max_load);
-    auto* advance_slot = mk(".advance_slot");
-    b.CreateCondBr(has_room, advance_slot, full_exit);
-    b.SetInsertPoint(advance_slot);
-    slot_phi->addIncoming(
-        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask),
-        advance_slot);
-    b.CreateBr(probe_hdr);
+    slot_phi->addIncoming(next_s, next_slot);
+    b.CreateCondBr(wrapped, full_exit, probe_hdr);
 
     b.SetInsertPoint(latch);
     auto* occ_next = b.CreatePHI(i32, 2);
@@ -5314,9 +5589,18 @@ std::optional<JitRadixKeyDoubleAgg> JitRadixKeyDoubleAgg::Compile(
     b.CreateCondBr(b.CreateICmpEQ(hk, k), check_valid, next_slot);
 
     b.SetInsertPoint(next_slot);
-    slot_phi->addIncoming(
-        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask), next_slot);
-    b.CreateBr(probe_hdr);
+    // Lean proof:
+    //   lean/TinylambOpt/ResearchProofs/JitFrontiers/BailoutState/
+    //     (Goal_SumValid_FullTableHit, Goal_SumValid_BailReason)
+    // Guarantee probe termination even if max_load == ht_mask + 1 while still
+    // allowing existing-key hits at capacity without spurious resize.
+    auto* next_slot_idx =
+        b.CreateAnd(b.CreateAdd(slot_phi, b.getInt64(1)), ht_mask);
+    auto* wrapped = b.CreateICmpEQ(next_slot_idx, init_slot);
+    full_preds.emplace_back(i_phi, next_slot);
+    full_occ_preds.emplace_back(occ_phi, next_slot);
+    slot_phi->addIncoming(next_slot_idx, next_slot);
+    b.CreateCondBr(wrapped, full_exit, probe_hdr);
 
     b.SetInsertPoint(check_valid);
     auto* occ_cur = b.CreatePHI(i32, 2);

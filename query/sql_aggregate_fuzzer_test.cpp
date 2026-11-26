@@ -101,6 +101,7 @@ TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {
        {"NULL,|1|,NULL,", "|1|,|1|,|1|,"}},
       {"SELECT u, ROW_NUMBER() OVER (PARTITION BY b ORDER BY u) FROM t;",
        {"|0|,|1|,", "|1|,|1|,"}},
+      {"SELECT ANY_VALUE(b) FROM t;", {"|ANY{-2;3;}|,"}},
   };
   const std::string text =
       SerializeAggregateTest(5, trace, "synthetic for pipeline test");
@@ -112,6 +113,9 @@ TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {
   EXPECT_EQ(parsed, trace);
   EXPECT_EQ(ReplayAggregateTrace(parsed), "") << "honest trace mismatched";
 
+  auto outside_group = trace;
+  outside_group.queries.back().expected = {"|ANY{1;2;}|,"};
+  EXPECT_NE(ReplayAggregateTrace(outside_group), "");
   AggTrace broken = trace;
   broken.queries[1].expected = {"|0|,|9|,", "|1|,|9|,"};
   const std::string broken_text = SerializeAggregateTest(6, broken, "");

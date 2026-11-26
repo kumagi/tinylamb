@@ -241,28 +241,35 @@ bool SameGroup(const std::vector<SortKeyOrder>& orders, const Row& left,
 
 // ===================================================== AggregateGroupTable ===
 
-StatusOr<size_t> AggregateGroupTable::StateIndex(size_t group, size_t index) const {
+StatusOr<size_t> AggregateGroupTable::StateIndex(size_t group,
+                                                 size_t index) const {
   const size_t count = AggregateCount();
   if (group >= keys_.size() || index >= count || index >= aggregates_->size() ||
       group > (std::numeric_limits<size_t>::max() - index) / count) {
-    return StatusError(StatusCode::kInvalidArgument, "aggregate state index out of range");
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate state index out of range");
   }
-  if ((*aggregates_)[index] == nullptr) { return StatusError(StatusCode::kInvalidArgument, "empty aggregate slot");
-}
+  if ((*aggregates_)[index] == nullptr) {
+    return StatusError(StatusCode::kInvalidArgument, "empty aggregate slot");
+  }
   const size_t flat = (group * count) + index;
   const size_t block = flat / kStateBlockElements;
-  if (block >= states_.size() || flat % kStateBlockElements >= states_[block]->size()) {
-    return StatusError(StatusCode::kCorrupt, "aggregate state block is incomplete");
+  if (block >= states_.size() ||
+      flat % kStateBlockElements >= states_[block]->size()) {
+    return StatusError(StatusCode::kCorrupt,
+                       "aggregate state block is incomplete");
   }
   return flat;
 }
 
-StatusOr<relational_detail::AggregateAccumulator*> AggregateGroupTable::StateFor(size_t group, size_t index) {
+StatusOr<relational_detail::AggregateAccumulator*>
+AggregateGroupTable::StateFor(size_t group, size_t index) {
   ASSIGN_OR_RETURN(size_t, flat, StateIndex(group, index));
   return &(*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
 }
 
-StatusOr<const relational_detail::AggregateAccumulator*> AggregateGroupTable::StateFor(size_t group, size_t index) const {
+StatusOr<const relational_detail::AggregateAccumulator*>
+AggregateGroupTable::StateFor(size_t group, size_t index) const {
   ASSIGN_OR_RETURN(size_t, flat, StateIndex(group, index));
   return &(*states_[flat / kStateBlockElements])[flat % kStateBlockElements];
 }
@@ -274,9 +281,8 @@ Status AggregateGroupTable::CheckAggregateList() {
     return Status::kSuccess;
   }
   if (aggregate_count_ != count) {
-    return StatusError(
-        StatusCode::kRuntimeError,
-        "aggregate list resized after the group table started");
+    return StatusError(StatusCode::kRuntimeError,
+                       "aggregate list resized after the group table started");
   }
   return Status::kSuccess;
 }
@@ -320,15 +326,26 @@ StatusOr<size_t> AggregateGroupTable::FindOrCreate(Row key) {
 }
 
 Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
-  RETURN_IF_FAIL(CheckAggregateList());
-  if (group >= keys_.size()) { return StatusError(StatusCode::kInvalidArgument, "aggregate group index out of range");
+  return AccumulateExcluding(group, row, std::numeric_limits<size_t>::max());
 }
+
+Status AggregateGroupTable::AccumulateExcluding(size_t group, const Row& row,
+                                                size_t skip_index) {
+  RETURN_IF_FAIL(CheckAggregateList());
+  if (group >= keys_.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate group index out of range");
+  }
   for (size_t i = 0; i < AggregateCount(); ++i) {
+    if (i == skip_index) {
+      continue;
+    }
     const AggregateExpression* aggregate = (*aggregates_)[i];
     if (aggregate == nullptr) {
       continue;
     }
-    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, StateFor(group, i));
+    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
+                     StateFor(group, i));
     if (state->IsDone()) {
       continue;
     }
@@ -381,8 +398,10 @@ Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
 
 StatusOr<Row> AggregateGroupTable::Finish(size_t group) {
   RETURN_IF_FAIL(CheckAggregateList());
-  if (group >= keys_.size()) { return StatusError(StatusCode::kInvalidArgument, "aggregate group index out of range");
-}
+  if (group >= keys_.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate group index out of range");
+  }
   const Row& key = Key(group);
   std::vector<Value> values;
   values.reserve(key.values_.size() + AggregateCount());
@@ -394,7 +413,8 @@ StatusOr<Row> AggregateGroupTable::Finish(size_t group) {
       values.emplace_back();
       continue;
     }
-    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, StateFor(group, i));
+    ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
+                     StateFor(group, i));
     ASSIGN_OR_RETURN(Value, finished, state->TryFinish());
     values.push_back(std::move(finished));
   }
@@ -403,8 +423,10 @@ StatusOr<Row> AggregateGroupTable::Finish(size_t group) {
 
 Status AggregateGroupTable::Merge(const AggregateGroupTable& other) {
   RETURN_IF_FAIL(CheckAggregateList());
-  if (AggregateCount() != other.AggregateCount() || other.AggregateCount() != other.aggregates_->size()) {
-    return StatusError(StatusCode::kInvalidArgument, "aggregate shapes differ during merge");
+  if (AggregateCount() != other.AggregateCount() ||
+      other.AggregateCount() != other.aggregates_->size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate shapes differ during merge");
   }
   for (size_t group = 0; group < other.keys_.size(); ++group) {
     const Row& other_key = other.Key(group);
@@ -418,8 +440,10 @@ Status AggregateGroupTable::Merge(const AggregateGroupTable& other) {
       if ((*aggregates_)[i] == nullptr) {
         continue;
       }
-      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, target_state, StateFor(target, i));
-      ASSIGN_OR_RETURN(const relational_detail::AggregateAccumulator*, source_state, other.StateFor(group, i));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, target_state,
+                       StateFor(target, i));
+      ASSIGN_OR_RETURN(const relational_detail::AggregateAccumulator*,
+                       source_state, other.StateFor(group, i));
       RETURN_IF_FAIL(target_state->Merge(*source_state));
     }
   }
@@ -622,7 +646,8 @@ Status HashAggregateExecutor::AccumulatePositional(AggregateGroupTable* table,
         }
         value = image[value_offset.value()];
       }
-      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state, table->StateFor(group, i));
+      ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
+                       table->StateFor(group, i));
       RETURN_IF_FAIL(state->Add(value));
     }
   }
@@ -799,8 +824,9 @@ Status HashAggregateExecutor::BuildParallel() {
     }
   }
   threads.clear();
-  peak_groups_.store(*std::max_element(worker_peaks.begin(), worker_peaks.end()),
-                     std::memory_order_relaxed);
+  peak_groups_.store(
+      *std::max_element(worker_peaks.begin(), worker_peaks.end()),
+      std::memory_order_relaxed);
   if (error == Status::kSuccess && child_->GetStatus() != Status::kSuccess) {
     error = child_->GetStatus();
   }

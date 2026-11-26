@@ -164,7 +164,7 @@ ARRAY<STRUCT<id INT64, x INT64, y INT64, z INT64>>[
 SELECT id, f * 0.0 AS z FROM arithmetic_input ORDER BY id
 --
 ARRAY<STRUCT<id INT64, z FLOAT64>>[
-  {1, 0}, {2, 0}, {3, NULL}
+  {1, 0}, {2, -0}, {3, NULL}
 ]
 ==
 

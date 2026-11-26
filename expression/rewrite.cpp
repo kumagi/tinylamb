@@ -468,7 +468,12 @@ TryResolveSchemaBoundNonThrowingType(  // NOLINT(misc-no-recursion)
         case UnaryOperation::kIsNotTrue:
         case UnaryOperation::kIsFalse:
         case UnaryOperation::kIsNotFalse:
-          if (ct->type == ValueType::kInt64 || ct->type == ValueType::kNull) {
+          // T3698: TryEvaluateUnary rejects any INT64 outside {0, 1} with
+          // "IS TRUE/FALSE requires a BOOL operand". Because the engine
+          // carries BOOL as kInt64 without a distinct schema ValueType, only a
+          // NULL operand (or a constant already evaluated above) is statically
+          // guaranteed not to throw.
+          if (ct->type == ValueType::kNull) {
             return SchemaBoundExprType{.type = ValueType::kInt64};
           }
           return std::nullopt;
@@ -1161,6 +1166,18 @@ bool StaticallyNonBoolean(const Expression& expression) {
       return true;
     }
   }
+  if (expression->Type() == TypeTag::kCaseExp) {
+    const auto& c = expression->AsCaseExpression();
+    for (const auto& [cond, result] : c.when_clauses_) {
+      (void)cond;
+      if (StaticallyNonBoolean(result)) {
+        return true;
+      }
+    }
+    if (c.else_clause_ && StaticallyNonBoolean(c.else_clause_)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -1436,6 +1453,24 @@ bool SideCanBeDouble(const Expression& side, const Schema& schema) {
     return false;
   }
 }
+
+Expression FoldedConstant(const Expression& expression, const Value& value) {
+  if (value.IsNull() && expression) {
+    try {
+      const Schema empty;
+      const Schema& schema =
+          ActiveRewriteSchema() != nullptr ? *ActiveRewriteSchema() : empty;
+      if (expression->ResultType(schema).GetType() == TypeTag::kDouble) {
+        return CastExpressionExp(ConstantValueExp(Value()), "FLOAT64");
+      }
+    } catch (const std::exception& e) {
+      // Unresolved column references have no static type; fall back to plain
+      // NULL constant below.
+      (void)e;
+    }
+  }
+  return ConstantValueExp(value);
+}
 }  // namespace
 
 const ExpressionRuleSet& ExpressionRuleSet::Default() {
@@ -1457,7 +1492,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
 
               folded.HasValue()) {
-            return ConstantValueExp(folded.MoveValue());
+            return FoldedConstant(expression, folded.MoveValue());
           }
 
           return Expression{};
@@ -1473,7 +1508,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
 
               folded.HasValue()) {
-            return ConstantValueExp(folded.MoveValue());
+            return FoldedConstant(expression, folded.MoveValue());
           }
 
           return Expression{};
@@ -1522,7 +1557,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (StatusOr<Value> folded = expression->TryEvaluate(Row(), Schema());
 
               folded.HasValue()) {
-            return ConstantValueExp(folded.MoveValue());
+            return FoldedConstant(expression, folded.MoveValue());
           }
 
           return Expression{};
@@ -1681,10 +1716,29 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!changed) {
             return Expression{};
           }
-          if (clauses.empty()) {
-            return otherwise ? otherwise : ConstantValueExp(Value());
+          const Schema empty_schema;
+          const Schema& type_schema = ActiveRewriteSchema() != nullptr
+                                          ? *ActiveRewriteSchema()
+                                          : empty_schema;
+          auto safe_is_double = [&](const Expression& e) -> bool {
+            if (!e) {
+              return false;
+            }
+            try {
+              return e->ResultType(type_schema).GetType() == TypeTag::kDouble;
+            } catch (...) {
+              return false;
+            }
+          };
+          const bool orig_is_double = safe_is_double(expression);
+          Expression simplified =
+              clauses.empty()
+                  ? (otherwise ? otherwise : ConstantValueExp(Value()))
+                  : CaseExpressionExp(std::move(clauses), std::move(otherwise));
+          if (orig_is_double && !safe_is_double(simplified)) {
+            simplified = CastExpressionExp(std::move(simplified), "FLOAT64");
           }
-          return CaseExpressionExp(std::move(clauses), std::move(otherwise));
+          return simplified;
         }));
     // Lean proof: lean/TinylambOpt/ThreeValued.lean
     //   (not_comparison_unsound_on_nan)
@@ -3625,10 +3679,20 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!expression) {
             return Expression{};
           }
-          // Unary expression over CASE
+          // Unary expression over CASE.
+          // CaseExpression::TryEvaluate coerces INT64 branches to DOUBLE when
+          // another branch is DOUBLE (CoerceCaseBranch). Pushing type-sensitive
+          // unary ops (-, ~, IS [NOT] TRUE/FALSE) inside CASE bypasses that
+          // promotion (e.g. `IS NOT FALSE (-CASE WHEN i THEN i ELSE d END)`
+          // turns a throwing DOUBLE into a valid BOOL INT64 1, and `-INT64_MIN`
+          // overflows where `-(double)INT64_MIN` does not). Only IS NULL,
+          // IS NOT NULL, and NOT are invariant under INT64 -> DOUBLE coercion.
           if (expression->Type() == TypeTag::kUnaryExp) {
             const auto& unary = expression->AsUnaryExpression();
-            if (unary.Child() && unary.Child()->Type() == TypeTag::kCaseExp) {
+            if (unary.Child() && unary.Child()->Type() == TypeTag::kCaseExp &&
+                (unary.Op() == UnaryOperation::kIsNull ||
+                 unary.Op() == UnaryOperation::kIsNotNull ||
+                 unary.Op() == UnaryOperation::kNot)) {
               const auto& c = unary.Child()->AsCaseExpression();
               std::vector<std::pair<Expression, Expression>> new_whens;
               new_whens.reserve(c.when_clauses_.size());
@@ -3677,7 +3741,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
             }
             if (right && right->Type() == TypeTag::kCaseExp && left &&
                 left->Type() != TypeTag::kCaseExp &&
-                SafeToReduceEvaluationCount(left)) {
+                SafeToReduceEvaluationCount(left) &&
+                ExpressionCannotThrow(left)) {
               const auto& c = right->AsCaseExpression();
               std::vector<std::pair<Expression, Expression>> new_whens;
               new_whens.reserve(c.when_clauses_.size());
@@ -5068,11 +5133,10 @@ bool ContainsNotOfOrderedDoubleComparison(  // NOLINT(misc-no-recursion)
           return true;
         }
       }
-      return std::ranges::any_of(aggregate.InnerGroupBy(),
-                                 [&](const Expression& key) {
-                                   return ContainsNotOfOrderedDoubleComparison(
-                                       key, schema);
-                                 });
+      return std::ranges::any_of(
+          aggregate.InnerGroupBy(), [&](const Expression& key) {
+            return ContainsNotOfOrderedDoubleComparison(key, schema);
+          });
     }
     case TypeTag::kCastExp:
       return ContainsNotOfOrderedDoubleComparison(

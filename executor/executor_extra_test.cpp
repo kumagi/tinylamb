@@ -66,11 +66,27 @@ TEST(ConstantRowsTest, MixedSignednessSurvivesOneRowBatches) {
     DataChunk batch;
     for (const Row& row : rows) {
       ASSERT_EQ(source->NextBatch(&batch, 1), 1U);
+      ASSERT_EQ(batch.ColumnCount(), 1U);
+      EXPECT_EQ(batch.ColumnAt(0).Type(), ValueType::kInt64);
       const Value actual = batch.RowAt(0)[0];
       EXPECT_EQ(actual.IsUnsigned(), row[0].IsUnsigned());
       EXPECT_EQ(actual.AsString(), row[0].AsString());
     }
     EXPECT_EQ(source->NextBatch(&batch, 1), 0U);
+    ASSERT_EQ(batch.ColumnCount(), 1U);
+    EXPECT_EQ(batch.Size(), 0U);
+  }
+}
+
+TEST(ConstantRowsTest, EmptyBatchRetainsHomogeneousColumnType) {
+  const std::vector<Row> rows{Row({Value(int64_t{1}).WithUnsigned()})};
+  const std::array<Executor, 2> sources = {
+      std::make_shared<ConstantExecutor>(rows),
+      std::make_shared<ValuesExecutor>(rows)};
+  for (const auto& source : sources) {
+    DataChunk batch;
+    ASSERT_EQ(source->NextBatch(&batch, 1), 1U);
+    ASSERT_EQ(source->NextBatch(&batch, 1), 0U);
     ASSERT_EQ(batch.ColumnCount(), 1U);
     EXPECT_EQ(batch.ColumnAt(0).Type(), ValueType::kInt64);
   }

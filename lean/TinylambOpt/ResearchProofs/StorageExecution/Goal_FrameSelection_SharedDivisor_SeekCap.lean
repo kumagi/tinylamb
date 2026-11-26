@@ -1,0 +1,48 @@
+import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.Goal_FrameSelection_SharedDivisor_SeekCap
+
+open TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
+open TinylambOpt.ResearchGoals.StorageExecution.FrameSelection.SharedDivisor
+
+private theorem min?_some_le_of_mem {l : List Nat} {s : Nat} (hs : s ∈ l) :
+    ∃ t, l.min? = some t ∧ t ≤ s := by
+  cases l with
+  | nil => simp at hs
+  | cons x xs =>
+      let t := xs.min?.elim x (min x)
+      have hmin : (x :: xs).min? = some t := by
+        simp [t]
+      exact ⟨t, hmin, (List.min?_eq_some_iff.mp hmin).2 s hs⟩
+
+theorem sound_SeekCap : SeekCap.Goal := by
+  unfold SeekCap.Goal seekCap
+  intro xs a b s hab hbud
+  unfold budget at hbud
+  have hs_mem : s ∈
+      (((parts xs).filter (fun ps => ps.all (fun p => p.length ≤ a))).map (charge write 0)) :=
+    List.min?_mem hbud
+  rcases List.mem_map.mp hs_mem with ⟨ps, hpsA, hcharge⟩
+  have hpsA' : ps ∈ (parts xs).filter (fun ps => ps.all (fun p => p.length ≤ a)) := by
+    simpa using hpsA
+  rw [List.mem_filter] at hpsA'
+  have hpsA_le : ∀ p ∈ ps, p.length ≤ a := by
+    intro p hp
+    exact of_decide_eq_true ((List.all_eq_true.mp hpsA'.2) p hp)
+  have hpsB : ps ∈ (parts xs).filter (fun ps => ps.all (fun p => p.length ≤ b)) := by
+    rw [List.mem_filter]
+    refine ⟨hpsA'.1, ?_⟩
+    apply List.all_eq_true.mpr
+    intro p hp
+    exact decide_eq_true (Nat.le_trans (hpsA_le p hp) hab)
+  have hs_mem_B : s ∈
+      (((parts xs).filter (fun ps => ps.all (fun p => p.length ≤ b))).map (charge write 0)) := by
+    exact List.mem_map.mpr ⟨ps, by simpa using hpsB, hcharge⟩
+  rcases min?_some_le_of_mem hs_mem_B with ⟨t, htmin, hts⟩
+  refine ⟨t, hts, ?_⟩
+  simpa [budget] using htmin
+
+end TinylambOpt.ResearchProofs.StorageExecution.Goal_FrameSelection_SharedDivisor_SeekCap

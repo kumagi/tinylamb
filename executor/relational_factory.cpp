@@ -19,9 +19,9 @@
 #include <utility>
 #include <vector>
 
-#include "common/platform/process.hpp"
 #include "common/constants.hpp"
 #include "common/platform/int128_conversion.hpp"
+#include "common/platform/process.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/set_operation.hpp"
 #include "database/transaction_context.hpp"
@@ -279,7 +279,8 @@ Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
   // keeps the streaming serial Selection.
   auto* scan = dynamic_cast<ParallelScan*>(src.get());
   if (scan != nullptr && scan->CanTakeRowFilter() &&
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") ==
+          nullptr &&
       !relational_detail::ContainsQuery(exp_) && BytecodeEnabled()) {
     std::vector<Expression> conjuncts = SplitConjuncts(exp_);
     auto filter = std::make_unique<relational_detail::CompiledScanFilter>(
@@ -308,8 +309,16 @@ Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<LimitExecutor>(src_->EmitExecutor(ctx), limit_count_,
-                                         limit_offset_);
+  Executor src = src_->EmitExecutor(ctx);
+  size_t effective_offset = limit_offset_;
+  if (effective_offset > 0) {
+    if (auto* inc_sort = dynamic_cast<IncrementalSortExecutor*>(src.get());
+        inc_sort != nullptr && inc_sort->TryPushOffset(effective_offset)) {
+      effective_offset = 0;
+    }
+  }
+  return std::make_shared<LimitExecutor>(std::move(src), limit_count_,
+                                         effective_offset);
 }
 
 Executor SamplePlan::EmitExecutor(TransactionContext& ctx) const {
@@ -1179,7 +1188,8 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
   // Read per call like TINYLAMB_DISABLE_PARALLEL_SCAN so interactive A/B and
   // regression tests can toggle the hatch after warm-up.
   const bool parallel_index_scan_disabled =
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") !=
+      nullptr;
   if (!parallel_index_scan_disabled && ascending_ && !lock_rows_ &&
       LimitHint() == std::numeric_limits<size_t>::max() &&
       EmitRowCount() >= kParallelIndexScanMinRows) {

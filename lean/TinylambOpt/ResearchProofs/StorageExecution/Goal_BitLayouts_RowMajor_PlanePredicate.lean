@@ -1,4 +1,4 @@
-import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
+import TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_RowMajor_Nonoverlap
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -8,170 +8,153 @@ namespace TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_RowMajor_P
 open TinylambOpt.ResearchGoals.Compression.Wire
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts.RowMajor
+open TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_RowMajor_Nonoverlap
 
--- One lane insertion step, written with the physical position `i*w+c`.
-private def step (x i w : Nat) (a c : Nat) : Nat :=
-  if x.testBit c then a ||| 2 ^ (i*w+c) else a
+private def step (w i : Nat) (x acc c : Nat) : Nat :=
+  if x.testBit c then acc ||| 2 ^ (i * w + c) else acc
 
-private theorem fold_step_far (acc x i w p : Nat) (ls : List Nat)
-    (hfar : ∀ c ∈ ls, i*w+c ≠ p) :
-    (ls.foldl (step x i w) acc).testBit p = acc.testBit p := by
-  induction ls generalizing acc with
+private def row (w i : Nat) (x acc : Nat) : Nat :=
+  (lanes w).foldl (step w i x) acc
+
+private theorem testBit_fold_step (w i : Nat) (x acc p : Nat) (bs : List Nat) :
+    (bs.foldl (step w i x) acc).testBit p =
+      (acc.testBit p || bs.any (fun b => x.testBit b && decide (i * w + b = p))) := by
+  induction bs generalizing acc with
   | nil => simp
-  | cons c cs ih =>
-      rw [List.foldl_cons]
-      have hcne : i*w+c ≠ p := hfar c (by simp)
-      have hbit : (step x i w acc c).testBit p = acc.testBit p := by
-        by_cases hxc : x.testBit c
-        · simp [step, hxc, Nat.testBit_or, Nat.testBit_two_pow, hcne]
-        · simp [step, hxc]
-      rw [hbit]
-      exact ih acc (by intro d hd; exact hfar d (by simp [hd]))
+  | cons b bs ih =>
+      simp only [List.foldl_cons, List.any_cons]
+      rw [ih]
+      dsimp [step]
+      by_cases hx : x.testBit b
+      · rw [ite_eq_left hx, Nat.testBit_or, Nat.testBit_two_pow]
+        by_cases heq : i * w + b = p
+        · subst heq
+          simp [hx]
+        · simp [hx, heq]
+      · rw [ite_eq_right hx]
+        simp [hx]
 
-private theorem fold_step_self (acc x i w b : Nat) (ls : List Nat)
-    (hmem : b ∈ ls) (hnd : ls.Nodup) :
-    (ls.foldl (step x i w) acc).testBit (i*w+b) =
-      (acc.testBit (i*w+b) || x.testBit b) := by
-  induction ls generalizing acc with
-  | nil => simp at hmem
-  | cons c cs ih =>
-      rw [List.foldl_cons]
-      have hnd' : cs.Nodup := (List.nodup_cons.mp hnd).2
-      have hcnot : c ∉ cs := (List.nodup_cons.mp hnd).1
-      by_cases hcb : c = b
-      · subst c
-        have hbnot : b ∉ cs := hcnot
-        have hfar : ∀ d ∈ cs, i*w+d ≠ i*w+b := by
-          intro d hd heq
-          have hdb : d = b := by omega
-          exact hbnot (by simpa [hdb] using hd)
-        have hbit : (step x i w acc b).testBit (i*w+b) =
-            (acc.testBit (i*w+b) || x.testBit b) := by
-          by_cases hxb : x.testBit b
-          · simp [step, hxb, Nat.testBit_or, Nat.testBit_two_pow]
-          · simp [step, hxb]
-        rw [hbit]
-        rw [fold_step_far (step x i w acc b) x i w (i*w+b) cs hfar]
-      · have hbcs : b ∈ cs := by
-          simp only [List.mem_cons] at hmem
-          rcases hmem with hbc | hbcs
-          · exact False.elim (hcb hbc.symm)
-          · exact hbcs
-        have hbit : (step x i w acc c).testBit (i*w+b) = acc.testBit (i*w+b) := by
-          have hne : i*w+c ≠ i*w+b := by omega
-          by_cases hxc : x.testBit c
-          · simp [step, hxc, Nat.testBit_or, Nat.testBit_two_pow, hne]
-          · simp [step, hxc]
-        rw [hbit]
-        exact ih acc hbcs hnd'
-
-private def row (w i x acc : Nat) : Nat :=
-  (List.range w).foldl (step x i w) acc
-
-private theorem row_bit_self (acc x i w b : Nat) (hb : b < w) :
-    (row w i x acc).testBit (i*w+b) = (acc.testBit (i*w+b) || x.testBit b) := by
+private theorem row_testBit (w i x acc p : Nat) :
+    (row w i x acc).testBit p =
+      (acc.testBit p || (lanes w).any (fun b => x.testBit b && decide (i * w + b = p))) := by
   unfold row
-  exact fold_step_self acc x i w b (List.range w) (List.mem_range.mpr hb) List.nodup_range
+  exact testBit_fold_step w i x acc p (lanes w)
 
-private theorem row_bit_far (acc x i w j b : Nat) (hb : b < w) (hji : j ≠ i) :
-    (row w i x acc).testBit (j*w+b) = acc.testBit (j*w+b) := by
-  unfold row
-  apply fold_step_far
-  intro c hc
-  have hcw : c < w := List.mem_range.mp hc
-  have hwpos : 0 < w := by omega
-  intro heq
-  have hcdiv : (i*w+c)/w = i := by
-    rw [Nat.add_comm, Nat.add_mul_div_right c i hwpos, Nat.div_eq_of_lt hcw, Nat.zero_add]
-  have hbdiv : (j*w+b)/w = j := by
-    rw [Nat.add_comm, Nat.add_mul_div_right b j hwpos, Nat.div_eq_of_lt hb, Nat.zero_add]
-  have hij : i = j := by
-    rw [← hcdiv, ← hbdiv, heq]
-  exact hji hij.symm
+private theorem fold_row_testBit (w : Nat) (l : List (Nat × Nat)) (acc p : Nat) :
+    (l.foldl (fun a q => row w q.2 q.1 a) acc).testBit p =
+      (acc.testBit p ||
+        l.any (fun q => (lanes w).any (fun b => q.1.testBit b && decide (q.2 * w + b = p)))) := by
+  induction l generalizing acc with
+  | nil => simp
+  | cons q qs ih =>
+      simp only [List.foldl_cons, List.any_cons]
+      rw [ih]
+      rw [row_testBit]
+      simp only [Bool.or_assoc]
 
-private def imageFrom (w off : Nat) (acc : Nat) (xs : List Nat) : Nat :=
-  (xs.zipIdx off).foldl (fun a p => row w p.2 p.1 a) acc
+private theorem image_testBit (w : Nat) (xs : List Nat) (p : Nat) :
+    (image layout w xs).testBit p =
+      xs.zipIdx.any
+        (fun q => (lanes w).any (fun b => q.1.testBit b && decide (q.2 * w + b = p))) := by
+  unfold image layout
+  change ((xs.zipIdx).foldl (fun a q => row w q.2 q.1 a) 0).testBit p = _
+  rw [fold_row_testBit]
+  simp
 
-private theorem image_eq_imageFrom (w : Nat) (xs : List Nat) :
-    image layout w xs = imageFrom w 0 0 xs := by
-  rfl
+private theorem rowMajor_nonoverlap : nonoverlap layout := by
+  intro n w i j a b hi hj ha hb
+  exact sound_Nonoverlap n w i j a b hi hj ha hb
 
-private theorem imageFrom_bit (w off i b acc : Nat) (xs : List Nat) (hb : b < w) :
-    (imageFrom w off acc xs).testBit (i*w+b) =
-      if off ≤ i ∧ i < off + xs.length then
-        acc.testBit (i*w+b) || (xs[i-off]?.getD 0).testBit b
-      else acc.testBit (i*w+b) := by
-  induction xs generalizing off acc with
-  | nil =>
-      have hnot : ¬ (off ≤ i ∧ i < off + 0) := by omega
-      simp [imageFrom, hnot]
-  | cons x xs ih =>
-      rw [imageFrom, List.zipIdx_cons, List.foldl_cons]
-      change (imageFrom w (off+1) (row w off x acc) xs).testBit (i*w+b) = _
-      rw [ih (off+1) (row w off x acc)]
-      by_cases hio : i = off
-      · subst i
-        have hnot : ¬ (off+1 ≤ off ∧ off < off+1+xs.length) := by omega
-        simp [hnot, row_bit_self acc x off w b hb]
-      · by_cases hlt : i < off
-        · have hnot1 : ¬ (off ≤ i ∧ i < off + (x::xs).length) := by
-            simp only [List.length_cons]
-            omega
-          have hnot2 : ¬ (off+1 ≤ i ∧ i < off+1 + xs.length) := by omega
-          simp [hnot1, hnot2, row_bit_far acc x off w i b hb hio]
-        · have hgt : off < i := by omega
-          have hcond1 : off ≤ i ∧ i < off + (x::xs).length := by
-            simp only [List.length_cons]
-            omega
-          have hcond2 : off+1 ≤ i ∧ i < off+1 + xs.length := by omega
-          have hidx : i - off = (i - (off+1)) + 1 := by omega
-          simp [hcond1, hcond2, hidx, row_bit_far acc x off w i b hb hio]
+private theorem image_bit_at (w : Nat) (xs : List Nat) (i b : Nat)
+    (hi : i < xs.length) (hb : b < w) :
+    (image layout w xs).testBit (layout.bit xs.length w i b) =
+      (xs[i]?.getD 0).testBit b := by
+  rw [image_testBit]
+  apply Bool.eq_iff_iff.mpr
+  constructor
+  · intro h
+    rw [List.any_eq_true] at h
+    rcases h with ⟨⟨x, j⟩, hjmem, hj⟩
+    rw [List.any_eq_true] at hj
+    rcases hj with ⟨a, ha, hcond⟩
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hcond
+    have haw : a < w := by simpa [lanes] using ha
+    have hjlt : j < xs.length := by
+      have := List.snd_lt_of_mem_zipIdx hjmem
+      simpa [List.length_zipIdx] using this
+    have hxmem : xs[j]? = some x := List.mem_zipIdx_iff_getElem?.mp hjmem
+    have hx : x = xs[j]?.getD 0 := by
+      rw [List.getElem?_eq_getElem hjlt] at hxmem
+      rw [List.getElem?_eq_getElem hjlt]
+      simpa using hxmem.symm
+    have hinj := (rowMajor_nonoverlap xs.length w j i a b hjlt hi haw hb).mp hcond.2
+    obtain ⟨hji, hab⟩ := hinj
+    subst j
+    subst a
+    simpa [hx] using hcond.1
+  · intro h
+    rw [List.any_eq_true]
+    refine ⟨(xs[i]?.getD 0, i), ?_, ?_⟩
+    · rw [List.mem_zipIdx_iff_getElem?]
+      simp [hi]
+    · rw [List.any_eq_true]
+      refine ⟨b, by simp [lanes, hb], ?_⟩
+      simp [h, layout]
 
-private theorem little_byte_bit (v k j r : Nat) (hj : j < k) (hr : r < 8) :
-    (((List.range k).map (fun j => (v / 256^j) % 256))[j]?.getD 0).testBit r =
-      v.testBit (r + 8*j) := by
-  rw [List.getElem?_eq_getElem (by simpa using hj)]
-  simp only [Option.getD_some, List.getElem?_map, List.getElem?_range hj,
-    Option.map_some]
-  have h256 : 256 = 2 ^ 8 := by decide
-  have hpow : 256 ^ j = 2 ^ (8*j) := by rw [h256, Nat.pow_mul]
-  rw [hpow, Nat.testBit_mod_two_pow]
-  simp [hr]
+private theorem atByte_little (n k j : Nat) (hj : j < k) :
+    atByte (little n k) j = (n / 256 ^ j) % 256 := by
+  unfold atByte little
+  have hj' : j < ((List.range k).map (fun i => (n / 256 ^ i) % 256)).length := by
+    simp [List.length_map, List.length_range, hj]
+  rw [List.getElem?_eq_getElem hj']
+  simp
 
+private theorem little_testBit (v k j r : Nat) (hj : j < k) (hr : r < 8) :
+    (atByte (little v k) j).testBit r = v.testBit (8 * j + r) := by
+  rw [atByte_little v k j hj]
+  have h256 : (256 : Nat) = 2 ^ 8 := by decide
+  have hpow : 256 ^ j = 2 ^ (8 * j) := by rw [h256, Nat.pow_mul]
+  rw [hpow, h256, Nat.testBit_mod_two_pow]
+  simp only [hr, decide_true, Bool.true_and]
+  rw [← Nat.testBit_add]
+  congr 1
+  omega
+
+private theorem file_testBit (w : Nat) (xs : List Nat) (j r : Nat)
+    (hj : j < byteCount (layout.capacity xs.length w)) (hr : r < 8) :
+    (atByte (file layout w xs) j).testBit r = (image layout w xs).testBit (j * 8 + r) := by
+  unfold file
+  rw [little_testBit _ _ j r hj hr]
+  congr 1
+  omega
+
+private theorem bit_bound (n w i b : Nat) (hi : i < n) (hb : b < w) :
+    layout.bit n w i b < 8 * byteCount (layout.capacity n w) := by
+  have hbit : i * w + b < n * w := by
+    have hmul : (i + 1) * w ≤ n * w := Nat.mul_le_mul_right w (by omega)
+    rw [Nat.succ_mul] at hmul
+    omega
+  change i * w + b < 8 * byteCount (n * w)
+  unfold byteCount
+  omega
+
+/-- A serialized row-major plane bit is exactly the corresponding source bit. -/
 theorem sound_PlanePredicate : RowMajor.PlanePredicate.Goal := by
   intro w xs b hb
   unfold planeRows
-  dsimp [layout]
-  unfold file
   apply List.filter_congr
   intro i hi
-  simp only [List.mem_range] at hi
-  let v := image layout w xs
-  let p := i*w+b
-  let k := byteCount (xs.length*w)
-  change (atByte (little v k) (p/8)).testBit (p%8) = (xs[i]?.getD 0).testBit b
-  have hp_lt : p < xs.length*w := by
-    have hi' : i + 1 ≤ xs.length := Nat.succ_le_of_lt hi
-    have hmul : (i+1)*w ≤ xs.length*w := Nat.mul_le_mul_right w hi'
-    have hp_le : p < (i+1)*w := by
-      dsimp [p]
-      rw [Nat.succ_mul]
-      omega
-    exact Nat.lt_of_lt_of_le hp_le hmul
-  have hj : p/8 < k := by
-    dsimp [k, byteCount]
+  have hi' : i < xs.length := by simpa using hi
+  let p := layout.bit xs.length w i b
+  change (atByte (file layout w xs) (p / 8)).testBit (p % 8) =
+    (xs[i]?.getD 0).testBit b
+  have hp := bit_bound xs.length w i b hi' hb
+  have hj : p / 8 < byteCount (layout.capacity xs.length w) := by omega
+  rw [file_testBit w xs (p / 8) (p % 8) hj (Nat.mod_lt p (by decide : 0 < 8))]
+  have hdecomp : p / 8 * 8 + p % 8 = p := by
+    have := Nat.div_add_mod p 8
     omega
-  have hbyte : (atByte (little v k) (p/8)).testBit (p%8) =
-      v.testBit ((p%8) + 8*(p/8)) := by
-    unfold atByte little
-    exact little_byte_bit v k (p/8) (p%8) hj (Nat.mod_lt p (by decide : 0 < 8))
-  rw [hbyte]
-  have hdecomp : (p%8) + 8*(p/8) = p := Nat.mod_add_div p 8
   rw [hdecomp]
-  dsimp [p, v]
-  rw [image_eq_imageFrom]
-  have hcond : 0 ≤ i ∧ i < 0 + xs.length := by omega
-  rw [imageFrom_bit w 0 i b 0 xs hb]
-  simp [hcond]
+  exact image_bit_at w xs i b hi' hb
 
 end TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_RowMajor_PlanePredicate

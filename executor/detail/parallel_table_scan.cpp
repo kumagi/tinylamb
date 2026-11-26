@@ -197,26 +197,6 @@ uint32_t SelectIntegerRange(const LSTableColumnBlock& col, uint32_t count,
   return selected;
 }
 
-template <typename Left, typename Right>
-bool ComparePositional(BinaryOperation op, const Left& left,
-                       const Right& right) {
-  switch (op) {
-    case BinaryOperation::kEquals:
-      return left == right;
-    case BinaryOperation::kNotEquals:
-      return left != right;
-    case BinaryOperation::kLessThan:
-      return left < right;
-    case BinaryOperation::kLessThanEquals:
-      return left <= right;
-    case BinaryOperation::kGreaterThan:
-      return left > right;
-    case BinaryOperation::kGreaterThanEquals:
-      return left >= right;
-    default:
-      return false;
-  }
-}
 
 Value ReadLSTableCellValue(const LSTableColumnBlock& col, uint32_t r) {
   if (col.IsNull(r) || col.type == ValueType::kNull) {

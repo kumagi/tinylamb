@@ -11,6 +11,7 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "executor/detail/engine_decisions.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/binary_expression.hpp"
@@ -62,7 +63,8 @@ MergeJoin::MergeJoin(Executor left, std::vector<slot_t> left_columns,
   // The emit path only knows inner/left/right/semi/anti; a null-aware-anti or
   // mark join here would silently fall through to the inner path and emit
   // combined-width rows. Fail loudly, like the relational factory does.
-  // NOLINTBEGIN(readability-simplify-boolean-expr): CHECK_MSG negates condition.
+  // NOLINTBEGIN(readability-simplify-boolean-expr): CHECK_MSG negates
+  // condition.
   CHECK_MSG(kind != JoinKind::kNullAwareAnti && kind != JoinKind::kMark,
             "MergeJoin does not support null-aware anti / mark joins");
   // NOLINTEND(readability-simplify-boolean-expr)
@@ -337,31 +339,76 @@ void MergeJoin::Materialize() {
            CompareKeys(left_rows_[left_index], right_rows_[right_end]) == 0) {
       ++right_end;
     }
-    std::vector<char> matched_left(left_end - left_index, 0);
-    std::vector<char> matched_right(right_end - right_index, 0);
-    for (size_t i = left_index;
-         i < left_end && residual_error_ == Status::kSuccess; ++i) {
-      for (size_t j = right_index;
-           j < right_end && residual_error_ == Status::kSuccess; ++j) {
-        if (!PairPasses(i, j)) {
-          continue;
+    const size_t l_cnt = left_end - left_index;
+    const size_t r_cnt = right_end - right_index;
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/EngineDecisions/Goal_Exec_HotRunTiles.lean
+    // (sound): split large equal-key runs in pair-ordinal tile space and
+    // reconstruct exact outer unmatched left/right indices from surviving hits.
+    if (l_cnt > 0 && r_cnt > 0 && l_cnt <= (SIZE_MAX / r_cnt) &&
+        (l_cnt * r_cnt) >= 4096) {
+      constexpr size_t kTileWidth = 2048;
+      const size_t n_tiles =
+          engine_decisions::HotRunTileCount(l_cnt, r_cnt, kTileWidth);
+      std::vector<std::pair<size_t, size_t>> hits;
+      for (size_t t = 0; t < n_tiles && residual_error_ == Status::kSuccess;
+           ++t) {
+        for (const auto& [li, rj] :
+             engine_decisions::HotRunTilePairs(l_cnt, r_cnt, kTileWidth, t)) {
+          if (residual_error_ != Status::kSuccess) {
+            break;
+          }
+          if (PairPasses(left_index + li, right_index + rj)) {
+            hits.emplace_back(li, rj);
+          }
         }
-        matched_left[i - left_index] = 1;
-        matched_right[j - right_index] = 1;
-        output_.push_back(left_rows_[i] + right_rows_[j]);
       }
-    }
-    if (residual_error_ != Status::kSuccess) {
-      return;
-    }
-    for (size_t i = left_index; i < left_end; ++i) {
-      if (left_outer && matched_left[i - left_index] == 0) {
-        emit_padded_left(i);
+      if (residual_error_ != Status::kSuccess) {
+        return;
       }
-    }
-    for (size_t j = right_index; j < right_end; ++j) {
-      if (right_outer && matched_right[j - right_index] == 0) {
-        emit_padded_right(right_rows_[j]);
+      const engine_decisions::HotRunOuterResult res =
+          engine_decisions::FinishHotRunOuter(l_cnt, r_cnt, hits);
+      for (const auto& [li, rj] : hits) {
+        output_.push_back(left_rows_[left_index + li] +
+                          right_rows_[right_index + rj]);
+      }
+      if (left_outer) {
+        for (const size_t li : res.unmatched_left) {
+          emit_padded_left(left_index + li);
+        }
+      }
+      if (right_outer) {
+        for (const size_t rj : res.unmatched_right) {
+          emit_padded_right(right_rows_[right_index + rj]);
+        }
+      }
+    } else {
+      std::vector<char> matched_left(l_cnt, 0);
+      std::vector<char> matched_right(r_cnt, 0);
+      for (size_t i = left_index;
+           i < left_end && residual_error_ == Status::kSuccess; ++i) {
+        for (size_t j = right_index;
+             j < right_end && residual_error_ == Status::kSuccess; ++j) {
+          if (!PairPasses(i, j)) {
+            continue;
+          }
+          matched_left[i - left_index] = 1;
+          matched_right[j - right_index] = 1;
+          output_.push_back(left_rows_[i] + right_rows_[j]);
+        }
+      }
+      if (residual_error_ != Status::kSuccess) {
+        return;
+      }
+      for (size_t i = left_index; i < left_end; ++i) {
+        if (left_outer && matched_left[i - left_index] == 0) {
+          emit_padded_left(i);
+        }
+      }
+      for (size_t j = right_index; j < right_end; ++j) {
+        if (right_outer && matched_right[j - right_index] == 0) {
+          emit_padded_right(right_rows_[j]);
+        }
       }
     }
     left_index = left_end;

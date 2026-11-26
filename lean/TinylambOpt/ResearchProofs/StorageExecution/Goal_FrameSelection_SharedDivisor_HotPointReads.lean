@@ -1,0 +1,121 @@
+import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.Goal_FrameSelection_SharedDivisor_HotPointReads
+
+open TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
+
+private def objective (f : Writer) (fee price : Nat) (ps : List (List Nat)) : Nat :=
+  charge f fee ps + price * seekWork ps
+
+private theorem parts_ne_nil (xs : List Nat) : parts xs ≠ [] := by
+  induction xs with
+  | nil => simp [parts]
+  | cons x xs ih =>
+      intro h
+      have hall := List.flatMap_eq_nil_iff.mp h
+      cases hp : parts xs with
+      | nil => exact ih hp
+      | cons ps rest =>
+          have hps := hall ps (by simp [hp])
+          cases ps with
+          | nil => simp at hps
+          | cons a rest => simp at hps
+
+private theorem mergeSort_head_min {α : Type} (le : α → α → Bool)
+    (trans : ∀ a b c : α, le a b = true → le b c = true → le a c = true)
+    (total : ∀ a b : α, (le a b || le b a) = true)
+    {l : List α} {a : α} {t : List α} (h : l.mergeSort le = a :: t) :
+    ∀ b ∈ l, le a b = true := by
+  have hs := List.pairwise_mergeSort trans total l
+  rw [h] at hs
+  have hhead : ∀ b ∈ t, le a b = true := (List.pairwise_cons.mp hs).1
+  intro b hb
+  have hb' : b ∈ l.mergeSort le := by simpa using hb
+  rw [h] at hb'
+  simp only [List.mem_cons] at hb'
+  rcases hb' with rfl | hbt
+  · simpa using total b b
+  · exact hhead b hbt
+
+private theorem plan_mem_parts (f : Writer) (fee price : Nat) (xs : List Nat) :
+    plan f fee price xs ∈ parts xs := by
+  let le := fun a b => decide (objective f fee price a ≤ objective f fee price b)
+  change ((parts xs).mergeSort le).head?.getD [] ∈ parts xs
+  cases hm : (parts xs).mergeSort le with
+  | nil =>
+      have hlen := List.length_mergeSort (parts xs) (le := le)
+      rw [hm] at hlen
+      exact (parts_ne_nil xs (List.length_eq_zero_iff.mp hlen.symm)).elim
+  | cons a t =>
+      change a ∈ parts xs
+      have hmem : a ∈ (parts xs).mergeSort le := by
+        rw [hm]
+        exact List.mem_cons_self
+      exact List.mem_mergeSort.mp hmem
+
+private theorem plan_min (f : Writer) (fee price : Nat) (xs : List Nat) (ps : List (List Nat))
+    (hps : ps ∈ parts xs) :
+    objective f fee price (plan f fee price xs) ≤ objective f fee price ps := by
+  let le := fun a b => decide (objective f fee price a ≤ objective f fee price b)
+  have htrans : ∀ a b c : List (List Nat), le a b = true → le b c = true → le a c = true := by
+    intro a b c hab hbc
+    exact decide_eq_true (Nat.le_trans (of_decide_eq_true hab) (of_decide_eq_true hbc))
+  have htotal : ∀ a b : List (List Nat), (le a b || le b a) = true := by
+    intro a b
+    by_cases h : objective f fee price a ≤ objective f fee price b
+    · simp [le, h]
+    · have h' : objective f fee price b ≤ objective f fee price a := Nat.le_of_not_ge h
+      simp [le, h, h']
+  have hne : (parts xs).mergeSort le ≠ [] := by
+    intro hm
+    have hlen := List.length_mergeSort (parts xs) (le := le)
+    rw [hm] at hlen
+    exact parts_ne_nil xs (List.length_eq_zero_iff.mp hlen.symm)
+  cases hm : (parts xs).mergeSort le with
+  | nil => exact (hne hm).elim
+  | cons a t =>
+      have hle := mergeSort_head_min le htrans htotal hm ps hps
+      have hnat : objective f fee price a ≤ objective f fee price ps :=
+        of_decide_eq_true hle
+      change objective f fee price (((parts xs).mergeSort le).head?.getD []) ≤
+        objective f fee price ps
+      rw [hm]
+      exact hnat
+
+private theorem hotPointReads_holds (f : Writer) : hotPointReads f := by
+  intro xs fee p q hpq
+  let A := plan f fee p xs
+  let B := plan f fee q xs
+  have hA : objective f fee p A ≤ objective f fee p B :=
+    plan_min f fee p xs B (plan_mem_parts f fee q xs)
+  have hB : objective f fee q B ≤ objective f fee q A :=
+    plan_min f fee q xs A (plan_mem_parts f fee p xs)
+  change seekWork B ≤ seekWork A
+  apply Nat.le_of_not_gt
+  intro hnot
+  have hBA : seekWork A < seekWork B := by omega
+  have hq : q = p + (q - p) := by omega
+  have hpos : 0 < q - p := by omega
+  have hr : (q - p) * seekWork A < (q - p) * seekWork B :=
+    Nat.mul_lt_mul_of_pos_left hBA hpos
+  have hqB : q * seekWork B = p * seekWork B + (q - p) * seekWork B := by
+    have heq : q * seekWork B = (p + (q - p)) * seekWork B :=
+      congrArg (fun z => z * seekWork B) hq
+    rw [Nat.add_mul] at heq
+    exact heq
+  have hqA : q * seekWork A = p * seekWork A + (q - p) * seekWork A := by
+    have heq : q * seekWork A = (p + (q - p)) * seekWork A :=
+      congrArg (fun z => z * seekWork A) hq
+    rw [Nat.add_mul] at heq
+    exact heq
+  simp only [objective] at hA hB
+  omega
+
+theorem sound_HotPointReads :
+    TinylambOpt.ResearchGoals.StorageExecution.FrameSelection.SharedDivisor.HotPointReads.Goal :=
+  hotPointReads_holds TinylambOpt.ResearchGoals.StorageExecution.FrameSelection.SharedDivisor.write
+
+end TinylambOpt.ResearchProofs.StorageExecution.Goal_FrameSelection_SharedDivisor_HotPointReads

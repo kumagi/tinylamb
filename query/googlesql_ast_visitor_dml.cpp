@@ -668,6 +668,13 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
     const GroupingSetBranchContext context = key_texts.ForBranch(active);
     const std::unordered_set<std::string> inactive_aliases =
         inactive_bare_key_aliases(context);
+    std::unordered_set<std::string> active_aliases;
+    for (const Expression& key : active) {
+      if (key && key->Type() == TypeTag::kColumnValue &&
+          key->AsColumnValue().GetColumnName().schema.empty()) {
+        active_aliases.insert(Lower(key_texts.TextOf(key)));
+      }
+    }
 
     std::vector<NamedExpression> rewritten_list;
     rewritten_list.reserve(base.SelectList().size() + window_inputs.size());
@@ -691,12 +698,17 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
       // differs from the key text (`k`).
       const std::string entry_text = item.expression->ToString();
       const bool entry_is_active =
-          context.active_key_texts.contains(entry_text);
+          context.active_key_texts.contains(entry_text) ||
+          (!item.name.empty() && active_aliases.contains(Lower(item.name)));
       const bool entry_aliases_inactive_key =
           !item.name.empty() && inactive_aliases.contains(Lower(item.name)) &&
           !entry_is_active;
       if (entry_aliases_inactive_key) {
         rewritten_list.emplace_back(entry_name, ConstantValueExp(Value()));
+        continue;
+      }
+      if (entry_is_active) {
+        rewritten_list.emplace_back(entry_name, item.expression);
         continue;
       }
       ASSIGN_OR_RETURN(Expression, rewritten,

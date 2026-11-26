@@ -1,6 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "table/tlcs_compression.hpp"
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -66,6 +67,29 @@ TEST(TlcsCompressionTest, CompactNullsBitmapAndSparseModesRoundTrip) {
   ASSERT_TRUE(
       DecodeCompactNulls(dense, static_cast<uint32_t>(dense.size()), &dec));
   EXPECT_EQ(dec, dense);
+
+  // 5. Wave 11 (BitLayouts.RowMajor.SparseGather + Nullable): sparse gather
+  // matches full decode across raw, bitmap (0x01), sparse-null (0x02), and
+  // sparse-valid (0x03) encodings.
+  const std::vector<uint32_t> probe{0, 1, 5, 10, 499, 500, 900, 998, 999};
+  auto check_gather = [&](const std::vector<uint8_t>& orig) {
+    std::vector<uint8_t> packed;
+    ASSERT_TRUE(TryEncodeCompactNulls(orig, &packed));
+    std::vector<uint8_t> got(probe.size(), 0xFFU);
+    ASSERT_TRUE(GatherCompactNulls(packed, static_cast<uint32_t>(orig.size()),
+                                   probe, got.data()));
+    for (size_t j = 0; j < probe.size(); ++j) {
+      EXPECT_EQ(got[j], orig[probe[j]]) << "probe idx " << j;
+    }
+    // Also verify raw gather.
+    std::vector<uint8_t> got_raw(probe.size(), 0xFFU);
+    ASSERT_TRUE(GatherCompactNulls(orig, static_cast<uint32_t>(orig.size()),
+                                   probe, got_raw.data()));
+    EXPECT_EQ(got_raw, got);
+  };
+  check_gather(dense);
+  check_gather(sparse_nulls);
+  check_gather(sparse_valid);
 }
 
 TEST(TlcsCompressionTest, TemporalText47BitRoundTripAndRandomAccess) {
@@ -79,10 +103,11 @@ TEST(TlcsCompressionTest, TemporalText47BitRoundTripAndRandomAccess) {
       nulls[i] = 1;
       expected.emplace_back();
     } else {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "2013-07-%02u %02u:%02u:%02u+00",
-                    1U + (i % 28U), i % 24U, i % 60U, (i * 7U) % 60U);
-      expected.emplace_back(buf);
+      std::array<char, 32> buf{};
+      (void)std::snprintf(buf.data(), buf.size(),
+                          "2013-07-%02u %02u:%02u:%02u+00", 1U + (i % 28U),
+                          i % 24U, i % 60U, (i * 7U) % 60U);
+      expected.emplace_back(buf.data());
       bytes.insert(bytes.end(), expected.back().begin(), expected.back().end());
     }
     ends.push_back(static_cast<uint32_t>(bytes.size()));
@@ -91,7 +116,8 @@ TEST(TlcsCompressionTest, TemporalText47BitRoundTripAndRandomAccess) {
   std::vector<uint8_t> enc;
   ASSERT_TRUE(TryEncodeTemporalText(bytes, ends, nulls.data(), kRows, &enc));
   EXPECT_EQ(enc.size(), kRows * kTemporalTextPackedBytes);
-  EXPECT_LT(enc.size() * 4, bytes.size() + kRows * 4U);  // > 4x smaller!
+  EXPECT_LT(enc.size() * 4,
+            bytes.size() + (static_cast<size_t>(kRows) * 4U));  // > 4x smaller!
 
   std::vector<char> dec_bytes;
   std::vector<uint32_t> dec_ends;
@@ -137,7 +163,7 @@ TEST(TlcsCompressionTest, VarCharFrontDictRoundTripAndShrinksUrls) {
   std::vector<uint8_t> enc;
   ASSERT_TRUE(
       TryEncodeVarCharFrontDict(bytes, ends, nulls.data(), kRows, &enc));
-  const size_t raw_total = bytes.size() + kRows * sizeof(uint32_t);
+  const size_t raw_total = bytes.size() + (kRows * sizeof(uint32_t));
   EXPECT_LT(enc.size() * 5, raw_total);  // > 5x smaller on URLs!
 
   std::vector<char> dec_bytes;
@@ -160,7 +186,7 @@ TEST(TlcsCompressionTest, BitPackedForWithGcdStrideRoundTrip) {
       ints[i] = 0;
     } else {
       // Stride = 60, range 0..15 steps -> 4 bits/row instead of 2 bytes/row!
-      const int64_t v = -1200 + static_cast<int64_t>(i % 16U) * 60;
+      const int64_t v = -1200 + (static_cast<int64_t>(i % 16U) * 60);
       ints[i] = v;
       mn = std::min(mn, v);
       mx = std::max(mx, v);
@@ -178,17 +204,50 @@ TEST(TlcsCompressionTest, BitPackedForWithGcdStrideRoundTrip) {
       EXPECT_EQ(dec[i], ints[i]) << "row " << i;
     }
   }
+
+  // Wave 8 (BitLayouts.RowMajor.SparseGather): sparse random-access gather
+  // matches full decode across edge positions (0, middle, last) and arbitrary
+  // bit widths (including >56-bit cross-word boundary).
+  const std::vector<uint32_t> sparse_rows{0, 1, 7, 8, 15, 63, 128, 254, 255};
+  std::vector<int64_t> gathered(sparse_rows.size(), 0);
+  ASSERT_TRUE(GatherBitPackedFor(enc, kRows, mn, sparse_rows, gathered.data()));
+  for (size_t j = 0; j < sparse_rows.size(); ++j) {
+    EXPECT_EQ(gathered[j], dec[sparse_rows[j]]) << "sparse idx " << j;
+  }
+
+  // Test wide bit width (bw = 59) where bit_off + bw > 64 crosses 9 bytes.
+  constexpr uint32_t kWideRows = 64;
+  std::vector<int64_t> wide(kWideRows);
+  int64_t w_mn = 0;
+  int64_t w_mx = 0;
+  for (uint32_t i = 0; i < kWideRows; ++i) {
+    wide[i] = (static_cast<int64_t>(i) << 53) + static_cast<int64_t>(i * 17U);
+    w_mx = std::max(w_mx, wide[i]);
+  }
+  std::vector<uint8_t> wide_enc;
+  ASSERT_TRUE(TryEncodeBitPackedFor(wide, nullptr, kWideRows, w_mn, w_mx,
+                                    kWideRows * 8ULL, &wide_enc));
+  std::vector<int64_t> wide_dec(kWideRows, 0);
+  ASSERT_TRUE(DecodeBitPackedFor(wide_enc, kWideRows, w_mn, wide_dec.data()));
+  const std::vector<uint32_t> wide_rows{0, 1, 2, 3, 7, 31, 62, 63};
+  std::vector<int64_t> wide_gathered(wide_rows.size(), 0);
+  ASSERT_TRUE(GatherBitPackedFor(wide_enc, kWideRows, w_mn, wide_rows,
+                                 wide_gathered.data()));
+  for (size_t j = 0; j < wide_rows.size(); ++j) {
+    EXPECT_EQ(wide_gathered[j], wide_dec[wide_rows[j]]) << "wide idx " << j;
+  }
 }
 
 TEST(TlcsCompressionTest, XorDoubleBitExactRoundTrip) {
   constexpr uint32_t kRows = 256;
   std::vector<int64_t> bits(kRows);
-  const double vals[] = {
+  constexpr std::array<double, 8> vals = {
       0.0,   -0.0,  19.95, 19.95,
       19.95, 20.00, 100.5, std::numeric_limits<double>::quiet_NaN()};
   for (uint32_t i = 0; i < kRows; ++i) {
+    const uint32_t bucket = i / 16U;
     const double d =
-        (i < 16) ? vals[i % 8U] : (10.0 + static_cast<double>(i / 16U) * 0.5);
+        (i < 16) ? vals[i % 8U] : (10.0 + (static_cast<double>(bucket) * 0.5));
     std::memcpy(&bits[i], &d, sizeof(double));
   }
   std::vector<uint8_t> enc;
@@ -218,7 +277,7 @@ TEST(TlcsCompressionTest, PhraseTableDpShortestParseAndZstdRoundTrip) {
     }
     ends.push_back(static_cast<uint32_t>(bytes.size()));
   }
-  const size_t raw_total = bytes.size() + kRows * sizeof(uint32_t);
+  const size_t raw_total = bytes.size() + (kRows * sizeof(uint32_t));
 
   // 1. Pure-C++ PhraseTable DP shortest parse.
   std::vector<uint8_t> enc_pt;
@@ -259,17 +318,18 @@ TEST(TlcsCompressionTest, EndToEndTlcsFileShrinksStorageAndMatchesExactly) {
   std::vector<Row> expected;
   expected.reserve(kRows);
   for (int i = 0; i < kRows; ++i) {
-    char ts_buf[32];
-    std::snprintf(ts_buf, sizeof(ts_buf), "2013-07-%02d %02d:%02d:%02d+00",
-                  1 + (i % 28), i % 24, i % 60, (i * 11) % 60);
+    std::array<char, 32> ts_buf{};
+    (void)std::snprintf(ts_buf.data(), ts_buf.size(),
+                        "2013-07-%02d %02d:%02d:%02d+00", 1 + (i % 28), i % 24,
+                        i % 60, (i * 11) % 60);
     std::string url =
         "https://news.example.org/2013/07/article-" + std::to_string(i % 25);
-    expected.emplace_back(
-        std::vector<Value>{Value(int64_t{i * 100}),
-                           (i % 50 == 0) ? Value() : Value(std::string(ts_buf)),
-                           Value(std::move(url)), Value(int64_t{i % 4}),
-                           Value(10.0 + static_cast<double>(i % 5) * 0.25),
-                           Value(std::string("CONSTANT_BLOCK_TAG"))});
+    expected.emplace_back(std::vector<Value>{
+        Value(static_cast<int64_t>(i) * 100),
+        (i % 50 == 0) ? Value() : Value(std::string(ts_buf.data())),
+        Value(std::move(url)), Value(int64_t{i % 4}),
+        Value(10.0 + (static_cast<double>(i % 5) * 0.25)),
+        Value(std::string("CONSTANT_BLOCK_TAG"))});
   }
 
   auto build_and_measure = [&](bool disable_compression,
@@ -289,8 +349,10 @@ TEST(TlcsCompressionTest, EndToEndTlcsFileShrinksStorageAndMatchesExactly) {
       EXPECT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
     }
     if (disable_compression) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       setenv("TINYLAMB_DISABLE_TLCS_COMPRESSION", "1", 1);
     } else {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       unsetenv("TINYLAMB_DISABLE_TLCS_COMPRESSION");
     }
     {
@@ -307,6 +369,7 @@ TEST(TlcsCompressionTest, EndToEndTlcsFileShrinksStorageAndMatchesExactly) {
         }
       }
     }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     unsetenv("TINYLAMB_DISABLE_TLCS_COMPRESSION");
     const std::string tlcs_path =
         prefix + ".db.tlcs." + std::to_string(first_pid);
@@ -316,18 +379,53 @@ TEST(TlcsCompressionTest, EndToEndTlcsFileShrinksStorageAndMatchesExactly) {
   std::vector<Row> scanned;
   const uint64_t comp_size = build_and_measure(false, &scanned);
   const uint64_t raw_size = build_and_measure(true, nullptr);
-  std::fprintf(stderr,
-               "[TlcsCompressionTest] raw_tlcs=%llu B, compressed_tlcs=%llu B "
-               "(%.2fx smaller)\n",
-               static_cast<unsigned long long>(raw_size),
-               static_cast<unsigned long long>(comp_size),
-               static_cast<double>(raw_size) /
-                   static_cast<double>(std::max<uint64_t>(1, comp_size)));
+  (void)std::fprintf(
+      stderr,
+      "[TlcsCompressionTest] raw_tlcs=%llu B, compressed_tlcs=%llu B "
+      "(%.2fx smaller)\n",
+      static_cast<unsigned long long>(raw_size),
+      static_cast<unsigned long long>(comp_size),
+      static_cast<double>(raw_size) /
+          static_cast<double>(std::max<uint64_t>(1, comp_size)));
   EXPECT_LT(comp_size * 2, raw_size)
       << "comp_size=" << comp_size << " raw_size=" << raw_size;
   ASSERT_EQ(scanned.size(), expected.size());
   for (size_t i = 0; i < expected.size(); ++i) {
     ASSERT_EQ(scanned[i], expected[i]) << "mismatch at row " << i;
+  }
+}
+
+TEST(TlcsCompressionTest, ClickBenchLayoutStorageCodecs) {
+  // 1. TieOrientation: Lean #guard example {{"abc"}, {}, {"z", "abd"}} where
+  // reversing group 2 strictly reduces front-coded payload bytes.
+  const std::vector<std::vector<std::string_view>> groups = {
+      {"abc"},
+      {},
+      {"z", "abd"},
+  };
+  const TieOrientationPlan tie_plan = ChooseOptimalTieOrientations(groups);
+  ASSERT_EQ(tie_plan.reversed.size(), groups.size());
+  EXPECT_EQ(tie_plan.reversed[2], 1U);
+  // Forward order ("abc","z","abd"): (2+3)+(2+1)+(2+3) = 13 bytes.
+  // Reversed group 2 ("abc","abd","z"): (2+3)+(2+1)+(2+1) = 11 bytes.
+  EXPECT_EQ(tie_plan.min_bytes, 11U);
+
+  // 2. ClockWindow: Lean #guard example [63, 64, 65], w=2, exc=10 -> base=62
+  // (zigzag(62) = 124 fits in 1 byte, whereas zigzag(64) = 128 takes 2 bytes!).
+  const std::array<int64_t, 3> deltas = {63, 64, 65};
+  const ClockWindowPlan cw = ChooseOptimalClockWindow(deltas, 2U, 10U);
+  EXPECT_EQ(cw.base, 62);
+  EXPECT_EQ(cw.exception_count, 0U);
+
+  // 3. HashExceptions: Lean #guard example [(1,7),(1,8),(2,7),(1,7)].
+  const std::array<uint32_t, 4> codes = {1, 1, 2, 1};
+  const std::array<uint64_t, 4> hashes = {7, 8, 7, 7};
+  const HashExceptionsTable ht = EncodeHashExceptions(codes, hashes);
+  ASSERT_EQ(ht.exceptions.size(), 1U);
+  EXPECT_EQ(ht.exceptions[0].first, 1U);
+  EXPECT_EQ(ht.exceptions[0].second, 8ULL);
+  for (uint32_t i = 0; i < 4; ++i) {
+    EXPECT_EQ(ht.HashAt(i, codes[i]), hashes[i]);
   }
 }
 

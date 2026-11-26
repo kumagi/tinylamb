@@ -221,18 +221,22 @@ void TransactionManager::AddWaitForEdge(txn_id_t waiter, txn_id_t holder,
                                         RowPosition row) {
   {
     std::scoped_lock lk(wait_for_mu_);
+    // Any edge change (insert or overwrite) may complete a cycle the last
+    // analysis pass has not seen. Stamp the edge with its creation generation
+    // so CycleInstant can certify simultaneous wait-cycle existence.
+    const uint64_t next_gen =
+        wait_for_generation_.fetch_add(1, std::memory_order_release) + 1;
     const auto [it, inserted] = wait_for_edges_.try_emplace(
-        waiter, WaitForEdge{.row = row, .holder = holder});
+        waiter,
+        WaitForEdge{.row = row, .holder = holder, .since_gen = next_gen});
     // A waiter may move to a different row/holder while already in the graph.
     // Refresh the fields in place rather than constructing a second edge.
     it->second.row = row;
     it->second.holder = holder;
+    it->second.since_gen = next_gen;
     if (inserted) {
       wait_for_edge_count_.fetch_add(1, std::memory_order_relaxed);
     }
-    // Any edge change (insert or overwrite) may complete a cycle the last
-    // analysis pass has not seen.
-    wait_for_generation_.fetch_add(1, std::memory_order_release);
   }
   // Notify with the cv mutex held so the wake cannot slip between the
   // detector's predicate check and its block (the edge map itself is guarded
@@ -307,10 +311,15 @@ void TransactionManager::DeadlockDetectorLoop() {
   // Reused across passes: the wait-for snapshot and the walk scratch. The
   // detector thread is their only user, so clear() (which keeps the bucket
   // arrays) keeps every pass allocation-free in steady state.
-  std::unordered_map<txn_id_t, txn_id_t> waits_for;
+  struct WaitSnapshotEdge {
+    txn_id_t holder{0};
+    WaitEdgeWindow window{};
+  };
+  std::unordered_map<txn_id_t, WaitSnapshotEdge> waits_for;
   std::unordered_set<txn_id_t> visited;
   std::unordered_set<txn_id_t> already_wounded;
   std::vector<txn_id_t> path;
+  std::vector<WaitEdgeWindow> cycle_windows;
   while (!deadlock_detector_stop_.load(std::memory_order_acquire)) {
     {
       std::unique_lock<std::mutex> lk(deadlock_detector_mu_);
@@ -336,9 +345,14 @@ void TransactionManager::DeadlockDetectorLoop() {
     waits_for.clear();
     {
       std::scoped_lock g(wait_for_mu_);
+      const uint64_t snap_gen =
+          wait_for_generation_.load(std::memory_order_acquire);
       waits_for.reserve(wait_for_edges_.size());
       for (const auto& [w, e] : wait_for_edges_) {
-        waits_for.emplace(w, e.holder);
+        waits_for.emplace(
+            w, WaitSnapshotEdge{.holder = e.holder,
+                                .window = WaitEdgeWindow{.start = e.since_gen,
+                                                         .end = snap_gen}});
       }
     }
     if (waits_for.empty()) {
@@ -373,9 +387,20 @@ void TransactionManager::DeadlockDetectorLoop() {
         if (it == waits_for.end()) {
           break;  // cur is not waiting; no follow-on.
         }
-        cur = it->second;
+        cur = it->second.holder;
       }
       if (!found_cycle) {
+        continue;
+      }
+      cycle_windows.clear();
+      cycle_windows.reserve(path.size());
+      for (const txn_id_t member : path) {
+        const auto wit = waits_for.find(member);
+        if (wit != waits_for.end()) {
+          cycle_windows.push_back(wit->second.window);
+        }
+      }
+      if (!IsSimultaneousWaitCycle(cycle_windows)) {
         continue;
       }
       txn_id_t victim = *std::max_element(path.begin(), path.end());
@@ -403,6 +428,8 @@ void TransactionManager::DeadlockDetectorLoop() {
 
 void TransactionManager::GcWorkerLoop() {
   bool retained_versions = false;
+  mvcc::GcSweepWakeupFence last_fence;
+  bool has_fence = false;
   while (!gc_stop_.load(std::memory_order_acquire)) {
     std::unique_lock<std::mutex> lk(gc_mutex_);
     // Hybrid idle strategy. ForgetTransaction notifies (under this mutex)
@@ -431,11 +458,37 @@ void TransactionManager::GcWorkerLoop() {
     // forever once a write burst gives way to read-only traffic. Retention is
     // deliberately absent from the wait predicate: pinned chains must not
     // turn this into a busy loop.
-    if (commits_since_gc_.exchange(0, std::memory_order_relaxed) == 0 &&
-        !retained_versions) {
+    const uint64_t new_commits =
+        commits_since_gc_.exchange(0, std::memory_order_relaxed);
+    if (new_commits == 0 && !retained_versions) {
       continue;
     }
-    GarbageCollectVersions();
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/EngineDecisions/Goal_MVCC_GcWakeup.lean
+    // (sound): when no new commits landed since the last full sweep (with no
+    // pending writers), skip scanning all 256 shards if neither the oldest
+    // active snapshot nor the WAL durability frontier crossed the wakeup fence.
+    if (new_commits == 0 && has_fence) {
+      uint64_t current_snap = std::numeric_limits<uint64_t>::max();
+      {
+        std::scoped_lock lock(transaction_table_lock);
+        for (const auto& [id, snapshot] : active_snapshots_) {
+          (void)id;
+          current_snap = std::min(current_snap, snapshot);
+        }
+      }
+      const lsn_t current_durable = logger_ == nullptr
+                                        ? std::numeric_limits<lsn_t>::max()
+                                        : logger_->DurableLSN();
+      if (!last_fence.MayReleaseAt(current_snap, current_durable)) {
+        continue;
+      }
+    }
+    mvcc::GcSweepWakeupFence next_fence;
+    bool next_fence_valid = false;
+    GarbageCollectVersions(&next_fence, &next_fence_valid);
+    last_fence = next_fence;
+    has_fence = next_fence_valid;
     retained_versions =
         std::ranges::any_of(page_chain_counts_, [](const auto& count) {
           return count.load(std::memory_order_relaxed) != 0;
@@ -2136,6 +2189,14 @@ bool TransactionManager::IsActive(txn_id_t id) const {
   // shard locks in other functions cannot form an ABBA pair with it.
   std::scoped_lock lk(transaction_table_lock);
   return active_transactions_.contains(id);
+}
+
+bool TransactionManager::HasOtherCatalogDirtyTransactions(txn_id_t self) const {
+  std::scoped_lock lk(transaction_table_lock);
+  return std::ranges::any_of(active_transactions_, [self](const auto& entry) {
+    const auto& [id, txn] = entry;
+    return id != self && txn != nullptr && txn->IsCatalogDirty();
+  });
 }
 
 bool TransactionManager::IsRunningUncommitted(txn_id_t id) const {
@@ -3861,7 +3922,11 @@ void TransactionManager::ForgetTransaction(Transaction& txn) {
   }
 }
 
-void TransactionManager::GarbageCollectVersions() {
+void TransactionManager::GarbageCollectVersions(
+    mvcc::GcSweepWakeupFence* out_fence, bool* out_fence_valid) {
+  if (out_fence_valid != nullptr) {
+    *out_fence_valid = false;
+  }
   std::optional<uint64_t> oldest_snapshot;
   txn_id_t oldest_snapshot_txn = 0;
   // The table lock is released before any shard mutex is taken below: the two
@@ -3880,7 +3945,9 @@ void TransactionManager::GarbageCollectVersions() {
                                 ? std::numeric_limits<lsn_t>::max()
                                 : logger_->DurableLSN();
 
-  auto collect_shard = [&](VersionShard& shard) {
+  bool saw_pending_chain = false;
+  std::vector<mvcc::GcVersionStamp> stamp_scratch;
+  auto collect_shard = [&](VersionShard& shard, bool record_fence) {
     std::scoped_lock lock(shard.mutex);
     for (auto chain_iter = shard.versions.begin();
          chain_iter != shard.versions.end();) {
@@ -3914,6 +3981,19 @@ void TransactionManager::GarbageCollectVersions() {
         chain_iter = shard.versions.erase(chain_iter);
         continue;
       }
+      if (record_fence) {
+        if (chain.pending) {
+          saw_pending_chain = true;
+        } else if (!chain.committed.empty()) {
+          stamp_scratch.clear();
+          stamp_scratch.reserve(chain.committed.size());
+          for (const CommittedVersion& ve : chain.committed) {
+            stamp_scratch.push_back(
+                mvcc::GcVersionStamp{.ts = ve.begin_ts, .lsn = ve.commit_lsn});
+          }
+          out_fence->Observe(stamp_scratch, /*pending=*/false);
+        }
+      }
       ++chain_iter;
     }
   };
@@ -3934,11 +4014,17 @@ void TransactionManager::GarbageCollectVersions() {
       total_chains <= kGcFullScanChainLimit
           ? kVersionShardCount
           : std::max(kVersionShardCount / kGcPassDivisor, size_t{1});
+  const bool full_scan = (shards_this_pass == kVersionShardCount);
+  const bool record_fence = full_scan && out_fence != nullptr;
   const size_t begin_shard =
       gc_cursor_.fetch_add(shards_this_pass, std::memory_order_relaxed) %
       kVersionShardCount;
   for (size_t i = 0; i < shards_this_pass; ++i) {
-    collect_shard(version_shards_[(begin_shard + i) % kVersionShardCount]);
+    collect_shard(version_shards_[(begin_shard + i) % kVersionShardCount],
+                  record_fence);
+  }
+  if (record_fence && out_fence_valid != nullptr && !saw_pending_chain) {
+    *out_fence_valid = true;
   }
   uint64_t remaining_chains = 0;
   for (const auto& count : page_chain_counts_) {

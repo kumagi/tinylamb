@@ -288,37 +288,41 @@ struct GroupKeySliceHasher {
     return MixHash64(kSeed ^ HashView64(value));
   }
 
+  static uint64_t HashCell(const RuntimeKeyCell& c,
+                           const ColGroupKeySpec& spec) noexcept {
+    if (c.is_null) {
+      return 0x243f6a8885a308d3ULL;
+    }
+    switch (spec.kind) {
+      case ColKeyKind::kColVarChar:
+      case ColKeyKind::kCaseWhenVarChar:
+      case ColKeyKind::kRegexReplaceVarChar:
+        return HashView64(c.StrView());
+      case ColKeyKind::kColDouble: {
+        double d = c.double_val;
+        if (d == 0.0) {
+          d = 0.0;
+        }
+        uint64_t bits = std::isnan(d) ? 0x7ff8000000000000ULL
+                                      : std::bit_cast<uint64_t>(d);
+        return MixHash64(bits);
+      }
+      default:
+        return MixHash64(static_cast<uint64_t>(c.int_val));
+    }
+  }
+
+  static uint64_t HashSingle(const RuntimeKeyCell& c,
+                             const ColGroupKeySpec& spec) noexcept {
+    return MixHash64(kSeed ^ HashCell(c, spec));
+  }
+
   static uint64_t HashTyped(
       const RuntimeKeyCell* cells,
       const std::vector<ColGroupKeySpec>& specs) noexcept {
     uint64_t h = kSeed;
     for (size_t i = 0; i < specs.size(); ++i) {
-      const RuntimeKeyCell& c = cells[i];
-      uint64_t k = 0;
-      if (c.is_null) {
-        k = 0x243f6a8885a308d3ULL;
-      } else {
-        switch (specs[i].kind) {
-          case ColKeyKind::kColVarChar:
-          case ColKeyKind::kCaseWhenVarChar:
-          case ColKeyKind::kRegexReplaceVarChar:
-            k = HashView64(c.StrView());
-            break;
-          case ColKeyKind::kColDouble: {
-            double d = c.double_val;
-            if (d == 0.0) {
-              d = 0.0;
-            }
-            uint64_t bits = std::isnan(d) ? 0x7ff8000000000000ULL
-                                          : std::bit_cast<uint64_t>(d);
-            k = MixHash64(bits);
-            break;
-          }
-          default:
-            k = MixHash64(static_cast<uint64_t>(c.int_val));
-            break;
-        }
-      }
+      const uint64_t k = HashCell(cells[i], specs[i]);
       h = MixHash64(h ^ (k + (i * 0x9e3779b97f4a7c15ULL)));
     }
     return h;
@@ -1001,6 +1005,40 @@ inline bool ExtractSingleKeyCell(
   }
   return true;
 }
+
+bool CompilePredicatesFromTypedPlan(const TypedAggregationPlan& plan,
+                                    const TlcsFile& tlcs,
+                                    std::span<const slot_t> proj_to_full,
+                                    const Schema& table_schema,
+                                    ColumnarPredicateSet* out);
+
+inline slot_t MapSlot(size_t slot, std::span<const slot_t> proj_to_full) noexcept {
+  return proj_to_full.empty() ? static_cast<slot_t>(slot) : proj_to_full[slot];
+}
+
+bool TryClassifyAggregate(const AggregateExpression* agg,
+                          const Schema& qualified_schema,
+                          std::span<const slot_t> proj_to_full,
+                          const Schema& table_schema, ColAggSpec* out);
+
+bool TryClassifyGroupKey(const Expression& expr, const Schema& qualified_schema,
+                         std::span<const slot_t> proj_to_full,
+                         const Schema& table_schema, ColGroupKeySpec* out);
+
+bool BindExpressionToOutputSlot(const Expression& expr,
+                                const std::vector<ColGroupKeySpec>& key_specs,
+                                const std::vector<ColAggSpec>& agg_specs,
+                                const std::vector<NamedExpression>* select_list,
+                                OutputSlotBinding* out);
+
+StatusOr<std::optional<Relation>> TryFoldTlcsBoundaryAggregate(
+    const TlcsFile& tlcs, const SelectStatement& stmt, const Schema& schema,
+    const Schema& qualified_schema, const ColumnarPredicateSet& preds,
+    const std::vector<ColGroupKeySpec>& keys,
+    const std::vector<ColAggSpec>& aggregates,
+    const std::vector<OutputSlotBinding>& emit,
+    const std::vector<ColumnarOrderBinding>& order,
+    std::span<const NamedExpression> output_names, ExecutionRuntime* runtime);
 
 }  // namespace tinylamb::relational_detail
 

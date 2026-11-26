@@ -44,14 +44,30 @@ class BandJoin final : public ExecutorBase {
     size_t row_index{0};
   };
 
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/StorageExecution/PostingJoinsA.lean
+  //     (Following.OrderedProbe, Following.OffsetCount, Following.PruneExtent)
+  struct PostingBandSpec {
+    int64_t lower_offset{0};
+    int64_t upper_offset{0};
+    bool has_lower{false};
+    bool lower_inclusive{true};
+    bool has_upper{false};
+    bool upper_inclusive{true};
+    bool covers_all_conjuncts{false};
+  };
+
   void EnsureMaterialized();
   Status Materialize();
   [[nodiscard]] static StatusOr<std::optional<int64_t>> ReadKey(const Row& row,
                                                                 slot_t column);
   [[nodiscard]] StatusOr<bool> PairPasses(const Row& left,
                                           const Row& right) const;
+  [[nodiscard]] PostingBandSpec CompilePostingBandSpec(
+      std::optional<ValueType> key_type) const;
   mutable Row pair_scratch_;  // reused residual-predicate concatenation
-  [[nodiscard]] std::pair<size_t, size_t> CandidateRange(int64_t value) const;
+  [[nodiscard]] std::pair<size_t, size_t> CandidateRange(
+      int64_t value, const PostingBandSpec& spec) const;
 
   Executor left_;
   std::vector<slot_t> left_columns_;

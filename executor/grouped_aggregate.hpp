@@ -89,6 +89,9 @@ class AggregateGroupTable {
   [[nodiscard]] StatusOr<size_t> FindOrCreate(Row key);
   // Folds one input row into an existing group.
   [[nodiscard]] Status Accumulate(size_t group, const Row& row);
+  // Folds one input row into every aggregate of `group` except `skip_index`.
+  [[nodiscard]] Status AccumulateExcluding(size_t group, const Row& row,
+                                           size_t skip_index);
   // [group keys..., aggregate results...] for one group.
   [[nodiscard]] StatusOr<Row> Finish(size_t group);
   // Folds `other`'s groups into this one; a group seen by both merges its
@@ -113,8 +116,8 @@ class AggregateGroupTable {
   // reject a flat-index overflow before it can alias another group's state.
   [[nodiscard]] StatusOr<relational_detail::AggregateAccumulator*> StateFor(
       size_t group, size_t index);
-  [[nodiscard]] StatusOr<const relational_detail::AggregateAccumulator*> StateFor(
-      size_t group, size_t index) const;
+  [[nodiscard]] StatusOr<const relational_detail::AggregateAccumulator*>
+  StateFor(size_t group, size_t index) const;
   void Clear();
 
  private:

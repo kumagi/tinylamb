@@ -595,8 +595,8 @@ TEST_F(SqlFunctionCoverageTest, CoalesceIfNull_NullIfBranches) {
   ExpectNullScalar("SELECT NULLIF(NULL, 3)");
   // Short-circuit over row values: an error in an unevaluated branch does
   // not surface.
-  ExpectScalar("SELECT COALESCE(a, 1/0) FROM UNNEST([1]) AS a", Value(1));
-  ExpectScalar("SELECT IFNULL(a, 1/0) FROM UNNEST([2]) AS a", Value(2));
+  ExpectScalar("SELECT COALESCE(a, 1/0) FROM UNNEST([1]) AS a", Value(1.0));
+  ExpectScalar("SELECT IFNULL(a, 1/0) FROM UNNEST([2]) AS a", Value(2.0));
   ExpectError("SELECT NULLIF(1)");
   ExpectError("SELECT IFNULL(1, 2, 3)");
 }

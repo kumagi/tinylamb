@@ -17,6 +17,20 @@
 
 namespace tinylamb::relational_detail {
 
+struct ScanTupleFilter;
+
+Schema ConcatRelationSchemas(const std::vector<Relation>& relations);
+const ScanTupleFilter* InputTupleFilter(const SelectStatement& statement,
+                                        const GroupedJoinFusionSpec* fusion,
+                                        size_t source);
+
+StatusOr<Relation> BuildOrderedJoinInput(
+    TransactionContext& context, const SelectStatement& statement,
+    const Scope* outer, const CteMap& ctes, bool* where_fully_applied,
+    GroupedJoinFusionSpec* fusion, bool columnar_output,
+    std::vector<Relation>& relations, const std::vector<bool>& base_sources,
+    std::vector<std::vector<slot_t>>& projections);
+
 StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
                                          const SelectSource& source,
                                          Relation& prefix, const Scope* outer,

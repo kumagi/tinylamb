@@ -2115,8 +2115,13 @@ static std::shared_ptr<const LSTableStore> BuildLSTableStoreImpl(
         !store->memory_charge->TryAddWithReclaim(extra_bytes)) {
       // Wide-integer dictionaries are purely optional secondary encodings whose
       // backing int_cells remain intact; drop them under pool pressure rather
-      // than discarding the already-charged base column blocks.
+      // than discarding the already-charged base column blocks. Wide-string
+      // dictionaries replace varchar_bytes/varchar_ends and must NEVER be
+      // dropped without restoring those buffers.
       for (slot_t c = 0; c < col_count; ++c) {
+        if (schema.GetColumn(c).Type() == ValueType::kVarChar) {
+          continue;
+        }
         LSTableColumnDictionary& dict = store->dictionaries[c];
         if (!dict.wide_codes.empty()) {
           dict = LSTableColumnDictionary{};

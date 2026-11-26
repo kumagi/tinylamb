@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -145,6 +146,9 @@ class JitInt64Kernels {
 
   // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
   //   (zonemap_prefix_sum_masked_sound)
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/PrefixKernels/
+  //     (Goal_SignedSum_PeakEnvelope, Goal_SignedSum_TwoEntryChecks,
+  //      Goal_SignedSum_UncheckedFold, Goal_SignedSum_JoinCertificates)
   // Returns true iff `running_total + prefix_sum` is guaranteed to remain in
   // `[INT64_MIN, INT64_MAX]` at EVERY intermediate row of a `count`-row batch
   // whose non-null values lie in `[min_value, max_value]`.
@@ -152,6 +156,20 @@ class JitInt64Kernels {
                                                int64_t min_value,
                                                int64_t max_value,
                                                size_t count) noexcept;
+
+  // Tighter prefix-envelope certificate (`PrefixKernels.SignedSum.PeakEnvelope`):
+  // exact necessary-and-sufficient guard when a block's prefix-sum extrema
+  // `[prefix_min, prefix_max]` are known.
+  [[nodiscard]] static bool CanUseUncheckedSumWithEnvelope(
+      int64_t running_total, __int128 prefix_min,
+      __int128 prefix_max) noexcept;
+
+  // Interval-entry certificate (`PrefixKernels.SignedSum.TwoEntryChecks`):
+  // checking only the two endpoints `[init_lo, init_hi]` certifies every
+  // incoming accumulator `s` in `[init_lo, init_hi]`.
+  [[nodiscard]] static bool CanUseUncheckedSumForInitialRange(
+      int64_t init_lo, int64_t init_hi, int64_t min_value, int64_t max_value,
+      size_t count) noexcept;
 
   JitInt64Kernels(JitInt64Kernels&&) noexcept;
   JitInt64Kernels& operator=(JitInt64Kernels&&) noexcept;
@@ -256,6 +274,19 @@ class JitBranchlessProgram {
                             size_t count, uint8_t* out_keep,
                             bool* out_used_unchecked = nullptr) const;
 
+  // Earliest-match predicate path (`LIMIT 1` / `EXISTS`): scans in 64-lane
+  // slices and stops at the first matching row before any fault.
+  // Lean proof:
+  //   lean/TinylambOpt/ResearchProofs/JitFrontiers/PredicateBallots_All.lean
+  //     (Conjunction/Disjunction/Coalesce: LimitBeforeFault, TrapBallot)
+  // On success returns `true` and sets `*out_match_row` to the first matching
+  // row index in `[0, count)`, or `count` if no row matched. Returns `false`
+  // if any slice encountered an error at or before the first match (caller
+  // falls back to scalar evaluation from the failing slice or batch start).
+  [[nodiscard]] bool FilterFirstMatch(std::span<const JitColumnInput> columns,
+                                      size_t count, size_t* out_match_row,
+                                      bool* out_used_unchecked = nullptr) const;
+
   [[nodiscard]] double CompileMilliseconds() const noexcept;
   [[nodiscard]] bool HasUncheckedFastPath() const noexcept;
 
@@ -270,6 +301,84 @@ class JitBranchlessProgram {
   uint64_t h = (k ^ (k >> 30U)) * 0xbf58476d1ce4e5b9ULL;
   h = (h ^ (h >> 27U)) * 0x94d049bb133111ebULL;
   return h ^ (h >> 31U);
+}
+
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/PackedKeys/
+//     (Goal_OrderBiased_Recover, Goal_OrderBiased_ReuseForSort,
+//      Goal_MixedDirection_Recover, Goal_MixedDirection_ReverseTie,
+//      Goal_CorrelatedDelta_Recover, Goal_CorrelatedDelta_GuardRange)
+// Order-preserving 64-bit packed composite key codecs for 2-column ASC/ASC,
+// ASC/DESC, and correlated (48-bit non-negative base + 16-bit signed delta).
+[[nodiscard]] inline bool TryPackOrderBiased2x32(int64_t hi, int64_t lo,
+                                                 uint64_t* out) noexcept {
+  constexpr int64_t kMin32 = -2147483648LL;
+  constexpr int64_t kMax32 = 2147483647LL;
+  if (hi < kMin32 || hi > kMax32 || lo < kMin32 || lo > kMax32) {
+    return false;
+  }
+  const auto uhi = static_cast<uint64_t>(hi - kMin32);
+  const auto ulo = static_cast<uint64_t>(lo - kMin32);
+  *out = (uhi << 32U) | ulo;
+  return true;
+}
+
+[[nodiscard]] inline std::pair<int64_t, int64_t> UnpackOrderBiased2x32(
+    uint64_t packed) noexcept {
+  constexpr int64_t kMin32 = -2147483648LL;
+  const int64_t hi = static_cast<int64_t>(packed >> 32U) + kMin32;
+  const int64_t lo = static_cast<int64_t>(packed & 0xFFFFFFFFULL) + kMin32;
+  return {hi, lo};
+}
+
+[[nodiscard]] inline bool TryPackMixedDirection2x32(int64_t hi_asc,
+                                                    int64_t lo_desc,
+                                                    uint64_t* out) noexcept {
+  constexpr int64_t kMin32 = -2147483648LL;
+  constexpr int64_t kMax32 = 2147483647LL;
+  if (hi_asc < kMin32 || hi_asc > kMax32 || lo_desc < kMin32 ||
+      lo_desc > kMax32) {
+    return false;
+  }
+  const auto uhi = static_cast<uint64_t>(hi_asc - kMin32);
+  const auto ulo = static_cast<uint64_t>(kMax32 - lo_desc);
+  *out = (uhi << 32U) | ulo;
+  return true;
+}
+
+[[nodiscard]] inline std::pair<int64_t, int64_t> UnpackMixedDirection2x32(
+    uint64_t packed) noexcept {
+  constexpr int64_t kMin32 = -2147483648LL;
+  constexpr int64_t kMax32 = 2147483647LL;
+  const int64_t hi = static_cast<int64_t>(packed >> 32U) + kMin32;
+  const int64_t lo = kMax32 - static_cast<int64_t>(packed & 0xFFFFFFFFULL);
+  return {hi, lo};
+}
+
+[[nodiscard]] inline bool TryPackCorrelatedDelta48x16(int64_t x, int64_t y,
+                                                      uint64_t* out) noexcept {
+  constexpr int64_t kMax48 = (int64_t{1} << 48) - 1;
+  constexpr int64_t kMin16 = -32768;
+  constexpr int64_t kMax16 = 32767;
+  if (x < 0 || x > kMax48) {
+    return false;
+  }
+  const __int128 delta = static_cast<__int128>(y) - static_cast<__int128>(x);
+  if (delta < kMin16 || delta > kMax16) {
+    return false;
+  }
+  const auto uhi = static_cast<uint64_t>(x);
+  const auto ulo = static_cast<uint64_t>(static_cast<int64_t>(delta) - kMin16);
+  *out = (uhi << 16U) | ulo;
+  return true;
+}
+
+[[nodiscard]] inline std::pair<int64_t, int64_t> UnpackCorrelatedDelta48x16(
+    uint64_t packed) noexcept {
+  constexpr int64_t kMin16 = -32768;
+  const auto x = static_cast<int64_t>(packed >> 16U);
+  const int64_t delta = static_cast<int64_t>(packed & 0xFFFFULL) + kMin16;
+  return {x, x + delta};
 }
 
 inline void InsertPacked2x32Bloom(uint64_t hash, uint64_t* bloom_words,

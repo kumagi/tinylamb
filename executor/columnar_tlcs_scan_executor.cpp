@@ -590,22 +590,25 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     const bool key0_nf = spec_.sort_specs[0].order.NullsFirst();
     const bool use_int_cutoff =
         (key0_type == ValueType::kInt64 || key0_type == ValueType::kDate);
+    const bool use_double_cutoff = (key0_type == ValueType::kDouble);
     bool use_varchar_cutoff = (key0_type == ValueType::kVarChar &&
                                spec_.sort_specs[0].order.KeyCollation() !=
                                    Collation::kCaseInsensitive &&
                                candidate_blocks_.size() >= 2);
 
     struct BlockKeyMeta {
+      int64_t min_int{0};
+      int64_t max_int{0};
+      double min_double{0.0};
+      double max_double{0.0};
+      uint64_t sort_score{0};
+      TlcsFile::VarcharBlockBound vbound{};
       uint32_t bidx{0};
       uint8_t tier{0};  // 0 = unknown/null-when-nulls-first, 1 = bounded, 2 =
                         // all-null-last
       bool is_const_null{false};
       bool has_null{false};
       bool has_min_max{false};
-      int64_t min_int{0};
-      int64_t max_int{0};
-      uint64_t sort_score{0};
-      TlcsFile::VarcharBlockBound vbound{};
     };
     std::vector<BlockKeyMeta> ordered_blocks;
     ordered_blocks.reserve(candidate_blocks_.size());
@@ -636,7 +639,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
         }
       }
     }
-    if (use_int_cutoff) {
+    if (use_int_cutoff || use_double_cutoff) {
       const uint32_t dg_count = spec_.tlcs->DirGroupCount();
       const uint32_t dg_size = spec_.tlcs->DirGroupSize();
       std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(
@@ -646,16 +649,33 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
                          spec_.tlcs->GetDirGroup(g));
         dir_groups[g] = std::move(grp);
       }
+      // Lean proofs:
+      //   lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesA.lean
+      //     (Product.DominatedTop)
+      //   lean/TinylambOpt/ResearchProofs/StorageExecution/OrderedFootersA.lean
+      //     (MonotoneBreaks.SortingCertificate, MonotoneBreaks.ParallelMergeFree)
+      auto double_order_key = [](double d) noexcept -> uint64_t {
+        const auto bits = std::bit_cast<uint64_t>(d);
+        return (bits >> 63U) != 0U ? ~bits : (bits ^ (uint64_t{1} << 63U));
+      };
       for (const uint32_t bidx : candidate_blocks_) {
         const uint32_t g = bidx / dg_size;
         const uint32_t local = bidx % dg_size;
         const auto& meta = dir_groups[g]->blocks[local].columns[key0_col];
-        BlockKeyMeta bm{.bidx = bidx};
+        BlockKeyMeta bm;
+        bm.bidx = bidx;
         bm.is_const_null = (meta.encoding == TlcsColumnEncoding::kConstNull);
         bm.has_null = meta.has_null || bm.is_const_null;
-        bm.has_min_max = meta.has_min_max;
-        bm.min_int = meta.min_int;
-        bm.max_int = meta.max_int;
+        if (use_double_cutoff) {
+          bm.has_min_max =
+              meta.has_double_min_max && !meta.has_nan && !meta.is_unsigned;
+          bm.min_double = meta.min_double;
+          bm.max_double = meta.max_double;
+        } else {
+          bm.has_min_max = meta.has_min_max;
+          bm.min_int = meta.min_int;
+          bm.max_int = meta.max_int;
+        }
         if (bm.is_const_null) {
           bm.tier = key0_nf ? 0 : 2;
           bm.sort_score = 0;
@@ -664,10 +684,16 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
           bm.sort_score = 1;
         } else if (bm.has_min_max) {
           bm.tier = 1;
-          const int64_t best = key0_asc ? bm.min_int : bm.max_int;
-          const uint64_t mapped =
-              static_cast<uint64_t>(best) ^ (uint64_t{1} << 63);
-          bm.sort_score = key0_asc ? mapped : ~mapped;
+          if (use_double_cutoff) {
+            const double best = key0_asc ? bm.min_double : bm.max_double;
+            const uint64_t mapped = double_order_key(best);
+            bm.sort_score = key0_asc ? mapped : ~mapped;
+          } else {
+            const int64_t best = key0_asc ? bm.min_int : bm.max_int;
+            const uint64_t mapped =
+                static_cast<uint64_t>(best) ^ (uint64_t{1} << 63);
+            bm.sort_score = key0_asc ? mapped : ~mapped;
+          }
         } else {
           bm.tier = 0;
           bm.sort_score = 2;
@@ -691,7 +717,9 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
             (vb.is_const_null || !vb.has_nonempty_min)) {
           continue;
         }
-        BlockKeyMeta bm{.bidx = bidx, .vbound = vb};
+        BlockKeyMeta bm;
+        bm.bidx = bidx;
+        bm.vbound = vb;
         if (vb.is_const_null) {
           bm.tier = key0_nf ? 0 : 2;
         } else if (vb.has_min_max && (key0_excludes_empty_and_null ||
@@ -810,6 +838,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
     std::mutex cutoff_mu;
     std::atomic<bool> cutoff_ready{false};
     std::atomic<int64_t> cutoff_val{0};
+    std::atomic<double> cutoff_dbl{0.0};
     std::mutex v_cutoff_mu;
     std::atomic<uint64_t> v_cutoff_seq{0};
     std::string v_cutoff_str;
@@ -832,6 +861,27 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
         const int64_t cur = cutoff_val.load(std::memory_order_relaxed);
         if (key0_asc ? (worst_val < cur) : (worst_val > cur)) {
           cutoff_val.store(worst_val, std::memory_order_release);
+        }
+      }
+    };
+    auto publish_dbl_cutoff = [&](double worst_val) {
+      if (!use_double_cutoff || std::isnan(worst_val)) {
+        return;
+      }
+      if (cutoff_ready.load(std::memory_order_acquire)) {
+        const double cur = cutoff_dbl.load(std::memory_order_relaxed);
+        if (key0_asc ? (worst_val >= cur) : (worst_val <= cur)) {
+          return;
+        }
+      }
+      const std::scoped_lock<std::mutex> lock(cutoff_mu);
+      if (!cutoff_ready.load(std::memory_order_relaxed)) {
+        cutoff_dbl.store(worst_val, std::memory_order_relaxed);
+        cutoff_ready.store(true, std::memory_order_release);
+      } else {
+        const double cur = cutoff_dbl.load(std::memory_order_relaxed);
+        if (key0_asc ? (worst_val < cur) : (worst_val > cur)) {
+          cutoff_dbl.store(worst_val, std::memory_order_release);
         }
       }
     };
@@ -889,6 +939,18 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
             }
           } else if (bm.has_min_max && (!bm.has_null || !key0_nf)) {
             if (key0_asc ? (bm.min_int > cut) : (bm.max_int < cut)) {
+              continue;
+            }
+          }
+        } else if (use_double_cutoff &&
+                   cutoff_ready.load(std::memory_order_acquire)) {
+          const double cut = cutoff_dbl.load(std::memory_order_relaxed);
+          if (bm.is_const_null) {
+            if (!key0_nf) {
+              continue;
+            }
+          } else if (bm.has_min_max && (!bm.has_null || !key0_nf)) {
+            if (key0_asc ? (bm.min_double > cut) : (bm.max_double < cut)) {
               continue;
             }
           }
@@ -1097,6 +1159,8 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
             if (heap.size() == keep && !heap.front().keys[0].is_null) {
               if (use_int_cutoff) {
                 publish_cutoff(heap.front().keys[0].int_val);
+              } else if (use_double_cutoff) {
+                publish_dbl_cutoff(heap.front().keys[0].double_val);
               } else if (use_varchar_cutoff) {
                 publish_v_cutoff(heap.front().keys[0].str_val);
               }
@@ -1108,6 +1172,8 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
             if (!heap.front().keys[0].is_null) {
               if (use_int_cutoff) {
                 publish_cutoff(heap.front().keys[0].int_val);
+              } else if (use_double_cutoff) {
+                publish_dbl_cutoff(heap.front().keys[0].double_val);
               } else if (use_varchar_cutoff) {
                 publish_v_cutoff(heap.front().keys[0].str_val);
               }

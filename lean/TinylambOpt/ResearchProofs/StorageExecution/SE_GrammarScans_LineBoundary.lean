@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace LineBoundary
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.LineBoundary
+theorem sound_RunBoundaryCRLF : RunBoundaryCRLF.Goal := Common.sound_LineBoundary_RunBoundaryCRLF
+theorem sound_FinalPair : FinalPair.Goal := Common.sound_LineBoundary_FinalPair
+end LineBoundary
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

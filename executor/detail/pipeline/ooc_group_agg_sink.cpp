@@ -38,28 +38,46 @@ constexpr size_t SaturatingAddBytes(size_t a, size_t b) noexcept {
 // Only COUNT/SUM/AVG qualify: they are the non-idempotent-insensitive
 // aggregates whose distinct set is the only growing state, and a plain
 // non-distinct clone over deduplicated input yields the DISTINCT result.
-[[nodiscard]] const AggregateExpression* SingleStrippableDistinctAggregate(
-    const std::vector<const AggregateExpression*>& aggregates) noexcept {
-  if (aggregates.size() != 1 || aggregates[0] == nullptr) {
-    return nullptr;
+// Any number of non-DISTINCT, non-collection siblings (e.g. MIN/MAX/SUM/COUNT)
+// may accompany the single DISTINCT aggregate: the sorted skew path feeds
+// siblings on every row and deduplicates the single DISTINCT aggregate.
+[[nodiscard]] std::optional<size_t> SingleStrippableDistinctAggregate(
+    const std::vector<const AggregateExpression*>& aggregates,
+    bool has_collection_agg) noexcept {
+  if (has_collection_agg || aggregates.empty()) {
+    return std::nullopt;
   }
-  const AggregateExpression* agg = aggregates[0];
-  const AggregationType t = agg->GetType();
-  if (!agg->Distinct() || agg->HasWhereFilter() || agg->NeedsGroupContext() ||
-      agg->HasInnerGroupBy() || agg->Child() == nullptr ||
-      (t != AggregationType::kCount && t != AggregationType::kSum &&
-       t != AggregationType::kAvg)) {
-    return nullptr;
+  std::optional<size_t> distinct_idx;
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    const AggregateExpression* agg = aggregates[i];
+    if (agg == nullptr) {
+      return std::nullopt;
+    }
+    if (!agg->Distinct()) {
+      continue;
+    }
+    if (distinct_idx.has_value()) {
+      return std::nullopt;
+    }
+    const AggregationType t = agg->GetType();
+    if (agg->HasWhereFilter() || agg->NeedsGroupContext() ||
+        agg->HasInnerGroupBy() || agg->Child() == nullptr ||
+        (t != AggregationType::kCount && t != AggregationType::kSum &&
+         t != AggregationType::kAvg)) {
+      return std::nullopt;
+    }
+    distinct_idx = i;
   }
-  return agg;
+  return distinct_idx;
 }
 
 // Streams finished aggregate rows lazily from PartitionLeafSet one leaf at a
 // time so working memory stays <= B_op throughout Finalize -> NextBatch.
 // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
 // non-copyable by design
-class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-functions):
-                                // scope-owned cleanup.
+class
+    GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-functions):
+                              // scope-owned cleanup.
     : public PipelineSource {  // NOLINT(cppcoreguidelines-special-member-functions)
 
  public:
@@ -70,6 +88,7 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
       std::vector<Expression> aggregate_owners,
       std::vector<const AggregateExpression*> aggregates, bool partial_mode,
       bool has_collection_agg, std::optional<slot_t> single_distinct_child_slot,
+      size_t single_distinct_agg_index,
       std::shared_ptr<AggregateExpression> skew_strip_aggregate,
       size_t budget_bytes, QueryMemoryGrant* grant,
       std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard,
@@ -84,6 +103,7 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
         partial_mode_(partial_mode),
         has_collection_agg_(has_collection_agg),
         single_distinct_child_slot_(single_distinct_child_slot),
+        single_distinct_agg_index_(single_distinct_agg_index),
         skew_strip_aggregate_(std::move(skew_strip_aggregate)),
         budget_bytes_(budget_bytes),
         grant_(grant),
@@ -100,11 +120,15 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
         }
       }
     }
-    if (skew_strip_aggregate_ != nullptr) {
-      // The skew table accumulates the DISTINCT-stripped clone instead of
-      // the original aggregate: the sorter already feeds each distinct
-      // value once, so the clone's plain state stays O(1) per group.
-      skew_table_aggregates_.push_back(skew_strip_aggregate_.get());
+    if (skew_strip_aggregate_ != nullptr &&
+        single_distinct_agg_index_ < aggregates_.size()) {
+      // The skew table accumulates the DISTINCT-stripped clone at
+      // single_distinct_agg_index_ instead of the original aggregate: the
+      // sorter already feeds each distinct value once, so the clone's plain
+      // state stays O(1) per group while non-distinct siblings fold normally.
+      skew_table_aggregates_ = aggregates_;
+      skew_table_aggregates_[single_distinct_agg_index_] =
+          skew_strip_aggregate_.get();
     }
     if (grant_ != nullptr) {
       const size_t refill =
@@ -310,7 +334,8 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
   [[nodiscard]] bool UseSingleCountDistinctSort() const noexcept {
     return single_distinct_child_slot_.has_value() ||
            (!partial_mode_ &&
-            SingleStrippableDistinctAggregate(aggregates_) != nullptr);
+            SingleStrippableDistinctAggregate(aggregates_, has_collection_agg_)
+                .has_value());
   }
 
   void EnsureConsumerGuard() {
@@ -437,9 +462,11 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
                 const slot_t dslot = *single_distinct_child_slot_;
                 dv = dslot < skew_raw_width_ ? raw[dslot] : Value();
               } else {
-                ASSIGN_OR_RETURN(Value, ev,
-                                 EvalRowExpression(aggregates_[0]->Child(),
-                                                   input_schema_, raw));
+                ASSIGN_OR_RETURN(
+                    Value, ev,
+                    EvalRowExpression(
+                        aggregates_[single_distinct_agg_index_]->Child(),
+                        input_schema_, raw));
                 dv = std::move(ev);
               }
               raw.values_.push_back(
@@ -518,11 +545,16 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
         RETURN_IF_FAIL(
             MergePackedPartialStates(skew_table_.get(), 0, sorted_row));
       } else if (single_cd) {
-        // Sorted by (group_key, distinct_val): deduplicate adjacent equal
-        // distinct_vals and feed each once into the DISTINCT-stripped
-        // skew-table clone, so the accumulator keeps O(1) state per group
-        // instead of materializing a distinct-value set!
-        const Value& dval = sorted_row[skew_raw_width_ + gcnt];
+        // Sorted by (group_key, distinct_val): fold non-distinct siblings on
+        // every row, deduplicate adjacent equal distinct_vals, and feed each
+        // once into the DISTINCT-stripped skew-table clone so the accumulator
+        // keeps O(1) state per group instead of materializing a distinct set.
+        const Value dval = sorted_row[skew_raw_width_ + gcnt];
+        sorted_row.values_.resize(skew_raw_width_);
+        if (aggregates_.size() > 1) {
+          RETURN_IF_FAIL(skew_table_->AccumulateExcluding(
+              0, sorted_row, single_distinct_agg_index_));
+        }
         if (!dval.IsNull()) {
           if (!have_prev_distinct_ || !relational_detail::DistinctValueEqual{}(
                                           prev_distinct_val_, dval)) {
@@ -537,8 +569,9 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
                   StatusCode::kTooBigData,
                   "Single aggregate group exceeds operator memory budget");
             }
-            ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
-                             skew_table_->StateFor(0, 0));
+            ASSIGN_OR_RETURN(
+                relational_detail::AggregateAccumulator*, state,
+                skew_table_->StateFor(0, single_distinct_agg_index_));
             RETURN_IF_FAIL(state->Add(dval));
           }
         }
@@ -599,8 +632,9 @@ class GroupAggLeafSource final  // NOLINT(cppcoreguidelines-special-member-funct
   bool partial_mode_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
-  // Owned DISTINCT-stripped clone used by the skew table when the whole
-  // aggregate list is one plain DISTINCT aggregate (see
+  size_t single_distinct_agg_index_{0};
+  // Owned DISTINCT-stripped clone used by the skew table when the aggregate
+  // list has one plain DISTINCT aggregate and non-distinct siblings (see
   // SingleStrippableDistinctAggregate). Non-null implies the skew path is
   // the sorted single-distinct path, so its per-group state stays O(1).
   std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
@@ -729,10 +763,13 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
   // skew fallback: the sorter feeds each distinct value once, so the skew
   // table accumulates a DISTINCT-stripped clone whose state stays O(1).
   single_distinct_child_slot_.reset();
+  single_distinct_agg_index_ = 0;
   skew_strip_aggregate_.reset();
-  const AggregateExpression* strip_agg =
-      SingleStrippableDistinctAggregate(aggregates_);
-  if (strip_agg != nullptr) {
+  const std::optional<size_t> strip_idx =
+      SingleStrippableDistinctAggregate(aggregates_, has_collection_agg_);
+  if (strip_idx.has_value()) {
+    single_distinct_agg_index_ = *strip_idx;
+    const AggregateExpression* strip_agg = aggregates_[*strip_idx];
     auto stripped = std::make_shared<AggregateExpression>(
         strip_agg->GetType(), strip_agg->Child(), false);
     stripped->SetIgnoreNulls(strip_agg->IgnoreNulls());
@@ -1052,9 +1089,9 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
   return std::make_shared<GroupAggLeafSource>(
       &ctx->spill_store, std::move(leaves), input_schema_, group_keys_,
       group_key_slots_, aggregate_owners_, aggregates_, all_combinable_,
-      has_collection_agg_, single_distinct_child_slot_, skew_strip_aggregate_,
-      budget_bytes_, &ctx->grant, std::move(leaf_guard), label_ + "Output",
-      output_groups_);
+      has_collection_agg_, single_distinct_child_slot_,
+      single_distinct_agg_index_, skew_strip_aggregate_, budget_bytes_,
+      &ctx->grant, std::move(leaf_guard), label_ + "Output", output_groups_);
 }
 
 StatusOr<std::shared_ptr<PipelineSource>>

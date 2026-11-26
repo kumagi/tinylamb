@@ -119,7 +119,7 @@ class ScopedDb {
     }
 
     // WAL segment series `<name>.log.<index>` (RemoveWalSegmentFiles in
-    // database.cpp): contiguous digits from 0, recycled by trimming a prefix.
+    // database_files.cpp): contiguous digits from 0, recycled by trimming a prefix.
     const std::filesystem::path wal_base(name_ + ".log");
     const std::filesystem::path wal_dir = wal_base.has_parent_path()
                                               ? wal_base.parent_path()
@@ -152,7 +152,7 @@ class ScopedDb {
                 << iter_ec.message();
     }
 
-    // LSM/block/TLCS companions (RemoveCompanionStorageFiles in database.cpp)
+    // LSM/block/TLCS companions (RemoveCompanionStorageFiles in database_files.cpp)
     // for both the page file (<name>.db) and the bare base name.
     const auto remove_companions = [](const std::string& file) {
       const std::filesystem::path p(file);

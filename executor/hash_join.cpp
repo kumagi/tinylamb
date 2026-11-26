@@ -42,6 +42,7 @@
 #include "common/join_hash.hpp"
 #include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/engine_decisions.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "executor/query_memory.hpp"
@@ -1628,6 +1629,31 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
     }
     return state != 1;
   };
+
+  // EngineDecisions.Optimizer.TupleAnti: for 2-column `WHERE (x, y) NOT IN
+  // (...)` with resident build side and no residual predicate or null-safe
+  // keys, partition the build side by NULL pattern for exact 3VL O(1) probes.
+  const bool any_null_safe_key =
+      std::ranges::any_of(key_null_safe_, [](bool ns) { return ns; });
+  if (null_aware && left_cols_.size() == 2 && right_cols_.size() == 2 &&
+      !s.left.Spilled() && !s.right.Spilled() && !residual_predicate_ &&
+      !any_null_safe_key) {
+    engine_decisions::TupleAntiIndex tuple_anti;
+    const slot_t rc0 = right_cols_[0];
+    const slot_t rc1 = right_cols_[1];
+    for (const PositionedRow& br : s.right.rows) {
+      tuple_anti.Insert(br.first[rc0], br.first[rc1]);
+    }
+    const slot_t lc0 = left_cols_[0];
+    const slot_t lc1 = left_cols_[1];
+    for (const PositionedRow& probe : s.left.rows) {
+      if (tuple_anti.Keep(probe.first[lc0], probe.first[lc1])) {
+        emit_probe(probe);
+      }
+    }
+    output_charge_.Add(output_bytes);
+    return Status::kSuccess;
+  }
 
   if (null_aware && build.has_null_key) {
     // NOT IN is UNKNOWN for every non-matching probe when the build set has a

@@ -52,6 +52,7 @@
 #include "common/encoder.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
+#include "database/database_files.hpp"
 #include "database/page_storage.hpp"
 #include "index/lsm_index.hpp"
 #include "page/page.hpp"
@@ -102,11 +103,6 @@ struct MallocTuning {
 // thresholds once at process start, before any big block churns.
 const MallocTuning g_malloc_tuning;  // NOLINT(cert-err58-cpp)
 #endif
-
-// Base names of every database this process opened through Create().
-// Guards RemoveCreatedDatabaseFiles(); see the header comment.
-std::mutex created_databases_mutex;
-std::unordered_set<std::string> created_databases;
 
 // GoogleSQL identifiers are case-insensitive; table-name comparison folds
 // ASCII case the same way GetTable()'s catalog fallback does.
@@ -175,10 +171,7 @@ StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
   // name before this process exits; the exit-time sweep must not unlink that
   // other process's files. Names are never unregistered after success (see
   // database.hpp), preserving the reopen-cycle policy.
-  {
-    const std::scoped_lock lock(created_databases_mutex);
-    created_databases.insert(std::string(dbname));
-  }
+  database_files::RegisterCreated(dbname);
   return database;
 }
 
@@ -1578,10 +1571,12 @@ StatusOr<lsn_t> Database::WriteCheckpoint(bool allow_auto_compaction) {
     } guard{auto_tlcs_in_progress_};
     TransactionContext ctx = BeginContext();
     ctx.txn_.SweepCommittedVersionChains();
-    if (!ctx.txn_.HasAnyPageVersionChains()) {
+    if (!ctx.txn_.HasOtherCatalogDirtyTransactions() &&
+        !ctx.txn_.HasAnyPageVersionChains()) {
       const std::vector<std::string> tables = ListTables(ctx);
       for (const std::string& name : tables) {
-        if (ctx.txn_.HasAnyPageVersionChains()) {
+        if (ctx.txn_.HasOtherCatalogDirtyTransactions() ||
+            ctx.txn_.HasAnyPageVersionChains()) {
           break;
         }
         // Best-effort: TryAutoCompactTable logs unexpected failures itself.
@@ -1691,8 +1686,10 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
     return Status::kInvalidArgument;
   }
 
+  const bool force_recompact =
+      ::tinylamb::platform::GetEnv("TINYLAMB_FORCE_TLCS_RECOMPACT") != nullptr;
   std::shared_ptr<const TlcsFile> existing_tlcs = tbl.GetBackingTlcsStore();
-  if (existing_tlcs != nullptr &&
+  if (!force_recompact && existing_tlcs != nullptr &&
       existing_tlcs->FormatVersion() >= TlcsFile::kFormatVersion) {
     if (existing_tlcs->LayoutGeneration() == tbl.LayoutGeneration() &&
         existing_tlcs->FirstPageId() == tbl.FirstPageId()) {
@@ -1742,6 +1739,9 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
                        "cannot compact table with secondary indexes in a "
                        "read-only transaction");
   }
+  if (ctx.txn_.HasOtherCatalogDirtyTransactions()) {
+    return Status::kConflicts;
+  }
   if (non_blocking_quiescence && ctx.txn_.HasAnyPageVersionChains()) {
     return Status::kConflicts;
   }
@@ -1779,6 +1779,9 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
   RETURN_IF_FAIL(storage_->pm_->WaitForTableTailQuiescence(tbl.FirstPageId(),
                                                            ctx.txn_.ID()));
   if (tbl.LayoutGeneration() != before_gen) {
+    return Status::kConflicts;
+  }
+  if (ctx.txn_.HasOtherCatalogDirtyTransactions()) {
     return Status::kConflicts;
   }
   // P356/426: a stub serves every row as one current TLCS image.  Demoting a
@@ -2017,7 +2020,8 @@ bool Database::TryAutoCompactTable(TransactionContext& ctx,
     return false;
   }
   ctx.txn_.SweepCommittedVersionChains();
-  if (ctx.txn_.HasAnyPageVersionChains()) {
+  if (ctx.txn_.HasOtherCatalogDirtyTransactions() ||
+      ctx.txn_.HasAnyPageVersionChains()) {
     return false;
   }
   auto tbl_or = GetTable(ctx, schema_name);
@@ -2111,100 +2115,6 @@ Status Database::CompactAllTablesToTlcs() {
   return Status::kSuccess;
 }
 
-namespace {
-// Removes the WAL segment series `<wal_base>.<index>` for one database,
-// where `wal_base` is the database's `.log` path. Segments are contiguous
-// from index 0 (recycling only ever trims a prefix), so the first missing
-// file ends the sweep.
-void RemoveWalSegmentFiles(const std::filesystem::path& wal_base) {
-  const std::filesystem::path directory = wal_base.has_parent_path()
-                                              ? wal_base.parent_path()
-                                              : std::filesystem::path(".");
-  const std::string prefix = wal_base.filename().string() + ".";
-  std::error_code ec;
-  std::filesystem::directory_iterator it(directory, ec);
-  if (ec) {
-    return;
-  }
-  for (const std::filesystem::directory_entry& entry : it) {
-    const std::string filename = entry.path().filename().string();
-    if (!filename.starts_with(prefix)) {
-      continue;
-    }
-    const std::string suffix = filename.substr(prefix.size());
-    if (!suffix.empty() && std::ranges::all_of(suffix, [](char c) {
-          return c >= '0' && c <= '9';
-        })) {
-      std::filesystem::remove(entry.path(), ec);
-    }
-  }
-}
-}  // namespace
-
-namespace {
-void RemoveCompanionStorageFiles(const std::string& db_file_path) {
-  std::ignore = std::remove((db_file_path + ".blocks").c_str());
-  std::ignore = std::remove((db_file_path + ".lsm").c_str());
-  const std::filesystem::path p(db_file_path);
-  const std::filesystem::path parent =
-      p.parent_path().empty() ? std::filesystem::path(".") : p.parent_path();
-  const std::string base_blocks = p.filename().string() + ".blocks.";
-  const std::string base_lsm = p.filename().string() + ".lsm.";
-  const std::string base_tlcs = p.filename().string() + ".tlcs";
-  std::error_code ec;
-  for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
-    if (ec) {
-      break;
-    }
-    const std::string fname = entry.path().filename().string();
-    if (fname.starts_with(base_blocks) || fname.starts_with(base_lsm) ||
-        fname.starts_with(base_tlcs)) {
-      std::filesystem::remove(entry.path(), ec);
-    }
-  }
-  // A constructor or increment failure leaves ec set with the loop already
-  // at end; without this check a partial enumeration looks like a complete
-  // one and companion files silently survive cleanup.
-  if (ec) {
-    LOG(WARN) << "RemoveCompanionStorageFiles: directory iteration over "
-              << parent << " failed: " << ec.message();
-  }
-}
-}  // namespace
-
-void Database::RemoveCreatedDatabaseFiles() { RemoveCreatedDatabaseFiles({}); }
-
-void Database::RemoveCreatedDatabaseFiles(
-    const std::unordered_set<std::string>& preserve_bases) {
-  std::unordered_set<std::string> names;
-  {
-    const std::scoped_lock lock(created_databases_mutex);
-    names = created_databases;
-  }
-  for (const std::string& name : names) {
-    if (preserve_bases.contains(name)) {
-      continue;
-    }
-    // Same file set as DeleteAll(): the page file, companion block/tlcs
-    // files, the WAL segment series, the checkpoint marker and its stranded
-    // temp sibling. Missing entries are the norm and simply ignored.
-    std::ignore = std::remove((name + ".db").c_str());
-    // The snapshot temp is <db>.tmp (page_manager.cpp); the old .db.ckpt
-    // names are kept only to clean up files from retired versions.
-    std::ignore = std::remove((name + ".tmp").c_str());
-    std::ignore = std::remove((name + ".db.ckpt").c_str());
-    std::ignore = std::remove((name + ".db.ckpt.tmp").c_str());
-    RemoveCompanionStorageFiles(name + ".db");
-    RemoveCompanionStorageFiles(name);
-    std::ignore = std::remove((name + ".log").c_str());
-    std::ignore = std::remove((name + ".log.meta").c_str());
-    std::ignore = std::remove((name + ".log.meta.tmp").c_str());
-    RemoveWalSegmentFiles(name + ".log");
-    std::ignore = std::remove((name + ".last_checkpoint").c_str());
-    std::ignore = std::remove((name + ".last_checkpoint.tmp").c_str());
-  }
-}
-
 void Database::DeleteAll() {
   if (storage_ == nullptr) {
     return;
@@ -2218,15 +2128,15 @@ void Database::DeleteAll() {
   std::ignore = std::remove((database_name + ".tmp").c_str());
   std::ignore = std::remove((database_name + ".ckpt").c_str());
   std::ignore = std::remove((database_name + ".ckpt.tmp").c_str());
-  RemoveCompanionStorageFiles(database_name);
+  database_files::RemoveCompanionStorageFiles(database_name);
   if (database_name.ends_with(".db")) {
-    RemoveCompanionStorageFiles(
+    database_files::RemoveCompanionStorageFiles(
         database_name.substr(0, database_name.size() - 3));
   }
   std::ignore = std::remove(log_name.c_str());
   std::ignore = std::remove((log_name + ".meta").c_str());
   std::ignore = std::remove((log_name + ".meta.tmp").c_str());
-  RemoveWalSegmentFiles(log_name);
+  database_files::RemoveWalSegmentFiles(log_name);
   // Legacy cleanup only: MasterRecordName() is the retired
   // "<db>.last_checkpoint" file, which current code no longer writes. Keep
   // deleting it so DeleteAll also clears databases created by older versions.

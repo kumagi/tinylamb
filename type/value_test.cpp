@@ -1334,12 +1334,11 @@ TEST(ValueTest, Operations_OnInvalidValueType_AbortOrThrow) {
   broken.type = invalid_type;
   std::array<char, 16> buffer{};
 
-  // The storage boundary rejects an unknown tag without touching output.
-  buffer.fill('x');
-  const auto original = buffer;
+  // The storage boundary rejects an unknown tag before serialization.
   EXPECT_EQ(broken.Size(), 0U);
-  EXPECT_EQ(broken.Serialize(buffer.data()), 0U);
-  EXPECT_EQ(buffer, original);
+  EXPECT_EQ(broken.CheckSerializable(), Status::kCorrupt);
+  EXPECT_DEATH(std::ignore = broken.Serialize(buffer.data()),
+               "cannot serialize an invalid value type tag");
   // Operations that require an already-valid in-memory value keep their
   // diagnostics for a broken tag.
   EXPECT_DEATH(std::ignore = broken.AsString(), "undefined type");
@@ -1466,6 +1465,16 @@ TEST(ValueTest, AsString_SpecialDoubles_FormatsInfAndNan) {
   EXPECT_EQ(inf_val.AsString(), "inf");
   EXPECT_EQ(neg_inf_val.AsString(), "-inf");
   EXPECT_EQ(nan_val.AsString(), "nan");
+}
+
+TEST(ValueTest, AsString_OutOfRangeDate_DoesNotThrow) {
+  // Fuzz-found (function_fuzzer): Value::AsString() on an out-of-range DATE
+  // previously called throwing FormatDateDays(), letting std::runtime_error
+  // escape TryEvaluate boundaries via raw_str/raw_view.
+  const Value low = Value::DateFromDays(kDateMinDays - 1000);
+  const Value high = Value::DateFromDays(kDateMaxDays + 1000);
+  EXPECT_NO_THROW(std::ignore = low.AsString());
+  EXPECT_NO_THROW(std::ignore = high.AsString());
 }
 
 TEST(ValueTest, EncodeMemcomparableFormat_OnNullValue_EncodesNullTag) {
@@ -1739,9 +1748,15 @@ TEST(ValueIntervalTest, Comparison_WithHugeIntervals_KeepsOrderAndEquality) {
 
 TEST(ValueIntervalTest, Arithmetic_WithHugeOperands_ThrowsOnOverflow) {
   const IntervalValue huge = IntervalValue::Parse("P4000000000D");
-  EXPECT_THROW(std::ignore = huge + huge, std::runtime_error);
-  EXPECT_THROW(std::ignore = huge * 2, std::runtime_error);
-  EXPECT_THROW(std::ignore = -huge, std::runtime_error);
+  EXPECT_EQ((huge + huge).days, 8000000000LL);
+  EXPECT_EQ((huge * 2).days, 8000000000LL);
+  EXPECT_EQ((-huge).days, -4000000000LL);
+
+  const IntervalValue max_days{.days = INT64_MAX};
+  const IntervalValue min_days{.days = INT64_MIN};
+  EXPECT_THROW(std::ignore = max_days + huge, std::runtime_error);
+  EXPECT_THROW(std::ignore = max_days * 2, std::runtime_error);
+  EXPECT_THROW(std::ignore = -min_days, std::runtime_error);
 
   const IntervalValue normal = IntervalValue::Parse("P1D");
   const IntervalValue sum = normal + normal;

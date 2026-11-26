@@ -654,7 +654,7 @@ Transaction::Transaction(Transaction&& o) noexcept
       read_only_(o.read_only_),
       wounded_(o.wounded_.load(std::memory_order_acquire)),
       abort_started_(o.abort_started_.load(std::memory_order_acquire)),
-      catalog_dirty_(o.catalog_dirty_),
+      catalog_dirty_(o.catalog_dirty_.load(std::memory_order_acquire)),
       intent_wait_failure_(o.intent_wait_failure_),
       write_set_failure_status_(std::move(o.write_set_failure_status_)) {
   debug_phase_.store(o.debug_phase_.load(std::memory_order_relaxed),

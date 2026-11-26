@@ -634,10 +634,11 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       // Mixed timestamp/INTERVAL operators are unsupported; use TIMESTAMP_ADD.
       "SELECT TIMESTAMP '2026-12-31 23:59:59+00' + INTERVAL 1 SECOND",
       // TIMESTAMP literals reject named zones, impossible dates, and
-      // leap-second field values (second must be < 60).
+      // out-of-range seconds (second must be <= 60; :60 is a GoogleSQL leap
+      // second).
       "SELECT TIMESTAMP '2026-01-02 03:04:05 JST'",
       "SELECT TIMESTAMP '2026-02-29 00:00:00+00'",
-      "SELECT TIMESTAMP '2026-01-02 23:59:60+00'",
+      "SELECT TIMESTAMP '2026-01-02 23:59:61+00'",
       // Garbage text and a fractional dot with no digits are not TIMESTAMPs.
       "SELECT TIMESTAMP 'nonsense_123456'",
       "SELECT TIMESTAMP '2026-01-01 00:00:00.'",

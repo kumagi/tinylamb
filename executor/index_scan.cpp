@@ -18,7 +18,6 @@
 // Created by kumagi on 22/06/19.
 //
 
-#include "common/platform/process.hpp"
 #include "index_scan.hpp"
 
 #include <cstddef>
@@ -31,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -62,7 +62,8 @@ inline constexpr size_t kIndexScanPrefetchDistance = 8;
 bool IndexScanPrefetchDisabled() {
   // Environment configuration is sampled once; set it before the first scan.
   static const bool disabled =
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") != nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH") !=
+      nullptr;
   return disabled;
 }
 
@@ -320,6 +321,11 @@ size_t IndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
                                             : txn_.TryAddWriteSet(pointed_row));
     txn_.DebugSetPhase(nullptr);
     if (!locked) {
+      const Status ws_err = txn_.LastWriteSetFailureStatus();
+      if (ws_err != Status::kSuccess && ws_err != Status::kConflicts) {
+        FailWith(ws_err);
+        return destination->Size();
+      }
       const char* reason = "conflicting writer holds the write intent";
       using Failure = Transaction::IntentWaitFailure;
       switch (txn_.LastIntentWaitFailure()) {

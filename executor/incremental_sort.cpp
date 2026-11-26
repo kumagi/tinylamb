@@ -34,14 +34,14 @@ namespace {
 class PrefixRun final : public ExecutorBase {
  public:
   PrefixRun(Executor source, Row first, RowPosition position,
-            std::optional<std::pair<Row, RowPosition>> second,
+            std::vector<std::pair<Row, RowPosition>> buffered,
             std::function<StatusOr<bool>(const Row&, const Row&)> peers,
             std::function<void(Row, RowPosition)> next_group,
             std::function<void()> exhausted)
       : source_(std::move(source)),
         first_(std::move(first)),
         position_(position),
-        second_(std::move(second)),
+        buffered_(std::move(buffered)),
         peers_(std::move(peers)),
         next_group_(std::move(next_group)),
         exhausted_(std::move(exhausted)) {}
@@ -53,9 +53,9 @@ class PrefixRun final : public ExecutorBase {
         destination->Append(first_, position_);
         continue;
       }
-      if (second_) {
-        destination->Append(std::move(second_->first), second_->second);
-        second_.reset();
+      if (buffered_idx_ < buffered_.size()) {
+        auto& entry = buffered_[buffered_idx_++];
+        destination->Append(std::move(entry.first), entry.second);
         continue;
       }
       DataChunk candidate_chunk;
@@ -90,7 +90,8 @@ class PrefixRun final : public ExecutorBase {
   Executor source_;
   Row first_;
   RowPosition position_;
-  std::optional<std::pair<Row, RowPosition>> second_;
+  std::vector<std::pair<Row, RowPosition>> buffered_;
+  size_t buffered_idx_{0};
   std::function<StatusOr<bool>(const Row&, const Row&)> peers_;
   std::function<void(Row, RowPosition)> next_group_;
   std::function<void()> exhausted_;
@@ -107,10 +108,12 @@ IncrementalSortExecutor::IncrementalSortExecutor(
       prefix_keys_(std::move(prefix_keys)),
       suffix_keys_(std::move(suffix_keys)),
       suffix_orders_(std::make_shared<std::vector<SortKeyOrder>>()) {
-  for (const auto& key : prefix_keys_) { prefix_orders_.push_back(MakeSortKeyOrder(key));
-}
-  for (const auto& key : suffix_keys_) { suffix_orders_->push_back(MakeSortKeyOrder(key));
-}
+  for (const auto& key : prefix_keys_) {
+    prefix_orders_.push_back(MakeSortKeyOrder(key));
+  }
+  for (const auto& key : suffix_keys_) {
+    suffix_orders_->push_back(MakeSortKeyOrder(key));
+  }
   singleton_passthrough_ =
       !suffix_keys_.empty() &&
       std::ranges::all_of(suffix_keys_, [&](const auto& key) {
@@ -124,7 +127,8 @@ IncrementalSortExecutor::IncrementalSortExecutor(
 Status IncrementalSortExecutor::ObserveSingleton(const Row& row) {
   // The singleton shortcut is only enabled for direct suffix columns.
   for (size_t i = 0; i < suffix_keys_.size(); ++i) {
-    const int col = schema_.Offset(suffix_keys_[i].expression->AsColumnValue().GetColumnName());
+    const int col = schema_.Offset(
+        suffix_keys_[i].expression->AsColumnValue().GetColumnName());
     RETURN_IF_FAIL((*suffix_orders_)[i].Observe(row[static_cast<size_t>(col)]));
   }
   return Status::kSuccess;
@@ -150,10 +154,12 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       equal = false;
       continue;
     }
-    if (sort_error_.ok()) { sort_error_ = prefix_orders_[i].Observe(va_or.Value());
-}
-    if (sort_error_.ok()) { sort_error_ = prefix_orders_[i].Observe(vb_or.Value());
-}
+    if (sort_error_.ok()) {
+      sort_error_ = prefix_orders_[i].Observe(va_or.Value());
+    }
+    if (sort_error_.ok()) {
+      sort_error_ = prefix_orders_[i].Observe(vb_or.Value());
+    }
     if (prefix_orders_[i].Compare(va_or.Value(), vb_or.Value()) != 0) {
       equal = false;
     }
@@ -197,8 +203,50 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
       pending_position_ = pending_chunk.PositionAt(0);
     }
     has_pending_ = false;
-    std::optional<std::pair<Row, RowPosition>> second;
-    if (singleton_passthrough_ &&
+    std::vector<std::pair<Row, RowPosition>> buffered;
+    // Lean proof:
+    //   lean/TinylambOpt/ResearchProofs/EngineDecisions/Goal_Exec_RunOffset.lean
+    //     (RunOffset.Goal)
+    // When a downstream OFFSET covers an entire prefix-peer run, skip sorting
+    // that run completely and subtract its row count from `remaining_skip_`.
+    if (remaining_skip_ > 0) {
+      Row first = std::move(pending_row_);
+      const RowPosition first_position = pending_position_;
+      bool run_ended = false;
+      while (1 + buffered.size() <= remaining_skip_) {
+        DataChunk candidate_chunk;
+        if (source_->NextBatch(&candidate_chunk, 1) == 0) {
+          input_exhausted_ = true;
+          if (FailWithChildOf(*source_)) {
+            return false;
+          }
+          run_ended = true;
+          break;
+        }
+        Row candidate = candidate_chunk.RowAt(0);
+        const RowPosition candidate_position = candidate_chunk.PositionAt(0);
+        const bool equal = ArePrefixEqual(first, candidate);
+        if (sort_error_ != Status::kSuccess) {
+          return FailWith(sort_error_);
+        }
+        if (!equal) {
+          pending_row_ = std::move(candidate);
+          pending_position_ = candidate_position;
+          has_pending_ = true;
+          run_ended = true;
+          break;
+        }
+        buffered.emplace_back(std::move(candidate), candidate_position);
+      }
+      if (run_ended) {
+        remaining_skip_ -= (1 + buffered.size());
+        ++skipped_runs_;
+        continue;
+      }
+      pending_row_ = std::move(first);
+      pending_position_ = first_position;
+    }
+    if (remaining_skip_ == 0 && singleton_passthrough_ &&
         pending_row_.Count() == schema_.ColumnCount()) {
       Row first = std::move(pending_row_);
       const RowPosition first_position = pending_position_;
@@ -208,8 +256,9 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         if (FailWithChildOf(*source_)) {
           return false;
         }
-        if (const Status st = ObserveSingleton(first); !st.ok()) { return FailWith(st);
-}
+        if (const Status st = ObserveSingleton(first); !st.ok()) {
+          return FailWith(st);
+        }
         *dst = std::move(first);
         if (rp != nullptr) {
           *rp = first_position;
@@ -227,8 +276,9 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         pending_row_ = std::move(candidate);
         pending_position_ = candidate_position;
         has_pending_ = true;
-        if (const Status st = ObserveSingleton(first); !st.ok()) { return FailWith(st);
-}
+        if (const Status st = ObserveSingleton(first); !st.ok()) {
+          return FailWith(st);
+        }
         *dst = std::move(first);
         if (rp != nullptr) {
           *rp = first_position;
@@ -238,10 +288,11 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
       }
       pending_row_ = std::move(first);
       pending_position_ = first_position;
-      second.emplace(std::move(candidate), candidate_position);
+      buffered.emplace_back(std::move(candidate), candidate_position);
     }
     auto run = std::make_shared<PrefixRun>(
-        source_, std::move(pending_row_), pending_position_, std::move(second),
+        source_, std::move(pending_row_), pending_position_,
+        std::move(buffered),
         [this](const Row& a, const Row& b) -> StatusOr<bool> {
           const bool equal = ArePrefixEqual(a, b);
           if (sort_error_ != Status::kSuccess) {
@@ -259,7 +310,21 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
     // peer group. Only that group, rather than the entire child, is consumed.
     SortExecutor::Options options;
     options.collation_domains = suffix_orders_;
-    group_sort_ = std::make_shared<SortExecutor>(run, schema_, suffix_keys_, 1, std::move(options));
+    group_sort_ = std::make_shared<SortExecutor>(run, schema_, suffix_keys_, 1,
+                                                 std::move(options));
+    while (remaining_skip_ > 0) {
+      DataChunk skip_chunk;
+      const size_t skipped =
+          group_sort_->NextBatch(&skip_chunk, remaining_skip_);
+      if (skipped == 0) {
+        if (FailWithChildOf(*group_sort_)) {
+          return false;
+        }
+        group_sort_.reset();
+        break;
+      }
+      remaining_skip_ -= skipped;
+    }
   }
 }
 
@@ -284,6 +349,16 @@ void IncrementalSortExecutor::EnsureMaterialized() {
 }
 
 void IncrementalSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
+
+bool IncrementalSortExecutor::TryPushOffset(size_t offset) {
+  constexpr size_t kMaxPushedRunOffset = 65536;
+  if (offset == 0 || offset > kMaxPushedRunOffset || materialized_ ||
+      remaining_skip_ != 0 || !singleton_passthrough_) {
+    return false;
+  }
+  remaining_skip_ = offset;
+  return true;
+}
 
 size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
                                           size_t max_rows) {

@@ -136,6 +136,7 @@ ARRAY<STRUCT<year INT64, product STRING, quarter STRING, amount INT64>>[
 ]
 ==
 
+[required_features=SQL_GRAPH]
 [prepare_database]
 CREATE TABLE Person (id INT64, name STRING);
 INSERT INTO Person VALUES

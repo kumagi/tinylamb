@@ -244,6 +244,19 @@ TEST(DataChunkTest, ZoneMap_ArrayValuesCountedOnColumnAppendPath) {
   EXPECT_TRUE(zone.MayMatch(BinaryOperation::kEquals, Value(1)));
 }
 
+TEST(DataChunkTest, ZoneMap_NaNWithSingleFiniteValueRetainsNotEquals) {
+  // Fuzz-found (zone_map_scan_filter_fuzzer): when a zone contains {1.0, NaN},
+  // minimum == maximum == 1.0, yet `NaN != 1.0` is TRUE under IEEE-754 /
+  // GoogleSQL semantics. MayMatch(kNotEquals, 1.0) must not prune the block.
+  ZoneMap zone;
+  zone.AddDouble(1.0);
+  zone.AddDouble(std::numeric_limits<double>::quiet_NaN());
+  EXPECT_TRUE(zone.MayMatch(BinaryOperation::kNotEquals, Value(1.0)));
+  EXPECT_TRUE(zone.MayMatch(BinaryOperation::kEquals, Value(1.0)));
+  EXPECT_FALSE(zone.MayMatch(BinaryOperation::kGreaterThan, Value(1.0)));
+  EXPECT_FALSE(zone.MayMatch(BinaryOperation::kLessThan, Value(1.0)));
+}
+
 TEST(DataChunkTest, ZoneMap_NaNDoesNotPoisonEnvelope) {
   // PRODUCTION BUG (fixed): a leading NaN made min/max (NaN, NaN), so
   // MayMatch pruned batches that actually contained matching rows.

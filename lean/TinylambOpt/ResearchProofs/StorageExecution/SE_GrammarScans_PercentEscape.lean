@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace PercentEscape
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.PercentEscape
+theorem sound_LoneIntroducer : LoneIntroducer.Goal := Common.sound_PercentEscape_LoneIntroducer
+theorem sound_EscapeAcrossBoundary : EscapeAcrossBoundary.Goal := Common.sound_PercentEscape_EscapeAcrossBoundary
+end PercentEscape
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

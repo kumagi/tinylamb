@@ -25,6 +25,7 @@
 #include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -805,10 +806,27 @@ bool FactorAndEnvelopeOneSelect(SelectStatement* stmt,
     }
   };
 
+  Schema combined_schema;
+  if (all_base_rels) {
+    std::vector<Column> combined_cols;
+    for (const ResolvedBaseRel& rel : rels) {
+      for (size_t ci = 0; ci < rel.schema.ColumnCount(); ++ci) {
+        Column col = rel.schema.GetColumn(ci);
+        col.Name() = ColumnName(rel.qualifier, col.Name().name);
+        combined_cols.push_back(std::move(col));
+      }
+    }
+    combined_schema = Schema("", std::move(combined_cols));
+  }
+
   for (const Expression& conj : orig_conjuncts) {
     const std::vector<Expression> branches = SplitOrDisjuncts(conj);
+    const bool error_free_for_factor =
+        all_base_rels
+            ? AuditIsErrorFreePredicateForOrdering(conj, combined_schema)
+            : ExpressionCannotThrowForPlanner(conj);
     if (branches.size() < 2 || ExprHasParamOrSubqueryOrVolatile(conj) ||
-        ExprContainsAggregateNode(conj)) {
+        ExprContainsAggregateNode(conj) || !error_free_for_factor) {
       new_conjuncts.push_back(conj);
       continue;
     }

@@ -42,17 +42,47 @@ struct DictFilterMask {
   std::array<uint64_t, 4> allowed{};
 };
 
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesA.lean
+//     (Product, SaturatingLoss, Distance, BucketSum, FloorRatio: SoundInterval,
+//      SkipRange, TakeAll)
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesB.lean
+//     (WrappedSum, BitwiseXor, CappedPair: SoundInterval, SkipRange, TakeAll)
+struct DerivedZoneCompare {
+  enum class Kernel : uint8_t {
+    kAdd = 0,        // col_a + col_b <op> const
+    kSub,            // col_a - col_b <op> const
+    kMul,            // col_a * col_b <op> const
+    kAbsDiff,        // ABS(col_a - col_b) <op> const
+    kFloorDiv,       // DIV(col_a, col_b) <op> const (a >= 0, b > 0)
+    kBitXor,         // col_a ^ col_b <op> const (a >= 0, b >= 0)
+    kMin,            // LEAST(col_a, col_b) <op> const
+    kMax,            // GREATEST(col_a, col_b) <op> const
+    kSaturatingSub,  // GREATEST(col_a - col_b, 0) <op> const
+  };
+  int64_t int_constant{0};
+  double double_constant{0.0};
+  slot_t col_a{0};
+  slot_t col_b{0};
+  BinaryOperation op{BinaryOperation::kEquals};
+  Kernel kernel{Kernel::kAdd};
+  bool is_double{false};
+};
+
 struct ColumnarPredicateSet {
   std::vector<TypedFilterCompare> compares;
   std::vector<TypedInListCompare> inlists;
   std::vector<TypedNullCompare> nulls;
+  std::vector<DerivedZoneCompare> derived_compares;
   std::vector<ContainsPrecheck> contains_prechecks;
   std::vector<DictFilterMask> dict_masks;
+  std::vector<uint8_t> col_dict_mask_covers_const;
   std::vector<uint8_t> col_referenced;
   std::vector<uint8_t> col_needs_varchar_bytes;
 
   [[nodiscard]] bool Empty() const noexcept {
-    return compares.empty() && inlists.empty() && nulls.empty();
+    return compares.empty() && inlists.empty() && nulls.empty() &&
+           derived_compares.empty();
   }
 };
 
@@ -78,6 +108,17 @@ bool RowMatchesColPtrs(
     const ColumnarPredicateSet& preds,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
     uint32_t row) noexcept;
+
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesA.lean
+//     (Product, SaturatingLoss, Distance, BucketSum: TakeAll)
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesB.lean
+//     (WrappedSum: TakeAll)
+// True when every predicate in `preds` is statically guaranteed to hold on
+// every row of the decoded block (no NULLs and interval strictly inside).
+bool BlockSatisfiesAllColumnarPredicates(
+    const ColumnarPredicateSet& preds,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs) noexcept;
 
 // When refine is true, filter strictly increasing candidate indices in place.
 // Otherwise, emit matching row indices for the full decoded block.

@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace CStringEnd
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.CStringEnd
+theorem sound_TruncateAtTerminator : TruncateAtTerminator.Goal := Common.sound_CStringEnd_TruncateAtTerminator
+theorem sound_OneTerminator : OneTerminator.Goal := Common.sound_CStringEnd_OneTerminator
+end CStringEnd
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

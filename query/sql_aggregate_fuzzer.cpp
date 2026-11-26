@@ -13,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -166,6 +167,26 @@ bool CellAlmostEqual(const std::string& lhs, const std::string& rhs,
                      double row_scale = 1.0) {
   if (lhs == rhs) {
     return true;
+  }
+  if (rhs.starts_with("|ANY{") && rhs.ends_with("}|")) {
+    if (lhs.size() < 3 || lhs.front() != '|' || lhs.back() != '|') {
+      return false;
+    }
+    std::string_view choices(rhs);
+    choices.remove_prefix(5);
+    choices.remove_suffix(2);
+    const std::string_view actual(lhs.data() + 1, lhs.size() - 2);
+    while (!choices.empty()) {
+      const size_t end = choices.find(';');
+      if (end == std::string_view::npos) {
+        return false;
+      }
+      if (choices.substr(0, end) == actual) {
+        return true;
+      }
+      choices.remove_prefix(end + 1);
+    }
+    return false;
   }
   const auto parse_any = [](const std::string& cell,
                             bool* float_shaped) -> std::optional<double> {
@@ -438,6 +459,7 @@ struct AggSpec {
     kSum,
     kMin,
     kMax,
+    kAnyValue,
     kCountDistinct,
     kSumDistinct,
     kAvg,
@@ -670,6 +692,27 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
         }
       }
       return FmtInt(static_cast<int64_t>(seen.size()));
+    }
+    case AggSpec::Kind::kAnyValue: {
+      // The generator uses INT64 and the strings "x" and "yy" here.
+      // Record the group's eligible values for both live and replay checks.
+      std::set<int64_t> candidates;
+      for (const MRow& row : rows) {
+        const int64_t value = CellOf(row, spec.col);
+        if (value != kNullRepr) {
+          candidates.insert(value);
+        }
+      }
+      if (candidates.empty()) {
+        return "NULL";
+      }
+      std::string cell = "|ANY{";
+      for (int64_t value : candidates) {
+        const auto formatted =
+            IsStrCol(spec.col) ? FmtStr(value) : FmtInt(value);
+        cell += formatted.substr(1, formatted.size() - 2) + ";";
+      }
+      return cell + "}|";
     }
     case AggSpec::Kind::kMin:
     case AggSpec::Kind::kMax: {
@@ -1079,12 +1122,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         aggs.push_back({"COUNT(f)", 3, AggSpec::Kind::kCount});
       }
       if (g.Chance(30)) {
-        // ANY_VALUE normalizes to MIN in the frontend, so the mirror can
-        // reuse the kMin computation verbatim.  With a HAVING MIN/MAX
-        // modifier this is the argmin/argmax idiom.
         const int acol = g.Pick(0, 2);
-        aggs.push_back(
-            {"ANY_VALUE(" + ColName(acol) + ")", acol, AggSpec::Kind::kMin});
+        aggs.push_back({"ANY_VALUE(" + ColName(acol) + ")", acol,
+                        AggSpec::Kind::kAnyValue});
       }
       if (g.Chance(15)) {
         aggs.push_back({"AVG(DISTINCT f)", 3, AggSpec::Kind::kAvgDistinct});
@@ -2040,7 +2080,8 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
            std::string(pre.GetMessage()) + "\n";
   }
   ctx = db.BeginContext();
-  const char* prev_route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   const int num_passes = large ? 2 : 4;
   for (int pass = 0; pass < num_passes; ++pass) {
@@ -2108,6 +2149,47 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
 
+  // TLCS-compacted storage cross-check: compact `t` into immutable `.tlcs`
+  // columnar blocks and re-verify every recorded query against the mirror.
+  if (report.empty() && ctx.txn_.PreCommit() == Status::kSuccess) {
+    ctx = db.BeginContext();
+    if (const Status cmp =
+            db.CompactTableToTlcs(ctx, "t", /*write_checkpoint=*/false,
+                                  /*refresh_statistics=*/false);
+        cmp != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] CompactTableToTlcs failed: " +
+             std::string(cmp.GetMessage()) + "\n";
+    }
+    if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] PreCommit after TLCS compaction: " +
+             std::string(pre.GetMessage()) + "\n";
+    }
+    ctx = db.BeginContext();
+    for (const AggQueryExpect& qe : t.queries) {
+      std::string error;
+      auto got = RunQuery(db, ctx, qe.sql, &error);
+      if (!got.has_value()) {
+        return "[AGGREGATE-TLCS MISMATCH] " + qe.sql +
+               "\n  re-verification query failed: " + error + "\n";
+      }
+      const std::vector<std::string> actual = FormatRows(*got);
+      std::vector<std::string> expected = qe.expected;
+      std::sort(expected.begin(), expected.end());
+      if (actual != expected && !RowsAlmostEqual(actual, expected)) {
+        report += "[AGGREGATE-TLCS MISMATCH] " + qe.sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
+
   // IEEE-754 NaN + constant-value LSTable zone-map & window APPROX_QUANTILES
   // differential oracle (targeting 2026-11-10 audit High #4, #8, #9):
   // When all non-NaN values in a FLOAT64 column equal a single constant `c`,
@@ -2156,7 +2238,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
              std::string(status.GetMessage());
     }
     ctx = db.BeginContext();
-    const std::array<std::pair<std::string, std::string>, 4> nan_probes = {{
+    const std::array<std::pair<std::string, std::string>, 6> nan_probes = {{
         {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit + ";",
          "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit + ";"},
         {"SELECT a, COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit +
@@ -2169,6 +2251,14 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
          "t_nan_heap ORDER BY u;",
          "SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
          "t_nan_lst ORDER BY u;"},
+        {"SELECT u, a FROM t_nan_heap QUALIFY "
+         "ROW_NUMBER() OVER (PARTITION BY a ORDER BY u) = 1 ORDER BY u;",
+         "SELECT u, a FROM t_nan_lst QUALIFY "
+         "ROW_NUMBER() OVER (PARTITION BY a ORDER BY u) = 1 ORDER BY u;"},
+        {"SELECT h1.a, ARRAY_AGG(h2.u ORDER BY h2.u) FROM t_nan_heap h1 "
+         "JOIN t_nan_heap h2 ON h1.a = h2.a GROUP BY h1.a ORDER BY h1.a;",
+         "SELECT l1.a, ARRAY_AGG(l2.u ORDER BY l2.u) FROM t_nan_lst l1 "
+         "JOIN t_nan_lst l2 ON l1.a = l2.a GROUP BY l1.a ORDER BY l1.a;"},
     }};
     for (const auto& [q_heap, q_lst] : nan_probes) {
       std::string err_h, err_l;
@@ -2285,7 +2375,8 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       !rep.empty()) {
     return rep;
   }
-  const char* prev_route = ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
+  const char* prev_route =
+      ::tinylamb::platform::GetEnv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
   // Restore on every exit path (including exceptions) so the override cannot
@@ -2314,6 +2405,24 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
     platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
   } else {
     platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+  }
+
+  // TLCS-compacted storage cross-check on replay.
+  if (rep.empty() && ctx.txn_.PreCommit() == Status::kSuccess) {
+    ctx = db.BeginContext();
+    if (const Status cmp =
+            db.CompactTableToTlcs(ctx, "t", /*write_checkpoint=*/false,
+                                  /*refresh_statistics=*/false);
+        cmp != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] CompactTableToTlcs on replay: " +
+             std::string(cmp.GetMessage()) + "\n";
+    }
+    if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+      return "[AGG FUZZ SETUP ERROR] PreCommit after replay TLCS compaction: " +
+             std::string(pre.GetMessage()) + "\n";
+    }
+    ctx = db.BeginContext();
+    rep = check_all("[AGGREGATE-TLCS REPLAY MISMATCH]");
   }
   return rep;
 }

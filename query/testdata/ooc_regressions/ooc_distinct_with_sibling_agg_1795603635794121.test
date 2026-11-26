@@ -1,0 +1,8 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795603635794121
+-- profile: pool=0 columnar=0 opmem=16384 spill=0 temp=0 route=0
+-- failure: query fails under memory pressure but runs without it [distinct] | stream: TooBigData :: op 3 `q ord=0 heavy=0 take=-1 nv=1 vs=995594181 ex=0 snap=0 :: SELECT COUNT(DISTINCT v) AS c1, MIN(k) AS c2 FROM t2`: query fails under memory pressure but runs without it [distinct]: SELECT COUNT(DISTINCT v) AS c1, MIN(k) AS c2 FROM t2 |   stream: TooBigData: Single aggregate group exceeds operator memory budget Single aggregate group exceeds operator memory budget |   knobs {opmem=16384 spill=0 temp=0 route=0}
+create t2 49 96 781
+ins_bulk t2 48 388 773
+ins_bulk t2 389 654 936
+q ord=0 heavy=0 take=-1 nv=1 vs=995594181 ex=0 snap=0 :: SELECT COUNT(DISTINCT v) AS c1, MIN(k) AS c2 FROM t2

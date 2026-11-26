@@ -1182,7 +1182,7 @@ private theorem tieCount_multiplicity (x : Series) :
         simp [hca] at hfa
         have hchoose := choose2_succ (xs.count a)
         rw [hfa, hchoose]
-        rfl
+        omega
       · have hmem : a ∉ xs := by
           intro hm
           exact hca (List.contains_iff_mem.mpr (List.mem_eraseDups.mpr hm))

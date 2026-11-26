@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace AsciiOnly
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.AsciiOnly
+theorem sound_RejectEarly : RejectEarly.Goal := Common.sound_AsciiOnly_RejectEarly
+theorem sound_SevenBitFastPath : SevenBitFastPath.Goal := Common.sound_AsciiOnly_SevenBitFastPath
+end AsciiOnly
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

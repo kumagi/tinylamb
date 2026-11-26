@@ -1,0 +1,11 @@
+import TinylambOpt.ResearchProofs.Atlas.RangePlans3
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.Atlas.Goal_RangePlans_EitherEndpointInside_UnionAnti
+
+theorem sound : TinylambOpt.ResearchGoals.Atlas.RangePlans.EitherEndpointInside.UnionAnti.Goal :=
+  TinylambOpt.ResearchProofs.Atlas.RangePlans3.sound_EitherEndpointInside_UnionAnti
+
+end TinylambOpt.ResearchProofs.Atlas.Goal_RangePlans_EitherEndpointInside_UnionAnti

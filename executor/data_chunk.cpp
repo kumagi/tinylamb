@@ -277,7 +277,7 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
     Append(source.ValueAt(index));
     return;
   }
-  if (!is_null && type_ == ValueType::kNull) {
+  if (type_ == ValueType::kNull && source.type_ != ValueType::kNull) {
     type_ = source.type_;
     unsigned_ = source.unsigned_;
     MaterializeInferredStorage();
@@ -291,8 +291,9 @@ void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
     }
     CHECK_MSG(false, "column vector type mismatch");
   }
-  if (!is_null && type_ == ValueType::kVarChar && source.type_ == ValueType::kVarChar) {
-    if (observed_collation_ && collation_ != source.ColumnCollation()) {
+  if (type_ == ValueType::kVarChar && source.type_ == ValueType::kVarChar) {
+    if (!is_null && observed_collation_ &&
+        collation_ != source.ColumnCollation()) {
       Append(source.ValueAt(index));
       return;
     }

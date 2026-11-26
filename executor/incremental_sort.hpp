@@ -43,6 +43,11 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
   void Dump(std::ostream& o, int indent) const override;
   void Explain(std::ostream& o, int indent) const override;
 
+  // EngineDecisions.Executor.RunOffset: push a downstream OFFSET so entire
+  // prefix-peer runs covered by the offset are skipped without sorting.
+  bool TryPushOffset(size_t offset);
+  [[nodiscard]] size_t SkippedRuns() const noexcept { return skipped_runs_; }
+
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
   void MaterializePipeline() override;
@@ -80,6 +85,8 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
   bool input_exhausted_{false};
   bool singleton_passthrough_{false};
   size_t singleton_runs_{0};
+  size_t remaining_skip_{0};
+  size_t skipped_runs_{0};
 };
 
 }  // namespace tinylamb

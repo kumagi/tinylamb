@@ -5,10 +5,12 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/join_kind.hpp"
+#include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 #include "page/row_position.hpp"
@@ -37,8 +39,15 @@ class ApplyExecutor final : public ExecutorBase {
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
+  [[nodiscard]] size_t DemandCacheHits() const noexcept {
+    return demand_cache_hits_;
+  }
 
  private:
+  struct DemandVerdict {
+    Status status{Status::kSuccess};
+    bool matched{false};
+  };
   bool NextRow(Row* dst, RowPosition* rp);
   TransactionContext& context_;
   Schema outer_schema_;
@@ -67,6 +76,11 @@ class ApplyExecutor final : public ExecutorBase {
 
   std::vector<Row> static_inner_rows_;
   bool static_inner_cached_{false};
+
+  // EngineDecisions.Executor.DemandCache: per-outer-row verdict cache for
+  // pure correlated SEMI/ANTI filters, preserving first-demanded fault order.
+  std::unordered_map<std::string, DemandVerdict> demand_cache_;
+  size_t demand_cache_hits_{0};
 };
 
 }  // namespace tinylamb

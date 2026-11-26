@@ -439,9 +439,14 @@ TEST_F(TpcdsQueryTest, LimitedQueriesUseBoundedFinishPath) {
     }
     const std::string plan = DumpSql(query.sql);
     SCOPED_TRACE(query.name);
+    constexpr std::string_view counter = "topn_finish_uses=";
+    const auto pos = plan.find(counter);
+    const bool used_topn =
+        pos != std::string::npos &&
+        plan.find_first_of("123456789", pos + counter.size()) ==
+            pos + counter.size();
     EXPECT_TRUE(plan.find("TopNFinish") != std::string::npos ||
-                plan.find("TopN (") != std::string::npos ||
-                plan.find("topn_finish_uses=1") != std::string::npos ||
+                plan.find("TopN (") != std::string::npos || used_topn ||
                 plan.find("Limit: ") != std::string::npos ||
                 plan.find("Limit count=") != std::string::npos)
         << plan;

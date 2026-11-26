@@ -393,8 +393,9 @@ class Transaction final {
     // now points at the new object, so keep the flags observable there.
     o.wounded_.store(false, std::memory_order_release);
     o.abort_started_.store(false, std::memory_order_release);
-    catalog_dirty_ = o.catalog_dirty_;
-    o.catalog_dirty_ = false;
+    catalog_dirty_.store(o.catalog_dirty_.load(std::memory_order_acquire),
+                         std::memory_order_release);
+    o.catalog_dirty_.store(false, std::memory_order_release);
     return *this;
   }
 
@@ -743,8 +744,12 @@ class Transaction final {
   // T485: an Abort rolls those writes back without moving the schema-epoch
   // counter, so the abort path must bump the epoch for caches that were
   // stamped from the transaction-local catalog view to go stale.
-  void MarkCatalogDirty() noexcept { catalog_dirty_ = true; }
-  [[nodiscard]] bool IsCatalogDirty() const noexcept { return catalog_dirty_; }
+  void MarkCatalogDirty() noexcept {
+    catalog_dirty_.store(true, std::memory_order_release);
+  }
+  [[nodiscard]] bool IsCatalogDirty() const noexcept {
+    return catalog_dirty_.load(std::memory_order_acquire);
+  }
   // Diagnostic (round 9): where this transaction is currently parked, set
   // just before each potentially-blocking engine wait (write-intent wait,
   // tail reservation wait, durability barrier, undo walk, WAL append) and
@@ -886,6 +891,10 @@ class Transaction final {
   [[nodiscard]] bool IsTransactionActive(txn_id_t id) const {
     return transaction_manager_ != nullptr &&
            transaction_manager_->IsActive(id);
+  }
+  [[nodiscard]] bool HasOtherCatalogDirtyTransactions() const {
+    return transaction_manager_ != nullptr &&
+           transaction_manager_->HasOtherCatalogDirtyTransactions(txn_id_);
   }
   friend std::ostream& operator<<(std::ostream& o, const Transaction& t) {
     o << "Transaction(id=" << t.txn_id_ << ", status=" << t.status_
@@ -1052,7 +1061,7 @@ class Transaction final {
   std::atomic<bool> abort_started_{false};
   // Thread-confined (catalog writes hold Database::catalog_mu_); see
   // MarkCatalogDirty.
-  bool catalog_dirty_{false};
+  std::atomic<bool> catalog_dirty_{false};
   // Last write-intent acquisition failure reason (owner-thread confined).
   IntentWaitFailure intent_wait_failure_{IntentWaitFailure::kNone};
   Status write_set_failure_status_{Status::kSuccess};

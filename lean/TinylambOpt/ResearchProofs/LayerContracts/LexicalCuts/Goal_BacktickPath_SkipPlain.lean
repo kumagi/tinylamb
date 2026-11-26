@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
+import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Common
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_BacktickPath_SkipPlain
+
+open TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
+open TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Common
+
+theorem refute : ¬ BacktickPath.SkipPlain.Goal := by
+  intro h
+  have hr : reachable BacktickPath.model 2 := ⟨[Sym.tick, Sym.slash], by native_decide⟩
+  have hh := h 2 [Sym.atom] hr (by decide)
+  have hneq : scan BacktickPath.model 2 [Sym.atom] ≠ (2,[]) := by native_decide
+  exact hneq hh
+
+end TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_BacktickPath_SkipPlain

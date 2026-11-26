@@ -2944,11 +2944,11 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     return std::nullopt;
   }
   // Validate the calendar date and clock fields: TimeGm below normalizes
-  // out-of-range fields like mktime, so 2026-02-29 used to roll silently to
-  // March 1 and second=60 (leap second) used to advance a minute. BigQuery
-  // rejects both.
+  // out-of-range fields like mktime, so 2026-02-29 must be rejected by ymd.ok()
+  // while second=60 (leap second) is accepted per GoogleSQL civil_time.test
+  // and rolls forward into the next minute with subseconds preserved.
   if (Y < 1 || Y > 9999 || M < 1 || M > 12 || h < 0 || h > 23 || m < 0 ||
-      m > 59 || seconds < 0 || seconds >= 60) {
+      m > 59 || seconds < 0 || seconds > 60) {
     return std::nullopt;
   }
   {

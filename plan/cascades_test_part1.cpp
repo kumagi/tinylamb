@@ -905,13 +905,14 @@ TEST(CascadesTest, PushSelectionThroughJoinMovesSingleRelationConjuncts) {
 }
 
 TEST(CascadesTest, JoinEnumerationPrunesDisconnectedBipartitions) {
-  // Arrange: a connected conjunct between a and b only; associativity rules
-  // are removed so the root count isolates join_enumeration's pruning.
-  std::vector<ConjunctInfo> conjuncts;
-  conjuncts.push_back(
+  // In the chain a-b-c, the proposed child {a,c} is disconnected.
+  std::vector<ConjunctInfo> conjuncts{
       {BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kEquals,
                            ColumnValueExp("b.y")),
-       {"a", "b"}});
+       {"a", "b"}},
+      {BinaryExpressionExp(ColumnValueExp("b.y"), BinaryOperation::kEquals,
+                           ColumnValueExp("c.z")),
+       {"b", "c"}}};
   Memo pruned;
   const GroupId pruned_root = pruned.Build({"a", "b", "c"}, conjuncts);
   Memo exhaustive;
@@ -926,12 +927,21 @@ TEST(CascadesTest, JoinEnumerationPrunesDisconnectedBipartitions) {
   pruned_search.Explore(pruned_root);
   exhaustive_search.Explore(exhaustive_root);
 
-  // Assert: the {a,b}|{c} cut carries no conjunct and is pruned; the fully
-  // disconnected graph keeps exhaustive enumeration.
-  EXPECT_EQ(pruned_search.GetMemo().ExpressionCount(pruned_root), 2U);
-  // The disconnected graph retains the six inner join shapes plus their
-  // explicit CrossJoin alternatives.
-  EXPECT_EQ(exhaustive_search.GetMemo().ExpressionCount(exhaustive_root), 6U);
+  auto has_disconnected_child = [](const Memo& memo, GroupId root) {
+    for (const auto& expr : memo.Get(root).expressions) {
+      for (const auto child : expr.children) {
+        if (memo.Get(child).relations == std::vector<std::string>{"a", "c"}) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  EXPECT_FALSE(has_disconnected_child(pruned_search.GetMemo(), pruned_root));
+  EXPECT_TRUE(
+      has_disconnected_child(exhaustive_search.GetMemo(), exhaustive_root));
+  EXPECT_LT(pruned_search.GetMemo().ExpressionCount(pruned_root),
+            exhaustive_search.GetMemo().ExpressionCount(exhaustive_root));
 }
 
 TEST(CascadesTest, JoinEnumerationKeepsChainSplitsConnected) {

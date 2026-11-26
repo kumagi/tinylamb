@@ -1,0 +1,11 @@
+import TinylambOpt.ResearchProofs.Atlas.RangePlans3
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.Atlas.Goal_RangePlans_EitherEndpointInside_PrefixIndex
+
+theorem sound : TinylambOpt.ResearchGoals.Atlas.RangePlans.EitherEndpointInside.PrefixIndex.Goal :=
+  TinylambOpt.ResearchProofs.Atlas.RangePlans3.EitherEndpointInsideProofs.sound_EitherEndpointInside_PrefixIndex
+
+end TinylambOpt.ResearchProofs.Atlas.Goal_RangePlans_EitherEndpointInside_PrefixIndex

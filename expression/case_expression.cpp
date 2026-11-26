@@ -77,7 +77,6 @@ StatusOr<Value> TryPickBranch(
 }
 }  // namespace
 
-
 namespace {
 
 bool IsNullLiteral(const Expression& expression) {
@@ -113,8 +112,8 @@ Type UnifiedBranchType(std::vector<Type> branch_types) {
   if (all_same) {
     return first;
   }
-  const bool all_numeric = std::ranges::all_of(
-      branch_types, [](const Type& type) {
+  const bool all_numeric =
+      std::ranges::all_of(branch_types, [](const Type& type) {
         return type.GetType() == TypeTag::kInteger ||
                type.GetType() == TypeTag::kBigInt ||
                type.GetType() == TypeTag::kDouble;
@@ -156,10 +155,9 @@ StatusOr<Value> CaseExpression::TryEvaluate(const Row* left,
                                             const Schema& left_schema,
                                             const Row* right,
                                             const Schema& right_schema) const {
-  return CoerceCaseBranch(
-      TryPickBranch(when_clauses_, else_clause_.get(), left, left_schema,
-                    right, right_schema),
-      ResultType(left_schema, right_schema));
+  return CoerceCaseBranch(TryPickBranch(when_clauses_, else_clause_.get(), left,
+                                        left_schema, right, right_schema),
+                          ResultType(left_schema, right_schema));
 }
 
 // Context-aware form: same dispatch as the plain evaluator with the context
@@ -195,11 +193,17 @@ Type CaseExpression::ResultType(const Schema& schema) const {
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
     if (when.second != nullptr && !IsNullLiteral(when.second)) {
-      branch_types.push_back(when.second->ResultType(schema));
+      const tinylamb::Type branch_type = when.second->ResultType(schema);
+      if (branch_type.GetType() != TypeTag::kInvalid) {
+        branch_types.push_back(branch_type);
+      }
     }
   }
   if (else_clause_ && !IsNullLiteral(else_clause_)) {
-    branch_types.push_back(else_clause_->ResultType(schema));
+    const tinylamb::Type else_type = else_clause_->ResultType(schema);
+    if (else_type.GetType() != TypeTag::kInvalid) {
+      branch_types.push_back(else_type);
+    }
   }
   return UnifiedBranchType(std::move(branch_types));
 }
@@ -209,11 +213,17 @@ Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
     if (when.second != nullptr && !IsNullLiteral(when.second)) {
-      branch_types.push_back(when.second->ResultType(left, right));
+      const tinylamb::Type branch_type = when.second->ResultType(left, right);
+      if (branch_type.GetType() != TypeTag::kInvalid) {
+        branch_types.push_back(branch_type);
+      }
     }
   }
   if (else_clause_ && !IsNullLiteral(else_clause_)) {
-    branch_types.push_back(else_clause_->ResultType(left, right));
+    const tinylamb::Type else_type = else_clause_->ResultType(left, right);
+    if (else_type.GetType() != TypeTag::kInvalid) {
+      branch_types.push_back(else_type);
+    }
   }
   return UnifiedBranchType(std::move(branch_types));
 }

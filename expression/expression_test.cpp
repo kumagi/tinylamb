@@ -864,7 +864,7 @@ TEST(ExpressionTest, CaseResultTypeIgnoresOnlyLiteralNullBranches) {
   }
   const auto parameter = std::make_shared<ParameterSlot>(0, Value());
   const auto parameter_case = CaseExpressionExp({{yes, number}}, parameter);
-  EXPECT_EQ(parameter_case->ResultType(schema).GetType(), TypeTag::kInvalid);
+  EXPECT_EQ(parameter_case->ResultType(schema).GetType(), TypeTag::kDouble);
   parameter->Bind(Value("text"));
   EXPECT_EQ(parameter_case->ResultType(schema).GetType(), TypeTag::kInvalid);
   EXPECT_EQ(
@@ -873,7 +873,7 @@ TEST(ExpressionTest, CaseResultTypeIgnoresOnlyLiteralNullBranches) {
   EXPECT_EQ(CaseExpressionExp({{yes, number}}, ConstantValueExp(Value(0)))
                 ->ResultType(schema)
                 .GetType(),
-            TypeTag::kInvalid);
+            TypeTag::kDouble);
 }
 
 TEST(ExpressionTest, CaseExpression_Inspect_ReturnsTouchedColumnsAndString) {
@@ -2602,7 +2602,7 @@ TEST(ExpressionTest, Expression_PathologicalPatterns_EvaluatesCorrectly) {
       BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
                           BinaryOperation::kDivide,
                           ConstantValueExp(Value(int64_t{0}))));
-  EXPECT_EQ(case_safe->Evaluate(dummy, dummy_schema), Value(int64_t{42}));
+  EXPECT_EQ(case_safe->Evaluate(dummy, dummy_schema), Value(42.0));
 
   Expression and_safe = BinaryExpressionExp(
       ConstantValueExp(Value(0)), BinaryOperation::kAnd,

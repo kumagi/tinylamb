@@ -3071,10 +3071,20 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           }
           if (ordinal >= 1 && ordinal <= projections.size() &&
               projections[ordinal - 1].expression) {
-            order_by.push_back(
-                {ReapplyCollation(projections[ordinal - 1].expression,
-                                  parsed.expression),
-                 parsed.ascending, parsed.nulls_first});
+            if (AmbiguousOrderByName(projections,
+                                     projections[ordinal - 1].expression)
+                    .has_value()) {
+              // Keeping the ordinal avoids turning `SELECT u, u ... ORDER BY 1`
+              // into an ambiguous bare `u` lookup against the duplicate output
+              // schema in the relational route.
+              order_by.push_back({std::move(parsed.expression),
+                                  parsed.ascending, parsed.nulls_first});
+            } else {
+              order_by.push_back(
+                  {ReapplyCollation(projections[ordinal - 1].expression,
+                                    parsed.expression),
+                   parsed.ascending, parsed.nulls_first});
+            }
             continue;
           }
           return AstError<std::shared_ptr<SelectStatement>>(
@@ -3680,6 +3690,13 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       const GroupingSetBranchContext context = key_texts.ForBranch(active);
       const std::unordered_set<std::string> inactive_aliases =
           inactive_bare_key_aliases(context);
+      std::unordered_set<std::string> active_aliases;
+      for (const Expression& key : active) {
+        if (key && key->Type() == TypeTag::kColumnValue &&
+            key->AsColumnValue().GetColumnName().schema.empty()) {
+          active_aliases.insert(Lower(key_texts.TextOf(key)));
+        }
+      }
       // Select list: NULL-pad entries that reference inactive keys (direct
       // fingerprint match or alias match), fold GROUPING() to constants.
       std::vector<NamedExpression> rewritten_list;
@@ -3691,7 +3708,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         }
         const std::string entry_text = item.expression->ToString();
         const bool entry_is_active =
-            context.active_key_texts.contains(entry_text);
+            context.active_key_texts.contains(entry_text) ||
+            (!item.name.empty() && active_aliases.contains(Lower(item.name)));
         const bool entry_is_inactive_key =
             !entry_is_active && context.all_key_texts.contains(entry_text);
         const bool entry_aliases_inactive_key =
@@ -3699,6 +3717,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
             !entry_is_active;
         if (entry_is_inactive_key || entry_aliases_inactive_key) {
           rewritten_list.emplace_back(item.name, ConstantValueExp(Value()));
+          continue;
+        }
+        if (entry_is_active) {
+          rewritten_list.push_back(item);
           continue;
         }
         ASSIGN_OR_RETURN(Expression, rewritten,

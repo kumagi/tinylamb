@@ -1,0 +1,221 @@
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.Goal_GrammarScans_PercentEscape_RepeatedState
+
+open TinylambOpt.ResearchGoals.Compression.Wire
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.PercentEscape
+
+/-! Truth check on small inputs. Every tested `q` satisfies `q < reader.states`
+and the samples cover literals, concatenation, repetition, the empty phrase,
+percent signs, hex digits and non-hex bytes. -/
+
+private def samples : List Rope :=
+  [ .lit [], .lit [37], .lit [37, 52], .lit [37, 70, 65], .lit [37, 52, 70],
+    .lit [65, 37, 102], .lit [37, 37], .lit [37, 52, 70, 37],
+    .cat (.lit [37]) (.lit [52, 70]), .cat (.lit [65]) (.lit [37, 70]),
+    .rep 0 (.lit [37]), .rep 2 (.lit [37, 52]), .rep 3 (.lit []),
+    .rep 2 (.lit [37, 52, 70]), .rep 3 (.lit [37, 37]),
+    .cat (.rep 2 (.lit [37, 52])) (.lit [70]) ]
+
+private def check : Bool :=
+  samples.all fun x => (List.range 7).all fun n =>
+    (List.range reader.states).all fun q =>
+      applyT (power n (compile reader x)) q ==
+        ((List.replicate n (expand x)).flatten).foldl reader.step q
+
+#eval check
+
+example : check := by native_decide
+
+/-! ## Generic table / power correctness (self-contained) -/
+
+private theorem chain_length (a b : Table) : (chain a b).length = a.length := by
+  simp [chain]
+
+private theorem applyT_chain (a b : Table) (q : Nat) (hq : q < a.length) :
+    applyT (chain a b) q = applyT b (applyT a q) := by
+  have hq' : q < (chain a b).length := by simpa [chain_length] using hq
+  simp [applyT, chain, List.getElem?_eq_getElem hq', List.getElem?_eq_getElem hq]
+
+private theorem power_length (n : Nat) (t : Table) : (power n t).length = t.length := by
+  induction n using Nat.strongRecOn with
+  | _ n ih =>
+      by_cases hn : n = 0
+      · simp [power, hn]
+      · have hpos : 0 < n := by omega
+        have hhalf : (power (n / 2) t).length = t.length :=
+          ih (n / 2) (Nat.div_lt_self hpos (by decide : 1 < 2))
+        unfold power
+        rw [dif_neg hn]
+        dsimp only
+        by_cases heven : n % 2 == 0
+        · simp [heven, chain_length, hhalf]
+        · simp [heven, chain_length, hhalf]
+
+private theorem compile_length (x : Rope) : (compile reader x).length = reader.states := by
+  induction x with
+  | lit s => simp [compile]
+  | cat a b ihA ihB => simp [compile, chain_length, ihA]
+  | rep n a ihA =>
+      change (power n (compile reader a)).length = reader.states
+      rw [power_length]
+      exact ihA
+
+private theorem getD_range (i n : Nat) (hi : i < n) : (List.range n)[i]?.getD i = i := by
+  have hi' : i < (List.range n).length := by simpa using hi
+  simp [List.getElem?_eq_getElem hi']
+
+private theorem applyT_power_zero (t : Table) (q : Nat) (hq : q < t.length) :
+    applyT (power 0 t) q = q := by
+  simp [power, applyT, getD_range q t.length hq]
+
+private theorem foldl_append_step (xs ys : Bytes) (q : Nat) :
+    (xs ++ ys).foldl reader.step q = ys.foldl reader.step (xs.foldl reader.step q) := by
+  induction xs generalizing q with
+  | nil => simp
+  | cons x xs ih => simp [ih]
+
+private theorem replicate_succ_last (n : Nat) (xs : Bytes) :
+    List.replicate (n + 1) xs = List.replicate n xs ++ [xs] := by
+  induction n with
+  | zero => simp
+  | succ n ih =>
+      calc
+        List.replicate (Nat.succ n + 1) xs = xs :: List.replicate (n + 1) xs := by
+          rw [List.replicate_succ]
+        _ = xs :: (List.replicate n xs ++ [xs]) := by rw [ih]
+        _ = (xs :: List.replicate n xs) ++ [xs] := by rfl
+        _ = List.replicate (n + 1) xs ++ [xs] := by rw [List.replicate_succ]
+
+private theorem foldl_flatten_replicate_succ (n : Nat) (xs : Bytes) (q : Nat) :
+    ((List.replicate (n + 1) xs).flatten).foldl reader.step q =
+      xs.foldl reader.step (((List.replicate n xs).flatten).foldl reader.step q) := by
+  rw [replicate_succ_last]
+  simp [List.flatten_append]
+
+private theorem foldl_flatten_replicate_add (m n : Nat) (xs : Bytes) (q : Nat) :
+    ((List.replicate (m + n) xs).flatten).foldl reader.step q =
+      ((List.replicate n xs).flatten).foldl reader.step
+        (((List.replicate m xs).flatten).foldl reader.step q) := by
+  induction n generalizing q with
+  | zero => simp
+  | succ n ih =>
+      rw [show m + (n + 1) = (m + n) + 1 by omega]
+      rw [foldl_flatten_replicate_succ]
+      rw [ih]
+      rw [foldl_flatten_replicate_succ]
+
+/-! ## `PercentEscape.reader` specifics -/
+
+/-! The step function always stays inside the four-state dictionary: a `%`
+yields state 1, a hex digit advances 1 -> 2 -> 3 and otherwise resets to 0,
+and any other byte resets to 0. -/
+private theorem stepBounded : ∀ q b, q < reader.states → reader.step q b < reader.states := by
+  intro q b hq
+  have hq4 : q < 4 := by simpa [reader] using hq
+  simp [reader]
+  by_cases h37 : b = 37
+  · simp [h37]
+  · by_cases hhex : (48 ≤ b ∧ b ≤ 57 ∨ 65 ≤ b ∧ b ≤ 70) ∨ 97 ≤ b ∧ b ≤ 102
+    · by_cases hq12 : q = 1 ∨ q = 2
+      · simp [h37, hhex, hq12]
+        omega
+      · simp [h37, hhex, hq12]
+    · simp [h37, hhex]
+
+private theorem foldl_step_bounded (xs : Bytes) {q : Nat} (hq : q < reader.states) :
+    xs.foldl reader.step q < reader.states := by
+  induction xs generalizing q with
+  | nil => simpa
+  | cons x xs ih => exact ih (stepBounded q x hq)
+
+private theorem applyT_compile_eq_foldl (x : Rope) {q : Nat} (hq : q < reader.states) :
+    applyT (compile reader x) q = (expand x).foldl reader.step q := by
+  induction x generalizing q with
+  | lit s =>
+      have hq' : q < (List.range reader.states).length := by simpa using hq
+      simp [compile, applyT, expand, List.getElem?_eq_getElem hq']
+  | cat a b ihA ihB =>
+      have hqA' : (expand a).foldl reader.step q < reader.states :=
+        foldl_step_bounded (expand a) hq
+      rw [show compile reader (.cat a b) = chain (compile reader a) (compile reader b) by rfl]
+      rw [applyT_chain (compile reader a) (compile reader b) q (by rw [compile_length]; exact hq)]
+      rw [ihA hq, ihB hqA']
+      simp [expand, foldl_append_step]
+  | rep n a ihA =>
+      have hpow : ∀ m q, q < reader.states →
+          applyT (power m (compile reader a)) q =
+            ((List.replicate m (expand a)).flatten).foldl reader.step q := by
+        intro m
+        induction m using Nat.strongRecOn with
+        | _ m ihM =>
+            intro q hq
+            by_cases hm : m = 0
+            · subst m
+              simp [applyT_power_zero (compile reader a) q (by rw [compile_length]; exact hq)]
+            · have hpos : 0 < m := by omega
+              have hhalf : m / 2 < m := Nat.div_lt_self hpos (by decide : 1 < 2)
+              have ihH := ihM (m / 2) hhalf
+              unfold power
+              rw [dif_neg hm]
+              dsimp only
+              have hlen_h : (power (m / 2) (compile reader a)).length = reader.states := by
+                rw [power_length, compile_length]
+              have hHq : applyT (power (m / 2) (compile reader a)) q =
+                  ((List.replicate (m / 2) (expand a)).flatten).foldl reader.step q := ihH q hq
+              have hHqBound : ((List.replicate (m / 2) (expand a)).flatten).foldl reader.step q <
+                  reader.states := foldl_step_bounded _ hq
+              have hsq : applyT (chain (power (m / 2) (compile reader a))
+                                         (power (m / 2) (compile reader a))) q =
+                  ((List.replicate (m / 2 + m / 2) (expand a)).flatten).foldl reader.step q := by
+                rw [applyT_chain _ _ q (by rw [hlen_h]; exact hq)]
+                rw [hHq]
+                rw [show applyT (power (m / 2) (compile reader a))
+                        (((List.replicate (m / 2) (expand a)).flatten).foldl reader.step q) =
+                    ((List.replicate (m / 2) (expand a)).flatten).foldl reader.step
+                      (((List.replicate (m / 2) (expand a)).flatten).foldl reader.step q) from
+                  ihH _ hHqBound]
+                rw [foldl_flatten_replicate_add]
+              by_cases heven : m % 2 == 0
+              · rw [if_pos heven]
+                have hmzero : m % 2 = 0 := by simpa [beq_iff_eq] using heven
+                have hm2 : m / 2 + m / 2 = m := by omega
+                simpa [hm2] using hsq
+              · rw [if_neg heven]
+                rw [applyT_chain (chain (power (m / 2) (compile reader a))
+                                         (power (m / 2) (compile reader a)))
+                                  (compile reader a) q
+                    (by rw [chain_length, hlen_h]; exact hq)]
+                rw [hsq]
+                have hsqBound : ((List.replicate (m / 2 + m / 2) (expand a)).flatten).foldl reader.step q <
+                    reader.states := foldl_step_bounded _ hq
+                rw [ihA hsqBound]
+                have hmodne : m % 2 ≠ 0 := by
+                  intro h0
+                  apply heven
+                  simp [h0]
+                have hmodlt : m % 2 < 2 := Nat.mod_lt _ (by decide)
+                have hm2 : m / 2 + m / 2 + 1 = m := by omega
+                have hlast := foldl_flatten_replicate_succ (m / 2 + m / 2) (expand a) q
+                rw [hm2] at hlast
+                exact hlast.symm
+      change applyT (power n (compile reader a)) q =
+        ((List.replicate n (expand a)).flatten).foldl reader.step q
+      exact hpow n q hq
+
+private theorem applyT_power_eq_foldl_replicate (x : Rope) (n q : Nat) (hq : q < reader.states) :
+    applyT (power n (compile reader x)) q =
+      ((List.replicate n (expand x)).flatten).foldl reader.step q := by
+  have h := applyT_compile_eq_foldl (.rep n x) hq
+  simpa [compile, expand] using h
+
+theorem sound_RepeatedState : PercentEscape.RepeatedState.Goal := by
+  intro x n q hq
+  exact applyT_power_eq_foldl_replicate x n q hq
+
+end TinylambOpt.ResearchProofs.StorageExecution.Goal_GrammarScans_PercentEscape_RepeatedState

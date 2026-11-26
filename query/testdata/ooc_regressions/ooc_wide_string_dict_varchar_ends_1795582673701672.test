@@ -1,0 +1,12 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795582673701672
+-- profile: pool=0 columnar=1048576 opmem=0 spill=0 temp=0 route=0
+-- failure: post-crash count(t#) query failed | stream: Corrupt :: op 7 `crash`: post-crash count(t5) query failed: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t5 |   stream: Corrupt: LSTable VARCHAR ends are incomplete LSTable VARCHAR ends are incomplete
+create t5 19 153 546
+ins_bulk t5 1 409 328
+del t5 rmod 2 265 4 3
+upd t5 all 0 0 1 0 pad 2297 85 none 0 0
+del t5 range 240 277 1 0
+ins_copy t5 t5 278 364 179
+commit
+crash

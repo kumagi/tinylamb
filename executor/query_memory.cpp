@@ -204,11 +204,13 @@ void QueryMemoryCharge::Add(size_t bytes) {
   if (bytes == 0) {
     return;
   }
-  if (bytes > std::numeric_limits<size_t>::max() - bytes_) {
-    throw std::overflow_error("query memory charge size overflow");
+  const size_t headroom = std::numeric_limits<size_t>::max() - bytes_;
+  const size_t delta = std::min(bytes, headroom);
+  if (delta == 0) {
+    return;
   }
-  QueryMemoryBudget::Global().ReserveForced(bytes);
-  bytes_ += bytes;
+  QueryMemoryBudget::Global().ReserveForced(delta);
+  bytes_ += delta;
 }
 
 bool QueryMemoryCharge::TryAdd(size_t bytes) {

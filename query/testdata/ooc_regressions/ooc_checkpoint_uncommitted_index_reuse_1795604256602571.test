@@ -1,0 +1,12 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795604256602571
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: check full(t#) mismatch :: op 7 `check full t1`: check full(t1) mismatch: SELECT k, g, v, t, pad FROM t1 ORDER BY k |   expected 2978 rows, engine returned 874 |   row 534: expected [535|14|100|NULL|535:e] got [534|31|15|NULL|534:jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj...(1751B)] |   row 535: expected [536|4|113|ccc|536:f] got [535|14|100|NULL|535:e] |   row 536: expected [537|11|NULL|a|537:g] got [535|2|28|ccc|535:kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk...(1780B)] |   
+create t0 36 169 1883
+create t1 17 1 1
+ins_bulk t1 1 2978 145
+commit
+index t1 ix0 tk
+checkpoint
+ins_bulk t0 512 721 73
+check full t1

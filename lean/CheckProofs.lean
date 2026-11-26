@@ -1,4 +1,7 @@
 import TinylambOpt
+import TinylambOpt.ResearchProofs.EngineDecisions.AllGoalProofs
+import TinylambOpt.ResearchProofs.ClickBenchLayout.AllGoalProofs
+import TinylambOpt.ResearchProofs.RestartRaces.AllGoalProofs
 import Lean.Util.CollectAxioms
 import Lean.Elab.Command
 

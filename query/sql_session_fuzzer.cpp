@@ -1,6 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include "common/platform/process.hpp"
 #include "query/sql_session_fuzzer.hpp"
 
 #include <algorithm>
@@ -23,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -229,7 +229,8 @@ struct SPred {
         // op ANY folds to an OR-chain, op ALL to an AND-chain over the
         // snapshot (empty: ANY=FALSE, ALL=TRUE), matching both the
         // prepare-time fold and TryEvaluateQuantifiedComparison.
-        if (::tinylamb::platform::GetEnv("TINYLAMB_SESSION_PRED_DEBUG") != nullptr) {
+        if (::tinylamb::platform::GetEnv("TINYLAMB_SESSION_PRED_DEBUG") !=
+            nullptr) {
           std::cerr << "[pred-debug] quant col=" << col << " op=" << op
                     << (sub_is_all ? " ALL" : " ANY") << " neg=" << negated
                     << " subn=" << sub_vals.size() << " render=" << Render()
@@ -826,7 +827,8 @@ std::vector<std::string> SortedDump(const std::vector<Row>& rows) {
 bool RouteFlipFor(size_t ordinal) {
   static const bool enabled =
       ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_ROUTE_FLIP") != nullptr &&
-      ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_FORCE_RELATIONAL") == nullptr;
+      ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_FORCE_RELATIONAL") ==
+          nullptr;
   return enabled && (ordinal % 3U) == 2U;
 }
 
@@ -930,7 +932,7 @@ bool ApplyDdl(Database& db, TransactionContext& ctx, const std::string& ddl,
       const char* end = begin + part.size();
       const auto result = std::from_chars(begin, end, parsed);
       if (result.ec != std::errc{} || result.ptr != end || parsed < 0 ||
-          std::cmp_greater(parsed , std::numeric_limits<slot_t>::max())) {
+          std::cmp_greater(parsed, std::numeric_limits<slot_t>::max())) {
         return std::nullopt;
       }
       slots.push_back(static_cast<slot_t>(parsed));
@@ -2083,7 +2085,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       kDropTable,
       kCreateTable,
       kAnalyze,
-      kMerge
+      kMerge,
+      kForUpdate
     };
     Op op = Op::kCheck;
     const int roll = g.Pick(1, 100);
@@ -2113,6 +2116,10 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       // MERGE INTO with WHEN MATCHED (UPDATE / DELETE) and WHEN NOT MATCHED
       // (INSERT) against a single-row inline source table on unique key `u`.
       op = Op::kMerge;
+    } else if (roll <= 93 && !target->rows.empty()) {
+      // SELECT ... FOR UPDATE acquires row write-intents without mutating
+      // logical rows; must compose cleanly with later DML/ABORT/CHECKPOINT.
+      op = Op::kForUpdate;
     } else {
       op = Op::kCheck;
     }
@@ -2205,7 +2212,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             t.steps.push_back({.must_fail = true, .sql = sql});
             if (ok || why.find("integer overflow") == std::string::npos) {
               std::string error =
-                  "INSERT SELECT did not report the predicted integer overflow: ";
+                  "INSERT SELECT did not report the predicted integer "
+                  "overflow: ";
               error += sql;
               error += " :: ";
               error += why;
@@ -2336,8 +2344,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       case Op::kUpdate: {
         // Debug aid: quantified/EXISTS predicates expose snapshot drift
         // instantly; check right after applying them (env-gated).
-        const bool dbg_pred =
-            ::tinylamb::platform::GetEnv("TINYLAMB_SESSION_CHECK_QUANT") != nullptr;
+        const bool dbg_pred = ::tinylamb::platform::GetEnv(
+                                  "TINYLAMB_SESSION_CHECK_QUANT") != nullptr;
         const SPredPtr pred =
             GenPred(g, *target, tables, g.Pick(1, 2), SubqMode::kConjunct);
         const int set_col =
@@ -2691,6 +2699,28 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
           t.steps.push_back({.sql = sql});
           std::string err = "ANALYZE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
+        }
+        t.steps.push_back({.sql = sql});
+        break;
+      }
+      case Op::kForUpdate: {
+        const size_t pos = static_cast<size_t>(
+            g.Pick(0, static_cast<int>(target->rows.size()) - 1));
+        const int64_t u = RowU(target->rows[pos]);
+        const std::string sql = "SELECT u FROM " + target->name +
+                                " WHERE u = " + std::to_string(u) +
+                                " FOR UPDATE;";
+        std::string why;
+        // FOR UPDATE is rejected on the relational fallback route by design,
+        // so always run on the normal route (route_flip = false).
+        if (!RunSqlWhy(*db, ctx, sql, /*route_flip=*/false, &why)) {
+          t.steps.push_back({.sql = sql});
+          std::string err = "SELECT FOR UPDATE rejected: ";
           err += sql;
           err += " :: ";
           err += why;

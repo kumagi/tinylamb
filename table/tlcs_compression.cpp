@@ -105,6 +105,11 @@ class BitWriter {
     if (bit_count < 64U) {
       value &= (uint64_t{1} << bit_count) - 1ULL;
     }
+    if (bits_in_buf_ >= 64U) {
+      FlushBytes(8U);
+      buf_ = 0ULL;
+      bits_in_buf_ = 0;
+    }
     // Emit in up to two chunks if accumulator would overflow 64 bits.
     if (bits_in_buf_ + bit_count > 64U) {
       const unsigned lo = 64U - bits_in_buf_;
@@ -194,15 +199,15 @@ inline bool ParseTemporalAscii22(std::string_view sv, uint64_t* packed_out) {
       sv[16] != ':' || sv[19] != '+' || sv[20] != '0' || sv[21] != '0') {
     return false;
   }
-  static constexpr size_t kDigitIdx[14] = {0, 1,  2,  3,  5,  6,  8,
-                                           9, 11, 12, 14, 15, 17, 18};
+  static constexpr std::array<size_t, 14> kDigitIdx = {
+      0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
   uint64_t acc = 0;
   for (size_t idx : kDigitIdx) {
-    const unsigned char ch = static_cast<unsigned char>(sv[idx]);
+    const auto ch = static_cast<unsigned char>(sv[idx]);
     if (ch < '0' || ch > '9') {
       return false;
     }
-    acc = acc * 10ULL + static_cast<uint64_t>(ch - '0');
+    acc = (acc * 10ULL) + static_cast<uint64_t>(ch - '0');
   }
   *packed_out = acc;
   return true;
@@ -210,8 +215,8 @@ inline bool ParseTemporalAscii22(std::string_view sv, uint64_t* packed_out) {
 
 inline void FormatTemporalAscii22(uint64_t packed, char* dst) {
   // Format `YYYYMMDDHHMMSS` into `YYYY-MM-DD HH:MM:SS+00`.
-  static constexpr size_t kDigitIdx[14] = {0, 1,  2,  3,  5,  6,  8,
-                                           9, 11, 12, 14, 15, 17, 18};
+  static constexpr std::array<size_t, 14> kDigitIdx = {
+      0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
   dst[4] = '-';
   dst[7] = '-';
   dst[10] = ' ';
@@ -312,7 +317,7 @@ bool DecodeCompactNulls(std::span<const uint8_t> encoded, uint32_t n,
     if (!ReadU32Le(encoded, &pos, &cnt)) {
       return false;
     }
-    if (encoded.size() != 5U + static_cast<size_t>(cnt) * sizeof(uint32_t)) {
+    if (encoded.size() != 5U + (static_cast<size_t>(cnt) * sizeof(uint32_t))) {
       return false;
     }
     const uint8_t default_val = (tag == 0x02U) ? 0U : 1U;
@@ -324,6 +329,82 @@ bool DecodeCompactNulls(std::span<const uint8_t> encoded, uint32_t n,
         return false;
       }
       (*out)[idx] = mark_val;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool GatherCompactNulls(std::span<const uint8_t> encoded, uint32_t n,
+                        std::span<const uint32_t> rows, uint8_t* out) {
+  if (encoded.size() == n) {
+    for (size_t j = 0; j < rows.size(); ++j) {
+      if (rows[j] >= n) {
+        return false;
+      }
+      out[j] = encoded[rows[j]];
+    }
+    return true;
+  }
+  if (encoded.empty() || encoded.size() > n) {
+    return false;
+  }
+  const uint8_t tag = encoded[0];
+  if (tag == 0x01U) {
+    const size_t expected = 1U + ((static_cast<size_t>(n) + 7U) / 8U);
+    if (encoded.size() != expected) {
+      return false;
+    }
+    for (size_t j = 0; j < rows.size(); ++j) {
+      const uint32_t r = rows[j];
+      if (r >= n) {
+        return false;
+      }
+      out[j] = ((encoded[1U + (r >> 3U)] >> (r & 7U)) & 1U) != 0 ? 1U : 0U;
+    }
+    return true;
+  }
+  if (tag == 0x02U || tag == 0x03U) {
+    size_t pos = 1;
+    uint32_t cnt = 0;
+    if (!ReadU32Le(encoded, &pos, &cnt)) {
+      return false;
+    }
+    if (encoded.size() != 5U + (static_cast<size_t>(cnt) * sizeof(uint32_t))) {
+      return false;
+    }
+    const uint8_t default_val = (tag == 0x02U) ? 0U : 1U;
+    const uint8_t mark_val = (tag == 0x02U) ? 1U : 0U;
+    const uint8_t* const base = encoded.data() + pos;
+    auto read_at = [base](uint32_t idx) noexcept -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, base + (static_cast<size_t>(idx) * sizeof(uint32_t)),
+                  sizeof(uint32_t));
+      return v;
+    };
+    for (size_t j = 0; j < rows.size(); ++j) {
+      const uint32_t r = rows[j];
+      if (r >= n) {
+        return false;
+      }
+      // TryEncodeCompactNulls writes marked positions in strictly ascending
+      // order; binary search locates `r` in O(log cnt) without allocation.
+      uint32_t lo = 0;
+      uint32_t hi = cnt;
+      bool found = false;
+      while (lo < hi) {
+        const uint32_t mid = lo + ((hi - lo) >> 1U);
+        const uint32_t mv = read_at(mid);
+        if (mv < r) {
+          lo = mid + 1U;
+        } else if (mv > r) {
+          hi = mid;
+        } else {
+          found = true;
+          break;
+        }
+      }
+      out[j] = found ? mark_val : default_val;
     }
     return true;
   }
@@ -343,7 +424,7 @@ bool TryEncodeTemporalText(std::span<const char> bytes,
   }
   // Must strictly save bytes compared to raw kVarChar (bytes + 4*n ends).
   const size_t packed_size = static_cast<size_t>(n) * kTemporalTextPackedBytes;
-  const size_t raw_size = bytes.size() + static_cast<size_t>(n) * 4ULL;
+  const size_t raw_size = bytes.size() + (static_cast<size_t>(n) * 4ULL);
   if (packed_size >= raw_size) {
     return false;
   }
@@ -364,7 +445,7 @@ bool TryEncodeTemporalText(std::span<const char> bytes,
       }
     }
     uint8_t* dst =
-        out->data() + static_cast<size_t>(r) * kTemporalTextPackedBytes;
+        out->data() + (static_cast<size_t>(r) * kTemporalTextPackedBytes);
     for (size_t b = 0; b < kTemporalTextPackedBytes; ++b) {
       dst[b] = static_cast<uint8_t>((val >> (b * 8U)) & 0xFFULL);
     }
@@ -382,14 +463,14 @@ bool DecodeTemporalText(std::span<const uint8_t> encoded, const uint8_t* nulls,
   bytes_out->clear();
   bytes_out->reserve(static_cast<size_t>(n) * kTemporalTextAsciiBytes);
   ends_out->resize(n);
-  char buf[kTemporalTextAsciiBytes];
+  std::array<char, kTemporalTextAsciiBytes> buf{};
   for (uint32_t r = 0; r < n; ++r) {
     if (nulls != nullptr && nulls[r] != 0) {
       (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
       continue;
     }
     const uint8_t* src =
-        encoded.data() + static_cast<size_t>(r) * kTemporalTextPackedBytes;
+        encoded.data() + (static_cast<size_t>(r) * kTemporalTextPackedBytes);
     uint64_t val = 0;
     for (size_t b = 0; b < kTemporalTextPackedBytes; ++b) {
       val |= static_cast<uint64_t>(src[b]) << (b * 8U);
@@ -397,8 +478,8 @@ bool DecodeTemporalText(std::span<const uint8_t> encoded, const uint8_t* nulls,
     if (val > 99999999999999ULL) {
       return false;
     }
-    FormatTemporalAscii22(val, buf);
-    bytes_out->insert(bytes_out->end(), buf, buf + kTemporalTextAsciiBytes);
+    FormatTemporalAscii22(val, buf.data());
+    bytes_out->insert(bytes_out->end(), buf.begin(), buf.end());
     (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
   }
   return true;
@@ -434,7 +515,7 @@ bool TryEncodeVarCharFrontDict(std::span<const char> bytes,
   if (n < 16 || ends.size() != n) {
     return false;
   }
-  const size_t raw_total = bytes.size() + static_cast<size_t>(n) * 4ULL;
+  const size_t raw_total = bytes.size() + (static_cast<size_t>(n) * 4ULL);
   std::unordered_map<std::string_view, uint32_t> unique_map;
   unique_map.reserve(std::min<size_t>(n, 4096));
   std::vector<std::string_view> dict;
@@ -468,13 +549,12 @@ bool TryEncodeVarCharFrontDict(std::span<const char> bytes,
   const size_t packed_id_bytes = (static_cast<size_t>(n) * bw + 7ULL) / 8ULL;
 
   // Header: [u32 dict_size][u8 bit_width][front-coded dict...][packed IDs...]
-  out->reserve(5U + packed_id_bytes + bytes.size() / 2);
+  out->reserve(5U + packed_id_bytes + (bytes.size() / 2));
   AppendU32Le(out, static_cast<uint32_t>(dict.size()));
   out->push_back(static_cast<uint8_t>(bw));
 
   std::string_view prev_str;
-  for (size_t i = 0; i < dict.size(); ++i) {
-    const std::string_view cur = dict[i];
+  for (const std::string_view cur : dict) {
     size_t lcp = 0;
     const size_t max_lcp = std::min(prev_str.size(), cur.size());
     while (lcp < max_lcp && prev_str[lcp] == cur[lcp]) {
@@ -604,7 +684,7 @@ bool TryEncodeBitPackedFor(std::span<const int64_t> ints, const uint8_t* nulls,
   if (n < 16 || ints.size() != n) {
     return false;
   }
-  const uint64_t base_u = static_cast<uint64_t>(min_int);
+  const auto base_u = static_cast<uint64_t>(min_int);
   const uint64_t span = static_cast<uint64_t>(max_int) - base_u;
   if (span == 0) {
     return false;  // Handled by zero-width kFor.
@@ -626,7 +706,7 @@ bool TryEncodeBitPackedFor(std::span<const int64_t> ints, const uint8_t* nulls,
     stride = 1ULL;
   }
   const uint64_t scaled_max = span / stride;
-  const unsigned bw = static_cast<unsigned>(std::bit_width(scaled_max));
+  const auto bw = static_cast<unsigned>(std::bit_width(scaled_max));
   if (bw == 0 || bw >= 64U) {
     return false;
   }
@@ -668,14 +748,71 @@ bool DecodeBitPackedFor(std::span<const uint8_t> encoded, uint32_t n,
   if (encoded.size() - pos != expected_payload) {
     return false;
   }
-  const uint64_t base_u = static_cast<uint64_t>(min_int);
+  const auto base_u = static_cast<uint64_t>(min_int);
   BitReader reader(encoded, pos);
   for (uint32_t r = 0; r < n; ++r) {
     uint64_t q = 0;
     if (!reader.ReadBits(bw, &q)) {
       return false;
     }
-    out[r] = static_cast<int64_t>(base_u + q * stride);
+    out[r] = static_cast<int64_t>(base_u + (q * stride));
+  }
+  return true;
+}
+
+bool GatherBitPackedFor(std::span<const uint8_t> encoded, uint32_t n,
+                        int64_t min_int, std::span<const uint32_t> rows,
+                        int64_t* out) {
+  if (encoded.size() < 9U) {
+    return false;
+  }
+  const unsigned bw = encoded[0];
+  if (bw == 0 || bw >= 64U) {
+    return false;
+  }
+  size_t pos = 1;
+  uint64_t stride = 0;
+  if (!ReadU64Le(encoded, &pos, &stride) || stride == 0) {
+    return false;
+  }
+  const size_t expected_payload = (static_cast<size_t>(n) * bw + 7ULL) / 8ULL;
+  if (encoded.size() - pos != expected_payload) {
+    return false;
+  }
+  const auto base_u = static_cast<uint64_t>(min_int);
+  const uint64_t value_mask = (uint64_t{1} << bw) - 1ULL;
+  const uint8_t* const payload = encoded.data() + pos;
+  const size_t payload_size = expected_payload;
+  for (size_t j = 0; j < rows.size(); ++j) {
+    const uint32_t r = rows[j];
+    if (r >= n) {
+      return false;
+    }
+    const size_t bit_pos = static_cast<size_t>(r) * bw;
+    size_t byte_pos = bit_pos >> 3U;
+    auto bit_off = static_cast<unsigned>(bit_pos & 7U);
+    uint64_t q = 0;
+    if (bit_off + bw <= 64U && byte_pos + 8U <= payload_size) {
+      uint64_t word = 0;
+      std::memcpy(&word, payload + byte_pos, sizeof(word));
+      q = (word >> bit_off) & value_mask;
+    } else {
+      unsigned filled = 0;
+      while (filled < bw) {
+        if (byte_pos >= payload_size) {
+          return false;
+        }
+        const unsigned avail = 8U - bit_off;
+        const unsigned take = std::min(avail, bw - filled);
+        const uint64_t take_mask = (uint64_t{1} << take) - 1ULL;
+        const uint64_t bits =
+            (static_cast<uint64_t>(payload[byte_pos++]) >> bit_off) & take_mask;
+        q |= (bits << filled);
+        filled += take;
+        bit_off = 0;
+      }
+    }
+    out[j] = static_cast<int64_t>(base_u + (q * stride));
   }
   return true;
 }
@@ -693,19 +830,19 @@ bool TryEncodeXorDouble(std::span<const int64_t> bits, uint32_t n,
   const size_t raw_size = static_cast<size_t>(n) * sizeof(uint64_t);
   out->reserve(raw_size / 2);
   BitWriter writer(out);
-  uint64_t prev = static_cast<uint64_t>(bits[0]);
+  auto prev = static_cast<uint64_t>(bits[0]);
   writer.WriteBits(prev, 64U);
   unsigned prev_leading = 64U;
   unsigned prev_trailing = 0U;
 
   for (uint32_t r = 1; r < n; ++r) {
-    const uint64_t cur = static_cast<uint64_t>(bits[r]);
+    const auto cur = static_cast<uint64_t>(bits[r]);
     const uint64_t x = prev ^ cur;
     if (x == 0ULL) {
       writer.WriteBits(0ULL, 1U);
     } else {
-      const unsigned leading = static_cast<unsigned>(std::countl_zero(x));
-      const unsigned trailing = static_cast<unsigned>(std::countr_zero(x));
+      const auto leading = static_cast<unsigned>(std::countl_zero(x));
+      const auto trailing = static_cast<unsigned>(std::countr_zero(x));
       if (prev_leading <= leading && prev_trailing <= trailing &&
           prev_leading < 64U) {
         // Control bits `10`: reuse previous meaningful window.
@@ -812,7 +949,7 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
   if (n < 16 || ends.size() != n || bytes.size() < 256) {
     return false;
   }
-  const size_t raw_total = bytes.size() + static_cast<size_t>(n) * 4ULL;
+  const size_t raw_total = bytes.size() + (static_cast<size_t>(n) * 4ULL);
 
   // Sample up to 512 non-null rows to build a 2..8-byte phrase histogram.
   std::unordered_map<std::string_view, uint32_t> freq;
@@ -843,7 +980,7 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
   }
   struct Cand {
     std::string_view sv;
-    int64_t gain;
+    int64_t gain{0};
   };
   std::vector<Cand> cands;
   cands.reserve(freq.size());
@@ -851,12 +988,12 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
     if (cnt < 3U) {
       continue;
     }
-    const int64_t gain = static_cast<int64_t>(cnt) *
-                             static_cast<int64_t>(sv.size() - 1U) *
-                             static_cast<int64_t>(step) -
-                         static_cast<int64_t>(sv.size() + 1U);
+    const int64_t gain =
+        (static_cast<int64_t>(cnt) * static_cast<int64_t>(sv.size() - 1U) *
+         static_cast<int64_t>(step)) -
+        static_cast<int64_t>(sv.size() + 1U);
     if (gain > 16) {
-      cands.push_back(Cand{sv, gain});
+      cands.push_back(Cand{.sv = sv, .gain = gain});
     }
   }
   if (cands.empty()) {
@@ -875,12 +1012,12 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
   // Lookup table indexed by first byte -> list of (symbol_id, sv).
   std::array<std::vector<std::pair<uint8_t, std::string_view>>, 256> by_first;
   for (size_t i = 0; i < cands.size(); ++i) {
-    const uint8_t b0 = static_cast<uint8_t>(cands[i].sv[0]);
+    const auto b0 = static_cast<uint8_t>(cands[i].sv[0]);
     by_first[b0].emplace_back(static_cast<uint8_t>(i), cands[i].sv);
   }
 
   // Header: [u8 num_phrases][for each: u8 len, bytes...]
-  out->reserve(bytes.size() / 2 + 256);
+  out->reserve((bytes.size() / 2) + 256);
   out->push_back(static_cast<uint8_t>(cands.size()));
   for (const Cand& c : cands) {
     out->push_back(static_cast<uint8_t>(c.sv.size()));
@@ -913,7 +1050,7 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
       // Option 1: literal escape (0xFF + byte) = 2 bytes.
       uint32_t best = dp_cost[i + 1U] + 2U;
       uint16_t choice = 255U;
-      const uint8_t b0 = static_cast<uint8_t>(sv[i]);
+      const auto b0 = static_cast<uint8_t>(sv[i]);
       for (const auto& [sym, psv] : by_first[b0]) {
         const size_t plen = psv.size();
         if (i + plen <= len && sv.substr(i, plen) == psv) {
@@ -1034,13 +1171,13 @@ bool TryCompressZstdFrame(std::span<const uint8_t> payload, uint8_t inner_tag,
   out->resize(kHdr + bound);
   const size_t csize = ZSTD_compress(out->data() + kHdr, bound, payload.data(),
                                      payload.size(), level);
-  if (ZSTD_isError(csize) || kHdr + csize >= payload.size()) {
+  if (ZSTD_isError(csize) != 0 || kHdr + csize >= payload.size()) {
     out->clear();
     return false;
   }
   (*out)[0] = inner_tag;
   (*out)[1] = inner_subtag;
-  const uint32_t orig_len = static_cast<uint32_t>(payload.size());
+  const auto orig_len = static_cast<uint32_t>(payload.size());
   const uint32_t crc = Crc32C(payload.data(), payload.size());
   std::memcpy(out->data() + 2U, &orig_len, 4U);
   std::memcpy(out->data() + 6U, &crc, 4U);
@@ -1073,11 +1210,19 @@ bool DecompressZstdFrame(std::span<const uint8_t> encoded,
   if (orig_len == 0 || orig_len > (256U << 20U)) {
     return false;
   }
+  // Validate the Zstd frame header before allocating `orig_len` bytes so a
+  // corrupt or fuzzed 15-byte header cannot trigger a 256 MiB OOM allocation.
+  const unsigned long long frame_size =
+      ZSTD_getFrameContentSize(encoded.data() + kHdr, encoded.size() - kHdr);
+  if (frame_size == ZSTD_CONTENTSIZE_ERROR ||
+      frame_size == ZSTD_CONTENTSIZE_UNKNOWN || frame_size != orig_len) {
+    return false;
+  }
   payload_out->resize(orig_len);
   const size_t dsize =
       ZSTD_decompress(payload_out->data(), orig_len, encoded.data() + kHdr,
                       encoded.size() - kHdr);
-  if (ZSTD_isError(dsize) || dsize != orig_len) {
+  if (ZSTD_isError(dsize) != 0 || dsize != orig_len) {
     payload_out->clear();
     return false;
   }
@@ -1110,7 +1255,7 @@ bool TryEncodeZstdVarChar(std::span<const char> bytes,
     return false;
   }
   std::vector<uint8_t> packed;
-  packed.reserve(bytes.size() + static_cast<size_t>(n) * 2U);
+  packed.reserve(bytes.size() + (static_cast<size_t>(n) * 2U));
   uint32_t prev_end = 0;
   for (uint32_t r = 0; r < n; ++r) {
     const uint32_t cur_end = ends[r];
@@ -1175,6 +1320,215 @@ bool DecodeZstdVarChar(std::span<const uint8_t> encoded, const uint8_t* nulls,
     (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
   }
   return pos == packed.size();
+}
+
+// ============================================================================
+// 8. ClickBenchLayout.Storage: TieOrientation, ClockWindow, HashExceptions
+// ============================================================================
+
+namespace {
+
+size_t UVarIntBytes(uint64_t v) noexcept {
+  size_t n = 1;
+  while (v >= 0x80ULL) {
+    v >>= 7U;
+    ++n;
+  }
+  return n;
+}
+
+size_t SVarIntBytes(int64_t v) noexcept {
+  // Zigzag encoding: (v << 1) ^ (v >> 63).
+  const auto uv = static_cast<uint64_t>(v);
+  const uint64_t zz = (uv << 1U) ^ (v < 0 ? ~uint64_t{0} : uint64_t{0});
+  return UVarIntBytes(zz);
+}
+
+size_t FrontCodePrice(std::string_view prev, std::string_view cur) noexcept {
+  const size_t lim = std::min(prev.size(), cur.size());
+  size_t lcp = 0;
+  while (lcp < lim && prev[lcp] == cur[lcp]) {
+    ++lcp;
+  }
+  const size_t suffix = cur.size() - lcp;
+  return UVarIntBytes(lcp) + UVarIntBytes(suffix) + suffix;
+}
+
+size_t ChargeGroupOrder(std::string_view prev,
+                        const std::vector<std::string_view>& group,
+                        bool rev) noexcept {
+  size_t total = 0;
+  std::string_view cur_prev = prev;
+  if (!rev) {
+    for (const std::string_view w : group) {
+      total += FrontCodePrice(cur_prev, w);
+      cur_prev = w;
+    }
+  } else {
+    for (size_t i = group.size(); i-- > 0;) {
+      total += FrontCodePrice(cur_prev, group[i]);
+      cur_prev = group[i];
+    }
+  }
+  return total;
+}
+
+}  // namespace
+
+TieOrientationPlan ChooseOptimalTieOrientations(
+    std::span<const std::vector<std::string_view>> groups) {
+  TieOrientationPlan plan;
+  plan.reversed.assign(groups.size(), 0);
+  // Two-state DP: state 0 = previous group forward, state 1 = previous group
+  // reversed. Initial state before group 0 has empty word "" at cost 0.
+  std::array<std::string_view, 2> prev_word{"", ""};
+  std::array<size_t, 2> prev_cost{0, 0};
+  std::vector<std::array<uint8_t, 2>> parent(groups.size(), {0, 0});
+  bool has_nonempty = false;
+
+  for (size_t g = 0; g < groups.size(); ++g) {
+    if (groups[g].empty()) {
+      parent[g] = {0, 1};
+      continue;
+    }
+    has_nonempty = true;
+    std::array<size_t, 2> next_cost{0, 0};
+    std::array<std::string_view, 2> next_word{groups[g].back(),
+                                              groups[g].front()};
+    for (size_t orient = 0; orient < 2; ++orient) {
+      const bool rev = (orient == 1);
+      const size_t c0 =
+          prev_cost[0] + ChargeGroupOrder(prev_word[0], groups[g], rev);
+      const size_t c1 =
+          prev_cost[1] + ChargeGroupOrder(prev_word[1], groups[g], rev);
+      if (c1 < c0) {
+        next_cost[orient] = c1;
+        parent[g][orient] = 1;
+      } else {
+        next_cost[orient] = c0;
+        parent[g][orient] = 0;
+      }
+    }
+    prev_cost = next_cost;
+    prev_word = next_word;
+  }
+
+  if (!has_nonempty) {
+    return plan;
+  }
+  size_t cur_state = (prev_cost[1] < prev_cost[0]) ? 1U : 0U;
+  plan.min_bytes = prev_cost[cur_state];
+  for (size_t g = groups.size(); g-- > 0;) {
+    if (!groups[g].empty()) {
+      plan.reversed[g] = static_cast<uint8_t>(cur_state);
+      cur_state = parent[g][cur_state];
+    }
+  }
+  return plan;
+}
+
+ClockWindowPlan ChooseOptimalClockWindow(std::span<const int64_t> deltas,
+                                         unsigned bit_width,
+                                         size_t exception_bytes) {
+  const size_t packed_bytes =
+      ((deltas.size() * static_cast<size_t>(bit_width)) + 7U) / 8U;
+  const __int128 span =
+      (bit_width == 0)
+          ? __int128{0}
+          : ((__int128{1} << std::min<unsigned>(bit_width, 62U)) - 1);
+  constexpr auto kMinI64 =
+      static_cast<__int128>(std::numeric_limits<int64_t>::min());
+  constexpr auto kMaxI64 =
+      static_cast<__int128>(std::numeric_limits<int64_t>::max());
+
+  std::vector<int64_t> anchors;
+  anchors.reserve(1U + (deltas.size() * 2U));
+  anchors.push_back(0);
+  for (int64_t d : deltas) {
+    anchors.push_back(d);
+    const __int128 lo_anchor = static_cast<__int128>(d) - span;
+    if (lo_anchor >= kMinI64 && lo_anchor <= kMaxI64) {
+      anchors.push_back(static_cast<int64_t>(lo_anchor));
+    }
+  }
+  std::ranges::sort(anchors);
+  const auto dup = std::ranges::unique(anchors);
+  anchors.erase(dup.begin(), dup.end());
+
+  ClockWindowPlan best{
+      .base = 0,
+      .total_bytes = std::numeric_limits<size_t>::max(),
+      .exception_count = deltas.size(),
+  };
+  for (int64_t low : anchors) {
+    const auto lo128 = static_cast<__int128>(low);
+    const __int128 hi128 = lo128 + span;
+    size_t misses = 0;
+    for (int64_t d : deltas) {
+      const auto d128 = static_cast<__int128>(d);
+      if (d128 < lo128 || d128 > hi128) {
+        ++misses;
+      }
+    }
+    const size_t cost =
+        1U + SVarIntBytes(low) + packed_bytes + (misses * exception_bytes);
+    if (cost < best.total_bytes) {
+      best.base = low;
+      best.total_bytes = cost;
+      best.exception_count = misses;
+    }
+  }
+  return best;
+}
+
+uint64_t HashExceptionsTable::HashAt(uint32_t row,
+                                     uint32_t code) const noexcept {
+  const auto it = std::lower_bound(exceptions.begin(), exceptions.end(), row,
+                                   [](const std::pair<uint32_t, uint64_t>& e,
+                                      uint32_t r) { return e.first < r; });
+  if (it != exceptions.end() && it->first == row) {
+    return it->second;
+  }
+  if (code < mode_hash_by_code.size()) {
+    return mode_hash_by_code[code];
+  }
+  return 0;
+}
+
+HashExceptionsTable EncodeHashExceptions(std::span<const uint32_t> codes,
+                                         std::span<const uint64_t> hashes) {
+  HashExceptionsTable tbl;
+  const size_t n = std::min(codes.size(), hashes.size());
+  if (n == 0) {
+    return tbl;
+  }
+  uint32_t max_code = 0;
+  for (size_t i = 0; i < n; ++i) {
+    max_code = std::max(max_code, codes[i]);
+  }
+  std::vector<std::unordered_map<uint64_t, uint32_t>> freq(
+      static_cast<size_t>(max_code) + 1U);
+  for (size_t i = 0; i < n; ++i) {
+    ++freq[codes[i]][hashes[i]];
+  }
+  tbl.mode_hash_by_code.assign(static_cast<size_t>(max_code) + 1U, 0);
+  for (size_t c = 0; c < freq.size(); ++c) {
+    uint64_t best_h = 0;
+    uint32_t best_cnt = 0;
+    for (const auto& [h, cnt] : freq[c]) {
+      if (cnt > best_cnt) {
+        best_cnt = cnt;
+        best_h = h;
+      }
+    }
+    tbl.mode_hash_by_code[c] = best_h;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (hashes[i] != tbl.mode_hash_by_code[codes[i]]) {
+      tbl.exceptions.emplace_back(static_cast<uint32_t>(i), hashes[i]);
+    }
+  }
+  return tbl;
 }
 
 }  // namespace tinylamb::tlcs_compression

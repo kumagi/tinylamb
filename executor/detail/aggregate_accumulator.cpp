@@ -2048,7 +2048,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() {
       const platform::ExtendedFloat vx = stat_.sxx - (count * mx * mx);
       const platform::ExtendedFloat vy = stat_.syy - (count * my * my);
       if (vx <= 0 || vy <= 0) {
-        return Value();
+        return Value(std::numeric_limits<double>::quiet_NaN());
       }
       return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }

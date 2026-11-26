@@ -2758,9 +2758,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          "BYTE_SUBSTR argument type mismatch");
     }
     const std::string input = raw_str(values[0]);
-    // Same raw INT64-bit-pattern start as SUBSTR: UINT64 end-relative offsets
-    // must not be turned into an out-of-range positive position.
-    const int64_t start = values[1].value.int_value;
+    const int64_t start = to_i64(values[1], 0);
     int64_t len = 0;
     if (values.size() == 3) {
       len = to_i64(values[2], 0);
@@ -6618,11 +6616,13 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
       return StatusError(StatusCode::kInvalidArgument,
                          "IFNULL requires 2 arguments");
     }
+    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(schema)));
     ASSIGN_OR_RETURN(Value, first, args_[0]->TryEvaluate(row, schema));
     if (!first.IsNull()) {
-      return first;
+      return NormalizeIfBranch(std::move(first), common == TypeTag::kDouble);
     }
-    return args_[1]->TryEvaluate(row, schema);
+    ASSIGN_OR_RETURN(Value, second, args_[1]->TryEvaluate(row, schema));
+    return NormalizeIfBranch(std::move(second), common == TypeTag::kDouble);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -6750,13 +6750,18 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
       return StatusError(StatusCode::kInvalidArgument,
                          "IFNULL requires 2 arguments");
     }
+    ASSIGN_OR_RETURN(TypeTag, common,
+                     (CoalesceType(left_schema, &right_schema)));
     ASSIGN_OR_RETURN(
         Value, first,
         (args_[0]->TryEvaluate(left, left_schema, right, right_schema)));
     if (!first.IsNull()) {
-      return first;
+      return NormalizeIfBranch(std::move(first), common == TypeTag::kDouble);
     }
-    return args_[1]->TryEvaluate(left, left_schema, right, right_schema);
+    ASSIGN_OR_RETURN(
+        Value, second,
+        (args_[1]->TryEvaluate(left, left_schema, right, right_schema)));
+    return NormalizeIfBranch(std::move(second), common == TypeTag::kDouble);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -6860,11 +6865,14 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
       return StatusError(StatusCode::kInvalidArgument,
                          "IFNULL requires 2 arguments");
     }
+    ASSIGN_OR_RETURN(TypeTag, common, (CoalesceType(schema)));
     ASSIGN_OR_RETURN(Value, first, args_[0]->TryEvaluate(row, schema, context));
     if (!first.IsNull()) {
-      return first;
+      return NormalizeIfBranch(std::move(first), common == TypeTag::kDouble);
     }
-    return args_[1]->TryEvaluate(row, schema, context);
+    ASSIGN_OR_RETURN(Value, second,
+                     args_[1]->TryEvaluate(row, schema, context));
+    return NormalizeIfBranch(std::move(second), common == TypeTag::kDouble);
   }
   std::vector<Value> values;
   values.reserve(args_.size());
@@ -7104,6 +7112,9 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
                          : args_[0]->ResultType(schema);
   }
   // Match the runtime value types of these builtins.
+  if (func_name_ == "error") {
+    return {TypeTag::kInvalid};
+  }
   if (func_name_ == "rand") {
     return {TypeTag::kDouble};
   }
@@ -7313,6 +7324,9 @@ Type FunctionCallExpression::ResultType(const Schema& left,
                          : args_[0]->ResultType(left, right);
   }
   // Keep both ResultType overloads in sync.
+  if (func_name_ == "error") {
+    return {TypeTag::kInvalid};
+  }
   if (func_name_ == "rand") {
     return {TypeTag::kDouble};
   }

@@ -45,6 +45,13 @@
 #include "executor/detail/analytics_factorized_join.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/flat_int_key_map.hpp"
+#include "executor/detail/fused_group_emit.hpp"
+#include "executor/detail/fused_group_probe.hpp"
+#include "executor/detail/fused_dense_aggregates.hpp"
+#include "executor/detail/fused_raw_aggregates.hpp"
+#include "executor/detail/fused_compact_radix.hpp"
+#include "executor/detail/fused_group_dictionary.hpp"
+#include "executor/detail/fused_varchar_groups.hpp"
 #include "executor/detail/fused_grouped_join_internal.hpp"
 #include "executor/detail/planning_columnar_keys.hpp"
 #include "executor/detail/relation.hpp"
@@ -85,169 +92,13 @@ namespace tinylamb::relational_detail {
 
 namespace {
 
-constexpr size_t kRawAggregateCapacity = 24;
 
-void SortUniqueSlots(std::vector<slot_t>* cols) {
-  std::sort(cols->begin(), cols->end());
-  cols->erase(std::unique(cols->begin(), cols->end()), cols->end());
-}
 
-std::vector<slot_t> BuildDeferredProbeMatCols(
-    const DeferredLSTableProbe& probe) {
-  std::vector<slot_t> cols;
-  cols.reserve(probe.projection.size() + probe.integer_peeks.size() +
-               probe.null_peeks.size());
-  cols.insert(cols.end(), probe.projection.begin(), probe.projection.end());
-  for (const IntegerPeekCompare& pred : probe.integer_peeks) {
-    cols.push_back(pred.column);
-  }
-  for (const NullPeekCompare& test : probe.null_peeks) {
-    cols.push_back(test.column);
-  }
-  SortUniqueSlots(&cols);
-  return cols;
-}
 
-bool DenseIntBlockMayMatch(const LSTablePageBlock& meta_blk, slot_t full_key,
-                           int64_t dense_int_min,
-                           std::span<const uint32_t> dense_int_idxs,
-                           uint32_t invalid_idx) noexcept {
-  if (full_key >= meta_blk.columns.size() || dense_int_idxs.empty()) {
-    return true;
-  }
-  const LSTableColumnBlock& jk = meta_blk.columns[full_key];
-  if (!jk.has_min_max) {
-    return true;
-  }
-  const uint64_t span = dense_int_idxs.size();
-  const bool above = jk.min_int >= dense_int_min &&
-                     static_cast<uint64_t>(jk.min_int) -
-                             static_cast<uint64_t>(dense_int_min) >=
-                         span;
-  if (jk.max_int < dense_int_min || above) {
-    return false;
-  }
-  if (jk.min_int > jk.max_int) {
-    return true;
-  }
-  const uint64_t lo_off = jk.min_int >= dense_int_min
-                              ? static_cast<uint64_t>(jk.min_int) -
-                                    static_cast<uint64_t>(dense_int_min)
-                              : 0;
-  const uint64_t hi_off = std::min<uint64_t>(
-      static_cast<uint64_t>(jk.max_int) - static_cast<uint64_t>(dense_int_min),
-      span - 1);
-  if (hi_off - lo_off <= 512) {
-    for (uint64_t off = lo_off; off <= hi_off; ++off) {
-      if (dense_int_idxs[off] != invalid_idx) {
-        return true;
-      }
-    }
-    return false;
-  }
-  return true;
-}
 
-inline bool ColumnarCellIsNullOrNaN(const ColumnarColumn& col,
-                                    size_t r) noexcept {
-  if (col.IsNull(r)) {
-    return true;
-  }
-  if (col.is_uniform) {
-    return col.type == ValueType::kDouble && std::isnan(col.DoubleAt(r));
-  }
-  Value tmp;
-  col.WriteValueInto(r, &tmp);
-  return tmp.IsNull() ||
-         (tmp.type == ValueType::kDouble && std::isnan(tmp.value.double_value));
-}
 
-inline int64_t ColumnarIntValue(const ColumnarColumn& col, size_t r) noexcept {
-  if (col.is_uniform) {
-    return col.IntAt(r);
-  }
-  Value tmp;
-  col.WriteValueInto(r, &tmp);
-  return tmp.value.int_value;
-}
 
-inline bool ColumnarColMayBeDouble(const ColumnarTable& table, slot_t col) {
-  for (const ColumnarChunk& ch : table.chunks) {
-    if (col >= ch.columns.size()) {
-      continue;
-    }
-    const ColumnarColumn& cc = ch.columns[col];
-    if (cc.is_uniform) {
-      if (cc.type == ValueType::kDouble) {
-        return true;
-      }
-      continue;
-    }
-    for (size_t r = 0; r < ch.rows; ++r) {
-      Value tmp;
-      cc.WriteValueInto(r, &tmp);
-      if (tmp.type == ValueType::kDouble) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
 
-// Register-tight, out-of-line dense RF pre-filter over one LSTablePageBlock.
-// Keeps the 28M-row rejection loop out of TryFusedGroupedJoin's large stack
-// frame (zero stack spills) and checks the unsigned range test BEFORE null
-// bitmaps or bitset loads.
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
-//   (dense_rf_prefilter_block_sound)
-[[gnu::noinline]] size_t PrefilterDenseRfBlock(
-    const int64_t* __restrict__ vals, uint32_t nrows, int64_t rf_lo,
-    int64_t rf_hi, const uint64_t* __restrict__ bits, bool all_bits_set,
-    const LSTableColumnBlock* rf_col, bool has_null,
-    uint32_t* __restrict__ out_sel) noexcept {
-  const auto lo_u = static_cast<uint64_t>(rf_lo);
-  const uint64_t span_u = static_cast<uint64_t>(rf_hi) - lo_u;
-  size_t n_sel = 0;
-  if (all_bits_set) {
-    uint32_t selected =
-        platform::SelectInt64ClosedRange(vals, nrows, rf_lo, rf_hi, out_sel);
-    if (has_null) {
-      uint32_t nonnull = 0;
-      for (uint32_t i = 0; i < selected; ++i) {
-        if (!rf_col->IsNull(out_sel[i])) {
-          out_sel[nonnull++] = out_sel[i];
-        }
-      }
-      selected = nonnull;
-    }
-    return selected;
-  }
-  if (!has_null) {
-    for (uint32_t r = 0; r < nrows; ++r) {
-      const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
-      if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
-          [[unlikely]] {
-        out_sel[n_sel++] = r;
-      }
-    }
-  } else {
-    for (uint32_t r = 0; r < nrows; ++r) {
-      const uint64_t off = static_cast<uint64_t>(vals[r]) - lo_u;
-      if (off <= span_u && ((bits[off >> 6] >> (off & 63)) & 1ULL) != 0)
-          [[unlikely]] {
-        if (!rf_col->IsNull(r)) {
-          out_sel[n_sel++] = r;
-        }
-      }
-    }
-  }
-
-  return n_sel;
-}
-
-}  // namespace
-
-namespace {
 
 // One probe row updates all aggregate cells under the same group lock.
 // Release on every Status/error path as well as normal completion.
@@ -273,950 +124,13 @@ class FusedGroupLock {
   uint8_t* state_;
 };
 
-struct FusedRawBlock {
-  static constexpr size_t kGroups = 1024;
-  explicit FusedRawBlock(size_t aggregates, bool has_stat = false,
-                         bool has_double = true, bool has_int = true)
-      : doubles(has_double ? kGroups * aggregates : 0),
-        ints(has_int ? kGroups * aggregates : 0),
-        counts(kGroups * aggregates),
-        flags(kGroups * aggregates),
-        ext_sx(has_stat ? kGroups * aggregates : 0),
-        ext_sxx(has_stat ? kGroups * aggregates : 0) {}
-  std::vector<double> doubles;
-  std::vector<int64_t> ints;
-  std::vector<int64_t> counts;
-  std::vector<uint8_t> flags;
-  std::vector<platform::ExtendedFloat> ext_sx;
-  std::vector<platform::ExtendedFloat> ext_sxx;
-};
 
-struct RightColLocator {
-  const ColumnarTable* table{nullptr};
-  std::vector<uint32_t> chunk_bases;
-  uint32_t fixed_chunk_rows{0};
-  uint32_t chunk_shift{0};
-  uint32_t chunk_mask{0};
-  bool single_chunk{false};
-  bool uniform_pow2{false};
-  bool uniform_fixed{false};
-
-  void Init(const ColumnarTable* tbl) {
-    table = tbl;
-    chunk_bases.clear();
-    fixed_chunk_rows = 0;
-    chunk_shift = 0;
-    chunk_mask = 0;
-    single_chunk = false;
-    uniform_pow2 = false;
-    uniform_fixed = false;
-    if (tbl == nullptr || tbl->chunks.empty()) {
-      return;
-    }
-    const size_t n = tbl->chunks.size();
-    chunk_bases.resize(n + 1);
-    uint64_t acc = 0;
-    for (size_t i = 0; i < n; ++i) {
-      chunk_bases[i] = static_cast<uint32_t>(acc);
-      acc += tbl->chunks[i].rows;
-    }
-    chunk_bases[n] = static_cast<uint32_t>(acc);
-    if (n == 1) {
-      single_chunk = true;
-      return;
-    }
-    const size_t first_rows = tbl->chunks[0].rows;
-    if (first_rows > 0 && first_rows <= std::numeric_limits<uint32_t>::max()) {
-      bool all_interior_same = true;
-      for (size_t i = 1; i + 1 < n; ++i) {
-        if (tbl->chunks[i].rows != first_rows) {
-          all_interior_same = false;
-          break;
-        }
-      }
-      if (all_interior_same && tbl->chunks.back().rows <= first_rows) {
-        fixed_chunk_rows = static_cast<uint32_t>(first_rows);
-        if (std::has_single_bit(first_rows)) {
-          uniform_pow2 = true;
-          chunk_shift = static_cast<uint32_t>(std::countr_zero(first_rows));
-          chunk_mask = fixed_chunk_rows - 1;
-        } else {
-          uniform_fixed = true;
-        }
-      }
-    }
-  }
-
-  [[nodiscard]] [[gnu::always_inline]] std::pair<uint32_t, uint32_t> Locate(
-      uint32_t r_idx) const noexcept {
-    if (single_chunk) [[likely]] {
-      return {0, r_idx};
-    }
-    if (uniform_pow2) [[likely]] {
-      return {r_idx >> chunk_shift, r_idx & chunk_mask};
-    }
-    if (uniform_fixed) {
-      return {r_idx / fixed_chunk_rows, r_idx % fixed_chunk_rows};
-    }
-    const auto it =
-        std::upper_bound(chunk_bases.begin() + 1, chunk_bases.end(), r_idx);
-    const auto ci = static_cast<uint32_t>((it - chunk_bases.begin()) - 1);
-    return {ci, r_idx - chunk_bases[ci]};
-  }
-
-  void WriteValue(size_t col, uint32_t r_idx, Value* out) const {
-    const auto [ci, ri] = Locate(r_idx);
-    table->chunks[ci].columns[col].WriteValueInto(ri, out);
-  }
-
-  [[nodiscard]] bool ReadInt(size_t col, uint32_t r_idx, int64_t* out,
-                             ValueType* out_type = nullptr,
-                             bool* out_unsigned = nullptr) const noexcept {
-    const auto [ci, ri] = Locate(r_idx);
-    const ColumnarColumn& cc = table->chunks[ci].columns[col];
-    const ColumnarColumn* leaf = &cc;
-    size_t lr = ri;
-    // Lean proof:
-    // lean/TinylambOpt/ResearchProofs/GatheredSmallDictFastPath.lean (sound)
-    if (leaf->encoding == ColumnarColumn::Encoding::kGathered) [[unlikely]] {
-      if (!cc.ResolveLeaf(ri, &leaf, &lr)) {
-        return false;
-      }
-    } else if (leaf->NonGatheredIsNull(lr)) {
-      return false;
-    }
-    if (leaf->is_uniform) [[likely]] {
-      if (leaf->type != ValueType::kInt64 && leaf->type != ValueType::kDate) {
-        return false;
-      }
-      if (out_type != nullptr) {
-        *out_type = leaf->type;
-      }
-      if (out_unsigned != nullptr) {
-        *out_unsigned = leaf->is_unsigned;
-      }
-      *out = leaf->IntAt(lr);
-      return true;
-    }
-    const Value& fv = leaf->fallback[lr];
-    if (fv.IsNull() ||
-        (fv.type != ValueType::kInt64 && fv.type != ValueType::kDate)) {
-      return false;
-    }
-    if (out_type != nullptr) {
-      *out_type = fv.type;
-    }
-    if (out_unsigned != nullptr) {
-      *out_unsigned = fv.IsUnsigned();
-    }
-    *out = fv.value.int_value;
-    return true;
-  }
-
-  [[nodiscard]] bool IsNull(size_t col, uint32_t r_idx) const noexcept {
-    const auto [ci, ri] = Locate(r_idx);
-    return table->chunks[ci].columns[col].IsNull(ri);
-  }
-};
-
-struct FusedGroup {
-  // Canonical group key, kept so the merge re-probes the shared map without
-  // re-evaluating the key programs.
-  Row key;
-  std::unique_ptr<Row> representative;
-  const Row* rep_left{nullptr};
-  uint32_t rep_col_chunk{kInvalidRightIdx};
-  uint32_t rep_col_row{0};
-  uint32_t rep_right_idx{kInvalidRightIdx};
-  size_t state_offset{0};
-  // count-star-only fusions accumulate here instead of through
-  // AggregateAccumulator states: the per-pair work is one integer increment
-  // and the merge is an integer add.
-  int64_t raw_count{0};
-  uint64_t key_hash{0};
-  bool has_key_hash{false};
-  // COUNT/group-presence needs none of these arrays. Other aggregations use
-  // exactly their aggregate count in stable blocks instead of eight cells
-  // in every group, including every count-only group.
-  // The worker/merge arena owns the block through result materialization.
-  FusedRawBlock* raw_owner{nullptr};
-  size_t raw_base{0};
-  [[nodiscard]] double* RawDoubles() const {
-    return raw_owner->doubles.data() + raw_base;
-  }
-  [[nodiscard]] int64_t* RawInts() const {
-    return raw_owner->ints.data() + raw_base;
-  }
-  [[nodiscard]] int64_t* RawCounts() const {
-    return raw_owner->counts.data() + raw_base;
-  }
-  [[nodiscard]] uint8_t* RawInfFlags() const {
-    return raw_owner->flags.data() + raw_base;
-  }
-  [[nodiscard]] platform::ExtendedFloat* RawStatX() const {
-    return raw_owner->ext_sx.data() + raw_base;
-  }
-  [[nodiscard]] platform::ExtendedFloat* RawStatXX() const {
-    return raw_owner->ext_sxx.data() + raw_base;
-  }
-  std::unique_ptr<FlatIntKeyMap<uint8_t>> raw_int_set;
-};
-
-struct FusedRawArena {
-  std::vector<std::unique_ptr<FusedRawBlock>> blocks;
-  size_t used{FusedRawBlock::kGroups};
-  bool has_stat{false};
-  bool has_double{true};
-  bool has_int{true};
-  void Initialize(FusedGroup& group, size_t aggregates) {
-    if (group.raw_owner != nullptr || aggregates == 0) {
-      return;
-    }
-    if (used == FusedRawBlock::kGroups) {
-      blocks.push_back(std::make_unique<FusedRawBlock>(aggregates, has_stat,
-                                                       has_double, has_int));
-      used = 0;
-    }
-    const size_t base = used++ * aggregates;
-    group.raw_owner = blocks.back().get();
-    group.raw_base = base;
-  }
-};
 
 // Bulk raw-count state: one map entry per distinct build key replaces the
 // whole bucket chain.  `r_idx` keeps the most recently inserted build row for
 // that key -- the row a bucket-head walk would have filled a new group's
 // representative from.
-struct BulkCountValue {
-  int64_t count{0};
-  size_t pairs{0};
-  uint32_t r_idx{kInvalidRightIdx};
-};
 
-struct CompactCountGroup {
-  uint64_t hash{0};
-  size_t next{SIZE_MAX};
-  int64_t count{0};
-  const Row* left{nullptr};
-  uint32_t right_idx{kInvalidRightIdx};
-};
-
-struct FusedWorkerLocal {
-  FusedRawArena raw_arena;
-  GroupKeyMap offsets;
-  // Single-INT64/DATE group-key fast path: raw-payload probes skip the
-  // Value-vector hashing the generic map pays per pair.  Key spaces of the
-  // two maps are disjoint (NULL keys route to the generic map, which groups
-  // NULLs), so a group lives in exactly one of them.
-  FlatIntKeyMap<size_t> int_offsets;
-  std::vector<FusedGroup> groups;
-  std::vector<CompactCountGroup> compact_counts;
-  std::vector<std::vector<uint64_t>> compact_split_shards;
-  size_t compact_count_inputs{0};
-  bool compact_count_log{false};
-  std::deque<AggregateAccumulator> states;
-  // Reusable probe key: avoids a fresh vector per probe row (see
-  // accumulate_into).  The transparent group-key hash/equal pair accepts the
-  // bare value vector, so probes never construct a Row.
-  std::vector<Value> key_scratch;
-  std::vector<const Value*> key_ptrs;
-  std::deque<Row> owned_rep_left;
-  std::array<uint32_t, 8192> local_2key_gid{};
-  bool local_2key_gid_init{false};
-  std::array<uint32_t, 4> cur_pk_subgids{};
-  bool have_cur_pk_subgids{false};
-  Status error{Status::kSuccess};
-  size_t comparisons{0};
-};
-
-}  // namespace
-
-ProgramShape ClassifyProgram(const BytecodeProgram& program,
-                             const Expression& expr, const Schema* schema) {
-  ProgramShape shape;
-  shape.fast = program.FastInterpretable();
-  const std::vector<BytecodeInstruction>& instructions = program.Instructions();
-  if (instructions.size() == 1 &&
-      instructions[0].opcode == BytecodeOp::kLoadColumn) {
-    shape.direct_column = instructions[0].operand;
-  } else if (instructions.size() == 2 &&
-             instructions[0].opcode == BytecodeOp::kLoadColumn &&
-             instructions[1].opcode == BytecodeOp::kExtractDatePart) {
-    shape.extract_date_col = static_cast<int32_t>(instructions[0].operand);
-    shape.extract_date_part = instructions[1].operand;
-  } else if (instructions.size() == 3 &&
-             instructions[0].opcode == BytecodeOp::kLoadColumn &&
-             instructions[1].opcode == BytecodeOp::kLoadColumn &&
-             instructions[2].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[2].binary == BinaryOperation::kMultiply) {
-    shape.mul_col0 = static_cast<int32_t>(instructions[0].operand);
-    shape.mul_col1 = static_cast<int32_t>(instructions[1].operand);
-  } else if (instructions.size() == 5 &&
-             instructions[0].opcode == BytecodeOp::kLoadColumn &&
-             instructions[1].opcode == BytecodeOp::kLoadConstant &&
-             instructions[2].opcode == BytecodeOp::kLoadColumn &&
-             instructions[3].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[3].binary == BinaryOperation::kSubtract &&
-             instructions[4].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[4].binary == BinaryOperation::kMultiply) {
-    const Value& k = program.Constants()[instructions[1].operand];
-    if (!k.IsNull() && (k.type == ValueType::kDouble ||
-                        (k.type == ValueType::kInt64 && !k.IsUnsigned()))) {
-      shape.mul_one_minus_col0 = static_cast<int32_t>(instructions[0].operand);
-      shape.mul_one_minus_col1 = static_cast<int32_t>(instructions[2].operand);
-      shape.mul_one_minus_const = k.type == ValueType::kDouble
-                                      ? k.value.double_value
-                                      : static_cast<double>(k.value.int_value);
-    }
-  } else if (instructions.size() == 9 &&
-             instructions[0].opcode == BytecodeOp::kLoadColumn &&
-             instructions[1].opcode == BytecodeOp::kLoadConstant &&
-             instructions[2].opcode == BytecodeOp::kLoadColumn &&
-             instructions[3].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[3].binary == BinaryOperation::kSubtract &&
-             instructions[4].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[4].binary == BinaryOperation::kMultiply &&
-             instructions[5].opcode == BytecodeOp::kLoadColumn &&
-             instructions[6].opcode == BytecodeOp::kLoadColumn &&
-             instructions[7].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[7].binary == BinaryOperation::kMultiply &&
-             instructions[8].opcode == BytecodeOp::kBinaryDouble &&
-             instructions[8].binary == BinaryOperation::kSubtract) {
-    const Value& k = program.Constants()[instructions[1].operand];
-    if (!k.IsNull() && (k.type == ValueType::kDouble ||
-                        (k.type == ValueType::kInt64 && !k.IsUnsigned()))) {
-      shape.profit_col0 = static_cast<int32_t>(instructions[0].operand);
-      shape.profit_col1 = static_cast<int32_t>(instructions[2].operand);
-      shape.profit_col2 = static_cast<int32_t>(instructions[5].operand);
-      shape.profit_col3 = static_cast<int32_t>(instructions[6].operand);
-      shape.profit_const = k.type == ValueType::kDouble
-                               ? k.value.double_value
-                               : static_cast<double>(k.value.int_value);
-    }
-  }
-  if (instructions.size() == 3 &&
-      instructions[2].opcode == BytecodeOp::kBinaryVarchar &&
-      (instructions[2].binary == BinaryOperation::kLike ||
-       instructions[2].binary == BinaryOperation::kNotLike) &&
-      instructions[0].opcode == BytecodeOp::kLoadColumn &&
-      instructions[1].opcode == BytecodeOp::kLoadConstant) {
-    // The stack pops right then left, so the constant is the pattern only
-    // when it was pushed second.  A collated pattern never reaches the fast
-    // interpreter (ProgramIsFastInterpretable keeps such programs canonical);
-    // mirror that gate so both paths agree.
-    const Value& pattern = program.Constants()[instructions[1].operand];
-    if (pattern.type == ValueType::kVarChar && pattern.Collation() == 0) {
-      shape.like_column = static_cast<int32_t>(instructions[0].operand);
-      shape.like_pattern = pattern.value.varchar_value;
-      shape.like_negated = instructions[2].binary == BinaryOperation::kNotLike;
-    }
-  }
-  if (expr && schema != nullptr && expr->Type() == TypeTag::kFunctionCallExp &&
-      !shape.HasPairDirect()) {
-    const FunctionCallExpression& call = expr->AsFunctionCallExpression();
-    if ((call.FuncName() == "coalesce" || call.FuncName() == "ifnull") &&
-        call.Args().size() == 2) {
-      auto unwrap_double_cast = [](Expression e, bool* saw_cast) -> Expression {
-        if (e && e->Type() == TypeTag::kCastExp &&
-            e->AsCastExpression().TargetValueType() == ValueType::kDouble &&
-            e->AsCastExpression().Child() != nullptr) {
-          if (saw_cast != nullptr) {
-            *saw_cast = true;
-          }
-          return e->AsCastExpression().Child();
-        }
-        return e;
-      };
-      const Expression& a0 = unwrap_double_cast(call.Args()[0], nullptr);
-      const Expression& a1 = unwrap_double_cast(call.Args()[1], nullptr);
-      bool zero_ok = false;
-      if (a1 && a1->Type() == TypeTag::kConstantValue) {
-        const Value& kv = a1->AsConstantValue().GetValue();
-        if (!kv.IsNull() && !kv.IsUnsigned()) {
-          if ((kv.type == ValueType::kDouble && kv.value.double_value == 0.0) ||
-              (kv.type == ValueType::kInt64 && kv.value.int_value == 0)) {
-            zero_ok = true;
-          }
-        }
-      }
-      if (zero_ok && a0 && a0->Type() == TypeTag::kBinaryExp &&
-          a0->AsBinaryExpression().Op() == BinaryOperation::kMultiply) {
-        const BinaryExpression& mb = a0->AsBinaryExpression();
-        bool saw_left_cast = false;
-        bool saw_right_cast = false;
-        const Expression& ml = unwrap_double_cast(mb.Left(), &saw_left_cast);
-        const Expression& mr = unwrap_double_cast(mb.Right(), &saw_right_cast);
-        if (ml && ml->Type() == TypeTag::kColumnValue && mr &&
-            mr->Type() == TypeTag::kColumnValue) {
-          const auto off0 =
-              LocalColumnOffset(*schema, ml->AsColumnValue().GetColumnName());
-          const auto off1 =
-              LocalColumnOffset(*schema, mr->AsColumnValue().GetColumnName());
-          if (off0.has_value() && off1.has_value()) {
-            const Column& c0 = schema->GetColumn(*off0);
-            const Column& c1 = schema->GetColumn(*off1);
-            const bool t0_ok =
-                !c0.IsUnsigned() && (c0.Type() == ValueType::kDouble ||
-                                     c0.Type() == ValueType::kInt64);
-            const bool t1_ok =
-                !c1.IsUnsigned() && (c1.Type() == ValueType::kDouble ||
-                                     c1.Type() == ValueType::kInt64);
-            const bool is_double_mul = c0.Type() == ValueType::kDouble ||
-                                       c1.Type() == ValueType::kDouble ||
-                                       saw_left_cast || saw_right_cast;
-            if (t0_ok && t1_ok && is_double_mul) {
-              shape.coalesce_mul_col0 = static_cast<int32_t>(*off0);
-              shape.coalesce_mul_col1 = static_cast<int32_t>(*off1);
-            }
-          }
-        }
-      }
-    }
-  }
-  if (expr && schema != nullptr && expr->Type() == TypeTag::kCaseExp &&
-      !shape.HasPairDirect()) {
-    const CaseExpression& ce = expr->AsCaseExpression();
-    if (ce.when_clauses_.size() == 1 &&
-        (!ce.else_clause_ ||
-         ce.else_clause_->Type() == TypeTag::kConstantValue)) {
-      const Value null_else;
-      const Value& ev = ce.else_clause_
-                            ? ce.else_clause_->AsConstantValue().GetValue()
-                            : null_else;
-      const bool else_zero_int = !ev.IsNull() && ev.type == ValueType::kInt64 &&
-                                 !ev.IsUnsigned() && ev.value.int_value == 0;
-      const bool else_zero_double = !ev.IsNull() &&
-                                    ev.type == ValueType::kDouble &&
-                                    ev.value.double_value == 0.0;
-      if (else_zero_int || else_zero_double || ev.IsNull()) {
-        const Expression& cond = ce.when_clauses_[0].first;
-        const Expression& val = ce.when_clauses_[0].second;
-        ProgramShape::CaseCondKind ck = ProgramShape::CaseCondKind::kNone;
-        int32_t ccol = -1;
-        int64_t cint = 0;
-        std::string_view cstr0;
-        std::string_view cstr1;
-        if (cond && cond->Type() == TypeTag::kBinaryExp) {
-          const BinaryExpression& cb = cond->AsBinaryExpression();
-          if (cb.Op() == BinaryOperation::kEquals && cb.Left() && cb.Right() &&
-              cb.Left()->Type() == TypeTag::kColumnValue &&
-              cb.Right()->Type() == TypeTag::kConstantValue) {
-            const auto off = LocalColumnOffset(
-                *schema, cb.Left()->AsColumnValue().GetColumnName());
-            const Value& cv = cb.Right()->AsConstantValue().GetValue();
-            if (off.has_value() && !cv.IsNull()) {
-              const Column& sc = schema->GetColumn(*off);
-              if (sc.Type() == ValueType::kInt64 && !sc.IsUnsigned() &&
-                  cv.type == ValueType::kInt64 && !cv.IsUnsigned()) {
-                ck = ProgramShape::CaseCondKind::kColEqInt;
-                ccol = static_cast<int32_t>(*off);
-                cint = cv.value.int_value;
-              } else if (sc.Type() == ValueType::kVarChar &&
-                         cv.type == ValueType::kVarChar &&
-                         cv.Collation() == 0 && !cv.IsCaseInsensitive()) {
-                ck = ProgramShape::CaseCondKind::kColEqStr;
-                ccol = static_cast<int32_t>(*off);
-                cstr0 = cv.value.varchar_value;
-              }
-            }
-          } else if (cb.Op() == BinaryOperation::kLike && cb.Left() &&
-                     cb.Right() && cb.Left()->Type() == TypeTag::kColumnValue &&
-                     cb.Right()->Type() == TypeTag::kConstantValue) {
-            const auto off = LocalColumnOffset(
-                *schema, cb.Left()->AsColumnValue().GetColumnName());
-            const Value& cv = cb.Right()->AsConstantValue().GetValue();
-            if (off.has_value() &&
-                schema->GetColumn(*off).Type() == ValueType::kVarChar &&
-                !cv.IsNull() && cv.type == ValueType::kVarChar &&
-                cv.Collation() == 0 && !cv.IsCaseInsensitive()) {
-              const std::string_view pat = cv.value.varchar_value;
-              if (pat.size() >= 2 && pat.back() == '%' &&
-                  pat.substr(0, pat.size() - 1).find_first_of("%_") ==
-                      std::string_view::npos) {
-                ck = ProgramShape::CaseCondKind::kColLikePrefix;
-                ccol = static_cast<int32_t>(*off);
-                cstr0 = pat.substr(0, pat.size() - 1);
-              }
-            }
-          } else if ((cb.Op() == BinaryOperation::kOr ||
-                      cb.Op() == BinaryOperation::kAnd) &&
-                     cb.Left() && cb.Right() &&
-                     cb.Left()->Type() == TypeTag::kBinaryExp &&
-                     cb.Right()->Type() == TypeTag::kBinaryExp) {
-            const BinaryExpression& b0 = cb.Left()->AsBinaryExpression();
-            const BinaryExpression& b1 = cb.Right()->AsBinaryExpression();
-            const BinaryOperation exp_op = (cb.Op() == BinaryOperation::kOr)
-                                               ? BinaryOperation::kEquals
-                                               : BinaryOperation::kNotEquals;
-            if (b0.Op() == exp_op && b1.Op() == exp_op && b0.Left() &&
-                b0.Right() && b1.Left() && b1.Right() &&
-                b0.Left()->Type() == TypeTag::kColumnValue &&
-                b0.Right()->Type() == TypeTag::kConstantValue &&
-                b1.Left()->Type() == TypeTag::kColumnValue &&
-                b1.Right()->Type() == TypeTag::kConstantValue) {
-              const auto off0 = LocalColumnOffset(
-                  *schema, b0.Left()->AsColumnValue().GetColumnName());
-              const auto off1 = LocalColumnOffset(
-                  *schema, b1.Left()->AsColumnValue().GetColumnName());
-              const Value& v0 = b0.Right()->AsConstantValue().GetValue();
-              const Value& v1 = b1.Right()->AsConstantValue().GetValue();
-              if (off0.has_value() && off1.has_value() && *off0 == *off1 &&
-                  schema->GetColumn(*off0).Type() == ValueType::kVarChar &&
-                  !v0.IsNull() && !v1.IsNull() &&
-                  v0.type == ValueType::kVarChar &&
-                  v1.type == ValueType::kVarChar && v0.Collation() == 0 &&
-                  v1.Collation() == 0 && !v0.IsCaseInsensitive() &&
-                  !v1.IsCaseInsensitive()) {
-                ck = (cb.Op() == BinaryOperation::kOr)
-                         ? ProgramShape::CaseCondKind::kColEq2StrOr
-                         : ProgramShape::CaseCondKind::kColNe2StrAnd;
-                ccol = static_cast<int32_t>(*off0);
-                cstr0 = v0.value.varchar_value;
-                cstr1 = v1.value.varchar_value;
-              }
-            }
-          }
-        }
-        if (ck == ProgramShape::CaseCondKind::kNone && cond) {
-          const auto terms = SplitConjuncts(cond);
-          bool valid = !terms.empty() && terms.size() <= 2;
-          for (const auto& term : terms) {
-            if (!valid || term->Type() != TypeTag::kBinaryExp) {
-              valid = false;
-              break;
-            }
-            const auto& comparison = term->AsBinaryExpression();
-            const auto op = comparison.Op();
-            if (op != BinaryOperation::kEquals &&
-                op != BinaryOperation::kLessThan &&
-                op != BinaryOperation::kLessThanEquals &&
-                op != BinaryOperation::kGreaterThan &&
-                op != BinaryOperation::kGreaterThanEquals) {
-              valid = false;
-              break;
-            }
-            auto constant =
-                comparison.Right() &&
-                        comparison.Right()->Type() == TypeTag::kConstantValue
-                    ? std::optional<Value>(
-                          comparison.Right()->AsConstantValue().GetValue())
-                    : TryDecideConstantConjunct(comparison.Right());
-            const bool is_date_cmp =
-                constant.has_value() && constant->type == ValueType::kDate;
-            if (!constant ||
-                (!is_date_cmp && (constant->type != ValueType::kInt64 ||
-                                  constant->IsUnsigned()))) {
-              valid = false;
-              break;
-            }
-            Expression lhs = comparison.Left(), rhs;
-            if (is_date_cmp && lhs && lhs->Type() == TypeTag::kCastExp &&
-                lhs->AsCastExpression().TargetValueType() == ValueType::kDate) {
-              lhs = lhs->AsCastExpression().Child();
-            }
-            if (!is_date_cmp && lhs && lhs->Type() == TypeTag::kBinaryExp &&
-                lhs->AsBinaryExpression().Op() == BinaryOperation::kSubtract) {
-              rhs = lhs->AsBinaryExpression().Right();
-              lhs = lhs->AsBinaryExpression().Left();
-            }
-            const auto column = [&](const Expression& e) -> int32_t {
-              if (!e || e->Type() != TypeTag::kColumnValue) {
-                return -1;
-              }
-              auto offset = LocalColumnOffset(
-                  *schema, e->AsColumnValue().GetColumnName());
-              if (!offset) {
-                return -1;
-              }
-              const Column& sc = schema->GetColumn(*offset);
-              if (is_date_cmp) {
-                if (sc.Type() != ValueType::kDate) {
-                  return -1;
-                }
-              } else if (sc.Type() != ValueType::kInt64 || sc.IsUnsigned()) {
-                return -1;
-              }
-              return static_cast<int32_t>(*offset);
-            };
-            const int32_t left_col = column(lhs);
-            const int32_t right_col = column(rhs);
-            if (left_col < 0 || (rhs && right_col < 0)) {
-              valid = false;
-              break;
-            }
-            shape.case_int_comparisons.push_back({left_col, right_col, op,
-                                                  constant->value.int_value,
-                                                  is_date_cmp});
-          }
-          if (valid) {
-            ck = ProgramShape::CaseCondKind::kIntComparisons;
-          } else {
-            shape.case_int_comparisons.clear();
-          }
-        }
-        ProgramShape::CaseValKind vk = ProgramShape::CaseValKind::kNone;
-        int32_t vcol0 = -1;
-        int32_t vcol1 = -1;
-        double vconst = 1.0;
-        std::shared_ptr<const BytecodeProgram> vprog_shared;
-        if (ck != ProgramShape::CaseCondKind::kNone && val) {
-          // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
-          //   (count_case_one_else_null_sound)
-          if ((else_zero_int || ev.IsNull()) &&
-              val->Type() == TypeTag::kConstantValue) {
-            const Value& tv = val->AsConstantValue().GetValue();
-            if (!tv.IsNull() && tv.type == ValueType::kInt64 &&
-                !tv.IsUnsigned() && tv.value.int_value == 1) {
-              vk = ProgramShape::CaseValKind::kIntConst1;
-            }
-          } else if (val->Type() == TypeTag::kColumnValue) {
-            const auto voff = LocalColumnOffset(
-                *schema, val->AsColumnValue().GetColumnName());
-            if (voff.has_value()) {
-              const Column& vc = schema->GetColumn(*voff);
-              if (vc.Type() == ValueType::kDouble) {
-                vk = ProgramShape::CaseValKind::kDirectDoubleCol;
-                vcol0 = static_cast<int32_t>(*voff);
-              } else if ((else_zero_int || ev.IsNull()) &&
-                         vc.Type() == ValueType::kInt64 && !vc.IsUnsigned()) {
-                vk = ProgramShape::CaseValKind::kDirectInt64Col;
-                vcol0 = static_cast<int32_t>(*voff);
-              }
-            }
-          } else if (val->Type() == TypeTag::kBinaryExp) {
-            std::optional<BytecodeProgram> vprog =
-                BytecodeCompiler::CompileRowCached(
-                    val, *schema, BytecodeCompiler::Context::kValue);
-            if (vprog.has_value()) {
-              const ProgramShape vs = ClassifyProgram(*vprog);
-              if (vs.mul_one_minus_col0 >= 0) {
-                vk = ProgramShape::CaseValKind::kMulOneMinus;
-                vcol0 = vs.mul_one_minus_col0;
-                vcol1 = vs.mul_one_minus_col1;
-                vconst = vs.mul_one_minus_const;
-              } else if (vprog->ResultType() == ValueType::kDouble) {
-                size_t d_depth = 0;
-                bool d_ok = true;
-                for (const auto& inst : vprog->Instructions()) {
-                  if (inst.opcode == BytecodeOp::kLoadColumn) {
-                    if (inst.operand < schema->ColumnCount()) {
-                      const Column& col = schema->GetColumn(inst.operand);
-                      d_ok = d_ok && (col.Type() == ValueType::kDouble ||
-                                      (col.Type() == ValueType::kInt64 &&
-                                       !col.IsUnsigned()));
-                    } else {
-                      d_ok = false;
-                    }
-                    ++d_depth;
-                  } else if (inst.opcode == BytecodeOp::kLoadConstant) {
-                    const Value& kv = vprog->Constants()[inst.operand];
-                    d_ok = d_ok && !kv.IsNull() && !kv.IsUnsigned() &&
-                           (kv.type == ValueType::kDouble ||
-                            kv.type == ValueType::kInt64);
-                    ++d_depth;
-                  } else if (inst.opcode == BytecodeOp::kBinaryDouble &&
-                             d_depth >= 2 &&
-                             (inst.binary == BinaryOperation::kAdd ||
-                              inst.binary == BinaryOperation::kSubtract ||
-                              inst.binary == BinaryOperation::kMultiply ||
-                              inst.binary == BinaryOperation::kDivide)) {
-                    --d_depth;
-                  } else {
-                    d_ok = false;
-                  }
-                  if (!d_ok || d_depth > 16) {
-                    d_ok = false;
-                    break;
-                  }
-                }
-                if (d_ok && d_depth == 1) {
-                  vk = ProgramShape::CaseValKind::kDoubleArith;
-                  vprog_shared =
-                      std::make_shared<BytecodeProgram>(std::move(*vprog));
-                }
-              }
-            }
-          }
-        }
-        if (ck != ProgramShape::CaseCondKind::kNone &&
-            vk != ProgramShape::CaseValKind::kNone) {
-          shape.case_cond = ck;
-          shape.case_val = vk;
-          shape.case_else_null = ev.IsNull();
-          shape.case_cond_col = ccol;
-          shape.case_cond_int = cint;
-          shape.case_cond_str0 = cstr0;
-          shape.case_cond_str1 = cstr1;
-          shape.case_val_col0 = vcol0;
-          shape.case_val_col1 = vcol1;
-          shape.case_val_const = vconst;
-          shape.case_val_program = std::move(vprog_shared);
-        }
-      }
-    }
-  }
-  return shape;
-}
-
-// Column cells referenced by a program's loads (the scratch-mask copy set).
-void CollectLoadCells(const BytecodeProgram& program,
-                      std::vector<slot_t>* cells) {
-  for (const BytecodeInstruction& instruction : program.Instructions()) {
-    if (instruction.opcode == BytecodeOp::kLoadColumn) {
-      cells->push_back(instruction.operand);
-    }
-  }
-}
-
-StatusOr<Value> EvaluateProgramValue(const BytecodeProgram& program,
-                                     const ProgramShape& shape,
-                                     const Row& scratch) {
-  if (shape.direct_column >= 0) {
-    return scratch[static_cast<slot_t>(shape.direct_column)];
-  }
-  if (shape.like_column >= 0) {
-    const Value& cell = scratch[static_cast<slot_t>(shape.like_column)];
-    // Collated operands keep the canonical verdict (case folding and the
-    // '_' collation raise live in the evaluator); NULL propagates as the
-    // comparison NULL it is, so both fall through to the program.
-    if (!cell.IsNull() && cell.type == ValueType::kVarChar &&
-        cell.Collation() == 0 && !cell.IsCaseInsensitive()) {
-      const bool matched = Like(cell.value.varchar_value, shape.like_pattern);
-      return Value(shape.like_negated ? !matched : matched);
-    }
-  }
-  if (shape.fast) {
-    Value out;
-    Status error{Status::kSuccess};
-    switch (program.TryEvaluateRowFast(scratch, &out, &error)) {
-      case BytecodeProgram::FastEval::kDone:
-        return out;
-      case BytecodeProgram::FastEval::kError:
-        return error;
-      case BytecodeProgram::FastEval::kUnsupported:
-        break;
-    }
-  }
-  return program.TryEvaluateRow(scratch);
-}
-
-namespace {
-
-// A scalar aggregate over NULL tests depends on a small nullness signature,
-// not on the joined payload. Count signatures during a FULL join, preserving
-// duplicate matches and each unmatched build/probe row. Only nonnegative
-// integer SUM inputs qualify, so folding repeated inputs cannot hide overflow.
-StatusOr<std::optional<Relation>> TryNullSignatureFullAggregate(
-    TransactionContext& context, const Relation& left, const Relation& right,
-    const std::vector<Expression>& predicates, const Scope* outer,
-    const CteMap& ctes, const GroupedJoinFusionSpec& fusion) {
-  if (!fusion.group_keys.empty() || fusion.having ||
-      fusion.post_having_active || fusion.rollup_count_distribution ||
-      left.HasSpill() || right.HasSpill() || left.using_columns ||
-      right.using_columns || right.rows.size() >= UINT32_MAX) {
-    return std::optional<Relation>{};
-  }
-  const Schema schema = left.schema + right.schema;
-  const auto keys = EqualityKeys(left.schema, right.schema, predicates);
-  if (keys.empty() || keys.size() > CompositeIntKey::kMaxParts ||
-      HasMixedKeySignednessOrType(left, right, keys) ||
-      !ResidualJoinPredicates(left.schema, right.schema, predicates).empty()) {
-    return std::optional<Relation>{};
-  }
-  std::vector<slot_t> left_keys, right_keys;
-  right_keys.reserve(keys.size());
-  for (const auto& key : keys) {
-    const auto type = left.schema.GetColumn(key.left).Type();
-    if (key.null_safe || key.left_offset != 0 || key.right_offset != 0 ||
-        type != right.schema.GetColumn(key.right).Type() ||
-        (type != ValueType::kInt64 && type != ValueType::kDate)) {
-      return std::optional<Relation>{};
-    }
-    left_keys.push_back(static_cast<slot_t>(key.left));
-    right_keys.push_back(static_cast<slot_t>(key.right));
-  }
-  std::vector<slot_t> null_columns;
-  const auto null_expression = [&](const auto& self,
-                                   const Expression& expression) -> bool {
-    if (!expression || ContainsParameterSlot(expression)) {
-      return false;
-    }
-    if (expression->Type() == TypeTag::kConstantValue) {
-      const auto& value = expression->AsConstantValue().GetValue();
-      return value.IsNull() ||
-             (value.type == ValueType::kInt64 && !value.IsUnsigned() &&
-              value.value.int_value >= 0);
-    }
-    if (expression->Type() == TypeTag::kUnaryExp) {
-      const auto& unary = expression->AsUnaryExpression();
-      if (unary.Op() == UnaryOperation::kNot) {
-        return self(self, unary.Child());
-      }
-      if ((unary.Op() != UnaryOperation::kIsNull &&
-           unary.Op() != UnaryOperation::kIsNotNull) ||
-          !unary.Child() || unary.Child()->Type() != TypeTag::kColumnValue) {
-        return false;
-      }
-      const auto slot = LocalColumnOffset(
-          schema, unary.Child()->AsColumnValue().GetColumnName());
-      if (!slot) {
-        return false;
-      }
-      if (std::ranges::find(null_columns, *slot) == null_columns.end()) {
-        null_columns.push_back(static_cast<slot_t>(*slot));
-      }
-      return null_columns.size() <= 8;
-    }
-    if (expression->Type() == TypeTag::kBinaryExp) {
-      const auto& binary = expression->AsBinaryExpression();
-      return (binary.Op() == BinaryOperation::kAnd ||
-              binary.Op() == BinaryOperation::kOr) &&
-             self(self, binary.Left()) && self(self, binary.Right());
-    }
-    if (expression->Type() == TypeTag::kCaseExp) {
-      const auto& branch = expression->AsCaseExpression();
-      for (const auto& [condition, value] : branch.when_clauses_) {
-        if (!self(self, condition) || !self(self, value)) {
-          return false;
-        }
-      }
-      return !branch.else_clause_ || self(self, branch.else_clause_);
-    }
-    return false;
-  };
-  for (size_t i = 0; i < fusion.aggregates.size(); ++i) {
-    const auto* aggregate = fusion.aggregates[i];
-    if ((aggregate->GetType() != AggregationType::kSum &&
-         aggregate->GetType() != AggregationType::kCount) ||
-        aggregate->Distinct() ||
-        (!fusion.count_star[i] &&
-         !null_expression(null_expression, aggregate->Child()))) {
-      return std::optional<Relation>{};
-    }
-  }
-  // The ordinary grouped emitter can evaluate scalar expressions of the
-  // finished aggregates; no input column may escape the aggregate boundary.
-  const size_t signature_count = size_t{1} << null_columns.size();
-  const size_t bytes = (right.rows.size() * 128) + (signature_count * 16);
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return std::optional<Relation>{};
-  }
-  QueryMemoryCharge charge(bytes);
-  const auto started = std::chrono::steady_clock::now();
-  const size_t left_width = left.schema.ColumnCount();
-  const auto signature = [&](const Row* lhs, const Row* rhs) {
-    size_t mask = 0;
-    for (size_t i = 0; i < null_columns.size(); ++i) {
-      const size_t column = null_columns[i];
-      const bool is_null =
-          column < left_width
-              ? lhs == nullptr || (*lhs)[column].IsNull()
-              : rhs == nullptr || (*rhs)[column - left_width].IsNull();
-      mask |= static_cast<size_t>(is_null) << i;
-    }
-    return mask;
-  };
-  FlatJoinBuckets<CompositeIntKey, CompositeIntKeyHash> buckets;
-  buckets.reserve(right.rows.size());
-  for (const Row& row : right.rows) {
-    if (!HasNullKey(row, right_keys)) {
-      buckets.emplace(EncodeCompositeIntKey(row, right_keys), &row);
-    }
-  }
-  std::vector<uint64_t> counts(signature_count, 0);
-  std::vector<uint8_t> matched(right.rows.size(), 0);
-  uint64_t comparisons = 0;
-  for (const Row& row : left.rows) {
-    bool found = false;
-    if (!HasNullKey(row, left_keys)) {
-      const auto [begin, end] =
-          buckets.equal_range(EncodeCompositeIntKey(row, left_keys));
-      for (auto iter = begin; iter != end; ++iter) {
-        ++comparisons;
-        ++counts[signature(&row, iter->second)];
-        matched[static_cast<size_t>(iter->second - right.rows.data())] = 1;
-        found = true;
-      }
-    }
-    if (!found) {
-      ++counts[signature(&row, nullptr)];
-    }
-  }
-  for (size_t i = 0; i < right.rows.size(); ++i) {
-    if (matched[i] == 0) {
-      ++counts[signature(nullptr, &right.rows[i])];
-    }
-  }
-  Row representative(std::vector<Value>(schema.ColumnCount(), Value(1)));
-  Scope scope{.row = &representative, .schema = &schema, .outer = outer};
-  AggregateResultMap finished;
-  for (size_t i = 0; i < fusion.aggregates.size(); ++i) {
-    const auto* aggregate = fusion.aggregates[i];
-    const bool is_count = aggregate->GetType() == AggregationType::kCount;
-    int64_t sum = 0;
-    bool any = false;
-    for (size_t mask = 0; mask < signature_count; ++mask) {
-      if (counts[mask] == 0) {
-        continue;
-      }
-      for (size_t c = 0; c < null_columns.size(); ++c) {
-        representative.values_[null_columns[c]] =
-            (mask & (size_t{1} << c)) != 0 ? Value() : Value(1);
-      }
-      Value value(1);
-      if (!fusion.count_star[i]) {
-        ASSIGN_OR_RETURN(
-            Value, evaluated,
-            TryEvaluate(aggregate->Child(), scope, nullptr, context, ctes));
-        value = std::move(evaluated);
-      }
-      if (value.IsNull()) {
-        continue;
-      }
-      const int64_t contribution = is_count ? 1 : value.value.int_value;
-      int64_t increment = 0;
-      if (counts[mask] > static_cast<uint64_t>(INT64_MAX) ||
-          __builtin_mul_overflow(
-              contribution, static_cast<int64_t>(counts[mask]), &increment) ||
-          __builtin_add_overflow(sum, increment, &sum)) {
-        return StatusError(StatusCode::kIsInfinity,
-                           "integer overflow in aggregate");
-      }
-      any = true;
-    }
-    finished.emplace(aggregate, any || is_count ? Value(sum) : Value());
-  }
-  Row output;
-  std::vector<Column> columns;
-  columns.reserve(fusion.select_items.size());
-  for (size_t i = 0; i < fusion.select_items.size(); ++i) {
-    ASSIGN_OR_RETURN(
-        Value, value,
-        TryEvaluate(fusion.select_items[i], scope, &finished, context, ctes));
-    columns.emplace_back(fusion.select_names[i], ValueTypeOf(value));
-    columns.back().SetUnsigned(value.IsUnsigned());
-    output.values_.push_back(std::move(value));
-  }
-  Relation result(context.execution_runtime());
-  result.schema = Schema("", std::move(columns));
-  result.hash_joins = left.hash_joins + right.hash_joins + 1;
-  result.in_memory_hash_joins =
-      left.in_memory_hash_joins + right.in_memory_hash_joins + 1;
-  result.hybrid_hash_joins = left.hybrid_hash_joins + right.hybrid_hash_joins;
-  result.nested_loop_joins = left.nested_loop_joins + right.nested_loop_joins;
-  result.join_comparisons =
-      left.join_comparisons + right.join_comparisons + comparisons;
-  result.peak_intermediate_rows =
-      std::max(left.peak_intermediate_rows, right.peak_intermediate_rows);
-  result.AddRow(std::move(output));
-  RETURN_IF_FAIL(result.FinishSpill());
-  RETURN_IF_FAIL(result.GetStatus());
-  if (auto* runtime = context.execution_runtime()) {
-    ++runtime->grouped_join_fusions;
-    runtime->join_ms += ElapsedMs(started);
-  }
-  return std::optional<Relation>(std::move(result));
-}
 
 }  // namespace
 
@@ -1856,801 +770,30 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // matched pairs.  Mixed shapes stay on the generic path.
   // A grouping-only join needs the same key-presence state as COUNT(*).
   // Its count is internal; no aggregate column is emitted.
-  bool count_star_only = true;
-  for (const bool count_star : fusion->count_star) {
-    count_star_only = count_star_only && count_star;
-  }
-  bool count_nonnull_only = false;
-  std::optional<slot_t> count_right_column;
-  // A COUNT over a left-side NOT NULL / PRIMARY KEY column also counts the
-  // null-extended row of an unmatched LEFT JOIN; hoisted out of the setup
-  // block so the accumulate paths can apply that rule.
-  bool unconditional_matched_count = false;
-  {
-    bool all_count_nonnull = !fusion->aggregates.empty();
-    bool any_nonnull = false;
-    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-      if (fusion->count_star[i]) {
-        all_count_nonnull = false;
-        break;
-      }
-      const AggregateExpression* aggregate = fusion->aggregates[i];
-      const bool plain_column_child =
-          aggregate->GetType() == AggregationType::kCount &&
-          child_shapes[i].direct_column >= 0 && !aggregate->Distinct() &&
-          !aggregate->WhereFilter() &&
-          aggregate->Having() == AggregateHavingModifier::kNone &&
-          aggregate->InnerOrderBy().empty() && !aggregate->SecondaryArg() &&
-          aggregate->ExtraArgs().empty();
-      bool eligible_column = false;
-      if (plain_column_child) {
-        const auto col_idx = static_cast<size_t>(child_shapes[i].direct_column);
-        const Column& column = result.schema.GetColumn(col_idx);
-        const Constraint::ConstraintType ctype = column.GetConstraint().ctype;
-        if ((ctype == Constraint::kNotNull ||
-             ctype == Constraint::kPrimaryKey) &&
-            (col_idx < left_width || join_type == JoinType::kInner)) {
-          // A shared counter requires identical NULL behavior. A left
-          // not-null column also counts the unmatched row of a LEFT JOIN,
-          // but a right-side column can still be NULL-padded by an outer
-          // join, so its declared kNotNull is not proof there.
-          eligible_column = !count_right_column.has_value();
-          unconditional_matched_count = true;
-        } else if (col_idx >= left_width && !unconditional_matched_count) {
-          const auto right_col = static_cast<slot_t>(col_idx - left_width);
-          if (!count_right_column.has_value() ||
-              *count_right_column == right_col) {
-            count_right_column = right_col;
-            eligible_column = true;
-          }
-        }
-      }
-      if (!eligible_column) {
-        all_count_nonnull = false;
-        break;
-      }
-      any_nonnull = true;
-    }
-    count_nonnull_only = all_count_nonnull && any_nonnull;
-  }
-  static const bool count_fusion_disabled =
-      ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_COUNT_STAR_FUSION") !=
-      nullptr;
-  const bool raw_count_fusion =
-      !count_fusion_disabled && (count_star_only || count_nonnull_only);
-  enum class RawAggKind : uint8_t {
-    kNone = 0,
-    kSumDouble,
-    kSumInt64,
-    kAvgDouble,
-    kStddevSamp,
-    kStddevPop,
-    kVarSamp,
-    kVarPop,
-    kCountStar,
-    kCountValue,
-    kConstantExtremum,
-    kCountDistinctInt64,
-  };
   const auto is_stat_raw_kind = [](RawAggKind kind) noexcept {
     return kind == RawAggKind::kStddevSamp || kind == RawAggKind::kStddevPop ||
            kind == RawAggKind::kVarSamp || kind == RawAggKind::kVarPop;
   };
-  std::array<RawAggKind, kRawAggregateCapacity> raw_agg_kinds{};
-  std::array<Value, kRawAggregateCapacity> raw_constants{};
-  bool raw_sum_fusion = !raw_count_fusion && !fusion->aggregates.empty() &&
-                        fusion->aggregates.size() <= kRawAggregateCapacity;
-  bool has_count_distinct = false;
-  // Several aggregates can read the same column (SUM(c), AVG(c), MIN(c)...).
-  // The DOUBLE-admixture proof below scans the whole side once per column;
-  // memoize it so a column is scanned only once per fused-join planning pass.
-  std::vector<int8_t> left_double_cache(left_width, -1);
-  std::vector<int8_t> right_double_cache(right_width, -1);
-  const auto column_may_be_double = [&](bool is_left, size_t offset) -> bool {
-    auto& cache = is_left ? left_double_cache : right_double_cache;
-    if (offset >= cache.size()) {
-      return false;
-    }
-    int8_t& cached = cache[offset];
-    if (cached >= 0) {
-      return cached != 0;
-    }
-    bool may = false;
-    if (is_left) {
-      if (left.HasColumnarOnly() && left.columnar != nullptr) {
-        may =
-            ColumnarColMayBeDouble(*left.columnar, static_cast<slot_t>(offset));
-      } else {
-        for (const Row& r : left.rows) {
-          if (offset < r.Count() && r[offset].type == ValueType::kDouble) {
-            may = true;
-            break;
-          }
-        }
-      }
-    } else if (right_col_only && right_arg.columnar != nullptr) {
-      may = ColumnarColMayBeDouble(*right_arg.columnar,
-                                   static_cast<slot_t>(offset));
-    } else {
-      for (const Row& r : right_ptr->rows) {
-        if (offset < r.Count() && r[offset].type == ValueType::kDouble) {
-          may = true;
-          break;
-        }
-      }
-    }
-    cached = may ? 1 : 0;
-    return may;
-  };
-  if (raw_sum_fusion) {
-    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-      if (fusion->count_star[i]) {
-        raw_agg_kinds[i] = RawAggKind::kCountStar;
-        continue;
-      }
-      const AggregateExpression* agg = fusion->aggregates[i];
-      if (agg->WhereFilter() ||
-          agg->Having() != AggregateHavingModifier::kNone ||
-          !agg->InnerOrderBy().empty() || agg->SecondaryArg() ||
-          !agg->ExtraArgs().empty() || !agg->Child()) {
-        raw_sum_fusion = false;
-        break;
-      }
-      // A uniform numeric input column makes MIN/MAX an existence test.
-      // Prove uniformity from this snapshot's resident rows, preserving NULL
-      // padding and empty groups; no catalog statistic is trusted as a value.
-      if (!agg->Distinct() &&
-          (agg->GetType() == AggregationType::kMin ||
-           agg->GetType() == AggregationType::kMax) &&
-          child_shapes[i].direct_column >= 0) {
-        const auto column = static_cast<size_t>(child_shapes[i].direct_column);
-        const Relation& side = column < left_width ? left : right;
-        const size_t offset =
-            column < left_width ? column : column - left_width;
-        const auto valid_const_type = [](const Value& v) noexcept {
-          return (v.type == ValueType::kInt64 || v.type == ValueType::kDouble ||
-                  v.IsNull()) &&
-                 (v.type != ValueType::kDouble ||
-                  !std::isnan(v.value.double_value));
-        };
-        const auto matches_first = [](const Value& first_val,
-                                      const Value& other) noexcept {
-          return first_val.type == other.type &&
-                 first_val.IsUnsigned() == other.IsUnsigned() &&
-                 first_val == other &&
-                 (first_val.type != ValueType::kDouble ||
-                  std::signbit(first_val.value.double_value) ==
-                      std::signbit(other.value.double_value));
-        };
-        if (!side.HasSpill() && !side.HasColumnarOnly() && !side.rows.empty() &&
-            side.rows.size() <= 500000) {
-          const Value& value = side.rows.front()[offset];
-          if (valid_const_type(value) &&
-              std::ranges::all_of(side.rows, [&](const Row& row) {
-                return matches_first(value, row[offset]);
-              })) {
-            raw_agg_kinds[i] = RawAggKind::kConstantExtremum;
-            raw_constants[i] = value;
-            continue;
-          }
-        } else if (!side.HasSpill() && side.HasColumnarOnly() &&
-                   side.columnar != nullptr) {
-          const size_t total_col_rows = side.TotalRows();
-          if (total_col_rows > 0 && total_col_rows <= 500000) {
-            bool uniform_ok = true;
-            bool has_first = false;
-            Value first_val;
-            for (const ColumnarChunk& chunk : side.columnar->chunks) {
-              if (chunk.rows == 0) {
-                continue;
-              }
-              if (offset >= chunk.columns.size()) {
-                uniform_ok = false;
-                break;
-              }
-              const ColumnarColumn& col = chunk.columns[offset];
-              if (col.encoding == ColumnarColumn::Encoding::kConstant) {
-                Value cv;
-                col.WriteValueInto(0, &cv);
-                if (!has_first) {
-                  if (!valid_const_type(cv)) {
-                    uniform_ok = false;
-                    break;
-                  }
-                  first_val = cv;
-                  has_first = true;
-                } else if (!matches_first(first_val, cv)) {
-                  uniform_ok = false;
-                  break;
-                }
-                continue;
-              }
-              for (size_t r = 0; r < chunk.rows; ++r) {
-                Value rv;
-                col.WriteValueInto(r, &rv);
-                if (!has_first) {
-                  if (!valid_const_type(rv)) {
-                    uniform_ok = false;
-                    break;
-                  }
-                  first_val = rv;
-                  has_first = true;
-                } else if (!matches_first(first_val, rv)) {
-                  uniform_ok = false;
-                  break;
-                }
-              }
-              if (!uniform_ok) {
-                break;
-              }
-            }
-            if (uniform_ok && has_first) {
-              raw_agg_kinds[i] = RawAggKind::kConstantExtremum;
-              raw_constants[i] = first_val;
-              continue;
-            }
-          }
-        }
-      }
-      const TypeTag child_tag =
-          agg->Child()->ResultType(result.schema).GetType();
-      bool child_may_unsigned = false;
-      bool child_has_mixed_double = false;
-      for (const BytecodeInstruction& inst : child_programs[i].Instructions()) {
-        if (inst.opcode == BytecodeOp::kLoadColumn &&
-            inst.operand < result.schema.ColumnCount()) {
-          if (result.schema.GetColumn(inst.operand).IsUnsigned()) {
-            child_may_unsigned = true;
-            break;
-          }
-          if (result.schema.GetColumn(inst.operand).Type() ==
-              ValueType::kInt64) {
-            child_has_mixed_double =
-                child_has_mixed_double ||
-                column_may_be_double(
-                    inst.operand < left_width,
-                    inst.operand < left_width
-                        ? static_cast<size_t>(inst.operand)
-                        : static_cast<size_t>(inst.operand - left_width));
-          }
-        }
-      }
-      if (child_has_mixed_double) {
-        raw_sum_fusion = false;
-        break;
-      }
-      for (const Value& cval : child_programs[i].Constants()) {
-        if (!cval.IsNull() && cval.IsUnsigned()) {
-          child_may_unsigned = true;
-          break;
-        }
-      }
-      if (agg->Distinct()) {
-        if (agg->GetType() == AggregationType::kCount && !has_count_distinct &&
-            (child_tag == TypeTag::kBigInt || child_tag == TypeTag::kInteger) &&
-            !child_may_unsigned) {
-          raw_agg_kinds[i] = RawAggKind::kCountDistinctInt64;
-          has_count_distinct = true;
-          continue;
-        }
-        raw_sum_fusion = false;
-        break;
-      }
-      if (agg->GetType() == AggregationType::kCount) {
-        raw_agg_kinds[i] = RawAggKind::kCountValue;
-      } else if (agg->GetType() == AggregationType::kSum) {
-        bool mixed_double_case = false;
-        if (child_tag == TypeTag::kInvalid && !child_may_unsigned &&
-            agg->Child()->Type() == TypeTag::kCaseExp) {
-          const auto& ce = agg->Child()->AsCaseExpression();
-          bool saw_dbl = false;
-          bool all_num = !ce.when_clauses_.empty();
-          auto check_br = [&](const Expression& br) {
-            if (!br) {
-              return;
-            }
-            if (br->Type() == TypeTag::kConstantValue &&
-                br->AsConstantValue().GetValue().IsNull()) {
-              return;
-            }
-            const TypeTag bt = br->ResultType(result.schema).GetType();
-            if (bt == TypeTag::kDouble) {
-              saw_dbl = true;
-            } else if (bt != TypeTag::kBigInt && bt != TypeTag::kInteger) {
-              all_num = false;
-            }
-          };
-          for (const auto& w : ce.when_clauses_) {
-            check_br(w.second);
-          }
-          check_br(ce.else_clause_);
-          mixed_double_case = all_num && saw_dbl;
-        }
-        if (child_tag == TypeTag::kDouble || mixed_double_case) {
-          raw_agg_kinds[i] = RawAggKind::kSumDouble;
-        } else if ((child_tag == TypeTag::kBigInt ||
-                    child_tag == TypeTag::kInteger) &&
-                   !child_may_unsigned) {
-          raw_agg_kinds[i] = RawAggKind::kSumInt64;
-        } else {
-          raw_sum_fusion = false;
-          break;
-        }
-      } else if (agg->GetType() == AggregationType::kAvg ||
-                 agg->GetType() == AggregationType::kStddevSamp ||
-                 agg->GetType() == AggregationType::kStddevPop ||
-                 agg->GetType() == AggregationType::kVarSamp ||
-                 agg->GetType() == AggregationType::kVarPop) {
-        if (child_tag == TypeTag::kDouble ||
-            ((child_tag == TypeTag::kBigInt ||
-              child_tag == TypeTag::kInteger) &&
-             !child_may_unsigned)) {
-          switch (agg->GetType()) {
-            case AggregationType::kAvg:
-              raw_agg_kinds[i] = RawAggKind::kAvgDouble;
-              break;
-            case AggregationType::kStddevSamp:
-              raw_agg_kinds[i] = RawAggKind::kStddevSamp;
-              break;
-            case AggregationType::kStddevPop:
-              raw_agg_kinds[i] = RawAggKind::kStddevPop;
-              break;
-            case AggregationType::kVarSamp:
-              raw_agg_kinds[i] = RawAggKind::kVarSamp;
-              break;
-            case AggregationType::kVarPop:
-              raw_agg_kinds[i] = RawAggKind::kVarPop;
-              break;
-            default:
-              break;
-          }
-        } else {
-          raw_sum_fusion = false;
-          break;
-        }
-      } else {
-        raw_sum_fusion = false;
-        break;
-      }
-    }
+  FusedRawAggregates raw_aggregates;
+  if (const char* reason = raw_aggregates.Classify({
+      .left = left,
+      .right_arg = right_arg,
+      .join_type = join_type,
+      .fusion = fusion,
+      .deferred_left_probe = deferred_left_probe,
+      .effective_left_rows = effective_left_rows,
+      .right_col_only = right_col_only,
+      .right_ptr = right_ptr,
+      .right = right,
+      .result = result,
+      .left_width = left_width,
+      .right_width = right_width,
+      .child_programs = child_programs,
+      .right_build_count = right_build_count(),
+      .child_shapes = child_shapes,
+  })) {
+    return not_fusable(reason);
   }
-  // A parent rollup may reassociate only exact partials. The Cartesian join
-  // bound covers duplicate build keys and LEFT padding without catalog PK
-  // assumptions; immutable scan bounds cover every possible filtered subset.
-  size_t exact_left_rows_bound = effective_left_rows;
-  if (deferred_left_probe != nullptr && deferred_left_probe->store != nullptr &&
-      !deferred_left_probe->store->blocks.empty()) {
-    const auto& probe = *deferred_left_probe;
-    const size_t base_proj_cols = probe.projection.size();
-    const ScanRuntimeFilter& primary_rf = probe.runtime_filter;
-    uint64_t zm_rows = 0;
-    for (const LSTablePageBlock& blk : probe.store->blocks) {
-      if (blk.row_count == 0) {
-        continue;
-      }
-      // Zone-map metadata on a block-lazy deferred store can be older than the
-      // decoded rows. Only the filter's own RejectsAll() is authoritative for
-      // a row-count UPPER bound: rejecting whole blocks via min/max could
-      // undercount and let a wrong exact-integer-total check pass.
-      bool extra_zm_reject = false;
-      for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-        if (!ext.enabled() || ext.column >= base_proj_cols) {
-          continue;
-        }
-        if (ext.group->RejectsAll()) {
-          extra_zm_reject = true;
-          break;
-        }
-      }
-      if (!extra_zm_reject) {
-        zm_rows += blk.row_count;
-      }
-    }
-    exact_left_rows_bound =
-        std::min<size_t>(effective_left_rows, static_cast<size_t>(zm_rows));
-  }
-  // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/ExactIntTotalOverflowGuard.lean (sound)
-  const auto exact_integer_total = [&](size_t aggregate) {
-    constexpr uint64_t kExactLimit = uint64_t{1} << 53;
-    const size_t build_bound = std::max<size_t>(1, right_build_count());
-    if ((exact_left_rows_bound > 0 &&
-         exact_left_rows_bound > kExactLimit / build_bound) ||
-        child_shapes[aggregate].direct_column < 0) {
-      return false;
-    }
-    const auto slot =
-        static_cast<size_t>(child_shapes[aggregate].direct_column);
-    if (result.schema.GetColumn(slot).Type() != ValueType::kInt64 ||
-        result.schema.GetColumn(slot).IsUnsigned()) {
-      return false;
-    }
-    uint64_t maximum = 0;
-    const auto magnitude = [](int64_t value) {
-      const auto bits = static_cast<uint64_t>(value);
-      return value < 0 ? uint64_t{0} - bits : bits;
-    };
-    if (slot < left_width && deferred_left_probe != nullptr) {
-      const auto& probe = *deferred_left_probe;
-      if (!probe.store || slot >= probe.projection.size() ||
-          std::ranges::any_of(probe.pk_lookups, [&](const auto& lookup) {
-            return lookup.target_proj_col == slot;
-          })) {
-        return false;
-      }
-      const auto& store = *probe.store;
-      const slot_t column = probe.projection[slot];
-      if (!store.HasColumn(column) || store.blocks.empty() ||
-          column >= store.column_min_int.size() ||
-          column >= store.column_max_int.size() ||
-          column >= store.blocks.front().columns.size() ||
-          store.blocks.front().columns[column].type != ValueType::kInt64 ||
-          store.blocks.front().columns[column].is_unsigned ||
-          store.column_min_int[column] > store.column_max_int[column]) {
-        return false;
-      }
-      if (exact_left_rows_bound == 0) {
-        // The deferred store path derived this bound from every block's
-        // runtime-filter zone maps, so zero proves there are no joined pairs.
-        return true;
-      }
-      maximum = std::max(magnitude(store.column_min_int[column]),
-                         magnitude(store.column_max_int[column]));
-      const uint64_t pairs =
-          static_cast<uint64_t>(exact_left_rows_bound) * build_bound;
-      const uint64_t max_allowed = kExactLimit / pairs;
-      return maximum <= max_allowed;
-    }
-    // Without the deferred-store zone-map proof, keep the zero-bound case on
-    // the conservative fallback path.
-    if (exact_left_rows_bound == 0) {
-      return false;
-    }
-    const uint64_t pairs =
-        static_cast<uint64_t>(exact_left_rows_bound) * build_bound;
-    const uint64_t max_allowed = kExactLimit / pairs;
-    const Relation& side = slot < left_width ? left : *right_ptr;
-    const size_t column = slot < left_width ? slot : slot - left_width;
-    if (side.HasSpill()) {
-      return false;
-    }
-    if (side.HasColumnarOnly()) {
-      const auto check_chunk = [&](const ColumnarChunk& ch,
-                                   uint64_t* local_max) -> bool {
-        if (column >= ch.columns.size()) {
-          return false;
-        }
-        if (ch.rows == 0) {
-          return true;
-        }
-        const ColumnarColumn& cc = ch.columns[column];
-        if (cc.encoding == ColumnarColumn::Encoding::kConstant) {
-          if (cc.IsNull(0)) {
-            return true;
-          }
-          if (cc.is_uniform) {
-            if (cc.type != ValueType::kInt64 || cc.is_unsigned) {
-              return false;
-            }
-            *local_max = std::max(*local_max, magnitude(cc.IntAt(0)));
-          } else {
-            Value tmp;
-            cc.WriteValueInto(0, &tmp);
-            if (!tmp.IsNull()) {
-              if (tmp.type != ValueType::kInt64 || tmp.IsUnsigned()) {
-                return false;
-              }
-              *local_max = std::max(*local_max, magnitude(tmp.value.int_value));
-            }
-          }
-          return *local_max <= max_allowed;
-        }
-        if (cc.encoding == ColumnarColumn::Encoding::kFlat && cc.is_uniform &&
-            cc.type == ValueType::kInt64 && !cc.is_unsigned &&
-            cc.ints.size() >= ch.rows &&
-            (!cc.has_null || cc.nulls.empty() || cc.nulls.size() >= ch.rows)) {
-          const int64_t* ptr = cc.ints.data();
-          if (!cc.has_null || cc.nulls.empty()) {
-            int64_t lo = std::numeric_limits<int64_t>::max();
-            int64_t hi = std::numeric_limits<int64_t>::min();
-            for (size_t r = 0; r < ch.rows; ++r) {
-              const int64_t v = ptr[r];
-              lo = v < lo ? v : lo;
-              hi = v > hi ? v : hi;
-            }
-            *local_max = std::max({*local_max, magnitude(lo), magnitude(hi)});
-            return *local_max <= max_allowed;
-          }
-          const uint8_t* nul = cc.nulls.data();
-          bool seen = false;
-          int64_t lo = std::numeric_limits<int64_t>::max();
-          int64_t hi = std::numeric_limits<int64_t>::min();
-          for (size_t r = 0; r < ch.rows; ++r) {
-            if (nul[r] == 0) {
-              const int64_t v = ptr[r];
-              if (!seen) {
-                lo = hi = v;
-                seen = true;
-              } else {
-                lo = v < lo ? v : lo;
-                hi = v > hi ? v : hi;
-              }
-            }
-          }
-          if (seen) {
-            *local_max = std::max({*local_max, magnitude(lo), magnitude(hi)});
-            return *local_max <= max_allowed;
-          }
-          return true;
-        }
-        for (size_t r = 0; r < ch.rows; ++r) {
-          if (cc.IsNull(r)) {
-            continue;
-          }
-          if (cc.is_uniform) {
-            if (cc.type != ValueType::kInt64 || cc.is_unsigned) {
-              return false;
-            }
-            *local_max = std::max(*local_max, magnitude(cc.IntAt(r)));
-          } else {
-            Value tmp;
-            cc.WriteValueInto(r, &tmp);
-            if (tmp.IsNull()) {
-              continue;
-            }
-            if (tmp.type != ValueType::kInt64 || tmp.IsUnsigned()) {
-              return false;
-            }
-            *local_max = std::max(*local_max, magnitude(tmp.value.int_value));
-          }
-          if (*local_max > max_allowed) {
-            return false;
-          }
-        }
-        return true;
-      };
-      const auto& chunks = side.columnar->chunks;
-      const size_t total_rows = side.TotalRows();
-      if (total_rows >= 65536 && chunks.size() > 1) {
-        const size_t workers = std::min(
-            chunks.size(),
-            std::max<size_t>(1, ParallelWorkerCount(total_rows / 65536)));
-        if (workers > 1) {
-          std::atomic<size_t> next_chunk{0};
-          std::atomic<bool> ok{true};
-          std::vector<uint64_t> local_maxes(workers, 0);
-          const Status pst = RunParallelTasks(workers, [&](size_t w) {
-            uint64_t lmax = 0;
-            while (ok.load(std::memory_order_relaxed)) {
-              const size_t ci =
-                  next_chunk.fetch_add(1, std::memory_order_relaxed);
-              if (ci >= chunks.size()) {
-                break;
-              }
-              if (!check_chunk(chunks[ci], &lmax)) {
-                ok.store(false, std::memory_order_relaxed);
-                return;
-              }
-            }
-            local_maxes[w] = lmax;
-          });
-          if (!pst.ok() || !ok.load(std::memory_order_relaxed)) {
-            return false;
-          }
-          for (uint64_t lm : local_maxes) {
-            maximum = std::max(maximum, lm);
-          }
-        } else {
-          for (const ColumnarChunk& ch : chunks) {
-            if (!check_chunk(ch, &maximum)) {
-              return false;
-            }
-          }
-        }
-      } else {
-        for (const ColumnarChunk& ch : chunks) {
-          if (!check_chunk(ch, &maximum)) {
-            return false;
-          }
-        }
-      }
-    } else {
-      for (const Row& row : side.rows) {
-        const Value& value = row[column];
-        if (value.IsNull()) {
-          continue;
-        }
-        if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
-          return false;
-        }
-        maximum = std::max(maximum, magnitude(value.value.int_value));
-        if (maximum > max_allowed) {
-          return false;
-        }
-      }
-    }
-    // Division avoids overflow even for INT64_MIN and excessive cardinality.
-    return maximum <= max_allowed;
-  };
-  if (fusion->require_exact_integer_totals) {
-    const size_t build_bound = std::max<size_t>(1, right_build_count());
-    if (!raw_sum_fusion ||
-        exact_left_rows_bound > (uint64_t{1} << 53) / build_bound) {
-      return not_fusable("unproved partial totals");
-    }
-    for (size_t a = 0; a < fusion->aggregates.size(); ++a) {
-      if (raw_agg_kinds[a] == RawAggKind::kCountStar ||
-          raw_agg_kinds[a] == RawAggKind::kCountValue) {
-        continue;
-      }
-      if (raw_agg_kinds[a] != RawAggKind::kSumInt64 ||
-          !exact_integer_total(a)) {
-        return not_fusable("unproved partial integer sum");
-      }
-    }
-  }
-  std::array<int8_t, kRawAggregateCapacity> raw_agg_slot{};
-  raw_agg_slot.fill(-1);
-  std::array<uint8_t, kRawAggregateCapacity> raw_slot_origin{};
-  std::array<RawAggKind, kRawAggregateCapacity> slot_agg_kinds{};
-  std::array<bool, kRawAggregateCapacity> raw_const_folded{};
-  size_t raw_slot_count = 0;
-  if (raw_sum_fusion) {
-    const bool allow_const_extremum_fold = !fusion->group_keys.empty() &&
-                                           join_type == JoinType::kInner &&
-                                           !fusion->rollup_count_distribution;
-    const auto raw_family = [](RawAggKind kind) noexcept -> uint8_t {
-      switch (kind) {
-        case RawAggKind::kSumDouble:
-        case RawAggKind::kAvgDouble:
-          return 1;
-        case RawAggKind::kStddevSamp:
-        case RawAggKind::kStddevPop:
-        case RawAggKind::kVarSamp:
-        case RawAggKind::kVarPop:
-          return 2;
-        case RawAggKind::kSumInt64:
-          return 3;
-        case RawAggKind::kCountStar:
-          return 4;
-        case RawAggKind::kCountValue:
-          return 5;
-        case RawAggKind::kConstantExtremum:
-          return 6;
-        case RawAggKind::kCountDistinctInt64:
-          return 7;
-        case RawAggKind::kNone:
-          return 0;
-      }
-      return 0;
-    };
-    const auto same_value_bits = [](const Value& a,
-                                    const Value& b) noexcept -> bool {
-      if (a.type != b.type || a.IsUnsigned() != b.IsUnsigned() ||
-          a.IsInterval() != b.IsInterval()) {
-        return false;
-      }
-      if (a.type == ValueType::kDouble) {
-        return std::bit_cast<uint64_t>(a.value.double_value) ==
-               std::bit_cast<uint64_t>(b.value.double_value);
-      }
-      return a == b;
-    };
-    const auto same_child_program = [&](size_t a, size_t b) -> bool {
-      if (fusion->count_star[a] != fusion->count_star[b]) {
-        return false;
-      }
-      if (fusion->count_star[a]) {
-        return true;
-      }
-      const BytecodeProgram& pa = child_programs[a];
-      const BytecodeProgram& pb = child_programs[b];
-      // Lean proof: lean/TinylambOpt/ResearchProofs/BytecodeSideTableEquiv.lean
-      //   (sound)
-      if (!pa.Casts().empty() || !pb.Casts().empty() ||
-          !pa.StringSets().empty() || !pb.StringSets().empty() ||
-          !pa.RowInMasks().empty() || !pb.RowInMasks().empty() ||
-          pa.ResultType() != pb.ResultType()) {
-        return false;
-      }
-      const auto& ia = pa.Instructions();
-      const auto& ib = pb.Instructions();
-      if (ia.size() != ib.size()) {
-        return false;
-      }
-      for (size_t k = 0; k < ia.size(); ++k) {
-        if (ia[k].opcode != ib[k].opcode || ia[k].operand != ib[k].operand ||
-            ia[k].binary != ib[k].binary || ia[k].unary != ib[k].unary ||
-            ia[k].jump_target != ib[k].jump_target) {
-          return false;
-        }
-      }
-      const auto& ca = pa.Constants();
-      const auto& cb = pb.Constants();
-      if (ca.size() != cb.size()) {
-        return false;
-      }
-      for (size_t k = 0; k < ca.size(); ++k) {
-        if (!same_value_bits(ca[k], cb[k])) {
-          return false;
-        }
-      }
-      const auto& ra = pa.Int64Ranges();
-      const auto& rb = pb.Int64Ranges();
-      if (ra.size() != rb.size()) {
-        return false;
-      }
-      for (size_t k = 0; k < ra.size(); ++k) {
-        if (ra[k].lo != rb[k].lo || ra[k].hi != rb[k].hi ||
-            ra[k].expected_type != rb[k].expected_type) {
-          return false;
-        }
-      }
-      const auto& rca = pa.Reciprocals();
-      const auto& rcb = pb.Reciprocals();
-      if (rca.size() != rcb.size()) {
-        return false;
-      }
-      for (size_t k = 0; k < rca.size(); ++k) {
-        if (rca[k].divisor != rcb[k].divisor || rca[k].abs_d != rcb[k].abs_d ||
-            rca[k].recip != rcb[k].recip) {
-          return false;
-        }
-      }
-      return true;
-    };
-    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-      if (allow_const_extremum_fold &&
-          raw_agg_kinds[i] == RawAggKind::kConstantExtremum &&
-          !raw_constants[i].IsNull()) {
-        raw_const_folded[i] = true;
-        raw_agg_slot[i] = -1;
-        continue;
-      }
-      int8_t matched_slot = -1;
-      const uint8_t fam = raw_family(raw_agg_kinds[i]);
-      if (fam != 0 && fam != 7) {
-        for (size_t s = 0; s < raw_slot_count; ++s) {
-          const size_t src = raw_slot_origin[s];
-          if (raw_family(raw_agg_kinds[src]) == fam &&
-              same_child_program(i, src)) {
-            matched_slot = static_cast<int8_t>(s);
-            break;
-          }
-        }
-      }
-      if (matched_slot >= 0) {
-        raw_agg_slot[i] = matched_slot;
-      } else {
-        const size_t s = raw_slot_count++;
-        raw_slot_origin[s] = static_cast<uint8_t>(i);
-        slot_agg_kinds[s] = raw_agg_kinds[i];
-        raw_agg_slot[i] = static_cast<int8_t>(s);
-      }
-    }
-  }
-  // SUM raises kIsInfinity on an infinite total but AVG returns it as a value
-  // (aggregate_accumulator.cpp), so a slot consumed only by AVG(DOUBLE) must
-  // not turn its sticky inf flag into a query error.  A slot shared with any
-  // other aggregate kind keeps raising.
-  std::array<bool, kRawAggregateCapacity> slot_raises_inf{};
-  if (raw_sum_fusion) {
-    for (size_t i = 0;
-         i < fusion->aggregates.size() && i < raw_const_folded.size(); ++i) {
-      if (raw_const_folded[i] || raw_agg_slot[i] < 0) {
-        continue;
-      }
-      if (raw_agg_kinds[i] != RawAggKind::kAvgDouble) {
-        const auto slot_idx =
-            static_cast<size_t>(static_cast<unsigned char>(raw_agg_slot[i]));
-        if (slot_idx < slot_raises_inf.size()) {
-          slot_raises_inf[slot_idx] = true;
-        }
-      }
-    }
-  }
-  const bool skip_accumulator_states =
-      raw_count_fusion || raw_sum_fusion || fusion->aggregates.empty();
   // For INNER joins over exact INT64/DATE equality keys, align join-key group
   // columns with the side that owns the remaining group keys so either
   // right-only pre-assigned build groups (Q3, Q18) or left-only group caching
@@ -2708,7 +851,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     const bool prefer_right_group_key =
         preallocation_safe &&
         (has_non_join_right_key ||
-         (skip_accumulator_states && residual_programs.empty() &&
+         (raw_aggregates.skip_accumulator_states && residual_programs.empty() &&
           right.TotalRows() * 2 <= effective_left_rows));
     for (ProgramShape& kshape : key_shapes) {
       if (prefer_right_group_key) {
@@ -2887,18 +1030,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     left_key_offsets.push_back(key.left_offset);
     right_key_offsets.push_back(key.right_offset);
   }
-  constexpr auto kInvalidFusedPacked2x32 = static_cast<int64_t>(
-      (static_cast<uint64_t>(0x80000000ULL) << 32) | 0x80000000ULL);
-  const auto fits_fused_i32 = [](int64_t v) noexcept {
-    return v >= static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&
-           v <= static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-  };
-  const auto pack_fused_2x32 = [](int64_t k0, int64_t k1) noexcept -> int64_t {
-    return static_cast<int64_t>(
-        (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(k0)))
-         << 32) |
-        static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(k1))));
-  };
+
   std::vector<int64_t> validated_packed_keys;
   std::shared_ptr<QueryMemoryCharge> validated_packed_keys_charge;
   if (right_col_only) {
@@ -2964,13 +1096,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
             const int64_t k0 = AddJoinKeyBias(v0, roff0);
             const int64_t k1 = AddJoinKeyBias(v1, roff1);
-            if (!fits_fused_i32(k0) || !fits_fused_i32(k1) ||
-                pack_fused_2x32(k0, k1) == kInvalidFusedPacked2x32) {
+            if (!FitsFusedInt32(k0) || !FitsFusedInt32(k1) ||
+                PackFusedInt32Pair(k0, k1) == kInvalidFusedPacked2x32) {
               can_pack = false;
               break;
             }
             if (!validated_packed_keys.empty()) {
-              validated_packed_keys[base_row + r] = pack_fused_2x32(k0, k1);
+              validated_packed_keys[base_row + r] = PackFusedInt32Pair(k0, k1);
             }
           }
           if (!can_pack) {
@@ -3032,7 +1164,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       join_type == JoinType::kLeft && fusion->anti_unmatched_only;
   const bool bulk_raw_count =
       !singleton_right_relation && !left.HasSpill() && !bulk_count_disabled &&
-      !anti_unmatched_only && raw_count_fusion && residual_programs.empty() &&
+      !anti_unmatched_only && raw_aggregates.raw_count_fusion && residual_programs.empty() &&
       int_group_key && int_group_slot < left_width && integer_key;
   static const Value kNullCell{};
   const auto right_row_ptr = [&](uint32_t r_idx) noexcept -> const Row* {
@@ -3040,17 +1172,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                ? &right_ptr->rows[r_idx]
                : nullptr;
   };
-  const auto read_right_cell = [&](uint32_t r_idx, size_t rcol,
-                                   Value* scratch) -> const Value& {
-    if (r_idx == kInvalidRightIdx) {
-      return kNullCell;
-    }
-    if (right_col_only) {
-      right_locator.WriteValue(rcol, r_idx, scratch);
-      return *scratch;
-    }
-    return right_ptr->rows[r_idx].values_[rcol];
-  };
+  const FusedRightCellReader read_right_cell{.right_locator = right_locator,
+                                             .right_ptr = right_ptr,
+                                             .right_col_only = right_col_only,
+                                             .kNullCell = kNullCell};
   const auto right_cell_is_null = [&](uint32_t r_idx,
                                       size_t rcol) noexcept -> bool {
     if (r_idx == kInvalidRightIdx) {
@@ -3068,17 +1193,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
     return right_row != nullptr ? right_row->values_[col - left_width]
                                 : kNullCell;
-  };
-  auto cell_as_double = [](const Value& v, double* out) noexcept -> bool {
-    if (v.type == ValueType::kDouble) {
-      *out = v.value.double_value;
-      return true;
-    }
-    if (v.type == ValueType::kInt64 && !v.IsUnsigned()) {
-      *out = static_cast<double>(v.value.int_value);
-      return true;
-    }
-    return false;
   };
   const auto eval_case_cond = [&](const ProgramShape& shape,
                                   const Row* left_row, const Row* right_row,
@@ -3179,7 +1293,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::array<bool, kRawAggregateCapacity> right_case_complete{};
   const size_t right_case_rows =
       right_col_only ? total_right_rows : right_ptr->rows.size();
-  if (raw_sum_fusion && effective_left_rows >= 1024 &&
+  if (raw_aggregates.raw_sum_fusion && effective_left_rows >= 1024 &&
       effective_left_rows >= right_case_rows && right_case_rows > 0 &&
       !right_ptr->HasSpill() &&
       right_case_rows <= SIZE_MAX / fusion->aggregates.size() &&
@@ -3312,7 +1426,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Value();
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         return Value(d0 * d1);
       }
       scratch.values_[static_cast<size_t>(shape.mul_col0)] = c0;
@@ -3328,7 +1442,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Value(0.0);
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         return Value(d0 * d1);
       }
       scratch.values_[static_cast<size_t>(shape.coalesce_mul_col0)] = c0;
@@ -3344,7 +1458,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Value();
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         return Value(d0 * (shape.mul_one_minus_const - d1));
       }
       scratch.values_[static_cast<size_t>(shape.mul_one_minus_col0)] = c0;
@@ -3364,8 +1478,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Value();
       }
       double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1) &&
-          cell_as_double(c2, &d2) && cell_as_double(c3, &d3)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1) &&
+          ReadFusedDouble(c2, &d2) && ReadFusedDouble(c3, &d3)) [[likely]] {
         return Value((d0 * (shape.profit_const - d1)) - (d2 * d3));
       }
       scratch.values_[static_cast<size_t>(shape.profit_col0)] = c0;
@@ -3407,7 +1521,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             return Value();
           }
           double d0 = 0.0;
-          if (cell_as_double(v0, &d0)) [[likely]] {
+          if (ReadFusedDouble(v0, &d0)) [[likely]] {
             return Value(d0);
           }
         } else if (shape.case_val == ProgramShape::CaseValKind::kMulOneMinus) {
@@ -3419,7 +1533,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             return Value();
           }
           double d0 = 0.0, d1 = 0.0;
-          if (cell_as_double(v0, &d0) && cell_as_double(v1, &d1)) [[likely]] {
+          if (ReadFusedDouble(v0, &d0) && ReadFusedDouble(v1, &d1)) [[likely]] {
             return Value(d0 * (shape.case_val_const - d1));
           }
         }
@@ -3452,7 +1566,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     return EvaluateProgramValue(program, shape, scratch);
   };
   std::vector<std::vector<double>> right_profit_doubles(child_shapes.size());
-  if (!right_col_only && raw_sum_fusion && !right_ptr->HasSpill() &&
+  if (!right_col_only && raw_aggregates.raw_sum_fusion && !right_ptr->HasSpill() &&
       !right_ptr->rows.empty() && right_ptr->rows.size() <= 262144) {
     for (size_t i = 0; i < child_shapes.size(); ++i) {
       const ProgramShape& sh = child_shapes[i];
@@ -3481,7 +1595,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       for (size_t ri = 0; ri < right_ptr->rows.size(); ++ri) {
         const Value& rv = right_ptr->rows[ri].values_[rcol];
         double dv = 0.0;
-        if (rv.IsNull() || !cell_as_double(rv, &dv)) {
+        if (rv.IsNull() || !ReadFusedDouble(rv, &dv)) {
           all_ok = false;
           break;
         }
@@ -3541,7 +1655,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         *is_null = true;
         return Status::kSuccess;
       }
-      if (cell_as_double(c, out)) [[likely]] {
+      if (ReadFusedDouble(c, out)) [[likely]] {
         *is_null = false;
         return Status::kSuccess;
       }
@@ -3555,7 +1669,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         *out = d0 * d1;
         *is_null = false;
         return Status::kSuccess;
@@ -3571,7 +1685,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         *out = d0 * d1;
         *is_null = false;
         return Status::kSuccess;
@@ -3586,7 +1700,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }
       double d0 = 0.0, d1 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1)) [[likely]] {
         *out = d0 * (shape.mul_one_minus_const - d1);
         *is_null = false;
         return Status::kSuccess;
@@ -3609,8 +1723,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           return Status::kSuccess;
         }
         double d0 = 0.0, d1 = 0.0, left_number = 0.0;
-        if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1) &&
-            cell_as_double(left_factor, &left_number)) [[likely]] {
+        if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1) &&
+            ReadFusedDouble(left_factor, &left_number)) [[likely]] {
           const double dr = right_profit_doubles[agg_idx][r_idx];
           *out = (d0 * (shape.profit_const - d1)) -
                  (col2_right ? (dr * left_number) : (left_number * dr));
@@ -3631,8 +1745,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }
       double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
-      if (cell_as_double(c0, &d0) && cell_as_double(c1, &d1) &&
-          cell_as_double(c2, &d2) && cell_as_double(c3, &d3)) [[likely]] {
+      if (ReadFusedDouble(c0, &d0) && ReadFusedDouble(c1, &d1) &&
+          ReadFusedDouble(c2, &d2) && ReadFusedDouble(c3, &d3)) [[likely]] {
         *out = (d0 * (shape.profit_const - d1)) - (d2 * d3);
         *is_null = false;
         return Status::kSuccess;
@@ -3654,7 +1768,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             *is_null = true;
             return Status::kSuccess;
           }
-          if (cell_as_double(v0, out)) [[likely]] {
+          if (ReadFusedDouble(v0, out)) [[likely]] {
             *is_null = false;
             return Status::kSuccess;
           }
@@ -3668,7 +1782,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             return Status::kSuccess;
           }
           double d0 = 0.0, d1 = 0.0;
-          if (cell_as_double(v0, &d0) && cell_as_double(v1, &d1)) [[likely]] {
+          if (ReadFusedDouble(v0, &d0) && ReadFusedDouble(v1, &d1)) [[likely]] {
             *out = d0 * (shape.case_val_const - d1);
             *is_null = false;
             return Status::kSuccess;
@@ -3748,7 +1862,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       *is_null = true;
       return Status::kSuccess;
     }
-    if (cell_as_double(child, out)) {
+    if (ReadFusedDouble(child, out)) {
       *is_null = false;
       return Status::kSuccess;
     }
@@ -3816,71 +1930,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           grp, static_cast<size_t>(key_shapes[k].direct_column), &col_tmp);
       grp.key.values_[k] = CanonicalDistinctValue(raw);
     }
-  };
-  struct PreparedDeferredPkBlock {
-    int64_t min_k{0};
-    int64_t max_k{0};
-    uint32_t row_count{0};
-    uint8_t dense_contiguous{0};
-    uint8_t has_null_payload{0};
-    const int64_t* pk_cells{nullptr};
-    const int64_t* pay_cells{nullptr};
-    const LSTableColumnBlock* pay_blk{nullptr};
-  };
-  struct PreparedDeferredPkLookup {
-    enum : size_t {
-      kDirShift = 12U,
-      kDirBuckets = size_t{1} << kDirShift,
-    };
-    slot_t pk_col{0};
-    slot_t store_payload_col{0};
-    slot_t target_proj_col{0};
-    size_t group_idx{0};
-    ValueType payload_type{ValueType::kNull};
-    bool payload_unsigned{false};
-    int64_t min_k{0};
-    int64_t max_k{0};
-    uint64_t span{1};
-    std::array<uint32_t, kDirBuckets + 1> bucket_lo{};
-    std::vector<int64_t> blk_max_keys;
-    std::vector<PreparedDeferredPkBlock> blocks;
-  };
-  struct PreparedDeferredPkGroup {
-    slot_t pk_col{0};
-    const LSTableStore* store{nullptr};
-    slot_t store_pk_col{0};
-    int64_t min_k{0};
-    int64_t max_k{0};
-    uint64_t span{1};
-    std::array<uint32_t, PreparedDeferredPkLookup::kDirBuckets + 1> bucket_lo{};
-    std::vector<int64_t> blk_max_keys;
-    struct Block {
-      int64_t min_k{0};
-      int64_t max_k{0};
-      uint32_t row_count{0};
-      uint32_t row_base{0};
-      uint8_t dense_contiguous{0};
-      const int64_t* pk_cells{nullptr};
-    };
-    std::vector<Block> blocks;
-    uint32_t total_rows{0};
-    using DensePkEntry = SharedBaseRelationCache::DensePkEntry;
-    std::vector<DensePkEntry> dense_index;
-    const DensePkEntry* dense_ptr{nullptr};
-    size_t dense_size{0};
-    std::shared_ptr<const std::vector<DensePkEntry>> shared_dense;
-    std::shared_ptr<const SharedBaseRelationCache::CachedPkDict> shared_pk_dict;
-    std::shared_ptr<const void> store_owner;
-    std::shared_ptr<QueryMemoryCharge> dense_index_charge;
-    std::vector<size_t> lookup_indices;
-    std::vector<uint32_t> subgid;
-    const uint32_t* subgid_ptr{nullptr};
-    std::vector<std::pair<uint32_t, uint32_t>> subgid_rep_loc;
-    const std::pair<uint32_t, uint32_t>* subgid_rep_ptr{nullptr};
-    uint32_t subgid_count{0};
-    uint8_t subgid_shift{0};
-    bool use_subgid{false};
-    bool lazy_payloads{false};
   };
   std::vector<ValueType> def_base_types;
   std::vector<uint8_t> def_overwritten_by_pk;
@@ -4176,2515 +2225,52 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  bool use_split_key_gid = false;
-  bool split_has_left_probe = false;
-  bool split_uses_right_subgid = false;
-  bool split_uses_pk_subgid = false;
-  uint8_t split_right_shift = 32;
-  size_t split_left_k = 1;
-  size_t split_right_subgid_count = 0;
-  std::vector<uint32_t> split_right_subgid;
-  const uint32_t* split_right_subgid_ptr = nullptr;
-  std::vector<uint32_t> split_right_rep_idx;
-  const uint32_t* split_right_rep_ptr = nullptr;
-  size_t split_right_rep_count = 0;
-  std::shared_ptr<const SharedBaseRelationCache::CachedSplitRightDict>
-      shared_right_dict;
-  const auto clear_split_right_dict = [&]() noexcept {
-    split_right_subgid.clear();
-    split_right_rep_idx.clear();
-    shared_right_dict.reset();
-    split_right_subgid_ptr = nullptr;
-    split_right_rep_ptr = nullptr;
-    split_right_rep_count = 0;
-    split_right_subgid_count = 0;
-  };
-  const auto fast_hash_val = [](const Value& value) -> uint64_t {
-    if (value.IsNull()) {
-      return 0;
-    }
-    if (value.type == ValueType::kVarChar && !value.IsInterval() &&
-        !value.IsCaseInsensitive()) {
-      return std::hash<std::string_view>{}(value.value.varchar_value);
-    }
-    if ((value.type == ValueType::kInt64 || value.type == ValueType::kDate) &&
-        !value.IsUnsigned()) {
-      uint64_t x =
-          static_cast<uint64_t>(value.value.int_value) + 0x9e3779b97f4a7c15ULL;
-      x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-      x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-      return x ^ (x >> 31);
-    }
-    return (value.IsCaseInsensitive() || value.type == ValueType::kDouble)
-               ? DistinctValueHash{}(value)
-               : std::hash<Value>{}(value);
-  };
-  const auto splitmix_i64 = [](int64_t iv) noexcept -> uint64_t {
-    uint64_t x = static_cast<uint64_t>(iv) + 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
-  };
-  const auto read_pk_cell = [&](size_t li, uint32_t nb, uint32_t rin,
-                                Value* out) {
-    const PreparedDeferredPkLookup& m = prepared_pk_lookups[li];
-    const PreparedDeferredPkBlock& pb = m.blocks[nb];
-    if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-      *out = Value();
-      return;
-    }
-    if (m.payload_type == ValueType::kVarChar) {
-      out->type = ValueType::kVarChar;
-      out->SetCollation(0);
-      out->value.varchar_value = pb.pay_blk->VarcharAt(rin);
-    } else if (m.payload_type == ValueType::kDouble) {
-      const auto dv = std::bit_cast<double>(pb.pay_cells[rin]);
-      out->type = ValueType::kDouble;
-      out->SetCollation(0);
-      out->value.double_value = dv == 0.0 ? 0.0 : dv;
-    } else {
-      out->type = m.payload_type;
-      out->SetCollation(0);
-      if (m.payload_unsigned) {
-        out->SetUnsigned();
-      }
-      out->value.int_value = pb.pay_cells[rin];
-    }
-  };
-  const auto build_flat_subgid_dict =
-      [&](size_t row_count, size_t max_unique, auto&& fill_hashes,
-          auto&& eq_rows, std::vector<uint32_t>* out_subgid,
-          uint32_t* out_count, const std::vector<uint8_t>* row_active = nullptr,
-          std::vector<uint32_t>* out_rep_rows = nullptr) -> bool {
-    if (row_count == 0) {
-      out_subgid->clear();
-      *out_count = 0;
-      if (out_rep_rows != nullptr) {
-        out_rep_rows->clear();
-      }
-      return true;
-    }
-    std::vector<uint64_t> row_hashes(row_count);
-    if (!fill_hashes(row_hashes).ok()) {
-      return false;
-    }
-    const size_t dict_workers = ParallelWorkerCount(row_count / 16384);
-    if (dict_workers > 1 && row_count >= 16384 && max_unique <= 4096) {
-      out_subgid->resize(row_count);
-      const size_t local_cap =
-          std::bit_ceil(std::max<size_t>(32ULL, max_unique * 2ULL));
-      const size_t local_mask = local_cap - 1;
-      std::vector<std::vector<uint32_t>> local_reps(dict_workers);
-      std::vector<std::vector<uint64_t>> local_hashes(dict_workers);
-      std::atomic<bool> overflowed{false};
-      const Status dict_status = RunParallelTasks(dict_workers, [&](size_t w) {
-        const size_t begin = (row_count * w) / dict_workers;
-        const size_t end = (row_count * (w + 1)) / dict_workers;
-        std::vector<uint32_t> buckets(local_cap,
-                                      std::numeric_limits<uint32_t>::max());
-        auto& l_reps = local_reps[w];
-        auto& l_hashes = local_hashes[w];
-        l_reps.reserve(std::min<size_t>(max_unique, 1024ULL));
-        l_hashes.reserve(std::min<size_t>(max_unique, 1024ULL));
-        for (size_t r = begin; r < end; ++r) {
-          if (row_active != nullptr && (*row_active)[r] == 0) {
-            (*out_subgid)[r] = std::numeric_limits<uint32_t>::max();
-            continue;
-          }
-          const uint64_t h = row_hashes[r];
-          size_t slot = static_cast<size_t>(h ^ (h >> 32)) & local_mask;
-          bool found = false;
-          uint32_t found_id = 0;
-          while (buckets[slot] != std::numeric_limits<uint32_t>::max()) {
-            const uint32_t id = buckets[slot];
-            if (l_hashes[id] == h && eq_rows(l_reps[id], r)) {
-              found = true;
-              found_id = id;
-              break;
-            }
-            slot = (slot + 1) & local_mask;
-          }
-          if (!found) {
-            if (l_reps.size() >= max_unique) {
-              overflowed.store(true, std::memory_order_relaxed);
-              return;
-            }
-            found_id = static_cast<uint32_t>(l_reps.size());
-            l_reps.push_back(static_cast<uint32_t>(r));
-            l_hashes.push_back(h);
-            buckets[slot] = found_id;
-          }
-          (*out_subgid)[r] = found_id;
-        }
-      });
-      if (!dict_status.ok()) {
-        // A worker exception leaves some local_reps incomplete; never build
-        // remaps over partial results.
-        out_subgid->clear();
-        *out_count = 0;
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-        }
-        return false;
-      }
-      if (overflowed.load(std::memory_order_relaxed)) {
-        out_subgid->clear();
-        *out_count = 0;
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-        }
-        return false;
-      }
-      size_t total_local = 0;
-      for (const auto& lr : local_reps) {
-        total_local += lr.size();
-      }
-      const size_t g_cap =
-          std::bit_ceil(std::max<size_t>(32ULL, total_local * 2ULL));
-      const size_t g_mask = g_cap - 1;
-      std::vector<uint32_t> g_buckets(g_cap,
-                                      std::numeric_limits<uint32_t>::max());
-      std::vector<uint32_t> rep_rows;
-      std::vector<uint64_t> rep_hashes;
-      rep_rows.reserve(std::min(max_unique, total_local));
-      rep_hashes.reserve(std::min(max_unique, total_local));
-      std::vector<std::vector<uint32_t>> remaps(dict_workers);
-      for (size_t w = 0; w < dict_workers; ++w) {
-        const auto& lr = local_reps[w];
-        const auto& lh = local_hashes[w];
-        auto& rm = remaps[w];
-        rm.resize(lr.size());
-        for (size_t lid = 0; lid < lr.size(); ++lid) {
-          const uint32_t rr = lr[lid];
-          const uint64_t h = lh[lid];
-          size_t slot = static_cast<size_t>(h ^ (h >> 32)) & g_mask;
-          bool found = false;
-          uint32_t gid = 0;
-          while (g_buckets[slot] != std::numeric_limits<uint32_t>::max()) {
-            const uint32_t cand = g_buckets[slot];
-            if (rep_hashes[cand] == h && eq_rows(rep_rows[cand], rr)) {
-              found = true;
-              gid = cand;
-              break;
-            }
-            slot = (slot + 1) & g_mask;
-          }
-          if (!found) {
-            if (rep_rows.size() >= max_unique) {
-              out_subgid->clear();
-              *out_count = 0;
-              if (out_rep_rows != nullptr) {
-                out_rep_rows->clear();
-              }
-              return false;
-            }
-            gid = static_cast<uint32_t>(rep_rows.size());
-            rep_rows.push_back(rr);
-            rep_hashes.push_back(h);
-            g_buckets[slot] = gid;
-          }
-          rm[lid] = gid;
-        }
-      }
-      const Status remap_status = RunParallelTasks(dict_workers, [&](size_t w) {
-        const size_t begin = (row_count * w) / dict_workers;
-        const size_t end = (row_count * (w + 1)) / dict_workers;
-        const auto& rm = remaps[w];
-        for (size_t r = begin; r < end; ++r) {
-          const uint32_t lid = (*out_subgid)[r];
-          if (lid != std::numeric_limits<uint32_t>::max()) {
-            (*out_subgid)[r] = rm[lid];
-          }
-        }
-      });
-      if (!remap_status.ok()) {
-        // A partial remap would mix local subgroupIds with global ones while
-        // out_count still claims a complete global dictionary.
-        out_subgid->clear();
-        *out_count = 0;
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-        }
-        return false;
-      }
-      *out_count = static_cast<uint32_t>(rep_rows.size());
-      if (out_rep_rows != nullptr) {
-        *out_rep_rows = std::move(rep_rows);
-      }
-      return true;
-    }
-    if (dict_workers > 1 && row_count >= 16384 &&
-        max_unique == std::numeric_limits<size_t>::max()) {
-      constexpr size_t kDictParts = 64;
-      const auto mix64 = [](uint64_t x) noexcept -> uint64_t {
-        x ^= x >> 30;
-        x *= 0xbf58476d1ce4e5b9ULL;
-        x ^= x >> 27;
-        x *= 0x94d049bb133111ebULL;
-        return x ^ (x >> 31);
-      };
-      out_subgid->resize(row_count);
-      std::vector<std::array<uint32_t, kDictParts>> worker_counts(dict_workers);
-      const Status count_status = RunParallelTasks(dict_workers, [&](size_t w) {
-        auto& counts = worker_counts[w];
-        counts.fill(0);
-        const size_t begin = (row_count * w) / dict_workers;
-        const size_t end = (row_count * (w + 1)) / dict_workers;
-        for (size_t r = begin; r < end; ++r) {
-          if (row_active != nullptr && (*row_active)[r] == 0) {
-            (*out_subgid)[r] = std::numeric_limits<uint32_t>::max();
-            continue;
-          }
-          const auto p = static_cast<size_t>(mix64(row_hashes[r]) >> 58);
-          ++counts[p];
-        }
-      });
-      if (!count_status.ok()) {
-        // Partial counts would make part_sizes/active_total disagree with the
-        // rows actually written by the partitioning pass below.
-        out_subgid->clear();
-        *out_count = 0;
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-        }
-        return false;
-      }
-      std::array<uint32_t, kDictParts> part_sizes{};
-      size_t active_total = 0;
-      for (size_t p = 0; p < kDictParts; ++p) {
-        uint32_t sum = 0;
-        for (size_t w = 0; w < dict_workers; ++w) {
-          sum += worker_counts[w][p];
-        }
-        part_sizes[p] = sum;
-        active_total += sum;
-      }
-      if (active_total == 0) {
-        *out_count = 0;
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-        }
-        return true;
-      }
-      uint32_t max_part_size = 0;
-      for (size_t p = 0; p < kDictParts; ++p) {
-        max_part_size = std::max(max_part_size, part_sizes[p]);
-      }
-      if (max_part_size <= (active_total / 2) + 64) {
-        std::array<size_t, kDictParts> part_offsets{};
-        std::vector<std::array<size_t, kDictParts>> worker_offsets(
-            dict_workers);
-        size_t running = 0;
-        for (size_t p = 0; p < kDictParts; ++p) {
-          part_offsets[p] = running;
-          for (size_t w = 0; w < dict_workers; ++w) {
-            worker_offsets[w][p] = running;
-            running += worker_counts[w][p];
-          }
-        }
-        std::vector<uint32_t> part_rows(active_total);
-        const Status scatter_status =
-            RunParallelTasks(dict_workers, [&](size_t w) {
-              auto cursors = worker_offsets[w];
-              const size_t begin = (row_count * w) / dict_workers;
-              const size_t end = (row_count * (w + 1)) / dict_workers;
-              for (size_t r = begin; r < end; ++r) {
-                if (row_active != nullptr && (*row_active)[r] == 0) {
-                  continue;
-                }
-                const auto p = static_cast<size_t>(mix64(row_hashes[r]) >> 58);
-                part_rows[cursors[p]++] = static_cast<uint32_t>(r);
-              }
-            });
-        if (!scatter_status.ok()) {
-          // An incomplete scatter leaves zero-filled slots in part_rows;
-          // consuming them would process row 0 repeatedly.
-          out_subgid->clear();
-          *out_count = 0;
-          if (out_rep_rows != nullptr) {
-            out_rep_rows->clear();
-          }
-          return false;
-        }
-        std::vector<uint32_t> part_local_ids(active_total);
-        std::array<std::vector<uint32_t>, kDictParts> part_rep_rows;
-        std::atomic<size_t> next_p{0};
-        const Status part_status = RunParallelTasks(dict_workers, [&](size_t) {
-          size_t p = 0;
-          while ((p = next_p.fetch_add(1, std::memory_order_relaxed)) <
-                 kDictParts) {
-            const uint32_t p_cnt = part_sizes[p];
-            if (p_cnt == 0) {
-              continue;
-            }
-            const size_t p_begin = part_offsets[p];
-            const size_t p_cap =
-                std::bit_ceil(std::max<size_t>(16ULL, p_cnt * 2ULL));
-            const size_t p_mask = p_cap - 1;
-            std::vector<uint32_t> buckets(p_cap,
-                                          std::numeric_limits<uint32_t>::max());
-            auto& preps = part_rep_rows[p];
-            preps.reserve(std::min<size_t>(p_cnt, 4096ULL));
-            std::vector<uint64_t> phashes;
-            phashes.reserve(std::min<size_t>(p_cnt, 4096ULL));
-            for (size_t idx = p_begin; idx < p_begin + p_cnt; ++idx) {
-              const uint32_t r = part_rows[idx];
-              const uint64_t h = row_hashes[r];
-              size_t slot = static_cast<size_t>(mix64(h)) & p_mask;
-              bool found = false;
-              uint32_t lid = 0;
-              while (buckets[slot] != std::numeric_limits<uint32_t>::max()) {
-                const uint32_t id = buckets[slot];
-                if (phashes[id] == h && eq_rows(preps[id], r)) {
-                  found = true;
-                  lid = id;
-                  break;
-                }
-                slot = (slot + 1) & p_mask;
-              }
-              if (!found) {
-                lid = static_cast<uint32_t>(preps.size());
-                preps.push_back(r);
-                phashes.push_back(h);
-                buckets[slot] = lid;
-              }
-              part_local_ids[idx] = lid;
-            }
-          }
-        });
-        if (!part_status.ok()) {
-          // A worker exception can leave some partitions' representative rows
-          // empty while part_local_ids still references them.
-          out_subgid->clear();
-          *out_count = 0;
-          if (out_rep_rows != nullptr) {
-            out_rep_rows->clear();
-          }
-          return false;
-        }
-        std::array<uint32_t, kDictParts> base_ids{};
-        uint32_t total_unique = 0;
-        for (size_t p = 0; p < kDictParts; ++p) {
-          base_ids[p] = total_unique;
-          total_unique += static_cast<uint32_t>(part_rep_rows[p].size());
-        }
-        if (out_rep_rows != nullptr) {
-          out_rep_rows->clear();
-          out_rep_rows->reserve(total_unique);
-          for (size_t p = 0; p < kDictParts; ++p) {
-            out_rep_rows->insert(out_rep_rows->end(), part_rep_rows[p].begin(),
-                                 part_rep_rows[p].end());
-          }
-        }
-        std::atomic<size_t> next_wp{0};
-        const Status write_status = RunParallelTasks(dict_workers, [&](size_t) {
-          size_t p = 0;
-          while ((p = next_wp.fetch_add(1, std::memory_order_relaxed)) <
-                 kDictParts) {
-            const uint32_t p_cnt = part_sizes[p];
-            const size_t p_begin = part_offsets[p];
-            const uint32_t bid = base_ids[p];
-            for (size_t idx = p_begin; idx < p_begin + p_cnt; ++idx) {
-              (*out_subgid)[part_rows[idx]] = bid + part_local_ids[idx];
-            }
-          }
-        });
-        if (!write_status.ok()) {
-          out_subgid->clear();
-          *out_count = 0;
-          if (out_rep_rows != nullptr) {
-            out_rep_rows->clear();
-          }
-          return false;
-        }
-        *out_count = total_unique;
-        return true;
-      }
-    }
-    const size_t cap = std::bit_ceil(std::max<size_t>(16ULL, row_count * 2ULL));
-    const size_t mask = cap - 1;
-    std::vector<uint32_t> buckets(cap, std::numeric_limits<uint32_t>::max());
-    std::vector<uint32_t> rep_rows;
-    std::vector<uint64_t> rep_hashes;
-    const size_t reserve_est = std::min<size_t>(row_count, 65536ULL);
-    rep_rows.reserve(reserve_est);
-    rep_hashes.reserve(reserve_est);
-    out_subgid->resize(row_count);
-    for (size_t r = 0; r < row_count; ++r) {
-      if (row_active != nullptr && (*row_active)[r] == 0) {
-        (*out_subgid)[r] = std::numeric_limits<uint32_t>::max();
-        continue;
-      }
-      const uint64_t h = row_hashes[r];
-      size_t slot = static_cast<size_t>(h ^ (h >> 32)) & mask;
-      bool found = false;
-      uint32_t found_id = 0;
-      while (buckets[slot] != std::numeric_limits<uint32_t>::max()) {
-        const uint32_t id = buckets[slot];
-        if (rep_hashes[id] == h && eq_rows(rep_rows[id], r)) {
-          found = true;
-          found_id = id;
-          break;
-        }
-        slot = (slot + 1) & mask;
-      }
-      if (!found) {
-        if (rep_rows.size() >= max_unique) {
-          out_subgid->clear();
-          *out_count = 0;
-          if (out_rep_rows != nullptr) {
-            out_rep_rows->clear();
-          }
-          return false;
-        }
-        found_id = static_cast<uint32_t>(rep_rows.size());
-        rep_rows.push_back(static_cast<uint32_t>(r));
-        rep_hashes.push_back(h);
-        buckets[slot] = found_id;
-      }
-      (*out_subgid)[r] = found_id;
-    }
-    *out_count = static_cast<uint32_t>(rep_rows.size());
-    if (out_rep_rows != nullptr) {
-      *out_rep_rows = std::move(rep_rows);
-    }
-    return true;
-  };
-  const size_t right_row_count =
-      right_col_only ? total_right_rows : right_ptr->rows.size();
-  const auto build_or_reuse_split_right_dict =
-      [&](const std::vector<size_t>& col_indices, uint32_t* out_card) -> bool {
-    *out_card = 0;
-    clear_split_right_dict();
-    struct RightDictSlotGuard {
-      SharedBaseRelationCache* cache{nullptr};
-      std::string key;
-      bool active{false};
-      RightDictSlotGuard() = default;
-      RightDictSlotGuard(SharedBaseRelationCache* c, std::string k, bool a)
-          : cache(c), key(std::move(k)), active(a) {}
-      RightDictSlotGuard(const RightDictSlotGuard&) = delete;
-      RightDictSlotGuard& operator=(const RightDictSlotGuard&) = delete;
-      RightDictSlotGuard(RightDictSlotGuard&&) = delete;
-      RightDictSlotGuard& operator=(RightDictSlotGuard&&) = delete;
-      ~RightDictSlotGuard() {
-        if (active && cache != nullptr) {
-          cache->AbandonSplitRightDict(key);
-        }
-      }
-    } right_dict_guard(shared_pk_cache, {}, false);
-    std::string right_dict_key;
-    if (shared_pk_cache != nullptr && right_col_only &&
-        right_col_owner != nullptr) {
-      right_dict_key =
-          "R:" +
-          std::to_string(reinterpret_cast<uintptr_t>(right_col_owner.get())) +
-          ":" + std::to_string(right_row_count) + ":" +
-          std::to_string(right_arg.columnar->chunks.size());
-      for (const size_t col : col_indices) {
-        right_dict_key += ":";
-        right_dict_key += std::to_string(col);
-      }
-      std::shared_ptr<const SharedBaseRelationCache::CachedSplitRightDict> hit;
-      if (!shared_pk_cache->AcquireSplitRightDictSlot(right_dict_key, &hit)) {
-        if (hit != nullptr) {
-          shared_right_dict = std::move(hit);
-          split_right_subgid_ptr = shared_right_dict->subgid.data();
-          split_right_rep_ptr = shared_right_dict->rep_idx.data();
-          split_right_rep_count = shared_right_dict->rep_idx.size();
-          *out_card = shared_right_dict->subgid_count;
-          return true;
-        }
-      } else {
-        right_dict_guard.key = right_dict_key;
-        right_dict_guard.active = true;
-      }
-    }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
-    //   (unique_col_identity_subgid_sound)
-    // If any dimension key column in col_indices is unique and non-null on the
-    // right relation (PK or promoted unique-nonnull column), every right row
-    // has a distinct dimension key tuple, so subgid(ri) = ri is an exact
-    // bijection without hashing wide VARCHAR dimension attributes.
-    if (right_row_count > 0 &&
-        right_row_count <= std::numeric_limits<uint32_t>::max()) {
-      bool any_unique_nonnull = false;
-      for (const size_t col : col_indices) {
-        if (col >= right.schema.ColumnCount()) {
-          continue;
-        }
-        const auto ct = right.schema.GetColumn(col).GetConstraint().ctype;
-        if (ct == Constraint::kPrimaryKey) {
-          any_unique_nonnull = true;
-          break;
-        }
-        if (ct == Constraint::kUnique && right_col_only &&
-            right_arg.columnar != nullptr) {
-          bool col_has_null = false;
-          for (const ColumnarChunk& ch : right_arg.columnar->chunks) {
-            if (ch.rows == 0) {
-              continue;
-            }
-            if (col >= ch.columns.size() || ch.columns[col].has_null) {
-              col_has_null = true;
-              break;
-            }
-          }
-          if (!col_has_null) {
-            any_unique_nonnull = true;
-            break;
-          }
-        }
-      }
-      if (any_unique_nonnull) {
-        std::vector<uint32_t> id_vec(right_row_count);
-        for (size_t ri = 0; ri < right_row_count; ++ri) {
-          id_vec[ri] = static_cast<uint32_t>(ri);
-        }
-        const auto card = static_cast<uint32_t>(right_row_count);
-        if (right_dict_guard.active && shared_pk_cache != nullptr) {
-          auto cached =
-              std::make_shared<SharedBaseRelationCache::CachedSplitRightDict>();
-          cached->subgid_count = card;
-          cached->subgid = id_vec;
-          cached->rep_idx = std::move(id_vec);
-          std::shared_ptr<const SharedBaseRelationCache::CachedSplitRightDict>
-              shared_rd = std::move(cached);
-          shared_pk_cache->PublishSplitRightDict(right_dict_key, shared_rd);
-          right_dict_guard.active = false;
-          shared_right_dict = std::move(shared_rd);
-          split_right_subgid_ptr = shared_right_dict->subgid.data();
-          split_right_rep_ptr = shared_right_dict->rep_idx.data();
-          split_right_rep_count = shared_right_dict->rep_idx.size();
-        } else {
-          split_right_subgid = id_vec;
-          split_right_rep_idx = std::move(id_vec);
-          split_right_subgid_ptr = split_right_subgid.data();
-          split_right_rep_ptr = split_right_rep_idx.data();
-          split_right_rep_count = split_right_rep_idx.size();
-        }
-        *out_card = card;
-        return true;
-      }
-    }
-    const auto fill_right_hashes =
-        [&](std::vector<uint64_t>& hashes) -> Status {
-      const auto mix_step = [](uint64_t& h, uint64_t v) noexcept {
-        h = std::rotl(h, 7);
-        h ^= v;
-        h *= 0x100000001b3ULL;
-      };
-      if (right_col_only && right_arg.columnar != nullptr) {
-        const auto& chunks = right_arg.columnar->chunks;
-        struct HashSlice {
-          size_t ci;
-          size_t rb;
-          size_t re;
-          size_t out_base;
-        };
-        std::vector<HashSlice> slices;
-        slices.reserve(chunks.size());
-        size_t base = 0;
-        for (size_t ci = 0; ci < chunks.size(); ++ci) {
-          const size_t rows = chunks[ci].rows;
-          if (rows == 0) {
-            continue;
-          }
-          constexpr size_t kSliceRows = 4096;
-          for (size_t rb = 0; rb < rows; rb += kSliceRows) {
-            const size_t re = std::min(rows, rb + kSliceRows);
-            slices.push_back(
-                HashSlice{.ci = ci, .rb = rb, .re = re, .out_base = base + rb});
-          }
-          base += rows;
-        }
-        auto run_slice_worker = [&](size_t s_begin, size_t s_end) {
-          std::vector<uint64_t> dict_hash;
-          std::vector<uint8_t> dict_valid;
-          Value v_tmp;
-          for (size_t si = s_begin; si < s_end; ++si) {
-            const HashSlice& slice = slices[si];
-            const size_t n = slice.re - slice.rb;
-            uint64_t* dst = hashes.data() + slice.out_base;
-            std::fill_n(dst, n, uint64_t{0x9e3779b97f4a7c15ULL});
-            const auto& cols = chunks[slice.ci].columns;
-            for (const size_t column : col_indices) {
-              const ColumnarColumn& sc = cols[column];
-              if (sc.encoding == ColumnarColumn::Encoding::kConstant &&
-                  sc.is_uniform) {
-                uint64_t ch_hash = 0;
-                if (!sc.const_is_null && sc.type != ValueType::kNull) {
-                  if (sc.type == ValueType::kVarChar && !sc.is_interval) {
-                    ch_hash = std::hash<std::string_view>{}(sc.const_string);
-                  } else if ((sc.type == ValueType::kInt64 ||
-                              sc.type == ValueType::kDate) &&
-                             !sc.is_unsigned) {
-                    ch_hash = splitmix_i64(sc.const_int);
-                  } else {
-                    sc.WriteValueInto(slice.rb, &v_tmp);
-                    ch_hash = fast_hash_val(v_tmp);
-                  }
-                }
-                for (size_t i = 0; i < n; ++i) {
-                  mix_step(dst[i], ch_hash);
-                }
-              } else if (sc.encoding == ColumnarColumn::Encoding::kDictionary &&
-                         sc.is_uniform && !sc.is_interval &&
-                         sc.type == ValueType::kVarChar && sc.dict != nullptr) {
-                const size_t entry_count = sc.DictEntryCount();
-                const bool cache_dict = entry_count <= 8192;
-                if (cache_dict) {
-                  dict_valid.assign(entry_count, 0);
-                  if (dict_hash.size() < entry_count) {
-                    dict_hash.resize(entry_count);
-                  }
-                }
-                if (!sc.has_null && sc.borrowed_dict_u8 != nullptr) {
-                  const uint8_t* codes = sc.borrowed_dict_u8 + slice.rb;
-                  for (size_t i = 0; i < n; ++i) {
-                    const uint32_t code = codes[i];
-                    uint64_t hv = 0;
-                    if (code < entry_count) [[likely]] {
-                      if (cache_dict) {
-                        if (dict_valid[code] != 0) [[likely]] {
-                          hv = dict_hash[code];
-                        } else {
-                          hv = std::hash<std::string_view>{}(
-                              sc.dict->StringEntryAt(code));
-                          dict_hash[code] = hv;
-                          dict_valid[code] = 1;
-                        }
-                      } else {
-                        hv = std::hash<std::string_view>{}(
-                            sc.dict->StringEntryAt(code));
-                      }
-                    }
-                    mix_step(dst[i], hv);
-                  }
-                } else {
-                  for (size_t i = 0; i < n; ++i) {
-                    const uint32_t code = sc.DictCodeAt(slice.rb + i);
-                    uint64_t hv = 0;
-                    if ((!sc.has_null ||
-                         code != ColumnarColumn::kNullDictCode) &&
-                        code < entry_count) [[likely]] {
-                      if (cache_dict) {
-                        if (dict_valid[code] != 0) [[likely]] {
-                          hv = dict_hash[code];
-                        } else {
-                          hv = std::hash<std::string_view>{}(
-                              sc.dict->StringEntryAt(code));
-                          dict_hash[code] = hv;
-                          dict_valid[code] = 1;
-                        }
-                      } else {
-                        hv = std::hash<std::string_view>{}(
-                            sc.dict->StringEntryAt(code));
-                      }
-                    }
-                    mix_step(dst[i], hv);
-                  }
-                }
-              } else if (sc.encoding == ColumnarColumn::Encoding::kDictionary &&
-                         sc.is_uniform && !sc.is_unsigned &&
-                         (sc.type == ValueType::kInt64 ||
-                          sc.type == ValueType::kDate) &&
-                         sc.dict != nullptr) {
-                const size_t entry_count = sc.DictEntryCount();
-                const bool cache_dict = entry_count <= 8192;
-                if (cache_dict) {
-                  dict_valid.assign(entry_count, 0);
-                  if (dict_hash.size() < entry_count) {
-                    dict_hash.resize(entry_count);
-                  }
-                }
-                for (size_t i = 0; i < n; ++i) {
-                  const uint32_t code = sc.DictCodeAt(slice.rb + i);
-                  uint64_t hv = 0;
-                  if ((!sc.has_null || code != ColumnarColumn::kNullDictCode) &&
-                      code < entry_count) [[likely]] {
-                    if (cache_dict) {
-                      if (dict_valid[code] != 0) [[likely]] {
-                        hv = dict_hash[code];
-                      } else {
-                        hv = splitmix_i64(sc.dict->IntEntryAt(code));
-                        dict_hash[code] = hv;
-                        dict_valid[code] = 1;
-                      }
-                    } else {
-                      hv = splitmix_i64(sc.dict->IntEntryAt(code));
-                    }
-                  }
-                  mix_step(dst[i], hv);
-                }
-              } else if (sc.encoding == ColumnarColumn::Encoding::kFlat &&
-                         sc.is_uniform && sc.type == ValueType::kVarChar &&
-                         !sc.is_interval && !sc.strings.empty()) {
-                const std::string_view* strs = sc.strings.data() + slice.rb;
-                if (!sc.has_null || sc.nulls.empty()) {
-                  for (size_t i = 0; i < n; ++i) {
-                    mix_step(dst[i], std::hash<std::string_view>{}(strs[i]));
-                  }
-                } else {
-                  const uint8_t* nul = sc.nulls.data() + slice.rb;
-                  for (size_t i = 0; i < n; ++i) {
-                    const uint64_t hv =
-                        nul[i] != 0 ? 0ULL
-                                    : std::hash<std::string_view>{}(strs[i]);
-                    mix_step(dst[i], hv);
-                  }
-                }
-              } else if (sc.is_uniform && !sc.is_unsigned &&
-                         (sc.type == ValueType::kInt64 ||
-                          sc.type == ValueType::kDate) &&
-                         ((sc.encoding == ColumnarColumn::Encoding::kFlat &&
-                           !sc.ints.empty()) ||
-                          sc.encoding ==
-                              ColumnarColumn::Encoding::kFrameOfReference)) {
-                if (sc.encoding == ColumnarColumn::Encoding::kFlat &&
-                    (!sc.has_null || sc.nulls.empty())) {
-                  const int64_t* ivs = sc.ints.data() + slice.rb;
-                  for (size_t i = 0; i < n; ++i) {
-                    mix_step(dst[i], splitmix_i64(ivs[i]));
-                  }
-                } else {
-                  for (size_t i = 0; i < n; ++i) {
-                    const uint64_t hv =
-                        sc.NonGatheredIsNull(slice.rb + i)
-                            ? 0ULL
-                            : splitmix_i64(
-                                  sc.encoding == ColumnarColumn::Encoding::kFlat
-                                      ? sc.ints[slice.rb + i]
-                                      : sc.ForIntAt(slice.rb + i));
-                    mix_step(dst[i], hv);
-                  }
-                }
-              } else {
-                for (size_t i = 0; i < n; ++i) {
-                  sc.WriteValueInto(slice.rb + i, &v_tmp);
-                  mix_step(dst[i], fast_hash_val(v_tmp));
-                }
-              }
-            }
-          }
-        };
-        if (right_row_count >= 16384 && slices.size() > 1) {
-          const size_t hw = std::min(
-              slices.size(), ParallelWorkerCount(right_row_count / 4096));
-          if (hw > 1) {
-            std::atomic<size_t> next_slice{0};
-            return RunParallelTasks(hw, [&](size_t) {
-              while (true) {
-                const size_t si =
-                    next_slice.fetch_add(1, std::memory_order_relaxed);
-                if (si >= slices.size()) {
-                  break;
-                }
-                run_slice_worker(si, si + 1);
-              }
-            });
-          }
-        }
-        run_slice_worker(0, slices.size());
-        return Status::kSuccess;
-      }
-      const auto hash_right_row = [&](size_t r) {
-        Value v_tmp;
-        uint64_t hash = 0x9e3779b97f4a7c15ULL;
-        for (const size_t column : col_indices) {
-          const auto& value =
-              read_right_cell(static_cast<uint32_t>(r), column, &v_tmp);
-          mix_step(hash, fast_hash_val(value));
-        }
-        return hash;
-      };
-      if (right_row_count >= 16384) {
-        const size_t hw = ParallelWorkerCount(right_row_count / 4096);
-        return RunParallelTasks(hw, [&](size_t worker) {
-          const size_t b = (right_row_count * worker) / hw;
-          const size_t e = (right_row_count * (worker + 1)) / hw;
-          for (size_t r = b; r < e; ++r) {
-            hashes[r] = hash_right_row(r);
-          }
-        });
-      }
-      for (size_t r = 0; r < right_row_count; ++r) {
-        hashes[r] = hash_right_row(r);
-      }
-      return Status::kSuccess;
-    };
-    const auto eq_right = [&](size_t a, size_t b) {
-      if (right_col_only && right_arg.columnar != nullptr) {
-        const auto [ca, ra] = right_locator.Locate(static_cast<uint32_t>(a));
-        const auto [cb, rb] = right_locator.Locate(static_cast<uint32_t>(b));
-        const auto& cols_a = right_arg.columnar->chunks[ca].columns;
-        const auto& cols_b = right_arg.columnar->chunks[cb].columns;
-        Value x_tmp;
-        Value y_tmp;
-        for (const size_t column : col_indices) {
-          const ColumnarColumn& sca = cols_a[column];
-          const ColumnarColumn& scb = cols_b[column];
-          if (sca.is_uniform && scb.is_uniform &&
-              sca.encoding != ColumnarColumn::Encoding::kGathered &&
-              scb.encoding != ColumnarColumn::Encoding::kGathered) {
-            const bool na = sca.NonGatheredIsNull(ra);
-            const bool nb = scb.NonGatheredIsNull(rb);
-            if (na != nb) {
-              return false;
-            }
-            if (na) {
-              continue;
-            }
-            if (sca.type == ValueType::kVarChar &&
-                scb.type == ValueType::kVarChar && !sca.is_interval &&
-                !scb.is_interval) {
-              if (sca.StringAt(ra) != scb.StringAt(rb)) {
-                return false;
-              }
-              continue;
-            }
-            if ((sca.type == ValueType::kInt64 ||
-                 sca.type == ValueType::kDate) &&
-                sca.type == scb.type && sca.is_unsigned == scb.is_unsigned) {
-              if (sca.IntAt(ra) != scb.IntAt(rb)) {
-                return false;
-              }
-              continue;
-            }
-          }
-          sca.WriteValueInto(ra, &x_tmp);
-          scb.WriteValueInto(rb, &y_tmp);
-          const bool eq =
-              x_tmp.IsCaseInsensitive() || y_tmp.IsCaseInsensitive()
-                  ? DistinctValueEqual{}(CanonicalDistinctValue(x_tmp),
-                                         CanonicalDistinctValue(y_tmp))
-                  : DistinctValueEqual{}(x_tmp, y_tmp);
-          if (!eq) {
-            return false;
-          }
-        }
-        return true;
-      }
-      Value x_tmp;
-      Value y_tmp;
-      return std::ranges::all_of(col_indices, [&](size_t column) {
-        const auto& x =
-            read_right_cell(static_cast<uint32_t>(a), column, &x_tmp);
-        const auto& y =
-            read_right_cell(static_cast<uint32_t>(b), column, &y_tmp);
-        return x.IsCaseInsensitive() || y.IsCaseInsensitive()
-                   ? DistinctValueEqual{}(CanonicalDistinctValue(x),
-                                          CanonicalDistinctValue(y))
-                   : DistinctValueEqual{}(x, y);
-      });
-    };
-    std::vector<uint32_t> rep_idxs;
-    if (!build_flat_subgid_dict(
-            right_row_count, std::numeric_limits<size_t>::max(),
-            fill_right_hashes, eq_right, &split_right_subgid, out_card, nullptr,
-            &rep_idxs)) {
-      clear_split_right_dict();
-      return false;
-    }
-    if (right_dict_guard.active && shared_pk_cache != nullptr) {
-      auto cached =
-          std::make_shared<SharedBaseRelationCache::CachedSplitRightDict>();
-      cached->subgid_count = *out_card;
-      cached->subgid = std::move(split_right_subgid);
-      cached->rep_idx = std::move(rep_idxs);
-      std::shared_ptr<const SharedBaseRelationCache::CachedSplitRightDict>
-          shared_rd = std::move(cached);
-      shared_pk_cache->PublishSplitRightDict(right_dict_key, shared_rd);
-      right_dict_guard.active = false;
-      shared_right_dict = std::move(shared_rd);
-      split_right_subgid_ptr = shared_right_dict->subgid.data();
-      split_right_rep_ptr = shared_right_dict->rep_idx.data();
-      split_right_rep_count = shared_right_dict->rep_idx.size();
-    } else {
-      split_right_rep_idx = std::move(rep_idxs);
-      split_right_subgid_ptr = split_right_subgid.data();
-      split_right_rep_ptr = split_right_rep_idx.data();
-      split_right_rep_count = split_right_rep_idx.size();
-    }
-    return true;
-  };
-  if (!int_group_key && !left.HasSpill() && !right_ptr->HasSpill() &&
-      key_programs.size() == 2 && right_row_count > 0 &&
-      right_row_count <= 262144) {
-    for (size_t rk = 0; rk < 2; ++rk) {
-      const size_t lk = 1 - rk;
-      if (std::cmp_less(key_shapes[rk].direct_column, left_width)) {
-        continue;
-      }
-      const bool left_is_extract =
-          key_shapes[lk].extract_date_col >= 0 &&
-          std::cmp_less(key_shapes[lk].extract_date_col, left_width);
-      bool left_is_int_col = false;
-      if (key_shapes[lk].direct_column >= 0 &&
-          std::cmp_less(key_shapes[lk].direct_column, left_width)) {
-        const Column& lcol = left.schema.GetColumn(
-            static_cast<size_t>(key_shapes[lk].direct_column));
-        left_is_int_col = (lcol.Type() == ValueType::kInt64 ||
-                           lcol.Type() == ValueType::kDate) &&
-                          !lcol.IsUnsigned();
-      }
-      if (!left_is_extract && !left_is_int_col) {
-        continue;
-      }
-      const auto rcol = static_cast<slot_t>(
-          static_cast<size_t>(key_shapes[rk].direct_column) - left_width);
-      if (rcol >= right.schema.ColumnCount()) {
-        continue;
-      }
-      const Column& rcol_def = right.schema.GetColumn(rcol);
-      Value rv_tmp;
-      if (rcol_def.Type() == ValueType::kVarChar) {
-        split_right_subgid.assign(right_row_count,
-                                  std::numeric_limits<uint32_t>::max());
-        // Columnar reads may use rv_tmp's owned short-string buffer.
-        // Keep dictionary keys and the consecutive-key shortcut independent
-        // of that scratch value.
-        std::unordered_map<std::string, uint32_t> sv_to_gid;
-        sv_to_gid.reserve(64);
-        std::vector<uint32_t> local_rep_idxs;
-        local_rep_idxs.reserve(64);
-        std::string_view last_sv;
-        uint32_t last_gid = std::numeric_limits<uint32_t>::max();
-        bool all_ok = true;
-        for (size_t ri = 0; ri < right_row_count; ++ri) {
-          const Value& rv =
-              read_right_cell(static_cast<uint32_t>(ri), rcol, &rv_tmp);
-          if (rv.IsNull() || rv.type != ValueType::kVarChar ||
-              rv.IsCaseInsensitive()) {
-            all_ok = false;
-            break;
-          }
-          const std::string_view sv = rv.value.varchar_value;
-          if (last_gid != std::numeric_limits<uint32_t>::max() &&
-              sv == last_sv) {
-            split_right_subgid[ri] = last_gid;
-            continue;
-          }
-          if (!sv.empty() && ((sv[0] >= '0' && sv[0] <= '9') || sv[0] == '-' ||
-                              sv[0] == '+' || sv[0] == ' ')) {
-            all_ok = false;
-            break;
-          }
-          const auto next_id = static_cast<uint32_t>(sv_to_gid.size());
-          const auto [it, ins] = sv_to_gid.emplace(std::string(sv), next_id);
-          if (sv_to_gid.size() > 65535) {
-            all_ok = false;
-            break;
-          }
-          if (ins) {
-            local_rep_idxs.push_back(static_cast<uint32_t>(ri));
-          }
-          last_sv = it->first;
-          last_gid = it->second;
-          split_right_subgid[ri] = last_gid;
-        }
-        if (all_ok) {
-          use_split_key_gid = true;
-          split_has_left_probe = true;
-          split_uses_right_subgid = true;
-          split_right_shift = 32;
-          split_left_k = lk;
-          split_right_subgid_count = sv_to_gid.size();
-          split_right_rep_idx = std::move(local_rep_idxs);
-          split_right_subgid_ptr = split_right_subgid.data();
-          split_right_rep_ptr = split_right_rep_idx.data();
-          split_right_rep_count = split_right_rep_idx.size();
-          break;
-        }
-        clear_split_right_dict();
-      } else if ((rcol_def.Type() == ValueType::kInt64 ||
-                  rcol_def.Type() == ValueType::kDate) &&
-                 !rcol_def.IsUnsigned()) {
-        split_right_subgid.assign(right_row_count,
-                                  std::numeric_limits<uint32_t>::max());
-        FlatIntKeyMap<uint32_t> int_to_gid;
-        int_to_gid.Reserve(256);
-        std::vector<uint32_t> local_rep_idxs;
-        local_rep_idxs.reserve(256);
-        uint32_t next_id = 0;
-        bool all_ok = true;
-        for (size_t ri = 0; ri < right_row_count; ++ri) {
-          const Value& rv =
-              read_right_cell(static_cast<uint32_t>(ri), rcol, &rv_tmp);
-          if (rv.IsNull() || rv.IsUnsigned()) {
-            all_ok = false;
-            break;
-          }
-          bool ins = false;
-          uint32_t* slot = int_to_gid.TryEmplace(rv.value.int_value, &ins);
-          if (ins) {
-            if (next_id >= 65535) {
-              all_ok = false;
-              break;
-            }
-            *slot = next_id++;
-            local_rep_idxs.push_back(static_cast<uint32_t>(ri));
-          }
-          split_right_subgid[ri] = *slot;
-        }
-        if (all_ok) {
-          use_split_key_gid = true;
-          split_has_left_probe = true;
-          split_uses_right_subgid = true;
-          split_right_shift = 32;
-          split_left_k = lk;
-          split_right_subgid_count = next_id;
-          split_right_rep_idx = std::move(local_rep_idxs);
-          split_right_subgid_ptr = split_right_subgid.data();
-          split_right_rep_ptr = split_right_rep_idx.data();
-          split_right_rep_count = split_right_rep_idx.size();
-          break;
-        }
-        clear_split_right_dict();
-      }
-    }
-  }
-  std::shared_ptr<QueryMemoryCharge> split_dictionary_charge;
-  if (!use_split_key_gid && !left.HasSpill() && !right_ptr->HasSpill() &&
-      !int_group_key && !key_programs.empty() && key_programs.size() <= 16) {
-    // Factor finite right and deferred-PK dimension tuples once per query so
-    // every surviving probe row probes one exact packed 64-bit integer key.
-    std::vector<size_t> dimension_columns;
-    dimension_columns.reserve(key_shapes.size());
-    std::vector<std::vector<size_t>> pk_group_key_lookups(def_pk_groups.size());
-    std::optional<size_t> probe_key;
-    size_t left_key_count = 0;
-    for (const auto& shape : key_shapes) {
-      if ((shape.direct_column >= 0 &&
-           std::cmp_less(shape.direct_column, left_width)) ||
-          (shape.extract_date_col >= 0 &&
-           std::cmp_less(shape.extract_date_col, left_width))) {
-        ++left_key_count;
-      }
-    }
-    const bool right_available =
-        right_row_count > 0 && right_row_count <= 1048576;
-    bool has_any_right_key = false;
-    bool supported = true;
-    for (size_t k = 0; k < key_shapes.size(); ++k) {
-      const auto& shape = key_shapes[k];
-      if (shape.direct_column >= 0 &&
-          std::cmp_greater_equal(shape.direct_column, left_width)) {
-        if (!right_available) {
-          supported = false;
-          break;
-        }
-        dimension_columns.push_back(static_cast<size_t>(shape.direct_column) -
-                                    left_width);
-        has_any_right_key = true;
-        continue;
-      }
-      if (shape.direct_column >= 0 &&
-          std::cmp_less(shape.direct_column, left_width)) {
-        const auto lcol = static_cast<size_t>(shape.direct_column);
-        const Column& column = left.schema.GetColumn(lcol);
-        const bool integer_probe =
-            !column.IsUnsigned() && (column.Type() == ValueType::kInt64 ||
-                                     column.Type() == ValueType::kDate);
-        const int li = deferred_left_probe != nullptr && lcol < 16
-                           ? static_cast<int>(def_col_to_pk_lookup[lcol])
-                           : -1;
-        const size_t gi =
-            li >= 0 ? prepared_pk_lookups[static_cast<size_t>(li)].group_idx
-                    : 0;
-        const bool pk_eligible =
-            li >= 0 && def_pk_groups[gi].total_rows <= 262144;
-        bool bypass_prefer_probe = false;
-        if (pk_eligible && deferred_left_probe != nullptr &&
-            def_pk_groups.size() == 1 && right_col_only &&
-            right_row_count > 0 && right_row_count <= 2097152) {
-          if (def_pk_groups[gi].total_rows <= 4096) {
-            bypass_prefer_probe = true;
-          } else {
-            const slot_t pkc = def_pk_groups[gi].pk_col;
-            const ScanRuntimeFilter& prf = deferred_left_probe->runtime_filter;
-            if (prf.enabled() && prf.column == pkc) {
-              bypass_prefer_probe = true;
-            } else {
-              for (const ScanRuntimeFilter& ext : prf.extra) {
-                if (ext.enabled() && ext.column == pkc) {
-                  bypass_prefer_probe = true;
-                  break;
-                }
-              }
-            }
-          }
-        }
-        // Keep a sole INT64/DATE left key paired with right keys in the low 32
-        // bits so split_key_unpack_only still avoids cloning left rep rows,
-        // unless encoding the PK key enables dense/JIT split direct GIDs.
-        const bool prefer_probe_slot =
-            integer_probe && !probe_key && left_key_count == 1 &&
-            has_any_right_key && !bypass_prefer_probe;
-        if (pk_eligible && !prefer_probe_slot) {
-          const auto uli = static_cast<size_t>(li);
-          pk_group_key_lookups[prepared_pk_lookups[uli].group_idx].push_back(
-              uli);
-          continue;
-        }
-        if (li < 0 && right_available && join_type == JoinType::kInner &&
-            integer_probe) {
-          const auto eq_it =
-              std::ranges::find_if(equality_keys, [&](const EqualityKey& eq) {
-                if (eq.left != lcol || eq.left_offset != 0 ||
-                    eq.right_offset != 0 || eq.null_safe ||
-                    eq.right >= right.schema.ColumnCount()) {
-                  return false;
-                }
-                const Column& rc = right.schema.GetColumn(eq.right);
-                return rc.Type() == column.Type() && !rc.IsUnsigned();
-              });
-          if (eq_it != equality_keys.end()) {
-            if (std::ranges::find(dimension_columns, eq_it->right) ==
-                dimension_columns.end()) {
-              dimension_columns.push_back(eq_it->right);
-            }
-            has_any_right_key = true;
-            continue;
-          }
-        }
-        if (!probe_key && integer_probe) {
-          probe_key = k;
-          continue;
-        }
-        supported = false;
-        break;
-      }
-      if (shape.extract_date_col >= 0 &&
-          std::cmp_less(shape.extract_date_col, left_width) && !probe_key) {
-        probe_key = k;
-        continue;
-      }
-      supported = false;
-      break;
-    }
-    const bool any_pk_dict = std::ranges::any_of(
-        pk_group_key_lookups,
-        [](const std::vector<size_t>& v) { return !v.empty(); });
-    if (supported && (!dimension_columns.empty() || any_pk_dict)) {
-      size_t charge_bytes = 0;
-      if (!dimension_columns.empty()) {
-        charge_bytes +=
-            (right_col_only ? 0 : right_ptr->charged_bytes_) +
-            (right_row_count * (64 + dimension_columns.size() * sizeof(Value)));
-      }
-      for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
-        if (!pk_group_key_lookups[gi].empty()) {
-          charge_bytes += static_cast<size_t>(def_pk_groups[gi].total_rows) *
-                          (32 + pk_group_key_lookups[gi].size() * 8);
-        }
-      }
-      split_dictionary_charge = TryReserveQueryMemory(charge_bytes);
-      if (split_dictionary_charge) {
-        bool dict_ok = true;
-        uint32_t right_card = 0;
-        if (!dimension_columns.empty()) {
-          dict_ok =
-              build_or_reuse_split_right_dict(dimension_columns, &right_card);
-        }
-        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> pk_locs(
-            def_pk_groups.size());
-        for (size_t gi = 0; dict_ok && gi < def_pk_groups.size(); ++gi) {
-          if (pk_group_key_lookups[gi].empty()) {
-            continue;
-          }
-          PreparedDeferredPkGroup& grp = def_pk_groups[gi];
-          const auto& lkp_idxs = pk_group_key_lookups[gi];
-          const size_t nb_count = grp.blocks.size();
-          std::vector<const RuntimeFilterGroup*> pk_rf_groups;
-          if (deferred_left_probe != nullptr &&
-              grp.pk_col < left.schema.ColumnCount() &&
-              !left.schema.GetColumn(grp.pk_col).IsUnsigned()) {
-            const ValueType col_type = left.schema.GetColumn(grp.pk_col).Type();
-            const ScanRuntimeFilter& prf = deferred_left_probe->runtime_filter;
-            if (prf.enabled() && prf.column == grp.pk_col &&
-                prf.type == col_type) {
-              pk_rf_groups.push_back(prf.group.get());
-            }
-            for (const ScanRuntimeFilter& ext : prf.extra) {
-              if (ext.enabled() && ext.column == grp.pk_col &&
-                  ext.type == col_type) {
-                pk_rf_groups.push_back(ext.group.get());
-              }
-            }
-          }
-          std::string pk_dict_key;
-          struct PkDictSlotGuard {
-            SharedBaseRelationCache* cache{nullptr};
-            std::string key;
-            bool active{false};
-            PkDictSlotGuard() = default;
-            PkDictSlotGuard(SharedBaseRelationCache* c, std::string k, bool a)
-                : cache(c), key(std::move(k)), active(a) {}
-            PkDictSlotGuard(const PkDictSlotGuard&) = delete;
-            PkDictSlotGuard& operator=(const PkDictSlotGuard&) = delete;
-            PkDictSlotGuard(PkDictSlotGuard&&) = delete;
-            PkDictSlotGuard& operator=(PkDictSlotGuard&&) = delete;
-            ~PkDictSlotGuard() {
-              if (active && cache != nullptr) {
-                cache->AbandonPkDict(key);
-              }
-            }
-          } pk_dict_guard(shared_pk_cache, {}, false);
-          if (pk_rf_groups.empty() && shared_pk_cache != nullptr &&
-              grp.store != nullptr) {
-            pk_dict_key =
-                "P:" + std::to_string(reinterpret_cast<uintptr_t>(grp.store)) +
-                ":" + std::to_string(grp.store->layout_generation) + ":" +
-                std::to_string(grp.store_pk_col) + ":" +
-                std::to_string(grp.total_rows);
-            for (const size_t li : lkp_idxs) {
-              const auto& prep = prepared_pk_lookups[li];
-              pk_dict_key +=
-                  ":" + std::to_string(prep.store_payload_col) + "," +
-                  std::to_string(static_cast<uint32_t>(prep.payload_type)) +
-                  "," + (prep.payload_unsigned ? "1" : "0");
-            }
-            const bool want_dense = grp.dense_ptr != nullptr;
-            pk_dict_key += ":" + std::to_string(want_dense ? 1 : 0);
-            if (want_dense) {
-              pk_dict_key += ":" + std::to_string(grp.min_k) + ":" +
-                             std::to_string(grp.max_k) + ":" +
-                             std::to_string(grp.dense_size);
-            }
-            std::shared_ptr<const SharedBaseRelationCache::CachedPkDict> hit;
-            if (!shared_pk_cache->AcquirePkDictSlot(pk_dict_key, &hit)) {
-              if (hit != nullptr) {
-                grp.shared_pk_dict = std::move(hit);
-                grp.use_subgid = true;
-                grp.subgid_count = grp.shared_pk_dict->subgid_count;
-                grp.subgid_ptr = grp.shared_pk_dict->subgid.data();
-                grp.subgid_rep_ptr = grp.shared_pk_dict->subgid_rep_loc.data();
-                if (grp.shared_pk_dict->has_dense) {
-                  grp.dense_ptr = grp.shared_pk_dict->remapped_dense.data();
-                  grp.dense_size = grp.shared_pk_dict->remapped_dense.size();
-                }
-                continue;
-              }
-            } else {
-              pk_dict_guard.key = pk_dict_key;
-              pk_dict_guard.active = true;
-            }
-          }
-          pk_locs[gi].resize(grp.total_rows);
-          std::vector<uint8_t> pk_active;
-          if (!pk_rf_groups.empty()) {
-            pk_active.assign(grp.total_rows, 1);
-          }
-          const auto fill_pk_hashes =
-              [&](std::vector<uint64_t>& hashes) -> Status {
-            const auto fill_blk = [&](uint32_t nb, Value& tmp) {
-              const auto& gb = grp.blocks[nb];
-              const uint32_t base = gb.row_base;
-              for (uint32_t rin = 0; rin < gb.row_count; ++rin) {
-                pk_locs[gi][base + rin] = {nb, rin};
-                if (!pk_active.empty()) {
-                  const int64_t pk_key = gb.pk_cells[rin];
-                  bool rejected = false;
-                  for (const RuntimeFilterGroup* rf_g : pk_rf_groups) {
-                    if (rf_g->Reject(pk_key)) {
-                      rejected = true;
-                      break;
-                    }
-                  }
-                  if (rejected) {
-                    pk_active[base + rin] = 0;
-                    continue;
-                  }
-                }
-                uint64_t hash = 0x9e3779b97f4a7c15ULL;
-                for (const size_t li : lkp_idxs) {
-                  read_pk_cell(li, nb, rin, &tmp);
-                  hash = std::rotl(hash, 7);
-                  hash ^= fast_hash_val(tmp);
-                  hash *= 0x100000001b3ULL;
-                }
-                hashes[base + rin] = hash;
-              }
-            };
-            const size_t pk_workers = std::min<size_t>(
-                ParallelWorkerCount(grp.total_rows / 16384), nb_count);
-            if (pk_workers > 1 && grp.total_rows >= 16384 && nb_count >= 2) {
-              std::atomic<uint32_t> next_nb{0};
-              const auto total_nb = static_cast<uint32_t>(nb_count);
-              return RunParallelTasks(pk_workers, [&](size_t) {
-                Value tmp;
-                uint32_t nb = 0;
-                while ((nb = next_nb.fetch_add(1, std::memory_order_relaxed)) <
-                       total_nb) {
-                  fill_blk(nb, tmp);
-                }
-              });
-            }
-            Value tmp;
-            for (uint32_t nb = 0; nb < nb_count; ++nb) {
-              fill_blk(nb, tmp);
-            }
-            return Status::kSuccess;
-          };
-          const auto eq_pk = [&](size_t a, size_t b) {
-            const auto [nba, ra] = pk_locs[gi][a];
-            const auto [nbb, rb] = pk_locs[gi][b];
-            Value va;
-            Value vb;
-            for (const size_t li : lkp_idxs) {
-              read_pk_cell(li, nba, ra, &va);
-              read_pk_cell(li, nbb, rb, &vb);
-              if (!DistinctValueEqual{}(va, vb)) {
-                return false;
-              }
-            }
-            return true;
-          };
-          std::vector<uint32_t> pk_rep_rows;
-          dict_ok = build_flat_subgid_dict(
-              grp.total_rows, std::numeric_limits<size_t>::max(),
-              fill_pk_hashes, eq_pk, &grp.subgid, &grp.subgid_count,
-              pk_active.empty() ? nullptr : &pk_active, &pk_rep_rows);
-          if (dict_ok) {
-            grp.use_subgid = true;
-            grp.subgid_rep_loc.resize(pk_rep_rows.size());
-            for (size_t id = 0; id < pk_rep_rows.size(); ++id) {
-              grp.subgid_rep_loc[id] = pk_locs[gi][pk_rep_rows[id]];
-            }
-            if (pk_dict_guard.active && shared_pk_cache != nullptr) {
-              auto cached =
-                  std::make_shared<SharedBaseRelationCache::CachedPkDict>();
-              cached->store_owner = grp.store_owner;
-              cached->subgid_count = grp.subgid_count;
-              cached->subgid = std::move(grp.subgid);
-              cached->subgid_rep_loc = std::move(grp.subgid_rep_loc);
-              if (grp.dense_ptr != nullptr && grp.dense_size > 0) {
-                cached->has_dense = true;
-                cached->min_k = grp.min_k;
-                cached->max_k = grp.max_k;
-                cached->span = grp.span;
-                cached->remapped_dense.assign(grp.dense_ptr,
-                                              grp.dense_ptr + grp.dense_size);
-                for (auto& entry : cached->remapped_dense) {
-                  if (entry.nb != std::numeric_limits<uint32_t>::max()) {
-                    entry.subgid = cached->subgid[entry.subgid];
-                  }
-                }
-              }
-              std::shared_ptr<const SharedBaseRelationCache::CachedPkDict>
-                  shared_pd = std::move(cached);
-              shared_pk_cache->PublishPkDict(pk_dict_key, shared_pd);
-              pk_dict_guard.active = false;
-              grp.shared_pk_dict = std::move(shared_pd);
-              grp.subgid_ptr = grp.shared_pk_dict->subgid.data();
-              grp.subgid_rep_ptr = grp.shared_pk_dict->subgid_rep_loc.data();
-              if (grp.shared_pk_dict->has_dense) {
-                grp.dense_ptr = grp.shared_pk_dict->remapped_dense.data();
-                grp.dense_size = grp.shared_pk_dict->remapped_dense.size();
-              }
-            } else {
-              grp.subgid_ptr = grp.subgid.data();
-              grp.subgid_rep_ptr = grp.subgid_rep_loc.data();
-            }
-          }
-        }
-        uint32_t bit_cursor = probe_key.has_value() ? 32U : 0U;
-        if (dict_ok && !dimension_columns.empty()) {
-          const uint32_t r_bits =
-              right_card <= 1
-                  ? 0U
-                  : static_cast<uint32_t>(std::bit_width(right_card - 1));
-          if (bit_cursor + r_bits <= 64U) {
-            split_uses_right_subgid = true;
-            split_right_shift = static_cast<uint8_t>(bit_cursor);
-            split_right_subgid_count = right_card;
-            bit_cursor += r_bits;
-          } else {
-            dict_ok = false;
-          }
-        }
-        for (size_t gi = 0; dict_ok && gi < def_pk_groups.size(); ++gi) {
-          if (!def_pk_groups[gi].use_subgid) {
-            continue;
-          }
-          const uint32_t p_card = def_pk_groups[gi].subgid_count;
-          const uint32_t p_bits =
-              p_card <= 1 ? 0U
-                          : static_cast<uint32_t>(std::bit_width(p_card - 1));
-          // A zero-width field at offset 64 has no representable shift; a
-          // shift of 64 on uint64 is UB, so fall back to the generic path.
-          if (bit_cursor < 64U && bit_cursor + p_bits <= 64U) {
-            def_pk_groups[gi].subgid_shift = static_cast<uint8_t>(bit_cursor);
-            split_uses_pk_subgid = true;
-            bit_cursor += p_bits;
-          } else {
-            dict_ok = false;
-          }
-        }
-        if (dict_ok && bit_cursor <= 64U) {
-          use_split_key_gid = true;
-          split_has_left_probe = probe_key.has_value();
-          split_left_k = probe_key.value_or(key_shapes.size());
-          for (PreparedDeferredPkGroup& grp : def_pk_groups) {
-            if (!grp.use_subgid || grp.dense_ptr == nullptr ||
-                grp.shared_pk_dict != nullptr) {
-              continue;
-            }
-            if (grp.shared_dense != nullptr) {
-              grp.dense_index = *grp.shared_dense;
-              grp.shared_dense.reset();
-              grp.dense_ptr = grp.dense_index.data();
-            }
-            for (auto& entry : grp.dense_index) {
-              if (entry.nb != std::numeric_limits<uint32_t>::max()) {
-                entry.subgid = grp.subgid_ptr[entry.subgid];
-              }
-            }
-          }
-        } else {
-          clear_split_right_dict();
-          split_uses_right_subgid = false;
-          split_uses_pk_subgid = false;
-          for (auto& grp : def_pk_groups) {
-            grp.subgid.clear();
-            grp.subgid_rep_loc.clear();
-            grp.shared_pk_dict.reset();
-            grp.subgid_ptr = nullptr;
-            grp.subgid_rep_ptr = nullptr;
-            grp.subgid_count = 0;
-            grp.use_subgid = false;
-            if (grp.shared_dense != nullptr) {
-              grp.dense_ptr = grp.shared_dense->data();
-              grp.dense_size = grp.shared_dense->size();
-            } else {
-              grp.dense_ptr =
-                  grp.dense_index.empty() ? nullptr : grp.dense_index.data();
-              grp.dense_size = grp.dense_index.size();
-            }
-          }
-          split_dictionary_charge.reset();
-        }
-      }
-    }
-  }
-  const bool use_fast_2key_year_lut =
-      use_split_key_gid && split_has_left_probe && !split_uses_pk_subgid &&
-      split_uses_right_subgid && split_right_subgid_count <= 64 &&
-      key_shapes[split_left_k].extract_date_col >= 0 &&
-      key_shapes[split_left_k].extract_date_part == 0;
-  // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/PackedRadix2x32BatchAgg.lean (sound)
-  bool packed_2x32_group_key = false;
-  slot_t packed_2x32_slot0 = 0;
-  slot_t packed_2x32_slot1 = 0;
-  ValueType packed_2x32_type0 = ValueType::kNull;
-  ValueType packed_2x32_type1 = ValueType::kNull;
-  if (!int_group_key && !use_split_key_gid && !left.HasSpill() &&
-      !right_ptr->HasSpill() && key_programs.size() == 2 &&
-      key_shapes[0].direct_column >= 0 && key_shapes[1].direct_column >= 0) {
-    const auto s0 = static_cast<slot_t>(key_shapes[0].direct_column);
-    const auto s1 = static_cast<slot_t>(key_shapes[1].direct_column);
-    const Column& c0 = result.schema.GetColumn(s0);
-    const Column& c1 = result.schema.GetColumn(s1);
-    const auto is_packable_type = [](const Column& col) {
-      return !col.IsUnsigned() && (col.Type() == ValueType::kInt64 ||
-                                   col.Type() == ValueType::kDate);
-    };
-    if (is_packable_type(c0) && is_packable_type(c1)) {
-      packed_2x32_group_key = true;
-      packed_2x32_slot0 = s0;
-      packed_2x32_slot1 = s1;
-      packed_2x32_type0 = c0.Type();
-      packed_2x32_type1 = c1.Type();
-    }
-  }
-  bool packed_2x32_unpack_only =
-      packed_2x32_group_key && result.using_columns == nullptr &&
-      !fusion->having && !fusion->post_having_active &&
-      fusion->topn_limit == 0 && !fusion->rollup_count_distribution;
-  if (packed_2x32_unpack_only) {
-    for (const Expression& item : fusion->select_items) {
-      if (!item) {
-        packed_2x32_unpack_only = false;
-        break;
-      }
-      if (item->Type() == TypeTag::kConstantValue &&
-          !ContainsParameterSlot(item)) {
-        continue;
-      }
-      if (item->Type() == TypeTag::kAggregateExp) {
-        if (std::ranges::find(fusion->aggregates,
-                              &item->AsAggregateExpression()) ==
-            fusion->aggregates.end()) {
-          packed_2x32_unpack_only = false;
-          break;
-        }
-        continue;
-      }
-      if (item->Type() == TypeTag::kColumnValue) {
-        const auto col_off = LocalColumnOffset(
-            result.schema, item->AsColumnValue().GetColumnName());
-        if (col_off.has_value() &&
-            (*col_off == packed_2x32_slot0 || *col_off == packed_2x32_slot1)) {
-          continue;
-        }
-      }
-      packed_2x32_unpack_only = false;
-      break;
-    }
-  }
-  std::optional<slot_t> split_left_slot;
-  ValueType split_left_type = ValueType::kNull;
-  std::optional<int64_t> compact_integer_threshold;
-  if (fusion->having && fusion->having->Type() == TypeTag::kBinaryExp) {
-    const auto& predicate = fusion->having->AsBinaryExpression();
-    if (predicate.Op() == BinaryOperation::kGreaterThan && predicate.Left() &&
-        predicate.Left()->Type() == TypeTag::kAggregateExp &&
-        predicate.Right() &&
-        predicate.Right()->Type() == TypeTag::kConstantValue &&
-        !ContainsParameterSlot(predicate.Right()) &&
-        std::ranges::find(fusion->aggregates,
-                          &predicate.Left()->AsAggregateExpression()) !=
-            fusion->aggregates.end()) {
-      const auto& threshold = predicate.Right()->AsConstantValue().GetValue();
-      if (threshold.type == ValueType::kInt64 && !threshold.IsUnsigned() &&
-          threshold.value.int_value >= 1) {
-        compact_integer_threshold = threshold.value.int_value;
-      }
-    }
-  }
-  const bool compact_having_count_gt =
-      raw_count_fusion && count_star_only &&
-      (!fusion->having || compact_integer_threshold.has_value()) &&
-      (!fusion->post_having_active ||
-       (!fusion->post_having_is_self_sum_factor &&
-        fusion->post_having_agg_slot == 0 &&
-        fusion->post_having_op == BinaryOperation::kGreaterThan &&
-        fusion->post_having_constant_or_factor >= 1.0)) &&
-      (compact_integer_threshold.has_value() || fusion->post_having_active);
-  bool split_key_unpack_only =
-      use_split_key_gid && (split_uses_right_subgid || split_uses_pk_subgid) &&
-      (split_has_left_probe || join_type == JoinType::kInner) &&
-      result.using_columns == nullptr &&
-      ((!fusion->having && !fusion->post_having_active) ||
-       compact_having_count_gt) &&
-      fusion->topn_limit == 0 && !fusion->rollup_count_distribution &&
-      (raw_sum_fusion || raw_count_fusion || fusion->aggregates.empty());
-  if (split_key_unpack_only && split_has_left_probe) {
-    if (key_shapes[split_left_k].direct_column >= 0 &&
-        std::cmp_less(key_shapes[split_left_k].direct_column, left_width)) {
-      const auto slot =
-          static_cast<slot_t>(key_shapes[split_left_k].direct_column);
-      const Column& lcol = left.schema.GetColumn(slot);
-      if (!lcol.IsUnsigned() && (lcol.Type() == ValueType::kInt64 ||
-                                 lcol.Type() == ValueType::kDate)) {
-        split_left_slot = slot;
-        split_left_type = lcol.Type();
-      } else {
-        split_key_unpack_only = false;
-      }
-    } else if (key_shapes[split_left_k].extract_date_col < 0 ||
-               std::cmp_greater_equal(key_shapes[split_left_k].extract_date_col,
-                                      left_width)) {
-      split_key_unpack_only = false;
-    }
-  }
-  if (split_key_unpack_only) {
-    auto col_unpackable = [&](size_t col_off) -> bool {
-      if ((col_off >= left_width &&
-           (split_uses_right_subgid || singleton_right_relation)) ||
-          (split_has_left_probe && split_left_slot.has_value() &&
-           col_off == *split_left_slot)) {
-        return true;
-      }
-      if (col_off < 16 && def_col_to_pk_lookup[col_off] >= 0 &&
-          def_pk_groups[prepared_pk_lookups[static_cast<size_t>(
-                                                def_col_to_pk_lookup[col_off])]
-                            .group_idx]
-              .use_subgid) {
-        return true;
-      }
-      if (join_type == JoinType::kInner &&
-          std::ranges::any_of(equality_keys, [&](const EqualityKey& eq) {
-            if (eq.left != col_off || eq.left_offset != 0 ||
-                eq.right_offset != 0 || eq.null_safe ||
-                eq.right >= right.schema.ColumnCount()) {
-              return false;
-            }
-            const Column& lc = left.schema.GetColumn(eq.left);
-            const Column& rc = right.schema.GetColumn(eq.right);
-            return lc.Type() == rc.Type() &&
-                   lc.IsUnsigned() == rc.IsUnsigned() &&
-                   lc.Type() != ValueType::kVarChar;
-          })) {
-        return true;
-      }
-      return false;
-    };
-    const std::function<bool(const Expression&)> expr_unpackable =
-        [&](const Expression& expr) -> bool {
-      if (!expr || ContainsParameterSlot(expr)) {
-        return false;
-      }
-      if (expr->Type() == TypeTag::kConstantValue) {
-        return true;
-      }
-      if (expr->Type() == TypeTag::kAggregateExp) {
-        return std::ranges::find(fusion->aggregates,
-                                 &expr->AsAggregateExpression()) !=
-               fusion->aggregates.end();
-      }
-      if (expr->Type() == TypeTag::kColumnValue) {
-        const auto col_off = LocalColumnOffset(
-            result.schema, expr->AsColumnValue().GetColumnName());
-        return col_off.has_value() && col_unpackable(*col_off);
-      }
-      if (expr->Type() == TypeTag::kUnaryExp) {
-        return expr_unpackable(expr->AsUnaryExpression().Child());
-      }
-      if (expr->Type() == TypeTag::kBinaryExp) {
-        const auto& bin = expr->AsBinaryExpression();
-        return expr_unpackable(bin.Left()) && expr_unpackable(bin.Right());
-      }
-      return false;
-    };
-    if (!std::ranges::all_of(fusion->select_items, expr_unpackable)) {
-      split_key_unpack_only = false;
-    }
-  }
-  struct LeftPackedIntCol {
-    slot_t col{0};
-    ValueType type{ValueType::kNull};
-    int64_t min_val{0};
-    uint64_t null_code{0};
-    uint64_t mask{0};
-    uint8_t shift{0};
-  };
-  bool use_left_packed_key = false;
-  bool left_pack_unpack_only = false;
-  bool left_pack_uses_right = false;
-  bool left_pack_uses_dict = false;
-  uint64_t left_pack_right_mask = 0;
-  uint64_t left_pack_dict_mask = 0;
-  uint8_t left_pack_dict_shift = 0;
-  std::vector<uint32_t> left_pack_dict_subgid;
-  std::vector<size_t> left_pack_dict_cols;
-  std::vector<size_t> left_pack_right_cols;
-  std::vector<uint32_t> left_pack_dict_rep_rows;
-  std::vector<std::pair<uint32_t, uint32_t>> left_pack_dict_rep_col_loc;
-  std::vector<size_t> left_pack_chunk_offsets;
-  std::vector<LeftPackedIntCol> left_pack_ints;
-  std::shared_ptr<QueryMemoryCharge> left_pack_charge;
-  const bool left_col_only = left.HasColumnarOnly();
-  const size_t left_total_rows = left.TotalRows();
-  if (!use_split_key_gid && !int_group_key && !packed_2x32_group_key &&
-      deferred_left_probe == nullptr && !left.HasSpill() &&
-      !right_ptr->HasSpill() && left_total_rows >= 8192 &&
-      left_total_rows <= 8'000'000 && all_direct_group_keys &&
-      key_programs.size() >= 2 && key_programs.size() <= 8 &&
-      !(raw_count_fusion && count_star_only &&
-        (fusion->having || fusion->post_having_active))) {
-    std::vector<size_t> lp_right_cols;
-    lp_right_cols.reserve(key_shapes.size());
-    std::vector<size_t> lp_dict_cols;
-    std::vector<LeftPackedIntCol> lp_ints;
-    const bool right_ok = right_row_count > 0 && right_row_count <= 262144;
-    bool ok = true;
-    for (const auto& shape : key_shapes) {
-      if (shape.direct_column < 0) {
-        ok = false;
-        break;
-      }
-      const auto col = static_cast<size_t>(shape.direct_column);
-      if (col >= left_width) {
-        if (!right_ok) {
-          ok = false;
-          break;
-        }
-        lp_right_cols.push_back(col - left_width);
-      } else {
-        const Column& cdef = left.schema.GetColumn(col);
-        if (!cdef.IsUnsigned() && (cdef.Type() == ValueType::kInt64 ||
-                                   cdef.Type() == ValueType::kDate)) {
-          lp_ints.push_back(LeftPackedIntCol{.col = static_cast<slot_t>(col),
-                                             .type = cdef.Type()});
-        } else if (cdef.Type() == ValueType::kVarChar) {
-          lp_dict_cols.push_back(col);
-        } else {
-          ok = false;
-          break;
-        }
-      }
-    }
-    std::vector<size_t> lp_col_offsets;
-    std::vector<uint32_t> lp_ne_chunks;
-    std::vector<size_t> lp_ne_bases;
-    const auto locate_left_col = [&](size_t li) -> std::pair<size_t, size_t> {
-      const auto it =
-          std::upper_bound(lp_ne_bases.begin(), lp_ne_bases.end(), li);
-      const auto idx = static_cast<size_t>((it - lp_ne_bases.begin()) - 1);
-      return {lp_ne_chunks[idx], li - lp_ne_bases[idx]};
-    };
-    if (ok && left_col_only) {
-      const auto& chunks = left.columnar->chunks;
-      lp_col_offsets.resize(chunks.size(), 0);
-      lp_ne_chunks.reserve(chunks.size());
-      lp_ne_bases.reserve(chunks.size());
-      size_t base = 0;
-      for (size_t ci = 0; ci < chunks.size(); ++ci) {
-        lp_col_offsets[ci] = base;
-        if (chunks[ci].rows > 0) {
-          lp_ne_chunks.push_back(static_cast<uint32_t>(ci));
-          lp_ne_bases.push_back(base);
-          base += chunks[ci].rows;
-        }
-      }
-    }
-    bool fast_dict_eligible = false;
-    uint32_t fast_dict_card = 0;
-    size_t fast_dict_col = 0;
-    std::vector<uint32_t> fast_src_row_to_subgid;
-    std::vector<size_t> fast_src_chunk_bases;
-    std::optional<uint32_t> fast_null_subgid;
-    if (ok && left_col_only && lp_dict_cols.size() == 1) {
-      const size_t dc = lp_dict_cols[0];
-      const ColumnarTable* src_table = nullptr;
-      slot_t gcol = 0;
-      bool can_src_gather = true;
-      bool any_gather_null = false;
-      for (const ColumnarChunk& ch : left.columnar->chunks) {
-        if (ch.rows == 0) {
-          continue;
-        }
-        const ColumnarColumn& cc = ch.columns[dc];
-        if (cc.encoding != ColumnarColumn::Encoding::kGathered ||
-            cc.gather_index == nullptr ||
-            cc.gather_index->source_table == nullptr ||
-            cc.gather_index->src_chunks.size() < ch.rows ||
-            cc.gather_index->src_rows.size() < ch.rows) {
-          can_src_gather = false;
-          break;
-        }
-        if (src_table == nullptr) {
-          src_table = cc.gather_index->source_table.get();
-          gcol = cc.gather_col;
-        } else if (src_table != cc.gather_index->source_table.get() ||
-                   gcol != cc.gather_col) {
-          can_src_gather = false;
-          break;
-        }
-        any_gather_null |= cc.gather_index->has_null;
-      }
-      if (can_src_gather && src_table != nullptr && src_table->total_rows > 0 &&
-          src_table->total_rows <= 4096) {
-        for (const ColumnarChunk& sch : src_table->chunks) {
-          if (sch.rows > 0 && gcol >= sch.columns.size()) {
-            can_src_gather = false;
-            break;
-          }
-        }
-        if (can_src_gather) {
-          fast_src_chunk_bases.resize(src_table->chunks.size(), 0);
-          size_t sbase = 0;
-          for (size_t sci = 0; sci < src_table->chunks.size(); ++sci) {
-            fast_src_chunk_bases[sci] = sbase;
-            sbase += src_table->chunks[sci].rows;
-          }
-          fast_src_row_to_subgid.assign(sbase, 0);
-          std::unordered_map<Value, uint32_t, DistinctValueHash,
-                             DistinctValueEqual>
-              src_map;
-          src_map.reserve(std::min<size_t>((sbase * 2) + 16, 4096));
-          uint32_t next_id = 0;
-          bool seen_ci = false;
-          Value tmp;
-          for (size_t sci = 0; sci < src_table->chunks.size() && !seen_ci;
-               ++sci) {
-            const ColumnarChunk& sch = src_table->chunks[sci];
-            if (sch.rows == 0) {
-              continue;
-            }
-            const ColumnarColumn& scc = sch.columns[gcol];
-            const size_t base_r = fast_src_chunk_bases[sci];
-            for (size_t sr = 0; sr < sch.rows; ++sr) {
-              scc.WriteValueInto(sr, &tmp);
-              if (tmp.IsCaseInsensitive()) {
-                seen_ci = true;
-                break;
-              }
-              Value kv = CanonicalDistinctValue(tmp);
-              if (kv.type == ValueType::kVarChar && !kv.IsNull() &&
-                  kv.owned_data.empty()) {
-                kv = Value(std::string(kv.value.varchar_value));
-              }
-              auto [it, inserted] = src_map.try_emplace(std::move(kv), next_id);
-              if (inserted) {
-                ++next_id;
-              }
-              if (it->first.IsNull() && !fast_null_subgid.has_value()) {
-                fast_null_subgid = it->second;
-              }
-              fast_src_row_to_subgid[base_r + sr] = it->second;
-            }
-          }
-          if (!seen_ci) {
-            if (any_gather_null && !fast_null_subgid.has_value()) {
-              fast_null_subgid = next_id++;
-            }
-            if (next_id <= 1024) {
-              fast_dict_eligible = true;
-              fast_dict_card = next_id;
-              fast_dict_col = dc;
-            }
-          }
-        }
-      }
-    }
-    if (ok && !lp_dict_cols.empty() && !fast_dict_eligible) {
-      constexpr size_t kSample = 256;
-      std::unordered_set<uint64_t> seen_hashes;
-      seen_hashes.reserve(256);
-      Value sample_tmp;
-      for (size_t s = 0; s < kSample; ++s) {
-        const size_t ri = (s * left_total_rows) / kSample;
-        uint64_t h = 0x9e3779b97f4a7c15ULL;
-        if (left_col_only) {
-          const auto [ci, r] = locate_left_col(ri);
-          const ColumnarChunk& ch = left.columnar->chunks[ci];
-          for (const size_t dc : lp_dict_cols) {
-            ch.columns[dc].WriteValueInto(r, &sample_tmp);
-            h = std::rotl(h, 7) ^ fast_hash_val(sample_tmp);
-            h *= 0x100000001b3ULL;
-          }
-        } else {
-          for (const size_t dc : lp_dict_cols) {
-            const Value& v = left.rows[ri].values_[dc];
-            h = std::rotl(h, 7) ^ std::hash<Value>{}(v);
-            h *= 0x100000001b3ULL;
-          }
-        }
-        seen_hashes.insert(h);
-        if (seen_hashes.size() > 128) {
-          ok = false;
-          break;
-        }
-      }
-    }
-    if (ok && (!lp_dict_cols.empty() || !lp_right_cols.empty() ||
-               lp_ints.size() > 2)) {
-      const size_t charge_bytes =
-          (left_total_rows *
-           (lp_dict_cols.empty() ? 1 : (fast_dict_eligible ? 4 : 20))) +
-          (lp_right_cols.empty() ? 0 : right_row_count * 16);
-      left_pack_charge = TryReserveQueryMemory(charge_bytes);
-      if (left_pack_charge) {
-        const size_t n_ints = lp_ints.size();
-        std::array<int64_t, 8> g_min{};
-        std::array<int64_t, 8> g_max{};
-        std::array<uint8_t, 8> g_non_null{};
-        std::array<uint8_t, 8> g_null{};
-        std::array<uint8_t, 8> int_range_done{};
-        g_min.fill(std::numeric_limits<int64_t>::max());
-        g_max.fill(std::numeric_limits<int64_t>::min());
-        if (left_col_only) {
-          for (size_t ji = 0; ji < n_ints; ++ji) {
-            const ColumnarTable* src_table = nullptr;
-            slot_t gcol = 0;
-            bool can_src_gather = true;
-            bool any_gather_null = false;
-            for (const ColumnarChunk& ch : left.columnar->chunks) {
-              if (ch.rows == 0) {
-                continue;
-              }
-              const ColumnarColumn& cc = ch.columns[lp_ints[ji].col];
-              if (cc.encoding != ColumnarColumn::Encoding::kGathered ||
-                  cc.gather_index == nullptr ||
-                  cc.gather_index->source_table == nullptr ||
-                  cc.gather_index->src_chunks.size() < ch.rows ||
-                  cc.gather_index->src_rows.size() < ch.rows) {
-                can_src_gather = false;
-                break;
-              }
-              if (src_table == nullptr) {
-                src_table = cc.gather_index->source_table.get();
-                gcol = cc.gather_col;
-              } else if (src_table != cc.gather_index->source_table.get() ||
-                         gcol != cc.gather_col) {
-                can_src_gather = false;
-                break;
-              }
-              any_gather_null |= cc.gather_index->has_null;
-            }
-            if (can_src_gather && src_table != nullptr &&
-                src_table->total_rows > 0 && src_table->total_rows <= 4096) {
-              bool type_ok = true;
-              for (const ColumnarChunk& sch : src_table->chunks) {
-                if (sch.rows > 0 && gcol >= sch.columns.size()) {
-                  type_ok = false;
-                  break;
-                }
-              }
-              int64_t smin = std::numeric_limits<int64_t>::max();
-              int64_t smax = std::numeric_limits<int64_t>::min();
-              uint8_t snon_null = 0;
-              uint8_t snull = any_gather_null ? uint8_t{1} : uint8_t{0};
-              Value tmp;
-              for (size_t sci = 0; sci < src_table->chunks.size() && type_ok;
-                   ++sci) {
-                const ColumnarChunk& sch = src_table->chunks[sci];
-                if (sch.rows == 0) {
-                  continue;
-                }
-                const ColumnarColumn& scc = sch.columns[gcol];
-                for (size_t sr = 0; sr < sch.rows; ++sr) {
-                  if (scc.is_uniform) {
-                    if (scc.IsNull(sr)) {
-                      snull = 1;
-                    } else if (scc.type == lp_ints[ji].type &&
-                               !scc.is_unsigned) {
-                      const int64_t iv = scc.IntAt(sr);
-                      snon_null = 1;
-                      smin = std::min(smin, iv);
-                      smax = std::max(smax, iv);
-                    } else {
-                      type_ok = false;
-                      break;
-                    }
-                  } else {
-                    scc.WriteValueInto(sr, &tmp);
-                    if (tmp.IsNull()) {
-                      snull = 1;
-                    } else if (tmp.type == lp_ints[ji].type &&
-                               !tmp.IsUnsigned()) {
-                      const int64_t iv = tmp.value.int_value;
-                      snon_null = 1;
-                      smin = std::min(smin, iv);
-                      smax = std::max(smax, iv);
-                    } else {
-                      type_ok = false;
-                      break;
-                    }
-                  }
-                }
-              }
-              if (type_ok) {
-                g_min[ji] = smin;
-                g_max[ji] = smax;
-                g_non_null[ji] = snon_null;
-                g_null[ji] = snull;
-                int_range_done[ji] = 1;
-              }
-            }
-          }
-        }
-        std::vector<uint64_t> left_hashes;
-        if (!lp_dict_cols.empty() && !fast_dict_eligible) {
-          left_hashes.resize(left_total_rows);
-        }
-        if (fast_dict_eligible) {
-          left_pack_dict_subgid.resize(left_total_rows);
-        }
-        const size_t scan_workers =
-            ParallelWorkerCount(left_total_rows / 32768);
-        std::vector<std::vector<std::pair<uint32_t, uint32_t>>>
-            worker_dict_reps;
-        if (fast_dict_eligible) {
-          worker_dict_reps.assign(scan_workers,
-                                  std::vector<std::pair<uint32_t, uint32_t>>(
-                                      fast_dict_card, {UINT32_MAX, 0U}));
-        }
-        struct WorkerRange {
-          std::array<int64_t, 8> min_v{};
-          std::array<int64_t, 8> max_v{};
-          std::array<uint8_t, 8> has_non_null{};
-          std::array<uint8_t, 8> has_null{};
-          bool valid{true};
-        };
-        std::vector<WorkerRange> wranges(scan_workers);
-        for (auto& wr : wranges) {
-          wr.min_v.fill(std::numeric_limits<int64_t>::max());
-          wr.max_v.fill(std::numeric_limits<int64_t>::min());
-        }
-        bool all_ints_precomputed = true;
-        for (size_t ji = 0; ji < n_ints; ++ji) {
-          if (int_range_done[ji] == 0) {
-            all_ints_precomputed = false;
-            break;
-          }
-        }
-        const bool need_scan =
-            !left_col_only || !lp_dict_cols.empty() || !all_ints_precomputed;
-        if (need_scan) {
-          RETURN_IF_FAIL(RunParallelTasks(scan_workers, [&](size_t worker) {
-            WorkerRange& wr = wranges[worker];
-            if (left_col_only) {
-              const auto& chunks = left.columnar->chunks;
-              const size_t cb = (chunks.size() * worker) / scan_workers;
-              const size_t ce = (chunks.size() * (worker + 1)) / scan_workers;
-              Value tmp;
-              for (size_t ci = cb; ci < ce; ++ci) {
-                const ColumnarChunk& ch = chunks[ci];
-                if (ch.rows == 0) {
-                  continue;
-                }
-                for (size_t ji = 0; ji < n_ints; ++ji) {
-                  if (int_range_done[ji] != 0) {
-                    continue;
-                  }
-                  const ColumnarColumn& cc = ch.columns[lp_ints[ji].col];
-                  if (cc.encoding == ColumnarColumn::Encoding::kConstant) {
-                    if (cc.IsNull(0)) {
-                      wr.has_null[ji] = 1;
-                    } else if (cc.is_uniform && !cc.is_unsigned &&
-                               cc.type == lp_ints[ji].type) {
-                      const int64_t iv = cc.IntAt(0);
-                      wr.has_non_null[ji] = 1;
-                      wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                      wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                    } else {
-                      cc.WriteValueInto(0, &tmp);
-                      if (tmp.IsNull()) {
-                        wr.has_null[ji] = 1;
-                      } else if (tmp.type == lp_ints[ji].type &&
-                                 !tmp.IsUnsigned()) {
-                        const int64_t iv = tmp.value.int_value;
-                        wr.has_non_null[ji] = 1;
-                        wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                        wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                      } else {
-                        wr.valid = false;
-                        return;
-                      }
-                    }
-                  } else if (cc.is_uniform && !cc.is_unsigned &&
-                             cc.type == lp_ints[ji].type) {
-                    if (cc.encoding == ColumnarColumn::Encoding::kFlat &&
-                        cc.ints.size() >= ch.rows &&
-                        (!cc.has_null || cc.nulls.empty() ||
-                         cc.nulls.size() >= ch.rows)) {
-                      const int64_t* ptr = cc.ints.data();
-                      if (!cc.has_null || cc.nulls.empty()) {
-                        int64_t lmin = wr.min_v[ji];
-                        int64_t lmax = wr.max_v[ji];
-                        for (size_t r = 0; r < ch.rows; ++r) {
-                          const int64_t iv = ptr[r];
-                          lmin = std::min(lmin, iv);
-                          lmax = std::max(lmax, iv);
-                        }
-                        wr.has_non_null[ji] = 1;
-                        wr.min_v[ji] = lmin;
-                        wr.max_v[ji] = lmax;
-                      } else {
-                        const uint8_t* nul = cc.nulls.data();
-                        int64_t lmin = wr.min_v[ji];
-                        int64_t lmax = wr.max_v[ji];
-                        bool seen_nn = false;
-                        bool seen_nl = false;
-                        for (size_t r = 0; r < ch.rows; ++r) {
-                          if (nul[r] != 0) {
-                            seen_nl = true;
-                          } else {
-                            const int64_t iv = ptr[r];
-                            lmin = std::min(lmin, iv);
-                            lmax = std::max(lmax, iv);
-                            seen_nn = true;
-                          }
-                        }
-                        if (seen_nl) {
-                          wr.has_null[ji] = 1;
-                        }
-                        if (seen_nn) {
-                          wr.has_non_null[ji] = 1;
-                          wr.min_v[ji] = lmin;
-                          wr.max_v[ji] = lmax;
-                        }
-                      }
-                    } else if (cc.encoding ==
-                               ColumnarColumn::Encoding::kGathered) {
-                      for (size_t r = 0; r < ch.rows; ++r) {
-                        const ColumnarColumn* leaf = nullptr;
-                        size_t lr = 0;
-                        if (!cc.ResolveLeaf(r, &leaf, &lr)) {
-                          wr.has_null[ji] = 1;
-                        } else {
-                          const int64_t iv = leaf->is_uniform
-                                                 ? leaf->IntAt(lr)
-                                                 : ColumnarIntValue(*leaf, lr);
-                          wr.has_non_null[ji] = 1;
-                          wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                          wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                        }
-                      }
-                    } else {
-                      for (size_t r = 0; r < ch.rows; ++r) {
-                        if (cc.IsNull(r)) {
-                          wr.has_null[ji] = 1;
-                        } else {
-                          const int64_t iv = cc.IntAt(r);
-                          wr.has_non_null[ji] = 1;
-                          wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                          wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                        }
-                      }
-                    }
-                  } else if (cc.is_uniform && cc.type == ValueType::kNull) {
-                    wr.has_null[ji] = 1;
-                  } else {
-                    for (size_t r = 0; r < ch.rows; ++r) {
-                      cc.WriteValueInto(r, &tmp);
-                      if (tmp.IsNull()) {
-                        wr.has_null[ji] = 1;
-                      } else if (tmp.type == lp_ints[ji].type &&
-                                 !tmp.IsUnsigned()) {
-                        const int64_t iv = tmp.value.int_value;
-                        wr.has_non_null[ji] = 1;
-                        wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                        wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                      } else {
-                        wr.valid = false;
-                        return;
-                      }
-                    }
-                  }
-                }
-                if (!lp_dict_cols.empty()) {
-                  const size_t base_li = lp_col_offsets[ci];
-                  if (fast_dict_eligible) {
-                    const ChunkGatherIndex* gi =
-                        ch.columns[fast_dict_col].gather_index.get();
-                    const uint32_t* sc_ptr = gi->src_chunks.data();
-                    const uint32_t* sr_ptr = gi->src_rows.data();
-                    uint32_t* dst = left_pack_dict_subgid.data() + base_li;
-                    auto* reps = worker_dict_reps[worker].data();
-                    const uint32_t* row_to_sg = fast_src_row_to_subgid.data();
-                    const size_t* cbases = fast_src_chunk_bases.data();
-                    const uint32_t null_sg = fast_null_subgid.value_or(0U);
-                    for (size_t r = 0; r < ch.rows; ++r) {
-                      const uint32_t sr = sr_ptr[r];
-                      const uint32_t sg =
-                          sr == ChunkGatherIndex::kNullRow
-                              ? null_sg
-                              : row_to_sg[cbases[sc_ptr[r]] + sr];
-                      dst[r] = sg;
-                      if (reps[sg].first == UINT32_MAX) {
-                        reps[sg] = {static_cast<uint32_t>(ci),
-                                    static_cast<uint32_t>(r)};
-                      }
-                    }
-                  } else {
-                    for (size_t r = 0; r < ch.rows; ++r) {
-                      uint64_t h = 0x9e3779b97f4a7c15ULL;
-                      for (const size_t dc : lp_dict_cols) {
-                        ch.columns[dc].WriteValueInto(r, &tmp);
-                        if (tmp.IsCaseInsensitive()) {
-                          wr.valid = false;
-                          return;
-                        }
-                        h = std::rotl(h, 7) ^ fast_hash_val(tmp);
-                        h *= 0x100000001b3ULL;
-                      }
-                      left_hashes[base_li + r] = h;
-                    }
-                  }
-                }
-              }
-            } else {
-              const size_t b = (left.rows.size() * worker) / scan_workers;
-              const size_t e = (left.rows.size() * (worker + 1)) / scan_workers;
-              for (size_t ri = b; ri < e; ++ri) {
-                const Row& row = left.rows[ri];
-                for (size_t ji = 0; ji < n_ints; ++ji) {
-                  const Value& v = row.values_[lp_ints[ji].col];
-                  if (v.IsNull()) {
-                    wr.has_null[ji] = 1;
-                  } else if (v.type == lp_ints[ji].type && !v.IsUnsigned()) {
-                    const int64_t iv = v.value.int_value;
-                    wr.has_non_null[ji] = 1;
-                    wr.min_v[ji] = std::min(wr.min_v[ji], iv);
-                    wr.max_v[ji] = std::max(wr.max_v[ji], iv);
-                  } else {
-                    wr.valid = false;
-                    return;
-                  }
-                }
-                if (!lp_dict_cols.empty()) {
-                  uint64_t h = 0x9e3779b97f4a7c15ULL;
-                  for (const size_t dc : lp_dict_cols) {
-                    const Value& v = row.values_[dc];
-                    if (v.IsCaseInsensitive()) {
-                      wr.valid = false;
-                      return;
-                    }
-                    h = std::rotl(h, 7) ^ std::hash<Value>{}(v);
-                    h *= 0x100000001b3ULL;
-                  }
-                  left_hashes[ri] = h;
-                }
-              }
-            }
-          }));
-        }
-        for (const WorkerRange& wr : wranges) {
-          if (!wr.valid) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) {
-          for (const WorkerRange& wr : wranges) {
-            for (size_t ji = 0; ji < n_ints; ++ji) {
-              if (int_range_done[ji] != 0) {
-                continue;
-              }
-              if (wr.has_non_null[ji] != 0) {
-                g_non_null[ji] = 1;
-                g_min[ji] = std::min(g_min[ji], wr.min_v[ji]);
-                g_max[ji] = std::max(g_max[ji], wr.max_v[ji]);
-              }
-              g_null[ji] |= wr.has_null[ji];
-            }
-          }
-        }
-        uint32_t dict_card = 0;
-        std::vector<uint32_t> lp_dict_rep_rows;
-        std::vector<std::pair<uint32_t, uint32_t>> fast_dict_rep_col_loc;
-        if (ok && !lp_dict_cols.empty()) {
-          if (fast_dict_eligible) {
-            dict_card = fast_dict_card;
-            fast_dict_rep_col_loc.assign(fast_dict_card, {UINT32_MAX, 0U});
-            for (const auto& wreps : worker_dict_reps) {
-              for (uint32_t sg = 0; sg < fast_dict_card; ++sg) {
-                if (fast_dict_rep_col_loc[sg].first == UINT32_MAX &&
-                    wreps[sg].first != UINT32_MAX) {
-                  fast_dict_rep_col_loc[sg] = wreps[sg];
-                }
-              }
-            }
-            left_pack_chunk_offsets = std::move(lp_col_offsets);
-          } else {
-            ok = build_flat_subgid_dict(
-                left_total_rows, 1024,
-                [&](std::vector<uint64_t>& hashes) -> Status {
-                  hashes = std::move(left_hashes);
-                  return Status::kSuccess;
-                },
-                [&](size_t a, size_t b) {
-                  if (left_col_only) {
-                    const auto [cia, ra] = locate_left_col(a);
-                    const auto [cib, rb] = locate_left_col(b);
-                    const ColumnarChunk& ca = left.columnar->chunks[cia];
-                    const ColumnarChunk& cb = left.columnar->chunks[cib];
-                    Value va;
-                    Value vb;
-                    for (const size_t dc : lp_dict_cols) {
-                      ca.columns[dc].WriteValueInto(ra, &va);
-                      cb.columns[dc].WriteValueInto(rb, &vb);
-                      if (!DistinctValueEqual{}(va, vb)) {
-                        return false;
-                      }
-                    }
-                    return true;
-                  }
-                  const Row& ra = left.rows[a];
-                  const Row& rb = left.rows[b];
-                  return std::ranges::all_of(lp_dict_cols, [&](size_t dc) {
-                    return DistinctValueEqual{}(ra.values_[dc], rb.values_[dc]);
-                  });
-                },
-                &left_pack_dict_subgid, &dict_card, nullptr, &lp_dict_rep_rows);
-            if (ok && left_col_only) {
-              left_pack_chunk_offsets = std::move(lp_col_offsets);
-            }
-          }
-        }
-        uint32_t right_card = 0;
-        if (ok && !lp_right_cols.empty()) {
-          ok = build_or_reuse_split_right_dict(lp_right_cols, &right_card);
-        }
-        uint32_t bit_cursor = 0;
-        if (ok && !lp_right_cols.empty()) {
-          const uint32_t r_bits =
-              right_card <= 1
-                  ? 0U
-                  : static_cast<uint32_t>(std::bit_width(right_card - 1));
-          if (bit_cursor + r_bits <= 64U) {
-            left_pack_uses_right = true;
-            split_right_shift = static_cast<uint8_t>(bit_cursor);
-            split_right_subgid_count = right_card;
-            left_pack_right_mask =
-                r_bits == 0 ? 0ULL : ((uint64_t{1} << r_bits) - 1ULL);
-            bit_cursor += r_bits;
-          } else {
-            ok = false;
-          }
-        }
-        if (ok && !lp_dict_cols.empty()) {
-          const uint32_t d_bits =
-              dict_card <= 1
-                  ? 0U
-                  : static_cast<uint32_t>(std::bit_width(dict_card - 1));
-          if (bit_cursor + d_bits <= 64U) {
-            left_pack_uses_dict = true;
-            left_pack_dict_shift = static_cast<uint8_t>(bit_cursor);
-            left_pack_dict_mask =
-                d_bits == 0 ? 0ULL : ((uint64_t{1} << d_bits) - 1ULL);
-            bit_cursor += d_bits;
-          } else {
-            ok = false;
-          }
-        }
-        for (size_t ji = 0; ok && ji < n_ints; ++ji) {
-          if (g_non_null[ji] == 0) {
-            if (bit_cursor >= 64U) {
-              // Zero bits left: a shift of 64 on uint64 is UB, so drop the
-              // packed-key fast path and let the generic path handle it.
-              ok = false;
-              break;
-            }
-            lp_ints[ji].min_val = 0;
-            lp_ints[ji].null_code = 0;
-            lp_ints[ji].mask = 0;
-            lp_ints[ji].shift = static_cast<uint8_t>(bit_cursor);
-            continue;
-          }
-          const uint64_t span = static_cast<uint64_t>(g_max[ji]) -
-                                static_cast<uint64_t>(g_min[ji]);
-          if (span >= std::numeric_limits<uint64_t>::max() - 2ULL) {
-            ok = false;
-            break;
-          }
-          const uint64_t domain = span + 1ULL + (g_null[ji] != 0 ? 1ULL : 0ULL);
-          const uint32_t bits =
-              domain <= 1ULL
-                  ? 0U
-                  : static_cast<uint32_t>(std::bit_width(domain - 1ULL));
-          // `bits == 0` at offset 64 would store an unrepresentable shift.
-          if (bit_cursor >= 64U || bit_cursor + bits > 64U) {
-            ok = false;
-            break;
-          }
-          lp_ints[ji].min_val = g_min[ji];
-          lp_ints[ji].null_code = span + 1ULL;
-          lp_ints[ji].mask = bits == 0 ? 0ULL : ((uint64_t{1} << bits) - 1ULL);
-          lp_ints[ji].shift = static_cast<uint8_t>(bit_cursor);
-          bit_cursor += bits;
-        }
-        if (ok && bit_cursor <= 64U) {
-          use_left_packed_key = true;
-          left_pack_ints = std::move(lp_ints);
-          left_pack_dict_cols = std::move(lp_dict_cols);
-          left_pack_right_cols = std::move(lp_right_cols);
-          if (left_pack_uses_dict) {
-            if (left_col_only) {
-              if (!fast_dict_rep_col_loc.empty()) {
-                left_pack_dict_rep_col_loc = std::move(fast_dict_rep_col_loc);
-              } else {
-                left_pack_dict_rep_col_loc.reserve(lp_dict_rep_rows.size());
-                for (const uint32_t rr : lp_dict_rep_rows) {
-                  const auto [ci, r] = locate_left_col(rr);
-                  left_pack_dict_rep_col_loc.emplace_back(
-                      static_cast<uint32_t>(ci), static_cast<uint32_t>(r));
-                }
-              }
-            } else {
-              left_pack_dict_rep_rows = std::move(lp_dict_rep_rows);
-            }
-          }
-          auto col_unpackable = [&](size_t col_off) -> bool {
-            if (std::ranges::any_of(left_pack_ints, [&](const auto& lpi) {
-                  return lpi.col == col_off;
-                })) {
-              return true;
-            }
-            if (std::ranges::find(left_pack_dict_cols, col_off) !=
-                left_pack_dict_cols.end()) {
-              return true;
-            }
-            if (col_off >= left_width) {
-              return std::ranges::find(left_pack_right_cols,
-                                       col_off - left_width) !=
-                     left_pack_right_cols.end();
-            }
-            if (join_type == JoinType::kInner) {
-              return std::ranges::any_of(
-                  equality_keys, [&](const EqualityKey& eq) {
-                    if (eq.left != col_off || eq.left_offset != 0 ||
-                        eq.right_offset != 0 || eq.null_safe ||
-                        eq.right >= right.schema.ColumnCount()) {
-                      return false;
-                    }
-                    const Column& lc = left.schema.GetColumn(eq.left);
-                    const Column& rc = right.schema.GetColumn(eq.right);
-                    return lc.Type() == rc.Type() &&
-                           lc.IsUnsigned() == rc.IsUnsigned() &&
-                           lc.Type() != ValueType::kVarChar &&
-                           std::ranges::find(left_pack_right_cols, eq.right) !=
-                               left_pack_right_cols.end();
-                  });
-            }
-            return false;
-          };
-          const std::function<bool(const Expression&)> expr_unpackable =
-              [&](const Expression& expr) -> bool {
-            if (!expr || ContainsParameterSlot(expr)) {
-              return false;
-            }
-            if (expr->Type() == TypeTag::kConstantValue) {
-              return true;
-            }
-            if (expr->Type() == TypeTag::kAggregateExp) {
-              return std::ranges::find(fusion->aggregates,
-                                       &expr->AsAggregateExpression()) !=
-                     fusion->aggregates.end();
-            }
-            if (expr->Type() == TypeTag::kColumnValue) {
-              const auto off = LocalColumnOffset(
-                  result.schema, expr->AsColumnValue().GetColumnName());
-              return off.has_value() && col_unpackable(*off);
-            }
-            if (expr->Type() == TypeTag::kUnaryExp) {
-              return expr_unpackable(expr->AsUnaryExpression().Child());
-            }
-            if (expr->Type() == TypeTag::kBinaryExp) {
-              const auto& bin = expr->AsBinaryExpression();
-              return expr_unpackable(bin.Left()) &&
-                     expr_unpackable(bin.Right());
-            }
-            return false;
-          };
-          left_pack_unpack_only =
-              !left.HasSpill() && !right_ptr->HasSpill() &&
-              result.using_columns == nullptr && !fusion->having &&
-              !fusion->post_having_active && fusion->topn_limit == 0 &&
-              !fusion->rollup_count_distribution &&
-              (raw_sum_fusion || raw_count_fusion ||
-               fusion->aggregates.empty()) &&
-              std::ranges::all_of(fusion->select_items, expr_unpackable);
-        } else {
-          left_pack_uses_right = false;
-          left_pack_uses_dict = false;
-          left_pack_dict_subgid.clear();
-          clear_split_right_dict();
-          left_pack_charge.reset();
-        }
-      }
-    }
-  }
+  const PreparedPkCellReader read_pk_cell{prepared_pk_lookups};
+  FusedGroupKeyLayout layout;
+  RETURN_IF_FAIL(layout.Prepare({
+      .left = left,
+      .right_arg = right_arg,
+      .join_type = join_type,
+      .fusion = fusion,
+      .deferred_left_probe = deferred_left_probe,
+      .total_right_rows = total_right_rows,
+      .right_col_only = right_col_only,
+      .right_col_owner = right_col_owner,
+      .right_locator = right_locator,
+      .right_ptr = right_ptr,
+      .right = right,
+      .result = result,
+      .singleton_right_relation = singleton_right_relation,
+      .equality_keys = equality_keys,
+      .left_width = left_width,
+      .key_programs = key_programs,
+      .key_shapes = key_shapes,
+      .count_star_only = raw_aggregates.count_star_only,
+      .raw_count_fusion = raw_aggregates.raw_count_fusion,
+      .raw_sum_fusion = raw_aggregates.raw_sum_fusion,
+      .all_direct_group_keys = all_direct_group_keys,
+      .int_group_key = int_group_key,
+      .read_right_cell = read_right_cell,
+      .prepared_pk_lookups = prepared_pk_lookups,
+      .def_pk_groups = def_pk_groups,
+      .def_col_to_pk_lookup = def_col_to_pk_lookup,
+      .shared_pk_cache = shared_pk_cache,
+      .read_pk_cell = read_pk_cell,
+  }));
   // A selective COUNT HAVING needs only a counter and borrowed key owners
   // while probing. Delay the much larger general aggregate state until the
   // worker counts have merged and the HAVING predicate has accepted a group.
   // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
   //   (packed_2x32_join_key_bijection_sound)
   const bool compact_raw_left_key = [&]() {
-    if (!split_key_unpack_only || !split_left_slot ||
+    if (!layout.split_key_unpack_only || !layout.split_left_slot ||
         deferred_left_probe == nullptr ||
-        *split_left_slot >= deferred_left_probe->projection.size() ||
+        *layout.split_left_slot >= deferred_left_probe->projection.size() ||
         !prepared_pk_lookups.empty() || !residual_programs.empty()) {
       return false;
     }
     const auto& store = *deferred_left_probe->store;
-    const slot_t col = deferred_left_probe->projection[*split_left_slot];
+    const slot_t col = deferred_left_probe->projection[*layout.split_left_slot];
     return store.HasColumn(col) && col < store.column_has_null.size() &&
            !store.column_has_null[col] && col < store.column_min_int.size() &&
            col < store.column_max_int.size() &&
@@ -6693,27 +2279,27 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
            std::in_range<int32_t>(store.column_max_int[col]);
   }();
   const bool compact_split_key_eligible =
-      use_split_key_gid && split_key_unpack_only &&
-      (!split_has_left_probe || compact_raw_left_key) && right_row_count > 0 &&
-      (!split_uses_right_subgid ||
-       split_right_rep_count == split_right_subgid_count);
+      layout.use_split_key_gid && layout.split_key_unpack_only &&
+      (!layout.split_has_left_probe || compact_raw_left_key) && layout.right_row_count > 0 &&
+      (!layout.split_uses_right_subgid ||
+       layout.split_right_rep_count == layout.split_right_subgid_count);
   const bool compact_counts =
-      raw_count_fusion && count_star_only && !bulk_raw_count &&
+      raw_aggregates.raw_count_fusion && raw_aggregates.count_star_only && !bulk_raw_count &&
       all_direct_group_keys && !right_ptr->HasSpill() &&
       join_type == JoinType::kInner &&
       ((deferred_left_probe == nullptr && !left.HasColumnarOnly()) ||
        (integer_key && compact_split_key_eligible)) &&
-      (compact_integer_threshold.has_value() ||
+      (layout.compact_integer_threshold.has_value() ||
        (fusion->post_having_active && !fusion->post_having_is_self_sum_factor &&
         fusion->post_having_agg_slot == 0 &&
         fusion->post_having_op == BinaryOperation::kGreaterThan &&
         fusion->post_having_constant_or_factor >= 1.0));
   const bool compact_split_key_only =
       compact_counts && compact_split_key_eligible;
-  constexpr size_t kCompactSplitShards = 256;
+
   const auto compact_count_passes = [&](int64_t count) {
-    return compact_integer_threshold
-               ? count > *compact_integer_threshold
+    return layout.compact_integer_threshold
+               ? count > *layout.compact_integer_threshold
                : static_cast<double>(count) >
                      fusion->post_having_constant_or_factor;
   };
@@ -6740,7 +2326,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   if (debug_fusion && compact_counts) {
     std::cerr << "[fusion] compact counts rows=" << left.rows.size() << '\n';
   }
-  constexpr size_t kNoCachedGroup = std::numeric_limits<size_t>::max();
+
   const auto read_pair_cell = [&](const Row* left_row, uint32_t r_idx,
                                   slot_t col,
                                   Value* col_scratch) -> const Value& {
@@ -6785,18 +2371,18 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
           new_group = true;
         }
-      } else if (use_split_key_gid) {
+      } else if (layout.use_split_key_gid) {
         const uint32_t r_subgid =
-            !split_uses_right_subgid
+            !layout.split_uses_right_subgid
                 ? 0U
                 : (r_idx == kInvalidRightIdx
                        ? std::numeric_limits<uint32_t>::max()
-                       : split_right_subgid_ptr[r_idx]);
-        const bool pk_ok = !split_uses_pk_subgid || local.have_cur_pk_subgids;
+                       : layout.split_right_subgid_ptr[r_idx]);
+        const bool pk_ok = !layout.split_uses_pk_subgid || local.have_cur_pk_subgids;
         int64_t l_val = 0;
-        bool l_ok = !split_has_left_probe;
-        if (split_has_left_probe) {
-          const ProgramShape& l_shape = key_shapes[split_left_k];
+        bool l_ok = !layout.split_has_left_probe;
+        if (layout.split_has_left_probe) {
+          const ProgramShape& l_shape = key_shapes[layout.split_left_k];
           if (left_row != nullptr && l_shape.direct_column >= 0) {
             const Value& lv =
                 left_row->values_[static_cast<size_t>(l_shape.direct_column)];
@@ -6842,7 +2428,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
         if (r_subgid != std::numeric_limits<uint32_t>::max() && pk_ok && l_ok)
             [[likely]] {
-          if (use_fast_2key_year_lut && r_subgid < 64 && l_val >= 1900 &&
+          if (layout.use_fast_2key_year_lut && r_subgid < 64 && l_val >= 1900 &&
               l_val < 2028) [[likely]] {
             if (!local.local_2key_gid_init) [[unlikely]] {
               local.local_2key_gid.fill(std::numeric_limits<uint32_t>::max());
@@ -6858,10 +2444,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             fast_lut_slot = &local.local_2key_gid[lut_idx];
           }
           uint64_t packed_u64 = 0;
-          if (split_uses_right_subgid) {
-            packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
+          if (layout.split_uses_right_subgid) {
+            packed_u64 |= static_cast<uint64_t>(r_subgid) << layout.split_right_shift;
           }
-          if (split_uses_pk_subgid) {
+          if (layout.split_uses_pk_subgid) {
             for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
               if (def_pk_groups[gi].use_subgid) {
                 packed_u64 |= static_cast<uint64_t>(local.cur_pk_subgids[gi])
@@ -6869,7 +2455,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               }
             }
           }
-          if (split_has_left_probe) {
+          if (layout.split_has_left_probe) {
             packed_u64 |= static_cast<uint64_t>(
                 static_cast<uint32_t>(static_cast<int32_t>(l_val)));
           }
@@ -6887,15 +2473,15 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             local.key_scratch.resize(key_programs.size());
             Value rv_tmp;
             for (size_t k = 0; k < key_shapes.size(); ++k) {
-              if (split_has_left_probe && k == split_left_k) {
-                const ProgramShape& l_shape = key_shapes[split_left_k];
+              if (layout.split_has_left_probe && k == layout.split_left_k) {
+                const ProgramShape& l_shape = key_shapes[layout.split_left_k];
                 if (l_shape.direct_column >= 0 &&
                     left_row->values_[static_cast<size_t>(
                                           l_shape.direct_column)]
                             .type == ValueType::kDate) {
-                  local.key_scratch[split_left_k] = Value::DateFromDays(l_val);
+                  local.key_scratch[layout.split_left_k] = Value::DateFromDays(l_val);
                 } else {
-                  local.key_scratch[split_left_k] = Value(l_val);
+                  local.key_scratch[layout.split_left_k] = Value(l_val);
                 }
               } else if (std::cmp_greater_equal(key_shapes[k].direct_column,
                                                 left_width)) {
@@ -6939,22 +2525,22 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             new_group = true;
           }
         }
-      } else if (use_left_packed_key && left_row != nullptr &&
-                 (!left_pack_uses_right || r_idx != kInvalidRightIdx) &&
-                 (!left_pack_uses_dict ||
+      } else if (layout.use_left_packed_key && left_row != nullptr &&
+                 (!layout.left_pack_uses_right || r_idx != kInvalidRightIdx) &&
+                 (!layout.left_pack_uses_dict ||
                   (left_row >= left.rows.data() &&
                    left_row < left.rows.data() + left.rows.size()))) {
         uint64_t packed_u64 = 0;
-        if (left_pack_uses_right) {
-          const uint32_t r_subgid = split_right_subgid_ptr[r_idx];
-          packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
+        if (layout.left_pack_uses_right) {
+          const uint32_t r_subgid = layout.split_right_subgid_ptr[r_idx];
+          packed_u64 |= static_cast<uint64_t>(r_subgid) << layout.split_right_shift;
         }
-        if (left_pack_uses_dict) {
+        if (layout.left_pack_uses_dict) {
           const auto li = static_cast<size_t>(left_row - left.rows.data());
-          packed_u64 |= static_cast<uint64_t>(left_pack_dict_subgid[li])
-                        << left_pack_dict_shift;
+          packed_u64 |= static_cast<uint64_t>(layout.left_pack_dict_subgid[li])
+                        << layout.left_pack_dict_shift;
         }
-        for (const LeftPackedIntCol& lpi : left_pack_ints) {
+        for (const LeftPackedIntCol& lpi : layout.left_pack_ints) {
           const Value& v = left_row->values_[lpi.col];
           const uint64_t code =
               v.IsNull()
@@ -6972,13 +2558,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         computed_key_hash = packed_u64;
         has_computed_key_hash = true;
         new_group = true;
-      } else if (packed_2x32_group_key) {
+      } else if (layout.packed_2x32_group_key) {
         Value v0_tmp;
         Value v1_tmp;
         const Value& v0 =
-            read_pair_cell(left_row, r_idx, packed_2x32_slot0, &v0_tmp);
+            read_pair_cell(left_row, r_idx, layout.packed_2x32_slot0, &v0_tmp);
         const Value& v1 =
-            read_pair_cell(left_row, r_idx, packed_2x32_slot1, &v1_tmp);
+            read_pair_cell(left_row, r_idx, layout.packed_2x32_slot1, &v1_tmp);
         const auto fits_i32 = [](const Value& v, ValueType expected) noexcept {
           return !v.IsNull() && v.type == expected && !v.IsUnsigned() &&
                  v.value.int_value >=
@@ -6987,7 +2573,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                  v.value.int_value <=
                      static_cast<int64_t>(std::numeric_limits<int32_t>::max());
         };
-        if (fits_i32(v0, packed_2x32_type0) && fits_i32(v1, packed_2x32_type1))
+        if (fits_i32(v0, layout.packed_2x32_type0) && fits_i32(v1, layout.packed_2x32_type1))
             [[likely]] {
           const uint64_t u0 =
               static_cast<uint32_t>(static_cast<int32_t>(v0.value.int_value));
@@ -7275,10 +2861,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       if (new_group) {
         group_index = local.groups.size();
         FusedGroup group;
-        if (raw_sum_fusion) {
-          local.raw_arena.Initialize(group, raw_slot_count);
+        if (raw_aggregates.raw_sum_fusion) {
+          local.raw_arena.Initialize(group, raw_aggregates.raw_slot_count);
         }
-        if (!skip_accumulator_states) {
+        if (!raw_aggregates.skip_accumulator_states) {
           group.state_offset = local.states.size();
           for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
             local.states.emplace_back(fusion->aggregates[i],
@@ -7302,7 +2888,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         } else {
           if ((deferred_left_probe != nullptr || left.HasColumnarOnly()) &&
               left_row != nullptr &&
-              !((packed_2x32_unpack_only || split_key_unpack_only) &&
+              !((layout.packed_2x32_unpack_only || layout.split_key_unpack_only) &&
                 has_computed_key_hash)) {
             local.owned_rep_left.push_back(*left_row);
             group.rep_left = &local.owned_rep_left.back();
@@ -7392,7 +2978,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       if (compact_split_key_only && r_idx != kInvalidRightIdx) {
         uint64_t packed_u64 = 0;
         bool pk_ok = true;
-        if (split_uses_pk_subgid) {
+        if (layout.split_uses_pk_subgid) {
           pk_ok = local.have_cur_pk_subgids;
           for (size_t gi = 0; pk_ok && gi < def_pk_groups.size(); ++gi) {
             if (def_pk_groups[gi].use_subgid) {
@@ -7407,16 +2993,16 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
         }
         const uint32_t r_subgid =
-            !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
+            !layout.split_uses_right_subgid ? 0U : layout.split_right_subgid_ptr[r_idx];
         if (pk_ok && r_subgid != std::numeric_limits<uint32_t>::max()) {
-          if (split_uses_right_subgid) {
-            packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
+          if (layout.split_uses_right_subgid) {
+            packed_u64 |= static_cast<uint64_t>(r_subgid) << layout.split_right_shift;
           }
           if (compact_raw_left_key) {
             Value scratch_key;
             const auto& key =
-                read_pair_cell(left_row, r_idx, *split_left_slot, &scratch_key);
-            if (key.IsNull() || key.type != split_left_type ||
+                read_pair_cell(left_row, r_idx, *layout.split_left_slot, &scratch_key);
+            if (key.IsNull() || key.type != layout.split_left_type ||
                 key.IsUnsigned() ||
                 !std::in_range<int32_t>(key.value.int_value)) {
               return StatusError(StatusCode::kCorrupt,
@@ -7432,17 +3018,17 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       probe.left = left_row;
       probe.right_idx = r_idx;
       bool packed = false;
-      if (use_split_key_gid && split_has_left_probe && !split_uses_pk_subgid &&
-          split_uses_right_subgid &&
-          key_shapes[split_left_k].direct_column >= 0 && left_row != nullptr &&
+      if (layout.use_split_key_gid && layout.split_has_left_probe && !layout.split_uses_pk_subgid &&
+          layout.split_uses_right_subgid &&
+          key_shapes[layout.split_left_k].direct_column >= 0 && left_row != nullptr &&
           r_idx != kInvalidRightIdx) {
         const auto& value = (*left_row)[static_cast<size_t>(
-            key_shapes[split_left_k].direct_column)];
+            key_shapes[layout.split_left_k].direct_column)];
         if (!value.IsNull() && !value.IsUnsigned() &&
             (value.type == ValueType::kInt64 ||
              value.type == ValueType::kDate) &&
             std::in_range<int32_t>(value.value.int_value)) {
-          const uint32_t dimension = split_right_subgid_ptr[r_idx];
+          const uint32_t dimension = layout.split_right_subgid_ptr[r_idx];
           if (dimension != std::numeric_limits<uint32_t>::max()) {
             probe.hash = (static_cast<uint64_t>(dimension) << 32U) |
                          static_cast<uint32_t>(value.value.int_value);
@@ -7458,7 +3044,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               read_pair_cell(left_row, r_idx,
                              static_cast<slot_t>(shape.direct_column), &v_tmp);
           probe.hash = std::rotl(probe.hash, 7);
-          probe.hash ^= fast_hash_val(value);
+          probe.hash ^= HashFusedKeyValue(value);
           probe.hash *= 0x100000001b3ULL;
         }
       }
@@ -7497,30 +3083,30 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     RETURN_IF_FAIL(resolve_group_index(local, scratch, left_row, r_idx, masked,
                                        cached_group, &group_index));
     FusedGroup& group = local.groups[group_index];
-    if (count_star_only) {
+    if (raw_aggregates.count_star_only) {
       group.raw_count += 1;
       return Status::kSuccess;
     }
-    if (count_nonnull_only) {
+    if (raw_aggregates.count_nonnull_only) {
       // COUNT(right column): unmatched LEFT rows and NULL cells contribute 0.
       // COUNT(left NOT NULL column) is unconditional instead: the left value
       // is still present for a null-extended row, so that row counts too.
-      if (unconditional_matched_count ||
+      if (raw_aggregates.unconditional_matched_count ||
           (r_idx != kInvalidRightIdx &&
-           (!count_right_column.has_value() ||
-            !right_cell_is_null(r_idx, *count_right_column)))) {
+           (!raw_aggregates.count_right_column.has_value() ||
+            !right_cell_is_null(r_idx, *raw_aggregates.count_right_column)))) {
         group.raw_count += 1;
       }
       return Status::kSuccess;
     }
-    if (raw_sum_fusion) {
+    if (raw_aggregates.raw_sum_fusion) {
       Value v_tmp;
-      for (size_t s = 0; s < raw_slot_count; ++s) {
-        const size_t src = raw_slot_origin[s];
+      for (size_t s = 0; s < raw_aggregates.raw_slot_count; ++s) {
+        const size_t src = raw_aggregates.raw_slot_origin[s];
         if (case_always_null(src, right_row)) {
           continue;
         }
-        switch (slot_agg_kinds[s]) {
+        switch (raw_aggregates.slot_agg_kinds[s]) {
           case RawAggKind::kCountStar:
             group.RawCounts()[s] += 1;
             break;
@@ -7736,7 +3322,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   ProgramShape left_disj_shape;
   std::vector<uint8_t> precomputed_right_disj;
   const bool non_residual_scratch_unused =
-      all_direct_group_keys && raw_sum_fusion &&
+      all_direct_group_keys && raw_aggregates.raw_sum_fusion &&
       std::ranges::all_of(child_shapes, [](const ProgramShape& shape) {
         return shape.direct_column >= 0;
       });
@@ -7884,14 +3470,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   bool has_double_raw_agg = false;
   bool has_int_raw_agg = false;
   bool has_stat_raw_agg = false;
-  if (raw_sum_fusion) {
-    for (size_t s = 0; s < raw_slot_count && s < slot_agg_kinds.size(); ++s) {
-      if (slot_agg_kinds[s] == RawAggKind::kSumDouble ||
-          slot_agg_kinds[s] == RawAggKind::kAvgDouble) {
+  if (raw_aggregates.raw_sum_fusion) {
+    for (size_t s = 0; s < raw_aggregates.raw_slot_count && s < raw_aggregates.slot_agg_kinds.size(); ++s) {
+      if (raw_aggregates.slot_agg_kinds[s] == RawAggKind::kSumDouble ||
+          raw_aggregates.slot_agg_kinds[s] == RawAggKind::kAvgDouble) {
         has_double_raw_agg = true;
-      } else if (is_stat_raw_kind(slot_agg_kinds[s])) {
+      } else if (is_stat_raw_kind(raw_aggregates.slot_agg_kinds[s])) {
         has_stat_raw_agg = true;
-      } else if (slot_agg_kinds[s] == RawAggKind::kSumInt64) {
+      } else if (raw_aggregates.slot_agg_kinds[s] == RawAggKind::kSumInt64) {
         has_int_raw_agg = true;
       }
     }
@@ -8054,8 +3640,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<FusedWorkerLocal> locals(workers);
   for (FusedWorkerLocal& l : locals) {
     l.raw_arena.has_stat = has_stat_raw_agg;
-    l.raw_arena.has_double = !raw_sum_fusion || has_double_raw_agg;
-    l.raw_arena.has_int = !raw_sum_fusion || has_int_raw_agg;
+    l.raw_arena.has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+    l.raw_arena.has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
   }
   std::shared_ptr<QueryMemoryCharge> group_capacity_charge;
   if (all_direct_group_keys && !right_only_group_keys &&
@@ -8117,11 +3703,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // Partition ColumnarTable probe chunks into morsels so large or high-fanout
   // ColumnarTables fan out across all worker threads instead of serializing
   // on Worker 0.
-  struct ColProbeMorsel {
-    uint32_t ci;
-    uint32_t r_begin;
-    uint32_t r_end;
-  };
   std::vector<ColProbeMorsel> col_morsels;
   if (left.HasColumnarOnly()) {
     const auto& chunks = left.columnar->chunks;
@@ -8162,10 +3743,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<BulkCountValue> dense_bulk_counts;
   int64_t dense_bulk_min = 0;
   bool use_dense_bulk = false;
-  struct BuildKey {
-    int64_t key;
-    uint32_t row;
-  };
   std::vector<std::vector<BuildKey>> key_cache;
   std::shared_ptr<QueryMemoryCharge> key_cache_charge;
   std::vector<uint32_t> dense_int_idxs;
@@ -8180,38 +3757,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<UniqueIntSlot> unique_int_table;
   size_t unique_int_mask = 0;
   bool use_unique_int_table = false;
-  auto hash_unique_int_key = HashUniqueIntKey;
-  const auto read_col_int_cell = [&](const ColumnarColumn& kc, size_t r,
-                                     bool fast_uniform,
-                                     int64_t* out) noexcept -> bool {
-    if (fast_uniform) {
-      return kc.TryReadNonNullInt(r, out);
-    }
-    if (ColumnarCellIsNullOrNaN(kc, r)) {
-      return false;
-    }
-    *out = ColumnarIntValue(kc, r);
-    return true;
-  };
+
   // Decode each component once, including gathered columns and NULLs.
-  const auto read_col_composite_key = [&](const ColumnarChunk& chunk,
-                                          const std::vector<slot_t>& columns,
-                                          const std::vector<int64_t>& biases,
-                                          size_t row, CompositeIntKey* key) {
-    *key = CompositeIntKey{};
-    for (size_t i = 0; i < columns.size(); ++i) {
-      const auto& column = chunk.columns[columns[i]];
-      const bool fast =
-          column.is_uniform && !column.is_unsigned &&
-          (column.type == ValueType::kInt64 || column.type == ValueType::kDate);
-      int64_t raw = 0;
-      if (!read_col_int_cell(column, row, fast, &raw)) {
-        return false;
-      }
-      key->parts[key->count++] = AddJoinKeyBias(raw, biases[i]);
-    }
-    return true;
-  };
   const auto visit_right_int_keys = [&](auto&& on_row) {
     if (right_col_only) {
       const slot_t rc0 = right_columns[0];
@@ -8224,7 +3771,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
         for (size_t r = 0; r < ch.rows; ++r) {
           int64_t raw_k = 0;
-          if (!read_col_int_cell(kc, r, fast, &raw_k)) {
+          if (!ReadFusedIntCell(kc, r, fast, &raw_k)) {
             continue;
           }
           if (!on_row(base_r + static_cast<uint32_t>(r),
@@ -8277,11 +3824,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         for (size_t r = 0; r < ch.rows; ++r) {
           int64_t v0 = 0;
           int64_t v1 = 0;
-          if (!read_col_int_cell(kc0, r, fast0, &v0) ||
-              !read_col_int_cell(kc1, r, fast1, &v1)) {
+          if (!ReadFusedIntCell(kc0, r, fast0, &v0) ||
+              !ReadFusedIntCell(kc1, r, fast1, &v1)) {
             continue;
           }
-          const int64_t bkey = pack_fused_2x32(AddJoinKeyBias(v0, bias0),
+          const int64_t bkey = PackFusedInt32Pair(AddJoinKeyBias(v0, bias0),
                                                AddJoinKeyBias(v1, bias1));
           if (!on_row(base_r + static_cast<uint32_t>(r), bkey)) {
             return;
@@ -8301,7 +3848,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       const int64_t k1 = AddJoinKeyBias(IntegerJoinKey(row, right_columns[1]),
                                         right_key_offsets[1]);
       if (!on_row(static_cast<uint32_t>(row_ptr - right_ptr->rows.data()),
-                  pack_fused_2x32(k0, k1))) {
+                  PackFusedInt32Pair(k0, k1))) {
         return;
       }
     }
@@ -8313,7 +3860,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         if (right_col_only) {
           const slot_t rc0 = right_columns[0];
           const int64_t bias0 = right_key_offsets[0];
-          const std::optional<slot_t> count_rc = count_right_column;
+          const std::optional<slot_t> count_rc = raw_aggregates.count_right_column;
           uint32_t base_r = 0;
           for (const ColumnarChunk& ch : right_arg.columnar->chunks) {
             const ColumnarColumn& kc = ch.columns[rc0];
@@ -8324,7 +3871,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
             for (size_t r = 0; r < ch.rows; ++r) {
               int64_t raw_k = 0;
-              if (!read_col_int_cell(kc, r, fast, &raw_k)) {
+              if (!ReadFusedIntCell(kc, r, fast, &raw_k)) {
                 continue;
               }
               const int64_t add =
@@ -8343,8 +3890,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
           const int64_t bkey = AddJoinKeyBias(
               IntegerJoinKey(row, right_columns[0]), right_key_offsets[0]);
-          const int64_t add = (!count_right_column.has_value() ||
-                               !row.values_[*count_right_column].IsNull())
+          const int64_t add = (!raw_aggregates.count_right_column.has_value() ||
+                               !row.values_[*raw_aggregates.count_right_column].IsNull())
                                   ? 1
                                   : 0;
           on_bulk(static_cast<uint32_t>(row_ptr - right_ptr->rows.data()), bkey,
@@ -8431,7 +3978,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                  column.type == ValueType::kDate);
               for (size_t r = 0; r < chunks[ci].rows; ++r) {
                 int64_t raw = 0;
-                if (!read_col_int_cell(column, r, fast, &raw)) {
+                if (!ReadFusedIntCell(column, r, fast, &raw)) {
                   continue;
                 }
                 const int64_t key = AddJoinKeyBias(raw, right_key_offsets[0]);
@@ -8569,7 +4116,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           unique_int_mask = cap - 1;
           bool unique = true;
           visit_build_int_keys([&](uint32_t r_idx, int64_t bkey) {
-            size_t slot = hash_unique_int_key(bkey) & unique_int_mask;
+            size_t slot = HashUniqueIntKey(bkey) & unique_int_mask;
             while (unique_int_table[slot].r_idx !=
                    std::numeric_limits<uint32_t>::max()) {
               if (unique_int_table[slot].key == bkey) {
@@ -8610,8 +4157,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               IntegerJoinKey(row, right_columns[0]), right_key_offsets[0]);
           const int64_t k1 = AddJoinKeyBias(
               IntegerJoinKey(row, right_columns[1]), right_key_offsets[1]);
-          if (!fits_fused_i32(k0) || !fits_fused_i32(k1) ||
-              pack_fused_2x32(k0, k1) == kInvalidFusedPacked2x32) {
+          if (!FitsFusedInt32(k0) || !FitsFusedInt32(k1) ||
+              PackFusedInt32Pair(k0, k1) == kInvalidFusedPacked2x32) {
             can_pack = false;
             break;
           }
@@ -8629,7 +4176,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           unique_int_mask = cap - 1;
           bool unique = true;
           visit_right_packed_2x32_keys([&](uint32_t r_idx, int64_t bkey) {
-            size_t slot = hash_unique_int_key(bkey) & unique_int_mask;
+            size_t slot = HashUniqueIntKey(bkey) & unique_int_mask;
             while (unique_int_table[slot].r_idx !=
                    std::numeric_limits<uint32_t>::max()) {
               if (unique_int_table[slot].key == bkey) {
@@ -8669,7 +4216,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             for (const auto& chunk : right_arg.columnar->chunks) {
               for (size_t r = 0; r < chunk.rows; ++r) {
                 CompositeIntKey key;
-                if (!read_col_composite_key(chunk, right_columns,
+                if (!ReadFusedCompositeKey(chunk, right_columns,
                                             right_key_offsets, r, &key)) {
                   continue;
                 }
@@ -8733,7 +4280,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           for (const auto& chunk : right_arg.columnar->chunks) {
             for (size_t r = 0; r < chunk.rows; ++r) {
               CompositeIntKey key;
-              if (!read_col_composite_key(chunk, right_columns,
+              if (!ReadFusedCompositeKey(chunk, right_columns,
                                           right_key_offsets, r, &key)) {
                 continue;
               }
@@ -8827,792 +4374,33 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       fusion->topn_limit == 0 && !fusion->rollup_count_distribution &&
       result.using_columns == nullptr && fusion->output_sink == nullptr &&
       fusion->columnar_output && def_pk_groups.empty() &&
-      key_programs.size() == 2 && raw_sum_fusion && !raw_count_fusion &&
-      !has_count_distinct && !fusion->aggregates.empty() &&
-      fusion->aggregates.size() <= 4 && right_row_count > 0 &&
-      right_row_count <= 262144) {
-    bool v2_ok = true;
-    std::array<int32_t, 2> key_full_col{-1, -1};
-    std::array<bool, 2> key_on_right{false, false};
-    for (size_t k = 0; k < 2; ++k) {
-      const int32_t dc = key_shapes[k].direct_column;
-      if (dc < 0) {
-        v2_ok = false;
-        break;
-      }
-      key_full_col[k] = dc;
-      if (std::cmp_less(dc, left_width)) {
-        const Column& lc = left.schema.GetColumn(static_cast<size_t>(dc));
-        if (lc.Type() != ValueType::kVarChar) {
-          v2_ok = false;
-          break;
-        }
-        key_on_right[k] = false;
-      } else {
-        const size_t rc_idx = static_cast<size_t>(dc) - left_width;
-        if (rc_idx >= right.schema.ColumnCount() ||
-            right.schema.GetColumn(rc_idx).Type() != ValueType::kVarChar) {
-          v2_ok = false;
-          break;
-        }
-        key_on_right[k] = true;
-      }
-    }
-    if (v2_ok && key_on_right[0] && key_on_right[1]) {
-      v2_ok = false;
-    }
-    struct V2AggSpec {
-      bool is_case{false};
-      bool else_null{false};
-      bool cond_on_right{false};
-      int32_t val_col{-1};
-      int32_t cond_col{-1};
-      BinaryOperation cond_op{BinaryOperation::kEquals};
-      int64_t cond_const{0};
+      key_programs.size() == 2 && raw_aggregates.raw_sum_fusion && !raw_aggregates.raw_count_fusion &&
+      !raw_aggregates.has_count_distinct && !fusion->aggregates.empty() &&
+      fusion->aggregates.size() <= 4 && layout.right_row_count > 0 &&
+      layout.right_row_count <= 262144) {
+    DenseVarcharGroups varchar_groups{
+      .raw_aggregates = raw_aggregates,
+        .context = context,
+        .left = left,
+        .fusion = fusion,
+        .debug_fusion = debug_fusion,
+        .right = right,
+        .join_begin = join_begin,
+        .result = result,
+        .left_width = left_width,
+        .key_shapes = key_shapes,
+        .child_shapes = child_shapes,
+        .left_columns = left_columns,
+        .left_key_offsets = left_key_offsets,
+        .read_right_cell = read_right_cell,
+        .right_row_count = layout.right_row_count,
+        .workers = workers,
+        .dense_int_idxs = dense_int_idxs,
+        .dense_int_min = dense_int_min,
     };
-    const size_t v2_aggs = fusion->aggregates.size();
-    std::vector<V2AggSpec> v2_specs(v2_aggs);
-    if (v2_ok) {
-      for (size_t a = 0; a < v2_aggs; ++a) {
-        if (slot_agg_kinds[a] != RawAggKind::kSumInt64) {
-          v2_ok = false;
-          break;
-        }
-        const ProgramShape& sh = child_shapes[a];
-        if (sh.direct_column >= 0 &&
-            std::cmp_less(sh.direct_column, left_width) &&
-            left.schema.GetColumn(static_cast<size_t>(sh.direct_column))
-                    .Type() == ValueType::kInt64 &&
-            !left.schema.GetColumn(static_cast<size_t>(sh.direct_column))
-                 .IsUnsigned()) {
-          v2_specs[a].is_case = false;
-          v2_specs[a].val_col = sh.direct_column;
-        } else if (sh.case_cond ==
-                       ProgramShape::CaseCondKind::kIntComparisons &&
-                   sh.case_int_comparisons.size() == 1 &&
-                   sh.case_int_comparisons[0].subtract < 0 &&
-                   sh.case_int_comparisons[0].left >= 0 &&
-                   sh.case_val == ProgramShape::CaseValKind::kDirectInt64Col &&
-                   sh.case_val_col0 >= 0 &&
-                   std::cmp_less(sh.case_val_col0, left_width)) {
-          const auto& cmp = sh.case_int_comparisons[0];
-          const bool c_right = std::cmp_greater_equal(cmp.left, left_width);
-          const Column& cc =
-              c_right ? right.schema.GetColumn(static_cast<size_t>(cmp.left) -
-                                               left_width)
-                      : left.schema.GetColumn(static_cast<size_t>(cmp.left));
-          const Column& vc =
-              left.schema.GetColumn(static_cast<size_t>(sh.case_val_col0));
-          if ((cc.Type() != ValueType::kInt64 &&
-               cc.Type() != ValueType::kDate) ||
-              cc.IsUnsigned() || vc.Type() != ValueType::kInt64 ||
-              vc.IsUnsigned()) {
-            v2_ok = false;
-            break;
-          }
-          v2_specs[a].is_case = true;
-          v2_specs[a].else_null = sh.case_else_null;
-          v2_specs[a].cond_on_right = c_right;
-          v2_specs[a].val_col = sh.case_val_col0;
-          v2_specs[a].cond_col =
-              c_right ? static_cast<int32_t>(static_cast<size_t>(cmp.left) -
-                                             left_width)
-                      : cmp.left;
-          v2_specs[a].cond_op = cmp.op;
-          v2_specs[a].cond_const = cmp.constant;
-        } else {
-          v2_ok = false;
-          break;
-        }
-      }
-    }
-    struct V2OutItem {
-      uint8_t kind{0};  // 0 = key0, 1 = key1, 2 = agg
-      size_t agg_idx{0};
-    };
-    std::vector<V2OutItem> v2_out_items;
-    if (v2_ok) {
-      v2_out_items.reserve(fusion->select_items.size());
-      for (const Expression& item : fusion->select_items) {
-        if (!item) {
-          v2_ok = false;
-          break;
-        }
-        if (item->Type() == TypeTag::kColumnValue) {
-          const auto off = LocalColumnOffset(
-              result.schema, item->AsColumnValue().GetColumnName());
-          if (!off.has_value()) {
-            v2_ok = false;
-            break;
-          }
-          if (std::cmp_equal(*off, key_full_col[0])) {
-            v2_out_items.push_back({0, 0});
-          } else if (std::cmp_equal(*off, key_full_col[1])) {
-            v2_out_items.push_back({1, 0});
-          } else {
-            v2_ok = false;
-            break;
-          }
-        } else if (item->Type() == TypeTag::kAggregateExp) {
-          const auto it = std::ranges::find(fusion->aggregates,
-                                            &item->AsAggregateExpression());
-          if (it == fusion->aggregates.end()) {
-            v2_ok = false;
-            break;
-          }
-          v2_out_items.push_back({2, static_cast<size_t>(std::distance(
-                                         fusion->aggregates.begin(), it))});
-        } else {
-          v2_ok = false;
-          break;
-        }
-      }
-    }
-    const size_t jk_col = left_columns[0];
-    if (v2_ok) {
-      for (const ColumnarChunk& ch : left.columnar->chunks) {
-        if (ch.rows == 0) {
-          continue;
-        }
-        auto chk_int = [&](size_t c) {
-          if (c >= ch.columns.size()) {
-            return false;
-          }
-          const ColumnarColumn& col = ch.columns[c];
-          return col.is_uniform && !col.is_unsigned &&
-                 (col.type == ValueType::kInt64 ||
-                  col.type == ValueType::kDate);
-        };
-        if (!chk_int(jk_col)) {
-          v2_ok = false;
-          break;
-        }
-        for (size_t k = 0; k < 2; ++k) {
-          if (!key_on_right[k]) {
-            const auto kc = static_cast<size_t>(key_full_col[k]);
-            if (kc >= ch.columns.size() || !ch.columns[kc].is_uniform ||
-                ch.columns[kc].type != ValueType::kVarChar) {
-              v2_ok = false;
-              break;
-            }
-          }
-        }
-        if (!v2_ok) {
-          break;
-        }
-        for (const auto& sp : v2_specs) {
-          if (!chk_int(static_cast<size_t>(sp.val_col)) ||
-              (sp.is_case && !sp.cond_on_right &&
-               !chk_int(static_cast<size_t>(sp.cond_col)))) {
-            v2_ok = false;
-            break;
-          }
-        }
-        if (!v2_ok) {
-          break;
-        }
-      }
-    }
-    if (v2_ok) {
-      // Per-key dictionary representation: either right-indexed,
-      // gathered-source indexed (zero string reads on probe rows!), or direct
-      // left-row indexed.
-      struct V2KeyDict {
-        bool on_right{false};
-        bool gathered_src{false};
-        size_t card{0};
-        uint32_t null_id{std::numeric_limits<uint32_t>::max()};
-        std::shared_ptr<std::vector<std::string>> reps;
-        // on_right: [right_row_count]
-        std::vector<uint32_t> right_subgid;
-        // gathered_src: source_table chunk_prefix + flat [src_total_rows]
-        const ColumnarTable* src_table{nullptr};
-        size_t src_col{0};
-        std::vector<size_t> src_chunk_prefix;
-        std::vector<uint32_t> src_subgid;
-        // direct left fallback: [nchunks][chunk_rows]
-        std::vector<std::vector<uint32_t>> left_subgids;
-      };
-      std::array<V2KeyDict, 2> kdicts;
-      Value rv_tmp;
-      for (size_t k = 0; k < 2 && v2_ok; ++k) {
-        V2KeyDict& kd = kdicts[k];
-        kd.on_right = key_on_right[k];
-        kd.reps = std::make_shared<std::vector<std::string>>();
-        auto get_or_add_null = [&]() -> uint32_t {
-          if (kd.null_id == std::numeric_limits<uint32_t>::max()) {
-            kd.null_id = static_cast<uint32_t>(kd.reps->size());
-            kd.reps->emplace_back();
-          }
-          return kd.null_id;
-        };
-        if (kd.on_right) {
-          const auto rcol = static_cast<slot_t>(
-              static_cast<size_t>(key_full_col[k]) - left_width);
-          kd.right_subgid.assign(right_row_count,
-                                 std::numeric_limits<uint32_t>::max());
-          std::unordered_map<std::string, uint32_t> smap;
-          smap.reserve(std::min<size_t>(right_row_count, 16384));
-          std::string_view last_sv;
-          uint32_t last_id = std::numeric_limits<uint32_t>::max();
-          for (size_t ri = 0; ri < right_row_count; ++ri) {
-            const Value& rv =
-                read_right_cell(static_cast<uint32_t>(ri), rcol, &rv_tmp);
-            if (rv.IsNull()) {
-              if (kd.reps->size() >= 65535 &&
-                  kd.null_id == std::numeric_limits<uint32_t>::max()) {
-                v2_ok = false;
-                break;
-              }
-              kd.right_subgid[ri] = get_or_add_null();
-              continue;
-            }
-            if (rv.type != ValueType::kVarChar || rv.IsCaseInsensitive()) {
-              v2_ok = false;
-              break;
-            }
-            const std::string_view sv = rv.value.varchar_value;
-            if (last_id != std::numeric_limits<uint32_t>::max() &&
-                sv == last_sv) {
-              kd.right_subgid[ri] = last_id;
-              continue;
-            }
-            const auto next_id = static_cast<uint32_t>(kd.reps->size());
-            const auto [it, ins] = smap.emplace(std::string(sv), next_id);
-            if (ins) {
-              if (kd.reps->size() >= 65535) {
-                v2_ok = false;
-                break;
-              }
-              kd.reps->push_back(it->first);
-            }
-            last_sv = it->first;
-            last_id = it->second;
-            kd.right_subgid[ri] = last_id;
-          }
-          kd.card = kd.reps->size();
-        } else {
-          const auto lcol = static_cast<size_t>(key_full_col[k]);
-          // Check if all non-empty chunks are kGathered from the same small
-          // source_table (e.g. warehouse 10 rows, item 6,464 rows).
-          const ColumnarTable* common_src = nullptr;
-          size_t common_src_col = 0;
-          bool all_gathered = true;
-          for (const ColumnarChunk& ch : left.columnar->chunks) {
-            if (ch.rows == 0) {
-              continue;
-            }
-            const ColumnarColumn& c = ch.columns[lcol];
-            if (c.encoding != ColumnarColumn::Encoding::kGathered ||
-                c.gather_index == nullptr ||
-                c.gather_index->source_table == nullptr ||
-                c.gather_index->has_null) {
-              all_gathered = false;
-              break;
-            }
-            if (common_src == nullptr) {
-              common_src = c.gather_index->source_table.get();
-              common_src_col = c.gather_col;
-            } else if (common_src != c.gather_index->source_table.get() ||
-                       common_src_col != c.gather_col) {
-              all_gathered = false;
-              break;
-            }
-          }
-          if (all_gathered && common_src != nullptr &&
-              common_src->total_rows > 0 && common_src->total_rows <= 65535) {
-            kd.gathered_src = true;
-            kd.src_table = common_src;
-            kd.src_col = common_src_col;
-            kd.src_chunk_prefix.resize(common_src->chunks.size() + 1, 0);
-            for (size_t sci = 0; sci < common_src->chunks.size(); ++sci) {
-              kd.src_chunk_prefix[sci + 1] =
-                  kd.src_chunk_prefix[sci] + common_src->chunks[sci].rows;
-            }
-            kd.src_subgid.assign(common_src->total_rows,
-                                 std::numeric_limits<uint32_t>::max());
-            std::unordered_map<std::string, uint32_t> smap;
-            smap.reserve(std::min<size_t>(common_src->total_rows, 16384));
-            std::string_view last_sv;
-            uint32_t last_id = std::numeric_limits<uint32_t>::max();
-            for (size_t sci = 0; sci < common_src->chunks.size() && v2_ok;
-                 ++sci) {
-              const ColumnarChunk& sch = common_src->chunks[sci];
-              if (sch.rows == 0) {
-                continue;
-              }
-              if (common_src_col >= sch.columns.size() ||
-                  !sch.columns[common_src_col].is_uniform ||
-                  sch.columns[common_src_col].type != ValueType::kVarChar) {
-                v2_ok = false;
-                break;
-              }
-              const ColumnarColumn& scol = sch.columns[common_src_col];
-              const size_t base = kd.src_chunk_prefix[sci];
-              for (size_t sr = 0; sr < sch.rows; ++sr) {
-                if (scol.IsNull(sr)) {
-                  if (kd.reps->size() >= 65535 &&
-                      kd.null_id == std::numeric_limits<uint32_t>::max()) {
-                    v2_ok = false;
-                    break;
-                  }
-                  kd.src_subgid[base + sr] = get_or_add_null();
-                  continue;
-                }
-                const std::string_view sv = scol.StringAt(sr);
-                if (last_id != std::numeric_limits<uint32_t>::max() &&
-                    sv == last_sv) {
-                  kd.src_subgid[base + sr] = last_id;
-                  continue;
-                }
-                const auto next_id = static_cast<uint32_t>(kd.reps->size());
-                const auto [it, ins] = smap.emplace(std::string(sv), next_id);
-                if (ins) {
-                  if (kd.reps->size() >= 65535) {
-                    v2_ok = false;
-                    break;
-                  }
-                  kd.reps->push_back(it->first);
-                }
-                last_sv = it->first;
-                last_id = it->second;
-                kd.src_subgid[base + sr] = last_id;
-              }
-            }
-            kd.card = kd.reps->size();
-          } else {
-            // Direct scan fallback for low-cardinality flat left VARCHAR col.
-            kd.left_subgids.resize(left.columnar->chunks.size());
-            std::vector<std::string_view> l_views;
-            l_views.reserve(128);
-            kd.reps->reserve(128);
-            std::string_view last_lsv;
-            uint32_t last_lid = std::numeric_limits<uint32_t>::max();
-            for (size_t ci = 0; ci < left.columnar->chunks.size() && v2_ok;
-                 ++ci) {
-              const ColumnarChunk& ch = left.columnar->chunks[ci];
-              if (ch.rows == 0) {
-                continue;
-              }
-              const ColumnarColumn& lkc = ch.columns[lcol];
-              auto& dst_ids = kd.left_subgids[ci];
-              dst_ids.resize(ch.rows);
-              for (size_t r = 0; r < ch.rows; ++r) {
-                if (lkc.has_null && lkc.IsNull(r)) {
-                  if (kd.reps->size() >= 128 &&
-                      kd.null_id == std::numeric_limits<uint32_t>::max()) {
-                    v2_ok = false;
-                    break;
-                  }
-                  const uint32_t nid = get_or_add_null();
-                  l_views.clear();
-                  for (const std::string& s : *kd.reps) {
-                    l_views.emplace_back(s);
-                  }
-                  dst_ids[r] = nid;
-                  continue;
-                }
-                const std::string_view sv = lkc.StringAt(r);
-                if (last_lid != std::numeric_limits<uint32_t>::max() &&
-                    sv == last_lsv) [[likely]] {
-                  dst_ids[r] = last_lid;
-                  continue;
-                }
-                uint32_t found = std::numeric_limits<uint32_t>::max();
-                for (size_t li = 0; li < l_views.size(); ++li) {
-                  if (li == kd.null_id) {
-                    continue;
-                  }
-                  if (l_views[li] == sv) {
-                    found = static_cast<uint32_t>(li);
-                    break;
-                  }
-                }
-                if (found == std::numeric_limits<uint32_t>::max()) {
-                  if (kd.reps->size() >= 128) {
-                    v2_ok = false;
-                    break;
-                  }
-                  found = static_cast<uint32_t>(kd.reps->size());
-                  kd.reps->emplace_back(sv);
-                  l_views.clear();
-                  for (const std::string& s : *kd.reps) {
-                    l_views.emplace_back(s);
-                  }
-                }
-                last_lsv = l_views[found];
-                last_lid = found;
-                dst_ids[r] = found;
-              }
-            }
-            kd.card = kd.reps->size();
-          }
-        }
-      }
-      // Precompute right-side CASE condition bitmasks once per right row.
-      std::array<std::vector<uint8_t>, 4> right_cond_ok;
-      if (v2_ok) {
-        auto eval_int_op = [](int64_t cv, BinaryOperation op,
-                              int64_t k) noexcept -> bool {
-          switch (op) {
-            case BinaryOperation::kLessThan:
-              return cv < k;
-            case BinaryOperation::kLessThanEquals:
-              return cv <= k;
-            case BinaryOperation::kGreaterThan:
-              return cv > k;
-            case BinaryOperation::kGreaterThanEquals:
-              return cv >= k;
-            case BinaryOperation::kEquals:
-              return cv == k;
-            case BinaryOperation::kNotEquals:
-              return cv != k;
-            default:
-              return false;
-          }
-        };
-        for (size_t a = 0; a < v2_aggs; ++a) {
-          const auto& sp = v2_specs[a];
-          if (sp.is_case && sp.cond_on_right) {
-            right_cond_ok[a].assign(right_row_count, 0);
-            for (size_t ri = 0; ri < right_row_count; ++ri) {
-              const Value& rv =
-                  read_right_cell(static_cast<uint32_t>(ri),
-                                  static_cast<slot_t>(sp.cond_col), &rv_tmp);
-              if (!rv.IsNull() &&
-                  (rv.type == ValueType::kInt64 ||
-                   rv.type == ValueType::kDate) &&
-                  !rv.IsUnsigned() &&
-                  eval_int_op(rv.value.int_value, sp.cond_op, sp.cond_const)) {
-                right_cond_ok[a][ri] = 1;
-              }
-            }
-          }
-        }
-      }
-      const size_t card0 = kdicts[0].card;
-      const size_t card1 = kdicts[1].card;
-      const size_t dom =
-          (v2_ok && card0 > 0 && card1 > 0 && card0 <= 524288 / card1)
-              ? (card0 * card1)
-              : 0;
-      const size_t v2_workers = std::max<size_t>(
-          1, std::min<size_t>(workers, left.columnar->total_rows / 4096));
-      const size_t mem_bytes =
-          v2_workers * dom * (1 + v2_aggs * (sizeof(int64_t) + 1));
-      std::shared_ptr<QueryMemoryCharge> v2_charge;
-      if (v2_ok && dom > 0 && dom <= 524288 &&
-          mem_bytes <= (size_t{128} << 20)) {
-        v2_charge = TryReserveQueryMemory(mem_bytes);
-      }
-      if (v2_ok && v2_charge != nullptr) {
-        struct V2WorkerState {
-          std::vector<uint8_t> seen;
-          std::vector<int64_t> sums;
-          std::vector<uint8_t> has_val;
-        };
-        std::vector<V2WorkerState> wstates(v2_workers);
-        std::atomic<bool> overflow_flag{false};
-        const size_t nchunks = left.columnar->chunks.size();
-        std::vector<size_t> chunk_prefix(nchunks + 1, 0);
-        for (size_t ci = 0; ci < nchunks; ++ci) {
-          chunk_prefix[ci + 1] =
-              chunk_prefix[ci] + left.columnar->chunks[ci].rows;
-        }
-        const size_t total_lrows = chunk_prefix[nchunks];
-        const int64_t jk_bias = left_key_offsets[0];
-        const int64_t dmin = dense_int_min;
-        const size_t dspan = dense_int_idxs.size();
-        const uint32_t* __restrict didxs = dense_int_idxs.data();
-
-        RETURN_IF_FAIL(RunParallelTasks(v2_workers, [&](size_t w) {
-          V2WorkerState& st = wstates[w];
-          st.seen.assign(dom, 0);
-          st.sums.assign(dom * v2_aggs, 0);
-          st.has_val.assign(dom * v2_aggs, 0);
-          uint8_t* __restrict seen_p = st.seen.data();
-          int64_t* __restrict sums_p = st.sums.data();
-          uint8_t* __restrict hv_p = st.has_val.data();
-
-          const size_t gbegin = (total_lrows * w) / v2_workers;
-          const size_t gend = (total_lrows * (w + 1)) / v2_workers;
-          for (size_t ci = 0; ci < nchunks; ++ci) {
-            const size_t c_lo = chunk_prefix[ci];
-            const size_t c_hi = chunk_prefix[ci + 1];
-            if (c_hi <= gbegin) continue;
-            if (c_lo >= gend) break;
-            const size_t rbegin = gbegin > c_lo ? (gbegin - c_lo) : 0;
-            const size_t rend = gend < c_hi ? (gend - c_lo) : (c_hi - c_lo);
-            const ColumnarChunk& ch = left.columnar->chunks[ci];
-            const ColumnarColumn& jk_c = ch.columns[jk_col];
-            const bool jk_flat = jk_c.IsFlat();
-            const int64_t* __restrict jk_p =
-                jk_flat ? jk_c.ints.data() : nullptr;
-            const bool jk_null = jk_c.has_null;
-
-            // Key 0 / Key 1 chunk accessors.
-            std::array<const uint32_t*, 2> k_gi_chunks{nullptr, nullptr};
-            std::array<const uint32_t*, 2> k_gi_rows{nullptr, nullptr};
-            std::array<const uint32_t*, 2> k_direct_ids{nullptr, nullptr};
-            for (size_t k = 0; k < 2; ++k) {
-              if (kdicts[k].gathered_src) {
-                const auto* gi =
-                    ch.columns[static_cast<size_t>(key_full_col[k])]
-                        .gather_index.get();
-                k_gi_chunks[k] = gi->src_chunks.data();
-                k_gi_rows[k] = gi->src_rows.data();
-              } else if (!kdicts[k].on_right) {
-                k_direct_ids[k] = kdicts[k].left_subgids[ci].data();
-              }
-            }
-            const auto resolve_key = [&](size_t k, size_t r,
-                                         uint32_t r_idx) noexcept -> uint32_t {
-              if (kdicts[k].on_right) {
-                return kdicts[k].right_subgid[r_idx];
-              }
-              if (kdicts[k].gathered_src) {
-                const size_t sidx =
-                    kdicts[k].src_chunk_prefix[k_gi_chunks[k][r]] +
-                    k_gi_rows[k][r];
-                return kdicts[k].src_subgid[sidx];
-              }
-              return k_direct_ids[k][r];
-            };
-
-            std::array<const ColumnarColumn*, 4> val_c{};
-            std::array<const int64_t*, 4> val_p{};
-            std::array<const ColumnarColumn*, 4> cond_c{};
-            std::array<const int64_t*, 4> cond_p{};
-            for (size_t a = 0; a < v2_aggs; ++a) {
-              val_c[a] = &ch.columns[static_cast<size_t>(v2_specs[a].val_col)];
-              val_p[a] = val_c[a]->IsFlat() ? val_c[a]->ints.data() : nullptr;
-              if (v2_specs[a].is_case && !v2_specs[a].cond_on_right) {
-                cond_c[a] =
-                    &ch.columns[static_cast<size_t>(v2_specs[a].cond_col)];
-                cond_p[a] =
-                    cond_c[a]->IsFlat() ? cond_c[a]->ints.data() : nullptr;
-              }
-            }
-            for (size_t r = rbegin; r < rend; ++r) {
-              if (jk_null && jk_c.IsNull(r)) continue;
-              const int64_t jv = jk_flat ? jk_p[r] : jk_c.IntAt(r);
-              const uint64_t off =
-                  static_cast<uint64_t>(AddJoinKeyBias(jv, jk_bias)) -
-                  static_cast<uint64_t>(dmin);
-              if (off >= dspan) continue;
-              const uint32_t r_idx = didxs[off];
-              if (r_idx == kInvalidRightIdx) continue;
-              const uint32_t sg0 = resolve_key(0, r, r_idx);
-              const uint32_t sg1 = resolve_key(1, r, r_idx);
-              const size_t gid = (static_cast<size_t>(sg0) * card1) + sg1;
-              seen_p[gid] = 1;
-              const size_t base = gid * v2_aggs;
-              for (size_t a = 0; a < v2_aggs; ++a) {
-                const auto& sp = v2_specs[a];
-                if (sp.is_case) {
-                  bool c_ok = false;
-                  if (sp.cond_on_right) {
-                    c_ok = right_cond_ok[a][r_idx] != 0;
-                  } else if (!cond_c[a]->has_null || !cond_c[a]->IsNull(r)) {
-                    const int64_t cv = cond_p[a] != nullptr
-                                           ? cond_p[a][r]
-                                           : cond_c[a]->IntAt(r);
-                    switch (sp.cond_op) {
-                      case BinaryOperation::kLessThan:
-                        c_ok = cv < sp.cond_const;
-                        break;
-                      case BinaryOperation::kLessThanEquals:
-                        c_ok = cv <= sp.cond_const;
-                        break;
-                      case BinaryOperation::kGreaterThan:
-                        c_ok = cv > sp.cond_const;
-                        break;
-                      case BinaryOperation::kGreaterThanEquals:
-                        c_ok = cv >= sp.cond_const;
-                        break;
-                      case BinaryOperation::kEquals:
-                        c_ok = cv == sp.cond_const;
-                        break;
-                      case BinaryOperation::kNotEquals:
-                        c_ok = cv != sp.cond_const;
-                        break;
-                      default:
-                        break;
-                    }
-                  }
-                  if (!c_ok) {
-                    if (!sp.else_null) {
-                      hv_p[base + a] = 1;
-                    }
-                    continue;
-                  }
-                }
-                if (val_c[a]->has_null && val_c[a]->IsNull(r)) {
-                  continue;
-                }
-                const int64_t vv =
-                    val_p[a] != nullptr ? val_p[a][r] : val_c[a]->IntAt(r);
-                int64_t next_sum = 0;
-                if (__builtin_add_overflow(sums_p[base + a], vv, &next_sum))
-                    [[unlikely]] {
-                  overflow_flag.store(true, std::memory_order_relaxed);
-                  return;
-                }
-                sums_p[base + a] = next_sum;
-                hv_p[base + a] = 1;
-              }
-            }
-          }
-        }));
-        if (!overflow_flag.load(std::memory_order_relaxed)) {
-          std::vector<Column> v2_cols;
-          v2_cols.reserve(v2_out_items.size());
-          for (size_t c = 0; c < v2_out_items.size(); ++c) {
-            const std::string& nm = c < fusion->select_names.size()
-                                        ? fusion->select_names[c]
-                                        : std::string();
-            v2_cols.emplace_back(nm, v2_out_items[c].kind == 2
-                                         ? ValueType::kInt64
-                                         : ValueType::kVarChar);
-          }
-          const Schema out_schema("", v2_cols);
-          auto out_table = std::make_shared<ColumnarTable>();
-          out_table->AppendKeepalive(kdicts[0].reps);
-          out_table->AppendKeepalive(kdicts[1].reps);
-          constexpr size_t kV2ChunkRows = 8192;
-          auto make_chunk = [&]() {
-            ColumnarChunk ch;
-            ch.InitFromSchema(out_schema, 0);
-            ch.AppendKeepaliveUnique(kdicts[0].reps);
-            ch.AppendKeepaliveUnique(kdicts[1].reps);
-            for (size_t c = 0; c < v2_out_items.size(); ++c) {
-              if (v2_out_items[c].kind == 2) {
-                ch.columns[c].ints.reserve(kV2ChunkRows);
-              } else {
-                ch.columns[c].strings.reserve(kV2ChunkRows);
-              }
-            }
-            return ch;
-          };
-          ColumnarChunk dst_chunk = make_chunk();
-          size_t out_n = 0;
-          bool merge_overflow = false;
-          for (size_t g = 0; g < dom; ++g) {
-            bool any_seen = false;
-            for (size_t w = 0; w < v2_workers; ++w) {
-              if (wstates[w].seen[g] != 0) {
-                any_seen = true;
-                break;
-              }
-            }
-            if (!any_seen) {
-              continue;
-            }
-            std::array<int64_t, 4> gsum{};
-            std::array<uint8_t, 4> ghv{};
-            const size_t base = g * v2_aggs;
-            for (size_t w = 0; w < v2_workers; ++w) {
-              if (wstates[w].seen[g] == 0) {
-                continue;
-              }
-              for (size_t a = 0; a < v2_aggs; ++a) {
-                if (wstates[w].has_val[base + a] != 0) {
-                  int64_t ns = 0;
-                  if (__builtin_add_overflow(gsum[a], wstates[w].sums[base + a],
-                                             &ns)) [[unlikely]] {
-                    merge_overflow = true;
-                    break;
-                  }
-                  gsum[a] = ns;
-                  ghv[a] = 1;
-                }
-              }
-              if (merge_overflow) {
-                break;
-              }
-            }
-            if (merge_overflow) {
-              break;
-            }
-            if (dst_chunk.rows >= kV2ChunkRows) {
-              out_table->AppendChunk(std::move(dst_chunk));
-              dst_chunk = make_chunk();
-            }
-            const size_t i0 = g / card1;
-            const size_t i1 = g % card1;
-            for (size_t c = 0; c < v2_out_items.size(); ++c) {
-              ColumnarColumn& dc = dst_chunk.columns[c];
-              if (v2_out_items[c].kind == 0) {
-                if (i0 == kdicts[0].null_id) {
-                  if (!dc.has_null) {
-                    dc.has_null = true;
-                    dc.nulls.assign(dc.strings.size(), 0);
-                  }
-                  dc.strings.emplace_back();
-                  dc.nulls.push_back(1);
-                } else {
-                  dc.strings.emplace_back((*kdicts[0].reps)[i0]);
-                  if (dc.has_null) {
-                    dc.nulls.push_back(0);
-                  }
-                }
-              } else if (v2_out_items[c].kind == 1) {
-                if (i1 == kdicts[1].null_id) {
-                  if (!dc.has_null) {
-                    dc.has_null = true;
-                    dc.nulls.assign(dc.strings.size(), 0);
-                  }
-                  dc.strings.emplace_back();
-                  dc.nulls.push_back(1);
-                } else {
-                  dc.strings.emplace_back((*kdicts[1].reps)[i1]);
-                  if (dc.has_null) {
-                    dc.nulls.push_back(0);
-                  }
-                }
-              } else {
-                const size_t a = v2_out_items[c].agg_idx;
-                if (ghv[a] != 0) {
-                  dc.ints.push_back(gsum[a]);
-                  if (dc.has_null) {
-                    dc.nulls.push_back(0);
-                  }
-                } else {
-                  if (!dc.has_null) {
-                    dc.has_null = true;
-                    dc.nulls.assign(dc.ints.size(), 0);
-                  }
-                  dc.ints.push_back(0);
-                  dc.nulls.push_back(1);
-                }
-              }
-            }
-            ++dst_chunk.rows;
-            ++out_n;
-          }
-          if (!merge_overflow) {
-            if (dst_chunk.rows > 0) {
-              out_table->AppendChunk(std::move(dst_chunk));
-            }
-            const bool non_empty = out_table->total_rows > 0;
-            result.schema = Schema("", std::move(v2_cols));
-            result.SetColumnarTable(std::move(out_table), non_empty);
-            result.peak_intermediate_rows =
-                std::max(result.peak_intermediate_rows, result.TotalRows());
-            if (context.execution_runtime() != nullptr) {
-              ExecutionRuntime& runtime = *context.execution_runtime();
-              runtime.join_ms += ElapsedMs(join_begin);
-              ++runtime.grouped_join_fusions;
-            }
-            if (debug_fusion) {
-              std::cerr << "[fusion] v2_dense_2key_varchar groups=" << out_n
-                        << " card0=" << card0 << " card1=" << card1
-                        << " workers=" << v2_workers << "\n";
-            }
-            return std::optional<Relation>(std::move(result));
-          }
-        }
-      }
+    ASSIGN_OR_RETURN(bool, aggregated, varchar_groups.TryAggregate());
+    if (aggregated) {
+      return std::optional<Relation>(std::move(result));
     }
   }
 
@@ -9634,12 +4422,12 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           : nullptr;
   compact_log_allowed = compact_log_charge != nullptr;
 
-  constexpr uint32_t kInvalidGid = std::numeric_limits<uint32_t>::max();
+
   std::vector<uint32_t> right_row_gid;
   FusedRawArena pre_raw_arena;
   pre_raw_arena.has_stat = has_stat_raw_agg;
-  pre_raw_arena.has_double = !raw_sum_fusion || has_double_raw_agg;
-  pre_raw_arena.has_int = !raw_sum_fusion || has_int_raw_agg;
+  pre_raw_arena.has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+  pre_raw_arena.has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
   std::vector<FusedGroup> pre_groups;
   bool identity_right_gid = false;
   const size_t active_build_count = right_build_count();
@@ -9647,9 +4435,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // Larger unique build domains used to construct millions of FusedGroups
   // only to discard them at the fixed 512K cutoff below.
   const size_t direct_slots =
-      raw_sum_fusion ? raw_slot_count : fusion->aggregates.size();
+      raw_aggregates.raw_sum_fusion ? raw_aggregates.raw_slot_count : fusion->aggregates.size();
   const size_t direct_state_bytes =
-      raw_count_fusion
+      raw_aggregates.raw_count_fusion
           ? 9
           : 1 + (direct_slots *
                  (9 + (has_double_raw_agg ? 8 : 0) + (has_int_raw_agg ? 8 : 0) +
@@ -9657,20 +4445,20 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                     : 0)));
   size_t direct_group_limit = 524288;
   std::shared_ptr<QueryMemoryCharge> extended_direct_charge;
-  if (right_row_count > direct_group_limit && workers > 0 &&
-      right_row_count <= (size_t{256} << 20) / workers / direct_state_bytes &&
+  if (layout.right_row_count > direct_group_limit && workers > 0 &&
+      layout.right_row_count <= (size_t{256} << 20) / workers / direct_state_bytes &&
       integer_key && build_int_keys_unique && right_only_group_keys &&
-      all_direct_group_keys && !has_count_distinct) {
+      all_direct_group_keys && !raw_aggregates.has_count_distinct) {
     extended_direct_charge =
-        TryReserveQueryMemory(workers * right_row_count * direct_state_bytes);
+        TryReserveQueryMemory(workers * layout.right_row_count * direct_state_bytes);
     if (extended_direct_charge) {
-      direct_group_limit = right_row_count;
+      direct_group_limit = layout.right_row_count;
     }
   }
   bool use_preassigned_build_groups =
       join_type == JoinType::kInner && !left.HasSpill() &&
       !right_ptr->HasSpill() && right_only_group_keys &&
-      skip_accumulator_states && residual_programs.empty() && !bulk_raw_count &&
+      raw_aggregates.skip_accumulator_states && residual_programs.empty() && !bulk_raw_count &&
       active_build_count > 0;
   const auto for_each_build_nonnull_idx = [&](auto&& on_idx) -> Status {
     if (right_col_only) {
@@ -9684,7 +4472,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
           for (size_t r = 0; r < ch.rows; ++r) {
             int64_t dummy = 0;
-            if (read_col_int_cell(kc, r, fast, &dummy)) {
+            if (ReadFusedIntCell(kc, r, fast, &dummy)) {
               RETURN_IF_FAIL(on_idx(base_r + static_cast<uint32_t>(r)));
             }
           }
@@ -9720,8 +4508,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         for (size_t r = 0; r < ch.rows; ++r) {
           int64_t d0 = 0;
           int64_t d1 = 0;
-          if (read_col_int_cell(kc0, r, fast0, &d0) &&
-              read_col_int_cell(kc1, r, fast1, &d1)) {
+          if (ReadFusedIntCell(kc0, r, fast0, &d0) &&
+              ReadFusedIntCell(kc1, r, fast1, &d1)) {
             RETURN_IF_FAIL(on_idx(base_r + static_cast<uint32_t>(r)));
           }
         }
@@ -9739,7 +4527,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   };
   if (use_preassigned_build_groups) {
     if (key_programs.empty()) {
-      right_row_gid.assign(right_row_count, kInvalidGid);
+      right_row_gid.assign(layout.right_row_count, kInvalidGid);
       FusedGroup g;
       g.rep_left = (deferred_left_probe != nullptr || left.HasColumnarOnly() ||
                     left.rows.empty())
@@ -9755,7 +4543,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }));
     } else if (integer_key && build_int_keys_unique && all_direct_group_keys &&
-               !has_count_distinct && right_row_count <= direct_group_limit &&
+               !raw_aggregates.has_count_distinct && layout.right_row_count <= direct_group_limit &&
                std::ranges::any_of(key_shapes, [&](const ProgramShape& ks) {
                  return std::cmp_equal(ks.direct_column,
                                        left_width + right_columns[0]);
@@ -9766,7 +4554,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                  return std::cmp_equal(ks.direct_column,
                                        left_width + right_columns[0]);
                })) {
-      right_row_gid.assign(right_row_count, kInvalidGid);
+      right_row_gid.assign(layout.right_row_count, kInvalidGid);
       pre_groups.reserve(active_build_count);
       RETURN_IF_FAIL(for_each_build_nonnull_idx([&](uint32_t r_idx) -> Status {
         const auto gid = static_cast<uint32_t>(pre_groups.size());
@@ -9785,7 +4573,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       // Value/Row materialization and std::string copies.
       bool parallel_preassign_ok =
           all_direct_group_keys && right_col_only && workers >= 2 &&
-          right_row_count >= 16384 && !key_shapes.empty() &&
+          layout.right_row_count >= 16384 && !key_shapes.empty() &&
           key_shapes.size() <= 8 && !right_ptr->columnar->chunks.empty();
       std::array<slot_t, 8> pg_rcols{};
       std::array<ValueType, 8> pg_types{};
@@ -9824,7 +4612,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
       }
       if (parallel_preassign_ok) {
-        right_row_gid.assign(right_row_count, kInvalidGid);
+        right_row_gid.assign(layout.right_row_count, kInvalidGid);
         const size_t n_keys = key_shapes.size();
         const auto& rchunks = right_ptr->columnar->chunks;
         size_t n_parts = 1;
@@ -9869,8 +4657,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
 
         // Phase 1: Parallel hash + partition across workers.
         RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t tid) {
-          const size_t begin = (right_row_count * tid) / workers;
-          const size_t end = (right_row_count * (tid + 1)) / workers;
+          const size_t begin = (layout.right_row_count * tid) / workers;
+          const size_t end = (layout.right_row_count * (tid + 1)) / workers;
           auto& local_parts = w_parts[tid];
           for (size_t p = 0; p < n_parts; ++p) {
             local_parts[p].reserve(((end - begin) / n_parts) + 64);
@@ -10001,11 +4789,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           }
         }));
       } else {
-        right_row_gid.assign(right_row_count, kInvalidGid);
+        right_row_gid.assign(layout.right_row_count, kInvalidGid);
         FusedWorkerLocal pre_local;
         pre_local.raw_arena.has_stat = has_stat_raw_agg;
-        pre_local.raw_arena.has_double = !raw_sum_fusion || has_double_raw_agg;
-        pre_local.raw_arena.has_int = !raw_sum_fusion || has_int_raw_agg;
+        pre_local.raw_arena.has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+        pre_local.raw_arena.has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
         pre_local.int_offsets.Reserve(active_build_count);
         pre_local.groups.reserve(active_build_count);
         Row& pre_scratch = scratch_storage[0];
@@ -10038,14 +4826,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
   const size_t pre_group_count =
-      identity_right_gid ? right_row_count : pre_groups.size();
+      identity_right_gid ? layout.right_row_count : pre_groups.size();
   const bool use_direct_gid_agg = use_preassigned_build_groups &&
-                                  !has_count_distinct && pre_group_count > 0 &&
+                                  !raw_aggregates.has_count_distinct && pre_group_count > 0 &&
                                   pre_group_count <= direct_group_limit;
   const bool use_partitioned_count_distinct =
-      use_preassigned_build_groups && has_count_distinct &&
+      use_preassigned_build_groups && raw_aggregates.has_count_distinct &&
       fusion->aggregates.size() == 1 &&
-      raw_agg_kinds[0] == RawAggKind::kCountDistinctInt64 &&
+      raw_aggregates.raw_agg_kinds[0] == RawAggKind::kCountDistinctInt64 &&
       pre_group_count > 0;
   if (use_preassigned_build_groups && !use_direct_gid_agg &&
       !use_partitioned_count_distinct) {
@@ -10054,20 +4842,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     right_row_gid.clear();
     pre_groups.clear();
   }
-  struct DirectDoubleCell {
-    double sum{0.0};
-    uint64_t meta{0};  // bit 0: matched, bit 1: inf, bits 2..63: count
-  };
-  struct DirectGidWorker {
-    std::vector<uint8_t> matched;
-    std::vector<double> doubles;
-    std::vector<int64_t> ints;
-    std::vector<int64_t> counts;
-    std::vector<uint8_t> inf_flags;
-    std::vector<platform::ExtendedFloat> ext_sx;
-    std::vector<platform::ExtendedFloat> ext_sxx;
-    std::vector<DirectDoubleCell> double_cells;
-  };
   struct GidValPair {
     uint32_t gid{0};
     int64_t val{0};
@@ -10079,13 +4853,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   };
   const size_t agg_count =
-      raw_sum_fusion ? raw_slot_count : fusion->aggregates.size();
-  bool all_slot0_sum_double = raw_sum_fusion && agg_count == 1 &&
-                              slot_agg_kinds[0] == RawAggKind::kSumDouble;
+      raw_aggregates.raw_sum_fusion ? raw_aggregates.raw_slot_count : fusion->aggregates.size();
+  bool all_slot0_sum_double = raw_aggregates.raw_sum_fusion && agg_count == 1 &&
+                              raw_aggregates.slot_agg_kinds[0] == RawAggKind::kSumDouble;
   if (all_slot0_sum_double) {
     for (size_t oi = 0; oi < fusion->aggregates.size(); ++oi) {
-      if (raw_agg_slot[oi] == 0 &&
-          raw_agg_kinds[oi] != RawAggKind::kSumDouble) {
+      if (raw_aggregates.raw_agg_slot[oi] == 0 &&
+          raw_aggregates.raw_agg_kinds[oi] != RawAggKind::kSumDouble) {
         all_slot0_sum_double = false;
         break;
       }
@@ -10093,10 +4867,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   }
   const bool single_double_sum =
       all_slot0_sum_double &&
-      (child_shapes[raw_slot_origin[0]].direct_column >= 0 ||
-       child_shapes[raw_slot_origin[0]].mul_col0 >= 0 ||
-       (raw_slot_origin[0] < double_arithmetic.size() &&
-        double_arithmetic[raw_slot_origin[0]]));
+      (child_shapes[raw_aggregates.raw_slot_origin[0]].direct_column >= 0 ||
+       child_shapes[raw_aggregates.raw_slot_origin[0]].mul_col0 >= 0 ||
+       (raw_aggregates.raw_slot_origin[0] < double_arithmetic.size() &&
+        double_arithmetic[raw_aggregates.raw_slot_origin[0]]));
   // One shared group array takes a lock on every probe row. Multi-aggregate
   // probes keep a private partial per worker and fold them once. A lone
   // SUM(double) stays on the shared input-ordered log so its prefixes do
@@ -10133,7 +4907,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return;
       }
       dw.matched.assign(domain_count, 0);
-      if (raw_count_fusion) {
+      if (raw_aggregates.raw_count_fusion) {
         dw.counts.assign(domain_count, 0);
       } else {
         if (has_double_raw_agg) {
@@ -10171,11 +4945,6 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       cd_worker_matched[w].assign(pre_group_count, 0);
     }
   }
-  struct OrderedSumInput {
-    double value{0};
-    uint32_t gid{kInvalidGid};
-    bool nonnull{false};
-  };
   std::shared_ptr<QueryMemoryCharge> ordered_sum_charge;
   std::vector<OrderedSumInput> ordered_sum_inputs;
   if (use_shared_direct_gid && single_double_sum && integer_key &&
@@ -10199,7 +4968,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     // The group id is already the build row's. COUNT(*) never reads a cell,
     // so copying key strings into the scratch row on every fact row is wasted
     // (Q23's item-description grouping).
-    if (!count_star_only && (!mask_scratch || !scratch_cells.empty())) {
+    if (!raw_aggregates.count_star_only && (!mask_scratch || !scratch_cells.empty())) {
       Value cell_tmp;
       for (const slot_t cell : scratch_cells) {
         scratch.values_[cell] =
@@ -10242,7 +5011,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       auto& item =
           ordered_sum_inputs[static_cast<size_t>(&left_row - left.rows.data())];
       bool is_null = false;
-      RETURN_IF_FAIL(eval_pair_double(raw_slot_origin[0], scratch, &left_row,
+      RETURN_IF_FAIL(eval_pair_double(raw_aggregates.raw_slot_origin[0], scratch, &left_row,
                                       right_row, &item.value, &is_null));
       item.gid = gid;
       item.nonnull = !is_null;
@@ -10257,7 +5026,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
       return Status::kSuccess;
     }
-    if (count_star_only) {
+    if (raw_aggregates.count_star_only) {
       if (use_shared_direct_gid) {
         __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
@@ -10267,9 +5036,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
       return Status::kSuccess;
     }
-    if (count_nonnull_only) {
-      const bool non_null = !count_right_column.has_value() ||
-                            !right_cell_is_null(r_idx, *count_right_column);
+    if (raw_aggregates.count_nonnull_only) {
+      const bool non_null = !raw_aggregates.count_right_column.has_value() ||
+                            !right_cell_is_null(r_idx, *raw_aggregates.count_right_column);
       if (use_shared_direct_gid) {
         __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
         if (non_null) {
@@ -10291,7 +5060,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     if (single_double_sum) {
       double value = 0.0;
       bool is_null = false;
-      RETURN_IF_FAIL(eval_pair_double(raw_slot_origin[0], scratch, &left_row,
+      RETURN_IF_FAIL(eval_pair_double(raw_aggregates.raw_slot_origin[0], scratch, &left_row,
                                       right_row, &value, &is_null));
       if (!is_null) {
         const double previous = dw.doubles[gid];
@@ -10309,11 +5078,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     const size_t base = static_cast<size_t>(gid) * agg_count;
     Value v_tmp;
     for (size_t s = 0; s < agg_count; ++s) {
-      const size_t src = raw_slot_origin[s];
+      const size_t src = raw_aggregates.raw_slot_origin[s];
       if (case_always_null(src, right_row)) {
         continue;
       }
-      switch (slot_agg_kinds[s]) {
+      switch (raw_aggregates.slot_agg_kinds[s]) {
         case RawAggKind::kCountStar:
           dw.counts[base + s] += 1;
           break;
@@ -10479,50 +5248,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // Preassigned groups already name the build row. Aggregates that only read
   // left-side numeric columns can charge those cells without a scratch row
   // or a bytecode evaluation.
-  struct LeftNumericAgg {
-    int32_t col0{-1};
-    int32_t col1{-1};
-    int32_t orig_agg{-1};
-    uint8_t op{255};
-    bool is_int_col{false};
-    bool case_else_null{false};
-    uint8_t case_val_kind{0};
-    const uint8_t* right_cond{nullptr};
-    double scale{0};
-    bool diff_has_lo{false};
-    bool diff_has_hi{false};
-    bool diff_lo_incl{false};
-    bool diff_hi_incl{true};
-    int64_t diff_lo{0};
-    int64_t diff_hi{0};
-    int32_t pk_lookup_idx{-1};
-    int64_t pk_eq_val{0};
-  };
   std::array<LeftNumericAgg, kRawAggregateCapacity> left_numeric{};
-  bool left_cell_agg_ready = raw_sum_fusion && !ordered_sum_charge &&
+  bool left_cell_agg_ready = raw_aggregates.raw_sum_fusion && !ordered_sum_charge &&
                              !use_partitioned_count_distinct && agg_count > 0 &&
                              agg_count <= kRawAggregateCapacity;
   bool uses_double_arith_cell_op = false;
-  struct CompiledDefDoubleArith {
-    enum class Pattern : uint8_t {
-      kGeneral = 0,
-      kSub = 1,
-      kAdd = 2,
-      kSubDivConst = 3,
-      kSubSubAddDivConst = 4,
-    };
-    struct Step {
-      // 0: load def col, 1: load right col, 2: load const,
-      // 3: add, 4: sub, 5: mul, 6: div, 7: div by finite |c| >= 1.0
-      uint8_t kind{0};
-      uint32_t operand{0};
-      double cst{0.0};
-    };
-    Pattern pattern{Pattern::kGeneral};
-    std::array<uint32_t, 4> fast_cols{};
-    double fast_div{1.0};
-    std::vector<Step> steps;
-  };
   std::vector<CompiledDefDoubleArith> compiled_double_arith(
       fusion->aggregates.size());
   const auto numeric_left_col = [&](int32_t col) {
@@ -10773,14 +5503,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       return true;
     };
     for (size_t s = 0; s < agg_count; ++s) {
-      const size_t i = raw_slot_origin[s];
+      const size_t i = raw_aggregates.raw_slot_origin[s];
       if (child_shapes[i].profit_col0 >= 0) {
         left_cell_agg_ready = false;
         break;
       }
       LeftNumericAgg& op = left_numeric[s];
       op.orig_agg = static_cast<int32_t>(i);
-      if (slot_agg_kinds[s] == RawAggKind::kSumInt64 &&
+      if (raw_aggregates.slot_agg_kinds[s] == RawAggKind::kSumInt64 &&
           try_match_diff_range_case(i, &op)) {
         continue;
       }
@@ -10796,8 +5526,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               sh.case_cond_col >= 0 &&
               static_cast<size_t>(sh.case_cond_col) <
                   def_col_to_pk_lookup.size() &&
-              (slot_agg_kinds[s] == RawAggKind::kSumDouble ||
-               slot_agg_kinds[s] == RawAggKind::kAvgDouble) &&
+              (raw_aggregates.slot_agg_kinds[s] == RawAggKind::kSumDouble ||
+               raw_aggregates.slot_agg_kinds[s] == RawAggKind::kAvgDouble) &&
               sh.case_val == ProgramShape::CaseValKind::kDoubleArith &&
               sh.case_val_program != nullptr) {
             const int8_t pk_li =
@@ -10864,7 +5594,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           left_cell_agg_ready = false;
           break;
         }
-        switch (slot_agg_kinds[s]) {
+        switch (raw_aggregates.slot_agg_kinds[s]) {
           case RawAggKind::kCountValue:
             if (op.case_val_kind == 4) {
               // This operand needs arithmetic evaluation, including its
@@ -10902,12 +5632,12 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
         continue;
       }
-      switch (slot_agg_kinds[s]) {
+      switch (raw_aggregates.slot_agg_kinds[s]) {
         case RawAggKind::kCountStar:
           op.op = 0;
           break;
         case RawAggKind::kConstantExtremum:
-          if (raw_constants[i].IsNull()) {
+          if (raw_aggregates.raw_constants[i].IsNull()) {
             op.op = 5;
           } else if (join_type == JoinType::kInner) {
             // Every joined pair carries the uniform value, so "some pair
@@ -11085,10 +5815,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                        residual_programs.empty();
   bool def_group_cell_probe =
       deferred_left_probe != nullptr && !use_preassigned_build_groups &&
-      !compact_counts && residual_programs.empty() && raw_sum_fusion &&
-      left_cell_agg_ready && !has_count_distinct && all_direct_group_keys &&
-      (int_group_key || packed_2x32_group_key ||
-       (use_split_key_gid && !use_fast_2key_year_lut));
+      !compact_counts && residual_programs.empty() && raw_aggregates.raw_sum_fusion &&
+      left_cell_agg_ready && !raw_aggregates.has_count_distinct && all_direct_group_keys &&
+      (int_group_key || layout.packed_2x32_group_key ||
+       (layout.use_split_key_gid && !layout.use_fast_2key_year_lut));
   if (def_group_cell_probe) {
     const size_t base_proj_n = deferred_left_probe->projection.size();
     for (size_t i = 0; i < agg_count; ++i) {
@@ -11150,18 +5880,18 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   size_t dense_split_domain = 0;
   std::shared_ptr<QueryMemoryCharge> dense_split_charge;
   bool use_dense_split_direct_gid =
-      def_group_cell_probe && use_split_key_gid && !split_has_left_probe &&
-      split_key_unpack_only && join_type == JoinType::kInner &&
-      !fusion->aggregates.empty() && right_row_count > 0 &&
-      (!split_uses_right_subgid ||
-       split_right_rep_count == split_right_subgid_count);
+      def_group_cell_probe && layout.use_split_key_gid && !layout.split_has_left_probe &&
+      layout.split_key_unpack_only && join_type == JoinType::kInner &&
+      !fusion->aggregates.empty() && layout.right_row_count > 0 &&
+      (!layout.split_uses_right_subgid ||
+       layout.split_right_rep_count == layout.split_right_subgid_count);
   bool use_packed_double_cells = use_dense_split_direct_gid &&
-                                 !use_direct_gid_agg && !raw_count_fusion &&
+                                 !use_direct_gid_agg && !raw_aggregates.raw_count_fusion &&
                                  agg_count == 1 &&
-                                 (slot_agg_kinds[0] == RawAggKind::kSumDouble ||
-                                  slot_agg_kinds[0] == RawAggKind::kAvgDouble);
+                                 (raw_aggregates.slot_agg_kinds[0] == RawAggKind::kSumDouble ||
+                                  raw_aggregates.slot_agg_kinds[0] == RawAggKind::kAvgDouble);
   if (use_dense_split_direct_gid) {
-    uint64_t dom = split_uses_right_subgid ? split_right_subgid_count : 1ULL;
+    uint64_t dom = layout.split_uses_right_subgid ? layout.split_right_subgid_count : 1ULL;
     for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
       if (!def_pk_groups[gi].use_subgid) {
         continue;
@@ -11188,7 +5918,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                          : 0))));
       const size_t bytes = workers * static_cast<size_t>(dom) *
                            std::max<size_t>(per_group_bytes, 16);
-      const size_t dense_byte_cap = (!raw_count_fusion && has_stat_raw_agg)
+      const size_t dense_byte_cap = (!raw_aggregates.raw_count_fusion && has_stat_raw_agg)
                                         ? (size_t{192} << 20)
                                         : (size_t{256} << 20);
       if (bytes <= dense_byte_cap) {
@@ -11204,46 +5934,19 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  struct JitDenseSplitSelItem {
-    uint8_t kind{0};  // 0 = agg0, 1 = const, 2 = right_col, 3 = pk0_col
-    Value constant;
-    size_t idx{0};
-    std::string name;
-    ValueType vt{ValueType::kNull};
-    bool is_unsigned{false};
-    bool is_interval{false};
-    bool has_null{false};
-    bool is_uniform{true};
-  };
-  constexpr uint8_t kDenseSplitPartShift = 15;
-  struct JitDenseSplitPlan {
-    bool active{false};
-    uint64_t dom{0};
-    uint32_t pk0_card{0};
-    JitDenseSplitRadixAgg::ExprOp expr_op{
-        JitDenseSplitRadixAgg::ExprOp::kColDouble};
-    std::array<size_t, 4> v_cols{};
-    std::array<bool, 4> need_v{false, false, false, false};
-    double div_const{1.0};
-    bool is_avg{false};
-    bool raise_inf{false};
-    std::shared_ptr<QueryMemoryCharge> mem_charge;
-    std::optional<JitDenseSplitRadixAgg::ScatterKernel> scatter_k;
-    std::optional<JitDenseSplitRadixAgg::AccumKernel> accum_k;
-    std::vector<JitDenseSplitSelItem> sel_items;
-  } jit_dense_split;
+  JitDenseSplitPlan jit_dense_split;
   if (!use_dense_split_direct_gid && !use_direct_gid_agg &&
-      def_group_cell_probe && use_split_key_gid && !split_has_left_probe &&
-      split_key_unpack_only && join_type == JoinType::kInner &&
-      deferred_left_probe != nullptr && !raw_count_fusion && raw_sum_fusion &&
+      def_group_cell_probe && layout.use_split_key_gid && !layout.split_has_left_probe &&
+      layout.split_key_unpack_only && join_type == JoinType::kInner &&
+      deferred_left_probe != nullptr && !raw_aggregates.raw_count_fusion && raw_aggregates.raw_sum_fusion &&
       agg_count == 1 && fusion->aggregates.size() == 1 &&
-      (slot_agg_kinds[0] == RawAggKind::kSumDouble ||
-       slot_agg_kinds[0] == RawAggKind::kAvgDouble) &&
+      (raw_aggregates.slot_agg_kinds[0] == RawAggKind::kSumDouble ||
+       raw_aggregates.slot_agg_kinds[0] == RawAggKind::kAvgDouble) &&
       use_dense_int_rows && !dense_int_idxs.empty() &&
       ranked_int_bits.empty() && left_columns.size() == 1 &&
-      left_key_offsets[0] == 0 && right_col_only && right_row_count > 0 &&
-      (!split_uses_right_subgid ||
-       split_right_rep_count == split_right_subgid_count) &&
+      left_key_offsets[0] == 0 && right_col_only && layout.right_row_count > 0 &&
+      (!layout.split_uses_right_subgid ||
+       layout.split_right_rep_count == layout.split_right_subgid_count) &&
       def_pk_groups.size() == 1 && def_pk_groups[0].use_subgid &&
       def_pk_groups[0].dense_ptr != nullptr &&
       def_pk_groups[0].dense_size == def_pk_groups[0].span &&
@@ -11259,7 +5962,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           nullptr) {
     const auto& pk0 = def_pk_groups[0];
     const uint64_t r_card =
-        split_uses_right_subgid ? split_right_subgid_count : 1ULL;
+        layout.split_uses_right_subgid ? layout.split_right_subgid_count : 1ULL;
     const uint64_t dom =
         (pk0.subgid_count > 0 && r_card <= 2097152ULL / pk0.subgid_count)
             ? r_card * pk0.subgid_count
@@ -11576,8 +6279,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
             std::optional<size_t> eq_rc;
             if (*off < left_width && *off < left.schema.ColumnCount() &&
-                (!split_uses_right_subgid ||
-                 split_right_subgid_count == right_row_count)) {
+                (!layout.split_uses_right_subgid ||
+                 layout.split_right_subgid_count == layout.right_row_count)) {
               const Column& lc = left.schema.GetColumn(*off);
               if (lc.Type() != ValueType::kNull &&
                   lc.Type() != ValueType::kVarChar) {
@@ -11625,8 +6328,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
       }
       if (expr_ok) {
-        const bool is_avg = (slot_agg_kinds[0] == RawAggKind::kAvgDouble);
-        const bool raise_inf = slot_raises_inf[0];
+        const bool is_avg = (raw_aggregates.slot_agg_kinds[0] == RawAggKind::kAvgDouble);
+        const bool raise_inf = raw_aggregates.slot_raises_inf[0];
         auto sk = JitDenseSplitRadixAgg::CompileScatter(kDenseSplitPartShift);
         auto ak = JitDenseSplitRadixAgg::CompileAccum(is_avg, raise_inf);
         const size_t res_bytes =
@@ -11652,26 +6355,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  struct RadixSoABucket {
-    std::vector<uint64_t> keys;
-    std::vector<double> dvals;
-    std::vector<int64_t> ivals;
-    std::vector<uint8_t> valids;
-  };
-  constexpr size_t kRadixParts = 64;
-  const auto radix_bucket_of = [](uint64_t ukey) noexcept -> size_t {
-    uint64_t x = ukey + 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-    return static_cast<size_t>((x ^ (x >> 27U)) >> 58U);
-  };
-  if (use_left_packed_key && left_col_only && left_pack_uses_dict &&
+  if (layout.use_left_packed_key && layout.left_col_only && layout.left_pack_uses_dict &&
       (use_preassigned_build_groups || compact_counts ||
-       !residual_programs.empty() || !raw_sum_fusion || has_count_distinct ||
+       !residual_programs.empty() || !raw_aggregates.raw_sum_fusion || raw_aggregates.has_count_distinct ||
        !all_direct_group_keys || !left_cell_agg_ready ||
        uses_double_arith_cell_op || right_ptr->HasSpill() ||
        singleton_right_relation || !(integer_key || packed_2x32_int_key))) {
-    use_left_packed_key = false;
-    left_pack_unpack_only = false;
+    layout.use_left_packed_key = false;
+    layout.left_pack_unpack_only = false;
   }
   bool use_radix_agg = false;
   size_t radix_primary = 0;
@@ -11679,27 +6370,27 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
   // (packed_2x32_join_key_bijection_sound)
   const bool small_build_packed_2x32 =
-      (packed_2x32_group_key || (use_split_key_gid && split_key_unpack_only)) &&
-      right_row_count <= 512 && effective_left_rows <= 4000000;
+      (layout.packed_2x32_group_key || (layout.use_split_key_gid && layout.split_key_unpack_only)) &&
+      layout.right_row_count <= 512 && effective_left_rows <= 4000000;
   const bool bounded_packed_radix =
-      small_build_packed_2x32 && packed_2x32_group_key &&
-      packed_2x32_unpack_only && build_int_keys_unique &&
+      small_build_packed_2x32 && layout.packed_2x32_group_key &&
+      layout.packed_2x32_unpack_only && build_int_keys_unique &&
       deferred_left_probe != nullptr;
   std::shared_ptr<QueryMemoryCharge> bounded_radix_charge;
   if (workers > 1 && effective_left_rows >= 2000000 &&
-      (!small_build_packed_2x32 || bounded_packed_radix) && raw_sum_fusion &&
+      (!small_build_packed_2x32 || bounded_packed_radix) && raw_aggregates.raw_sum_fusion &&
       !use_preassigned_build_groups && !use_direct_gid_agg &&
       !use_dense_split_direct_gid && !jit_dense_split.active &&
       !ordered_sum_charge && !scalar_fact_charge && !compact_counts &&
-      !has_count_distinct && residual_programs.empty() &&
+      !raw_aggregates.has_count_distinct && residual_programs.empty() &&
       all_direct_group_keys && !fusion->group_keys.empty() && !fusion->having &&
       !fusion->post_having_active && fusion->topn_limit == 0 &&
       !fusion->rollup_count_distribution && left_cell_agg_ready &&
       agg_count >= 1 && join_type == JoinType::kInner &&
-      !right_ptr->HasSpill() && !use_fast_2key_year_lut &&
-      ((use_left_packed_key && left_pack_unpack_only) ||
-       (use_split_key_gid && split_key_unpack_only) ||
-       (packed_2x32_group_key && packed_2x32_unpack_only)) &&
+      !right_ptr->HasSpill() && !layout.use_fast_2key_year_lut &&
+      ((layout.use_left_packed_key && layout.left_pack_unpack_only) ||
+       (layout.use_split_key_gid && layout.split_key_unpack_only) ||
+       (layout.packed_2x32_group_key && layout.packed_2x32_unpack_only)) &&
       ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_AGG") == nullptr) {
     const bool radix_def_path =
         (deferred_left_probe != nullptr && def_group_cell_probe &&
@@ -11709,11 +6400,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         (deferred_left_probe == nullptr && left.HasColumnarOnly() &&
          !singleton_right_relation && !uses_double_arith_cell_op &&
          (integer_key || packed_2x32_int_key) && !bulk_raw_count &&
-         (use_left_packed_key ||
-          (use_split_key_gid && !split_uses_pk_subgid &&
-           (!split_has_left_probe ||
-            key_shapes[split_left_k].direct_column >= 0)) ||
-          packed_2x32_group_key));
+         (layout.use_left_packed_key ||
+          (layout.use_split_key_gid && !layout.split_uses_pk_subgid &&
+           (!layout.split_has_left_probe ||
+            key_shapes[layout.split_left_k].direct_column >= 0)) ||
+          layout.packed_2x32_group_key));
     if (radix_def_path || radix_col_path) {
       bool found_any_primary = false;
       for (size_t s = 0; s < agg_count; ++s) {
@@ -11778,7 +6469,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   } else if (!group_capacity_charge &&
              (deferred_left_probe != nullptr || left.HasColumnarOnly()) &&
              !left.HasSpill() && effective_left_rows >= 32768 &&
-             (int_group_key || use_split_key_gid || packed_2x32_group_key)) {
+             (int_group_key || layout.use_split_key_gid || layout.packed_2x32_group_key)) {
     const size_t max_reserve =
         effective_left_rows >= 2000000 ? size_t{65536} : size_t{8192};
     const size_t capacity =
@@ -12117,7 +6808,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
             double run_sum = 0.0;
             uint32_t run_hits = 0;
-            if (op_code == 6) {
+            if (op_code == 6 && flat_b != nullptr) {
               for (size_t r = run.begin; r < run.end; ++r) {
                 if (pred_cells[r] > pred_thresh) {
                   run_sum += std::bit_cast<double>(flat_a[r]) *
@@ -12125,7 +6816,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                   ++run_hits;
                 }
               }
-            } else if (op_code == 1) {
+            } else if (op_code == 1 && flat_b != nullptr) {
               for (size_t r = run.begin; r < run.end; ++r) {
                 if (pred_cells[r] > pred_thresh) {
                   run_sum += std::bit_cast<double>(flat_a[r]) *
@@ -12339,5964 +7030,56 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         fusion->select_items[0]->AsColumnValue().GetColumnName() ==
             fusion->group_keys[0]->AsColumnValue().GetColumnName();
     if (sel0_ok) {
-      const size_t nblocks = store.blocks.size();
-      const bool c0_dbl =
-          left.schema.GetColumn(static_cast<size_t>(lop.col0)).Type() ==
-          ValueType::kDouble;
-      const bool c1_dbl =
-          lop.op != 2 &&
-          left.schema.GetColumn(static_cast<size_t>(lop.col1)).Type() ==
-              ValueType::kDouble;
-      const auto lo_u = static_cast<uint64_t>(dense_int_min);
-      const size_t span_sz = dense_int_idxs.size();
-      const uint32_t* ridxs = dense_int_idxs.data();
-      // Pack dense_int_idxs into a compact 1-bit L1-resident bitset (32x
-      // smaller than uint32_t[] — e.g. 12.5 KiB for 100k suppliers in Q11).
-      std::vector<uint64_t> hit_bits((span_sz + 63) >> 6, 0ULL);
-      for (size_t i = 0; i < span_sz; ++i) {
-        if (ridxs[i] != kInvalidRightIdx) {
-          hit_bits[i >> 6] |= uint64_t{1} << (i & 63);
-        }
-      }
-      const uint64_t* hbits = hit_bits.data();
-      const uint8_t op_code = lop.op;
-      const double scale = lop.scale;
-
-      std::vector<std::vector<int64_t>> w_keys(workers);
-      std::vector<std::vector<double>> w_sums(workers);
-      std::atomic<bool> saw_nonfinite{false};
-      std::atomic<bool> saw_unsorted{false};
-      std::atomic<bool> saw_decode_error{false};
-
-      auto stream_worker = [&](size_t tid) {
-        const size_t b_begin = (nblocks * tid) / workers;
-        const size_t b_end = (nblocks * (tid + 1)) / workers;
-        if (b_begin >= b_end) {
-          return;
-        }
-        auto& out_k = w_keys[tid];
-        auto& out_s = w_sums[tid];
-        out_k.reserve(65536);
-        out_s.reserve(65536);
-        bool has_cur = false;
-        int64_t cur_k = 0;
-        double cur_sum = 0.0;
-        std::vector<slot_t> stream_mat_cols{g_base, j_base, c0_base};
-        if (lop.op != 2) {
-          stream_mat_cols.push_back(c1_base);
-        }
-        SortUniqueSlots(&stream_mat_cols);
-        LSTableStore::LazyBlockScratch lazy_scratch;
-        for (size_t bi = b_begin; bi < b_end; ++bi) {
-          const uint32_t rc = store.blocks[bi].row_count;
-          if (rc == 0) {
-            continue;
-          }
-          lazy_scratch.transient.clear();
-          const LSTablePageBlock* mat =
-              store.MaterializeBlockView(bi, &lazy_scratch, stream_mat_cols);
-          if (mat == nullptr) {
-            // A failed block materialization is corruption/I/O, not a
-            // monotonicity violation — surface it instead of silently
-            // degrading to the non-fast path.
-            saw_decode_error.store(true, std::memory_order_relaxed);
-            saw_unsorted.store(true, std::memory_order_relaxed);
-            return;
-          }
-          const LSTablePageBlock& blk = *mat;
-          const int64_t* gcells = blk.columns[g_base].int_cells.data();
-          const int64_t* jcells = blk.columns[j_base].int_cells.data();
-          const int64_t* c0cells = blk.columns[c0_base].int_cells.data();
-          const int64_t* c1cells =
-              op_code == 2 ? nullptr : blk.columns[c1_base].int_cells.data();
-          for (uint32_t r = 0; r < rc; ++r) {
-            const uint64_t off = static_cast<uint64_t>(jcells[r]) - lo_u;
-            if (off >= span_sz ||
-                ((hbits[off >> 6] >> (off & 63)) & uint64_t{1}) == 0) {
-              continue;
-            }
-            const double v0 = c0_dbl ? std::bit_cast<double>(c0cells[r])
-                                     : static_cast<double>(c0cells[r]);
-            double dv = v0;
-            if (op_code != 2) {
-              const double v1 = c1_dbl ? std::bit_cast<double>(c1cells[r])
-                                       : static_cast<double>(c1cells[r]);
-              dv = (op_code == 1) ? (v0 * v1) : (v0 * (scale - v1));
-            }
-            const int64_t gk = gcells[r];
-            if (has_cur) {
-              if (gk == cur_k) {
-                cur_sum += dv;
-              } else if (gk > cur_k) {
-                if (!std::isfinite(cur_sum)) {
-                  saw_nonfinite.store(true, std::memory_order_relaxed);
-                }
-                out_k.push_back(cur_k);
-                out_s.push_back(cur_sum);
-                cur_k = gk;
-                cur_sum = dv;
-              } else {
-                saw_unsorted.store(true, std::memory_order_relaxed);
-                return;
-              }
-            } else {
-              cur_k = gk;
-              cur_sum = dv;
-              has_cur = true;
-            }
-          }
-        }
-        if (has_cur) {
-          if (!std::isfinite(cur_sum)) {
-            saw_nonfinite.store(true, std::memory_order_relaxed);
-          }
-          out_k.push_back(cur_k);
-          out_s.push_back(cur_sum);
-        }
+      DenseFilteredGroups specialized{
+          .context = context,
+          .left = left,
+          .fusion = fusion,
+          .join_begin = join_begin,
+          .workers = workers,
+          .dense_int_idxs = dense_int_idxs,
+          .dense_int_min = dense_int_min,
+          .store = store,
+          .g_pcol = g_pcol,
+          .lop = lop,
+          .g_base = g_base,
+          .j_base = j_base,
+          .c0_base = c0_base,
+          .c1_base = c1_base,
       };
-
-      if (workers == 1) {
-        stream_worker(0);
-      } else {
-        RETURN_IF_FAIL(RunParallelTasks(workers, stream_worker));
-      }
-
-      if (saw_decode_error.load(std::memory_order_relaxed)) {
-        return StatusError(StatusCode::kCorrupt,
-                           "LSTable block materialization failed");
-      }
-
-      if (!saw_nonfinite.load(std::memory_order_relaxed) &&
-          !saw_unsorted.load(std::memory_order_relaxed)) {
-        // Merge boundary keys between consecutive non-empty worker slices.
-        std::vector<size_t> start_off(workers, 0);
-        size_t prev_w = workers;
-        for (size_t tid = 0; tid < workers; ++tid) {
-          if (w_keys[tid].empty()) {
-            continue;
-          }
-          if (prev_w < workers &&
-              w_keys[prev_w].back() == w_keys[tid].front()) {
-            w_sums[prev_w].back() += w_sums[tid].front();
-            start_off[tid] = 1;
-          }
-          if (start_off[tid] < w_keys[tid].size()) {
-            prev_w = tid;
-          }
-        }
-        auto out_table = std::make_shared<ColumnarTable>();
-        const ValueType gtype = left.schema.GetColumn(g_pcol).Type();
-        size_t total_out_groups = 0;
-        if (fusion->post_having_active) {
-          // Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
-          //   (grouped_having_global_sum_fubini_sound)
-          double threshold = fusion->post_having_constant_or_factor;
-          bool valid_threshold = true;
-          if (fusion->post_having_is_self_sum_factor) {
-            double grand_total = 0.0;
-            bool any_group = false;
-            for (size_t tid = 0; tid < workers; ++tid) {
-              const size_t s0 = start_off[tid];
-              for (size_t i = s0; i < w_sums[tid].size(); ++i) {
-                any_group = true;
-                grand_total += w_sums[tid][i];
-              }
-            }
-            if (!any_group) {
-              valid_threshold = false;
-            } else {
-              threshold = grand_total * fusion->post_having_constant_or_factor;
-              if (!std::isfinite(threshold)) {
-                valid_threshold = false;
-              }
-            }
-          }
-          if (valid_threshold) {
-            const BinaryOperation hop = fusion->post_having_op;
-            ColumnarColumn col_k;
-            col_k.type = gtype;
-            col_k.is_uniform = true;
-            col_k.has_null = false;
-            col_k.encoding = ColumnarColumn::Encoding::kFlat;
-            ColumnarColumn col_s;
-            col_s.type = ValueType::kDouble;
-            col_s.is_uniform = true;
-            col_s.has_null = false;
-            col_s.encoding = ColumnarColumn::Encoding::kFlat;
-            for (size_t tid = 0; tid < workers; ++tid) {
-              const size_t s0 = start_off[tid];
-              const auto& ks = w_keys[tid];
-              const auto& ss = w_sums[tid];
-              for (size_t i = s0; i < ks.size(); ++i) {
-                const double val = ss[i];
-                bool pass = false;
-                switch (hop) {
-                  case BinaryOperation::kEquals:
-                    pass = (val == threshold);
-                    break;
-                  case BinaryOperation::kNotEquals:
-                    pass = (val != threshold);
-                    break;
-                  case BinaryOperation::kLessThan:
-                    pass = (val < threshold);
-                    break;
-                  case BinaryOperation::kLessThanEquals:
-                    pass = (val <= threshold);
-                    break;
-                  case BinaryOperation::kGreaterThan:
-                    pass = (val > threshold);
-                    break;
-                  case BinaryOperation::kGreaterThanEquals:
-                    pass = (val >= threshold);
-                    break;
-                  default:
-                    break;
-                }
-                if (pass) {
-                  col_k.ints.push_back(ks[i]);
-                  col_s.doubles.push_back(val);
-                }
-              }
-            }
-            total_out_groups = col_k.ints.size();
-            if (total_out_groups > 0) {
-              ColumnarChunk chunk;
-              chunk.rows = total_out_groups;
-              chunk.columns.push_back(std::move(col_k));
-              chunk.columns.push_back(std::move(col_s));
-              out_table->AppendChunk(std::move(chunk));
-            }
-          }
-          fusion->post_having_applied = true;
-        } else {
-          for (size_t tid = 0; tid < workers; ++tid) {
-            const size_t s0 = start_off[tid];
-            if (s0 >= w_keys[tid].size()) {
-              continue;
-            }
-            const size_t cnt = w_keys[tid].size() - s0;
-            total_out_groups += cnt;
-            ColumnarColumn col_k;
-            col_k.type = gtype;
-            col_k.is_uniform = true;
-            col_k.has_null = false;
-            col_k.encoding = ColumnarColumn::Encoding::kFlat;
-            if (s0 == 0) {
-              col_k.ints = std::move(w_keys[tid]);
-            } else {
-              col_k.ints.assign(
-                  w_keys[tid].begin() + static_cast<ptrdiff_t>(s0),
-                  w_keys[tid].end());
-            }
-            ColumnarColumn col_s;
-            col_s.type = ValueType::kDouble;
-            col_s.is_uniform = true;
-            col_s.has_null = false;
-            col_s.encoding = ColumnarColumn::Encoding::kFlat;
-            if (s0 == 0) {
-              col_s.doubles = std::move(w_sums[tid]);
-            } else {
-              col_s.doubles.assign(
-                  w_sums[tid].begin() + static_cast<ptrdiff_t>(s0),
-                  w_sums[tid].end());
-            }
-            ColumnarChunk chunk;
-            chunk.rows = cnt;
-            chunk.columns.push_back(std::move(col_k));
-            chunk.columns.push_back(std::move(col_s));
-            out_table->AppendChunk(std::move(chunk));
-          }
-        }
-        Relation out_rel(context.execution_runtime());
-        std::string n0 =
-            !fusion->select_names.empty() && !fusion->select_names[0].empty()
-                ? fusion->select_names[0]
-                : left.schema.GetColumn(g_pcol).Name().name;
-        std::string n1 =
-            fusion->select_names.size() > 1 && !fusion->select_names[1].empty()
-                ? fusion->select_names[1]
-                : "agg_0";
-        out_rel.schema =
-            Schema("", {Column(std::move(n0), gtype),
-                        Column(std::move(n1), ValueType::kDouble)});
-        out_rel.SetColumnarTable(std::move(out_table), total_out_groups > 0);
-        out_rel.peak_intermediate_rows = total_out_groups;
-        if (context.execution_runtime() != nullptr) {
-          context.execution_runtime()->join_ms += ElapsedMs(join_begin);
-          ++context.execution_runtime()->grouped_join_fusions;
-        }
-        fusion->fired = true;
-        return std::optional<Relation>(std::move(out_rel));
+      ASSIGN_OR_RETURN(std::optional<Relation>, emitted, specialized.TryRun());
+      if (emitted) {
+        return emitted;
       }
     }
   }
 
   if (jit_dense_split.active) {
-    const auto& pk0 = def_pk_groups[0];
-    const uint32_t pk0_card = jit_dense_split.pk0_card;
-    const uint64_t dom = jit_dense_split.dom;
-    constexpr uint8_t kPartShift = kDenseSplitPartShift;
-    constexpr size_t kPartSize = size_t{1} << kPartShift;
-    const size_t n_parts = (dom + kPartSize - 1) >> kPartShift;
-
-    std::vector<uint32_t> key_to_rsubgid(dense_int_idxs.size(), UINT32_MAX);
-    for (size_t i = 0; i < dense_int_idxs.size(); ++i) {
-      const uint32_t r_idx = dense_int_idxs[i];
-      if (r_idx != kInvalidRightIdx) {
-        key_to_rsubgid[i] =
-            split_uses_right_subgid ? split_right_subgid_ptr[r_idx] : 0U;
-      }
+    return DenseSplitExecution{
+        .context = context,
+        .left = left,
+        .right = right,
+        .fusion = *fusion,
+        .probe = *deferred_left_probe,
+        .right_col_owner = right_col_owner,
+        .right_locator = right_locator,
+        .join_begin = join_begin,
+        .result = result,
+        .left_columns = left_columns,
+        .left_key_offsets = left_key_offsets,
+        .prepared_pk_lookups = prepared_pk_lookups,
+        .pk0 = def_pk_groups[0],
+        .split_uses_right_subgid = layout.split_uses_right_subgid,
+        .split_right_subgid_ptr = layout.split_right_subgid_ptr,
+        .split_right_rep_ptr = layout.split_right_rep_ptr,
+        .workers = workers,
+        .dense_int_idxs = dense_int_idxs,
+        .dense_int_min = dense_int_min,
+        .packed_2x32_int_key = packed_2x32_int_key,
+        .jit_dense_split = jit_dense_split,
     }
-    std::vector<uint32_t> pk0_subgid_lut(pk0.dense_size, UINT32_MAX);
-    for (size_t i = 0; i < pk0.dense_size; ++i) {
-      const auto& e = pk0.dense_ptr[i];
-      if (e.nb != std::numeric_limits<uint32_t>::max() && e.subgid < pk0_card) {
-        pk0_subgid_lut[i] = e.subgid;
-      }
-    }
-
-    const LSTableStore& store = *deferred_left_probe->store;
-    const size_t total_blocks = store.blocks.size();
-    const size_t base_proj_cols = deferred_left_probe->projection.size();
-    const slot_t jk0_slot = left_columns[0];
-    const slot_t pk0_slot = pk0.pk_col;
-    const auto* peek_ptr = deferred_left_probe->integer_peeks.empty()
-                               ? nullptr
-                               : &deferred_left_probe->integer_peeks;
-    const ScanRuntimeFilter& primary_rf = deferred_left_probe->runtime_filter;
-    const RuntimeFilterGroup* active_rf_group =
-        primary_rf.enabled() ? primary_rf.group.get() : nullptr;
-    const std::optional<slot_t> full_rf_col =
-        (active_rf_group != nullptr && primary_rf.column < base_proj_cols)
-            ? std::optional<slot_t>(
-                  deferred_left_probe->projection[primary_rf.column])
-            : std::nullopt;
-    const bool rf_has_dense =
-        active_rf_group != nullptr && active_rf_group->has_dense_bits();
-    const uint64_t* const rf_dense_bits =
-        rf_has_dense ? active_rf_group->dense_bits_data() : nullptr;
-    const size_t rf_dense_words =
-        rf_has_dense ? active_rf_group->dense_bits_word_count() : 0;
-    const int64_t rf_lo = rf_has_dense ? active_rf_group->Lo() : 0;
-    const int64_t rf_hi = rf_has_dense ? active_rf_group->Hi() : 0;
-    bool rf_dense_all_set = false;
-    if (rf_has_dense && rf_hi >= rf_lo) {
-      const uint64_t span =
-          static_cast<uint64_t>(rf_hi) - static_cast<uint64_t>(rf_lo);
-      const auto full_words = static_cast<size_t>(span >> 6);
-      if (full_words < rf_dense_words) {
-        bool ok = true;
-        for (size_t wi = 0; wi < full_words; ++wi) {
-          if (rf_dense_bits[wi] != ~uint64_t{0}) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) {
-          const uint32_t rem_bits = static_cast<uint32_t>(span & 63) + 1U;
-          const uint64_t mask = rem_bits == 64U
-                                    ? ~uint64_t{0}
-                                    : ((uint64_t{1} << rem_bits) - 1ULL);
-          if ((rf_dense_bits[full_words] & mask) == mask) {
-            rf_dense_all_set = true;
-          }
-        }
-      }
-    }
-    const bool has_null_peeks = !deferred_left_probe->null_peeks.empty();
-    const auto eval_int_peek = [](BinaryOperation op, int64_t a,
-                                  int64_t c) noexcept -> bool {
-      switch (op) {
-        case BinaryOperation::kEquals:
-          return a == c;
-        case BinaryOperation::kNotEquals:
-          return a != c;
-        case BinaryOperation::kLessThan:
-          return a < c;
-        case BinaryOperation::kLessThanEquals:
-          return a <= c;
-        case BinaryOperation::kGreaterThan:
-          return a > c;
-        case BinaryOperation::kGreaterThanEquals:
-          return a >= c;
-        default:
-          return false;
-      }
-    };
-
-    std::vector<std::vector<std::vector<uint32_t>>> worker_part_gids(
-        workers, std::vector<std::vector<uint32_t>>(n_parts));
-    std::vector<std::vector<std::vector<double>>> worker_part_vals(
-        workers, std::vector<std::vector<double>>(n_parts));
-    std::vector<Status> p1_errs(workers, Status::kSuccess);
-
-    const auto run_phase1 = [&](size_t w) {
-      std::array<std::optional<JitDenseSplitRadixAgg::ExtractKernel>, 128>
-          extract_cache;
-      std::vector<uint32_t> rf_sel_buf;
-      std::vector<uint32_t> stripe_gids;
-      std::vector<double> stripe_vals;
-      std::vector<int64_t> dummy_zeros;
-      std::vector<uint8_t> dummy_ones;
-      std::vector<uint32_t> stripe_hist(n_parts, 0);
-      std::vector<uint32_t*> dst_gids(n_parts, nullptr);
-      std::vector<double*> dst_vals(n_parts, nullptr);
-      std::vector<uint32_t> dst_pos(n_parts, 0);
-      std::array<const LSTableColumnBlock*, 16> proj_cols{};
-      struct DefExtraRf {
-        const LSTableColumnBlock* col{nullptr};
-        const uint64_t* dense_bits{nullptr};
-        int64_t lo{0};
-        int64_t hi{0};
-        bool has_null{false};
-        bool type_ok{true};
-        const RuntimeFilterGroup* group{nullptr};
-      };
-      std::array<DefExtraRf, 4> extra_rfs{};
-      std::vector<slot_t> p1_mat_cols;
-      p1_mat_cols.push_back(deferred_left_probe->projection[jk0_slot]);
-      p1_mat_cols.push_back(deferred_left_probe->projection[pk0_slot]);
-      if (full_rf_col.has_value()) {
-        p1_mat_cols.push_back(*full_rf_col);
-      }
-      for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-        if (ext.enabled() && ext.column < base_proj_cols) {
-          p1_mat_cols.push_back(deferred_left_probe->projection[ext.column]);
-        }
-      }
-      for (const IntegerPeekCompare& pred :
-           deferred_left_probe->integer_peeks) {
-        p1_mat_cols.push_back(pred.column);
-      }
-      for (const NullPeekCompare& test : deferred_left_probe->null_peeks) {
-        p1_mat_cols.push_back(test.column);
-      }
-      for (size_t vi = 0; vi < 4; ++vi) {
-        if (jit_dense_split.need_v[vi]) {
-          p1_mat_cols.push_back(
-              deferred_left_probe->projection[jit_dense_split.v_cols[vi]]);
-        }
-      }
-      SortUniqueSlots(&p1_mat_cols);
-      LSTableStore::LazyBlockScratch lazy_scratch;
-
-      for (size_t stripe = w; stripe * 64 < total_blocks; stripe += workers) {
-        const size_t b_begin = stripe * 64;
-        const size_t b_end = std::min(total_blocks, b_begin + 64);
-        std::fill(stripe_hist.begin(), stripe_hist.end(), 0U);
-        size_t stripe_m = 0;
-
-        for (size_t bi = b_begin; bi < b_end; ++bi) {
-          const LSTablePageBlock& meta_blk = store.blocks[bi];
-          if (meta_blk.row_count == 0) {
-            continue;
-          }
-          if (!meta_blk.MatchesZoneMaps(peek_ptr, active_rf_group,
-                                        full_rf_col)) {
-            continue;
-          }
-          bool extra_zm_reject = false;
-          for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-            if (!ext.enabled() || ext.column >= base_proj_cols) {
-              continue;
-            }
-            if (ext.group->RejectsAll()) {
-              extra_zm_reject = true;
-              break;
-            }
-            const slot_t ext_full = deferred_left_probe->projection[ext.column];
-            if (ext_full < meta_blk.columns.size()) {
-              const LSTableColumnBlock& mcol = meta_blk.columns[ext_full];
-              if ((mcol.type == ValueType::kInt64 ||
-                   mcol.type == ValueType::kDate) &&
-                  mcol.type == ext.type &&
-                  (!mcol.has_min_max ||
-                   ext.group->RejectRange(mcol.min_int, mcol.max_int))) {
-                extra_zm_reject = true;
-                break;
-              }
-            }
-          }
-          if (extra_zm_reject) {
-            continue;
-          }
-          if (!packed_2x32_int_key && left_key_offsets[0] == 0 &&
-              jk0_slot < base_proj_cols &&
-              !DenseIntBlockMayMatch(
-                  meta_blk, deferred_left_probe->projection[jk0_slot],
-                  dense_int_min, dense_int_idxs, kInvalidRightIdx)) {
-            continue;
-          }
-          bool peek_all_pass = true;
-          if (peek_ptr != nullptr) {
-            for (const IntegerPeekCompare& pred : *peek_ptr) {
-              const LSTableColumnBlock& pcol = meta_blk.columns[pred.column];
-              if (pcol.has_null || !pcol.has_min_max ||
-                  !eval_int_peek(pred.op, pcol.min_int, pred.constant) ||
-                  !eval_int_peek(pred.op, pcol.max_int, pred.constant)) {
-                peek_all_pass = false;
-                break;
-              }
-            }
-          }
-          lazy_scratch.transient.clear();
-          const LSTablePageBlock* mat =
-              store.MaterializeBlockView(bi, &lazy_scratch, p1_mat_cols);
-          if (mat == nullptr) {
-            p1_errs[w] = Status::kIOError;
-            return;
-          }
-          const LSTablePageBlock& blk = *mat;
-          for (size_t c = 0; c < base_proj_cols; ++c) {
-            proj_cols[c] = &blk.columns[deferred_left_probe->projection[c]];
-          }
-          const LSTableColumnBlock& jk_cb = *proj_cols[jk0_slot];
-          const LSTableColumnBlock& pk0_cb = *proj_cols[pk0_slot];
-          if (jk_cb.type == ValueType::kNull ||
-              pk0_cb.type == ValueType::kNull) {
-            continue;
-          }
-          const LSTableColumnBlock* const rf_col =
-              full_rf_col.has_value() ? &blk.columns[*full_rf_col] : nullptr;
-          const bool rf_col_has_null = rf_col != nullptr && rf_col->has_null;
-          size_t extra_rf_count = 0;
-          for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-            if (!ext.enabled() || ext.column >= base_proj_cols ||
-                extra_rf_count >= extra_rfs.size()) {
-              continue;
-            }
-            const LSTableColumnBlock* ecol = proj_cols[ext.column];
-            const bool hd = ext.group->has_dense_bits();
-            extra_rfs[extra_rf_count++] = DefExtraRf{
-                .col = ecol,
-                .dense_bits = hd ? ext.group->dense_bits_data() : nullptr,
-                .lo = hd ? ext.group->Lo() : 0,
-                .hi = hd ? ext.group->Hi() : 0,
-                .has_null = ecol->has_null,
-                .type_ok = (ecol->type == ext.type),
-                .group = ext.group.get(),
-            };
-          }
-
-          bool use_sel = false;
-          uint32_t row_cnt = blk.row_count;
-          if (!has_null_peeks && extra_rf_count == 0 &&
-              (peek_all_pass || peek_ptr == nullptr)) {
-            if (rf_col != nullptr) {
-              if (rf_has_dense && rf_hi >= rf_lo &&
-                  rf_col->int_cells.size() >= blk.row_count) {
-                if (!rf_dense_all_set || rf_col_has_null ||
-                    !rf_col->has_min_max || rf_col->min_int < rf_lo ||
-                    rf_col->max_int > rf_hi) {
-                  if (rf_sel_buf.size() < blk.row_count) {
-                    rf_sel_buf.resize(blk.row_count);
-                  }
-                  row_cnt = static_cast<uint32_t>(PrefilterDenseRfBlock(
-                      rf_col->int_cells.data(), blk.row_count, rf_lo, rf_hi,
-                      rf_dense_bits, rf_dense_all_set, rf_col, rf_col_has_null,
-                      rf_sel_buf.data()));
-                  if (row_cnt == 0) {
-                    continue;
-                  }
-                  use_sel = true;
-                }
-              } else {
-                if (rf_sel_buf.size() < blk.row_count) {
-                  rf_sel_buf.resize(blk.row_count);
-                }
-                uint32_t out_n = 0;
-                for (uint32_t r = 0; r < blk.row_count; ++r) {
-                  if (rf_col_has_null && rf_col->IsNull(r)) {
-                    continue;
-                  }
-                  if (active_rf_group->Reject(rf_col->IntAt(r))) {
-                    continue;
-                  }
-                  rf_sel_buf[out_n++] = r;
-                }
-                if (out_n == 0) {
-                  continue;
-                }
-                row_cnt = out_n;
-                use_sel = true;
-              }
-            }
-          } else {
-            if (rf_sel_buf.size() < blk.row_count) {
-              rf_sel_buf.resize(blk.row_count);
-            }
-            uint32_t out_n = 0;
-            for (uint32_t r = 0; r < blk.row_count; ++r) {
-              if (has_null_peeks &&
-                  std::ranges::any_of(deferred_left_probe->null_peeks,
-                                      [&](const NullPeekCompare& test) {
-                                        return blk.columns[test.column].IsNull(
-                                                   r) != test.expect_null;
-                                      })) {
-                continue;
-              }
-              if (rf_col != nullptr) {
-                if (rf_col_has_null && rf_col->IsNull(r)) {
-                  continue;
-                }
-                const int64_t kv = rf_col->IntAt(r);
-                if (rf_has_dense) {
-                  if (kv < rf_lo || kv > rf_hi) {
-                    continue;
-                  }
-                  const uint64_t off =
-                      static_cast<uint64_t>(kv) - static_cast<uint64_t>(rf_lo);
-                  if ((rf_dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
-                      0) {
-                    continue;
-                  }
-                } else if (active_rf_group->Reject(kv)) {
-                  continue;
-                }
-              }
-              if (extra_rf_count != 0) {
-                bool extra_ok = true;
-                for (size_t ei = 0; ei < extra_rf_count; ++ei) {
-                  const DefExtraRf& erf = extra_rfs[ei];
-                  if (erf.has_null && erf.col->IsNull(r)) {
-                    extra_ok = false;
-                    break;
-                  }
-                  if (!erf.type_ok) {
-                    continue;
-                  }
-                  const int64_t kv = erf.col->IntAt(r);
-                  if (erf.dense_bits != nullptr) {
-                    if (kv < erf.lo || kv > erf.hi) {
-                      extra_ok = false;
-                      {
-                      }
-                      break;
-                    }
-                    const uint64_t off = static_cast<uint64_t>(kv) -
-                                         static_cast<uint64_t>(erf.lo);
-                    {
-                    }
-                    if ((erf.dense_bits[off >> 6] &
-                         (uint64_t{1} << (off & 63))) == 0) {
-                      extra_ok = false;
-                      break;
-                    }
-                  } else if (erf.group->Reject(kv)) {
-                    extra_ok = false;
-                    break;
-                  }
-                }
-                if (!extra_ok) {
-                  continue;
-                }
-              }
-              if (!peek_all_pass && peek_ptr != nullptr) {
-                bool peek_ok = true;
-                for (const IntegerPeekCompare& pred : *peek_ptr) {
-                  const LSTableColumnBlock& pcol = blk.columns[pred.column];
-                  if ((pcol.has_null && pcol.IsNull(r)) ||
-                      !eval_int_peek(pred.op, pcol.IntAt(r), pred.constant)) {
-                    peek_ok = false;
-                    break;
-                  }
-                }
-                if (!peek_ok) {
-                  continue;
-                }
-              }
-              rf_sel_buf[out_n++] = r;
-            }
-            if (out_n == 0) {
-              continue;
-            }
-            row_cnt = out_n;
-            use_sel = true;
-          }
-
-          if (stripe_m + row_cnt > stripe_gids.size()) {
-            const size_t new_cap =
-                std::max<size_t>(stripe_m + row_cnt, stripe_gids.size() * 2);
-            stripe_gids.resize(new_cap);
-            stripe_vals.resize(new_cap);
-          }
-
-          const auto null_ptr_of =
-              [&](const LSTableColumnBlock& cb) noexcept -> const uint8_t* {
-            if (!cb.has_null) {
-              return nullptr;
-            }
-            const auto sp = cb.Nulls();
-            return sp.size() >= blk.row_count ? sp.data() : nullptr;
-          };
-          const uint8_t* jk_nulls = null_ptr_of(jk_cb);
-          const uint8_t* pk0_nulls = null_ptr_of(pk0_cb);
-          std::array<const int64_t*, 4> vp{nullptr, nullptr, nullptr, nullptr};
-          std::array<const uint8_t*, 4> np{nullptr, nullptr, nullptr, nullptr};
-          uint8_t val_null_mask = 0;
-          bool ensured_dummy = false;
-          for (size_t vi = 0; vi < 4; ++vi) {
-            if (!jit_dense_split.need_v[vi]) {
-              continue;
-            }
-            const LSTableColumnBlock& vcb =
-                *proj_cols[jit_dense_split.v_cols[vi]];
-            if (vcb.type == ValueType::kNull) {
-              if (!ensured_dummy) {
-                if (dummy_zeros.size() < blk.row_count) {
-                  dummy_zeros.assign(blk.row_count, 0);
-                }
-                if (dummy_ones.size() < blk.row_count) {
-                  dummy_ones.assign(blk.row_count, uint8_t{1});
-                }
-                ensured_dummy = true;
-              }
-              vp[vi] = dummy_zeros.data();
-              np[vi] = dummy_ones.data();
-              val_null_mask |= static_cast<uint8_t>(1U << vi);
-            } else {
-              vp[vi] = vcb.int_cells.data();
-              np[vi] = null_ptr_of(vcb);
-              if (np[vi] != nullptr) {
-                val_null_mask |= static_cast<uint8_t>(1U << vi);
-              }
-            }
-          }
-          const auto spec_idx = static_cast<size_t>(
-              (use_sel ? 1U : 0U) | (jk_nulls != nullptr ? 2U : 0U) |
-              (pk0_nulls != nullptr ? 4U : 0U) |
-              (static_cast<unsigned>(val_null_mask) << 3U));
-          if (!extract_cache[spec_idx].has_value()) {
-            JitDenseSplitRadixAgg::ExtractSpec espec{
-                .op = jit_dense_split.expr_op,
-                .use_sel = use_sel,
-                .jk_has_null = (jk_nulls != nullptr),
-                .pk0_has_null = (pk0_nulls != nullptr),
-                .val_null_mask = val_null_mask,
-                .part_shift = kPartShift,
-            };
-            extract_cache[spec_idx] =
-                JitDenseSplitRadixAgg::CompileExtract(espec);
-            if (!extract_cache[spec_idx].has_value()) {
-              p1_errs[w] =
-                  StatusError(StatusCode::kRuntimeError,
-                              "JitDenseSplitRadixAgg::CompileExtract failed");
-              return;
-            }
-          }
-          const uint32_t m_blk = extract_cache[spec_idx]->Run(
-              row_cnt, blk.row_count, use_sel ? rf_sel_buf.data() : nullptr,
-              jk_cb.int_cells.data(), jk_nulls, dense_int_min,
-              dense_int_idxs.size(), key_to_rsubgid.data(),
-              pk0_cb.int_cells.data(), pk0_nulls, pk0.min_k, pk0.dense_size,
-              pk0_subgid_lut.data(), pk0_card, vp[0], np[0], vp[1], np[1],
-              vp[2], np[2], vp[3], np[3], jit_dense_split.div_const,
-              stripe_gids.data() + stripe_m, stripe_vals.data() + stripe_m,
-              stripe_hist);
-          if (m_blk == JitDenseSplitRadixAgg::kInvalidExtractCount) {
-            p1_errs[w] = StatusError(StatusCode::kCorrupt,
-                                     "invalid dense split row or partition");
-            return;
-          }
-          stripe_m += m_blk;
-        }
-        if (stripe_m > 0) {
-          for (size_t p = 0; p < n_parts; ++p) {
-            const uint32_t cnt_p = stripe_hist[p];
-            if (cnt_p == 0) {
-              dst_gids[p] = nullptr;
-              dst_vals[p] = nullptr;
-              dst_pos[p] = 0;
-              continue;
-            }
-            const size_t old_sz = worker_part_gids[w][p].size();
-            worker_part_gids[w][p].resize(old_sz + cnt_p);
-            worker_part_vals[w][p].resize(old_sz + cnt_p);
-            dst_gids[p] = worker_part_gids[w][p].data();
-            dst_vals[p] = worker_part_vals[w][p].data();
-            dst_pos[p] = static_cast<uint32_t>(old_sz);
-          }
-          jit_dense_split.scatter_k->Run(static_cast<uint32_t>(stripe_m),
-                                         stripe_gids.data(), stripe_vals.data(),
-                                         dst_gids.data(), dst_vals.data(),
-                                         dst_pos.data());
-        }
-      }
-    };
-
-    if (workers == 1) {
-      run_phase1(0);
-    } else {
-      RETURN_IF_FAIL(RunParallelTasks(workers, run_phase1));
-    }
-    for (const Status& st : p1_errs) {
-      RETURN_IF_FAIL(st);
-    }
-    std::vector<uint32_t>().swap(key_to_rsubgid);
-    std::vector<uint32_t>().swap(pk0_subgid_lut);
-
-    const bool need_right_gi = std::ranges::any_of(
-        jit_dense_split.sel_items,
-        [](const auto& s) { return s.kind == 2 && s.vt != ValueType::kNull; });
-    const size_t sel_n = jit_dense_split.sel_items.size();
-    std::vector<std::vector<ColumnarChunk>> part_chunks(n_parts);
-    std::vector<std::vector<uint8_t>> part_col_nonnull(
-        n_parts, std::vector<uint8_t>(sel_n, 0));
-    std::atomic<size_t> next_p{0};
-    std::atomic<bool> any_inf{false};
-    std::atomic<uint64_t> total_matched_rows{0};
-
-    const auto run_phase2 = [&](size_t) {
-      std::vector<double> sums(kPartSize, 0.0);
-      std::vector<uint64_t> counts(jit_dense_split.is_avg ? kPartSize : 0, 0);
-      std::vector<uint64_t> matched_bits(kPartSize / 64, 0);
-      std::vector<uint64_t> nonnull_bits(kPartSize / 64, 0);
-      std::vector<uint32_t> matched_lgs;
-      matched_lgs.reserve(kPartSize);
-
-      while (true) {
-        const size_t p = next_p.fetch_add(1, std::memory_order_relaxed);
-        if (p >= n_parts) {
-          break;
-        }
-
-        size_t part_tuples = 0;
-        for (size_t w = 0; w < workers; ++w) {
-          part_tuples += worker_part_gids[w][p].size();
-        }
-        if (part_tuples == 0) {
-          continue;
-        }
-        total_matched_rows.fetch_add(part_tuples, std::memory_order_relaxed);
-
-        const size_t part_len =
-            std::min<size_t>(kPartSize, dom - (p << kPartShift));
-        const size_t n_words = (part_len + 63) >> 6;
-        std::fill_n(sums.data(), part_len, 0.0);
-        if (jit_dense_split.is_avg) {
-          std::fill_n(counts.data(), part_len, 0ULL);
-        }
-        std::fill_n(matched_bits.data(), n_words, 0ULL);
-        std::fill_n(nonnull_bits.data(), n_words, 0ULL);
-        uint8_t local_inf = 0;
-
-        for (size_t w = 0; w < workers; ++w) {
-          if (worker_part_gids[w][p].empty()) {
-            continue;
-          }
-          jit_dense_split.accum_k->Run(
-              static_cast<uint32_t>(worker_part_gids[w][p].size()),
-              worker_part_gids[w][p].data(), worker_part_vals[w][p].data(),
-              sums.data(), jit_dense_split.is_avg ? counts.data() : nullptr,
-              matched_bits.data(), nonnull_bits.data(), &local_inf);
-          std::vector<uint32_t>().swap(worker_part_gids[w][p]);
-          std::vector<double>().swap(worker_part_vals[w][p]);
-        }
-        if (jit_dense_split.raise_inf && local_inf != 0) {
-          any_inf.store(true, std::memory_order_relaxed);
-          return;
-        }
-
-        matched_lgs.clear();
-        for (size_t wi = 0; wi < n_words; ++wi) {
-          uint64_t mb = matched_bits[wi];
-          while (mb != 0) {
-            const auto bit = static_cast<uint32_t>(std::countr_zero(mb));
-            mb &= mb - 1;
-            matched_lgs.push_back(static_cast<uint32_t>((wi << 6) | bit));
-          }
-        }
-        if (matched_lgs.empty()) {
-          continue;
-        }
-
-        auto& out_pchunks = part_chunks[p];
-        out_pchunks.reserve((matched_lgs.size() + kColumnarChunkRows - 1) /
-                            kColumnarChunkRows);
-        for (size_t off = 0; off < matched_lgs.size();
-             off += kColumnarChunkRows) {
-          const size_t cnt =
-              std::min<size_t>(kColumnarChunkRows, matched_lgs.size() - off);
-          ColumnarChunk chunk;
-          chunk.rows = cnt;
-          chunk.columns.resize(sel_n);
-
-          std::shared_ptr<ChunkGatherIndex> right_gi;
-          if (need_right_gi) {
-            right_gi = std::make_shared<ChunkGatherIndex>();
-            right_gi->source_table = right_col_owner;
-            right_gi->src_chunks.resize(cnt);
-            right_gi->src_rows.resize(cnt);
-            for (size_t r = 0; r < cnt; ++r) {
-              const uint64_t gid = (p << kPartShift) | matched_lgs[off + r];
-              const uint32_t r_subgid =
-                  split_uses_right_subgid
-                      ? static_cast<uint32_t>(gid / pk0_card)
-                      : 0U;
-              const uint32_t r_idx =
-                  split_uses_right_subgid ? split_right_rep_ptr[r_subgid] : 0U;
-              const auto [rch, rr] = right_locator.Locate(r_idx);
-              right_gi->src_chunks[r] = static_cast<uint32_t>(rch);
-              right_gi->src_rows[r] = static_cast<uint32_t>(rr);
-            }
-          }
-
-          for (size_t c = 0; c < sel_n; ++c) {
-            const auto& item = jit_dense_split.sel_items[c];
-            ColumnarColumn& col = chunk.columns[c];
-            if (item.kind == 0) {
-              col.Init(ValueType::kDouble, false, false, 0);
-              col.doubles.resize(cnt);
-              double* dst = col.doubles.data();
-              bool any_null = false;
-              for (size_t r = 0; r < cnt; ++r) {
-                const uint32_t lg = matched_lgs[off + r];
-                if ((nonnull_bits[lg >> 6] & (uint64_t{1} << (lg & 63))) == 0) {
-                  any_null = true;
-                  dst[r] = 0.0;
-                } else {
-                  part_col_nonnull[p][c] = 1;
-                  dst[r] = jit_dense_split.is_avg
-                               ? (sums[lg] / static_cast<double>(counts[lg]))
-                               : sums[lg];
-                }
-              }
-              if (any_null) {
-                col.has_null = true;
-                col.nulls.assign(cnt, 0);
-                for (size_t r = 0; r < cnt; ++r) {
-                  const uint32_t lg = matched_lgs[off + r];
-                  if ((nonnull_bits[lg >> 6] & (uint64_t{1} << (lg & 63))) ==
-                      0) {
-                    col.nulls[r] = 1;
-                  }
-                }
-              }
-            } else if (item.kind == 1) {
-              TrySetConstantColumnarColumn(&col, ValueType::kNull, false, false,
-                                           item.constant, cnt, &chunk);
-              if (!item.constant.IsNull()) {
-                part_col_nonnull[p][c] = 1;
-              }
-            } else if (item.kind == 2) {
-              if (item.vt == ValueType::kNull) {
-                col.SetConstantNull(ValueType::kNull, item.is_unsigned,
-                                    item.is_interval, cnt);
-              } else {
-                col.SetGathered(right_gi, item.idx, item.vt, item.is_unsigned,
-                                item.is_interval, item.is_uniform,
-                                item.has_null);
-                if (!item.has_null) {
-                  part_col_nonnull[p][c] = 1;
-                } else {
-                  for (size_t r = 0; r < cnt; ++r) {
-                    if (!col.IsNull(r)) {
-                      part_col_nonnull[p][c] = 1;
-                      break;
-                    }
-                  }
-                }
-              }
-            } else {
-              const PreparedDeferredPkLookup& lkp =
-                  prepared_pk_lookups[item.idx];
-              const auto* rep_ptrs = pk0.subgid_rep_ptr;
-              const auto* blk_ptr = lkp.blocks.data();
-              col.Init(item.vt, item.is_unsigned, false, 0);
-              bool nonnull_seen = false;
-              if (item.vt == ValueType::kVarChar) {
-                col.encoding_owner = pk0.store_owner;
-                chunk.AppendKeepaliveUnique(pk0.store_owner);
-                col.strings.resize(cnt);
-                std::string_view* dst = col.strings.data();
-                for (size_t r = 0; r < cnt; ++r) {
-                  const auto sg = static_cast<uint32_t>(
-                      ((p << kPartShift) | matched_lgs[off + r]) % pk0_card);
-                  const auto [nb, rin] = rep_ptrs[sg];
-                  const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                  if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(cnt, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = {};
-                  } else {
-                    dst[r] = pb.pay_blk->VarcharAt(rin);
-                    nonnull_seen = true;
-                  }
-                }
-              } else if (item.vt == ValueType::kDouble) {
-                col.doubles.resize(cnt);
-                double* dst = col.doubles.data();
-                for (size_t r = 0; r < cnt; ++r) {
-                  const auto sg = static_cast<uint32_t>(
-                      ((p << kPartShift) | matched_lgs[off + r]) % pk0_card);
-                  const auto [nb, rin] = rep_ptrs[sg];
-                  const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                  if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(cnt, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0.0;
-                  } else {
-                    const auto dv = std::bit_cast<double>(pb.pay_cells[rin]);
-                    dst[r] = (dv == 0.0) ? 0.0 : dv;
-                    nonnull_seen = true;
-                  }
-                }
-              } else {
-                col.ints.resize(cnt);
-                int64_t* dst = col.ints.data();
-                for (size_t r = 0; r < cnt; ++r) {
-                  const auto sg = static_cast<uint32_t>(
-                      ((p << kPartShift) | matched_lgs[off + r]) % pk0_card);
-                  const auto [nb, rin] = rep_ptrs[sg];
-                  const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                  if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(cnt, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0;
-                  } else {
-                    dst[r] = pb.pay_cells[rin];
-                    nonnull_seen = true;
-                  }
-                }
-              }
-              if (nonnull_seen) {
-                part_col_nonnull[p][c] = 1;
-              }
-            }
-          }
-          out_pchunks.push_back(std::move(chunk));
-        }
-      }
-    };
-
-    const size_t p2_workers = std::min<size_t>(workers, n_parts);
-    if (p2_workers <= 1) {
-      run_phase2(0);
-    } else {
-      RETURN_IF_FAIL(RunParallelTasks(p2_workers, run_phase2));
-    }
-    if (any_inf.load(std::memory_order_relaxed)) {
-      return StatusError(StatusCode::kIsInfinity,
-                         "SUM overflow: result is infinite");
-    }
-
-    std::vector<uint8_t> any_col_nonnull(sel_n, 0);
-    for (size_t p = 0; p < n_parts; ++p) {
-      for (size_t c = 0; c < sel_n; ++c) {
-        any_col_nonnull[c] |= part_col_nonnull[p][c];
-      }
-    }
-
-    auto out_col = std::make_shared<ColumnarTable>();
-    if (right_col_owner != nullptr) {
-      out_col->AppendKeepalive(right_col_owner);
-    }
-    if (pk0.store_owner != nullptr) {
-      out_col->AppendKeepalive(pk0.store_owner);
-    }
-    for (size_t p = 0; p < n_parts; ++p) {
-      for (ColumnarChunk& ch : part_chunks[p]) {
-        if (ch.rows == 0) {
-          continue;
-        }
-        for (size_t c = 0; c < sel_n; ++c) {
-          if (any_col_nonnull[c] == 0 &&
-              jit_dense_split.sel_items[c].kind != 1) {
-            ch.columns[c].SetConstantNull(ValueType::kNull, false, false,
-                                          ch.rows);
-          }
-        }
-        out_col->AppendChunk(std::move(ch));
-      }
-    }
-
-    std::vector<Column> out_cols;
-    out_cols.reserve(sel_n);
-    const size_t out_total = out_col->total_rows;
-    for (size_t c = 0; c < sel_n; ++c) {
-      const auto& item = jit_dense_split.sel_items[c];
-      if (out_total == 0 || any_col_nonnull[c] == 0) {
-        out_cols.emplace_back(item.name, ValueType::kNull);
-      } else {
-        Column col_def(item.name, item.vt);
-        col_def.SetUnsigned(item.is_unsigned);
-        col_def.SetInterval(item.is_interval);
-        out_cols.push_back(std::move(col_def));
-      }
-    }
-    result.schema = Schema("", std::move(out_cols));
-    result.SetColumnarTable(std::move(out_col), out_total > 0);
-    result.hash_joins = left.hash_joins + right.hash_joins + 1;
-    result.in_memory_hash_joins =
-        left.in_memory_hash_joins + right.in_memory_hash_joins + 1;
-    result.nested_loop_joins = left.nested_loop_joins + right.nested_loop_joins;
-    result.hybrid_hash_joins = left.hybrid_hash_joins + right.hybrid_hash_joins;
-    result.join_comparisons =
-        left.join_comparisons + right.join_comparisons +
-        total_matched_rows.load(std::memory_order_relaxed);
-    result.peak_intermediate_rows =
-        std::max(result.peak_intermediate_rows, out_total);
-    if (result.runtime() != nullptr) {
-      ++result.runtime()->partitioned_aggregate_merges;
-    }
-    if (context.execution_runtime() != nullptr) {
-      ExecutionRuntime& runtime = *context.execution_runtime();
-      runtime.join_ms += ElapsedMs(join_begin);
-      ++runtime.grouped_join_fusions;
-    }
-    fusion->fired = true;
-    return std::optional<Relation>(std::move(result));
+        .Run();
   }
 
-  auto run_probe = [&](size_t w, FusedWorkerLocal& local,
-                       Row& scratch) -> Status {
-    const auto add_dw_double = [](DirectGidWorker& dw, size_t slot, double dv) {
-      const double prev = dw.doubles[slot];
-      const double next = prev + dv;
-      if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv)) {
-        dw.inf_flags[slot] = 1;
-      }
-      dw.doubles[slot] = next;
-      dw.counts[slot] += 1;
-    };
-    const auto add_dw_int = [](DirectGidWorker& dw, size_t slot, int64_t iv) {
-      int64_t next = 0;
-      if (__builtin_add_overflow(dw.ints[slot], iv, &next)) {
-        dw.inf_flags[slot] = 1;
-      } else {
-        dw.ints[slot] = next;
-      }
-      dw.counts[slot] += 1;
-    };
-    const auto charge_right_case_op = [&](const LeftNumericAgg& op,
-                                          size_t r_idx, bool has_right,
-                                          auto&& add_double, auto&& add_int,
-                                          auto&& add_count, auto&& as_double,
-                                          auto&& present) {
-      const uint8_t rc = has_right ? op.right_cond[r_idx] : uint8_t{0};
-      switch (op.op) {
-        case 10: {
-          if (rc == 1) {
-            double d0 = 0.0;
-            if (as_double(op.col0, &d0)) [[likely]] {
-              add_double(d0);
-            }
-          } else if (!op.case_else_null) {
-            add_double(0.0);
-          }
-          break;
-        }
-        case 11: {
-          if (rc == 1) {
-            double d0 = 0.0;
-            double d1 = 0.0;
-            if (as_double(op.col0, &d0) && as_double(op.col1, &d1)) [[likely]] {
-              add_double(d0 * (op.scale - d1));
-            }
-          } else if (!op.case_else_null) {
-            add_double(0.0);
-          }
-          break;
-        }
-        case 12:
-          if (rc == 1) {
-            add_int(1);
-          } else if (!op.case_else_null) {
-            add_count();
-          }
-          break;
-        case 13:
-          if (rc == 1) {
-            if (op.case_val_kind == 1 ||
-                (op.case_val_kind == 2 && present(op.col0)) ||
-                (op.case_val_kind == 3 && present(op.col0) &&
-                 present(op.col1))) {
-              add_count();
-            }
-          } else if (!op.case_else_null) {
-            add_count();
-          }
-          break;
-        default:
-          break;
-      }
-    };
-    const auto charge_numeric_with = [&](size_t r_idx, bool has_right,
-                                         auto&& add_double_fn,
-                                         auto&& add_int_fn, auto&& inc_count_fn,
-                                         auto&& add_stat_fn, auto&& as_double,
-                                         auto&& as_int, auto&& present) {
-      for (size_t i = 0; i < agg_count; ++i) {
-        const LeftNumericAgg& op = left_numeric[i];
-        switch (op.op) {
-          case 0:
-            inc_count_fn(i);
-            break;
-          case 1:
-          case 6: {
-            double d0 = 0;
-            double d1 = 0;
-            if (!as_double(op.col0, &d0) || !as_double(op.col1, &d1)) {
-              break;
-            }
-            add_double_fn(i, op.op == 1 ? d0 * d1 : d0 * (op.scale - d1));
-            break;
-          }
-          case 2: {
-            double d0 = 0;
-            if (!as_double(op.col0, &d0)) {
-              break;
-            }
-            add_double_fn(i, d0);
-            break;
-          }
-          case 3: {
-            int64_t iv = 0;
-            if (!as_int(op.col0, &iv)) {
-              break;
-            }
-            add_int_fn(i, iv);
-            break;
-          }
-          case 4:
-            if (present(op.col0)) {
-              inc_count_fn(i);
-            }
-            break;
-          case 7:
-            if (present(op.col0) && present(op.col1)) {
-              inc_count_fn(i);
-            }
-            break;
-          case 8: {
-            platform::ExtendedFloat x = 0;
-            if (op.is_int_col) {
-              int64_t iv = 0;
-              if (!as_int(op.col0, &iv)) {
-                break;
-              }
-              x = static_cast<platform::ExtendedFloat>(iv);
-            } else {
-              double d0 = 0;
-              if (!as_double(op.col0, &d0)) {
-                break;
-              }
-              x = static_cast<platform::ExtendedFloat>(d0);
-            }
-            add_stat_fn(i, x);
-            break;
-          }
-          case 10:
-          case 11:
-          case 12:
-          case 13:
-            charge_right_case_op(
-                op, r_idx, has_right, [&](double dv) { add_double_fn(i, dv); },
-                [&](int64_t iv) { add_int_fn(i, iv); },
-                [&]() { inc_count_fn(i); }, as_double, present);
-            break;
-          case 17: {
-            double d0 = 0.0;
-            double d1 = 0.0;
-            const double dv =
-                (as_double(op.col0, &d0) && as_double(op.col1, &d1)) ? (d0 * d1)
-                                                                     : 0.0;
-            add_double_fn(i, dv);
-            break;
-          }
-          default:
-            break;
-        }
-      }
-    };
-    const auto charge_numeric = [&](DirectGidWorker& dw, uint32_t gid,
-                                    size_t r_idx, auto&& as_double,
-                                    auto&& as_int, auto&& present) {
-      dw.matched[gid] = 1;
-      if (single_double_sum) {
-        const LeftNumericAgg& op = left_numeric[0];
-        if (op.op == 1 || op.op == 6) {
-          double d0 = 0.0;
-          double d1 = 0.0;
-          if (as_double(op.col0, &d0) && as_double(op.col1, &d1)) {
-            add_dw_double(dw, gid, op.op == 1 ? d0 * d1 : d0 * (op.scale - d1));
-          }
-          return;
-        }
-        if (op.op == 2) {
-          double d0 = 0.0;
-          if (as_double(op.col0, &d0)) {
-            add_dw_double(dw, gid, d0);
-          }
-          return;
-        }
-      }
-      const size_t base = static_cast<size_t>(gid) * agg_count;
-      charge_numeric_with(
-          r_idx, true,
-          [&](size_t i, double dv) { add_dw_double(dw, base + i, dv); },
-          [&](size_t i, int64_t iv) { add_dw_int(dw, base + i, iv); },
-          [&](size_t i) { dw.counts[base + i] += 1; },
-          [&](size_t i, platform::ExtendedFloat x) {
-            const size_t slot = base + i;
-            dw.ext_sx[slot] += x;
-            dw.ext_sxx[slot] += x * x;
-            dw.counts[slot] += 1;
-          },
-          as_double, as_int, present);
-    };
-    const auto charge_group_numeric = [&](FusedGroup& group, size_t r_idx,
-                                          bool has_right, auto&& as_double,
-                                          auto&& as_int, auto&& present) {
-      charge_numeric_with(
-          r_idx, has_right,
-          [&](size_t i, double dv) {
-            const double prev = group.RawDoubles()[i];
-            const double next = prev + dv;
-            if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv)) {
-              group.RawInfFlags()[i] = 1;
-            }
-            group.RawDoubles()[i] = next;
-            group.RawCounts()[i] += 1;
-          },
-          [&](size_t i, int64_t iv) {
-            int64_t next = 0;
-            if (__builtin_add_overflow(group.RawInts()[i], iv, &next)) {
-              group.RawInfFlags()[i] = 1;
-            } else {
-              group.RawInts()[i] = next;
-            }
-            group.RawCounts()[i] += 1;
-          },
-          [&](size_t i) { group.RawCounts()[i] += 1; },
-          [&](size_t i, platform::ExtendedFloat x) {
-            group.RawStatX()[i] += x;
-            group.RawStatXX()[i] += x * x;
-            group.RawCounts()[i] += 1;
-          },
-          as_double, as_int, present);
-    };
-    const auto scatter_radix_tuple =
-        [&](size_t worker_id, uint64_t ukey, auto&& as_double, auto&& as_int,
-            auto&& present, auto&& eval_op9) -> Status {
-      const LeftNumericAgg& rop = left_numeric[radix_primary];
-      uint64_t t_bits = 0;
-      uint8_t t_valid = 0;
-      if (radix_tuple_is_int) {
-        int64_t iv = 0;
-        if (as_int(rop.col0, &iv)) [[likely]] {
-          t_bits = static_cast<uint64_t>(iv);
-          t_valid = 1;
-        }
-      } else {
-        switch (rop.op) {
-          case 0:
-            t_valid = 1;
-            break;
-          case 1:
-          case 6: {
-            double d0 = 0.0;
-            double d1 = 0.0;
-            if (as_double(rop.col0, &d0) && as_double(rop.col1, &d1))
-                [[likely]] {
-              const double dv = rop.op == 1 ? d0 * d1 : d0 * (rop.scale - d1);
-              t_bits = std::bit_cast<uint64_t>(dv);
-              t_valid = 1;
-            }
-            break;
-          }
-          case 2:
-          case 8: {
-            double dv = 0.0;
-            if (as_double(rop.col0, &dv)) [[likely]] {
-              t_bits = std::bit_cast<uint64_t>(dv);
-              t_valid = 1;
-            }
-            break;
-          }
-          case 4:
-            if (present(rop.col0)) [[likely]] {
-              t_valid = 1;
-            }
-            break;
-          case 5:
-            break;
-          case 7:
-            if (present(rop.col0) && present(rop.col1)) [[likely]] {
-              t_valid = 1;
-            }
-            break;
-          case 9: {
-            double dv = 0.0;
-            bool is_null = false;
-            RETURN_IF_FAIL(eval_op9(rop.orig_agg, &dv, &is_null));
-            if (!is_null) [[likely]] {
-              t_bits = std::bit_cast<uint64_t>(dv);
-              t_valid = 1;
-            }
-            break;
-          }
-          case 17: {
-            double d0 = 0.0;
-            double d1 = 0.0;
-            const double dv =
-                (as_double(rop.col0, &d0) && as_double(rop.col1, &d1))
-                    ? (d0 * d1)
-                    : 0.0;
-            t_bits = std::bit_cast<uint64_t>(dv);
-            t_valid = 1;
-            break;
-          }
-          default:
-            break;
-        }
-      }
-      RadixSoABucket& bucket =
-          worker_radix_buckets[worker_id][radix_bucket_of(ukey)];
-      bucket.keys.push_back(ukey);
-      bucket.valids.push_back(t_valid);
-      if (radix_tuple_is_int) {
-        bucket.ivals.push_back(static_cast<int64_t>(t_bits));
-      } else {
-        bucket.dvals.push_back(std::bit_cast<double>(t_bits));
-      }
-      return Status::kSuccess;
-    };
-    const uint32_t* const right_gids =
-        identity_right_gid ? nullptr : right_row_gid.data();
-    const auto gid_of = [&](uint32_t r_idx) -> uint32_t {
-      return right_gids == nullptr ? r_idx : right_gids[r_idx];
-    };
-    if (deferred_left_probe != nullptr) {
-      // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
-      //   (interleaved_worker_partition_bijection_sound)
-      // Assign 64-block stripes deterministically across workers (`w, w+W,
-      // ...`) so parallel floating-point / ROLLUP partial sums are 100%
-      // reproducible across runs while preserving PK-cursor locality and
-      // date-range balance.
-      const LSTableStore& store = *deferred_left_probe->store;
-      const size_t total_blocks = store.blocks.size();
-      size_t stripe_idx = w;
-      size_t block_cursor = 0, block_end = 0;
-      const auto next_block = [&]() {
-        if (block_cursor == block_end) {
-          block_cursor = stripe_idx * 64;
-          block_end = block_cursor + 64;
-          stripe_idx += workers;
-        }
-        return block_cursor++;
-      };
-      const size_t base_proj_cols = deferred_left_probe->projection.size();
-      const auto* peek_ptr = deferred_left_probe->integer_peeks.empty()
-                                 ? nullptr
-                                 : &deferred_left_probe->integer_peeks;
-      const ScanRuntimeFilter& primary_rf = deferred_left_probe->runtime_filter;
-      const RuntimeFilterGroup* active_rf_group =
-          primary_rf.enabled() ? primary_rf.group.get() : nullptr;
-      const std::optional<slot_t> full_rf_col =
-          (active_rf_group != nullptr && primary_rf.column < base_proj_cols)
-              ? std::optional<slot_t>(
-                    deferred_left_probe->projection[primary_rf.column])
-              : std::nullopt;
-      const bool rf_has_dense =
-          active_rf_group != nullptr && active_rf_group->has_dense_bits();
-      const uint64_t* const rf_dense_bits =
-          rf_has_dense ? active_rf_group->dense_bits_data() : nullptr;
-      const size_t rf_dense_words =
-          rf_has_dense ? active_rf_group->dense_bits_word_count() : 0;
-      const int64_t rf_lo = rf_has_dense ? active_rf_group->Lo() : 0;
-      const int64_t rf_hi = rf_has_dense ? active_rf_group->Hi() : 0;
-      const bool rf_col_monotonic =
-          rf_has_dense && full_rf_col.has_value() &&
-          *full_rf_col < store.column_is_monotonic.size() &&
-          store.column_is_monotonic[*full_rf_col] != 0;
-      Row left_row;
-      left_row.values_.resize(left_width);
-      for (size_t c = 0; c < base_proj_cols; ++c) {
-        if (def_overwritten_by_pk[c] == 0) {
-          left_row.values_[c].type = def_base_types[c];
-        }
-      }
-      struct DefPkGroupCursor {
-        int64_t last_key{std::numeric_limits<int64_t>::min()};
-        bool have_last{false};
-        bool last_matched{false};
-        uint32_t last_nb{0};
-        uint32_t last_row_in_blk{0};
-        uint32_t last_subgid{0};
-      };
-      std::array<DefPkGroupCursor, 4> pk_group_cursors{};
-      std::array<const LSTableColumnBlock*, 16> proj_cols{};
-      std::array<const int64_t*, 16> proj_int_ptrs{};
-      std::array<uint8_t, 16> proj_has_null{};
-      const auto write_pk_group_payloads = [&](size_t gi,
-                                               const DefPkGroupCursor& cur) {
-        const uint32_t nb = cur.last_nb;
-        const uint32_t rin = cur.last_row_in_blk;
-        for (const size_t li : def_pk_groups[gi].lookup_indices) {
-          const PreparedDeferredPkLookup& lkp = prepared_pk_lookups[li];
-          const PreparedDeferredPkBlock& bm = lkp.blocks[nb];
-          Value& dst = left_row.values_[lkp.target_proj_col];
-          if (bm.has_null_payload != 0 && bm.pay_blk->IsNull(rin))
-              [[unlikely]] {
-            dst = Value();
-          } else if (lkp.payload_type == ValueType::kVarChar) {
-            dst.type = ValueType::kVarChar;
-            dst.SetCollation(0);
-            dst.owned_data.clear();
-            dst.value.varchar_value = bm.pay_blk->VarcharAt(rin);
-          } else if (lkp.payload_type == ValueType::kDouble) {
-            dst.type = ValueType::kDouble;
-            dst.SetCollation(0);
-            dst.value.double_value = std::bit_cast<double>(bm.pay_cells[rin]);
-          } else {
-            dst.type = lkp.payload_type;
-            dst.SetCollation(0);
-            if (lkp.payload_unsigned) {
-              dst.SetUnsigned();
-            }
-            dst.value.int_value = bm.pay_cells[rin];
-          }
-        }
-      };
-      const auto resolve_def_pk_groups = [&](uint32_t r,
-                                             bool write_all_payloads) -> bool {
-        local.have_cur_pk_subgids = false;
-        for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
-          const PreparedDeferredPkGroup& grp = def_pk_groups[gi];
-          DefPkGroupCursor& cur = pk_group_cursors[gi];
-          if (proj_has_null[grp.pk_col] != 0 &&
-              proj_cols[grp.pk_col]->IsNull(r)) [[unlikely]] {
-            return false;
-          }
-          const int64_t k = proj_int_ptrs[grp.pk_col][r];
-          if (k < grp.min_k || k > grp.max_k) [[unlikely]] {
-            return false;
-          }
-          if (!cur.have_last || k != cur.last_key) {
-            if (grp.dense_ptr != nullptr) {
-              const auto& entry = grp.dense_ptr[static_cast<size_t>(
-                  static_cast<uint64_t>(k) - static_cast<uint64_t>(grp.min_k))];
-              cur.last_key = k;
-              cur.have_last = true;
-              if (entry.nb == std::numeric_limits<uint32_t>::max())
-                  [[unlikely]] {
-                cur.last_matched = false;
-                return false;
-              }
-              cur.last_nb = entry.nb;
-              cur.last_row_in_blk = entry.rin;
-              cur.last_matched = true;
-              if (grp.use_subgid) {
-                cur.last_subgid = entry.subgid;
-              }
-            } else {
-              const auto nb_count = static_cast<uint32_t>(grp.blocks.size());
-              const auto* const meta_ptr = grp.blocks.data();
-              uint32_t nb = cur.last_nb;
-              if (nb >= nb_count || k > meta_ptr[nb].max_k ||
-                  k < meta_ptr[nb].min_k) {
-                if (nb + 1 < nb_count && k <= meta_ptr[nb + 1].max_k &&
-                    k >= meta_ptr[nb + 1].min_k) {
-                  nb = nb + 1;
-                } else {
-                  const auto b = static_cast<size_t>(
-                      (static_cast<__uint128_t>(
-                           static_cast<uint64_t>(k) -
-                           static_cast<uint64_t>(grp.min_k))
-                       << PreparedDeferredPkLookup::kDirShift) /
-                      grp.span);
-                  const uint32_t lo = grp.bucket_lo[b];
-                  const uint32_t hi = std::min<uint32_t>(
-                      nb_count - 1, grp.bucket_lo[b + 1] + 1);
-                  if (hi - lo <= 4) {
-                    nb = lo;
-                    while (nb < hi && meta_ptr[nb].max_k < k) {
-                      ++nb;
-                    }
-                  } else {
-                    const auto it =
-                        std::lower_bound(grp.blk_max_keys.begin() + lo,
-                                         grp.blk_max_keys.begin() + hi + 1, k);
-                    nb = static_cast<uint32_t>(
-                        std::distance(grp.blk_max_keys.begin(), it));
-                  }
-                }
-              }
-              const bool same_blk_monotonic =
-                  cur.have_last && nb == cur.last_nb && k > cur.last_key;
-              if (nb != cur.last_nb) {
-                cur.last_row_in_blk = 0;
-              }
-              cur.last_nb = nb;
-              cur.last_key = k;
-              cur.have_last = true;
-              const auto& bm = meta_ptr[nb];
-              if (k < bm.min_k || k > bm.max_k) [[unlikely]] {
-                cur.last_matched = false;
-                return false;
-              }
-              uint32_t row_in_blk = bm.row_count;
-              if (bm.dense_contiguous != 0) {
-                row_in_blk = static_cast<uint32_t>(
-                    static_cast<uint64_t>(k) - static_cast<uint64_t>(bm.min_k));
-                cur.last_row_in_blk = row_in_blk;
-              } else {
-                const int64_t* const begin_ptr = bm.pk_cells;
-                const int64_t* const end_ptr = begin_ptr + bm.row_count;
-                const int64_t* search_begin = begin_ptr;
-                const int64_t* search_end = end_ptr;
-                if (same_blk_monotonic && cur.last_row_in_blk < bm.row_count) {
-                  const uint32_t cur_r = cur.last_row_in_blk;
-                  if (begin_ptr[cur_r] == k) {
-                    row_in_blk = cur_r;
-                    search_begin = end_ptr;
-                  } else if (begin_ptr[cur_r] < k) {
-                    if (cur_r + 1 < bm.row_count && begin_ptr[cur_r + 1] == k) {
-                      row_in_blk = cur_r + 1;
-                      search_begin = end_ptr;
-                    } else {
-                      search_begin = begin_ptr + cur_r + 1;
-                      if (cur_r + 16 < bm.row_count &&
-                          begin_ptr[cur_r + 16] >= k) {
-                        search_end = begin_ptr + cur_r + 17;
-                      } else if (cur_r + 64 < bm.row_count &&
-                                 begin_ptr[cur_r + 64] >= k) {
-                        search_begin = begin_ptr + cur_r + 16;
-                        search_end = begin_ptr + cur_r + 65;
-                      }
-                    }
-                  }
-                }
-                if (search_begin < search_end) {
-                  const int64_t* const found_ptr =
-                      std::lower_bound(search_begin, search_end, k);
-                  const auto off = static_cast<uint32_t>(found_ptr - begin_ptr);
-                  cur.last_row_in_blk = off;
-                  if (found_ptr != search_end && *found_ptr == k) [[likely]] {
-                    row_in_blk = off;
-                  }
-                } else {
-                  cur.last_row_in_blk = row_in_blk;
-                }
-              }
-              if (row_in_blk >= bm.row_count) [[unlikely]] {
-                cur.last_matched = false;
-                return false;
-              }
-              cur.last_matched = true;
-              if (grp.use_subgid) {
-                cur.last_subgid = grp.subgid_ptr[bm.row_base + row_in_blk];
-              }
-            }
-          } else if (!cur.last_matched) [[unlikely]] {
-            return false;
-          }
-          if (grp.use_subgid) {
-            local.cur_pk_subgids[gi] = cur.last_subgid;
-          }
-          if (write_all_payloads) {
-            write_pk_group_payloads(gi, cur);
-          }
-        }
-        local.have_cur_pk_subgids = true;
-        return true;
-      };
-      const auto write_base_left_cols = [&](uint32_t r) {
-        for (size_t c = 0; c < base_proj_cols; ++c) {
-          if (def_overwritten_by_pk[c] != 0) {
-            continue;
-          }
-          Value& dst = left_row.values_[c];
-          if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) [[unlikely]] {
-            dst = Value();
-            continue;
-          }
-          const ValueType vt = def_base_types[c];
-          dst.type = vt;
-          const int64_t raw = proj_int_ptrs[c][r];
-          if (vt == ValueType::kDouble) {
-            dst.value.double_value = std::bit_cast<double>(raw);
-          } else {
-            dst.value.int_value = raw;
-          }
-        }
-      };
-      const auto finish_lazy_left_row = [&](uint32_t r) {
-        for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
-          write_pk_group_payloads(gi, pk_group_cursors[gi]);
-        }
-        write_base_left_cols(r);
-      };
-      const auto materialize_current_left_row = [&](uint32_t r) -> bool {
-        if (!def_pk_groups.empty() && !resolve_def_pk_groups(r, true)) {
-          return false;
-        }
-        write_base_left_cols(r);
-        return true;
-      };
-      const auto read_def_left_raw = [&](size_t c, uint32_t r, int64_t* out_raw,
-                                         ValueType* out_type,
-                                         bool* out_unsigned) -> bool {
-        const int8_t li = c < 16 ? def_col_to_pk_lookup[c] : int8_t{-1};
-        if (li >= 0) {
-          const PreparedDeferredPkLookup& lkp =
-              prepared_pk_lookups[static_cast<size_t>(li)];
-          if (lkp.payload_type == ValueType::kVarChar) {
-            return false;
-          }
-          const DefPkGroupCursor& cur = pk_group_cursors[lkp.group_idx];
-          const PreparedDeferredPkBlock& bm = lkp.blocks[cur.last_nb];
-          if (bm.has_null_payload != 0 &&
-              bm.pay_blk->IsNull(cur.last_row_in_blk)) [[unlikely]] {
-            return false;
-          }
-          *out_raw = bm.pay_cells[cur.last_row_in_blk];
-          *out_type = lkp.payload_type;
-          *out_unsigned = lkp.payload_unsigned;
-          return true;
-        }
-        if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) [[unlikely]] {
-          return false;
-        }
-        *out_raw = proj_int_ptrs[c][r];
-        *out_type = def_base_types[c];
-        *out_unsigned = false;
-        return true;
-      };
-      const auto read_pair_raw_int = [&](slot_t col, uint32_t r, uint32_t r_idx,
-                                         int64_t* out_val, ValueType* out_type,
-                                         bool* out_unsigned) -> bool {
-        if (col < left_width) {
-          return read_def_left_raw(col, r, out_val, out_type, out_unsigned);
-        }
-        Value rv_tmp;
-        const Value& v = read_right_cell(r_idx, col - left_width, &rv_tmp);
-        if (v.IsNull()) [[unlikely]] {
-          return false;
-        }
-        *out_val = v.value.int_value;
-        *out_type = v.type;
-        *out_unsigned = v.IsUnsigned();
-        return true;
-      };
-      const auto eval_double_arith_cells = [&](size_t agg_idx, uint32_t r,
-                                               uint32_t r_idx, double* out,
-                                               bool* is_null) -> Status {
-        const CompiledDefDoubleArith& plan = compiled_double_arith[agg_idx];
-        switch (plan.pattern) {
-          case CompiledDefDoubleArith::Pattern::kSubSubAddDivConst: {
-            const uint32_t c0 = plan.fast_cols[0];
-            const uint32_t c1 = plan.fast_cols[1];
-            const uint32_t c2 = plan.fast_cols[2];
-            const uint32_t c3 = plan.fast_cols[3];
-            if ((proj_has_null[c0] | proj_has_null[c1] | proj_has_null[c2] |
-                 proj_has_null[c3]) == 0) [[likely]] {
-              const auto v0 = std::bit_cast<double>(proj_int_ptrs[c0][r]);
-              const auto v1 = std::bit_cast<double>(proj_int_ptrs[c1][r]);
-              const auto v2 = std::bit_cast<double>(proj_int_ptrs[c2][r]);
-              const auto v3 = std::bit_cast<double>(proj_int_ptrs[c3][r]);
-              *out = (((v0 - v1) - v2) + v3) / plan.fast_div;
-              *is_null = false;
-              return Status::kSuccess;
-            }
-            if ((proj_has_null[c0] != 0 && proj_cols[c0]->IsNull(r)) ||
-                (proj_has_null[c1] != 0 && proj_cols[c1]->IsNull(r)) ||
-                (proj_has_null[c2] != 0 && proj_cols[c2]->IsNull(r)) ||
-                (proj_has_null[c3] != 0 && proj_cols[c3]->IsNull(r))) {
-              *is_null = true;
-              return Status::kSuccess;
-            }
-            const auto v0 = std::bit_cast<double>(proj_int_ptrs[c0][r]);
-            const auto v1 = std::bit_cast<double>(proj_int_ptrs[c1][r]);
-            const auto v2 = std::bit_cast<double>(proj_int_ptrs[c2][r]);
-            const auto v3 = std::bit_cast<double>(proj_int_ptrs[c3][r]);
-            *out = (((v0 - v1) - v2) + v3) / plan.fast_div;
-            *is_null = false;
-            return Status::kSuccess;
-          }
-          case CompiledDefDoubleArith::Pattern::kSubDivConst: {
-            const uint32_t c0 = plan.fast_cols[0];
-            const uint32_t c1 = plan.fast_cols[1];
-            if ((proj_has_null[c0] | proj_has_null[c1]) != 0 &&
-                ((proj_has_null[c0] != 0 && proj_cols[c0]->IsNull(r)) ||
-                 (proj_has_null[c1] != 0 && proj_cols[c1]->IsNull(r)))) {
-              *is_null = true;
-              return Status::kSuccess;
-            }
-            const auto v0 = std::bit_cast<double>(proj_int_ptrs[c0][r]);
-            const auto v1 = std::bit_cast<double>(proj_int_ptrs[c1][r]);
-            *out = (v0 - v1) / plan.fast_div;
-            *is_null = false;
-            return Status::kSuccess;
-          }
-          case CompiledDefDoubleArith::Pattern::kSub:
-          case CompiledDefDoubleArith::Pattern::kAdd: {
-            const uint32_t c0 = plan.fast_cols[0];
-            const uint32_t c1 = plan.fast_cols[1];
-            if ((proj_has_null[c0] | proj_has_null[c1]) != 0 &&
-                ((proj_has_null[c0] != 0 && proj_cols[c0]->IsNull(r)) ||
-                 (proj_has_null[c1] != 0 && proj_cols[c1]->IsNull(r)))) {
-              *is_null = true;
-              return Status::kSuccess;
-            }
-            const auto v0 = std::bit_cast<double>(proj_int_ptrs[c0][r]);
-            const auto v1 = std::bit_cast<double>(proj_int_ptrs[c1][r]);
-            *out = plan.pattern == CompiledDefDoubleArith::Pattern::kSub
-                       ? (v0 - v1)
-                       : (v0 + v1);
-            *is_null = false;
-            return Status::kSuccess;
-          }
-          case CompiledDefDoubleArith::Pattern::kGeneral:
-            break;
-        }
-        std::array<double, 16> values{};
-        std::array<uint8_t, 16> nulls{};
-        size_t depth = 0;
-        for (const CompiledDefDoubleArith::Step& st : plan.steps) {
-          switch (st.kind) {
-            case 0: {
-              const uint32_t col = st.operand;
-              if (proj_has_null[col] != 0 && proj_cols[col]->IsNull(r))
-                  [[unlikely]] {
-                nulls[depth] = 1;
-              } else {
-                nulls[depth] = 0;
-                values[depth] = std::bit_cast<double>(proj_int_ptrs[col][r]);
-              }
-              ++depth;
-              break;
-            }
-            case 8: {
-              const uint32_t col = st.operand;
-              if (proj_has_null[col] != 0 && proj_cols[col]->IsNull(r))
-                  [[unlikely]] {
-                nulls[depth] = 1;
-              } else {
-                nulls[depth] = 0;
-                values[depth] = static_cast<double>(proj_int_ptrs[col][r]);
-              }
-              ++depth;
-              break;
-            }
-            case 1: {
-              Value rv_tmp;
-              const Value& v = read_right_cell(r_idx, st.operand, &rv_tmp);
-              nulls[depth] = static_cast<uint8_t>(v.IsNull());
-              if (!nulls[depth]) {
-                values[depth] = v.value.double_value;
-              }
-              ++depth;
-              break;
-            }
-            case 2:
-              values[depth] = st.cst;
-              nulls[depth++] = 0;
-              break;
-            case 3: {
-              const size_t rhs = --depth;
-              const size_t lhs = depth - 1;
-              nulls[lhs] |= nulls[rhs];
-              if (!nulls[lhs]) [[likely]] {
-                values[lhs] += values[rhs];
-              }
-              break;
-            }
-            case 4: {
-              const size_t rhs = --depth;
-              const size_t lhs = depth - 1;
-              nulls[lhs] |= nulls[rhs];
-              if (!nulls[lhs]) [[likely]] {
-                values[lhs] -= values[rhs];
-              }
-              break;
-            }
-            case 5: {
-              const size_t rhs = --depth;
-              const size_t lhs = depth - 1;
-              nulls[lhs] |= nulls[rhs];
-              if (!nulls[lhs]) [[likely]] {
-                values[lhs] *= values[rhs];
-              }
-              break;
-            }
-            case 6: {
-              const size_t rhs = --depth;
-              const size_t lhs = depth - 1;
-              nulls[lhs] |= nulls[rhs];
-              if (!nulls[lhs]) [[likely]] {
-                if (values[rhs] == 0.0) {
-                  return StatusError(StatusCode::kIsInfinity,
-                                     "division by zero");
-                }
-                const double quotient = values[lhs] / values[rhs];
-                if (std::isfinite(values[lhs]) && std::isfinite(values[rhs]) &&
-                    std::isinf(quotient)) {
-                  return StatusError(StatusCode::kIsInfinity,
-                                     "double overflow");
-                }
-                values[lhs] = quotient;
-              }
-              break;
-            }
-            case 7: {
-              const size_t lhs = depth - 1;
-              if (!nulls[lhs]) [[likely]] {
-                values[lhs] /= st.cst;
-              }
-              break;
-            }
-            default:
-              break;
-          }
-        }
-        *out = values[0];
-        *is_null = nulls[0] != 0;
-        return Status::kSuccess;
-      };
-      const auto read_def_agg_double = [&](int32_t col, uint32_t r,
-                                           double* out) noexcept -> bool {
-        const auto c = static_cast<size_t>(col);
-        if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) [[unlikely]] {
-          return false;
-        }
-        const int64_t raw = proj_int_ptrs[c][r];
-        *out = def_base_types[c] == ValueType::kDouble
-                   ? std::bit_cast<double>(raw)
-                   : static_cast<double>(raw);
-        return true;
-      };
-      const auto read_def_agg_int = [&](int32_t col, uint32_t r,
-                                        int64_t* out) noexcept -> bool {
-        const auto c = static_cast<size_t>(col);
-        if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) [[unlikely]] {
-          return false;
-        }
-        *out = proj_int_ptrs[c][r];
-        return true;
-      };
-      const auto eval_pk_eq_cond =
-          [&](const LeftNumericAgg& op) noexcept -> bool {
-        const PreparedDeferredPkLookup& lkp =
-            prepared_pk_lookups[static_cast<size_t>(op.pk_lookup_idx)];
-        const DefPkGroupCursor& cur = pk_group_cursors[lkp.group_idx];
-        const PreparedDeferredPkBlock& blk = lkp.blocks[cur.last_nb];
-        if (blk.has_null_payload != 0 &&
-            blk.pay_blk->IsNull(cur.last_row_in_blk)) {
-          return false;
-        }
-        return blk.pay_cells[cur.last_row_in_blk] == op.pk_eq_val;
-      };
-      const auto process_def_match = [&](uint32_t r, uint32_t r_idx) -> Status {
-        if (def_compact_split_probe) {
-          if (!def_pk_groups.empty() && !resolve_def_pk_groups(r, false)) {
-            return Status::kSuccess;
-          }
-          const uint32_t r_subgid =
-              !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-          uint64_t pk_packed = 0;
-          bool pk_ok = true;
-          if (split_uses_pk_subgid) {
-            for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
-              if (def_pk_groups[gi].use_subgid) {
-                if (local.cur_pk_subgids[gi] ==
-                    std::numeric_limits<uint32_t>::max()) [[unlikely]] {
-                  pk_ok = false;
-                  break;
-                }
-                pk_packed |= static_cast<uint64_t>(local.cur_pk_subgids[gi])
-                             << def_pk_groups[gi].subgid_shift;
-              }
-            }
-          }
-          if (r_subgid != std::numeric_limits<uint32_t>::max() && pk_ok)
-              [[likely]] {
-            uint64_t packed_u64 = pk_packed;
-            if (split_uses_right_subgid) {
-              packed_u64 |= static_cast<uint64_t>(r_subgid)
-                            << split_right_shift;
-            }
-            if (compact_raw_left_key) {
-              const size_t col = *split_left_slot;
-              int64_t value = 0;
-              ValueType type = ValueType::kNull;
-              bool is_unsigned = false;
-              if (!read_def_left_raw(col, r, &value, &type, &is_unsigned) ||
-                  type != split_left_type || is_unsigned ||
-                  !std::in_range<int32_t>(value)) [[unlikely]] {
-                return StatusError(
-                    StatusCode::kCorrupt,
-                    "packed COUNT key differs from scan metadata");
-              }
-              packed_u64 |= static_cast<uint32_t>(static_cast<int32_t>(value));
-            }
-            ++local.comparisons;
-            return record_compact_split(local, packed_u64);
-          }
-          return Status::kSuccess;
-        }
-        if (def_group_cell_probe) {
-          if (!def_pk_groups.empty() && !resolve_def_pk_groups(r, false)) {
-            return Status::kSuccess;
-          }
-          if (use_dense_split_direct_gid) {
-            const uint32_t r_subgid =
-                !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-            if (r_subgid == std::numeric_limits<uint32_t>::max()) [[unlikely]] {
-              return Status::kSuccess;
-            }
-            uint32_t gid = r_subgid;
-            for (const size_t gi : dense_pk_group_indices) {
-              const uint32_t psg = local.cur_pk_subgids[gi];
-              if (psg == std::numeric_limits<uint32_t>::max()) [[unlikely]] {
-                return Status::kSuccess;
-              }
-              gid = (gid * def_pk_groups[gi].subgid_count) + psg;
-            }
-            ++local.comparisons;
-            DirectGidWorker& dw = direct_gid_workers[w];
-            if (use_packed_double_cells) {
-              DirectDoubleCell& cell = dw.double_cells[gid];
-              cell.meta |= 1ULL;
-              const auto charge_packed = [&](double dv) noexcept {
-                const double prev = cell.sum;
-                const double next = prev + dv;
-                uint64_t meta = (cell.meta + 4ULL) | 1ULL;
-                if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv))
-                    [[unlikely]] {
-                  meta |= 2ULL;
-                }
-                cell.sum = next;
-                cell.meta = meta;
-              };
-              const LeftNumericAgg& op = left_numeric[0];
-              switch (op.op) {
-                case 1:
-                case 6: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  if (read_def_agg_double(op.col0, r, &d0) &&
-                      read_def_agg_double(op.col1, r, &d1)) [[likely]] {
-                    charge_packed(op.op == 1 ? d0 * d1 : d0 * (op.scale - d1));
-                  }
-                  break;
-                }
-                case 2: {
-                  double dv = 0.0;
-                  if (read_def_agg_double(op.col0, r, &dv)) [[likely]] {
-                    charge_packed(dv);
-                  }
-                  break;
-                }
-                case 9: {
-                  double dv = 0.0;
-                  bool is_null = false;
-                  RETURN_IF_FAIL(
-                      eval_double_arith_cells(static_cast<size_t>(op.orig_agg),
-                                              r, r_idx, &dv, &is_null));
-                  if (!is_null) [[likely]] {
-                    charge_packed(dv);
-                  }
-                  break;
-                }
-                case 10:
-                case 11:
-                  charge_right_case_op(
-                      op, r_idx, true, [&](double dv) { charge_packed(dv); },
-                      [&](int64_t) {}, []() {},
-                      [&](int32_t col, double* out) {
-                        return read_def_agg_double(col, r, out);
-                      },
-                      [&](int32_t col) {
-                        const auto c = static_cast<size_t>(col);
-                        return proj_has_null[c] == 0 ||
-                               !proj_cols[c]->IsNull(r);
-                      });
-                  break;
-                case 14: {
-                  const uint8_t rc = (r_idx != kInvalidRightIdx)
-                                         ? op.right_cond[r_idx]
-                                         : uint8_t{0};
-                  if (rc == 1) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      charge_packed(dv);
-                    }
-                  } else if (rc == 0 && !op.case_else_null) {
-                    charge_packed(0.0);
-                  }
-                  break;
-                }
-                case 16: {
-                  if (eval_pk_eq_cond(op)) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      charge_packed(dv);
-                    }
-                  } else if (!op.case_else_null) {
-                    charge_packed(0.0);
-                  }
-                  break;
-                }
-                case 17: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  const double dv = (read_def_agg_double(op.col0, r, &d0) &&
-                                     read_def_agg_double(op.col1, r, &d1))
-                                        ? (d0 * d1)
-                                        : 0.0;
-                  charge_packed(dv);
-                  break;
-                }
-                default:
-                  break;
-              }
-              return Status::kSuccess;
-            }
-            dw.matched[gid] = 1;
-            const size_t base = static_cast<size_t>(gid) * agg_count;
-            if (disjoint_bucket5_ready) {
-              // Lean proof:
-              // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
-              //   (DisjointRangeBucketHistogram_sound)
-              int64_t a = 0;
-              int64_t b = 0;
-              if (read_def_agg_int(disjoint_bucket5_col0, r, &a) &&
-                  read_def_agg_int(disjoint_bucket5_col1, r, &b)) [[likely]] {
-                int64_t d = 0;
-                if (__builtin_sub_overflow(a, b, &d)) [[unlikely]] {
-                  return StatusError(StatusCode::kIsInfinity,
-                                     "integer overflow in subtraction");
-                }
-                const size_t target_slot =
-                    base +
-                    disjoint_bucket5_slots[ClassifyDisjointRangeBucket5(d)];
-                int64_t next = 0;
-                if (__builtin_add_overflow(dw.ints[target_slot], 1, &next))
-                    [[unlikely]] {
-                  dw.inf_flags[target_slot] = 1;
-                } else {
-                  dw.ints[target_slot] = next;
-                }
-              }
-              dw.counts[base + 0] += 1;
-              dw.counts[base + 1] += 1;
-              dw.counts[base + 2] += 1;
-              dw.counts[base + 3] += 1;
-              dw.counts[base + 4] += 1;
-              return Status::kSuccess;
-            }
-            for (size_t i = 0; i < agg_count; ++i) {
-              const LeftNumericAgg& op = left_numeric[i];
-              const size_t slot = base + i;
-              switch (op.op) {
-                case 0:
-                  dw.counts[slot] += 1;
-                  break;
-                case 1:
-                case 6: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  if (read_def_agg_double(op.col0, r, &d0) &&
-                      read_def_agg_double(op.col1, r, &d1)) [[likely]] {
-                    add_dw_double(dw, slot,
-                                  op.op == 1 ? d0 * d1 : d0 * (op.scale - d1));
-                  }
-                  break;
-                }
-                case 17: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  const double dv = (read_def_agg_double(op.col0, r, &d0) &&
-                                     read_def_agg_double(op.col1, r, &d1))
-                                        ? (d0 * d1)
-                                        : 0.0;
-                  add_dw_double(dw, slot, dv);
-                  break;
-                }
-                case 2: {
-                  double dv = 0.0;
-                  if (read_def_agg_double(op.col0, r, &dv)) [[likely]] {
-                    add_dw_double(dw, slot, dv);
-                  }
-                  break;
-                }
-                case 3: {
-                  int64_t iv = 0;
-                  if (read_def_agg_int(op.col0, r, &iv)) [[likely]] {
-                    add_dw_int(dw, slot, iv);
-                  }
-                  break;
-                }
-                case 4: {
-                  const auto c0 = static_cast<size_t>(op.col0);
-                  if (proj_has_null[c0] == 0 || !proj_cols[c0]->IsNull(r)) {
-                    dw.counts[slot] += 1;
-                  }
-                  break;
-                }
-                case 7: {
-                  const auto c0 = static_cast<size_t>(op.col0);
-                  const auto c1 = static_cast<size_t>(op.col1);
-                  if ((proj_has_null[c0] == 0 || !proj_cols[c0]->IsNull(r)) &&
-                      (proj_has_null[c1] == 0 || !proj_cols[c1]->IsNull(r))) {
-                    dw.counts[slot] += 1;
-                  }
-                  break;
-                }
-                case 8: {
-                  platform::ExtendedFloat x = 0;
-                  bool ok_x = false;
-                  if (op.is_int_col) {
-                    int64_t iv = 0;
-                    if (read_def_agg_int(op.col0, r, &iv)) [[likely]] {
-                      x = static_cast<platform::ExtendedFloat>(iv);
-                      ok_x = true;
-                    }
-                  } else {
-                    double dv = 0.0;
-                    if (read_def_agg_double(op.col0, r, &dv)) [[likely]] {
-                      x = static_cast<platform::ExtendedFloat>(dv);
-                      ok_x = true;
-                    }
-                  }
-                  if (ok_x) [[likely]] {
-                    dw.ext_sx[slot] += x;
-                    dw.ext_sxx[slot] += x * x;
-                    dw.counts[slot] += 1;
-                  }
-                  break;
-                }
-                case 9: {
-                  double dv = 0.0;
-                  bool is_null = false;
-                  RETURN_IF_FAIL(
-                      eval_double_arith_cells(static_cast<size_t>(op.orig_agg),
-                                              r, r_idx, &dv, &is_null));
-                  if (!is_null) [[likely]] {
-                    add_dw_double(dw, slot, dv);
-                  }
-                  break;
-                }
-                case 10:
-                case 11:
-                case 12:
-                case 13:
-                  charge_right_case_op(
-                      op, r_idx, true,
-                      [&](double dv) { add_dw_double(dw, slot, dv); },
-                      [&](int64_t iv) { add_dw_int(dw, slot, iv); },
-                      [&]() { dw.counts[slot] += 1; },
-                      [&](int32_t col, double* out) {
-                        return read_def_agg_double(col, r, out);
-                      },
-                      [&](int32_t col) {
-                        const auto c = static_cast<size_t>(col);
-                        return proj_has_null[c] == 0 ||
-                               !proj_cols[c]->IsNull(r);
-                      });
-                  break;
-                case 14: {
-                  const uint8_t rc = (r_idx != kInvalidRightIdx)
-                                         ? op.right_cond[r_idx]
-                                         : uint8_t{0};
-                  if (rc == 1) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      add_dw_double(dw, slot, dv);
-                    }
-                  } else if (rc == 0 && !op.case_else_null) {
-                    add_dw_double(dw, slot, 0.0);
-                  }
-                  break;
-                }
-                case 15: {
-                  int64_t a = 0;
-                  int64_t b = 0;
-                  int64_t add = 0;
-                  if (read_def_agg_int(op.col0, r, &a) &&
-                      read_def_agg_int(op.col1, r, &b)) [[likely]] {
-                    int64_t d = 0;
-                    if (__builtin_sub_overflow(a, b, &d)) [[unlikely]] {
-                      return StatusError(StatusCode::kIsInfinity,
-                                         "integer overflow in subtraction");
-                    }
-                    const bool lo_ok =
-                        !op.diff_has_lo || (op.diff_lo_incl ? (d >= op.diff_lo)
-                                                            : (d > op.diff_lo));
-                    const bool hi_ok =
-                        !op.diff_has_hi || (op.diff_hi_incl ? (d <= op.diff_hi)
-                                                            : (d < op.diff_hi));
-                    if (lo_ok && hi_ok) {
-                      add = 1;
-                    }
-                  }
-                  add_dw_int(dw, slot, add);
-                  break;
-                }
-                case 16: {
-                  if (eval_pk_eq_cond(op)) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      add_dw_double(dw, slot, dv);
-                    }
-                  } else if (!op.case_else_null) {
-                    add_dw_double(dw, slot, 0.0);
-                  }
-                  break;
-                }
-                default:
-                  break;
-              }
-            }
-            return Status::kSuccess;
-          }
-          bool key_ok = false;
-          int64_t lookup_key = 0;
-          uint64_t computed_key_hash = 0;
-          bool has_computed_key_hash = false;
-          bool need_rep_left = true;
-          if (use_split_key_gid) {
-            const uint32_t r_subgid =
-                !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-            int64_t l_val = 0;
-            bool l_ok = !split_has_left_probe;
-            if (split_has_left_probe) {
-              const auto& l_shape = key_shapes[split_left_k];
-              if (l_shape.direct_column >= 0) {
-                ValueType ltype = ValueType::kNull;
-                bool lunsigned = false;
-                if (read_def_left_raw(
-                        static_cast<size_t>(l_shape.direct_column), r, &l_val,
-                        &ltype, &lunsigned) &&
-                    !lunsigned &&
-                    (ltype == ValueType::kInt64 || ltype == ValueType::kDate) &&
-                    l_val >= static_cast<int64_t>(
-                                 std::numeric_limits<int32_t>::min()) &&
-                    l_val <= static_cast<int64_t>(
-                                 std::numeric_limits<int32_t>::max()))
-                    [[likely]] {
-                  l_ok = true;
-                }
-              }
-            }
-            bool pk_ok = true;
-            uint64_t pk_packed = 0;
-            if (split_uses_pk_subgid) {
-              for (size_t gi = 0; gi < def_pk_groups.size(); ++gi) {
-                if (def_pk_groups[gi].use_subgid) {
-                  if (local.cur_pk_subgids[gi] ==
-                      std::numeric_limits<uint32_t>::max()) [[unlikely]] {
-                    pk_ok = false;
-                    break;
-                  }
-                  pk_packed |= static_cast<uint64_t>(local.cur_pk_subgids[gi])
-                               << def_pk_groups[gi].subgid_shift;
-                }
-              }
-            }
-            if (r_subgid != std::numeric_limits<uint32_t>::max() && l_ok &&
-                pk_ok) [[likely]] {
-              uint64_t packed_u64 = pk_packed;
-              if (split_uses_right_subgid) {
-                packed_u64 |= static_cast<uint64_t>(r_subgid)
-                              << split_right_shift;
-              }
-              if (split_has_left_probe) {
-                packed_u64 |= static_cast<uint64_t>(
-                    static_cast<uint32_t>(static_cast<int32_t>(l_val)));
-              }
-              lookup_key = std::bit_cast<int64_t>(packed_u64);
-              computed_key_hash = packed_u64;
-              has_computed_key_hash = true;
-              need_rep_left = !split_key_unpack_only;
-              key_ok = true;
-            }
-          } else if (packed_2x32_group_key) {
-            int64_t v0 = 0;
-            int64_t v1 = 0;
-            ValueType t0 = ValueType::kNull;
-            ValueType t1 = ValueType::kNull;
-            bool u0_uns = false;
-            bool u1_uns = false;
-            if (read_pair_raw_int(packed_2x32_slot0, r, r_idx, &v0, &t0,
-                                  &u0_uns) &&
-                read_pair_raw_int(packed_2x32_slot1, r, r_idx, &v1, &t1,
-                                  &u1_uns) &&
-                t0 == packed_2x32_type0 && !u0_uns && t1 == packed_2x32_type1 &&
-                !u1_uns &&
-                v0 >=
-                    static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&
-                v0 <=
-                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()) &&
-                v1 >=
-                    static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&
-                v1 <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
-                [[likely]] {
-              const uint64_t packed_u64 =
-                  (static_cast<uint64_t>(
-                       static_cast<uint32_t>(static_cast<int32_t>(v0)))
-                   << 32) |
-                  static_cast<uint32_t>(static_cast<int32_t>(v1));
-              lookup_key = std::bit_cast<int64_t>(packed_u64);
-              computed_key_hash = packed_u64;
-              has_computed_key_hash = true;
-              need_rep_left = !packed_2x32_unpack_only;
-              key_ok = true;
-            }
-          } else {
-            ValueType kt = ValueType::kNull;
-            bool k_uns = false;
-            if (read_pair_raw_int(int_group_slot, r, r_idx, &lookup_key, &kt,
-                                  &k_uns) &&
-                kt == int_group_type && !k_uns) [[likely]] {
-              key_ok = true;
-            }
-          }
-          if (key_ok) [[likely]] {
-            ++local.comparisons;
-            if (use_radix_agg) {
-              RETURN_IF_FAIL(scatter_radix_tuple(
-                  w, std::bit_cast<uint64_t>(lookup_key),
-                  [&](int32_t col, double* out) {
-                    return read_def_agg_double(col, r, out);
-                  },
-                  [&](int32_t col, int64_t* out) {
-                    return read_def_agg_int(col, r, out);
-                  },
-                  [&](int32_t col) {
-                    const auto c = static_cast<size_t>(col);
-                    return proj_has_null[c] == 0 || !proj_cols[c]->IsNull(r);
-                  },
-                  [&](int32_t orig_agg, double* out_dv, bool* out_null) {
-                    return eval_double_arith_cells(
-                        static_cast<size_t>(orig_agg), r, r_idx, out_dv,
-                        out_null);
-                  }));
-              return Status::kSuccess;
-            }
-            bool inserted = false;
-            size_t* slot = local.int_offsets.TryEmplace(lookup_key, &inserted);
-            size_t group_index = 0;
-            if (!inserted) [[likely]] {
-              group_index = *slot;
-            } else {
-              group_index = local.groups.size();
-              FusedGroup group;
-              local.raw_arena.Initialize(group, agg_count);
-              if (!skip_accumulator_states) {
-                group.state_offset = local.states.size();
-                for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-                  local.states.emplace_back(fusion->aggregates[i],
-                                            aggregate_shapes[i]);
-                }
-              }
-              group.key_hash = computed_key_hash;
-              group.has_key_hash = has_computed_key_hash;
-              if (need_rep_left) {
-                finish_lazy_left_row(r);
-                local.owned_rep_left.push_back(left_row);
-                group.rep_left = &local.owned_rep_left.back();
-              }
-              group.rep_right_idx = r_idx;
-              local.groups.push_back(std::move(group));
-              *slot = group_index;
-            }
-            FusedGroup& group = local.groups[group_index];
-            if (disjoint_bucket5_ready) {
-              // Lean proof:
-              // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
-              //   (DisjointRangeBucketHistogram_sound)
-              int64_t a = 0;
-              int64_t b = 0;
-              if (read_def_agg_int(disjoint_bucket5_col0, r, &a) &&
-                  read_def_agg_int(disjoint_bucket5_col1, r, &b)) [[likely]] {
-                int64_t d = 0;
-                if (__builtin_sub_overflow(a, b, &d)) [[unlikely]] {
-                  return StatusError(StatusCode::kIsInfinity,
-                                     "integer overflow in subtraction");
-                }
-                const size_t target_i =
-                    disjoint_bucket5_slots[ClassifyDisjointRangeBucket5(d)];
-                int64_t next = 0;
-                if (__builtin_add_overflow(group.RawInts()[target_i], 1, &next))
-                    [[unlikely]] {
-                  group.RawInfFlags()[target_i] = 1;
-                } else {
-                  group.RawInts()[target_i] = next;
-                }
-              }
-              int64_t* cnts = group.RawCounts();
-              cnts[0] += 1;
-              cnts[1] += 1;
-              cnts[2] += 1;
-              cnts[3] += 1;
-              cnts[4] += 1;
-              return Status::kSuccess;
-            }
-            for (size_t i = 0; i < agg_count; ++i) {
-              const LeftNumericAgg& op = left_numeric[i];
-              switch (op.op) {
-                case 0:
-                  group.RawCounts()[i] += 1;
-                  break;
-                case 1: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  if (read_def_agg_double(op.col0, r, &d0) &&
-                      read_def_agg_double(op.col1, r, &d1)) [[likely]] {
-                    const double dv = d0 * d1;
-                    const double prev = group.RawDoubles()[i];
-                    const double next = prev + dv;
-                    if (std::isinf(next) && !std::isinf(prev) &&
-                        !std::isinf(dv)) {
-                      group.RawInfFlags()[i] = 1;
-                    }
-                    group.RawDoubles()[i] = next;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 17: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  const double dv = (read_def_agg_double(op.col0, r, &d0) &&
-                                     read_def_agg_double(op.col1, r, &d1))
-                                        ? (d0 * d1)
-                                        : 0.0;
-                  const double prev = group.RawDoubles()[i];
-                  const double next = prev + dv;
-                  if (std::isinf(next) && !std::isinf(prev) &&
-                      !std::isinf(dv)) {
-                    group.RawInfFlags()[i] = 1;
-                  }
-                  group.RawDoubles()[i] = next;
-                  group.RawCounts()[i] += 1;
-                  break;
-                }
-                case 2: {
-                  double dv = 0.0;
-                  if (read_def_agg_double(op.col0, r, &dv)) [[likely]] {
-                    const double prev = group.RawDoubles()[i];
-                    const double next = prev + dv;
-                    if (std::isinf(next) && !std::isinf(prev) &&
-                        !std::isinf(dv)) {
-                      group.RawInfFlags()[i] = 1;
-                    }
-                    group.RawDoubles()[i] = next;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 3: {
-                  int64_t iv = 0;
-                  if (read_def_agg_int(op.col0, r, &iv)) [[likely]] {
-                    int64_t next = 0;
-                    if (__builtin_add_overflow(group.RawInts()[i], iv, &next)) {
-                      group.RawInfFlags()[i] = 1;
-                    } else {
-                      group.RawInts()[i] = next;
-                    }
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 4: {
-                  const auto c0 = static_cast<size_t>(op.col0);
-                  if (proj_has_null[c0] == 0 || !proj_cols[c0]->IsNull(r)) {
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 5:
-                  break;
-                case 6: {
-                  double d0 = 0.0;
-                  double d1 = 0.0;
-                  if (read_def_agg_double(op.col0, r, &d0) &&
-                      read_def_agg_double(op.col1, r, &d1)) [[likely]] {
-                    const double dv = d0 * (op.scale - d1);
-                    const double prev = group.RawDoubles()[i];
-                    const double next = prev + dv;
-                    if (std::isinf(next) && !std::isinf(prev) &&
-                        !std::isinf(dv)) {
-                      group.RawInfFlags()[i] = 1;
-                    }
-                    group.RawDoubles()[i] = next;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 7: {
-                  const auto c0 = static_cast<size_t>(op.col0);
-                  const auto c1 = static_cast<size_t>(op.col1);
-                  if ((proj_has_null[c0] == 0 || !proj_cols[c0]->IsNull(r)) &&
-                      (proj_has_null[c1] == 0 || !proj_cols[c1]->IsNull(r))) {
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 8: {
-                  platform::ExtendedFloat x = 0;
-                  bool ok_x = false;
-                  if (op.is_int_col) {
-                    int64_t iv = 0;
-                    if (read_def_agg_int(op.col0, r, &iv)) [[likely]] {
-                      x = static_cast<platform::ExtendedFloat>(iv);
-                      ok_x = true;
-                    }
-                  } else {
-                    double dv = 0.0;
-                    if (read_def_agg_double(op.col0, r, &dv)) [[likely]] {
-                      x = static_cast<platform::ExtendedFloat>(dv);
-                      ok_x = true;
-                    }
-                  }
-                  if (ok_x) [[likely]] {
-                    group.RawStatX()[i] += x;
-                    group.RawStatXX()[i] += x * x;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 9: {
-                  double dv = 0.0;
-                  bool is_null = false;
-                  RETURN_IF_FAIL(
-                      eval_double_arith_cells(static_cast<size_t>(op.orig_agg),
-                                              r, r_idx, &dv, &is_null));
-                  if (!is_null) [[likely]] {
-                    const double prev = group.RawDoubles()[i];
-                    const double next = prev + dv;
-                    if (std::isinf(next) && !std::isinf(prev) &&
-                        !std::isinf(dv)) {
-                      group.RawInfFlags()[i] = 1;
-                    }
-                    group.RawDoubles()[i] = next;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 10:
-                case 11:
-                case 12:
-                case 13:
-                  charge_right_case_op(
-                      op, r_idx, r_idx != kInvalidRightIdx,
-                      [&](double dv) {
-                        const double prev = group.RawDoubles()[i];
-                        const double next = prev + dv;
-                        if (std::isinf(next) && !std::isinf(prev) &&
-                            !std::isinf(dv)) {
-                          group.RawInfFlags()[i] = 1;
-                        }
-                        group.RawDoubles()[i] = next;
-                        group.RawCounts()[i] += 1;
-                      },
-                      [&](int64_t iv) {
-                        int64_t next = 0;
-                        if (__builtin_add_overflow(group.RawInts()[i], iv,
-                                                   &next)) {
-                          group.RawInfFlags()[i] = 1;
-                        } else {
-                          group.RawInts()[i] = next;
-                        }
-                        group.RawCounts()[i] += 1;
-                      },
-                      [&]() { group.RawCounts()[i] += 1; },
-                      [&](int32_t col, double* out) {
-                        return read_def_agg_double(col, r, out);
-                      },
-                      [&](int32_t col) {
-                        const auto c = static_cast<size_t>(col);
-                        return proj_has_null[c] == 0 ||
-                               !proj_cols[c]->IsNull(r);
-                      });
-                  break;
-                case 14: {
-                  const uint8_t rc = (r_idx != kInvalidRightIdx)
-                                         ? op.right_cond[r_idx]
-                                         : uint8_t{0};
-                  if (rc == 1) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      const double prev = group.RawDoubles()[i];
-                      const double next = prev + dv;
-                      if (std::isinf(next) && !std::isinf(prev) &&
-                          !std::isinf(dv)) {
-                        group.RawInfFlags()[i] = 1;
-                      }
-                      group.RawDoubles()[i] = next;
-                      group.RawCounts()[i] += 1;
-                    }
-                  } else if (rc == 0 && !op.case_else_null) {
-                    group.RawDoubles()[i] = group.RawDoubles()[i] + 0.0;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                case 15: {
-                  int64_t a = 0;
-                  int64_t b = 0;
-                  int64_t add = 0;
-                  if (read_def_agg_int(op.col0, r, &a) &&
-                      read_def_agg_int(op.col1, r, &b)) [[likely]] {
-                    int64_t d = 0;
-                    if (__builtin_sub_overflow(a, b, &d)) [[unlikely]] {
-                      return StatusError(StatusCode::kIsInfinity,
-                                         "integer overflow in subtraction");
-                    }
-                    const bool lo_ok =
-                        !op.diff_has_lo || (op.diff_lo_incl ? (d >= op.diff_lo)
-                                                            : (d > op.diff_lo));
-                    const bool hi_ok =
-                        !op.diff_has_hi || (op.diff_hi_incl ? (d <= op.diff_hi)
-                                                            : (d < op.diff_hi));
-                    if (lo_ok && hi_ok) {
-                      add = 1;
-                    }
-                  }
-                  int64_t next = 0;
-                  if (__builtin_add_overflow(group.RawInts()[i], add, &next)) {
-                    group.RawInfFlags()[i] = 1;
-                  } else {
-                    group.RawInts()[i] = next;
-                  }
-                  group.RawCounts()[i] += 1;
-                  break;
-                }
-                case 16: {
-                  if (eval_pk_eq_cond(op)) {
-                    double dv = 0.0;
-                    bool is_null = false;
-                    RETURN_IF_FAIL(eval_double_arith_cells(
-                        static_cast<size_t>(op.orig_agg), r, r_idx, &dv,
-                        &is_null));
-                    if (!is_null) [[likely]] {
-                      const double prev = group.RawDoubles()[i];
-                      const double next = prev + dv;
-                      if (std::isinf(next) && !std::isinf(prev) &&
-                          !std::isinf(dv)) {
-                        group.RawInfFlags()[i] = 1;
-                      }
-                      group.RawDoubles()[i] = next;
-                      group.RawCounts()[i] += 1;
-                    }
-                  } else if (!op.case_else_null) {
-                    group.RawDoubles()[i] = group.RawDoubles()[i] + 0.0;
-                    group.RawCounts()[i] += 1;
-                  }
-                  break;
-                }
-                default:
-                  break;
-              }
-            }
-            return Status::kSuccess;
-          }
-        }
-        if (!materialize_current_left_row(r)) {
-          return Status::kSuccess;
-        }
-        ++local.comparisons;
-        if (use_preassigned_build_groups) {
-          return accumulate_preassigned_pair(w, scratch, left_row, r_idx);
-        }
-        size_t cached_group = kNoCachedGroup;
-        ASSIGN_OR_RETURN(
-            bool, accumulated,
-            process_pair(local, left_row, r_idx, scratch, &cached_group));
-        (void)accumulated;
-        return Status::kSuccess;
-      };
-      auto eval_int_peek = [](BinaryOperation op, int64_t a,
-                              int64_t b) noexcept -> bool {
-        switch (op) {
-          case BinaryOperation::kEquals:
-            return a == b;
-          case BinaryOperation::kNotEquals:
-            return a != b;
-          case BinaryOperation::kLessThan:
-            return a < b;
-          case BinaryOperation::kLessThanEquals:
-            return a <= b;
-          case BinaryOperation::kGreaterThan:
-            return a > b;
-          case BinaryOperation::kGreaterThanEquals:
-            return a >= b;
-          default:
-            return false;
-        }
-      };
-      if (scalar_fact_charge) {
-        DirectGidWorker& dw = direct_gid_workers[w];
-        const std::vector<slot_t> scalar_mat_cols =
-            BuildDeferredProbeMatCols(*deferred_left_probe);
-        LSTableStore::LazyBlockScratch lazy_scratch;
-        while (true) {
-          const size_t bi = next_block();
-          if (bi >= total_blocks) {
-            return Status::kSuccess;
-          }
-          const LSTablePageBlock& meta_blk = store.blocks[bi];
-          if (meta_blk.row_count == 0 ||
-              !meta_blk.MatchesZoneMaps(peek_ptr, active_rf_group,
-                                        full_rf_col)) {
-            continue;
-          }
-          lazy_scratch.transient.clear();
-          const LSTablePageBlock* mat =
-              store.MaterializeBlockView(bi, &lazy_scratch, scalar_mat_cols);
-          if (mat == nullptr) {
-            return Status::kIOError;
-          }
-          const LSTablePageBlock& blk = *mat;
-          for (size_t c = 0; c < base_proj_cols; ++c) {
-            const LSTableColumnBlock& cblk =
-                blk.columns[deferred_left_probe->projection[c]];
-            proj_cols[c] = &cblk;
-            proj_int_ptrs[c] = cblk.int_cells.data();
-            proj_has_null[c] = static_cast<uint8_t>(cblk.has_null);
-          }
-          const LSTableColumnBlock* const rf_col =
-              full_rf_col.has_value() ? &blk.columns[*full_rf_col] : nullptr;
-          struct ScalarExtraRf {
-            const LSTableColumnBlock* col{nullptr};
-            const uint64_t* dense_bits{nullptr};
-            int64_t lo{0};
-            int64_t hi{0};
-            bool has_null{false};
-            // ScanRuntimeFilter's contract (common/runtime_filter.hpp): a
-            // value whose decoded type differs from the filter's domain is
-            // never rejected. int_cells only describes INT64/DATE blocks, so
-            // the row-level reads below must be skipped for anything else
-            // instead of comparing incomparable bit patterns.
-            bool type_ok{true};
-            const RuntimeFilterGroup* group{nullptr};
-          };
-          std::array<ScalarExtraRf, 4> extra_rfs{};
-          size_t extra_rf_count = 0;
-          for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-            if (!ext.enabled() || ext.column >= base_proj_cols ||
-                extra_rf_count >= extra_rfs.size()) {
-              continue;
-            }
-            const LSTableColumnBlock* ecol = proj_cols[ext.column];
-            const bool hd = ext.group->has_dense_bits();
-            extra_rfs[extra_rf_count++] = ScalarExtraRf{
-                .col = ecol,
-                .dense_bits = hd ? ext.group->dense_bits_data() : nullptr,
-                .lo = hd ? ext.group->Lo() : 0,
-                .hi = hd ? ext.group->Hi() : 0,
-                .has_null = ecol->has_null,
-                .type_ok = (ecol->type == ext.type),
-                .group = ext.group.get(),
-            };
-          }
-          for (uint32_t r = 0; r < blk.row_count; ++r) {
-            if (std::ranges::any_of(deferred_left_probe->null_peeks,
-                                    [&](const NullPeekCompare& test) {
-                                      return blk.columns[test.column].IsNull(
-                                                 r) != test.expect_null;
-                                    })) {
-              continue;
-            }
-            if (rf_col != nullptr) {
-              if (rf_col->has_null && rf_col->IsNull(r)) {
-                continue;
-              }
-              const int64_t kv = rf_col->int_cells[r];
-              if (rf_has_dense) {
-                const uint64_t off =
-                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(rf_lo);
-                if (kv < rf_lo || kv > rf_hi ||
-                    (rf_dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
-                        0) {
-                  continue;
-                }
-              } else if (active_rf_group->Reject(kv)) {
-                continue;
-              }
-            }
-            bool extra_ok = true;
-            for (size_t ei = 0; ei < extra_rf_count; ++ei) {
-              const ScalarExtraRf& erf = extra_rfs[ei];
-              if (erf.has_null && erf.col->IsNull(r)) {
-                extra_ok = false;
-                break;
-              }
-              if (!erf.type_ok) {
-                continue;
-              }
-              const int64_t kv = erf.col->int_cells[r];
-              if (erf.dense_bits != nullptr) {
-                if (kv < erf.lo || kv > erf.hi) {
-                  extra_ok = false;
-                  break;
-                }
-                const uint64_t off =
-                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(erf.lo);
-                if ((erf.dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
-                    0) {
-                  extra_ok = false;
-                  break;
-                }
-              } else if (erf.group->Reject(kv)) {
-                extra_ok = false;
-                break;
-              }
-            }
-            if (!extra_ok) {
-              continue;
-            }
-            if (peek_ptr != nullptr) {
-              bool peek_ok = true;
-              for (const IntegerPeekCompare& pred : *peek_ptr) {
-                const LSTableColumnBlock& pcol = blk.columns[pred.column];
-                if ((pcol.has_null && pcol.IsNull(r)) ||
-                    !eval_int_peek(pred.op, pcol.int_cells[r], pred.constant)) {
-                  peek_ok = false;
-                  break;
-                }
-              }
-              if (!peek_ok) {
-                continue;
-              }
-            }
-            ++local.comparisons;
-            charge_numeric(
-                dw, 0, 0,
-                [&](int32_t col, double* out) {
-                  const auto c = static_cast<size_t>(col);
-                  if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
-                    return false;
-                  }
-                  const int64_t raw = proj_int_ptrs[c][r];
-                  if (def_base_types[c] == ValueType::kDouble) {
-                    *out = std::bit_cast<double>(raw);
-                  } else {
-                    *out = static_cast<double>(raw);
-                  }
-                  return true;
-                },
-                [&](int32_t col, int64_t* out) {
-                  const auto c = static_cast<size_t>(col);
-                  if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
-                    return false;
-                  }
-                  *out = proj_int_ptrs[c][r];
-                  return true;
-                },
-                [&](int32_t col) {
-                  const auto c = static_cast<size_t>(col);
-                  return proj_has_null[c] == 0 || !proj_cols[c]->IsNull(r);
-                });
-          }
-        }
-      }
-      const slot_t jk0 = left_columns[0];
-      const slot_t jk1 = packed_2x32_int_key ? left_columns[1] : 0;
-      const int64_t off0 = left_key_offsets[0];
-      const int64_t off1 = packed_2x32_int_key ? left_key_offsets[1] : 0;
-      bool charge_from_cells = left_numeric_probe &&
-                               prepared_pk_lookups.empty() &&
-                               use_dense_int_rows;
-      if (charge_from_cells) {
-        for (size_t ai = 0; ai < agg_count; ++ai) {
-          const LeftNumericAgg& op = left_numeric[ai];
-          if ((op.col0 >= 0 &&
-               (std::cmp_greater_equal(op.col0, base_proj_cols) ||
-                def_overwritten_by_pk[static_cast<size_t>(op.col0)] != 0)) ||
-              (op.col1 >= 0 &&
-               (std::cmp_greater_equal(op.col1, base_proj_cols) ||
-                def_overwritten_by_pk[static_cast<size_t>(op.col1)] != 0))) {
-            charge_from_cells = false;
-            break;
-          }
-        }
-      }
-      // The cache owns contiguous numeric columns as well as page views.
-      // A monotonic unique-build probe can scan those columns without doing
-      // projection and zone-map setup for every small heap page. NULL-bearing
-      // columns and unsupported expressions retain the page-aware path.
-      const auto flat_column = [&](size_t c) -> const int64_t* {
-        const auto sc = static_cast<slot_t>(c);
-        const auto col = store.IntegerColumn(sc);
-        if (!store.HasColumn(sc) || c >= store.column_has_null.size() ||
-            store.column_has_null[c] || col.size() != store.total_rows) {
-          return nullptr;
-        }
-        return col.data();
-      };
-      const size_t full_jk = deferred_left_probe->projection[jk0];
-      bool flat_ready = charge_from_cells && single_double_sum && integer_key &&
-                        !ranked_int_bits.empty() && off0 == 0 &&
-                        deferred_left_probe->null_peeks.empty() &&
-                        full_jk < store.column_is_monotonic.size() &&
-                        store.column_is_monotonic[full_jk] != 0 &&
-                        (left_numeric[0].op == 1 || left_numeric[0].op == 2 ||
-                         left_numeric[0].op == 6);
-      const int64_t* flat_keys = flat_ready ? flat_column(full_jk) : nullptr;
-      const int64_t* flat_a = nullptr;
-      const int64_t* flat_b = nullptr;
-      struct FlatPredicate {
-        const int64_t* cells;
-        BinaryOperation op;
-        int64_t value;
-      };
-      struct FlatFilter {
-        const int64_t* cells;
-        const RuntimeFilterGroup* group;
-      };
-      std::vector<FlatPredicate> flat_predicates;
-      std::vector<FlatFilter> flat_filters;
-      if (flat_ready) {
-        const auto& op = left_numeric[0];
-        flat_a = flat_column(deferred_left_probe->projection[op.col0]);
-        if (op.op != 2) {
-          flat_b = flat_column(deferred_left_probe->projection[op.col1]);
-        }
-        flat_ready = flat_keys && flat_a && (op.op == 2 || flat_b);
-        if (peek_ptr) {
-          for (const auto& pred : *peek_ptr) {
-            const auto* cells = flat_column(pred.column);
-            flat_ready = flat_ready && cells;
-            flat_predicates.push_back({cells, pred.op, pred.constant});
-          }
-        }
-        const auto add_filter = [&](const ScanRuntimeFilter& filter) {
-          if (!filter.enabled() || filter.column >= base_proj_cols) {
-            return;
-          }
-          const auto* cells =
-              flat_column(deferred_left_probe->projection[filter.column]);
-          flat_ready = flat_ready && cells;
-          flat_filters.push_back({cells, filter.group.get()});
-        };
-        add_filter(primary_rf);
-        for (const auto& filter : primary_rf.extra) {
-          add_filter(filter);
-        }
-      }
-      if (flat_ready) {
-        DirectGidWorker& dw =
-            direct_gid_workers[disjoint_direct_groups ? 0 : w];
-        const auto& op = left_numeric[0];
-        const bool a_double = def_base_types[op.col0] == ValueType::kDouble;
-        const bool b_double =
-            op.op != 2 && def_base_types[op.col1] == ValueType::kDouble;
-        const auto add_row = [&](uint32_t gid, size_t r) {
-          ++local.comparisons;
-          dw.matched[gid] = 1;
-          const double a = a_double ? std::bit_cast<double>(flat_a[r])
-                                    : static_cast<double>(flat_a[r]);
-          const double b = op.op == 2
-                               ? 0
-                               : (b_double ? std::bit_cast<double>(flat_b[r])
-                                           : static_cast<double>(flat_b[r]));
-          add_dw_double(
-              dw, gid,
-              op.op == 2 ? a : (op.op == 1 ? a * b : a * (op.scale - b)));
-        };
-        const bool single_greater =
-            flat_predicates.size() == 1 &&
-            flat_predicates[0].op == BinaryOperation::kGreaterThan &&
-            std::ranges::all_of(flat_filters, [&](const auto& filter) {
-              return filter.cells == flat_keys;
-            });
-        const auto consume_range = [&](int64_t key, uint32_t gid, size_t begin,
-                                       size_t end) {
-          if (gid == kInvalidGid) {
-            return;
-          }
-          for (const auto& filter : flat_filters) {
-            if (filter.cells == flat_keys && filter.group->Reject(key)) {
-              return;
-            }
-          }
-          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
-          //   (finite_sum_implies_no_inf, dense_group_block_accum_monoid_eq)
-          // A single range predicate over a non-NULL flat column needs one
-          // comparison per candidate, accumulating into a register across the
-          // entire same-gid run and writing to `dw` once per run.
-          if (single_greater) {
-            const auto* cells = flat_predicates[0].cells;
-            const int64_t threshold = flat_predicates[0].value;
-            const uint8_t op_code = op.op;
-            const double scale = op.scale;
-            double run_sum = 0.0;
-            uint32_t run_hits = 0;
-            if (op_code == 6 && a_double && b_double) {
-              for (size_t r = begin; r < end; ++r) {
-                if (cells[r] > threshold) {
-                  const auto a = std::bit_cast<double>(flat_a[r]);
-                  const auto b = std::bit_cast<double>(flat_b[r]);
-                  run_sum += a * (scale - b);
-                  ++run_hits;
-                }
-              }
-            } else if (op_code == 1 && a_double && b_double) {
-              for (size_t r = begin; r < end; ++r) {
-                if (cells[r] > threshold) {
-                  const auto a = std::bit_cast<double>(flat_a[r]);
-                  const auto b = std::bit_cast<double>(flat_b[r]);
-                  run_sum += a * b;
-                  ++run_hits;
-                }
-              }
-            } else if (op_code == 2 && a_double) {
-              for (size_t r = begin; r < end; ++r) {
-                if (cells[r] > threshold) {
-                  run_sum += std::bit_cast<double>(flat_a[r]);
-                  ++run_hits;
-                }
-              }
-            } else {
-              for (size_t r = begin; r < end; ++r) {
-                if (cells[r] > threshold) {
-                  add_row(gid, r);
-                }
-              }
-              return;
-            }
-            if (run_hits > 0) {
-              local.comparisons += run_hits;
-              dw.matched[gid] = 1;
-              if (std::isfinite(run_sum)) [[likely]] {
-                const double prev = dw.doubles[gid];
-                const double next = prev + run_sum;
-                dw.doubles[gid] = next;
-                if (std::isinf(next) && !std::isinf(prev)) [[unlikely]] {
-                  dw.inf_flags[gid] = 1;
-                }
-                dw.counts[gid] += run_hits;
-              } else {
-                // Slow exact fallback if any row produced ±inf or NaN.
-                for (size_t r = begin; r < end; ++r) {
-                  if (cells[r] > threshold) {
-                    const auto a = std::bit_cast<double>(flat_a[r]);
-                    const double b =
-                        op_code == 2 ? 0.0 : std::bit_cast<double>(flat_b[r]);
-                    add_dw_double(
-                        dw, gid,
-                        op_code == 2
-                            ? a
-                            : (op_code == 1 ? a * b : a * (scale - b)));
-                  }
-                }
-              }
-            }
-            return;
-          }
-          for (size_t r = begin; r < end; ++r) {
-            bool selected = true;
-            for (const auto& pred : flat_predicates) {
-              if (!eval_int_peek(pred.op, pred.cells[r], pred.value)) {
-                selected = false;
-                break;
-              }
-            }
-            if (selected) {
-              for (const auto& filter : flat_filters) {
-                if (filter.cells != flat_keys &&
-                    filter.group->Reject(filter.cells[r])) {
-                  selected = false;
-                  break;
-                }
-              }
-            }
-            if (selected) {
-              add_row(gid, r);
-            }
-          }
-        };
-        if (flat_run_index) {
-          struct PendingRun {
-            int64_t key;
-            uint32_t gid;
-            uint32_t begin;
-            uint32_t end;
-          };
-          std::array<PendingRun, 128> pending{};
-          size_t pending_count = 0;
-          const auto flush_runs = [&]() {
-            // Separate index reads and fact reads so several independent
-            // cache misses can be in flight instead of one per matching key.
-            for (size_t i = 0; i < pending_count; ++i) {
-              const auto off = static_cast<uint64_t>(pending[i].key) -
-                               static_cast<uint64_t>(flat_run_index->minimum);
-              if (flat_run_bounds && off < flat_run_bounds->packed.size()) {
-                __builtin_prefetch(flat_run_bounds->packed.data() + off, 0, 1);
-              } else if (off < flat_run_index->offsets.size() - 1) {
-                __builtin_prefetch(flat_run_index->offsets.data() + off, 0, 1);
-                __builtin_prefetch(flat_run_index->offsets.data() + off + 1, 0,
-                                   1);
-              }
-            }
-            for (size_t i = 0; i < pending_count; ++i) {
-              auto& run = pending[i];
-              if (flat_run_bounds && !flat_run_bounds->MayExceed(
-                                         run.key, flat_predicates[0].value)) {
-                run.begin = run.end = 0;
-                continue;
-              }
-              std::tie(run.begin, run.end) = flat_run_index->Find(run.key);
-              if (run.begin == run.end) {
-                continue;
-              }
-              for (const auto& pred : flat_predicates) {
-                __builtin_prefetch(pred.cells + run.begin, 0, 1);
-                if (run.end - run.begin > 8) {
-                  __builtin_prefetch(pred.cells + run.begin + 8, 0, 1);
-                }
-              }
-              if (flat_a != nullptr) {
-                __builtin_prefetch(flat_a + run.begin, 0, 1);
-              }
-              if (flat_b != nullptr) {
-                __builtin_prefetch(flat_b + run.begin, 0, 1);
-              }
-              for (const auto& filter : flat_filters) {
-                if (filter.cells != flat_keys) {
-                  __builtin_prefetch(filter.cells + run.begin, 0, 1);
-                }
-              }
-            }
-            for (size_t i = 0; i < pending_count; ++i) {
-              const auto& run = pending[i];
-              if (run.begin != run.end) {
-                consume_range(run.key, run.gid, run.begin, run.end);
-              }
-            }
-            pending_count = 0;
-          };
-          if (key_cache_charge) {
-            for (size_t ci = w; ci < key_cache.size(); ci += workers) {
-              for (const auto& entry : key_cache[ci]) {
-                pending[pending_count++] = {.key = entry.key,
-                                            .gid = gid_of(entry.row),
-                                            .begin = 0,
-                                            .end = 0};
-                if (pending_count == pending.size()) {
-                  flush_runs();
-                }
-              }
-            }
-          } else {
-            const size_t first_word = ranked_int_bits.size() * w / workers;
-            const size_t last_word = ranked_int_bits.size() * (w + 1) / workers;
-            for (size_t wi = first_word; wi < last_word; ++wi) {
-              uint64_t bits = ranked_int_bits[wi];
-              uint32_t rank = ranked_int_prefix[wi];
-              while (bits != 0) {
-                const int64_t key =
-                    dense_int_min +
-                    static_cast<int64_t>((wi * 64) + std::countr_zero(bits));
-                const uint32_t gid = gid_of(ranked_int_rows[rank++]);
-                pending[pending_count++] = {
-                    .key = key, .gid = gid, .begin = 0, .end = 0};
-                if (pending_count == pending.size()) {
-                  flush_runs();
-                }
-                bits &= bits - 1;
-              }
-            }
-          }
-          flush_runs();
-          return Status::kSuccess;
-        }
-        size_t r = store.total_rows * w / workers;
-        const size_t end = store.total_rows * (w + 1) / workers;
-        while (r < end) {
-          const int64_t key = flat_keys[r];
-          uint64_t idx =
-              static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_int_min);
-          if (key >= dense_int_min && idx >= ranked_int_span) {
-            break;
-          }
-          if (key < dense_int_min ||
-              (ranked_int_bits[idx >> 6] & (uint64_t{1} << (idx & 63))) == 0) {
-            idx = key < dense_int_min ? 0 : idx + 1;
-            size_t wi = idx >> 6;
-            if (wi >= ranked_int_bits.size()) {
-              break;
-            }
-            uint64_t bits = ranked_int_bits[wi] & (~uint64_t{0} << (idx & 63));
-            while (bits == 0 && ++wi < ranked_int_bits.size()) {
-              bits = ranked_int_bits[wi];
-            }
-            if (wi == ranked_int_bits.size()) {
-              break;
-            }
-            const int64_t next_key =
-                dense_int_min +
-                static_cast<int64_t>((wi * 64) + std::countr_zero(bits));
-            size_t lo = r + 1, step = 4;
-            while (step < end - lo && flat_keys[lo + step] < next_key) {
-              lo += step;
-              step = std::min(step * 2, end - lo);
-            }
-            const size_t hi = lo + std::min(step + 1, end - lo);
-            r = static_cast<size_t>(
-                std::lower_bound(flat_keys + lo, flat_keys + hi, next_key) -
-                flat_keys);
-            continue;
-          }
-          const uint64_t word = ranked_int_bits[idx >> 6];
-          const uint64_t lower = (uint64_t{1} << (idx & 63)) - 1;
-          const uint32_t rank =
-              ranked_int_prefix[idx >> 6] +
-              static_cast<uint32_t>(std::popcount(word & lower));
-          const uint32_t gid = gid_of(ranked_int_rows[rank]);
-          const size_t begin = r;
-          do {
-            ++r;
-          } while (r < end && flat_keys[r] == key);
-          consume_range(key, gid, begin, r);
-        }
-        return Status::kSuccess;
-      }
-      std::vector<uint32_t> rf_sel_buf;
-      std::vector<uint64_t> radix_blk_keys;
-      std::vector<double> radix_blk_dvals;
-      std::vector<uint8_t> radix_blk_valids;
-      std::vector<uint8_t> radix_blk_parts;
-      bool rf_dense_all_set = false;
-      if (rf_has_dense && rf_hi >= rf_lo) {
-        const uint64_t span =
-            static_cast<uint64_t>(rf_hi) - static_cast<uint64_t>(rf_lo);
-        const auto full_words = static_cast<size_t>(span >> 6);
-        if (full_words < rf_dense_words) {
-          bool ok = true;
-          for (size_t wi = 0; wi < full_words; ++wi) {
-            if (rf_dense_bits[wi] != ~uint64_t{0}) {
-              ok = false;
-              break;
-            }
-          }
-          if (ok) {
-            const uint32_t rem_bits = static_cast<uint32_t>(span & 63) + 1U;
-            const uint64_t mask = rem_bits == 64U
-                                      ? ~uint64_t{0}
-                                      : ((uint64_t{1} << rem_bits) - 1ULL);
-            if ((rf_dense_bits[full_words] & mask) == mask) {
-              rf_dense_all_set = true;
-            }
-          }
-        }
-      }
-      const bool has_null_peeks = !deferred_left_probe->null_peeks.empty();
-      const std::vector<slot_t> def_mat_cols =
-          BuildDeferredProbeMatCols(*deferred_left_probe);
-      LSTableStore::LazyBlockScratch lazy_scratch;
-      while (true) {
-        const size_t bi = next_block();
-        if (bi >= total_blocks) {
-          return Status::kSuccess;
-        }
-        const LSTablePageBlock& meta_blk = store.blocks[bi];
-        if (meta_blk.row_count == 0) {
-          continue;
-        }
-        if (!meta_blk.MatchesZoneMaps(peek_ptr, active_rf_group, full_rf_col)) {
-          continue;
-        }
-        bool extra_zm_reject = false;
-        for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-          if (!ext.enabled() || ext.column >= base_proj_cols) {
-            continue;
-          }
-          if (ext.group->RejectsAll()) {
-            extra_zm_reject = true;
-            break;
-          }
-          const slot_t ext_full = deferred_left_probe->projection[ext.column];
-          if (ext_full < meta_blk.columns.size()) {
-            const LSTableColumnBlock& mcol = meta_blk.columns[ext_full];
-            // RejectRange speaks the int64 key domain; a block column of
-            // any other type must not feed it (same guard as the sister
-            // delayed-scan loop and RuntimeFilterGroup::Reject).
-            if ((mcol.type == ValueType::kInt64 ||
-                 mcol.type == ValueType::kDate) &&
-                mcol.type == ext.type &&
-                (!mcol.has_min_max ||
-                 ext.group->RejectRange(mcol.min_int, mcol.max_int))) {
-              extra_zm_reject = true;
-              break;
-            }
-          }
-        }
-        if (extra_zm_reject) {
-          continue;
-        }
-        // A dense unique build key occupies [dense_int_min, dense_int_min +
-        // span). A block whose join key is entirely outside that range cannot
-        // match an inner probe, including NULL keys (NULL never matches).
-        if (use_dense_int_rows && integer_key && !packed_2x32_int_key &&
-            !dense_int_idxs.empty() && jk0 < base_proj_cols &&
-            left_key_offsets[0] == 0 &&
-            !DenseIntBlockMayMatch(
-                meta_blk, deferred_left_probe->projection[jk0], dense_int_min,
-                dense_int_idxs, kInvalidRightIdx)) {
-          continue;
-        }
-        bool peek_all_pass = true;
-        if (peek_ptr != nullptr) {
-          for (const IntegerPeekCompare& pred : *peek_ptr) {
-            const LSTableColumnBlock& pcol = meta_blk.columns[pred.column];
-            if (pcol.has_null || !pcol.has_min_max) {
-              peek_all_pass = false;
-              break;
-            }
-            bool all_ok = false;
-            switch (pred.op) {
-              case BinaryOperation::kEquals:
-                all_ok = (pcol.min_int == pred.constant &&
-                          pcol.max_int == pred.constant);
-                break;
-              case BinaryOperation::kNotEquals:
-                all_ok = (pred.constant < pcol.min_int ||
-                          pred.constant > pcol.max_int);
-                break;
-              case BinaryOperation::kLessThan:
-                all_ok = (pcol.max_int < pred.constant);
-                break;
-              case BinaryOperation::kLessThanEquals:
-                all_ok = (pcol.max_int <= pred.constant);
-                break;
-              case BinaryOperation::kGreaterThan:
-                all_ok = (pcol.min_int > pred.constant);
-                break;
-              case BinaryOperation::kGreaterThanEquals:
-                all_ok = (pcol.min_int >= pred.constant);
-                break;
-              default:
-                break;
-            }
-            if (!all_ok) {
-              peek_all_pass = false;
-              break;
-            }
-          }
-        }
-        lazy_scratch.transient.clear();
-        const LSTablePageBlock* mat =
-            store.MaterializeBlockView(bi, &lazy_scratch, def_mat_cols);
-        if (mat == nullptr) {
-          return Status::kIOError;
-        }
-        const LSTablePageBlock& blk = *mat;
-        for (size_t c = 0; c < base_proj_cols; ++c) {
-          const LSTableColumnBlock& cblk =
-              blk.columns[deferred_left_probe->projection[c]];
-          proj_cols[c] = &cblk;
-          proj_int_ptrs[c] = cblk.int_cells.data();
-          proj_has_null[c] = static_cast<uint8_t>(cblk.has_null);
-        }
-        const LSTableColumnBlock* const rf_col =
-            full_rf_col.has_value() ? &blk.columns[*full_rf_col] : nullptr;
-        const bool rf_col_has_null = rf_col != nullptr && rf_col->has_null;
-        const bool blk_rf_monotonic = rf_col_monotonic && !rf_col_has_null;
-        struct DefExtraRf {
-          const LSTableColumnBlock* col{nullptr};
-          const uint64_t* dense_bits{nullptr};
-          int64_t lo{0};
-          int64_t hi{0};
-          bool has_null{false};
-          // See ScalarExtraRf: the decoded type must match the filter's
-          // domain before int_cells is read.
-          bool type_ok{true};
-          const RuntimeFilterGroup* group{nullptr};
-        };
-        std::array<DefExtraRf, 4> extra_rfs{};
-        size_t extra_rf_count = 0;
-        for (const ScanRuntimeFilter& ext : primary_rf.extra) {
-          if (!ext.enabled() || ext.column >= base_proj_cols ||
-              extra_rf_count >= extra_rfs.size()) {
-            continue;
-          }
-          const LSTableColumnBlock* ecol = proj_cols[ext.column];
-          const bool hd = ext.group->has_dense_bits();
-          extra_rfs[extra_rf_count++] = DefExtraRf{
-              .col = ecol,
-              .dense_bits = hd ? ext.group->dense_bits_data() : nullptr,
-              .lo = hd ? ext.group->Lo() : 0,
-              .hi = hd ? ext.group->Hi() : 0,
-              .has_null = ecol->has_null,
-              .type_ok = (ecol->type == ext.type),
-              .group = ext.group.get(),
-          };
-        }
-        const int64_t* const jk0_ints = proj_int_ptrs[jk0];
-        const int64_t* const jk1_ints =
-            packed_2x32_int_key ? proj_int_ptrs[jk1] : nullptr;
-        const bool jk_has_null =
-            proj_has_null[jk0] != 0 ||
-            (packed_2x32_int_key && proj_has_null[jk1] != 0);
-        const bool fast_1pk_dense =
-            (use_dense_int_rows || use_unique_int_table) &&
-            !packed_2x32_int_key && !bulk_raw_count &&
-            (use_dense_int_rows || (!count_star_only && !charge_from_cells)) &&
-            !(count_star_only && use_direct_gid_agg &&
-              prepared_pk_lookups.empty()) &&
-            !charge_from_cells && def_pk_groups.size() == 1;
-        const size_t split_lcol =
-            (fast_1pk_dense && split_has_left_probe &&
-             split_left_k < key_shapes.size() &&
-             key_shapes[split_left_k].direct_column >= 0 &&
-             std::cmp_less(key_shapes[split_left_k].direct_column, left_width))
-                ? static_cast<size_t>(key_shapes[split_left_k].direct_column)
-                : base_proj_cols;
-        const int8_t split_left_li =
-            split_lcol < 16 ? def_col_to_pk_lookup[split_lcol] : int8_t{-1};
-        const bool split_left_from_pk0 =
-            fast_1pk_dense && split_has_left_probe && split_left_li >= 0 &&
-            prepared_pk_lookups[static_cast<size_t>(split_left_li)].group_idx ==
-                0;
-        const bool split_left_direct = fast_1pk_dense && split_has_left_probe &&
-                                       split_left_li < 0 &&
-                                       split_lcol < base_proj_cols;
-        const bool fast_split_left_ok =
-            !split_has_left_probe || split_left_from_pk0 || split_left_direct;
-        const bool fast_split_arith_agg =
-            fast_1pk_dense && fast_split_left_ok && def_group_cell_probe &&
-            use_split_key_gid && split_key_unpack_only &&
-            !use_dense_split_direct_gid && !use_radix_agg &&
-            !packed_2x32_group_key && skip_accumulator_states &&
-            agg_count == 1 && left_numeric[0].op == 9 &&
-            compiled_double_arith[static_cast<size_t>(left_numeric[0].orig_agg)]
-                    .pattern != CompiledDefDoubleArith::Pattern::kGeneral;
-        const bool fast_split_col_agg =
-            fast_1pk_dense && fast_split_left_ok && def_group_cell_probe &&
-            use_split_key_gid && split_key_unpack_only &&
-            !use_dense_split_direct_gid && !use_radix_agg &&
-            !packed_2x32_group_key && skip_accumulator_states &&
-            agg_count == 1 && left_numeric[0].op == 2;
-        const bool fast_split_count_or_distinct =
-            fast_1pk_dense && fast_split_left_ok && !def_group_cell_probe &&
-            !def_compact_split_probe &&
-            (count_star_only || fusion->aggregates.empty()) &&
-            !use_preassigned_build_groups && !compact_counts &&
-            !raw_sum_fusion && residual_programs.empty() && use_split_key_gid &&
-            split_key_unpack_only && !packed_2x32_group_key &&
-            join_type == JoinType::kInner &&
-            !fusion->rollup_count_distribution && all_direct_group_keys &&
-            !left.HasSpill();
-        const int64_t* const split_lcol_ints =
-            split_left_direct ? proj_int_ptrs[split_lcol] : nullptr;
-        const LSTableColumnBlock* const split_lcol_blk =
-            split_left_direct ? proj_cols[split_lcol] : nullptr;
-        const uint8_t split_lcol_has_null =
-            split_left_direct ? proj_has_null[split_lcol] : uint8_t{0};
-        const ValueType split_lcol_vt =
-            split_left_direct ? def_base_types[split_lcol] : ValueType::kNull;
-        const bool split_lcol_type_ok =
-            split_left_direct && (split_lcol_vt == ValueType::kInt64 ||
-                                  split_lcol_vt == ValueType::kDate);
-        bool have_cached_pk_lval = false;
-        int64_t cached_pk_key = 0;
-        bool cached_pk_lval_ok = !split_has_left_probe;
-        uint32_t cached_pk_lval_bits = 0;
-        const PreparedDeferredPkGroup* const pk0_ptr =
-            fast_1pk_dense ? def_pk_groups.data() : nullptr;
-        DefPkGroupCursor* const cur0_ptr =
-            fast_1pk_dense ? pk_group_cursors.data() : nullptr;
-        const LSTableColumnBlock* const pk0_col =
-            fast_1pk_dense ? proj_cols[pk0_ptr->pk_col] : nullptr;
-        const int64_t* const pk0_ints =
-            fast_1pk_dense ? proj_int_ptrs[pk0_ptr->pk_col] : nullptr;
-        const uint8_t pk0_has_null =
-            fast_1pk_dense ? proj_has_null[pk0_ptr->pk_col] : uint8_t{0};
-        const int64_t pk0_min_k = fast_1pk_dense ? pk0_ptr->min_k : 0;
-        const int64_t pk0_max_k = fast_1pk_dense ? pk0_ptr->max_k : -1;
-        const bool pk0_use_subgid =
-            fast_1pk_dense && pk0_ptr->use_subgid && split_uses_pk_subgid;
-        const uint8_t pk0_shift =
-            fast_1pk_dense ? pk0_ptr->subgid_shift : uint8_t{0};
-        const bool fast_dense_split_probe =
-            use_dense_split_direct_gid && !use_shared_direct_gid &&
-            !use_direct_gid_agg &&
-            (use_dense_int_rows || use_unique_int_table) &&
-            !def_compact_split_probe && !def_pk_groups.empty() &&
-            def_pk_groups.size() <= 3 && agg_count == 1 &&
-            (left_numeric[0].op == 0 || left_numeric[0].op == 2 ||
-             left_numeric[0].op == 3 || left_numeric[0].op == 9) &&
-            (left_numeric[0].op != 9 ||
-             compiled_double_arith[static_cast<size_t>(
-                                       left_numeric[0].orig_agg)]
-                     .pattern != CompiledDefDoubleArith::Pattern::kGeneral) &&
-            std::ranges::all_of(def_pk_groups, [](const auto& g) {
-              return g.dense_ptr != nullptr && g.total_rows > 0 &&
-                     g.max_k >= g.min_k && g.dense_size == g.span;
-            });
-        const bool want_da_arith =
-            fast_split_arith_agg ||
-            (fast_dense_split_probe && left_numeric[0].op == 9);
-        const bool want_da_col =
-            fast_split_col_agg ||
-            (fast_dense_split_probe && left_numeric[0].op == 2);
-        const bool want_da_int =
-            fast_dense_split_probe && left_numeric[0].op == 3;
-        const size_t dpk_n = fast_dense_split_probe ? def_pk_groups.size() : 0;
-        uint32_t dense_right_stride = 1;
-        std::array<uint32_t, 3> dpk_stride{};
-        std::array<int64_t, 3> dpk_min{};
-        std::array<uint64_t, 3> dpk_span{};
-        std::array<const decltype(def_pk_groups)::value_type::DensePkEntry*, 3>
-            dpk_dense{};
-        std::array<uint8_t, 3> dpk_use_subgid{};
-        std::array<const LSTableColumnBlock*, 3> dpk_col{};
-        std::array<const int64_t*, 3> dpk_ints{};
-        std::array<uint8_t, 3> dpk_has_null{};
-        if (fast_dense_split_probe) {
-          for (size_t idx = dense_pk_group_indices.size(); idx > 0; --idx) {
-            const size_t gi = dense_pk_group_indices[idx - 1];
-            dpk_stride[gi] = dense_right_stride;
-            dense_right_stride *= def_pk_groups[gi].subgid_count;
-          }
-          for (size_t gi = 0; gi < dpk_n; ++gi) {
-            const auto& g = def_pk_groups[gi];
-            dpk_min[gi] = g.min_k;
-            dpk_span[gi] = static_cast<uint64_t>(g.dense_size);
-            dpk_dense[gi] = g.dense_ptr;
-            dpk_use_subgid[gi] = static_cast<uint8_t>(g.use_subgid ? 1 : 0);
-            dpk_col[gi] = proj_cols[static_cast<size_t>(g.pk_col)];
-            dpk_ints[gi] = proj_int_ptrs[static_cast<size_t>(g.pk_col)];
-            dpk_has_null[gi] = proj_has_null[static_cast<size_t>(g.pk_col)];
-          }
-        }
-        DirectGidWorker* const dw_fast_ptr =
-            fast_dense_split_probe ? &direct_gid_workers[w] : nullptr;
-        DirectDoubleCell* const dw_packed_cells =
-            (fast_dense_split_probe && use_packed_double_cells)
-                ? dw_fast_ptr->double_cells.data()
-                : nullptr;
-        const CompiledDefDoubleArith* const da_plan =
-            want_da_arith ? &compiled_double_arith[static_cast<size_t>(
-                                left_numeric[0].orig_agg)]
-                          : nullptr;
-        const auto da_pattern = want_da_arith
-                                    ? da_plan->pattern
-                                    : CompiledDefDoubleArith::Pattern::kGeneral;
-        const uint32_t da_c0 =
-            want_da_arith
-                ? da_plan->fast_cols[0]
-                : (want_da_col
-                       ? static_cast<uint32_t>(left_numeric[0].col0)
-                       : (want_da_int
-                              ? static_cast<uint32_t>(left_numeric[0].col0)
-                              : 0U));
-        const uint32_t da_c1 = want_da_arith ? da_plan->fast_cols[1] : 0U;
-        const uint32_t da_c2 = want_da_arith ? da_plan->fast_cols[2] : 0U;
-        const uint32_t da_c3 = want_da_arith ? da_plan->fast_cols[3] : 0U;
-        const double da_div = want_da_arith ? da_plan->fast_div : 1.0;
-        const int64_t* const da_p0 =
-            (want_da_arith || want_da_col || want_da_int) ? proj_int_ptrs[da_c0]
-                                                          : nullptr;
-        const int64_t* const da_p1 =
-            want_da_arith ? proj_int_ptrs[da_c1] : nullptr;
-        const int64_t* const da_p2 =
-            want_da_arith ? proj_int_ptrs[da_c2] : nullptr;
-        const int64_t* const da_p3 =
-            want_da_arith ? proj_int_ptrs[da_c3] : nullptr;
-        const bool da_c0_is_double =
-            want_da_col && def_base_types[da_c0] == ValueType::kDouble;
-        const bool da_all_nonnull =
-            want_da_arith
-                ? ((da_pattern ==
-                    CompiledDefDoubleArith::Pattern::kSubSubAddDivConst)
-                       ? ((proj_has_null[da_c0] | proj_has_null[da_c1] |
-                           proj_has_null[da_c2] | proj_has_null[da_c3]) == 0)
-                       : ((proj_has_null[da_c0] | proj_has_null[da_c1]) == 0))
-                : ((want_da_col || want_da_int) ? (proj_has_null[da_c0] == 0)
-                                                : false);
-        const bool use_rf_sel = rf_col != nullptr && rf_has_dense &&
-                                !blk_rf_monotonic && rf_hi >= rf_lo &&
-                                rf_col->int_cells.size() >= blk.row_count;
-        size_t rf_sel_count = blk.row_count;
-        if (use_rf_sel) {
-          if (rf_sel_buf.size() < blk.row_count) {
-            rf_sel_buf.resize(blk.row_count);
-          }
-          rf_sel_count = PrefilterDenseRfBlock(
-              rf_col->int_cells.data(), blk.row_count, rf_lo, rf_hi,
-              rf_dense_bits, rf_dense_all_set, rf_col, rf_col_has_null,
-              rf_sel_buf.data());
-          if (rf_sel_count == 0) {
-            continue;
-          }
-        }
-        const uint32_t* const rf_sel_ptr =
-            use_rf_sel ? rf_sel_buf.data() : nullptr;
-        const size_t radix_agg_col =
-            (left_numeric.size() > radix_primary &&
-             left_numeric[radix_primary].col0 >= 0)
-                ? static_cast<size_t>(left_numeric[radix_primary].col0)
-                : base_proj_cols;
-        // Lean proof:
-        // lean/TinylambOpt/ResearchProofs/MonoContiguousFactSlice.lean (sound)
-        const bool mono_contiguous_rf =
-            blk_rf_monotonic && rf_col != nullptr && rf_has_dense &&
-            rf_dense_all_set && rf_hi >= rf_lo &&
-            rf_col->int_cells.size() >= blk.row_count;
-        const bool radix_rf_ok =
-            (!blk_rf_monotonic && (use_rf_sel || rf_col == nullptr)) ||
-            mono_contiguous_rf;
-        if (!has_null_peeks && extra_rf_count == 0 &&
-            (peek_all_pass || peek_ptr == nullptr) && radix_rf_ok &&
-            join_type == JoinType::kInner && integer_key &&
-            !packed_2x32_int_key && left_key_offsets[0] == 0 &&
-            !bulk_raw_count && !charge_from_cells && use_dense_int_rows &&
-            !dense_int_idxs.empty() && ranked_int_bits.empty() &&
-            def_group_cell_probe && residual_programs.empty() &&
-            !def_compact_split_probe && !use_split_key_gid &&
-            !use_dense_split_direct_gid && !use_direct_gid_agg &&
-            !use_shared_direct_gid && def_pk_groups.empty() &&
-            packed_2x32_group_key && use_radix_agg && single_double_sum &&
-            !uses_double_arith_cell_op && !radix_tuple_is_int &&
-            radix_primary < left_numeric.size() &&
-            left_numeric[radix_primary].op == 2 && jk0 < base_proj_cols &&
-            packed_2x32_slot0 < base_proj_cols &&
-            packed_2x32_slot1 < base_proj_cols &&
-            radix_agg_col < base_proj_cols &&
-            def_base_types[packed_2x32_slot0] == packed_2x32_type0 &&
-            def_base_types[packed_2x32_slot1] == packed_2x32_type1 &&
-            (def_base_types[radix_agg_col] == ValueType::kDouble ||
-             def_base_types[radix_agg_col] == ValueType::kInt64) &&
-            proj_cols[jk0]->int_cells.size() >= blk.row_count &&
-            proj_cols[packed_2x32_slot0]->int_cells.size() >= blk.row_count &&
-            proj_cols[packed_2x32_slot1]->int_cells.size() >= blk.row_count &&
-            proj_cols[radix_agg_col]->int_cells.size() >= blk.row_count) {
-          uint32_t r_begin = 0;
-          auto r_end = static_cast<uint32_t>(rf_sel_count);
-          if (mono_contiguous_rf) {
-            r_end = blk.row_count;
-            const int64_t* const rf_cells = rf_col->int_cells.data();
-            if (!rf_col->has_min_max || rf_col->min_int < rf_lo) {
-              r_begin = static_cast<uint32_t>(
-                  std::lower_bound(rf_cells, rf_cells + blk.row_count, rf_lo) -
-                  rf_cells);
-            }
-            if (!rf_col->has_min_max || rf_col->max_int > rf_hi) {
-              r_end = static_cast<uint32_t>(
-                  std::upper_bound(rf_cells + r_begin, rf_cells + blk.row_count,
-                                   rf_hi) -
-                  rf_cells);
-            }
-            if (r_begin >= r_end) {
-              continue;
-            }
-          }
-          const size_t blk_rows = r_end - r_begin;
-          if (radix_blk_keys.size() < blk_rows) {
-            radix_blk_keys.resize(blk_rows);
-            radix_blk_dvals.resize(blk_rows);
-            radix_blk_valids.resize(blk_rows);
-            radix_blk_parts.resize(blk_rows);
-          }
-          const int64_t* const __restrict__ jk_ints = jk0_ints;
-          const LSTableColumnBlock* const __restrict__ jk_null_blk =
-              proj_has_null[jk0] != 0 ? proj_cols[jk0] : nullptr;
-          const size_t s0 = packed_2x32_slot0;
-          const size_t s1 = packed_2x32_slot1;
-          const int64_t* const __restrict__ k0_ints = proj_int_ptrs[s0];
-          const LSTableColumnBlock* const __restrict__ k0_null_blk =
-              proj_has_null[s0] != 0 ? proj_cols[s0] : nullptr;
-          const int64_t* const __restrict__ k1_ints = proj_int_ptrs[s1];
-          const LSTableColumnBlock* const __restrict__ k1_null_blk =
-              proj_has_null[s1] != 0 ? proj_cols[s1] : nullptr;
-          const int64_t* const __restrict__ agg_ints =
-              proj_int_ptrs[radix_agg_col];
-          const LSTableColumnBlock* const __restrict__ agg_null_blk =
-              proj_has_null[radix_agg_col] != 0 ? proj_cols[radix_agg_col]
-                                                : nullptr;
-          const bool agg_is_double =
-              (def_base_types[radix_agg_col] == ValueType::kDouble);
-          const uint32_t* const __restrict__ dense_ptr = dense_int_idxs.data();
-          const uint64_t dense_sz = dense_int_idxs.size();
-          const int64_t dense_min = dense_int_min;
-          RadixSoABucket* const __restrict__ buckets_w =
-              worker_radix_buckets[w].data();
-          constexpr int64_t kI32Min = std::numeric_limits<int32_t>::min();
-          constexpr int64_t kI32Max = std::numeric_limits<int32_t>::max();
-          uint64_t* const __restrict__ bk = radix_blk_keys.data();
-          double* const __restrict__ bd = radix_blk_dvals.data();
-          uint8_t* const __restrict__ bv = radix_blk_valids.data();
-          uint8_t* const __restrict__ bp = radix_blk_parts.data();
-          std::array<uint32_t, kRadixParts> pcnt{};
-          size_t m = 0;
-          for (uint32_t ri = r_begin; ri < r_end; ++ri) {
-            const uint32_t r = use_rf_sel ? rf_sel_ptr[ri] : ri;
-            if (jk_null_blk != nullptr && jk_null_blk->IsNull(r)) [[unlikely]] {
-              continue;
-            }
-            const uint64_t idx = static_cast<uint64_t>(jk_ints[r]) -
-                                 static_cast<uint64_t>(dense_min);
-            if (idx >= dense_sz) {
-              continue;
-            }
-            const uint32_t r_idx = dense_ptr[idx];
-            if (r_idx == kInvalidRightIdx) {
-              continue;
-            }
-            const int64_t v0 = k0_ints[r];
-            const int64_t v1 = k1_ints[r];
-            if ((k0_null_blk != nullptr && k0_null_blk->IsNull(r)) ||
-                (k1_null_blk != nullptr && k1_null_blk->IsNull(r)) ||
-                v0 < kI32Min || v0 > kI32Max || v1 < kI32Min || v1 > kI32Max)
-                [[unlikely]] {
-              RETURN_IF_FAIL(process_def_match(r, r_idx));
-              continue;
-            }
-            const uint64_t ukey =
-                (static_cast<uint64_t>(
-                     static_cast<uint32_t>(static_cast<int32_t>(v0)))
-                 << 32) |
-                static_cast<uint32_t>(static_cast<int32_t>(v1));
-            double dv = 0.0;
-            uint8_t valid = 1;
-            if (agg_null_blk != nullptr && agg_null_blk->IsNull(r))
-                [[unlikely]] {
-              valid = 0;
-            } else {
-              const int64_t raw = agg_ints[r];
-              dv = agg_is_double ? std::bit_cast<double>(raw)
-                                 : static_cast<double>(raw);
-            }
-            const auto part = static_cast<uint8_t>(radix_bucket_of(ukey));
-            bk[m] = ukey;
-            bd[m] = dv;
-            bv[m] = valid;
-            bp[m] = part;
-            ++pcnt[part];
-            ++m;
-          }
-          if (m > 0) {
-            std::array<uint64_t*, kRadixParts> dst_k{};
-            std::array<double*, kRadixParts> dst_d{};
-            std::array<uint8_t*, kRadixParts> dst_v{};
-            std::array<uint32_t, kRadixParts> ppos{};
-            for (size_t p = 0; p < kRadixParts; ++p) {
-              if (pcnt[p] == 0) {
-                continue;
-              }
-              const size_t old_n = buckets_w[p].keys.size();
-              const size_t new_n = old_n + pcnt[p];
-              buckets_w[p].keys.resize(new_n);
-              buckets_w[p].dvals.resize(new_n);
-              buckets_w[p].valids.resize(new_n);
-              dst_k[p] = buckets_w[p].keys.data() + old_n;
-              dst_d[p] = buckets_w[p].dvals.data() + old_n;
-              dst_v[p] = buckets_w[p].valids.data() + old_n;
-            }
-            for (size_t i = 0; i < m; ++i) {
-              const uint8_t p = bp[i];
-              const uint32_t pos = ppos[p]++;
-              dst_k[p][pos] = bk[i];
-              dst_d[p][pos] = bd[i];
-              dst_v[p][pos] = bv[i];
-            }
-            local.comparisons += m;
-          }
-          continue;
-        }
-        for (uint32_t ri = 0; ri < rf_sel_count; ++ri) {
-          uint32_t r = use_rf_sel ? rf_sel_ptr[ri] : ri;
-          if (has_null_peeks &&
-              std::ranges::any_of(deferred_left_probe->null_peeks,
-                                  [&](const NullPeekCompare& test) {
-                                    return blk.columns[test.column].IsNull(r) !=
-                                           test.expect_null;
-                                  })) {
-            continue;
-          }
-          if (!use_rf_sel && rf_col != nullptr) {
-            if (rf_col_has_null && rf_col->IsNull(r)) [[unlikely]] {
-              continue;
-            }
-            const int64_t kv = rf_col->int_cells[r];
-            if (rf_has_dense) {
-              bool accepted = false;
-              if (kv >= rf_lo && kv <= rf_hi) {
-                const uint64_t off =
-                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(rf_lo);
-                accepted = (rf_dense_bits[off >> 6] &
-                            (uint64_t{1} << (off & 63))) != 0;
-              }
-              if (!accepted) {
-                if (blk_rf_monotonic) {
-                  if (kv > rf_hi) {
-                    break;
-                  }
-                  int64_t next_valid_key = rf_lo;
-                  if (kv >= rf_lo) {
-                    const uint64_t next_off = static_cast<uint64_t>(kv) -
-                                              static_cast<uint64_t>(rf_lo) +
-                                              1ULL;
-                    auto w_idx = static_cast<size_t>(next_off >> 6);
-                    if (w_idx >= rf_dense_words) {
-                      break;
-                    }
-                    uint64_t word =
-                        rf_dense_bits[w_idx] & (~0ULL << (next_off & 63));
-                    while (word == 0) {
-                      if (++w_idx >= rf_dense_words) {
-                        break;
-                      }
-                      word = rf_dense_bits[w_idx];
-                    }
-                    if (w_idx >= rf_dense_words) {
-                      break;
-                    }
-                    const uint64_t found_off =
-                        (static_cast<uint64_t>(w_idx) << 6) +
-                        static_cast<uint64_t>(std::countr_zero(word));
-                    next_valid_key = rf_lo + static_cast<int64_t>(found_off);
-                    if (next_valid_key > rf_hi) {
-                      break;
-                    }
-                  }
-                  if (rf_col->has_min_max && next_valid_key > rf_col->max_int) {
-                    break;
-                  }
-                  const uint32_t row_count = blk.row_count;
-                  const int64_t* const cells = rf_col->int_cells.data();
-                  if (r + 1 < row_count && cells[r + 1] < next_valid_key) {
-                    uint32_t lo = r + 1;
-                    uint32_t step = 4;
-                    while (lo + step < row_count &&
-                           cells[lo + step] < next_valid_key) {
-                      lo += step;
-                      step <<= 1;
-                    }
-                    const uint32_t hi = std::min(row_count, lo + step + 1);
-                    const int64_t* found = std::lower_bound(
-                        cells + lo, cells + hi, next_valid_key);
-                    ri = static_cast<uint32_t>(found - cells) - 1;
-                  }
-                }
-                continue;
-              }
-            } else if (active_rf_group->Reject(kv)) {
-              continue;
-            }
-          }
-          if (extra_rf_count != 0) {
-            bool extra_ok = true;
-            for (size_t ei = 0; ei < extra_rf_count; ++ei) {
-              const DefExtraRf& erf = extra_rfs[ei];
-              if (erf.has_null && erf.col->IsNull(r)) [[unlikely]] {
-                extra_ok = false;
-                break;
-              }
-              if (!erf.type_ok) {
-                continue;
-              }
-              const int64_t kv = erf.col->int_cells[r];
-              if (erf.dense_bits != nullptr) {
-                if (kv < erf.lo || kv > erf.hi) {
-                  extra_ok = false;
-                  break;
-                }
-                const uint64_t off =
-                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(erf.lo);
-                if ((erf.dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
-                    0) {
-                  extra_ok = false;
-                  break;
-                }
-              } else if (erf.group->Reject(kv)) {
-                extra_ok = false;
-                break;
-              }
-            }
-            if (!extra_ok) {
-              continue;
-            }
-          }
-          if (!peek_all_pass && peek_ptr != nullptr) {
-            bool peek_ok = true;
-            for (const IntegerPeekCompare& pred : *peek_ptr) {
-              const LSTableColumnBlock& pcol = blk.columns[pred.column];
-              if ((pcol.has_null && pcol.IsNull(r)) ||
-                  !eval_int_peek(pred.op, pcol.int_cells[r], pred.constant)) {
-                peek_ok = false;
-                break;
-              }
-            }
-            if (!peek_ok) {
-              continue;
-            }
-          }
-          if (jk_has_null) [[unlikely]] {
-            if ((proj_has_null[jk0] != 0 && proj_cols[jk0]->IsNull(r)) ||
-                (packed_2x32_int_key && proj_has_null[jk1] != 0 &&
-                 proj_cols[jk1]->IsNull(r))) {
-              continue;
-            }
-          }
-          int64_t key = 0;
-          if (!packed_2x32_int_key) {
-            key = AddJoinKeyBias(jk0_ints[r], off0);
-          } else {
-            const int64_t k0 = AddJoinKeyBias(jk0_ints[r], off0);
-            const int64_t k1 = AddJoinKeyBias(jk1_ints[r], off1);
-            if (!fits_fused_i32(k0) || !fits_fused_i32(k1)) [[unlikely]] {
-              continue;
-            }
-            key = pack_fused_2x32(k0, k1);
-          }
-          if (bulk_raw_count) {
-            const BulkCountValue* bulk = nullptr;
-            if (use_dense_bulk) {
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_bulk_min);
-              if (idx < dense_bulk_counts.size() &&
-                  dense_bulk_counts[idx].r_idx != kInvalidRightIdx) {
-                bulk = &dense_bulk_counts[idx];
-              }
-            } else {
-              bulk = bulk_counts->Find(key);
-            }
-            if (bulk == nullptr || !materialize_current_left_row(r)) {
-              continue;
-            }
-            local.comparisons += bulk->pairs;
-            const Value& bulk_cell = left_row.values_[int_group_slot];
-            size_t* bulk_slot = nullptr;
-            bool new_group = false;
-            size_t group_index = 0;
-            if (!bulk_cell.IsNull() && bulk_cell.type == int_group_type &&
-                !bulk_cell.IsUnsigned()) {
-              bool inserted = false;
-              bulk_slot = local.int_offsets.TryEmplace(
-                  bulk_cell.value.int_value, &inserted);
-              if (!inserted) {
-                group_index = *bulk_slot;
-              } else {
-                local.key_scratch.assign(1, bulk_cell);
-                new_group = true;
-              }
-            } else {
-              local.key_scratch.clear();
-              local.key_scratch.push_back(CanonicalDistinctValue(bulk_cell));
-              if (auto found = local.offsets.find(local.key_scratch);
-                  found != local.offsets.end()) {
-                group_index = found->second;
-              } else {
-                new_group = true;
-              }
-            }
-            if (new_group) {
-              group_index = local.groups.size();
-              FusedGroup group;
-              local.owned_rep_left.push_back(left_row);
-              group.rep_left = &local.owned_rep_left.back();
-              group.rep_right_idx = bulk->r_idx;
-              if (bulk_slot != nullptr) {
-                if (!all_direct_group_keys) {
-                  group.key = Row(local.key_scratch);
-                }
-                local.groups.push_back(std::move(group));
-                *bulk_slot = group_index;
-              } else {
-                // T4639/T4640: building two Rows from key_scratch paid two
-                // full key materializations (array + per-Value string copies)
-                // per new group. Move the scratch into one key, copy that
-                // into the offsets map, and move it into group.key -- same
-                // double ownership, half the allocations.
-                Row local_key(std::move(local.key_scratch));
-                local.offsets.emplace(Row(local_key), group_index);
-                group.key = std::move(local_key);
-                local.groups.push_back(std::move(group));
-              }
-            }
-            local.groups[group_index].raw_count += bulk->count;
-            continue;
-          }
-          if (use_dense_int_rows || use_unique_int_table) {
-            uint32_t r_idx = kInvalidRightIdx;
-            if (use_dense_int_rows) {
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_int_min);
-              if (!ranked_int_bits.empty()) {
-                if (idx < ranked_int_span) {
-                  const uint64_t word = ranked_int_bits[idx >> 6];
-                  const uint64_t bit = uint64_t{1} << (idx & 63);
-                  if ((word & bit) != 0) {
-                    const uint32_t rank =
-                        ranked_int_prefix[idx >> 6] +
-                        static_cast<uint32_t>(std::popcount(word & (bit - 1)));
-                    r_idx = ranked_int_rows[rank];
-                  }
-                }
-              } else if (idx < dense_int_idxs.size()) {
-                r_idx = dense_int_idxs[idx];
-              }
-            } else {
-              size_t slot = hash_unique_int_key(key) & unique_int_mask;
-              while (unique_int_table[slot].r_idx != kInvalidRightIdx) {
-                if (unique_int_table[slot].key == key) [[likely]] {
-                  r_idx = unique_int_table[slot].r_idx;
-                  break;
-                }
-                slot = (slot + 1) & unique_int_mask;
-              }
-            }
-            if (r_idx == kInvalidRightIdx) {
-              continue;
-            }
-            // COUNT(*) and existence-only fusions never read a fact cell.
-            // The build row already carries the group, so a matched gid is
-            // the whole update.
-            if (use_dense_int_rows && count_star_only && use_direct_gid_agg &&
-                prepared_pk_lookups.empty()) {
-              const uint32_t gid = gid_of(r_idx);
-              if (gid != kInvalidGid) {
-                DirectGidWorker& dw =
-                    direct_gid_workers[use_shared_direct_gid ? 0 : w];
-                ++local.comparisons;
-                if (use_shared_direct_gid) {
-                  __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
-                  __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
-                } else {
-                  dw.matched[gid] = 1;
-                  dw.counts[gid] += 1;
-                }
-                continue;
-              }
-            }
-            if (use_dense_int_rows && charge_from_cells) {
-              const uint32_t gid = gid_of(r_idx);
-              if (gid != kInvalidGid) {
-                ++local.comparisons;
-                DirectGidWorker& dw = direct_gid_workers[w];
-                charge_numeric(
-                    dw, gid, r_idx,
-                    [&](int32_t col, double* out) {
-                      const auto c = static_cast<size_t>(col);
-                      if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
-                        return false;
-                      }
-                      const int64_t raw = proj_int_ptrs[c][r];
-                      if (def_base_types[c] == ValueType::kDouble) {
-                        *out = std::bit_cast<double>(raw);
-                      } else {
-                        *out = static_cast<double>(raw);
-                      }
-                      return true;
-                    },
-                    [&](int32_t col, int64_t* out) {
-                      const auto c = static_cast<size_t>(col);
-                      if (proj_has_null[c] != 0 && proj_cols[c]->IsNull(r)) {
-                        return false;
-                      }
-                      *out = proj_int_ptrs[c][r];
-                      return true;
-                    },
-                    [&](int32_t col) {
-                      const auto c = static_cast<size_t>(col);
-                      return proj_has_null[c] == 0 || !proj_cols[c]->IsNull(r);
-                    });
-                continue;
-              }
-            }
-            if (fast_dense_split_probe) {
-              const uint32_t r_subgid =
-                  !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-              if (r_subgid == std::numeric_limits<uint32_t>::max())
-                  [[unlikely]] {
-                continue;
-              }
-              uint32_t gid = split_uses_right_subgid
-                                 ? (r_subgid * dense_right_stride)
-                                 : 0U;
-              bool pk_ok = true;
-              for (size_t gi = 0; gi < dpk_n; ++gi) {
-                if (dpk_has_null[gi] != 0 && dpk_col[gi]->IsNull(r))
-                    [[unlikely]] {
-                  pk_ok = false;
-                  break;
-                }
-                const uint64_t off = static_cast<uint64_t>(dpk_ints[gi][r]) -
-                                     static_cast<uint64_t>(dpk_min[gi]);
-                if (off >= dpk_span[gi]) [[unlikely]] {
-                  pk_ok = false;
-                  break;
-                }
-                const auto& entry = dpk_dense[gi][off];
-                if (entry.nb == std::numeric_limits<uint32_t>::max())
-                    [[unlikely]] {
-                  pk_ok = false;
-                  break;
-                }
-                if (dpk_use_subgid[gi] != 0) {
-                  if (entry.subgid == std::numeric_limits<uint32_t>::max())
-                      [[unlikely]] {
-                    pk_ok = false;
-                    break;
-                  }
-                  gid += entry.subgid * dpk_stride[gi];
-                }
-              }
-              if (!pk_ok) {
-                continue;
-              }
-              ++local.comparisons;
-              if (use_packed_double_cells) {
-                DirectDoubleCell& cell = dw_packed_cells[gid];
-                double dv = 0.0;
-                bool is_null = false;
-                if (want_da_col) {
-                  if (!da_all_nonnull && proj_cols[da_c0]->IsNull(r))
-                      [[unlikely]] {
-                    is_null = true;
-                  } else {
-                    const int64_t raw = da_p0[r];
-                    dv = da_c0_is_double ? std::bit_cast<double>(raw)
-                                         : static_cast<double>(raw);
-                  }
-                } else {
-                  if (!da_all_nonnull) {
-                    if ((proj_has_null[da_c0] != 0 &&
-                         proj_cols[da_c0]->IsNull(r)) ||
-                        (proj_has_null[da_c1] != 0 &&
-                         proj_cols[da_c1]->IsNull(r)) ||
-                        (da_pattern == CompiledDefDoubleArith::Pattern::
-                                           kSubSubAddDivConst &&
-                         ((proj_has_null[da_c2] != 0 &&
-                           proj_cols[da_c2]->IsNull(r)) ||
-                          (proj_has_null[da_c3] != 0 &&
-                           proj_cols[da_c3]->IsNull(r))))) {
-                      is_null = true;
-                    }
-                  }
-                  if (!is_null) [[likely]] {
-                    const auto v0 = std::bit_cast<double>(da_p0[r]);
-                    const auto v1 = std::bit_cast<double>(da_p1[r]);
-                    switch (da_pattern) {
-                      case CompiledDefDoubleArith::Pattern::kSubSubAddDivConst:
-                        dv = (((v0 - v1) - std::bit_cast<double>(da_p2[r])) +
-                              std::bit_cast<double>(da_p3[r])) /
-                             da_div;
-                        break;
-                      case CompiledDefDoubleArith::Pattern::kSubDivConst:
-                        dv = (v0 - v1) / da_div;
-                        break;
-                      case CompiledDefDoubleArith::Pattern::kSub:
-                        dv = v0 - v1;
-                        break;
-                      case CompiledDefDoubleArith::Pattern::kAdd:
-                        dv = v0 + v1;
-                        break;
-                      default:
-                        break;
-                    }
-                  }
-                }
-                if (is_null) [[unlikely]] {
-                  cell.meta |= 1ULL;
-                } else {
-                  const double prev = cell.sum;
-                  const double next = prev + dv;
-                  uint64_t meta = (cell.meta + 4ULL) | 1ULL;
-                  if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv))
-                      [[unlikely]] {
-                    meta |= 2ULL;
-                  }
-                  cell.sum = next;
-                  cell.meta = meta;
-                }
-              } else if (left_numeric[0].op == 0) {
-                dw_fast_ptr->matched[gid] = 1;
-                dw_fast_ptr->counts[gid] += 1;
-              } else {
-                dw_fast_ptr->matched[gid] = 1;
-                if (da_all_nonnull || !proj_cols[da_c0]->IsNull(r)) [[likely]] {
-                  const int64_t iv = da_p0[r];
-                  int64_t next = 0;
-                  if (__builtin_add_overflow(dw_fast_ptr->ints[gid], iv,
-                                             &next)) {
-                    dw_fast_ptr->inf_flags[gid] = 1;
-                  } else {
-                    dw_fast_ptr->ints[gid] = next;
-                  }
-                  dw_fast_ptr->counts[gid] += 1;
-                }
-              }
-              continue;
-            }
-            if (fast_1pk_dense &&
-                (def_compact_split_probe || fast_split_arith_agg ||
-                 fast_split_col_agg || fast_split_count_or_distinct)) {
-              if (pk0_has_null != 0 && pk0_col->IsNull(r)) [[unlikely]] {
-                local.have_cur_pk_subgids = false;
-                continue;
-              }
-              const int64_t pk_k = pk0_ints[r];
-              if (pk_k < pk0_min_k || pk_k > pk0_max_k) [[unlikely]] {
-                local.have_cur_pk_subgids = false;
-                continue;
-              }
-              if (!cur0_ptr->have_last || pk_k != cur0_ptr->last_key)
-                  [[unlikely]] {
-                if (!resolve_def_pk_groups(r, false)) [[unlikely]] {
-                  have_cached_pk_lval = false;
-                  continue;
-                }
-                if (split_left_from_pk0) {
-                  int64_t lv = 0;
-                  ValueType ltype = ValueType::kNull;
-                  bool luns = false;
-                  cached_pk_lval_ok =
-                      read_def_left_raw(split_lcol, r, &lv, &ltype, &luns) &&
-                      !luns &&
-                      (ltype == ValueType::kInt64 ||
-                       ltype == ValueType::kDate) &&
-                      lv >= static_cast<int64_t>(
-                                std::numeric_limits<int32_t>::min()) &&
-                      lv <= static_cast<int64_t>(
-                                std::numeric_limits<int32_t>::max());
-                  cached_pk_lval_bits =
-                      cached_pk_lval_ok
-                          ? static_cast<uint32_t>(static_cast<int32_t>(lv))
-                          : 0U;
-                  cached_pk_key = pk_k;
-                  have_cached_pk_lval = true;
-                }
-              } else {
-                if (!cur0_ptr->last_matched) [[unlikely]] {
-                  local.have_cur_pk_subgids = false;
-                  continue;
-                }
-                if (pk0_ptr->use_subgid) {
-                  local.cur_pk_subgids[0] = cur0_ptr->last_subgid;
-                }
-                local.have_cur_pk_subgids = true;
-                if (split_left_from_pk0 &&
-                    (!have_cached_pk_lval || cached_pk_key != pk_k))
-                    [[unlikely]] {
-                  int64_t lv = 0;
-                  ValueType ltype = ValueType::kNull;
-                  bool luns = false;
-                  cached_pk_lval_ok =
-                      read_def_left_raw(split_lcol, r, &lv, &ltype, &luns) &&
-                      !luns &&
-                      (ltype == ValueType::kInt64 ||
-                       ltype == ValueType::kDate) &&
-                      lv >= static_cast<int64_t>(
-                                std::numeric_limits<int32_t>::min()) &&
-                      lv <= static_cast<int64_t>(
-                                std::numeric_limits<int32_t>::max());
-                  cached_pk_lval_bits =
-                      cached_pk_lval_ok
-                          ? static_cast<uint32_t>(static_cast<int32_t>(lv))
-                          : 0U;
-                  cached_pk_key = pk_k;
-                  have_cached_pk_lval = true;
-                }
-              }
-              const uint32_t r_subgid =
-                  !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-              if (r_subgid == std::numeric_limits<uint32_t>::max())
-                  [[unlikely]] {
-                if (def_compact_split_probe) {
-                  continue;
-                }
-                RETURN_IF_FAIL(process_def_match(r, r_idx));
-                continue;
-              }
-              bool lval_ok = !split_has_left_probe || cached_pk_lval_ok;
-              uint32_t lval_bits =
-                  split_left_from_pk0 ? cached_pk_lval_bits : 0U;
-              if (split_left_direct) {
-                if (!split_lcol_type_ok ||
-                    (split_lcol_has_null != 0 && split_lcol_blk->IsNull(r)))
-                    [[unlikely]] {
-                  lval_ok = false;
-                } else {
-                  const int64_t lv = split_lcol_ints[r];
-                  lval_ok = lv >= static_cast<int64_t>(
-                                      std::numeric_limits<int32_t>::min()) &&
-                            lv <= static_cast<int64_t>(
-                                      std::numeric_limits<int32_t>::max());
-                  lval_bits = static_cast<uint32_t>(static_cast<int32_t>(lv));
-                }
-              }
-              if (!lval_ok) [[unlikely]] {
-                RETURN_IF_FAIL(process_def_match(r, r_idx));
-                continue;
-              }
-              uint64_t packed_u64 =
-                  split_uses_right_subgid
-                      ? (static_cast<uint64_t>(r_subgid) << split_right_shift)
-                      : 0ULL;
-              if (pk0_use_subgid) {
-                const uint32_t psg = local.cur_pk_subgids[0];
-                if (psg == std::numeric_limits<uint32_t>::max()) [[unlikely]] {
-                  if (def_compact_split_probe) {
-                    continue;
-                  }
-                  RETURN_IF_FAIL(process_def_match(r, r_idx));
-                  continue;
-                }
-                packed_u64 |= static_cast<uint64_t>(psg) << pk0_shift;
-              }
-              if (split_has_left_probe) {
-                packed_u64 |= static_cast<uint64_t>(lval_bits);
-              }
-              ++local.comparisons;
-              if (def_compact_split_probe) {
-                if (compact_log_allowed &&
-                    (local.compact_count_inputs == 1024 ||
-                     local.compact_count_inputs == 16384)) [[unlikely]] {
-                  RETURN_IF_FAIL(record_compact_split(local, packed_u64));
-                } else if (local.compact_count_log) {
-                  ++local.compact_count_inputs;
-                  uint64_t h = packed_u64 + 0x9e3779b97f4a7c15ULL;
-                  h = (h ^ (h >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-                  h = (h ^ (h >> 27U)) * 0x94d049bb133111ebULL;
-                  h ^= h >> 31U;
-                  local.compact_split_shards[h & (kCompactSplitShards - 1)]
-                      .push_back(packed_u64);
-                } else {
-                  ++local.compact_count_inputs;
-                  bool inserted = false;
-                  size_t* slot = local.int_offsets.TryEmplace(
-                      std::bit_cast<int64_t>(packed_u64), &inserted);
-                  if (!inserted) [[likely]] {
-                    ++local.compact_counts[*slot].count;
-                  } else {
-                    CompactCountGroup probe;
-                    probe.hash = packed_u64;
-                    probe.count = 1;
-                    *slot = local.compact_counts.size();
-                    local.compact_counts.push_back(probe);
-                  }
-                }
-                continue;
-              }
-              bool inserted = false;
-              size_t* slot = local.int_offsets.TryEmplace(
-                  std::bit_cast<int64_t>(packed_u64), &inserted);
-              if (fast_split_count_or_distinct) {
-                if (!inserted) [[likely]] {
-                  if (count_star_only) {
-                    ++local.groups[*slot].raw_count;
-                  }
-                } else {
-                  const size_t group_index = local.groups.size();
-                  FusedGroup group;
-                  group.key_hash = packed_u64;
-                  group.has_key_hash = true;
-                  group.rep_right_idx = r_idx;
-                  group.raw_count = count_star_only ? 1 : 0;
-                  local.groups.push_back(std::move(group));
-                  *slot = group_index;
-                }
-                continue;
-              }
-              size_t group_index = 0;
-              if (!inserted) [[likely]] {
-                group_index = *slot;
-              } else {
-                group_index = local.groups.size();
-                FusedGroup group;
-                local.raw_arena.Initialize(group, agg_count);
-                group.key_hash = packed_u64;
-                group.has_key_hash = true;
-                group.rep_right_idx = r_idx;
-                local.groups.push_back(std::move(group));
-                *slot = group_index;
-              }
-              FusedGroup& group = local.groups[group_index];
-              double dv = 0.0;
-              bool is_null = false;
-              if (fast_split_arith_agg) {
-                if (!da_all_nonnull) {
-                  if ((proj_has_null[da_c0] != 0 &&
-                       proj_cols[da_c0]->IsNull(r)) ||
-                      (proj_has_null[da_c1] != 0 &&
-                       proj_cols[da_c1]->IsNull(r)) ||
-                      (da_pattern == CompiledDefDoubleArith::Pattern::
-                                         kSubSubAddDivConst &&
-                       ((proj_has_null[da_c2] != 0 &&
-                         proj_cols[da_c2]->IsNull(r)) ||
-                        (proj_has_null[da_c3] != 0 &&
-                         proj_cols[da_c3]->IsNull(r))))) {
-                    is_null = true;
-                  }
-                }
-                if (!is_null) [[likely]] {
-                  const auto v0 = std::bit_cast<double>(da_p0[r]);
-                  const auto v1 = std::bit_cast<double>(da_p1[r]);
-                  switch (da_pattern) {
-                    case CompiledDefDoubleArith::Pattern::kSubSubAddDivConst:
-                      dv = (((v0 - v1) - std::bit_cast<double>(da_p2[r])) +
-                            std::bit_cast<double>(da_p3[r])) /
-                           da_div;
-                      break;
-                    case CompiledDefDoubleArith::Pattern::kSubDivConst:
-                      dv = (v0 - v1) / da_div;
-                      break;
-                    case CompiledDefDoubleArith::Pattern::kSub:
-                      dv = v0 - v1;
-                      break;
-                    case CompiledDefDoubleArith::Pattern::kAdd:
-                      dv = v0 + v1;
-                      break;
-                    default:
-                      break;
-                  }
-                }
-              } else {
-                if (!da_all_nonnull && proj_cols[da_c0]->IsNull(r))
-                    [[unlikely]] {
-                  is_null = true;
-                } else {
-                  const int64_t raw = da_p0[r];
-                  dv = da_c0_is_double ? std::bit_cast<double>(raw)
-                                       : static_cast<double>(raw);
-                }
-              }
-              if (!is_null) [[likely]] {
-                const double prev = group.RawDoubles()[0];
-                const double next = prev + dv;
-                if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv))
-                    [[unlikely]] {
-                  group.RawInfFlags()[0] = 1;
-                }
-                group.RawDoubles()[0] = next;
-                group.RawCounts()[0] += 1;
-              }
-              continue;
-            }
-            RETURN_IF_FAIL(process_def_match(r, r_idx));
-            continue;
-          }
-          const auto [first, last] = int_buckets->equal_range(key);
-          if (first == last) {
-            continue;
-          }
-          if (def_group_cell_probe || def_compact_split_probe) {
-            for (auto iter = first; iter != last; ++iter) {
-              RETURN_IF_FAIL(process_def_match(r, iter->second));
-            }
-          } else {
-            if (!materialize_current_left_row(r)) {
-              continue;
-            }
-            if (use_preassigned_build_groups) {
-              for (auto iter = first; iter != last; ++iter) {
-                ++local.comparisons;
-                RETURN_IF_FAIL(accumulate_preassigned_pair(w, scratch, left_row,
-                                                           iter->second));
-              }
-            } else {
-              size_t cached_group = kNoCachedGroup;
-              for (auto iter = first; iter != last; ++iter) {
-                ++local.comparisons;
-                ASSIGN_OR_RETURN(bool, accumulated,
-                                 process_pair(local, left_row, iter->second,
-                                              scratch, &cached_group));
-                (void)accumulated;
-              }
-            }
-          }
-        }
-      }
-    }
-    if (left.HasColumnarOnly()) {
-      const auto& chunks = left.columnar->chunks;
-      const size_t n_col_morsels = col_morsels.size();
-      const bool preassigned_no_left_row =
-          use_preassigned_build_groups && !use_partitioned_count_distinct &&
-          !ordered_sum_charge &&
-          (fusion->aggregates.empty() || count_star_only);
-      Row col_left_row;
-      if (singleton_right_relation) {
-        for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-          const ColProbeMorsel mor = col_morsels[mi];
-          const ColumnarChunk& ch = chunks[mor.ci];
-          for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-            if (!preassigned_no_left_row) {
-              ch.MaterializeRowInto(r, &col_left_row);
-            }
-            ++local.comparisons;
-            if (use_preassigned_build_groups) {
-              RETURN_IF_FAIL(accumulate_preassigned_pair(
-                  w, scratch, col_left_row, uint32_t{0}));
-            } else {
-              size_t cached_group = kNoCachedGroup;
-              ASSIGN_OR_RETURN(bool, accumulated,
-                               process_pair(local, col_left_row, uint32_t{0},
-                                            scratch, &cached_group));
-              (void)accumulated;
-            }
-          }
-        }
-        return Status::kSuccess;
-      }
-      const bool col_raw_fast =
-          !use_preassigned_build_groups && !compact_counts &&
-          residual_programs.empty() && raw_sum_fusion && !has_count_distinct &&
-          all_direct_group_keys && left_cell_agg_ready &&
-          !uses_double_arith_cell_op && !right_ptr->HasSpill() &&
-          (use_left_packed_key ||
-           (use_split_key_gid && !split_uses_pk_subgid &&
-            (!split_has_left_probe ||
-             key_shapes[split_left_k].direct_column >= 0)) ||
-           packed_2x32_group_key || int_group_key);
-      const bool col_raw_unmatched_ok =
-          col_raw_fast && !left_pack_uses_right && !split_uses_right_subgid;
-      const auto col_read_raw_int =
-          [&](slot_t slot_col, const ColumnarChunk& ch, size_t r,
-              uint32_t r_idx, int64_t* out, ValueType* out_t,
-              bool* out_uns) noexcept -> bool {
-        if (slot_col < left_width) {
-          const ColumnarColumn& cc = ch.columns[slot_col];
-          if (cc.IsNull(r)) [[unlikely]] {
-            return false;
-          }
-          if (cc.is_uniform) [[likely]] {
-            *out_t = cc.type;
-            *out_uns = cc.is_unsigned;
-            *out = cc.IntAt(r);
-            return true;
-          }
-          Value tmp;
-          cc.WriteValueInto(r, &tmp);
-          if (tmp.IsNull()) {
-            return false;
-          }
-          *out_t = tmp.type;
-          *out_uns = tmp.IsUnsigned();
-          *out = tmp.value.int_value;
-          return true;
-        }
-        if (r_idx == kInvalidRightIdx) {
-          return false;
-        }
-        Value rv_tmp;
-        const Value& rv =
-            read_right_cell(r_idx, slot_col - left_width, &rv_tmp);
-        if (rv.IsNull()) [[unlikely]] {
-          return false;
-        }
-        *out_t = rv.type;
-        *out_uns = rv.IsUnsigned();
-        *out = rv.value.int_value;
-        return true;
-      };
-      const auto process_col_raw_match = [&](size_t ci, const ColumnarChunk& ch,
-                                             size_t r,
-                                             uint32_t r_idx) -> Status {
-        bool key_ok = false;
-        int64_t lookup_key = 0;
-        uint64_t computed_key_hash = 0;
-        bool has_computed_key_hash = false;
-        bool need_rep_left = true;
-        if (use_left_packed_key) {
-          uint64_t packed_u64 = 0;
-          if (left_pack_uses_right) {
-            const uint32_t r_subgid = split_right_subgid_ptr[r_idx];
-            packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
-          }
-          if (left_pack_uses_dict) {
-            const size_t li = left_pack_chunk_offsets[ci] + r;
-            packed_u64 |= static_cast<uint64_t>(left_pack_dict_subgid[li])
-                          << left_pack_dict_shift;
-          }
-          for (const LeftPackedIntCol& lpi : left_pack_ints) {
-            const ColumnarColumn& cc = ch.columns[lpi.col];
-            uint64_t code = lpi.null_code;
-            if (cc.encoding == ColumnarColumn::Encoding::kFlat &&
-                cc.is_uniform && cc.ints.size() > r &&
-                (!cc.has_null || cc.nulls.empty() || cc.nulls.size() > r)) {
-              if (!cc.has_null || cc.nulls.empty() || cc.nulls[r] == 0) {
-                code = static_cast<uint64_t>(cc.ints[r]) -
-                       static_cast<uint64_t>(lpi.min_val);
-              }
-            } else if (cc.encoding == ColumnarColumn::Encoding::kGathered) {
-              const ColumnarColumn* leaf = nullptr;
-              size_t lr = 0;
-              if (cc.ResolveLeaf(r, &leaf, &lr)) {
-                const int64_t iv = leaf->is_uniform
-                                       ? leaf->IntAt(lr)
-                                       : ColumnarIntValue(*leaf, lr);
-                code = static_cast<uint64_t>(iv) -
-                       static_cast<uint64_t>(lpi.min_val);
-              }
-            } else if (!cc.IsNull(r)) {
-              code = static_cast<uint64_t>(cc.is_uniform
-                                               ? cc.IntAt(r)
-                                               : ColumnarIntValue(cc, r)) -
-                     static_cast<uint64_t>(lpi.min_val);
-            }
-            packed_u64 |= code << lpi.shift;
-          }
-          lookup_key = std::bit_cast<int64_t>(packed_u64);
-          computed_key_hash = packed_u64;
-          has_computed_key_hash = true;
-          need_rep_left = !left_pack_unpack_only;
-          key_ok = true;
-        } else if (use_split_key_gid) {
-          const uint32_t r_subgid =
-              !split_uses_right_subgid ? 0U : split_right_subgid_ptr[r_idx];
-          int64_t l_val = 0;
-          bool l_ok = !split_has_left_probe;
-          if (split_has_left_probe) {
-            const auto& l_shape = key_shapes[split_left_k];
-            ValueType ltype = ValueType::kNull;
-            bool luns = false;
-            if (l_shape.direct_column >= 0 &&
-                col_read_raw_int(static_cast<slot_t>(l_shape.direct_column), ch,
-                                 r, r_idx, &l_val, &ltype, &luns) &&
-                !luns &&
-                (ltype == ValueType::kInt64 || ltype == ValueType::kDate) &&
-                std::in_range<int32_t>(l_val)) [[likely]] {
-              l_ok = true;
-            }
-          }
-          if (r_subgid != std::numeric_limits<uint32_t>::max() && l_ok)
-              [[likely]] {
-            uint64_t packed_u64 = 0;
-            if (split_uses_right_subgid) {
-              packed_u64 |= static_cast<uint64_t>(r_subgid)
-                            << split_right_shift;
-            }
-            if (split_has_left_probe) {
-              packed_u64 |= static_cast<uint64_t>(
-                  static_cast<uint32_t>(static_cast<int32_t>(l_val)));
-            }
-            lookup_key = std::bit_cast<int64_t>(packed_u64);
-            computed_key_hash = packed_u64;
-            has_computed_key_hash = true;
-            need_rep_left = !split_key_unpack_only;
-            key_ok = true;
-          }
-        } else if (packed_2x32_group_key) {
-          int64_t v0 = 0;
-          int64_t v1 = 0;
-          ValueType t0 = ValueType::kNull;
-          ValueType t1 = ValueType::kNull;
-          bool u0 = false;
-          bool u1 = false;
-          if (col_read_raw_int(packed_2x32_slot0, ch, r, r_idx, &v0, &t0,
-                               &u0) &&
-              col_read_raw_int(packed_2x32_slot1, ch, r, r_idx, &v1, &t1,
-                               &u1) &&
-              t0 == packed_2x32_type0 && !u0 && t1 == packed_2x32_type1 &&
-              !u1 && std::in_range<int32_t>(v0) && std::in_range<int32_t>(v1))
-              [[likely]] {
-            const uint64_t packed_u64 =
-                (static_cast<uint64_t>(
-                     static_cast<uint32_t>(static_cast<int32_t>(v0)))
-                 << 32) |
-                static_cast<uint32_t>(static_cast<int32_t>(v1));
-            lookup_key = std::bit_cast<int64_t>(packed_u64);
-            computed_key_hash = packed_u64;
-            has_computed_key_hash = true;
-            need_rep_left = !packed_2x32_unpack_only;
-            key_ok = true;
-          }
-        } else {
-          ValueType kt = ValueType::kNull;
-          bool kuns = false;
-          if (col_read_raw_int(int_group_slot, ch, r, r_idx, &lookup_key, &kt,
-                               &kuns) &&
-              kt == int_group_type && !kuns) [[likely]] {
-            key_ok = true;
-          }
-        }
-        if (!key_ok) [[unlikely]] {
-          ch.MaterializeRowInto(r, &col_left_row);
-          if (r_idx == kInvalidRightIdx) {
-            return unmatched_left(local, scratch, col_left_row);
-          }
-          size_t cached_group = kNoCachedGroup;
-          ASSIGN_OR_RETURN(
-              bool, accumulated,
-              process_pair(local, col_left_row, r_idx, scratch, &cached_group));
-          (void)accumulated;
-          return Status::kSuccess;
-        }
-        const auto col_agg_double = [&](int32_t col, double* out) {
-          const ColumnarColumn& cc = ch.columns[static_cast<size_t>(col)];
-          if (cc.IsNull(r)) [[unlikely]] {
-            return false;
-          }
-          if (cc.is_uniform) [[likely]] {
-            if (cc.type == ValueType::kDouble) {
-              *out = cc.DoubleAt(r);
-              return true;
-            }
-            if (cc.type == ValueType::kInt64 && !cc.is_unsigned) {
-              *out = static_cast<double>(cc.IntAt(r));
-              return true;
-            }
-            return false;
-          }
-          Value tmp;
-          cc.WriteValueInto(r, &tmp);
-          return !tmp.IsNull() && cell_as_double(tmp, out);
-        };
-        const auto col_agg_int = [&](int32_t col, int64_t* out) {
-          const ColumnarColumn& cc = ch.columns[static_cast<size_t>(col)];
-          if (cc.IsNull(r)) [[unlikely]] {
-            return false;
-          }
-          if (cc.is_uniform) [[likely]] {
-            if (cc.type != ValueType::kInt64 || cc.is_unsigned) {
-              return false;
-            }
-            *out = cc.IntAt(r);
-            return true;
-          }
-          Value tmp;
-          cc.WriteValueInto(r, &tmp);
-          if (tmp.IsNull() || tmp.type != ValueType::kInt64 ||
-              tmp.IsUnsigned()) {
-            return false;
-          }
-          *out = tmp.value.int_value;
-          return true;
-        };
-        const auto col_agg_present = [&](int32_t col) {
-          return !ch.columns[static_cast<size_t>(col)].IsNull(r);
-        };
-        if (use_radix_agg) {
-          return scatter_radix_tuple(
-              w, std::bit_cast<uint64_t>(lookup_key), col_agg_double,
-              col_agg_int, col_agg_present,
-              [](int32_t, double*, bool*) { return Status::kSuccess; });
-        }
-        bool inserted = false;
-        size_t* slot = local.int_offsets.TryEmplace(lookup_key, &inserted);
-        size_t group_index = 0;
-        if (!inserted) [[likely]] {
-          group_index = *slot;
-        } else {
-          group_index = local.groups.size();
-          FusedGroup group;
-          local.raw_arena.Initialize(group, agg_count);
-          group.key_hash = computed_key_hash;
-          group.has_key_hash = has_computed_key_hash;
-          if (need_rep_left) {
-            group.rep_col_chunk = static_cast<uint32_t>(ci);
-            group.rep_col_row = static_cast<uint32_t>(r);
-          }
-          group.rep_right_idx = r_idx;
-          local.groups.push_back(std::move(group));
-          *slot = group_index;
-        }
-        charge_group_numeric(
-            local.groups[group_index],
-            r_idx != kInvalidRightIdx ? static_cast<size_t>(r_idx) : size_t{0},
-            r_idx != kInvalidRightIdx, col_agg_double, col_agg_int,
-            col_agg_present);
-        return Status::kSuccess;
-      };
-      if (integer_key || packed_2x32_int_key) {
-        if (integer_key && count_star_only && use_dense_int_rows &&
-            use_preassigned_build_groups && join_type == JoinType::kInner &&
-            !direct_gid_workers.empty()) {
-          const slot_t key_col = left_columns[0];
-          const int64_t bias = left_key_offsets[0];
-          DirectGidWorker& dw =
-              direct_gid_workers[use_shared_direct_gid ? 0 : w];
-          const uint32_t* dense = dense_int_idxs.data();
-          const size_t dense_n = dense_int_idxs.size();
-          const int64_t dense_base = dense_int_min;
-          for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-            const ColProbeMorsel mor = col_morsels[mi];
-            const ColumnarChunk& ch = chunks[mor.ci];
-            const ColumnarColumn& kc = ch.columns[key_col];
-            if (kc.encoding == ColumnarColumn::Encoding::kConstant &&
-                ch.rows > 0 && kc.IsNull(0)) {
-              continue;
-            }
-            const bool kc_fast =
-                kc.is_uniform && !kc.is_unsigned &&
-                (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
-            for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-              if (kc_fast ? kc.IsNull(r) : ColumnarCellIsNullOrNaN(kc, r)) {
-                continue;
-              }
-              const int64_t raw_k =
-                  kc_fast ? kc.IntAt(r) : ColumnarIntValue(kc, r);
-              const int64_t key = AddJoinKeyBias(raw_k, bias);
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_base);
-              if (idx >= dense_n) {
-                continue;
-              }
-              const uint32_t r_idx = dense[idx];
-              if (r_idx == kInvalidRightIdx) {
-                continue;
-              }
-              const uint32_t gid = gid_of(r_idx);
-              if (gid == kInvalidGid) {
-                continue;
-              }
-              ++local.comparisons;
-              if (use_shared_direct_gid) {
-                __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
-                __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
-              } else {
-                dw.matched[gid] = 1;
-                dw.counts[gid] += 1;
-              }
-            }
-          }
-          return Status::kSuccess;
-        }
-        if (integer_key && left_numeric_probe && use_dense_int_rows) {
-          const slot_t key_col = left_columns[0];
-          const int64_t bias = left_key_offsets[0];
-          DirectGidWorker& dw = direct_gid_workers[w];
-          const uint32_t* dense = dense_int_idxs.data();
-          const size_t dense_n = dense_int_idxs.size();
-          const int64_t dense_base = dense_int_min;
-          for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-            const ColProbeMorsel mor = col_morsels[mi];
-            const ColumnarChunk& ch = chunks[mor.ci];
-            const ColumnarColumn& kc = ch.columns[key_col];
-            if (kc.encoding == ColumnarColumn::Encoding::kConstant &&
-                ch.rows > 0 && kc.IsNull(0)) {
-              continue;
-            }
-            const bool kc_fast =
-                kc.is_uniform && !kc.is_unsigned &&
-                (kc.type == ValueType::kInt64 || kc.type == ValueType::kDate);
-            for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-              if (kc_fast ? kc.IsNull(r) : ColumnarCellIsNullOrNaN(kc, r)) {
-                continue;
-              }
-              const int64_t raw_k =
-                  kc_fast ? kc.IntAt(r) : ColumnarIntValue(kc, r);
-              const int64_t key = AddJoinKeyBias(raw_k, bias);
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_base);
-              if (idx >= dense_n) {
-                continue;
-              }
-              const uint32_t r_idx = dense[idx];
-              if (r_idx == kInvalidRightIdx) {
-                continue;
-              }
-              const uint32_t gid = gid_of(r_idx);
-              if (gid == kInvalidGid) {
-                continue;
-              }
-              ++local.comparisons;
-              charge_numeric(
-                  dw, gid, r_idx,
-                  [&](int32_t col, double* out) {
-                    const ColumnarColumn& cc =
-                        ch.columns[static_cast<size_t>(col)];
-                    if (cc.IsNull(r)) {
-                      return false;
-                    }
-                    if (cc.is_uniform) {
-                      if (cc.type == ValueType::kDouble) {
-                        *out = cc.DoubleAt(r);
-                        return true;
-                      }
-                      if (cc.type == ValueType::kInt64 && !cc.is_unsigned) {
-                        *out = static_cast<double>(cc.IntAt(r));
-                        return true;
-                      }
-                      return false;
-                    }
-                    Value tmp;
-                    cc.WriteValueInto(r, &tmp);
-                    return !tmp.IsNull() && cell_as_double(tmp, out);
-                  },
-                  [&](int32_t col, int64_t* out) {
-                    const ColumnarColumn& cc =
-                        ch.columns[static_cast<size_t>(col)];
-                    if (cc.IsNull(r)) {
-                      return false;
-                    }
-                    if (cc.is_uniform) {
-                      if (cc.type != ValueType::kInt64 || cc.is_unsigned) {
-                        return false;
-                      }
-                      *out = cc.IntAt(r);
-                      return true;
-                    }
-                    Value tmp;
-                    cc.WriteValueInto(r, &tmp);
-                    if (tmp.IsNull() || tmp.type != ValueType::kInt64 ||
-                        tmp.IsUnsigned()) {
-                      return false;
-                    }
-                    *out = tmp.value.int_value;
-                    return true;
-                  },
-                  [&](int32_t col) {
-                    return !ch.columns[static_cast<size_t>(col)].IsNull(r);
-                  });
-            }
-          }
-          return Status::kSuccess;
-        }
-        for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-          const ColProbeMorsel mor = col_morsels[mi];
-          const size_t ci = mor.ci;
-          const ColumnarChunk& ch = chunks[ci];
-          const ColumnarColumn& kc0 = ch.columns[left_columns[0]];
-          const ColumnarColumn* kc1 =
-              packed_2x32_int_key ? &ch.columns[left_columns[1]] : nullptr;
-          const bool kc0_fast =
-              kc0.is_uniform && !kc0.is_unsigned &&
-              (kc0.type == ValueType::kInt64 || kc0.type == ValueType::kDate);
-          const bool kc1_fast =
-              kc1 != nullptr && kc1->is_uniform && !kc1->is_unsigned &&
-              (kc1->type == ValueType::kInt64 || kc1->type == ValueType::kDate);
-          for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-            int64_t raw0 = 0, raw1 = 0;
-            if (!read_col_int_cell(kc0, r, kc0_fast, &raw0) ||
-                (kc1 != nullptr &&
-                 !read_col_int_cell(*kc1, r, kc1_fast, &raw1))) {
-              if (join_type == JoinType::kLeft) {
-                if (col_raw_unmatched_ok) {
-                  RETURN_IF_FAIL(
-                      process_col_raw_match(ci, ch, r, kInvalidRightIdx));
-                } else {
-                  ch.MaterializeRowInto(r, &col_left_row);
-                  RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-                }
-              }
-              continue;
-            }
-            int64_t key = 0;
-            if (integer_key) {
-              key = AddJoinKeyBias(raw0, left_key_offsets[0]);
-            } else {
-              const int64_t k0 = AddJoinKeyBias(raw0, left_key_offsets[0]);
-              const int64_t k1 = AddJoinKeyBias(raw1, left_key_offsets[1]);
-              if (!fits_fused_i32(k0) || !fits_fused_i32(k1)) {
-                if (join_type == JoinType::kLeft) {
-                  if (col_raw_unmatched_ok) {
-                    RETURN_IF_FAIL(
-                        process_col_raw_match(ci, ch, r, kInvalidRightIdx));
-                  } else {
-                    ch.MaterializeRowInto(r, &col_left_row);
-                    RETURN_IF_FAIL(
-                        unmatched_left(local, scratch, col_left_row));
-                  }
-                }
-                continue;
-              }
-              key = pack_fused_2x32(k0, k1);
-            }
-            if (bulk_raw_count) {
-              const BulkCountValue* bulk = nullptr;
-              if (use_dense_bulk) {
-                const uint64_t idx = static_cast<uint64_t>(key) -
-                                     static_cast<uint64_t>(dense_bulk_min);
-                if (idx < dense_bulk_counts.size() &&
-                    dense_bulk_counts[idx].r_idx != kInvalidRightIdx) {
-                  bulk = &dense_bulk_counts[idx];
-                }
-              } else {
-                bulk = bulk_counts->Find(key);
-              }
-              if (bulk == nullptr) {
-                if (join_type == JoinType::kLeft) {
-                  ch.MaterializeRowInto(r, &col_left_row);
-                  RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-                }
-                continue;
-              }
-              local.comparisons += bulk->pairs;
-              const ColumnarColumn& gcc = ch.columns[int_group_slot];
-              if (gcc.is_uniform && !gcc.is_unsigned &&
-                  gcc.type == int_group_type && !gcc.IsNull(r)) {
-                bool inserted = false;
-                size_t* bulk_slot =
-                    local.int_offsets.TryEmplace(gcc.IntAt(r), &inserted);
-                size_t group_index = 0;
-                if (!inserted) {
-                  group_index = *bulk_slot;
-                } else {
-                  group_index = local.groups.size();
-                  FusedGroup group;
-                  group.rep_col_chunk = static_cast<uint32_t>(ci);
-                  group.rep_col_row = static_cast<uint32_t>(r);
-                  group.rep_right_idx = bulk->r_idx;
-                  if (!all_direct_group_keys) {
-                    Value bulk_k;
-                    gcc.WriteValueInto(r, &bulk_k);
-                    group.key = Row(std::vector<Value>{std::move(bulk_k)});
-                  }
-                  local.groups.push_back(std::move(group));
-                  *bulk_slot = group_index;
-                }
-                local.groups[group_index].raw_count += bulk->count;
-                continue;
-              }
-              ch.MaterializeRowInto(r, &col_left_row);
-              const Value& bulk_cell = col_left_row.values_[int_group_slot];
-              size_t* bulk_slot = nullptr;
-              bool new_group = false;
-              size_t group_index = 0;
-              if (!bulk_cell.IsNull() && bulk_cell.type == int_group_type &&
-                  !bulk_cell.IsUnsigned()) {
-                bool inserted = false;
-                bulk_slot = local.int_offsets.TryEmplace(
-                    bulk_cell.value.int_value, &inserted);
-                if (!inserted) {
-                  group_index = *bulk_slot;
-                } else {
-                  local.key_scratch.assign(1, bulk_cell);
-                  new_group = true;
-                }
-              } else {
-                local.key_scratch.clear();
-                local.key_scratch.push_back(CanonicalDistinctValue(bulk_cell));
-                if (auto found = local.offsets.find(local.key_scratch);
-                    found != local.offsets.end()) {
-                  group_index = found->second;
-                } else {
-                  new_group = true;
-                }
-              }
-              if (new_group) {
-                group_index = local.groups.size();
-                local.owned_rep_left.push_back(col_left_row);
-                FusedGroup group;
-                group.rep_left = &local.owned_rep_left.back();
-                group.rep_right_idx = bulk->r_idx;
-                if (bulk_slot != nullptr) {
-                  if (!all_direct_group_keys) {
-                    group.key = Row(local.key_scratch);
-                  }
-                  local.groups.push_back(std::move(group));
-                  *bulk_slot = group_index;
-                } else {
-                  // T4639/T4640: single key construction + one copy into
-                  // the map (see sibling bulk sites).
-                  Row local_key(std::move(local.key_scratch));
-                  local.offsets.emplace(Row(local_key), group_index);
-                  group.key = std::move(local_key);
-                  local.groups.push_back(std::move(group));
-                }
-              }
-              local.groups[group_index].raw_count += bulk->count;
-              continue;
-            }
-            if (use_dense_int_rows) {
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_int_min);
-              const uint32_t r_idx = idx < dense_int_idxs.size()
-                                         ? dense_int_idxs[idx]
-                                         : kInvalidRightIdx;
-              bool matched = false;
-              if (r_idx != kInvalidRightIdx) {
-                ++local.comparisons;
-                if (anti_unmatched_only && residual_programs.empty()) {
-                  matched = true;
-                } else if (col_raw_fast) {
-                  RETURN_IF_FAIL(process_col_raw_match(ci, ch, r, r_idx));
-                  matched = true;
-                } else {
-                  if (!preassigned_no_left_row) {
-                    ch.MaterializeRowInto(r, &col_left_row);
-                  }
-                  if (use_preassigned_build_groups) {
-                    RETURN_IF_FAIL(accumulate_preassigned_pair(
-                        w, scratch, col_left_row, r_idx));
-                    matched = true;
-                  } else {
-                    size_t cached_group = kNoCachedGroup;
-                    ASSIGN_OR_RETURN(bool, accumulated,
-                                     process_pair(local, col_left_row, r_idx,
-                                                  scratch, &cached_group));
-                    matched = accumulated;
-                  }
-                }
-              }
-              if (!matched && join_type == JoinType::kLeft) {
-                if (col_raw_unmatched_ok) {
-                  RETURN_IF_FAIL(
-                      process_col_raw_match(ci, ch, r, kInvalidRightIdx));
-                } else {
-                  if (r_idx == kInvalidRightIdx || preassigned_no_left_row) {
-                    ch.MaterializeRowInto(r, &col_left_row);
-                  }
-                  RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-                }
-              }
-              continue;
-            }
-            if (use_unique_int_table) {
-              size_t slot = hash_unique_int_key(key) & unique_int_mask;
-              uint32_t r_idx = kInvalidRightIdx;
-              while (true) {
-                const UniqueIntSlot& entry = unique_int_table[slot];
-                if (entry.r_idx == kInvalidRightIdx) {
-                  break;
-                }
-                if (entry.key == key) [[likely]] {
-                  r_idx = entry.r_idx;
-                  break;
-                }
-                slot = (slot + 1) & unique_int_mask;
-              }
-              bool matched = false;
-              if (r_idx != kInvalidRightIdx) [[likely]] {
-                ++local.comparisons;
-                if (anti_unmatched_only && residual_programs.empty()) {
-                  matched = true;
-                } else if (col_raw_fast) {
-                  RETURN_IF_FAIL(process_col_raw_match(ci, ch, r, r_idx));
-                  matched = true;
-                } else {
-                  if (!preassigned_no_left_row) {
-                    ch.MaterializeRowInto(r, &col_left_row);
-                  }
-                  if (use_preassigned_build_groups) {
-                    RETURN_IF_FAIL(accumulate_preassigned_pair(
-                        w, scratch, col_left_row, r_idx));
-                    matched = true;
-                  } else {
-                    size_t cached_group = kNoCachedGroup;
-                    ASSIGN_OR_RETURN(bool, accumulated,
-                                     process_pair(local, col_left_row, r_idx,
-                                                  scratch, &cached_group));
-                    matched = accumulated;
-                  }
-                }
-              }
-              if (!matched && join_type == JoinType::kLeft) {
-                if (col_raw_unmatched_ok) {
-                  RETURN_IF_FAIL(
-                      process_col_raw_match(ci, ch, r, kInvalidRightIdx));
-                } else {
-                  if (r_idx == kInvalidRightIdx || preassigned_no_left_row) {
-                    ch.MaterializeRowInto(r, &col_left_row);
-                  }
-                  RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-                }
-              }
-              continue;
-            }
-            bool matched = false;
-            const auto [first, last] = int_buckets->equal_range(key);
-            if (first != last) {
-              if (anti_unmatched_only && residual_programs.empty()) {
-                ++local.comparisons;
-                matched = true;
-              } else if (col_raw_fast) {
-                for (auto iter = first; iter != last; ++iter) {
-                  ++local.comparisons;
-                  RETURN_IF_FAIL(
-                      process_col_raw_match(ci, ch, r, iter->second));
-                }
-                matched = true;
-              } else {
-                if (!preassigned_no_left_row) {
-                  ch.MaterializeRowInto(r, &col_left_row);
-                }
-                size_t cached_group = kNoCachedGroup;
-                for (auto iter = first; iter != last; ++iter) {
-                  ++local.comparisons;
-                  if (use_preassigned_build_groups) {
-                    RETURN_IF_FAIL(accumulate_preassigned_pair(
-                        w, scratch, col_left_row, iter->second));
-                    matched = true;
-                  } else {
-                    ASSIGN_OR_RETURN(
-                        bool, accumulated,
-                        process_pair(local, col_left_row, iter->second, scratch,
-                                     &cached_group));
-                    matched = matched || accumulated;
-                    if (matched && anti_unmatched_only) {
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-            if (!matched && join_type == JoinType::kLeft) {
-              if (col_raw_unmatched_ok) {
-                RETURN_IF_FAIL(
-                    process_col_raw_match(ci, ch, r, kInvalidRightIdx));
-              } else {
-                if (first == last || preassigned_no_left_row) {
-                  ch.MaterializeRowInto(r, &col_left_row);
-                }
-                RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-              }
-            }
-          }
-        }
-        return Status::kSuccess;
-      }
-      if (use_dense_composite) {
-        for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-          const ColProbeMorsel mor = col_morsels[mi];
-          const auto& chunk = chunks[mor.ci];
-          for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-            CompositeIntKey key;
-            uint32_t right_row = kInvalidRightIdx;
-            if (read_col_composite_key(chunk, left_columns, left_key_offsets, r,
-                                       &key)) {
-              const uint64_t offset =
-                  static_cast<uint64_t>(key.parts[0]) -
-                  static_cast<uint64_t>(dense_composite_min);
-              if (offset < dense_composite_rows.size()) {
-                const uint32_t candidate = dense_composite_rows[offset];
-                if (candidate != kInvalidRightIdx &&
-                    dense_composite_keys[candidate] == key) {
-                  right_row = candidate;
-                }
-              }
-            }
-            if (right_row == kInvalidRightIdx &&
-                join_type == JoinType::kInner) {
-              continue;
-            }
-            if (!preassigned_no_left_row || right_row == kInvalidRightIdx) {
-              chunk.MaterializeRowInto(r, &col_left_row);
-            }
-            bool matched = false;
-            if (right_row != kInvalidRightIdx) {
-              ++local.comparisons;
-              if (use_preassigned_build_groups) {
-                RETURN_IF_FAIL(accumulate_preassigned_pair(
-                    w, scratch, col_left_row, right_row));
-                matched = true;
-              } else {
-                ASSIGN_OR_RETURN(
-                    bool, accumulated,
-                    process_pair(local, col_left_row, right_row, scratch));
-                matched = accumulated;
-              }
-            }
-            if (!matched && join_type == JoinType::kLeft) {
-              if (right_row != kInvalidRightIdx && preassigned_no_left_row) {
-                chunk.MaterializeRowInto(r, &col_left_row);
-              }
-              RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-            }
-          }
-        }
-        return Status::kSuccess;
-      }
-      if (composite_int_key) {
-        const FlatJoinIdxBuckets<CompositeIntKey, CompositeIntKeyHash>&
-            buckets = *composite_buckets;
-        for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-          const ColProbeMorsel mor = col_morsels[mi];
-          const ColumnarChunk& ch = chunks[mor.ci];
-          for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-            CompositeIntKey key;
-            if (!read_col_composite_key(ch, left_columns, left_key_offsets, r,
-                                        &key)) {
-              if (join_type == JoinType::kLeft) {
-                ch.MaterializeRowInto(r, &col_left_row);
-                RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-              }
-              continue;
-            }
-            bool matched = false;
-            size_t cached_group = kNoCachedGroup;
-            const auto [first, last] = buckets.equal_range(key);
-            if (first == last && join_type == JoinType::kInner) {
-              continue;
-            }
-            if (!preassigned_no_left_row || first == last) {
-              ch.MaterializeRowInto(r, &col_left_row);
-            }
-            for (auto iter = first; iter != last; ++iter) {
-              ++local.comparisons;
-              if (use_preassigned_build_groups) {
-                RETURN_IF_FAIL(accumulate_preassigned_pair(
-                    w, scratch, col_left_row, iter->second));
-                matched = true;
-              } else {
-                ASSIGN_OR_RETURN(bool, accumulated,
-                                 process_pair(local, col_left_row, iter->second,
-                                              scratch, &cached_group));
-                matched = matched || accumulated;
-              }
-            }
-            if (!matched && join_type == JoinType::kLeft) {
-              if (first != last && preassigned_no_left_row) {
-                ch.MaterializeRowInto(r, &col_left_row);
-              }
-              RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-            }
-          }
-        }
-        return Status::kSuccess;
-      }
-      const FlatJoinIdxBuckets<std::string>& buckets = *key_buckets;
-      for (size_t mi = w; mi < n_col_morsels; mi += workers) {
-        const ColProbeMorsel mor = col_morsels[mi];
-        const ColumnarChunk& ch = chunks[mor.ci];
-        for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-          ch.MaterializeRowInto(r, &col_left_row);
-          if (HasNullKey(col_left_row, left_columns)) {
-            if (join_type == JoinType::kLeft) {
-              RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-            }
-            continue;
-          }
-          const std::string key =
-              EncodeJoinKey(col_left_row, left_columns, &left_key_offsets);
-          bool matched = false;
-          size_t cached_group = kNoCachedGroup;
-          const auto [first, last] = buckets.equal_range(key);
-          for (auto iter = first; iter != last; ++iter) {
-            ++local.comparisons;
-            if (use_preassigned_build_groups) {
-              RETURN_IF_FAIL(accumulate_preassigned_pair(
-                  w, scratch, col_left_row, iter->second));
-              matched = true;
-            } else {
-              ASSIGN_OR_RETURN(bool, accumulated,
-                               process_pair(local, col_left_row, iter->second,
-                                            scratch, &cached_group));
-              matched = matched || accumulated;
-            }
-          }
-          if (!matched && join_type == JoinType::kLeft) {
-            RETURN_IF_FAIL(unmatched_left(local, scratch, col_left_row));
-          }
-        }
-      }
-      return Status::kSuccess;
-    }
-    if (left.HasSpill()) {
-      // Spill readers own one row at a time. Feed it directly into groups;
-      // neither the probe nor its potentially huge join output is copied.
-      const auto probe_row = [&](const Row& left_row) -> Status {
-        bool matched = false;
-        const auto visit = [&](const auto& buckets, const auto& key) -> Status {
-          const auto [first, last] = buckets.equal_range(key);
-          for (auto iter = first; iter != last; ++iter) {
-            ++local.comparisons;
-            ASSIGN_OR_RETURN(
-                bool, accumulated,
-                process_pair(local, left_row, iter->second, scratch));
-            matched = matched || accumulated;
-          }
-          return Status::kSuccess;
-        };
-        if (!HasNullKey(left_row, left_columns)) {
-          if (integer_key) {
-            RETURN_IF_FAIL(
-                visit(*int_buckets,
-                      AddJoinKeyBias(IntegerJoinKey(left_row, left_columns[0]),
-                                     left_key_offsets[0])));
-          } else if (packed_2x32_int_key) {
-            const int64_t k0 = AddJoinKeyBias(
-                IntegerJoinKey(left_row, left_columns[0]), left_key_offsets[0]);
-            const int64_t k1 = AddJoinKeyBias(
-                IntegerJoinKey(left_row, left_columns[1]), left_key_offsets[1]);
-            if (fits_fused_i32(k0) && fits_fused_i32(k1)) {
-              RETURN_IF_FAIL(visit(*int_buckets, pack_fused_2x32(k0, k1)));
-            }
-          } else if (composite_int_key) {
-            RETURN_IF_FAIL(visit(*composite_buckets,
-                                 EncodeCompositeIntKey(left_row, left_columns,
-                                                       &left_key_offsets)));
-          } else {
-            RETURN_IF_FAIL(visit(
-                *key_buckets,
-                EncodeJoinKey(left_row, left_columns, &left_key_offsets)));
-          }
-        }
-        if (!matched && join_type == JoinType::kLeft) {
-          RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-        }
-        return Status::kSuccess;
-      };
-      Status evaluation = Status::kSuccess;
-      RETURN_IF_FAIL(left.ForEachRow([&](const Row& row) {
-        if (evaluation.ok()) {
-          evaluation = probe_row(row);
-        }
-      }));
-      return evaluation;
-    }
-    if (singleton_right_relation) {
-      for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-        const size_t begin = chunk * probe_chunk_rows;
-        const size_t end = std::min(total_left, begin + probe_chunk_rows);
-        for (size_t ri = begin; ri < end; ++ri) {
-          const Row& left_row = left.rows[ri];
-          ++local.comparisons;
-          if (use_preassigned_build_groups) {
-            RETURN_IF_FAIL(
-                accumulate_preassigned_pair(w, scratch, left_row, uint32_t{0}));
-          } else {
-            size_t cached_group = kNoCachedGroup;
-            ASSIGN_OR_RETURN(bool, accumulated,
-                             process_pair(local, left_row, uint32_t{0}, scratch,
-                                          &cached_group));
-            (void)accumulated;
-          }
-        }
-      }
-      return Status::kSuccess;
-    }
-    if (integer_key || packed_2x32_int_key) {
-      // COUNT(*) with a dense unique build key only needs the foreign key.
-      // The group id was assigned on the build row, so the fact row's other
-      // cells and the scratch copy are not read.
-      if (integer_key && count_star_only && use_dense_int_rows &&
-          use_preassigned_build_groups && join_type == JoinType::kInner &&
-          !left.HasSpill() && !direct_gid_workers.empty()) {
-        const slot_t key_col = left_columns[0];
-        const int64_t bias = left_key_offsets[0];
-        DirectGidWorker& dw = direct_gid_workers[use_shared_direct_gid ? 0 : w];
-        const uint32_t* dense = dense_int_idxs.data();
-        const size_t dense_n = dense_int_idxs.size();
-        const int64_t dense_base = dense_int_min;
-        for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-          const size_t begin = chunk * probe_chunk_rows;
-          const size_t end = std::min(total_left, begin + probe_chunk_rows);
-          for (size_t ri = begin; ri < end; ++ri) {
-            const Value& cell = left.rows[ri].values_[key_col];
-            if (cell.IsNull()) {
-              continue;
-            }
-            const int64_t key = AddJoinKeyBias(cell.value.int_value, bias);
-            const uint64_t idx =
-                static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_base);
-            if (idx >= dense_n) {
-              continue;
-            }
-            const uint32_t r_idx = dense[idx];
-            if (r_idx == kInvalidRightIdx) {
-              continue;
-            }
-            const uint32_t gid = gid_of(r_idx);
-            if (gid == kInvalidGid) {
-              continue;
-            }
-            ++local.comparisons;
-            if (use_shared_direct_gid) {
-              __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
-              __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
-            } else {
-              dw.matched[gid] = 1;
-              dw.counts[gid] += 1;
-            }
-          }
-        }
-        return Status::kSuccess;
-      }
-      if (integer_key && left_numeric_probe && use_dense_int_rows &&
-          !left.HasSpill()) {
-        const slot_t key_col = left_columns[0];
-        const int64_t bias = left_key_offsets[0];
-        DirectGidWorker& dw = direct_gid_workers[w];
-        const uint32_t* dense = dense_int_idxs.data();
-        const size_t dense_n = dense_int_idxs.size();
-        const int64_t dense_base = dense_int_min;
-        for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-          const size_t begin = chunk * probe_chunk_rows;
-          const size_t end = std::min(total_left, begin + probe_chunk_rows);
-          for (size_t ri = begin; ri < end; ++ri) {
-            const Row& left_row = left.rows[ri];
-            const Value& cell = left_row.values_[key_col];
-            if (cell.IsNull()) {
-              continue;
-            }
-            const int64_t key = AddJoinKeyBias(cell.value.int_value, bias);
-            const uint64_t idx =
-                static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_base);
-            if (idx >= dense_n) {
-              continue;
-            }
-            const uint32_t r_idx = dense[idx];
-            if (r_idx == kInvalidRightIdx) {
-              continue;
-            }
-            const uint32_t gid = gid_of(r_idx);
-            if (gid == kInvalidGid) {
-              continue;
-            }
-            ++local.comparisons;
-            charge_numeric(
-                dw, gid, r_idx,
-                [&](int32_t col, double* out) {
-                  const Value& value =
-                      left_row.values_[static_cast<size_t>(col)];
-                  return !value.IsNull() && cell_as_double(value, out);
-                },
-                [&](int32_t col, int64_t* out) {
-                  const Value& value =
-                      left_row.values_[static_cast<size_t>(col)];
-                  if (value.IsNull() || value.type != ValueType::kInt64 ||
-                      value.IsUnsigned()) {
-                    return false;
-                  }
-                  *out = value.value.int_value;
-                  return true;
-                },
-                [&](int32_t col) {
-                  return !left_row.values_[static_cast<size_t>(col)].IsNull();
-                });
-          }
-        }
-        return Status::kSuccess;
-      }
-      for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-        const size_t begin = chunk * probe_chunk_rows;
-        const size_t end = std::min(total_left, begin + probe_chunk_rows);
-        for (size_t ri = begin; ri < end; ++ri) {
-          const Row& left_row = left.rows[ri];
-          if (HasNullKey(left_row, left_columns)) {
-            if (join_type == JoinType::kLeft) {
-              RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-            }
-            continue;
-          }
-          int64_t key = 0;
-          if (integer_key) {
-            key = AddJoinKeyBias(IntegerJoinKey(left_row, left_columns[0]),
-                                 left_key_offsets[0]);
-          } else {
-            const int64_t k0 = AddJoinKeyBias(
-                IntegerJoinKey(left_row, left_columns[0]), left_key_offsets[0]);
-            const int64_t k1 = AddJoinKeyBias(
-                IntegerJoinKey(left_row, left_columns[1]), left_key_offsets[1]);
-            if (!fits_fused_i32(k0) || !fits_fused_i32(k1)) {
-              if (join_type == JoinType::kLeft) {
-                RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-              }
-              continue;
-            }
-            key = pack_fused_2x32(k0, k1);
-          }
-          if (bulk_raw_count) {
-            // One open-addressing probe answers the whole join step: the
-            // duplicate count stands in for the bucket walk (whose Entry
-            // chain and per-pair build-row dereferences dominated this
-            // loop), and the group key is read straight off the outer row.
-            const BulkCountValue* bulk = nullptr;
-            if (use_dense_bulk) {
-              const uint64_t idx = static_cast<uint64_t>(key) -
-                                   static_cast<uint64_t>(dense_bulk_min);
-              if (idx < dense_bulk_counts.size() &&
-                  dense_bulk_counts[idx].r_idx != kInvalidRightIdx) {
-                bulk = &dense_bulk_counts[idx];
-              }
-            } else {
-              bulk = bulk_counts->Find(key);
-            }
-            if (bulk == nullptr) {
-              if (join_type == JoinType::kLeft) {
-                RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-              }
-              continue;
-            }
-            local.comparisons += bulk->pairs;
-            const Value& bulk_cell = left_row.values_[int_group_slot];
-            size_t* bulk_slot = nullptr;
-            bool new_group = false;
-            size_t group_index = 0;
-            if (!bulk_cell.IsNull() && bulk_cell.type == int_group_type &&
-                !bulk_cell.IsUnsigned()) {
-              bool inserted = false;
-              bulk_slot = local.int_offsets.TryEmplace(
-                  bulk_cell.value.int_value, &inserted);
-              if (!inserted) {
-                group_index = *bulk_slot;
-              } else {
-                local.key_scratch.assign(1, bulk_cell);
-                new_group = true;
-              }
-            } else {
-              local.key_scratch.clear();
-              local.key_scratch.push_back(CanonicalDistinctValue(bulk_cell));
-              if (auto found = local.offsets.find(local.key_scratch);
-                  found != local.offsets.end()) {
-                group_index = found->second;
-              } else {
-                new_group = true;
-              }
-            }
-            if (new_group) {
-              group_index = local.groups.size();
-              FusedGroup group;
-              group.rep_left = &left_row;
-              group.rep_right_idx = bulk->r_idx;
-              if (bulk_slot != nullptr) {
-                if (!all_direct_group_keys) {
-                  group.key = Row(local.key_scratch);
-                }
-                local.groups.push_back(std::move(group));
-                *bulk_slot = group_index;
-              } else {
-                // T4639/T4640: building two Rows from key_scratch paid two
-                // full key materializations (array + per-Value string copies)
-                // per new group. Move the scratch into one key, copy that
-                // into the offsets map, and move it into group.key -- same
-                // double ownership, half the allocations.
-                Row local_key(std::move(local.key_scratch));
-                local.offsets.emplace(Row(local_key), group_index);
-                group.key = std::move(local_key);
-                local.groups.push_back(std::move(group));
-              }
-            }
-            local.groups[group_index].raw_count += bulk->count;
-            continue;
-          }
-          if (use_dense_int_rows) {
-            const uint64_t idx = static_cast<uint64_t>(key) -
-                                 static_cast<uint64_t>(dense_int_min);
-            const uint32_t r_idx = idx < dense_int_idxs.size()
-                                       ? dense_int_idxs[idx]
-                                       : kInvalidRightIdx;
-            bool matched = false;
-            if (r_idx != kInvalidRightIdx) {
-              ++local.comparisons;
-              if (use_preassigned_build_groups) {
-                RETURN_IF_FAIL(
-                    accumulate_preassigned_pair(w, scratch, left_row, r_idx));
-                matched = true;
-              } else {
-                size_t cached_group = kNoCachedGroup;
-                ASSIGN_OR_RETURN(bool, accumulated,
-                                 process_pair(local, left_row, r_idx, scratch,
-                                              &cached_group));
-                matched = accumulated;
-              }
-            }
-            if (!matched && join_type == JoinType::kLeft) {
-              RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-            }
-            continue;
-          }
-          if (use_unique_int_table) {
-            if (ri + 8 < end) {
-              const Row& next_row = left.rows[ri + 8];
-              if (!HasNullKey(next_row, left_columns)) [[likely]] {
-                if (integer_key) {
-                  const int64_t nk =
-                      AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
-                                     left_key_offsets[0]);
-                  __builtin_prefetch(&unique_int_table[hash_unique_int_key(nk) &
-                                                       unique_int_mask],
-                                     0, 1);
-                } else {
-                  const int64_t nk0 =
-                      AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
-                                     left_key_offsets[0]);
-                  const int64_t nk1 =
-                      AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[1]),
-                                     left_key_offsets[1]);
-                  if (fits_fused_i32(nk0) && fits_fused_i32(nk1)) [[likely]] {
-                    __builtin_prefetch(
-                        &unique_int_table[hash_unique_int_key(
-                                              pack_fused_2x32(nk0, nk1)) &
-                                          unique_int_mask],
-                        0, 1);
-                  }
-                }
-              }
-            }
-            size_t slot = hash_unique_int_key(key) & unique_int_mask;
-            uint32_t r_idx = kInvalidRightIdx;
-            while (true) {
-              const UniqueIntSlot& entry = unique_int_table[slot];
-              if (entry.r_idx == kInvalidRightIdx) {
-                break;
-              }
-              if (entry.key == key) [[likely]] {
-                r_idx = entry.r_idx;
-                break;
-              }
-              slot = (slot + 1) & unique_int_mask;
-            }
-            bool matched = false;
-            if (r_idx != kInvalidRightIdx) [[likely]] {
-              ++local.comparisons;
-              if (use_preassigned_build_groups) {
-                RETURN_IF_FAIL(
-                    accumulate_preassigned_pair(w, scratch, left_row, r_idx));
-                matched = true;
-              } else {
-                size_t cached_group = kNoCachedGroup;
-                ASSIGN_OR_RETURN(bool, accumulated,
-                                 process_pair(local, left_row, r_idx, scratch,
-                                              &cached_group));
-                matched = accumulated;
-              }
-            }
-            if (!matched && join_type == JoinType::kLeft) {
-              RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-            }
-            continue;
-          }
-          if (ri + 4 < end) {
-            const Row& next_row = left.rows[ri + 4];
-            if (!HasNullKey(next_row, left_columns)) [[likely]] {
-              if (integer_key) {
-                int_buckets->PrefetchBucket(
-                    AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
-                                   left_key_offsets[0]));
-              } else {
-                const int64_t nk0 =
-                    AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[0]),
-                                   left_key_offsets[0]);
-                const int64_t nk1 =
-                    AddJoinKeyBias(IntegerJoinKey(next_row, left_columns[1]),
-                                   left_key_offsets[1]);
-                if (fits_fused_i32(nk0) && fits_fused_i32(nk1)) [[likely]] {
-                  int_buckets->PrefetchBucket(pack_fused_2x32(nk0, nk1));
-                }
-              }
-            }
-          }
-          bool matched = false;
-          size_t cached_group = kNoCachedGroup;
-          const auto [first, last] = int_buckets->equal_range(key);
-          for (auto iter = first; iter != last; ++iter) {
-            ++local.comparisons;
-            if (use_preassigned_build_groups) {
-              RETURN_IF_FAIL(accumulate_preassigned_pair(w, scratch, left_row,
-                                                         iter->second));
-              matched = true;
-            } else {
-              ASSIGN_OR_RETURN(bool, accumulated,
-                               process_pair(local, left_row, iter->second,
-                                            scratch, &cached_group));
-              matched = matched || accumulated;
-            }
-          }
-          if (!matched && join_type == JoinType::kLeft) {
-            RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-          }
-        }
-      }
-      return Status::kSuccess;
-    }
-    if (composite_int_key) {
-      const FlatJoinIdxBuckets<CompositeIntKey, CompositeIntKeyHash>& buckets =
-          *composite_buckets;
-      for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-        const size_t begin = chunk * probe_chunk_rows;
-        const size_t end = std::min(total_left, begin + probe_chunk_rows);
-        for (size_t ri = begin; ri < end; ++ri) {
-          const Row& left_row = left.rows[ri];
-          if (HasNullKey(left_row, left_columns)) {
-            if (join_type == JoinType::kLeft) {
-              RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-            }
-            continue;
-          }
-          const CompositeIntKey key =
-              EncodeCompositeIntKey(left_row, left_columns, &left_key_offsets);
-          bool matched = false;
-          size_t cached_group = kNoCachedGroup;
-          const auto [first, last] = buckets.equal_range(key);
-          for (auto iter = first; iter != last; ++iter) {
-            ++local.comparisons;
-            if (use_preassigned_build_groups) {
-              RETURN_IF_FAIL(accumulate_preassigned_pair(w, scratch, left_row,
-                                                         iter->second));
-              matched = true;
-            } else {
-              ASSIGN_OR_RETURN(bool, accumulated,
-                               process_pair(local, left_row, iter->second,
-                                            scratch, &cached_group));
-              matched = matched || accumulated;
-            }
-          }
-          if (!matched && join_type == JoinType::kLeft) {
-            RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-          }
-        }
-      }
-      return Status::kSuccess;
-    }
-    const FlatJoinIdxBuckets<std::string>& buckets = *key_buckets;
-    const auto probe_key_bucket_range = [&](size_t begin,
-                                            size_t end) -> Status {
-      for (size_t ri = begin; ri < end; ++ri) {
-        const Row& left_row = left.rows[ri];
-        if (HasNullKey(left_row, left_columns)) {
-          if (join_type == JoinType::kLeft) {
-            RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-          }
-          continue;
-        }
-        const std::string key =
-            EncodeJoinKey(left_row, left_columns, &left_key_offsets);
-        bool matched = false;
-        size_t cached_group = kNoCachedGroup;
-        const auto [first, last] = buckets.equal_range(key);
-        for (auto iter = first; iter != last; ++iter) {
-          ++local.comparisons;
-          if (use_preassigned_build_groups) {
-            RETURN_IF_FAIL(accumulate_preassigned_pair(w, scratch, left_row,
-                                                       iter->second));
-            matched = true;
-          } else {
-            ASSIGN_OR_RETURN(bool, accumulated,
-                             process_pair(local, left_row, iter->second,
-                                          scratch, &cached_group));
-            matched = matched || accumulated;
-          }
-        }
-        if (!matched && join_type == JoinType::kLeft) {
-          RETURN_IF_FAIL(unmatched_left(local, scratch, left_row));
-        }
-      }
-      return Status::kSuccess;
-    };
-    if (fanout_key_bounds.size() == workers + 1) {
-      RETURN_IF_FAIL(probe_key_bucket_range(fanout_key_bounds[w],
-                                            fanout_key_bounds[w + 1]));
-    } else {
-      for (size_t chunk = w; chunk < chunk_count; chunk += workers) {
-        const size_t begin = chunk * probe_chunk_rows;
-        const size_t end = std::min(total_left, begin + probe_chunk_rows);
-        RETURN_IF_FAIL(probe_key_bucket_range(begin, end));
-      }
-    }
-    return Status::kSuccess;
-  };
   {
     ASSIGN_OR_RETURN(
         DistinctLSTableProbeOutcome, distinct_probe_outcome,
@@ -18342,7 +7125,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // with (right_direct_key, EXTRACT(year FROM left_date_col)) grouping and
   // SUM(c0 * (k - c1) - c2 * c3) profit arithmetic (e.g. TPC-H Q9).
   if (debug_fusion && packed_2x32_int_key && use_unique_int_table) {
-    std::cerr << "[fusion] profit-check: lcol=" << left_col_only
+    std::cerr << "[fusion] profit-check: lcol=" << layout.left_col_only
               << " rcol=" << right_col_only << " sds=" << single_double_sum
               << " prof="
               << (child_shapes.empty() ? -2 : child_shapes[0].profit_col0)
@@ -18373,9 +7156,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                       : "")
               << "\n";
   }
-  if (left_col_only && packed_2x32_int_key && use_unique_int_table &&
+  if (layout.left_col_only && packed_2x32_int_key && use_unique_int_table &&
       join_type == JoinType::kInner && residual_programs.empty() &&
-      single_double_sum && !has_count_distinct && agg_count == 1 &&
+      single_double_sum && !raw_aggregates.has_count_distinct && agg_count == 1 &&
       !right_ptr->HasSpill() && !left.HasSpill() && child_shapes.size() == 1 &&
       child_shapes[0].profit_col0 >= 0 && key_shapes.size() == 2 &&
       fusion->having == nullptr && !fusion->post_having_active &&
@@ -18404,382 +7187,144 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
     if (rk >= 0 && lk >= 0 && rk != lk) {
-      const size_t r_key_col =
-          static_cast<size_t>(key_shapes[rk].direct_column) - left_width;
-      const auto l_date_col =
-          static_cast<size_t>(key_shapes[lk].extract_date_col);
-      const ProgramShape& psh = child_shapes[0];
-      const std::array<int32_t, 4> pcols = {psh.profit_col0, psh.profit_col1,
-                                            psh.profit_col2, psh.profit_col3};
-      const double pconst = psh.profit_const;
-      const size_t r_rows =
-          right_col_only ? right_arg.columnar->total_rows : build_rows.size();
-      // Extract right group key into compact uint16_t IDs (<= 256 distinct).
-      std::vector<uint16_t> right_gid(r_rows, 0);
-      std::vector<Value> right_gid_vals;
-      std::unordered_map<std::string, uint16_t> right_str_map;
-      bool right_ok = (r_rows > 0 && r_rows <= 524288);
-      const ValueType rk_type = right_arg.schema.GetColumn(r_key_col).Type();
-      if (right_ok && rk_type != ValueType::kVarChar) {
-        right_ok = false;
-      }
-      if (right_ok) {
-        auto assign_rstr = [&](size_t idx, std::string_view sv) -> bool {
-          auto it = right_str_map.find(std::string(sv));
-          if (it == right_str_map.end()) {
-            if (right_gid_vals.size() >= 256) {
-              return false;
-            }
-            const auto id = static_cast<uint16_t>(right_gid_vals.size());
-            right_str_map.emplace(std::string(sv), id);
-            right_gid_vals.emplace_back(std::string(sv));
-            right_gid[idx] = id;
-          } else {
-            right_gid[idx] = it->second;
-          }
-          return true;
-        };
-        if (right_col_only) {
-          size_t base = 0;
-          for (const auto& rch : right_arg.columnar->chunks) {
-            const ColumnarColumn& rkc = rch.columns[r_key_col];
-            if (!rkc.is_uniform || rkc.has_null ||
-                rkc.type != ValueType::kVarChar) {
-              right_ok = false;
-              break;
-            }
-            for (size_t r = 0; r < rch.rows; ++r) {
-              if (!assign_rstr(base + r, rkc.StringAt(r))) {
-                right_ok = false;
-                break;
-              }
-            }
-            if (!right_ok) {
-              break;
-            }
-            base += rch.rows;
-          }
-        } else {
-          for (size_t r = 0; r < r_rows; ++r) {
-            const Value& v = build_rows[r]->values_[r_key_col];
-            if (v.IsNull() || v.type != ValueType::kVarChar ||
-                !assign_rstr(r, v.AsStringView())) {
-              right_ok = false;
-              break;
-            }
-          }
-        }
-      }
-      // Pre-extract any right-side profit columns into flat double arrays.
-      std::array<std::vector<double>, 4> right_pvals;
-      if (right_ok) {
-        for (size_t pi = 0; pi < 4 && right_ok; ++pi) {
-          if (std::cmp_less(pcols[pi], left_width)) {
-            continue;
-          }
-          const size_t rc = static_cast<size_t>(pcols[pi]) - left_width;
-          right_pvals[pi].resize(r_rows);
-          if (right_col_only) {
-            size_t base = 0;
-            for (const auto& rch : right_arg.columnar->chunks) {
-              const ColumnarColumn& col = rch.columns[rc];
-              if (!col.is_uniform || col.has_null ||
-                  col.encoding != ColumnarColumn::Encoding::kFlat) {
-                right_ok = false;
-                break;
-              }
-              if (col.type == ValueType::kDouble) {
-                std::memcpy(right_pvals[pi].data() + base, col.doubles.data(),
-                            rch.rows * sizeof(double));
-              } else if (col.type == ValueType::kInt64 && !col.is_unsigned) {
-                for (size_t r = 0; r < rch.rows; ++r) {
-                  right_pvals[pi][base + r] = static_cast<double>(col.ints[r]);
-                }
-              } else {
-                right_ok = false;
-                break;
-              }
-              base += rch.rows;
-            }
-          } else {
-            for (size_t r = 0; r < r_rows; ++r) {
-              const Value& v = build_rows[r]->values_[rc];
-              if (v.IsNull()) {
-                right_ok = false;
-                break;
-              }
-              if (v.type == ValueType::kDouble) {
-                right_pvals[pi][r] = v.value.double_value;
-              } else if (v.type == ValueType::kInt64 && !v.IsUnsigned()) {
-                right_pvals[pi][r] = static_cast<double>(v.value.int_value);
-              } else {
-                right_ok = false;
-                break;
-              }
-            }
-          }
-        }
-      }
-      if (right_ok && !right_gid_vals.empty()) {
-        const size_t n_rg = right_gid_vals.size();
-        const size_t slot_count = n_rg * 256U;
-        const size_t nworkers = locals.size();
-        std::vector<std::vector<double>> w_sums(
-            nworkers, std::vector<double>(slot_count, 0.0));
-        std::vector<std::vector<uint8_t>> w_hits(
-            nworkers, std::vector<uint8_t>(slot_count, 0));
-        std::vector<uint64_t> w_cmps(nworkers, 0);
-        std::atomic<bool> fast_bail{false};
-
-        const auto& lchunks = left.columnar->chunks;
-        std::vector<ColProbeMorsel> fast_morsels;
-        fast_morsels.reserve(lchunks.size() * 4);
-        for (size_t ci = 0; ci < lchunks.size(); ++ci) {
-          const size_t nrows = lchunks[ci].rows;
-          for (size_t r0 = 0; r0 < nrows; r0 += 16384) {
-            fast_morsels.push_back(ColProbeMorsel{
-                .ci = static_cast<uint32_t>(ci),
-                .r_begin = static_cast<uint32_t>(r0),
-                .r_end = static_cast<uint32_t>(std::min(nrows, r0 + 16384))});
-          }
-        }
-        const size_t n_fm = fast_morsels.size();
-        const UniqueIntSlot* const utbl = unique_int_table.data();
-        const size_t umask = unique_int_mask;
-        const uint16_t* const rgids = right_gid.data();
-        const int64_t off0 = left_key_offsets[0];
-        const int64_t off1 = left_key_offsets[1];
-        const slot_t lk0 = left_columns[0];
-        const slot_t lk1 = left_columns[1];
-        const std::array<const double*, 4> rp_ptrs = {
-            right_pvals[0].empty() ? nullptr : right_pvals[0].data(),
-            right_pvals[1].empty() ? nullptr : right_pvals[1].data(),
-            right_pvals[2].empty() ? nullptr : right_pvals[2].data(),
-            right_pvals[3].empty() ? nullptr : right_pvals[3].data()};
-
-        auto run_fast_profit = [&](size_t w) {
-          double* const sums = w_sums[w].data();
-          uint8_t* const hits = w_hits[w].data();
-          uint64_t cmp = 0;
-          for (size_t mi = w; mi < n_fm; mi += nworkers) {
-            if (fast_bail.load(std::memory_order_relaxed)) {
-              return;
-            }
-            const ColProbeMorsel mor = fast_morsels[mi];
-            const ColumnarChunk& ch = lchunks[mor.ci];
-            const ColumnarColumn& c_k0 = ch.columns[lk0];
-            const ColumnarColumn& c_k1 = ch.columns[lk1];
-            const ColumnarColumn& c_dt = ch.columns[l_date_col];
-            if (!c_k0.is_uniform || c_k0.has_null ||
-                c_k0.encoding != ColumnarColumn::Encoding::kFlat ||
-                !c_k1.is_uniform || c_k1.has_null ||
-                c_k1.encoding != ColumnarColumn::Encoding::kFlat ||
-                !c_dt.is_uniform || c_dt.has_null ||
-                c_dt.encoding != ColumnarColumn::Encoding::kFlat ||
-                c_dt.type != ValueType::kDate) {
-              fast_bail.store(true, std::memory_order_relaxed);
-              return;
-            }
-            std::array<const double*, 4> ldbl{nullptr, nullptr, nullptr,
-                                              nullptr};
-            std::array<const int64_t*, 4> lint{nullptr, nullptr, nullptr,
-                                               nullptr};
-            for (size_t pi = 0; pi < 4; ++pi) {
-              if (std::cmp_greater_equal(pcols[pi], left_width)) {
-                continue;
-              }
-              const ColumnarColumn& pc =
-                  ch.columns[static_cast<size_t>(pcols[pi])];
-              if (!pc.is_uniform || pc.has_null ||
-                  pc.encoding != ColumnarColumn::Encoding::kFlat) {
-                fast_bail.store(true, std::memory_order_relaxed);
-                return;
-              }
-              if (pc.type == ValueType::kDouble) {
-                ldbl[pi] = pc.doubles.data();
-              } else if (pc.type == ValueType::kInt64 && !pc.is_unsigned) {
-                lint[pi] = pc.ints.data();
-              } else {
-                fast_bail.store(true, std::memory_order_relaxed);
-                return;
-              }
-            }
-            const int64_t* const k0p = c_k0.ints.data();
-            const int64_t* const k1p = c_k1.ints.data();
-            const int64_t* const dtp = c_dt.ints.data();
-            auto read_p = [&](size_t pi, size_t r, uint32_t r_idx) noexcept {
-              if (rp_ptrs[pi] != nullptr) {
-                return rp_ptrs[pi][r_idx];
-              }
-              return ldbl[pi] != nullptr ? ldbl[pi][r]
-                                         : static_cast<double>(lint[pi][r]);
-            };
-            for (size_t r = mor.r_begin; r < mor.r_end; ++r) {
-              const int64_t k0 = AddJoinKeyBias(k0p[r], off0);
-              const int64_t k1 = AddJoinKeyBias(k1p[r], off1);
-              if (!fits_fused_i32(k0) || !fits_fused_i32(k1)) [[unlikely]] {
-                continue;
-              }
-              const int64_t key = pack_fused_2x32(k0, k1);
-              size_t slot = hash_unique_int_key(key) & umask;
-              uint32_t r_idx = kInvalidRightIdx;
-              while (true) {
-                const UniqueIntSlot& entry = utbl[slot];
-                if (entry.r_idx == kInvalidRightIdx) {
-                  break;
-                }
-                if (entry.key == key) [[likely]] {
-                  r_idx = entry.r_idx;
-                  break;
-                }
-                slot = (slot + 1) & umask;
-              }
-              if (r_idx == kInvalidRightIdx) [[unlikely]] {
-                continue;
-              }
-              ++cmp;
-              const int64_t days = dtp[r];
-              if (days < 0 || std::cmp_greater_equal(days, kFastYearLut.size()))
-                  [[unlikely]] {
-                fast_bail.store(true, std::memory_order_relaxed);
-                return;
-              }
-              const int32_t yr = kFastYearLut[static_cast<size_t>(days)];
-              if (yr < 1900 || yr >= 2156) [[unlikely]] {
-                fast_bail.store(true, std::memory_order_relaxed);
-                return;
-              }
-              const double v0 = read_p(0, r, r_idx);
-              const double v1 = read_p(1, r, r_idx);
-              const double v2 = read_p(2, r, r_idx);
-              const double v3 = read_p(3, r, r_idx);
-              const double dv = (v0 * (pconst - v1)) - (v2 * v3);
-              const size_t gslot = (static_cast<size_t>(rgids[r_idx]) << 8U) |
-                                   static_cast<size_t>(yr - 1900);
-              sums[gslot] += dv;
-              hits[gslot] = 1;
-            }
-          }
-          for (size_t s = 0; s < slot_count; ++s) {
-            if (hits[s] != 0 && !std::isfinite(sums[s])) {
-              fast_bail.store(true, std::memory_order_relaxed);
-              return;
-            }
-          }
-          w_cmps[w] = cmp;
-        };
-
-        if (nworkers == 1) {
-          run_fast_profit(0);
-        } else {
-          RETURN_IF_FAIL(RunParallelTasks(nworkers, run_fast_profit));
-        }
-        if (!fast_bail.load(std::memory_order_relaxed)) {
-          std::vector<double> merged_sums(slot_count, 0.0);
-          std::vector<uint8_t> merged_hits(slot_count, 0);
-          bool all_finite = true;
-          for (size_t w = 0; w < nworkers; ++w) {
-            for (size_t s = 0; s < slot_count; ++s) {
-              if (w_hits[w][s] != 0) {
-                merged_sums[s] += w_sums[w][s];
-                merged_hits[s] = 1;
-              }
-            }
-          }
-          for (size_t s = 0; s < slot_count; ++s) {
-            if (merged_hits[s] != 0 && !std::isfinite(merged_sums[s])) {
-              all_finite = false;
-              break;
-            }
-          }
-          if (all_finite) {
-            auto out_table = std::make_shared<ColumnarTable>();
-            ColumnarColumn col_rk;
-            col_rk.type = ValueType::kVarChar;
-            col_rk.is_uniform = true;
-            col_rk.has_null = false;
-            col_rk.encoding = ColumnarColumn::Encoding::kFlat;
-            ChunkStringArena* rk_arena = col_rk.EnsureLocalArena();
-            ColumnarColumn col_lk;
-            col_lk.type = ValueType::kInt64;
-            col_lk.is_uniform = true;
-            col_lk.has_null = false;
-            col_lk.encoding = ColumnarColumn::Encoding::kFlat;
-            ColumnarColumn col_agg;
-            col_agg.type = ValueType::kDouble;
-            col_agg.is_uniform = true;
-            col_agg.has_null = false;
-            col_agg.encoding = ColumnarColumn::Encoding::kFlat;
-            size_t out_rows = 0;
-            for (size_t rg = 0; rg < n_rg; ++rg) {
-              const std::string_view sv = right_gid_vals[rg].AsStringView();
-              for (size_t y = 0; y < 256; ++y) {
-                const size_t s = (rg << 8U) | y;
-                if (merged_hits[s] != 0) {
-                  col_rk.strings.push_back(rk_arena->Store(sv));
-                  col_lk.ints.push_back(1900 + static_cast<int64_t>(y));
-                  col_agg.doubles.push_back(merged_sums[s]);
-                  ++out_rows;
-                }
-              }
-            }
-            if (out_rows > 0) {
-              ColumnarChunk chunk;
-              chunk.rows = out_rows;
-              if (rk == 0) {
-                chunk.columns.push_back(std::move(col_rk));
-                chunk.columns.push_back(std::move(col_lk));
-              } else {
-                chunk.columns.push_back(std::move(col_lk));
-                chunk.columns.push_back(std::move(col_rk));
-              }
-              chunk.columns.push_back(std::move(col_agg));
-              out_table->AppendChunk(std::move(chunk));
-            }
-            std::string n0 = !fusion->select_names.empty() &&
-                                     !fusion->select_names[0].empty()
-                                 ? fusion->select_names[0]
-                                 : "col_0";
-            std::string n1 = fusion->select_names.size() > 1 &&
-                                     !fusion->select_names[1].empty()
-                                 ? fusion->select_names[1]
-                                 : "col_1";
-            std::string n2 = fusion->select_names.size() > 2 &&
-                                     !fusion->select_names[2].empty()
-                                 ? fusion->select_names[2]
-                                 : "agg_0";
-            const ValueType t0 =
-                rk == 0 ? ValueType::kVarChar : ValueType::kInt64;
-            const ValueType t1 =
-                rk == 0 ? ValueType::kInt64 : ValueType::kVarChar;
-            result.schema = Schema(
-                "", {Column(std::move(n0), t0), Column(std::move(n1), t1),
-                     Column(std::move(n2), ValueType::kDouble)});
-            result.SetColumnarTable(std::move(out_table), out_rows > 0);
-            result.hash_joins = left.hash_joins + right.hash_joins + 1;
-            result.in_memory_hash_joins =
-                left.in_memory_hash_joins + right.in_memory_hash_joins + 1;
-            result.nested_loop_joins =
-                left.nested_loop_joins + right.nested_loop_joins;
-            result.hybrid_hash_joins =
-                left.hybrid_hash_joins + right.hybrid_hash_joins;
-            result.join_comparisons =
-                left.join_comparisons + right.join_comparisons;
-            for (uint64_t c : w_cmps) {
-              result.join_comparisons += c;
-            }
-            result.peak_intermediate_rows = out_rows;
-            if (context.execution_runtime() != nullptr) {
-              context.execution_runtime()->join_ms += ElapsedMs(join_begin);
-              ++context.execution_runtime()->grouped_join_fusions;
-            }
-            fusion->fired = true;
-            return result;
-          }
-        }
+      DenseProfitGroups specialized{
+          .context = context,
+          .left = left,
+          .right_arg = right_arg,
+          .fusion = fusion,
+          .right_col_only = right_col_only,
+          .build_rows = build_rows,
+          .right = right,
+          .join_begin = join_begin,
+          .result = result,
+          .left_width = left_width,
+          .key_shapes = key_shapes,
+          .child_shapes = child_shapes,
+          .left_columns = left_columns,
+          .left_key_offsets = left_key_offsets,
+          .kFastYearLut = kFastYearLut,
+          .locals = locals,
+          .unique_int_table = unique_int_table,
+          .unique_int_mask = unique_int_mask,
+          .rk = rk,
+          .lk = lk,
+      };
+      ASSIGN_OR_RETURN(bool, emitted, specialized.TryRun());
+      if (emitted) {
+        return std::optional<Relation>(std::move(result));
       }
     }
   }
+  FusedGroupProbe probe_task{
+      .layout = layout,
+      .raw_aggregates = raw_aggregates,
+      .source = {
+          .left = left,
+          .fusion = fusion,
+          .deferred_left_probe = deferred_left_probe,
+          .right_ptr = right_ptr,
+          .left_width = left_width,
+          .residual_programs = residual_programs,
+          .key_shapes = key_shapes,
+          .left_columns = left_columns,
+          .left_key_offsets = left_key_offsets,
+          .total_left = total_left,
+          .aggregate_shapes = aggregate_shapes,
+          .read_right_cell = read_right_cell,
+          .def_base_types = def_base_types,
+          .def_overwritten_by_pk = def_overwritten_by_pk,
+          .prepared_pk_lookups = prepared_pk_lookups,
+          .def_pk_groups = def_pk_groups,
+          .def_col_to_pk_lookup = def_col_to_pk_lookup,
+          .workers = workers,
+          .probe_chunk_rows = probe_chunk_rows,
+          .chunk_count = chunk_count,
+          .col_morsels = col_morsels,
+          .int_group_slot = int_group_slot,
+          .join_type = join_type,
+          .singleton_right_relation = singleton_right_relation,
+          .all_direct_group_keys = all_direct_group_keys,
+          .integer_key = integer_key,
+          .composite_int_key = composite_int_key,
+          .int_group_key = int_group_key,
+          .int_group_type = int_group_type,
+          .anti_unmatched_only = anti_unmatched_only,
+          .bulk_raw_count = bulk_raw_count,
+          .compact_raw_left_key = compact_raw_left_key,
+          .compact_counts = compact_counts,
+          .compact_log_allowed = compact_log_allowed,
+      },
+      .keys = {
+          .int_buckets = int_buckets,
+          .composite_buckets = composite_buckets,
+          .dense_composite_keys = dense_composite_keys,
+          .dense_composite_rows = dense_composite_rows,
+          .dense_composite_min = dense_composite_min,
+          .key_buckets = key_buckets,
+          .bulk_counts = bulk_counts,
+          .dense_bulk_counts = dense_bulk_counts,
+          .dense_bulk_min = dense_bulk_min,
+          .key_cache = key_cache,
+          .key_cache_charge = key_cache_charge,
+          .dense_int_idxs = dense_int_idxs,
+          .ranked_int_bits = ranked_int_bits,
+          .ranked_int_prefix = ranked_int_prefix,
+          .ranked_int_rows = ranked_int_rows,
+          .ranked_int_span = ranked_int_span,
+          .dense_int_min = dense_int_min,
+          .unique_int_table = unique_int_table,
+          .unique_int_mask = unique_int_mask,
+          .fanout_key_bounds = fanout_key_bounds,
+          .right_row_gid = right_row_gid,
+          .use_dense_composite = use_dense_composite,
+          .use_dense_bulk = use_dense_bulk,
+          .use_dense_int_rows = use_dense_int_rows,
+          .packed_2x32_int_key = packed_2x32_int_key,
+          .use_unique_int_table = use_unique_int_table,
+          .identity_right_gid = identity_right_gid,
+          .use_preassigned_build_groups = use_preassigned_build_groups,
+      },
+      .direct = {
+          .agg_count = agg_count,
+          .direct_gid_workers = direct_gid_workers,
+          .ordered_sum_charge = ordered_sum_charge,
+          .use_direct_gid_agg = use_direct_gid_agg,
+          .use_partitioned_count_distinct = use_partitioned_count_distinct,
+          .single_double_sum = single_double_sum,
+          .use_shared_direct_gid = use_shared_direct_gid,
+          .scalar_fact_charge = scalar_fact_charge,
+      },
+      .deferred = {
+          .left_numeric = left_numeric,
+          .compiled_double_arith = compiled_double_arith,
+          .disjoint_bucket5_slots = disjoint_bucket5_slots,
+          .dense_pk_group_indices = dense_pk_group_indices,
+          .radix_primary = radix_primary,
+          .worker_radix_buckets = worker_radix_buckets,
+          .flat_run_index = flat_run_index,
+          .flat_run_bounds = flat_run_bounds,
+          .disjoint_bucket5_col0 = disjoint_bucket5_col0,
+          .disjoint_bucket5_col1 = disjoint_bucket5_col1,
+          .left_cell_agg_ready = left_cell_agg_ready,
+          .uses_double_arith_cell_op = uses_double_arith_cell_op,
+          .left_numeric_probe = left_numeric_probe,
+          .disjoint_bucket5_ready = disjoint_bucket5_ready,
+          .def_compact_split_probe = def_compact_split_probe,
+          .def_group_cell_probe = def_group_cell_probe,
+          .use_dense_split_direct_gid = use_dense_split_direct_gid,
+          .use_packed_double_cells = use_packed_double_cells,
+          .use_radix_agg = use_radix_agg,
+          .radix_tuple_is_int = radix_tuple_is_int,
+          .disjoint_direct_groups = disjoint_direct_groups,
+      },
+      .callbacks = {
+          .record_compact_split = std::ref(record_compact_split),
+          .process_pair = std::ref(process_pair),
+          .unmatched_left = std::ref(unmatched_left),
+          .accumulate_preassigned_pair = std::ref(accumulate_preassigned_pair),
+      },
+  };
+
   const bool track_group_phases =
       ::tinylamb::platform::GetEnv("TINYLAMB_GROUP_PHASES") != nullptr &&
       effective_left_rows >= 100000;
@@ -18791,10 +7336,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   if (locals.size() == 1) {
     // Small grouped joins need no helper or transfer. Besides thread startup,
     // this preserves the caller's expression scratch capacity across queries.
-    locals[0].error = run_probe(0, locals[0], scratch_storage[0]);
+    locals[0].error = probe_task.Run(0, locals[0], scratch_storage[0]);
   } else {
     RETURN_IF_FAIL(RunParallelTasks(locals.size(), [&](size_t w) {
-      locals[w].error = run_probe(w, locals[w], scratch_storage[w]);
+      locals[w].error = probe_task.Run(w, locals[w], scratch_storage[w]);
     }));
   }
   for (const FusedWorkerLocal& local : locals) {
@@ -18905,27 +7450,27 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<FusedGroup> groups;
   FusedRawArena merged_raw_arena;
   merged_raw_arena.has_stat = has_stat_raw_agg;
-  merged_raw_arena.has_double = !raw_sum_fusion || has_double_raw_agg;
-  merged_raw_arena.has_int = !raw_sum_fusion || has_int_raw_agg;
+  merged_raw_arena.has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+  merged_raw_arena.has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
   std::vector<FusedRawArena> extra_merged_arenas;
   std::deque<AggregateAccumulator> states;
   if (compact_counts) {
     if (compact_split_key_only) {
       const uint64_t r_mask =
-          (!split_uses_right_subgid || split_right_subgid_count <= 1)
+          (!layout.split_uses_right_subgid || layout.split_right_subgid_count <= 1)
               ? 0ULL
-              : ((uint64_t{1} << std::bit_width(split_right_subgid_count - 1)) -
+              : ((uint64_t{1} << std::bit_width(layout.split_right_subgid_count - 1)) -
                  1ULL);
       const auto make_split_group = [&](uint64_t packed_u64, int64_t cnt) {
         FusedGroup group;
         group.key_hash = packed_u64;
         group.has_key_hash = true;
         group.rep_left = nullptr;
-        if (split_uses_right_subgid) {
+        if (layout.split_uses_right_subgid) {
           const auto r_subgid =
-              static_cast<size_t>((packed_u64 >> split_right_shift) & r_mask);
-          group.rep_right_idx = split_right_rep_ptr[r_subgid];
-        } else if (right_row_count > 0) {
+              static_cast<size_t>((packed_u64 >> layout.split_right_shift) & r_mask);
+          group.rep_right_idx = layout.split_right_rep_ptr[r_subgid];
+        } else if (layout.right_row_count > 0) {
           group.rep_right_idx = 0;
         }
         group.raw_count = cnt;
@@ -19142,11 +7687,11 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             nullptr;
         uint8_t prefilter_limit = 0;
         if (!prefilter_disabled) {
-          if (compact_integer_threshold && *compact_integer_threshold >= 3 &&
-              *compact_integer_threshold <= 254) {
+          if (layout.compact_integer_threshold && *layout.compact_integer_threshold >= 3 &&
+              *layout.compact_integer_threshold <= 254) {
             prefilter_limit =
-                static_cast<uint8_t>(*compact_integer_threshold + 1);
-          } else if (!compact_integer_threshold &&
+                static_cast<uint8_t>(*layout.compact_integer_threshold + 1);
+          } else if (!layout.compact_integer_threshold &&
                      fusion->post_having_constant_or_factor >= 3.0 &&
                      fusion->post_having_constant_or_factor < 255.0) {
             prefilter_limit = static_cast<uint8_t>(
@@ -19387,17 +7932,17 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                           << def_pk_groups[gi].subgid_shift;
           }
           const uint32_t r_subgid = tmp_gid;
-          if (split_uses_right_subgid) {
-            packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
+          if (layout.split_uses_right_subgid) {
+            packed_u64 |= static_cast<uint64_t>(r_subgid) << layout.split_right_shift;
           }
           grp.key_hash = packed_u64;
           grp.has_key_hash = true;
           grp.rep_left = nullptr;
           grp.rep_right_idx =
-              split_uses_right_subgid
-                  ? split_right_rep_ptr[r_subgid]
-                  : (right_row_count > 0 ? 0U : kInvalidRightIdx);
-          arena.Initialize(grp, raw_slot_count);
+              layout.split_uses_right_subgid
+                  ? layout.split_right_rep_ptr[r_subgid]
+                  : (layout.right_row_count > 0 ? 0U : kInvalidRightIdx);
+          arena.Initialize(grp, raw_aggregates.raw_slot_count);
           grp.RawDoubles()[0] = sum;
           grp.RawCounts()[0] = static_cast<int64_t>(total_cnt);
           grp.RawInfFlags()[0] = any_inf;
@@ -19429,25 +7974,25 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                           << def_pk_groups[gi].subgid_shift;
           }
           const uint32_t r_subgid = tmp_gid;
-          if (split_uses_right_subgid) {
-            packed_u64 |= static_cast<uint64_t>(r_subgid) << split_right_shift;
+          if (layout.split_uses_right_subgid) {
+            packed_u64 |= static_cast<uint64_t>(r_subgid) << layout.split_right_shift;
           }
           grp.key_hash = packed_u64;
           grp.has_key_hash = true;
           grp.rep_left = nullptr;
           grp.rep_right_idx =
-              split_uses_right_subgid
-                  ? split_right_rep_ptr[r_subgid]
-                  : (right_row_count > 0 ? 0U : kInvalidRightIdx);
+              layout.split_uses_right_subgid
+                  ? layout.split_right_rep_ptr[r_subgid]
+                  : (layout.right_row_count > 0 ? 0U : kInvalidRightIdx);
         } else if (identity_right_gid) {
           grp.rep_right_idx = static_cast<uint32_t>(gid);
         } else {
           grp = std::move(pre_groups[gid]);
         }
-        if (raw_sum_fusion) {
-          arena.Initialize(grp, raw_slot_count);
+        if (raw_aggregates.raw_sum_fusion) {
+          arena.Initialize(grp, raw_aggregates.raw_slot_count);
         }
-        if (raw_count_fusion) {
+        if (raw_aggregates.raw_count_fusion) {
           int64_t total_cnt = 0;
           for (size_t w = 0; w < dw_count; ++w) {
             total_cnt += direct_gid_workers[w].counts[gid];
@@ -19461,7 +8006,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               continue;
             }
             for (size_t s = 0; s < agg_count; ++s) {
-              switch (slot_agg_kinds[s]) {
+              switch (raw_aggregates.slot_agg_kinds[s]) {
                 case RawAggKind::kCountStar:
                 case RawAggKind::kConstantExtremum:
                 case RawAggKind::kCountValue:
@@ -19519,8 +8064,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       extra_merged_arenas.resize(gid_workers);
       for (FusedRawArena& a : extra_merged_arenas) {
         a.has_stat = has_stat_raw_agg;
-        a.has_double = !raw_sum_fusion || has_double_raw_agg;
-        a.has_int = !raw_sum_fusion || has_int_raw_agg;
+        a.has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+        a.has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
       }
       std::vector<std::vector<FusedGroup>> slice_groups(gid_workers);
       RETURN_IF_FAIL(RunParallelTasks(gid_workers, [&](size_t mw) {
@@ -19636,8 +8181,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
   const auto merge_raw = [&](FusedGroup& destination, FusedGroup& group) {
-    for (size_t s = 0; s < raw_slot_count; ++s) {
-      switch (slot_agg_kinds[s]) {
+    for (size_t s = 0; s < raw_aggregates.raw_slot_count; ++s) {
+      switch (raw_aggregates.slot_agg_kinds[s]) {
         case RawAggKind::kCountStar:
         case RawAggKind::kConstantExtremum:
         case RawAggKind::kCountValue:
@@ -19696,946 +8241,58 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<FusedGroup*> group_ptrs;
   bool use_group_ptrs = false;
   if (use_radix_agg) {
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
-    //   (radix_compact_sum_partition_eq)
-    // Fast path for packed-2x32 single-SUM/AVG-double radix aggregation with
-    // direct columnar output (e.g. TPC-DS Q65 with 2.31M groups): accumulate
-    // into a compact 32-byte struct per group and emit each partition's
-    // ColumnarChunk on the worker thread while still hot in L2 cache, avoiding
-    // 2.31M FusedGroup (~250B) + FusedRawArena + group_ptrs allocations.
-    struct CompactSelectCol {
-      uint8_t kind{0};  // 0=slot0, 1=slot1, 2=agg0, 3=const, 4=right, 5=pk
-      std::string name;
-      ValueType type{ValueType::kNull};
-      bool is_unsigned{false};
-      bool is_interval{false};
-      bool is_uniform{true};
-      bool has_null{false};
-      bool all_null{false};
-      Value constant{};
-      size_t col_idx{0};  // right column index for kind=4
-      // Metadata & LUTs for kind=5 (kPkCol)
-      uint8_t pk_shift{0};
-      uint64_t pk_mask{0};
-      std::shared_ptr<const void> store_owner;
-      std::vector<int64_t> lut_i64;
-      std::vector<double> lut_f64;
-      std::vector<std::string_view> lut_sv;
-      std::vector<uint8_t> lut_null;
-      bool lut_any_null{false};
-      bool lut_all_null{false};
+    CompactRadixGroups compact_radix{
+      .raw_aggregates = raw_aggregates,
+      .layout = layout,
+      .context = context,
+      .left = left,
+      .right_arg = right_arg,
+      .fusion = fusion,
+      .right_col_only = right_col_only,
+      .right_col_owner = right_col_owner,
+      .right_locator = right_locator,
+      .right = right,
+      .join_begin = join_begin,
+      .result = result,
+      .equality_keys = equality_keys,
+      .left_width = left_width,
+      .prepared_pk_lookups = prepared_pk_lookups,
+      .def_pk_groups = def_pk_groups,
+      .def_col_to_pk_lookup = def_col_to_pk_lookup,
+      .has_stat_raw_agg = has_stat_raw_agg,
+      .workers = workers,
+      .locals = locals,
+      .agg_count = agg_count,
+      .left_numeric = left_numeric,
+      .radix_tuple_is_int = radix_tuple_is_int,
+      .bounded_radix_charge = bounded_radix_charge,
+      .worker_radix_buckets = worker_radix_buckets,
+      .track_group_phases = track_group_phases,
     };
-    size_t fallback_worker_groups_cnt = 0;
-    for (const FusedWorkerLocal& local : locals) {
-      fallback_worker_groups_cnt += local.groups.size();
-    }
-    const bool split_compact_ready =
-        use_split_key_gid && split_key_unpack_only && !split_has_left_probe &&
-        right_col_only && right_row_count > 0 && right_col_owner != nullptr &&
-        fallback_worker_groups_cnt == 0 &&
-        (!split_uses_right_subgid ||
-         (split_right_rep_ptr != nullptr &&
-          split_right_rep_count == split_right_subgid_count));
-    const bool use_split_compact =
-        split_compact_ready && !packed_2x32_unpack_only;
-    std::vector<CompactSelectCol> compact_cols;
-    bool compact_radix_double =
-        !radix_tuple_is_int && agg_count == 1 && !has_stat_raw_agg &&
-        raw_sum_fusion && !raw_count_fusion && fusion->aggregates.size() == 1 &&
-        (slot_agg_kinds[0] == RawAggKind::kSumDouble ||
-         slot_agg_kinds[0] == RawAggKind::kAvgDouble) &&
-        (left_numeric[0].op == 1 || left_numeric[0].op == 2 ||
-         left_numeric[0].op == 6 || left_numeric[0].op == 9 ||
-         left_numeric[0].op == 17) &&
-        (packed_2x32_unpack_only || use_split_compact) &&
-        fusion->columnar_output && fusion->output_sink == nullptr &&
-        result.using_columns == nullptr && !fusion->having &&
-        !fusion->post_having_active && fusion->topn_limit == 0 &&
-        !fusion->rollup_count_distribution && !result.HasSpill() &&
-        !fusion->select_items.empty();
-    if (compact_radix_double && !use_split_compact) {
-      compact_cols.reserve(fusion->select_items.size());
-      for (size_t si = 0; si < fusion->select_items.size(); ++si) {
-        const Expression& expr = fusion->select_items[si];
-        std::string col_name =
-            si < fusion->select_names.size() ? fusion->select_names[si] : "";
-        if (expr != nullptr && expr->Type() == TypeTag::kAggregateExp &&
-            &expr->AsAggregateExpression() == fusion->aggregates[0]) {
-          CompactSelectCol ccol;
-          ccol.kind = 2;
-          ccol.name = std::move(col_name);
-          ccol.type = ValueType::kDouble;
-          compact_cols.push_back(std::move(ccol));
-          continue;
-        }
-        if (expr != nullptr && expr->Type() == TypeTag::kColumnValue) {
-          const auto off = LocalColumnOffset(
-              result.schema, expr->AsColumnValue().GetColumnName());
-          if (off.has_value() &&
-              (*off == packed_2x32_slot0 || *off == packed_2x32_slot1)) {
-            const uint8_t k = (*off == packed_2x32_slot0) ? 0 : 1;
-            const ValueType kt =
-                result.schema.GetColumn(static_cast<size_t>(*off)).Type();
-            if (kt == ValueType::kInt64 || kt == ValueType::kDate) {
-              CompactSelectCol ccol;
-              ccol.kind = k;
-              ccol.name = std::move(col_name);
-              ccol.type = kt;
-              compact_cols.push_back(std::move(ccol));
-              continue;
-            }
-          }
-        }
-        compact_radix_double = false;
-        break;
-      }
-    } else if (compact_radix_double && use_split_compact) {
-      struct RightSummary {
-        bool all_uniform{true};
-        bool any_null{false};
-        bool all_null{true};
-        ValueType vt{ValueType::kNull};
-        bool is_unsigned{false};
-        bool is_interval{false};
-      };
-      const size_t rw = right.schema.ColumnCount();
-      std::vector<RightSummary> rsums(rw);
-      std::vector<bool> r_init(rw, false);
-      for (const ColumnarChunk& rch : right_arg.columnar->chunks) {
-        if (rch.rows == 0) {
-          continue;
-        }
-        for (size_t rc = 0; rc < rw && rc < rch.columns.size(); ++rc) {
-          const ColumnarColumn& col = rch.columns[rc];
-          RightSummary& s = rsums[rc];
-          if (col.has_null || col.type == ValueType::kNull ||
-              (col.encoding == ColumnarColumn::Encoding::kConstant &&
-               col.const_is_null)) {
-            s.any_null = true;
-          }
-          if (!col.is_uniform) {
-            s.all_uniform = false;
-            s.all_null = false;
-            continue;
-          }
-          if (col.type != ValueType::kNull) {
-            s.all_null = false;
-            if (!r_init[rc]) {
-              s.vt = col.type;
-              s.is_unsigned = col.is_unsigned;
-              s.is_interval = col.is_interval;
-              r_init[rc] = true;
-            } else if (s.vt != col.type || s.is_unsigned != col.is_unsigned ||
-                       s.is_interval != col.is_interval) {
-              s.all_uniform = false;
-            }
-          }
-        }
-      }
-      compact_cols.reserve(fusion->select_items.size());
-      for (size_t si = 0; si < fusion->select_items.size(); ++si) {
-        const Expression& expr = fusion->select_items[si];
-        std::string col_name =
-            si < fusion->select_names.size() ? fusion->select_names[si] : "";
-        if (expr == nullptr) {
-          compact_radix_double = false;
-          break;
-        }
-        if (expr->Type() == TypeTag::kAggregateExp &&
-            &expr->AsAggregateExpression() == fusion->aggregates[0]) {
-          CompactSelectCol ccol;
-          ccol.kind = 2;
-          ccol.name = std::move(col_name);
-          ccol.type = ValueType::kDouble;
-          compact_cols.push_back(std::move(ccol));
-          continue;
-        }
-        if (expr->Type() == TypeTag::kConstantValue &&
-            !ContainsParameterSlot(expr)) {
-          const Value& cv = expr->AsConstantValue().GetValue();
-          if (cv.IsCaseInsensitive() || cv.type == ValueType::kArray ||
-              (!cv.IsNull() && !cv.IsUnsigned() && cv.Collation() != 0)) {
-            compact_radix_double = false;
-            break;
-          }
-          CompactSelectCol ccol;
-          ccol.kind = 3;
-          ccol.name = std::move(col_name);
-          ccol.type = cv.IsNull() ? ValueType::kNull : cv.type;
-          ccol.is_unsigned = cv.IsUnsigned();
-          ccol.is_interval = cv.IsInterval();
-          ccol.has_null = cv.IsNull();
-          ccol.all_null = cv.IsNull();
-          ccol.constant = cv;
-          compact_cols.push_back(std::move(ccol));
-          continue;
-        }
-        if (expr->Type() == TypeTag::kColumnValue) {
-          const auto off = LocalColumnOffset(
-              result.schema, expr->AsColumnValue().GetColumnName());
-          if (!off.has_value()) {
-            compact_radix_double = false;
-            break;
-          }
-          if (*off >= left_width && (*off - left_width) < rw) {
-            const size_t rc = *off - left_width;
-            const RightSummary& rs = rsums[rc];
-            if (!rs.all_uniform) {
-              compact_radix_double = false;
-              break;
-            }
-            const Column& rcol_def = right.schema.GetColumn(rc);
-            const ValueType out_vt =
-                rs.all_null
-                    ? ValueType::kNull
-                    : (rs.vt != ValueType::kNull ? rs.vt : rcol_def.Type());
-            CompactSelectCol ccol;
-            ccol.kind = 4;
-            ccol.name = std::move(col_name);
-            ccol.type = out_vt;
-            ccol.is_unsigned = rs.is_unsigned;
-            ccol.is_interval = rs.is_interval;
-            ccol.is_uniform = rs.all_uniform;
-            ccol.has_null = rs.any_null;
-            ccol.all_null = rs.all_null;
-            ccol.col_idx = rc;
-            compact_cols.push_back(std::move(ccol));
-            continue;
-          }
-          if (*off < left_width && *off < 16 &&
-              def_col_to_pk_lookup[*off] >= 0) {
-            const auto li = static_cast<size_t>(
-                static_cast<unsigned char>(def_col_to_pk_lookup[*off]));
-            const PreparedDeferredPkLookup& lkp = prepared_pk_lookups[li];
-            const PreparedDeferredPkGroup& pk_grp =
-                def_pk_groups[lkp.group_idx];
-            if (pk_grp.use_subgid && pk_grp.subgid_rep_ptr != nullptr &&
-                !lkp.blocks.empty() && pk_grp.subgid_count > 0 &&
-                (lkp.payload_type != ValueType::kVarChar ||
-                 pk_grp.store_owner != nullptr) &&
-                (lkp.payload_type == ValueType::kInt64 ||
-                 lkp.payload_type == ValueType::kDate ||
-                 lkp.payload_type == ValueType::kDouble ||
-                 lkp.payload_type == ValueType::kVarChar)) {
-              const uint32_t card = pk_grp.subgid_count;
-              CompactSelectCol ccol;
-              ccol.kind = 5;
-              ccol.name = std::move(col_name);
-              ccol.type = lkp.payload_type;
-              ccol.is_unsigned = lkp.payload_unsigned;
-              ccol.pk_shift = pk_grp.subgid_shift;
-              ccol.pk_mask =
-                  card <= 1
-                      ? 0ULL
-                      : ((uint64_t{1} << std::bit_width(card - 1)) - 1ULL);
-              ccol.store_owner = pk_grp.store_owner;
-              ccol.lut_null.assign(card, 0);
-              bool any_null = false;
-              bool all_null = true;
-              if (lkp.payload_type == ValueType::kVarChar) {
-                ccol.lut_sv.resize(card);
-              } else if (lkp.payload_type == ValueType::kDouble) {
-                ccol.lut_f64.resize(card, 0.0);
-              } else {
-                ccol.lut_i64.resize(card, 0);
-              }
-              const auto* rep_ptrs = pk_grp.subgid_rep_ptr;
-              const auto* blk_ptr = lkp.blocks.data();
-              for (uint32_t sg = 0; sg < card; ++sg) {
-                const auto [nb, rin] = rep_ptrs[sg];
-                const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                  ccol.lut_null[sg] = 1;
-                  any_null = true;
-                } else {
-                  all_null = false;
-                  if (lkp.payload_type == ValueType::kVarChar) {
-                    ccol.lut_sv[sg] = pb.pay_blk->VarcharAt(rin);
-                  } else if (lkp.payload_type == ValueType::kDouble) {
-                    const auto dv = std::bit_cast<double>(pb.pay_cells[rin]);
-                    ccol.lut_f64[sg] = (dv == 0.0) ? 0.0 : dv;
-                  } else {
-                    ccol.lut_i64[sg] = pb.pay_cells[rin];
-                  }
-                }
-              }
-              ccol.lut_any_null = any_null;
-              ccol.lut_all_null = all_null;
-              ccol.has_null = any_null;
-              ccol.all_null = all_null;
-              compact_cols.push_back(std::move(ccol));
-              continue;
-            }
-          }
-          std::optional<size_t> eq_rc;
-          if (*off < left_width && *off < left.schema.ColumnCount() &&
-              (!split_uses_right_subgid ||
-               split_right_subgid_count == right_row_count)) {
-            const Column& lc = left.schema.GetColumn(*off);
-            if (lc.Type() != ValueType::kNull &&
-                lc.Type() != ValueType::kVarChar) {
-              for (const EqualityKey& eq : equality_keys) {
-                if (eq.left == *off && eq.left_offset == 0 &&
-                    eq.right_offset == 0 && !eq.null_safe && eq.right < rw) {
-                  const Column& rc_def = right.schema.GetColumn(eq.right);
-                  if (lc.Type() == rc_def.Type() &&
-                      lc.IsUnsigned() == rc_def.IsUnsigned() &&
-                      rc_def.Type() != ValueType::kVarChar) {
-                    eq_rc = eq.right;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-          if (eq_rc.has_value()) {
-            const size_t rc = *eq_rc;
-            const RightSummary& rs = rsums[rc];
-            if (rs.all_uniform) {
-              const Column& rcol_def = right.schema.GetColumn(rc);
-              const ValueType out_vt =
-                  rs.all_null
-                      ? ValueType::kNull
-                      : (rs.vt != ValueType::kNull ? rs.vt : rcol_def.Type());
-              CompactSelectCol ccol;
-              ccol.kind = 4;
-              ccol.name = std::move(col_name);
-              ccol.type = out_vt;
-              ccol.is_unsigned = rs.is_unsigned;
-              ccol.is_interval = rs.is_interval;
-              ccol.is_uniform = rs.all_uniform;
-              ccol.has_null = rs.any_null;
-              ccol.all_null = rs.all_null;
-              ccol.col_idx = rc;
-              compact_cols.push_back(std::move(ccol));
-              continue;
-            }
-          }
-        }
-        compact_radix_double = false;
-        break;
-      }
-    }
-    if (compact_radix_double) {
-      // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
-      //   (jit_radix_key_double_agg_sound)
-      // Reusable per-worker generation-stamped SoA open-addressed table driven
-      // by JitRadixKeyDoubleAgg with zero-copy right/PK columnar emission in
-      // kColumnarChunkRows (2048) slices (TPC-DS Q65/Q67).
-      const bool is_avg = (slot_agg_kinds[0] == RawAggKind::kAvgDouble);
-      const bool raise_inf = slot_raises_inf[0];
-      const std::optional<JitRadixKeyDoubleAgg> jit_radix_agg =
-          (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_JIT_RADIX_AGG") ==
-           nullptr)
-              ? JitRadixKeyDoubleAgg::Compile(raise_inf)
-              : std::nullopt;
-      const bool need_right_gi =
-          use_split_compact &&
-          std::ranges::any_of(compact_cols, [](const CompactSelectCol& cc) {
-            return cc.kind == 4 && !cc.all_null;
-          });
-      const uint64_t split_r_mask =
-          (!use_split_compact || !split_uses_right_subgid ||
-           split_right_subgid_count <= 1)
-              ? 0ULL
-              : ((uint64_t{1} << std::bit_width(split_right_subgid_count - 1)) -
-                 1ULL);
-      const size_t out_w = compact_cols.size();
-      std::vector<std::vector<ColumnarChunk>> part_chunks(kRadixParts);
-      std::vector<std::vector<uint8_t>> part_col_nonnull(
-          kRadixParts, std::vector<uint8_t>(out_w, 0));
-      std::vector<size_t> part_group_counts(kRadixParts, 0);
-      std::atomic<size_t> next_part{0};
-      std::mutex err_mu;
-      Status compact_err{Status::kSuccess};
-      const size_t part_workers = std::min<size_t>(workers, kRadixParts);
-      RETURN_IF_FAIL(RunParallelTasks(part_workers, [&](size_t) {
-        std::vector<uint64_t> ht_keys;
-        std::vector<double> ht_sums;
-        std::vector<uint64_t> ht_counts;
-        std::vector<uint32_t> ht_gens;
-        std::vector<uint8_t> ht_inf;
-        std::vector<uint32_t> occupied;
-        uint32_t cur_gen = 0;
-        auto grow_table = [&](size_t new_cap, uint32_t n_occ) {
-          std::vector<uint64_t> next_keys(new_cap, 0);
-          std::vector<double> next_sums(new_cap, 0.0);
-          std::vector<uint64_t> next_counts(new_cap, 0);
-          std::vector<uint32_t> next_gens(new_cap, 0);
-          std::vector<uint8_t> next_inf(raise_inf ? new_cap : 0, 0);
-          const auto new_max_load = static_cast<uint32_t>((new_cap * 7) / 10);
-          std::vector<uint32_t> next_occ(new_max_load);
-          cur_gen = 1;
-          const size_t nmask = new_cap - 1;
-          for (uint32_t j = 0; j < n_occ; ++j) {
-            const uint32_t old_pos = occupied[j];
-            const uint64_t k = ht_keys[old_pos];
-            auto pos = static_cast<size_t>(HashPacked2x32Key(k)) & nmask;
-            while (next_gens[pos] == cur_gen) {
-              pos = (pos + 1) & nmask;
-            }
-            next_keys[pos] = k;
-            next_sums[pos] = ht_sums[old_pos];
-            next_counts[pos] = ht_counts[old_pos];
-            next_gens[pos] = cur_gen;
-            if (raise_inf) {
-              next_inf[pos] = ht_inf[old_pos];
-            }
-            next_occ[j] = static_cast<uint32_t>(pos);
-          }
-          ht_keys.swap(next_keys);
-          ht_sums.swap(next_sums);
-          ht_counts.swap(next_counts);
-          ht_gens.swap(next_gens);
-          if (raise_inf) {
-            ht_inf.swap(next_inf);
-          }
-          occupied.swap(next_occ);
-        };
-        while (true) {
-          const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
-          if (p >= kRadixParts) {
-            break;
-          }
-          size_t part_total = 0;
-          for (auto& wb : worker_radix_buckets) {
-            part_total += wb[p].keys.size();
-          }
-          if (part_total == 0) {
-            continue;
-          }
-          size_t need_cap = 128;
-          const size_t est_groups =
-              std::min<size_t>(std::max<size_t>(part_total / 2, 64), 131072);
-          while (need_cap < est_groups * 2) {
-            need_cap <<= 1U;
-          }
-          if (ht_keys.size() < need_cap) {
-            ht_keys.assign(need_cap, 0);
-            ht_sums.assign(need_cap, 0.0);
-            ht_counts.assign(need_cap, 0);
-            ht_gens.assign(need_cap, 0);
-            ht_inf.assign(raise_inf ? need_cap : 0, 0);
-            cur_gen = 1;
-          } else {
-            ++cur_gen;
-            if (cur_gen == 0) {
-              std::fill(ht_gens.begin(), ht_gens.end(), 0);
-              cur_gen = 1;
-            }
-          }
-          auto max_load = static_cast<uint32_t>((ht_keys.size() * 7) / 10);
-          uint32_t n_occ = 0;
-          occupied.resize(max_load);
-          if (jit_radix_agg.has_value()) {
-            for (auto& wb : worker_radix_buckets) {
-              const RadixSoABucket& bucket = wb[p];
-              const size_t bsz = bucket.keys.size();
-              size_t off = 0;
-              while (off < bsz) {
-                const auto chunk_n = static_cast<uint32_t>(std::min<size_t>(
-                    bsz - off, std::numeric_limits<uint32_t>::max()));
-                const uint32_t done = jit_radix_agg->Accumulate(
-                    chunk_n, bucket.keys.data() + off,
-                    bucket.dvals.data() + off, bucket.valids.data() + off,
-                    ht_keys.data(), ht_sums.data(), ht_counts.data(),
-                    ht_gens.data(), raise_inf ? ht_inf.data() : nullptr,
-                    cur_gen, static_cast<uint64_t>(ht_keys.size() - 1),
-                    max_load, occupied.data(), &n_occ);
-                off += done;
-                if (off < bsz) [[unlikely]] {
-                  grow_table(ht_keys.size() * 2, n_occ);
-                  max_load = static_cast<uint32_t>((ht_keys.size() * 7) / 10);
-                }
-              }
-            }
-          } else {
-            size_t mask = ht_keys.size() - 1;
-            for (auto& wb : worker_radix_buckets) {
-              const RadixSoABucket& bucket = wb[p];
-              const size_t bsz = bucket.keys.size();
-              for (size_t idx = 0; idx < bsz; ++idx) {
-                const uint64_t key = bucket.keys[idx];
-                const double dval = bucket.dvals[idx];
-                const uint8_t valid = bucket.valids[idx];
-                auto pos = static_cast<size_t>(HashPacked2x32Key(key)) & mask;
-                while (true) {
-                  if (ht_gens[pos] != cur_gen) {
-                    if (n_occ >= max_load) [[unlikely]] {
-                      grow_table(ht_keys.size() * 2, n_occ);
-                      mask = ht_keys.size() - 1;
-                      max_load =
-                          static_cast<uint32_t>((ht_keys.size() * 7) / 10);
-                      pos = static_cast<size_t>(HashPacked2x32Key(key)) & mask;
-                      continue;
-                    }
-                    ht_keys[pos] = key;
-                    ht_sums[pos] = 0.0;
-                    ht_counts[pos] = 0;
-                    ht_gens[pos] = cur_gen;
-                    if (raise_inf) {
-                      ht_inf[pos] = 0;
-                    }
-                    occupied[n_occ++] = static_cast<uint32_t>(pos);
-                    if (valid != 0) [[likely]] {
-                      ht_sums[pos] = dval;
-                      ht_counts[pos] = 1;
-                    }
-                    break;
-                  }
-                  if (ht_keys[pos] == key) [[likely]] {
-                    if (valid != 0) [[likely]] {
-                      const double prev = ht_sums[pos];
-                      const double next = prev + dval;
-                      if (raise_inf && std::isinf(next) && !std::isinf(prev) &&
-                          !std::isinf(dval)) [[unlikely]] {
-                        ht_inf[pos] = 1;
-                      }
-                      ht_sums[pos] = next;
-                      ht_counts[pos] += 1;
-                    }
-                    break;
-                  }
-                  pos = (pos + 1) & mask;
-                }
-              }
-            }
-          }
-          occupied.resize(n_occ);
-          const size_t n = n_occ;
-          if (n == 0) {
-            continue;
-          }
-          if (raise_inf) {
-            bool any_inf = false;
-            for (uint32_t pos : occupied) {
-              if (ht_inf[pos] != 0) {
-                any_inf = true;
-                break;
-              }
-            }
-            if (any_inf) {
-              std::scoped_lock lk(err_mu);
-              if (compact_err.ok()) {
-                compact_err = StatusError(StatusCode::kIsInfinity,
-                                          "SUM overflow: result is infinite");
-              }
-              return;
-            }
-          }
-          part_group_counts[p] = n;
-          auto& out_pchunks = part_chunks[p];
-          out_pchunks.reserve((n + kColumnarChunkRows - 1) /
-                              kColumnarChunkRows);
-          for (size_t off = 0; off < n; off += kColumnarChunkRows) {
-            const size_t cnt = std::min<size_t>(kColumnarChunkRows, n - off);
-            ColumnarChunk chunk;
-            chunk.rows = cnt;
-            chunk.columns.resize(out_w);
-            std::shared_ptr<ChunkGatherIndex> right_gi;
-            if (need_right_gi) {
-              right_gi = std::make_shared<ChunkGatherIndex>();
-              right_gi->source_table = right_col_owner;
-              right_gi->src_chunks.resize(cnt);
-              right_gi->src_rows.resize(cnt);
-              for (size_t i = 0; i < cnt; ++i) {
-                const uint64_t key = ht_keys[occupied[off + i]];
-                const uint32_t r_subgid =
-                    split_uses_right_subgid
-                        ? static_cast<uint32_t>((key >> split_right_shift) &
-                                                split_r_mask)
-                        : 0U;
-                const uint32_t r_idx = split_uses_right_subgid
-                                           ? split_right_rep_ptr[r_subgid]
-                                           : 0U;
-                const auto [rch, rr] = right_locator.Locate(r_idx);
-                right_gi->src_chunks[i] = static_cast<uint32_t>(rch);
-                right_gi->src_rows[i] = static_cast<uint32_t>(rr);
-              }
-            }
-            for (size_t ci = 0; ci < out_w; ++ci) {
-              const CompactSelectCol& cc = compact_cols[ci];
-              ColumnarColumn& col = chunk.columns[ci];
-              if (cc.kind == 0 || cc.kind == 1) {
-                col.Init(cc.type, cc.is_unsigned, cc.is_interval, 0);
-                col.ints.resize(cnt);
-                int64_t* dst = col.ints.data();
-                if (cc.kind == 0) {
-                  for (size_t i = 0; i < cnt; ++i) {
-                    dst[i] = static_cast<int64_t>(
-                        static_cast<int32_t>(ht_keys[occupied[off + i]] >> 32));
-                  }
-                } else {
-                  for (size_t i = 0; i < cnt; ++i) {
-                    dst[i] = static_cast<int64_t>(static_cast<int32_t>(
-                        ht_keys[occupied[off + i]] & 0xffffffffULL));
-                  }
-                }
-                part_col_nonnull[p][ci] = 1;
-              } else if (cc.kind == 2) {
-                col.Init(ValueType::kDouble, false, false, 0);
-                col.doubles.resize(cnt);
-                double* dst = col.doubles.data();
-                bool any_null = false;
-                for (size_t i = 0; i < cnt; ++i) {
-                  const uint32_t pos = occupied[off + i];
-                  const uint64_t c = ht_counts[pos];
-                  if (c == 0) {
-                    any_null = true;
-                    dst[i] = 0.0;
-                  } else {
-                    part_col_nonnull[p][ci] = 1;
-                    dst[i] = is_avg ? (ht_sums[pos] / static_cast<double>(c))
-                                    : ht_sums[pos];
-                  }
-                }
-                if (any_null) {
-                  col.has_null = true;
-                  col.nulls.assign(cnt, 0);
-                  for (size_t i = 0; i < cnt; ++i) {
-                    if (ht_counts[occupied[off + i]] == 0) {
-                      col.nulls[i] = 1;
-                    }
-                  }
-                }
-              } else if (cc.kind == 3) {
-                TrySetConstantColumnarColumn(&col, ValueType::kNull, false,
-                                             false, cc.constant, cnt, &chunk);
-                if (!cc.constant.IsNull()) {
-                  part_col_nonnull[p][ci] = 1;
-                }
-              } else if (cc.kind == 4) {
-                if (cc.all_null) {
-                  col.SetConstantNull(ValueType::kNull, cc.is_unsigned,
-                                      cc.is_interval, cnt);
-                } else {
-                  col.SetGathered(right_gi, cc.col_idx, cc.type, cc.is_unsigned,
-                                  cc.is_interval, cc.is_uniform, cc.has_null);
-                  if (!cc.has_null) {
-                    part_col_nonnull[p][ci] = 1;
-                  } else {
-                    for (size_t i = 0; i < cnt; ++i) {
-                      if (!col.IsNull(i)) {
-                        part_col_nonnull[p][ci] = 1;
-                        break;
-                      }
-                    }
-                  }
-                }
-              } else {
-                // kind == 5: kPkCol via pre-extracted subgid LUT.
-                if (cc.lut_all_null) {
-                  col.SetConstantNull(ValueType::kNull, cc.is_unsigned, false,
-                                      cnt);
-                } else {
-                  col.Init(cc.type, cc.is_unsigned, false, 0);
-                  const uint8_t sh = cc.pk_shift;
-                  const uint64_t mk = cc.pk_mask;
-                  const bool chk_null = cc.lut_any_null;
-                  bool chunk_any_null = false;
-                  bool nonnull_seen = false;
-                  if (cc.type == ValueType::kVarChar) {
-                    col.encoding_owner = cc.store_owner;
-                    chunk.AppendKeepaliveUnique(cc.store_owner);
-                    col.strings.resize(cnt);
-                    std::string_view* dst = col.strings.data();
-                    const std::string_view* src = cc.lut_sv.data();
-                    if (!chk_null) {
-                      nonnull_seen = true;
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        dst[i] = src[sg];
-                      }
-                    } else {
-                      const uint8_t* nul = cc.lut_null.data();
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        if (nul[sg] != 0) {
-                          if (!chunk_any_null) {
-                            chunk_any_null = true;
-                            col.has_null = true;
-                            col.nulls.assign(cnt, 0);
-                          }
-                          col.nulls[i] = 1;
-                          dst[i] = {};
-                        } else {
-                          dst[i] = src[sg];
-                          nonnull_seen = true;
-                        }
-                      }
-                    }
-                  } else if (cc.type == ValueType::kDouble) {
-                    col.doubles.resize(cnt);
-                    double* dst = col.doubles.data();
-                    const double* src = cc.lut_f64.data();
-                    if (!chk_null) {
-                      nonnull_seen = true;
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        dst[i] = src[sg];
-                      }
-                    } else {
-                      const uint8_t* nul = cc.lut_null.data();
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        if (nul[sg] != 0) {
-                          if (!chunk_any_null) {
-                            chunk_any_null = true;
-                            col.has_null = true;
-                            col.nulls.assign(cnt, 0);
-                          }
-                          col.nulls[i] = 1;
-                          dst[i] = 0.0;
-                        } else {
-                          dst[i] = src[sg];
-                          nonnull_seen = true;
-                        }
-                      }
-                    }
-                  } else {
-                    col.ints.resize(cnt);
-                    int64_t* dst = col.ints.data();
-                    const int64_t* src = cc.lut_i64.data();
-                    if (!chk_null) {
-                      nonnull_seen = true;
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        dst[i] = src[sg];
-                      }
-                    } else {
-                      const uint8_t* nul = cc.lut_null.data();
-                      for (size_t i = 0; i < cnt; ++i) {
-                        const auto sg = static_cast<size_t>(
-                            (ht_keys[occupied[off + i]] >> sh) & mk);
-                        if (nul[sg] != 0) {
-                          if (!chunk_any_null) {
-                            chunk_any_null = true;
-                            col.has_null = true;
-                            col.nulls.assign(cnt, 0);
-                          }
-                          col.nulls[i] = 1;
-                          dst[i] = 0;
-                        } else {
-                          dst[i] = src[sg];
-                          nonnull_seen = true;
-                        }
-                      }
-                    }
-                  }
-                  if (nonnull_seen) {
-                    part_col_nonnull[p][ci] = 1;
-                  }
-                }
-              }
-            }
-            out_pchunks.push_back(std::move(chunk));
-          }
-        }
-      }));
-      std::vector<std::array<RadixSoABucket, kRadixParts>>().swap(
-          worker_radix_buckets);
-      bounded_radix_charge.reset();
-      RETURN_IF_FAIL(compact_err);
-      std::vector<uint8_t> any_col_nonnull(out_w, 0);
-      size_t total_compact_groups = 0;
-      for (size_t p = 0; p < kRadixParts; ++p) {
-        total_compact_groups += part_group_counts[p];
-        for (size_t ci = 0; ci < out_w; ++ci) {
-          any_col_nonnull[ci] |= part_col_nonnull[p][ci];
-        }
-      }
-      // Merge any out-of-range / NULL-key fallback groups from worker locals
-      // (disjoint from the packed non-NULL int32 radix keys) into one final
-      // chunk.
-      ColumnarChunk fallback_chunk;
-      {
-        std::vector<FusedGroup> fb_groups;
-        GroupKeyMap fb_map;
-        for (FusedWorkerLocal& local : locals) {
-          for (FusedGroup& g : local.groups) {
-            auto [it, ins] = fb_map.emplace(g.key, fb_groups.size());
-            if (ins) {
-              fb_groups.push_back(std::move(g));
-            } else {
-              FusedGroup& dst = fb_groups[it->second];
-              const double prev = dst.RawDoubles()[0];
-              const double add = g.RawDoubles()[0];
-              const double next = prev + add;
-              if (g.RawInfFlags()[0] != 0 ||
-                  (std::isinf(next) && !std::isinf(prev) && !std::isinf(add))) {
-                dst.RawInfFlags()[0] = 1;
-              }
-              dst.RawDoubles()[0] = next;
-              dst.RawCounts()[0] += g.RawCounts()[0];
-            }
-          }
-          std::vector<FusedGroup>().swap(local.groups);
-          local.offsets = GroupKeyMap();
-          local.int_offsets = FlatIntKeyMap<size_t>();
-        }
-        const size_t nfb = fb_groups.size();
-        if (nfb > 0) {
-          if (raise_inf) {
-            for (const FusedGroup& g : fb_groups) {
-              if (g.RawInfFlags()[0] != 0) {
-                return StatusError(StatusCode::kIsInfinity,
-                                   "SUM overflow: result is infinite");
-              }
-            }
-          }
-          fallback_chunk.rows = nfb;
-          fallback_chunk.columns.resize(compact_cols.size());
-          for (size_t ci = 0; ci < compact_cols.size(); ++ci) {
-            ColumnarColumn& col = fallback_chunk.columns[ci];
-            col.encoding = ColumnarColumn::Encoding::kFlat;
-            col.is_uniform = true;
-            col.is_unsigned = compact_cols[ci].is_unsigned;
-            col.is_interval = compact_cols[ci].is_interval;
-            col.type = compact_cols[ci].type;
-            if (compact_cols[ci].kind == 0 || compact_cols[ci].kind == 1) {
-              const size_t ki = compact_cols[ci].kind;
-              col.ints.resize(nfb, 0);
-              bool any_null = false;
-              for (size_t i = 0; i < nfb; ++i) {
-                const Value& kv = fb_groups[i].key.values_[ki];
-                if (kv.IsNull()) {
-                  any_null = true;
-                } else {
-                  any_col_nonnull[ci] = 1;
-                  col.ints[i] = kv.value.int_value;
-                }
-              }
-              if (any_null) {
-                col.has_null = true;
-                col.nulls.resize(nfb, 0);
-                for (size_t i = 0; i < nfb; ++i) {
-                  if (fb_groups[i].key.values_[ki].IsNull()) {
-                    col.nulls[i] = 1;
-                  }
-                }
-              }
-            } else {
-              col.doubles.resize(nfb, 0.0);
-              bool any_null = false;
-              for (size_t i = 0; i < nfb; ++i) {
-                const uint64_t cnt = fb_groups[i].RawCounts()[0];
-                if (cnt == 0) {
-                  any_null = true;
-                } else {
-                  any_col_nonnull[ci] = 1;
-                  col.doubles[i] = is_avg ? (fb_groups[i].RawDoubles()[0] /
-                                             static_cast<double>(cnt))
-                                          : fb_groups[i].RawDoubles()[0];
-                }
-              }
-              if (any_null) {
-                col.has_null = true;
-                col.nulls.resize(nfb, 0);
-                for (size_t i = 0; i < nfb; ++i) {
-                  if (fb_groups[i].RawCounts()[0] == 0) {
-                    col.nulls[i] = 1;
-                  }
-                }
-              }
-            }
-          }
-          total_compact_groups += nfb;
-        }
-        for (FusedWorkerLocal& local : locals) {
-          local.raw_arena.blocks.clear();
-        }
-      }
-      std::vector<Column> compact_out_cols;
-      compact_out_cols.reserve(out_w);
-      for (size_t ci = 0; ci < out_w; ++ci) {
-        const auto& cc = compact_cols[ci];
-        if (total_compact_groups == 0 || any_col_nonnull[ci] == 0) {
-          compact_out_cols.emplace_back(cc.name, ValueType::kNull);
-        } else {
-          Column col_def(cc.name, cc.type);
-          col_def.SetUnsigned(cc.is_unsigned);
-          col_def.SetInterval(cc.is_interval);
-          compact_out_cols.push_back(std::move(col_def));
-        }
-      }
-      auto out_col = std::make_shared<ColumnarTable>();
-      if (use_split_compact && right_col_owner != nullptr) {
-        out_col->AppendKeepalive(right_col_owner);
-      }
-      for (const CompactSelectCol& cc : compact_cols) {
-        if (cc.kind == 5 && cc.store_owner != nullptr) {
-          out_col->AppendKeepalive(cc.store_owner);
-        }
-      }
-      for (size_t p = 0; p < kRadixParts; ++p) {
-        for (ColumnarChunk& ch : part_chunks[p]) {
-          if (ch.rows == 0) {
-            continue;
-          }
-          for (size_t ci = 0; ci < out_w; ++ci) {
-            if (any_col_nonnull[ci] == 0 && compact_cols[ci].kind != 3) {
-              ch.columns[ci].SetConstantNull(
-                  ValueType::kNull, compact_cols[ci].is_unsigned,
-                  compact_cols[ci].is_interval, ch.rows);
-            }
-          }
-          out_col->AppendChunk(std::move(ch));
-        }
-      }
-      if (fallback_chunk.rows > 0) {
-        for (size_t ci = 0; ci < out_w; ++ci) {
-          if (any_col_nonnull[ci] == 0 && compact_cols[ci].kind != 3) {
-            fallback_chunk.columns[ci].SetConstantNull(
-                ValueType::kNull, compact_cols[ci].is_unsigned,
-                compact_cols[ci].is_interval, fallback_chunk.rows);
-          }
-        }
-        out_col->AppendChunk(std::move(fallback_chunk));
-      }
-      result.schema = Schema("", compact_out_cols);
-      result.SetColumnarTable(std::move(out_col), total_compact_groups > 0);
-      result.peak_intermediate_rows =
-          std::max(result.peak_intermediate_rows, result.TotalRows());
-      if (result.runtime() != nullptr) {
-        ++result.runtime()->partitioned_aggregate_merges;
-      }
-      if (context.execution_runtime() != nullptr) {
-        ExecutionRuntime& runtime = *context.execution_runtime();
-        runtime.join_ms += ElapsedMs(join_begin);
-        ++runtime.grouped_join_fusions;
-      }
-      if (track_group_phases) {
-        std::cerr << "[fusion] compact_radix_double total_ms="
-                  << ElapsedMs(join_begin) << " groups=" << total_compact_groups
-                  << "\n";
-      }
+    ASSIGN_OR_RETURN(bool, emitted, compact_radix.TryEmit());
+    if (emitted) {
       return std::optional<Relation>(std::move(result));
     }
     radix_part_arenas.resize(kRadixParts);
     radix_part_groups.resize(kRadixParts);
     for (size_t p = 0; p < kRadixParts; ++p) {
       radix_part_arenas[p].has_stat = has_stat_raw_agg;
-      radix_part_arenas[p].has_double = !raw_sum_fusion || has_double_raw_agg;
-      radix_part_arenas[p].has_int = !raw_sum_fusion || has_int_raw_agg;
+      radix_part_arenas[p].has_double = !raw_aggregates.raw_sum_fusion || has_double_raw_agg;
+      radix_part_arenas[p].has_int = !raw_aggregates.raw_sum_fusion || has_int_raw_agg;
     }
     const bool has_split_rep_right =
-        split_right_rep_ptr != nullptr &&
-        ((split_key_unpack_only && split_uses_right_subgid) ||
-         (left_pack_unpack_only && left_pack_uses_right));
+        layout.split_right_rep_ptr != nullptr &&
+        ((layout.split_key_unpack_only && layout.split_uses_right_subgid) ||
+         (layout.left_pack_unpack_only && layout.left_pack_uses_right));
     const uint64_t radix_r_mask =
         !has_split_rep_right
             ? 0ULL
-            : ((left_pack_unpack_only && left_pack_uses_right)
-                   ? left_pack_right_mask
-                   : (split_right_subgid_count <= 1
+            : ((layout.left_pack_unpack_only && layout.left_pack_uses_right)
+                   ? layout.left_pack_right_mask
+                   : (layout.split_right_subgid_count <= 1
                           ? 0ULL
                           : ((uint64_t{1}
-                              << std::bit_width(split_right_subgid_count - 1)) -
+                              << std::bit_width(layout.split_right_subgid_count - 1)) -
                              1ULL)));
     std::atomic<size_t> next_part{0};
     const size_t part_workers = std::min<size_t>(workers, kRadixParts);
@@ -20676,16 +8333,16 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             } else {
               gi = pgroups.size();
               FusedGroup grp;
-              arena.Initialize(grp, raw_slot_count);
+              arena.Initialize(grp, raw_aggregates.raw_slot_count);
               grp.key_hash = t_key;
               grp.has_key_hash = true;
               if (has_split_rep_right) {
                 const auto r_subgid = static_cast<size_t>(
-                    (t_key >> split_right_shift) & radix_r_mask);
-                if (r_subgid < split_right_rep_count) {
-                  grp.rep_right_idx = split_right_rep_ptr[r_subgid];
+                    (t_key >> layout.split_right_shift) & radix_r_mask);
+                if (r_subgid < layout.split_right_rep_count) {
+                  grp.rep_right_idx = layout.split_right_rep_ptr[r_subgid];
                 }
-              } else if (right_row_count > 0) {
+              } else if (layout.right_row_count > 0) {
                 grp.rep_right_idx = 0;
               }
               pgroups.push_back(std::move(grp));
@@ -20826,7 +8483,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     const bool partitionable_int = int_group_key && all_direct_group_keys;
     const bool partitionable =
         merge_workers > 1 && groups.empty() && all_direct_group_keys &&
-        (raw_sum_fusion || raw_count_fusion || fusion->aggregates.empty()) &&
+        (raw_aggregates.raw_sum_fusion || raw_aggregates.raw_count_fusion || fusion->aggregates.empty()) &&
         (partitionable_hash || partitionable_int) &&
         ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RAW_PARTITION_MERGE") ==
             nullptr;
@@ -20889,7 +8546,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       std::vector<std::vector<MergedRef>> merged(merge_workers);
       std::vector<FusedGroup*> first_groups(total_worker_groups, nullptr);
       const bool exact_packed_hash =
-          use_split_key_gid || packed_2x32_group_key || use_left_packed_key;
+          layout.use_split_key_gid || layout.packed_2x32_group_key || layout.use_left_packed_key;
       RETURN_IF_FAIL(RunParallelTasks(merge_workers, [&](size_t p) {
         FlatIntKeyMap<size_t> index;
         index.Reserve(partitions[p].size());
@@ -20940,9 +8597,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
             output.push_back({.ref = ref, .next = next});
             first_groups[ref.rank] = ref.group;
-          } else if (raw_count_fusion) {
+          } else if (raw_aggregates.raw_count_fusion) {
             output[match].ref.group->raw_count += ref.group->raw_count;
-          } else if (raw_sum_fusion) {
+          } else if (raw_aggregates.raw_sum_fusion) {
             merge_raw(*output[match].ref.group, *ref.group);
           }
         }
@@ -21006,7 +8663,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           !local.groups.empty()) {
         groups = std::move(local.groups);
         int_merge_offsets = std::move(local.int_offsets);
-        if (!skip_accumulator_states) {
+        if (!raw_aggregates.skip_accumulator_states) {
           states = std::move(local.states);
         } else {
           local.states.clear();
@@ -21057,8 +8714,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             // Split keys pack an exact dictionary ID and a signed 32-bit
             // probe value. Their integer slots are collision-free; fallback
             // keys live exclusively in offsets and never enter this map.
-          } else if (use_split_key_gid || packed_2x32_group_key ||
-                     use_left_packed_key ||
+          } else if (layout.use_split_key_gid || layout.packed_2x32_group_key ||
+                     layout.use_left_packed_key ||
                      same_group_key(groups[*slot], group)) [[likely]] {
             inserted = false;
             target_idx = *slot;
@@ -21076,7 +8733,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           target_idx = iter->second;
         }
         if (inserted) {
-          if (!skip_accumulator_states) {
+          if (!raw_aggregates.skip_accumulator_states) {
             const size_t local_offset = group.state_offset;
             for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
               states.push_back(std::move(local.states[local_offset + i]));
@@ -21084,9 +8741,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             group.state_offset = states.size() - fusion->aggregates.size();
           }
           groups.push_back(std::move(group));
-        } else if (raw_count_fusion) {
+        } else if (raw_aggregates.raw_count_fusion) {
           groups[target_idx].raw_count += group.raw_count;
-        } else if (raw_sum_fusion) {
+        } else if (raw_aggregates.raw_sum_fusion) {
           merge_raw(groups[target_idx], group);
         } else {
           FusedGroup& destination = groups[target_idx];
@@ -21106,10 +8763,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // fused shape would drop the row entirely.
   if (fusion->group_keys.empty() && groups.empty() && !use_group_ptrs) {
     FusedGroup group;
-    if (raw_sum_fusion) {
-      merged_raw_arena.Initialize(group, raw_slot_count);
+    if (raw_aggregates.raw_sum_fusion) {
+      merged_raw_arena.Initialize(group, raw_aggregates.raw_slot_count);
     }
-    if (!skip_accumulator_states) {
+    if (!raw_aggregates.skip_accumulator_states) {
       group.state_offset = 0;
       for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
         states.emplace_back(fusion->aggregates[i], aggregate_shapes[i]);
@@ -21119,2333 +8776,52 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         std::vector<Value>(result.schema.ColumnCount(), Value()));
     groups.push_back(std::move(group));
   }
-  const auto active_group_count = [&]() noexcept -> size_t {
-    return use_group_ptrs ? group_ptrs.size() : groups.size();
+  FusedGroupEmitter emitter{
+      .raw_aggregates = raw_aggregates,
+      .layout = layout,
+      .context = context,
+      .left = left,
+      .right_arg = right_arg,
+      .ctes = ctes,
+      .outer = outer,
+      .fusion = fusion,
+      .deferred_left_probe = deferred_left_probe,
+      .effective_left_rows = effective_left_rows,
+      .right_col_owner = right_col_owner,
+      .right_locator = right_locator,
+      .right_ptr = right_ptr,
+      .right = right,
+      .join_begin = join_begin,
+      .result = result,
+      .equality_keys = equality_keys,
+      .left_width = left_width,
+      .right_width = right_width,
+      .key_shapes = key_shapes,
+      .kNullCell = kNullCell,
+      .read_right_cell = read_right_cell,
+      .def_overwritten_by_pk = def_overwritten_by_pk,
+      .prepared_pk_lookups = prepared_pk_lookups,
+      .def_pk_groups = def_pk_groups,
+      .def_col_to_pk_lookup = def_col_to_pk_lookup,
+      .read_pk_cell = read_pk_cell,
+      .phase_buckets_done = phase_buckets_done,
+      .phase_states_done = phase_states_done,
+      .phase_probe_begin = phase_probe_begin,
+      .phase_merge_begin = phase_merge_begin,
+      .phase_merge_done = phase_merge_done,
+      .phase_emit_begin = phase_emit_begin,
+      .groups = groups,
+      .states = states,
+      .group_ptrs = group_ptrs,
+      .join_type = join_type,
+      .right_col_only = right_col_only,
+      .has_double_raw_agg = has_double_raw_agg,
+      .has_int_raw_agg = has_int_raw_agg,
+      .has_stat_raw_agg = has_stat_raw_agg,
+      .track_group_phases = track_group_phases,
+      .use_group_ptrs = use_group_ptrs,
   };
-  const auto active_group_at = [&](size_t idx) noexcept -> const FusedGroup& {
-    return use_group_ptrs ? *group_ptrs[idx] : groups[idx];
-  };
-
-  // Emit: finish the accumulators into an AggregateResultMap keyed by the
-  // aggregate node, then evaluate the select list against the representative
-  // row — the same contract as Project's generic grouped emit.
-  std::vector<Column> output_columns;
-  output_columns.reserve(fusion->select_items.size());
-  for (const std::string& name : fusion->select_names) {
-    output_columns.emplace_back(name, ValueType::kNull);
-  }
-  struct DirectEmitItem {
-    bool is_agg{false};
-    size_t index{0};
-    bool has_agg_scale{false};
-    double agg_scale{1.0};
-    std::optional<Value> constant{std::nullopt};
-    std::optional<BytecodeProgram> program{std::nullopt};
-  };
-  std::vector<DirectEmitItem> direct_emit;
-  std::vector<slot_t> emit_needed_cols;
-  emit_needed_cols.reserve(fusion->select_items.size());
-  std::vector<size_t> emit_needed_aggs;
-  emit_needed_aggs.reserve(fusion->select_items.size());
-  bool has_emit_program = false;
-  size_t emit_row_width = result.schema.ColumnCount();
-  std::optional<BytecodeProgram> having_prog;
-  std::vector<slot_t> having_cols;
-  std::vector<size_t> having_aggs;
-  size_t having_row_width = result.schema.ColumnCount();
-  bool can_direct_emit = result.using_columns == nullptr;
-  if (can_direct_emit) {
-    const auto static_agg_type = [&](size_t ai) -> std::optional<ValueType> {
-      if (raw_count_fusion) {
-        return ValueType::kInt64;
-      }
-      if (raw_sum_fusion) {
-        switch (raw_agg_kinds[ai]) {
-          case RawAggKind::kCountStar:
-          case RawAggKind::kCountValue:
-          case RawAggKind::kCountDistinctInt64:
-          case RawAggKind::kSumInt64:
-            return ValueType::kInt64;
-          case RawAggKind::kSumDouble:
-          case RawAggKind::kAvgDouble:
-          case RawAggKind::kStddevSamp:
-          case RawAggKind::kStddevPop:
-          case RawAggKind::kVarSamp:
-          case RawAggKind::kVarPop:
-            return ValueType::kDouble;
-          case RawAggKind::kConstantExtremum:
-            if (!raw_constants[ai].IsNull()) {
-              return raw_constants[ai].type;
-            }
-            if (fusion->aggregates[ai]->Child()) {
-              const TypeTag ct = fusion->aggregates[ai]
-                                     ->Child()
-                                     ->ResultType(result.schema)
-                                     .GetType();
-              return ct == TypeTag::kDouble ? ValueType::kDouble
-                                            : ValueType::kInt64;
-            }
-            return ValueType::kDouble;
-          default:
-            return std::nullopt;
-        }
-      }
-      switch (fusion->aggregates[ai]->GetType()) {
-        case AggregationType::kCount:
-          return ValueType::kInt64;
-        case AggregationType::kAvg:
-        case AggregationType::kStddevSamp:
-        case AggregationType::kStddevPop:
-        case AggregationType::kVarSamp:
-        case AggregationType::kVarPop:
-          return ValueType::kDouble;
-        default:
-          return std::nullopt;
-      }
-    };
-    std::optional<Schema> emit_schema_opt;
-    std::vector<std::string> agg_col_names;
-    const auto ensure_emit_schema = [&]() -> const Schema* {
-      if (!emit_schema_opt.has_value()) {
-        std::vector<Column> cols;
-        cols.reserve(result.schema.ColumnCount() + fusion->aggregates.size());
-        for (size_t ci = 0; ci < result.schema.ColumnCount(); ++ci) {
-          cols.push_back(result.schema.GetColumn(ci));
-        }
-        agg_col_names.resize(fusion->aggregates.size());
-        for (size_t ai = 0; ai < fusion->aggregates.size(); ++ai) {
-          const auto t = static_agg_type(ai);
-          if (!t.has_value()) {
-            return nullptr;
-          }
-          std::string nm = "__fused_agg_" + std::to_string(ai);
-          if (LocalColumnOffset(result.schema, ColumnName(nm)).has_value()) {
-            return nullptr;
-          }
-          agg_col_names[ai] = nm;
-          cols.emplace_back(std::move(nm), *t);
-        }
-        emit_schema_opt = Schema("", std::move(cols));
-        emit_row_width = emit_schema_opt->ColumnCount();
-      }
-      return &*emit_schema_opt;
-    };
-    const std::function<Expression(const Expression&, std::vector<slot_t>*,
-                                   std::vector<size_t>*)>
-        rewrite_for_emit = [&](const Expression& expr,
-                               std::vector<slot_t>* used_cols,
-                               std::vector<size_t>* used_aggs) -> Expression {
-      if (!expr || ContainsQuery(expr) || ContainsParameterSlot(expr)) {
-        return {};
-      }
-      if (expr->Type() == TypeTag::kConstantValue) {
-        return expr;
-      }
-      if (expr->Type() == TypeTag::kColumnValue) {
-        const auto off = LocalColumnOffset(
-            result.schema, expr->AsColumnValue().GetColumnName());
-        if (!off.has_value()) {
-          return {};
-        }
-        used_cols->push_back(static_cast<slot_t>(*off));
-        return expr;
-      }
-      if (expr->Type() == TypeTag::kAggregateExp) {
-        const auto* agg_ptr = &expr->AsAggregateExpression();
-        auto found = std::ranges::find(fusion->aggregates, agg_ptr);
-        if (found == fusion->aggregates.end()) {
-          return {};
-        }
-        const auto ai = static_cast<size_t>(
-            std::distance(fusion->aggregates.begin(), found));
-        if (raw_sum_fusion && raw_const_folded[ai]) {
-          return ConstantValueExp(raw_constants[ai]);
-        }
-        if (!static_agg_type(ai).has_value() ||
-            ensure_emit_schema() == nullptr) {
-          return {};
-        }
-        used_aggs->push_back(ai);
-        return ColumnValueExp(agg_col_names[ai]);
-      }
-      if (expr->Type() == TypeTag::kUnaryExp) {
-        auto child = rewrite_for_emit(expr->AsUnaryExpression().Child(),
-                                      used_cols, used_aggs);
-        if (!child) {
-          return {};
-        }
-        return UnaryExpressionExp(std::move(child),
-                                  expr->AsUnaryExpression().Op());
-      }
-      if (expr->Type() == TypeTag::kBinaryExp) {
-        const auto& bin = expr->AsBinaryExpression();
-        auto lhs = rewrite_for_emit(bin.Left(), used_cols, used_aggs);
-        auto rhs = rewrite_for_emit(bin.Right(), used_cols, used_aggs);
-        if (!lhs || !rhs) {
-          return {};
-        }
-        return BinaryExpressionExp(std::move(lhs), bin.Op(), std::move(rhs));
-      }
-      return {};
-    };
-    direct_emit.reserve(fusion->select_items.size());
-    const auto try_match_scaled_agg = [&](const Expression& expr,
-                                          DirectEmitItem* out_item) -> bool {
-      if (!raw_sum_fusion || !expr || expr->Type() != TypeTag::kBinaryExp) {
-        return false;
-      }
-      const BinaryExpression& bin = expr->AsBinaryExpression();
-      if (bin.Op() != BinaryOperation::kMultiply || !bin.Left() ||
-          !bin.Right()) {
-        return false;
-      }
-      const auto extract_finite_scale = [&](const Expression& cand,
-                                            double* out_scale) -> bool {
-        if (!cand || ContainsParameterSlot(cand)) {
-          return false;
-        }
-        bool negate = false;
-        const Expression* inner = &cand;
-        if ((*inner)->Type() == TypeTag::kUnaryExp) {
-          const auto& unary = (*inner)->AsUnaryExpression();
-          if (unary.Op() != UnaryOperation::kMinus || !unary.Child()) {
-            return false;
-          }
-          negate = true;
-          inner = &unary.Child();
-        }
-        if ((*inner)->Type() != TypeTag::kConstantValue) {
-          return false;
-        }
-        const Value& cval = (*inner)->AsConstantValue().GetValue();
-        if (cval.IsNull()) {
-          return false;
-        }
-        double scale = 1.0;
-        if (cval.type == ValueType::kDouble) {
-          if (!std::isfinite(cval.value.double_value)) {
-            return false;
-          }
-          scale = cval.value.double_value;
-        } else if (cval.type == ValueType::kInt64) {
-          scale = cval.IsUnsigned() ? static_cast<double>(static_cast<uint64_t>(
-                                          cval.value.int_value))
-                                    : static_cast<double>(cval.value.int_value);
-        } else {
-          return false;
-        }
-        *out_scale = negate ? -scale : scale;
-        return true;
-      };
-      const Expression* agg_expr = nullptr;
-      double scale = 1.0;
-      if (bin.Left()->Type() == TypeTag::kAggregateExp &&
-          extract_finite_scale(bin.Right(), &scale)) {
-        agg_expr = &bin.Left();
-      } else if (bin.Right()->Type() == TypeTag::kAggregateExp &&
-                 extract_finite_scale(bin.Left(), &scale)) {
-        agg_expr = &bin.Right();
-      } else {
-        return false;
-      }
-      const auto* agg_ptr = &(*agg_expr)->AsAggregateExpression();
-      auto found = std::ranges::find(fusion->aggregates, agg_ptr);
-      if (found == fusion->aggregates.end()) {
-        return false;
-      }
-      const auto ai =
-          static_cast<size_t>(std::distance(fusion->aggregates.begin(), found));
-      if (raw_const_folded[ai] || static_agg_type(ai) != ValueType::kDouble) {
-        return false;
-      }
-      *out_item = DirectEmitItem{.is_agg = true,
-                                 .index = ai,
-                                 .has_agg_scale = true,
-                                 .agg_scale = scale};
-      return true;
-    };
-    for (const Expression& item : fusion->select_items) {
-      if (!item) {
-        can_direct_emit = false;
-        break;
-      }
-      if (item->Type() == TypeTag::kConstantValue &&
-          !ContainsParameterSlot(item)) {
-        direct_emit.push_back({.constant = item->AsConstantValue().GetValue()});
-      } else if (item->Type() == TypeTag::kColumnValue) {
-        const auto col_off = LocalColumnOffset(
-            result.schema, item->AsColumnValue().GetColumnName());
-        if (!col_off.has_value()) {
-          can_direct_emit = false;
-          break;
-        }
-        direct_emit.push_back({.is_agg = false, .index = *col_off});
-      } else if (item->Type() == TypeTag::kAggregateExp) {
-        const auto* agg_ptr = &item->AsAggregateExpression();
-        auto found = std::ranges::find(fusion->aggregates, agg_ptr);
-        if (found == fusion->aggregates.end()) {
-          can_direct_emit = false;
-          break;
-        }
-        const auto ai = static_cast<size_t>(
-            std::distance(fusion->aggregates.begin(), found));
-        if (raw_sum_fusion && raw_const_folded[ai]) {
-          direct_emit.push_back({.constant = raw_constants[ai]});
-        } else {
-          direct_emit.push_back({.is_agg = true, .index = ai});
-        }
-      } else if (DirectEmitItem scaled_di;
-                 try_match_scaled_agg(item, &scaled_di)) {
-        direct_emit.push_back(std::move(scaled_di));
-      } else {
-        std::vector<slot_t> cols_used;
-        std::vector<size_t> aggs_used;
-        Expression rw = rewrite_for_emit(item, &cols_used, &aggs_used);
-        const Schema* es = rw ? ensure_emit_schema() : nullptr;
-        std::optional<BytecodeProgram> prog =
-            es != nullptr ? BytecodeCompiler::CompileRowCached(
-                                rw, *es, BytecodeCompiler::Context::kValue)
-                          : std::nullopt;
-        if (!prog.has_value()) {
-          can_direct_emit = false;
-          break;
-        }
-        emit_needed_cols.insert(emit_needed_cols.end(), cols_used.begin(),
-                                cols_used.end());
-        emit_needed_aggs.insert(emit_needed_aggs.end(), aggs_used.begin(),
-                                aggs_used.end());
-        has_emit_program = true;
-        DirectEmitItem di;
-        di.program = std::move(prog);
-        direct_emit.push_back(std::move(di));
-      }
-    }
-    if (has_emit_program) {
-      std::ranges::sort(emit_needed_cols);
-      emit_needed_cols.erase(
-          std::unique(emit_needed_cols.begin(), emit_needed_cols.end()),
-          emit_needed_cols.end());
-      std::ranges::sort(emit_needed_aggs);
-      emit_needed_aggs.erase(
-          std::unique(emit_needed_aggs.begin(), emit_needed_aggs.end()),
-          emit_needed_aggs.end());
-    }
-    if (can_direct_emit && fusion->having) {
-      Expression rw_having =
-          rewrite_for_emit(fusion->having, &having_cols, &having_aggs);
-      const Schema* es = rw_having ? ensure_emit_schema() : nullptr;
-      having_prog = es != nullptr
-                        ? BytecodeCompiler::CompileRowCached(
-                              rw_having, *es, BytecodeCompiler::Context::kValue)
-                        : std::nullopt;
-      if (!having_prog.has_value()) {
-        can_direct_emit = false;
-      } else {
-        having_row_width = emit_row_width;
-        std::ranges::sort(having_cols);
-        having_cols.erase(std::unique(having_cols.begin(), having_cols.end()),
-                          having_cols.end());
-        std::ranges::sort(having_aggs);
-        having_aggs.erase(std::unique(having_aggs.begin(), having_aggs.end()),
-                          having_aggs.end());
-      }
-    }
-  }
-  const auto finish_raw_agg = [&](const FusedGroup& group,
-                                  size_t i) -> StatusOr<Value> {
-    if (raw_const_folded[i]) {
-      return raw_constants[i];
-    }
-    const auto slot =
-        static_cast<size_t>(static_cast<unsigned char>(raw_agg_slot[i]));
-    if (group.RawInfFlags()[slot] && slot_raises_inf[slot]) {
-      return StatusError(StatusCode::kIsInfinity,
-                         "SUM overflow: result is infinite");
-    }
-    switch (raw_agg_kinds[i]) {
-      case RawAggKind::kConstantExtremum:
-        return group.RawCounts()[slot] == 0 ? Value() : raw_constants[i];
-      case RawAggKind::kCountStar:
-      case RawAggKind::kCountValue:
-        return Value(group.RawCounts()[slot]);
-      case RawAggKind::kSumInt64:
-        return group.RawCounts()[slot] == 0 ? Value()
-                                            : Value(group.RawInts()[slot]);
-      case RawAggKind::kSumDouble:
-        return group.RawCounts()[slot] == 0 ? Value()
-                                            : Value(group.RawDoubles()[slot]);
-      case RawAggKind::kAvgDouble:
-        return group.RawCounts()[slot] == 0
-                   ? Value()
-                   : Value(group.RawDoubles()[slot] /
-                           static_cast<double>(group.RawCounts()[slot]));
-      case RawAggKind::kStddevSamp:
-      case RawAggKind::kStddevPop:
-      case RawAggKind::kVarSamp:
-      case RawAggKind::kVarPop: {
-        const int64_t n = group.RawCounts()[slot];
-        const bool is_samp = raw_agg_kinds[i] == RawAggKind::kStddevSamp ||
-                             raw_agg_kinds[i] == RawAggKind::kVarSamp;
-        if (n < (is_samp ? 2 : 1)) {
-          return Value();
-        }
-        const platform::ExtendedFloat mean = group.RawStatX()[slot] / n;
-        const platform::ExtendedFloat ssd =
-            group.RawStatXX()[slot] - (n * mean * mean);
-        // Catastrophic cancellation in n*mean*mean can make ssd slightly
-        // negative for large means; clamp to zero to match the canonical
-        // accumulator instead of emitting NaN / a negative variance.
-        const platform::ExtendedFloat variance =
-            ssd > 0 ? ssd / (is_samp ? n - 1 : n) : platform::ExtendedFloat{0};
-        const bool is_stddev = raw_agg_kinds[i] == RawAggKind::kStddevSamp ||
-                               raw_agg_kinds[i] == RawAggKind::kStddevPop;
-        return Value(static_cast<double>(is_stddev ? platform::Sqrt(variance)
-                                                   : variance));
-      }
-      case RawAggKind::kCountDistinctInt64:
-        return Value(static_cast<int64_t>(
-            group.raw_int_set ? group.raw_int_set->Size()
-                              : static_cast<size_t>(group.RawCounts()[slot])));
-      case RawAggKind::kNone:
-        break;
-    }
-    return Value();
-  };
-  const auto apply_agg_scale = [](const DirectEmitItem& d, Value v) -> Value {
-    if (d.has_agg_scale && !v.IsNull() && v.type == ValueType::kDouble) {
-      v.value.double_value *= d.agg_scale;
-    }
-    return v;
-  };
-  const auto try_unpack_key_cell = [&](const FusedGroup& grp, size_t col_idx,
-                                       bool own_pk_strings,
-                                       Value* out) -> bool {
-    if (!grp.key.values_.empty()) {
-      for (size_t k = 0; k < key_shapes.size() && k < grp.key.values_.size();
-           ++k) {
-        if (std::cmp_equal(
-                key_shapes[k].direct_column,
-                col_idx)) {  // NOLINT(modernize-use-integer-sign-comparison)
-          *out = grp.key.values_[k];
-          if (own_pk_strings && out->type == ValueType::kVarChar &&
-              !out->IsNull() && out->owned_data.empty()) {
-            *out = Value(std::string(out->value.varchar_value));
-          }
-          return true;
-        }
-      }
-      return false;
-    }
-    if (packed_2x32_unpack_only && grp.has_key_hash) {
-      if (col_idx == packed_2x32_slot0) {
-        const auto v0 =
-            static_cast<int64_t>(static_cast<int32_t>(grp.key_hash >> 32));
-        *out = packed_2x32_type0 == ValueType::kDate ? Value::DateFromDays(v0)
-                                                     : Value(v0);
-        return true;
-      }
-      if (col_idx == packed_2x32_slot1) {
-        const auto v1 = static_cast<int64_t>(
-            static_cast<int32_t>(grp.key_hash & 0xffffffffULL));
-        *out = packed_2x32_type1 == ValueType::kDate ? Value::DateFromDays(v1)
-                                                     : Value(v1);
-        return true;
-      }
-    }
-    if (split_key_unpack_only && grp.has_key_hash) {
-      if (split_has_left_probe && split_left_slot.has_value() &&
-          col_idx == *split_left_slot) {
-        const auto v1 = static_cast<int64_t>(
-            static_cast<int32_t>(grp.key_hash & 0xffffffffULL));
-        *out = split_left_type == ValueType::kDate ? Value::DateFromDays(v1)
-                                                   : Value(v1);
-        return true;
-      }
-      if (col_idx < left_width && col_idx < 16 &&
-          def_col_to_pk_lookup[col_idx] >= 0) {
-        const auto li = static_cast<size_t>(
-            static_cast<unsigned char>(def_col_to_pk_lookup[col_idx]));
-        const PreparedDeferredPkGroup& pk_grp =
-            def_pk_groups[prepared_pk_lookups[li].group_idx];
-        if (pk_grp.use_subgid) {
-          const uint32_t p_card = pk_grp.subgid_count;
-          const uint64_t mask =
-              p_card <= 1
-                  ? 0ULL
-                  : ((uint64_t{1} << std::bit_width(p_card - 1)) - 1ULL);
-          const auto sg = static_cast<uint32_t>(
-              (grp.key_hash >> pk_grp.subgid_shift) & mask);
-          const auto [nb, rin] = pk_grp.subgid_rep_ptr[sg];
-          read_pk_cell(li, nb, rin, out);
-          if (own_pk_strings && out->type == ValueType::kVarChar &&
-              !out->IsNull()) {
-            *out = Value(std::string(out->value.varchar_value));
-          }
-          return true;
-        }
-      }
-    }
-    if (left_pack_unpack_only && grp.has_key_hash) {
-      for (const LeftPackedIntCol& lpi : left_pack_ints) {
-        if (lpi.col == col_idx) {
-          const uint64_t code = (grp.key_hash >> lpi.shift) & lpi.mask;
-          if (code == lpi.null_code) {
-            *out = Value();
-          } else {
-            const auto iv =
-                static_cast<int64_t>(static_cast<uint64_t>(lpi.min_val) + code);
-            *out = lpi.type == ValueType::kDate ? Value::DateFromDays(iv)
-                                                : Value(iv);
-          }
-          return true;
-        }
-      }
-      if (left_pack_uses_dict) {
-        for (const size_t dc : left_pack_dict_cols) {
-          if (dc == col_idx) {
-            const auto d_id = static_cast<uint32_t>(
-                (grp.key_hash >> left_pack_dict_shift) & left_pack_dict_mask);
-            if (left_col_only) {
-              const auto [ci, r] = left_pack_dict_rep_col_loc[d_id];
-              if (ci == std::numeric_limits<uint32_t>::max()) {
-                *out = Value();
-              } else {
-                left.columnar->chunks[ci].columns[col_idx].WriteValueInto(r,
-                                                                          out);
-                if (own_pk_strings && out->type == ValueType::kVarChar &&
-                    !out->IsNull()) {
-                  *out = Value(std::string(out->value.varchar_value));
-                }
-              }
-            } else {
-              *out = left.rows[left_pack_dict_rep_rows[d_id]].values_[col_idx];
-            }
-            return true;
-          }
-        }
-      }
-      if (left_pack_uses_right && split_right_rep_ptr != nullptr) {
-        const auto r_subgid = static_cast<uint32_t>(
-            (grp.key_hash >> split_right_shift) & left_pack_right_mask);
-        const uint32_t rep_idx = split_right_rep_ptr[r_subgid];
-        if (col_idx >= left_width) {
-          const Value& v = read_right_cell(rep_idx, col_idx - left_width, out);
-          if (&v != out) {
-            *out = v;
-          }
-          if (own_pk_strings && out->type == ValueType::kVarChar &&
-              !out->IsNull() && out->owned_data.empty()) {
-            *out = Value(std::string(out->value.varchar_value));
-          }
-          return true;
-        }
-        if (join_type == JoinType::kInner) {
-          for (const EqualityKey& eq : equality_keys) {
-            if (eq.left == col_idx && eq.left_offset == 0 &&
-                eq.right_offset == 0 && !eq.null_safe) {
-              const Value& v = read_right_cell(rep_idx, eq.right, out);
-              if (&v != out) {
-                *out = v;
-              }
-              if (own_pk_strings && out->type == ValueType::kVarChar &&
-                  !out->IsNull() && out->owned_data.empty()) {
-                *out = Value(std::string(out->value.varchar_value));
-              }
-              return true;
-            }
-          }
-        }
-      }
-    }
-    return false;
-  };
-  const auto rep_cell = [&](const FusedGroup& grp, size_t col_idx,
-                            Value* col_scratch) -> const Value& {
-    if (grp.representative != nullptr) {
-      return grp.representative->values_[col_idx];
-    }
-    if (grp.rep_left == nullptr &&
-        grp.rep_col_chunk == std::numeric_limits<uint32_t>::max() &&
-        try_unpack_key_cell(grp, col_idx, false, col_scratch)) {
-      return *col_scratch;
-    }
-    if (col_idx < left_width && grp.rep_left == nullptr &&
-        grp.rep_col_chunk != std::numeric_limits<uint32_t>::max()) {
-      left.columnar->chunks[grp.rep_col_chunk].columns[col_idx].WriteValueInto(
-          grp.rep_col_row, col_scratch);
-      return *col_scratch;
-    }
-    if (col_idx < left_width && grp.rep_left == nullptr &&
-        grp.rep_right_idx != kInvalidRightIdx) {
-      for (const EqualityKey& eq : equality_keys) {
-        if (eq.left == col_idx && eq.left_offset == 0 && eq.right_offset == 0 &&
-            !eq.null_safe) {
-          return read_right_cell(grp.rep_right_idx, eq.right, col_scratch);
-        }
-      }
-      return kNullCell;
-    }
-    if (col_idx < left_width) {
-      return grp.rep_left != nullptr ? grp.rep_left->values_[col_idx]
-                                     : kNullCell;
-    }
-    return read_right_cell(grp.rep_right_idx, col_idx - left_width,
-                           col_scratch);
-  };
-  const auto direct_key_value = [&](const FusedGroup& grp, size_t col_idx,
-                                    bool own_pk_strings = true) -> Value {
-    Value col_tmp;
-    if (try_unpack_key_cell(grp, col_idx, own_pk_strings, &col_tmp)) {
-      return CanonicalDistinctValue(col_tmp);
-    }
-    return CanonicalDistinctValue(rep_cell(grp, col_idx, &col_tmp));
-  };
-  // Reject count groups before materializing their representative and output
-  // row. A selective HAVING can discard almost every joined group.
-  if (fusion->post_having_active && !fusion->post_having_is_self_sum_factor &&
-      fusion->post_having_agg_slot < fusion->aggregates.size()) {
-    const slot_t orig_slot = fusion->post_having_agg_slot;
-    const bool count_only = raw_count_fusion && orig_slot == 0;
-    const bool count_slot =
-        raw_sum_fusion && (raw_agg_kinds[orig_slot] == RawAggKind::kCountStar ||
-                           raw_agg_kinds[orig_slot] == RawAggKind::kCountValue);
-    if (count_only || count_slot) {
-      const size_t slot =
-          count_only ? 0 : static_cast<size_t>(raw_agg_slot[orig_slot]);
-      const double threshold = fusion->post_having_constant_or_factor;
-      const auto rejected = [&](const FusedGroup& group) {
-        const auto count = static_cast<double>(
-            count_only ? group.raw_count : group.RawCounts()[slot]);
-        switch (fusion->post_having_op) {
-          case BinaryOperation::kEquals:
-            return !(count == threshold);
-          case BinaryOperation::kNotEquals:
-            return !(count != threshold);
-          case BinaryOperation::kLessThan:
-            return !(count < threshold);
-          case BinaryOperation::kLessThanEquals:
-            return !(count <= threshold);
-          case BinaryOperation::kGreaterThan:
-            return !(count > threshold);
-          case BinaryOperation::kGreaterThanEquals:
-            return !(count >= threshold);
-          default:
-            return false;
-        }
-      };
-      // Compact once in encounter order. Keeping this loop explicit avoids
-      // forcing the library remove_if search loop through an unroll request
-      // that ThinLTO cannot satisfy for this large group state.
-      size_t retained = 0;
-      if (use_group_ptrs) {
-        for (size_t index = 0; index < group_ptrs.size(); ++index) {
-          if (!rejected(*group_ptrs[index])) {
-            group_ptrs[retained++] = group_ptrs[index];
-          }
-        }
-        group_ptrs.resize(retained);
-      } else {
-        for (size_t index = 0; index < groups.size(); ++index) {
-          if (!rejected(groups[index])) {
-            if (retained != index) {
-              groups[retained] = std::move(groups[index]);
-            }
-            ++retained;
-          }
-        }
-        groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(retained),
-                     groups.end());
-      }
-      fusion->post_having_applied = true;
-    }
-  }
-  phase_merge_done = std::chrono::steady_clock::now();
-  if (fusion->post_having_active && raw_sum_fusion &&
-      fusion->post_having_agg_slot < fusion->aggregates.size()) {
-    const slot_t orig_agg_slot = fusion->post_having_agg_slot;
-    const RawAggKind akind = raw_agg_kinds[orig_agg_slot];
-    if (raw_agg_slot[orig_agg_slot] >= 0 &&
-        (akind == RawAggKind::kSumDouble || akind == RawAggKind::kSumInt64)) {
-      const auto agg_slot = static_cast<slot_t>(
-          static_cast<unsigned char>(raw_agg_slot[orig_agg_slot]));
-      bool any_inf = false;
-      const size_t group_count = active_group_count();
-      for (size_t gi = 0; gi < group_count; ++gi) {
-        if (active_group_at(gi).RawInfFlags()[agg_slot] != 0) {
-          any_inf = true;
-          break;
-        }
-      }
-      // INT64 sums compare as doubles below; that is only exact while every
-      // group sum and the grand total stay within +-2^53. Otherwise leave
-      // HAVING to the canonical integer comparison (post_having_applied
-      // stays false).
-      if (!any_inf && akind == RawAggKind::kSumInt64) {
-        constexpr platform::Int128 kExactLimit = platform::Int128{1} << 53;
-        platform::Int128 grand = 0;
-        for (size_t gi = 0; gi < group_count; ++gi) {
-          const FusedGroup& grp = active_group_at(gi);
-          if (grp.RawCounts()[agg_slot] <= 0) {
-            continue;
-          }
-          const platform::Int128 v = grp.RawInts()[agg_slot];
-          grand += v;
-          if (v > kExactLimit || v < -kExactLimit || grand > kExactLimit ||
-              grand < -kExactLimit) {
-            any_inf = true;  // Reuse the "skip the shortcut" exit.
-            break;
-          }
-        }
-      }
-      if (!any_inf) {
-        auto group_sum_val = [&](const FusedGroup& grp) noexcept -> double {
-          return akind == RawAggKind::kSumDouble
-                     ? grp.RawDoubles()[agg_slot]
-                     : static_cast<double>(grp.RawInts()[agg_slot]);
-        };
-        double threshold = fusion->post_having_constant_or_factor;
-        bool valid_threshold = true;
-        if (fusion->post_having_is_self_sum_factor) {
-          double grand_total = 0.0;
-          bool any_nonnull = false;
-          for (size_t gi = 0; gi < group_count; ++gi) {
-            const FusedGroup& grp = active_group_at(gi);
-            if (grp.RawCounts()[agg_slot] > 0) {
-              any_nonnull = true;
-              grand_total += group_sum_val(grp);
-            }
-          }
-          if (!any_nonnull) {
-            valid_threshold = false;
-          } else {
-            threshold = grand_total * fusion->post_having_constant_or_factor;
-            if (!std::isfinite(threshold)) {
-              valid_threshold = false;
-            }
-          }
-        }
-        if (valid_threshold) {
-          size_t out = 0;
-          for (size_t gi = 0; gi < group_count; ++gi) {
-            const FusedGroup& grp = active_group_at(gi);
-            if (grp.RawCounts()[agg_slot] <= 0) {
-              continue;
-            }
-            const double val = group_sum_val(grp);
-            bool pass = false;
-            switch (fusion->post_having_op) {
-              case BinaryOperation::kEquals:
-                pass = (val == threshold);
-                break;
-              case BinaryOperation::kNotEquals:
-                pass = (val != threshold);
-                break;
-              case BinaryOperation::kLessThan:
-                pass = (val < threshold);
-                break;
-              case BinaryOperation::kLessThanEquals:
-                pass = (val <= threshold);
-                break;
-              case BinaryOperation::kGreaterThan:
-                pass = (val > threshold);
-                break;
-              case BinaryOperation::kGreaterThanEquals:
-                pass = (val >= threshold);
-                break;
-              default:
-                break;
-            }
-            if (pass) {
-              if (use_group_ptrs) {
-                group_ptrs[out++] = group_ptrs[gi];
-              } else {
-                if (out != gi) {
-                  groups[out] = std::move(groups[gi]);
-                }
-                ++out;
-              }
-            }
-          }
-          if (use_group_ptrs) {
-            group_ptrs.resize(out);
-          } else {
-            groups.resize(out);
-          }
-          fusion->post_having_applied = true;
-        }
-      }
-    } else if (fusion->post_having_is_self_sum_factor &&
-               active_group_count() == 0) {
-      fusion->post_having_applied = true;
-    }
-  }
-  bool direct_having_applied = false;
-  if (can_direct_emit && having_prog.has_value() &&
-      !fusion->post_having_applied) {
-    const size_t group_count = active_group_count();
-    if (group_count > 0) {
-      const size_t having_workers = ParallelWorkerCount(group_count / 4096);
-      std::vector<std::vector<uint32_t>> kept_shards(having_workers);
-      std::vector<Status> having_errors(having_workers, Status::kSuccess);
-      RETURN_IF_FAIL(RunParallelTasks(having_workers, [&](size_t hw) {
-        const size_t begin = (group_count * hw) / having_workers;
-        const size_t end = (group_count * (hw + 1)) / having_workers;
-        std::vector<uint32_t>& kept = kept_shards[hw];
-        kept.reserve(end - begin);
-        Row eval_row;
-        eval_row.values_.resize(having_row_width);
-        for (size_t gi = begin; gi < end; ++gi) {
-          const FusedGroup& grp = active_group_at(gi);
-          if (raw_sum_fusion) {
-            for (size_t s = 0; s < raw_slot_count; ++s) {
-              if (grp.RawInfFlags()[s] != 0 && slot_raises_inf[s]) {
-                having_errors[hw] =
-                    StatusError(StatusCode::kIsInfinity,
-                                "SUM overflow: result is infinite");
-                return;
-              }
-            }
-          }
-          for (const slot_t col : having_cols) {
-            eval_row.values_[col] = direct_key_value(grp, col, false);
-          }
-          for (const size_t ai : having_aggs) {
-            if (raw_count_fusion) {
-              eval_row.values_[left_width + right_width + ai] =
-                  Value(grp.raw_count);
-            } else if (raw_sum_fusion) {
-              auto fin = finish_raw_agg(grp, ai);
-              if (!fin.HasValue()) {
-                having_errors[hw] = fin.GetStatus();
-                return;
-              }
-              eval_row.values_[left_width + right_width + ai] =
-                  std::move(fin.Value());
-            } else {
-              auto fin = states[grp.state_offset + ai].TryFinish();
-              if (!fin.HasValue()) {
-                having_errors[hw] = fin.GetStatus();
-                return;
-              }
-              eval_row.values_[left_width + right_width + ai] =
-                  std::move(fin.Value());
-            }
-          }
-          Value hv;
-          Status hst;
-          const auto fast =
-              having_prog->TryEvaluateRowFast(eval_row, &hv, &hst);
-          if (fast == BytecodeProgram::FastEval::kError) {
-            having_errors[hw] = std::move(hst);
-            return;
-          }
-          if (fast == BytecodeProgram::FastEval::kUnsupported) {
-            auto slow = having_prog->TryEvaluateRow(eval_row);
-            if (!slow.HasValue()) {
-              having_errors[hw] = slow.GetStatus();
-              return;
-            }
-            hv = std::move(slow.Value());
-          }
-          if (Truthy(hv)) {
-            kept.push_back(static_cast<uint32_t>(gi));
-          }
-        }
-      }));
-      for (const Status& err : having_errors) {
-        RETURN_IF_FAIL(err);
-      }
-      size_t total_kept = 0;
-      for (const auto& s : kept_shards) {
-        total_kept += s.size();
-      }
-      if (use_group_ptrs) {
-        std::vector<FusedGroup*> next_ptrs;
-        next_ptrs.reserve(total_kept);
-        for (const auto& shard : kept_shards) {
-          for (const uint32_t idx : shard) {
-            next_ptrs.push_back(group_ptrs[idx]);
-          }
-        }
-        group_ptrs = std::move(next_ptrs);
-      } else {
-        std::vector<FusedGroup> next_groups;
-        next_groups.reserve(total_kept);
-        for (const auto& shard : kept_shards) {
-          for (const uint32_t idx : shard) {
-            next_groups.push_back(std::move(groups[idx]));
-          }
-        }
-        groups = std::move(next_groups);
-      }
-    }
-    direct_having_applied = true;
-  }
-  if (fusion->topn_limit > 0 && fusion->topn_limit < active_group_count() &&
-      !fusion->output_order.empty() && can_direct_emit &&
-      (raw_count_fusion || raw_sum_fusion)) {
-    struct FastTopNTerm {
-      size_t col_idx{0};
-      SortKeyOrder order;
-    };
-    std::vector<FastTopNTerm> topn_terms;
-    topn_terms.reserve(fusion->output_order.size());
-    bool can_topn = true;
-    const size_t group_count = active_group_count();
-    if (raw_sum_fusion) {
-      for (size_t gi = 0; gi < group_count; ++gi) {
-        const FusedGroup& g = active_group_at(gi);
-        for (size_t s = 0; s < raw_slot_count; ++s) {
-          if (g.RawInfFlags()[s] != 0) {
-            can_topn = false;
-            break;
-          }
-        }
-        if (!can_topn) {
-          break;
-        }
-      }
-    }
-    for (const SelectStatement::OrderByTerm& term : fusion->output_order) {
-      if (!can_topn || !term.expression) {
-        can_topn = false;
-        break;
-      }
-      std::optional<size_t> resolved_col;
-      if (term.expression->Type() == TypeTag::kConstantValue) {
-        const Value& cv = term.expression->AsConstantValue().GetValue();
-        if (cv.type == ValueType::kInt64 && !cv.IsNull() &&
-            cv.value.int_value >= 1 &&
-            static_cast<size_t>(cv.value.int_value) <= direct_emit.size()) {
-          resolved_col = static_cast<size_t>(cv.value.int_value - 1);
-        }
-      } else if (term.expression->Type() == TypeTag::kColumnValue) {
-        const ColumnName& cn = term.expression->AsColumnValue().GetColumnName();
-        if (cn.schema.empty()) {
-          for (size_t si = 0; si < fusion->select_names.size(); ++si) {
-            if (!fusion->select_names[si].empty() &&
-                IdentifierEquals(fusion->select_names[si], cn.name)) {
-              resolved_col = si;
-              break;
-            }
-          }
-        }
-      }
-      if (!resolved_col.has_value() || *resolved_col >= direct_emit.size() ||
-          direct_emit[*resolved_col].program.has_value()) {
-        can_topn = false;
-        break;
-      }
-      topn_terms.push_back(
-          FastTopNTerm{.col_idx = *resolved_col,
-                       .order = SortKeyOrder(term.ascending, term.nulls_first,
-                                             Collation::kNone)});
-    }
-    if (can_topn && !topn_terms.empty()) {
-      std::vector<size_t> group_order(group_count);
-      for (size_t gi = 0; gi < group_count; ++gi) {
-        group_order[gi] = gi;
-      }
-      const auto cmp_groups = [&](size_t ga, size_t gb) -> bool {
-        const FusedGroup& a = active_group_at(ga);
-        const FusedGroup& b = active_group_at(gb);
-        for (const FastTopNTerm& t : topn_terms) {
-          const DirectEmitItem& d = direct_emit[t.col_idx];
-          int cmp = 0;
-          if (d.constant) {
-            continue;
-          }
-          if (!d.is_agg) {
-            Value va;
-            Value vb;
-            cmp = t.order.Compare(rep_cell(a, d.index, &va),
-                                  rep_cell(b, d.index, &vb));
-          } else if (raw_count_fusion) {
-            cmp = t.order.Compare(Value(a.raw_count), Value(b.raw_count));
-          } else {
-            auto fa = finish_raw_agg(a, d.index);
-            auto fb = finish_raw_agg(b, d.index);
-            cmp = t.order.Compare(apply_agg_scale(d, std::move(fa.Value())),
-                                  apply_agg_scale(d, std::move(fb.Value())));
-          }
-          if (cmp != 0) {
-            return cmp < 0;
-          }
-        }
-        return ga < gb;
-      };
-      std::partial_sort(
-          group_order.begin(),
-          group_order.begin() + static_cast<std::ptrdiff_t>(fusion->topn_limit),
-          group_order.end(), cmp_groups);
-      if (use_group_ptrs) {
-        std::vector<FusedGroup*> top_ptrs;
-        top_ptrs.reserve(fusion->topn_limit);
-        for (size_t k = 0; k < fusion->topn_limit; ++k) {
-          top_ptrs.push_back(group_ptrs[group_order[k]]);
-        }
-        group_ptrs = std::move(top_ptrs);
-      } else {
-        std::vector<FusedGroup> top_groups;
-        top_groups.reserve(fusion->topn_limit);
-        for (size_t k = 0; k < fusion->topn_limit; ++k) {
-          top_groups.push_back(std::move(groups[group_order[k]]));
-        }
-        groups = std::move(top_groups);
-      }
-    }
-  }
-  if (!can_direct_emit ||
-      (!fusion->columnar_output && fusion->output_sink == nullptr)) {
-    result.rows.reserve(active_group_count());
-  }
-  if (track_group_phases) {
-    phase_emit_begin = std::chrono::steady_clock::now();
-    std::cerr << "[fusion] pre_emit_ms=" << ElapsedMs(join_begin)
-              << " setup_ms="
-              << std::chrono::duration<double, std::milli>(phase_probe_begin -
-                                                           join_begin)
-                     .count()
-              << " index_ms="
-              << std::chrono::duration<double, std::milli>(phase_buckets_done -
-                                                           join_begin)
-                     .count()
-              << " states_ms="
-              << std::chrono::duration<double, std::milli>(phase_states_done -
-                                                           phase_buckets_done)
-                     .count()
-              << " probe_ms="
-              << std::chrono::duration<double, std::milli>(phase_merge_begin -
-                                                           phase_probe_begin)
-                     .count()
-              << " merge_ms="
-              << std::chrono::duration<double, std::milli>(phase_merge_done -
-                                                           phase_merge_begin)
-                     .count()
-              << " post_ms="
-              << std::chrono::duration<double, std::milli>(phase_emit_begin -
-                                                           phase_merge_done)
-                     .count()
-              << " groups=" << active_group_count()
-              << " left=" << effective_left_rows << "\n";
-  }
-  const size_t total_out_groups = active_group_count();
-  bool pushed_output = false;
-  std::shared_ptr<QueryMemoryCharge> push_batch_charge;
-  if (fusion->output_sink != nullptr && can_direct_emit && !has_emit_program &&
-      (raw_count_fusion || raw_sum_fusion || fusion->aggregates.empty()) &&
-      (!fusion->having || direct_having_applied ||
-       fusion->post_having_applied) &&
-      !fusion->post_having_active && fusion->topn_limit == 0 &&
-      !fusion->rollup_count_distribution) {
-    const size_t emit_workers = ParallelWorkerCount(total_out_groups / 8192);
-    // Preserve the ordinary output's first-row schema, including all-null
-    // columns. Actual cell tags remain in the batches; consumers must check
-    // their own narrower representation before accepting a build.
-    if (total_out_groups > 0) {
-      const auto eval_sink_cell =
-          [&](size_t gi, const DirectEmitItem& d) -> StatusOr<Value> {
-        const FusedGroup& grp = active_group_at(gi);
-        if (d.constant) {
-          return *d.constant;
-        }
-        if (!d.is_agg) {
-          return direct_key_value(grp, d.index);
-        }
-        if (raw_count_fusion) {
-          return Value(grp.raw_count);
-        }
-        ASSIGN_OR_RETURN(Value, fin, finish_raw_agg(grp, d.index));
-        return apply_agg_scale(d, std::move(fin));
-      };
-      for (size_t c = 0; c < direct_emit.size(); ++c) {
-        const auto& d = direct_emit[c];
-        ASSIGN_OR_RETURN(Value, first_val, eval_sink_cell(0, d));
-        std::optional<Value> sample;
-        if (!first_val.IsNull()) {
-          sample = std::move(first_val);
-        } else if (!d.constant) {
-          for (size_t gi = 1; gi < total_out_groups; ++gi) {
-            ASSIGN_OR_RETURN(Value, cand, eval_sink_cell(gi, d));
-            if (cand.IsNull()) {
-              continue;
-            }
-            if (!sample.has_value()) {
-              sample = std::move(cand);
-              break;
-            }
-          }
-          // Preserve homogeneous vs heterogeneous nullable type semantics
-          // when group 0 was NULL by verifying remaining non-null values.
-          if (sample.has_value()) {
-            const ValueType expected_t = ValueTypeOf(*sample);
-            const bool expected_u = sample->IsUnsigned();
-            const bool expected_iv = sample->IsInterval();
-            for (size_t gi = 1; gi < total_out_groups; ++gi) {
-              ASSIGN_OR_RETURN(Value, cand, eval_sink_cell(gi, d));
-              if (cand.IsNull()) {
-                continue;
-              }
-              if (ValueTypeOf(cand) != expected_t ||
-                  cand.IsUnsigned() != expected_u ||
-                  cand.IsInterval() != expected_iv) {
-                sample.reset();
-                break;
-              }
-            }
-          }
-        }
-        if (sample.has_value()) {
-          output_columns[c] =
-              Column(output_columns[c].Name(), ValueTypeOf(*sample));
-          output_columns[c].SetUnsigned(sample->IsUnsigned());
-          output_columns[c].SetInterval(sample->IsInterval());
-        } else {
-          output_columns[c] =
-              Column(output_columns[c].Name(), ValueType::kNull);
-        }
-      }
-    }
-    push_batch_charge =
-        TryReserveQueryMemory(emit_workers * GroupedOutputSink::kBatchRows *
-                              direct_emit.size() * sizeof(Value));
-    bool accepted = false;
-    if (push_batch_charge) {
-      Status begin_status = Status::kSuccess;
-      RETURN_IF_FAIL(RunParallelTasks(1, [&](size_t) {
-        auto begun = fusion->output_sink->begin(Schema("", output_columns),
-                                                total_out_groups, emit_workers);
-        begin_status = begun.GetStatus();
-        if (begun.HasValue()) accepted = begun.Value();
-      }));
-      RETURN_IF_FAIL(begin_status);
-    }
-    if (accepted) {
-      fusion->output_sink->used = true;
-      pushed_output = true;
-      std::vector<Status> errors(emit_workers, Status::kSuccess);
-      RETURN_IF_FAIL(RunParallelTasks(emit_workers, [&](size_t worker) {
-        const auto emit = [&]() -> Status {
-          const size_t end = total_out_groups * (worker + 1) / emit_workers;
-          const size_t width = direct_emit.size();
-          std::vector<Value> batch(GroupedOutputSink::kBatchRows * width);
-          for (size_t first = total_out_groups * worker / emit_workers;
-               first < end; first += GroupedOutputSink::kBatchRows) {
-            const size_t count =
-                std::min(GroupedOutputSink::kBatchRows, end - first);
-            for (size_t r = 0; r < count; ++r) {
-              const auto& group = active_group_at(first + r);
-              if (raw_sum_fusion) {
-                for (size_t s = 0; s < raw_slot_count; ++s) {
-                  if (group.RawInfFlags()[s] && slot_raises_inf[s]) {
-                    return StatusError(StatusCode::kIsInfinity,
-                                       "SUM overflow: result is infinite");
-                  }
-                }
-              }
-              for (size_t c = 0; c < width; ++c) {
-                const auto& d = direct_emit[c];
-                Value& cell = batch[(r * width) + c];
-                if (d.constant) {
-                  cell = *d.constant;
-                } else if (!d.is_agg) {
-                  cell = direct_key_value(group, d.index);
-                } else if (raw_count_fusion) {
-                  cell = Value(group.raw_count);
-                } else {
-                  ASSIGN_OR_RETURN(Value, value,
-                                   finish_raw_agg(group, d.index));
-                  cell = apply_agg_scale(d, std::move(value));
-                }
-              }
-            }
-            RETURN_IF_FAIL(fusion->output_sink->push(
-                worker, first,
-                std::span<const Value>(batch.data(), count * width)));
-          }
-          return Status::kSuccess;
-        };
-        errors[worker] = emit();
-      }));
-      for (const Status& error : errors) {
-        RETURN_IF_FAIL(error);
-      }
-      if (auto* runtime = context.execution_runtime()) {
-        runtime->pushed_group_rows += total_out_groups;
-      }
-    }
-  }
-  const size_t flush_granularity = Relation::ChargeFlushGranularity();
-  const auto eval_direct_group =
-      [&](const FusedGroup& group, const std::vector<uint8_t>* skip_cols,
-          bool own_pk_strings, std::vector<Value>* finished_aggs, Row* eval_row,
-          auto&& emit_cell_fn) -> Status {
-    const auto prepare_eval_row = [&]() -> Status {
-      if (!has_emit_program) {
-        return Status::kSuccess;
-      }
-      for (const slot_t col : emit_needed_cols) {
-        eval_row->values_[col] = direct_key_value(group, col, own_pk_strings);
-      }
-      for (const size_t ai : emit_needed_aggs) {
-        if (raw_count_fusion) {
-          eval_row->values_[left_width + right_width + ai] =
-              Value(group.raw_count);
-        } else if (raw_sum_fusion) {
-          ASSIGN_OR_RETURN(Value, finished, finish_raw_agg(group, ai));
-          eval_row->values_[left_width + right_width + ai] =
-              std::move(finished);
-        } else {
-          eval_row->values_[left_width + right_width + ai] =
-              (*finished_aggs)[ai];
-        }
-      }
-      return Status::kSuccess;
-    };
-    const auto eval_direct_item =
-        [&](const DirectEmitItem& d) -> StatusOr<Value> {
-      Value v;
-      Status eval_st;
-      const auto fast = d.program->TryEvaluateRowFast(*eval_row, &v, &eval_st);
-      if (fast == BytecodeProgram::FastEval::kError) {
-        return eval_st;
-      }
-      if (fast == BytecodeProgram::FastEval::kUnsupported) {
-        ASSIGN_OR_RETURN(Value, fallback_v,
-                         d.program->TryEvaluateRow(*eval_row));
-        v = std::move(fallback_v);
-      }
-      return v;
-    };
-    if (raw_count_fusion) {
-      RETURN_IF_FAIL(prepare_eval_row());
-      for (size_t c = 0; c < direct_emit.size(); ++c) {
-        if (skip_cols != nullptr && (*skip_cols)[c] != 0) {
-          continue;
-        }
-        const DirectEmitItem& d = direct_emit[c];
-        if (d.program.has_value()) {
-          ASSIGN_OR_RETURN(Value, v, eval_direct_item(d));
-          emit_cell_fn(c, std::move(v));
-        } else {
-          emit_cell_fn(
-              c, d.constant ? *d.constant
-                 : d.is_agg ? Value(group.raw_count)
-                            : direct_key_value(group, d.index, own_pk_strings));
-        }
-      }
-      return Status::kSuccess;
-    }
-    if (raw_sum_fusion) {
-      for (size_t s = 0; s < raw_slot_count; ++s) {
-        if (group.RawInfFlags()[s] && slot_raises_inf[s]) {
-          return StatusError(StatusCode::kIsInfinity,
-                             "SUM overflow: result is infinite");
-        }
-      }
-      RETURN_IF_FAIL(prepare_eval_row());
-      for (size_t c = 0; c < direct_emit.size(); ++c) {
-        if (skip_cols != nullptr && (*skip_cols)[c] != 0) {
-          continue;
-        }
-        const DirectEmitItem& d = direct_emit[c];
-        if (d.program.has_value()) {
-          ASSIGN_OR_RETURN(Value, v, eval_direct_item(d));
-          emit_cell_fn(c, std::move(v));
-          continue;
-        }
-        if (d.constant || !d.is_agg) {
-          emit_cell_fn(
-              c, d.constant ? *d.constant
-                            : direct_key_value(group, d.index, own_pk_strings));
-          continue;
-        }
-        const size_t i = d.index;
-        if (raw_const_folded[i]) {
-          emit_cell_fn(c, raw_constants[i]);
-          continue;
-        }
-        const auto slot =
-            static_cast<size_t>(static_cast<unsigned char>(raw_agg_slot[i]));
-        const int64_t count = group.RawCounts()[slot];
-        switch (raw_agg_kinds[i]) {
-          case RawAggKind::kCountStar:
-          case RawAggKind::kCountValue:
-            emit_cell_fn(c, Value(count));
-            break;
-          case RawAggKind::kSumInt64:
-            emit_cell_fn(c,
-                         count == 0 ? Value() : Value(group.RawInts()[slot]));
-            break;
-          case RawAggKind::kSumDouble:
-          case RawAggKind::kAvgDouble: {
-            if (count == 0) {
-              emit_cell_fn(c, Value());
-            } else {
-              double val =
-                  raw_agg_kinds[i] == RawAggKind::kAvgDouble
-                      ? group.RawDoubles()[slot] / static_cast<double>(count)
-                      : group.RawDoubles()[slot];
-              if (d.has_agg_scale) {
-                val *= d.agg_scale;
-              }
-              emit_cell_fn(c, Value(val));
-            }
-            break;
-          }
-          default: {
-            ASSIGN_OR_RETURN(Value, finished, finish_raw_agg(group, i));
-            emit_cell_fn(c, apply_agg_scale(d, std::move(finished)));
-            break;
-          }
-        }
-      }
-      return Status::kSuccess;
-    }
-    finished_aggs->clear();
-    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-      AggregateAccumulator& accumulator = states[group.state_offset + i];
-      ASSIGN_OR_RETURN(Value, finished, accumulator.TryFinish());
-      finished_aggs->push_back(std::move(finished));
-    }
-    RETURN_IF_FAIL(prepare_eval_row());
-    for (size_t c = 0; c < direct_emit.size(); ++c) {
-      if (skip_cols != nullptr && (*skip_cols)[c] != 0) {
-        continue;
-      }
-      const DirectEmitItem& d = direct_emit[c];
-      if (d.program.has_value()) {
-        ASSIGN_OR_RETURN(Value, v, eval_direct_item(d));
-        emit_cell_fn(c, std::move(v));
-      } else {
-        emit_cell_fn(c, d.constant ? *d.constant
-                        : d.is_agg
-                            ? apply_agg_scale(d, (*finished_aggs)[d.index])
-                            : direct_key_value(group, d.index, own_pk_strings));
-      }
-    }
-    return Status::kSuccess;
-  };
-  const bool emit_own_pk_strings = context.execution_runtime() == nullptr;
-  const auto emit_direct =
-      [&](size_t begin, size_t end, Relation* output,
-          std::vector<ColumnTypeTracker>* col_tracks) -> Status {
-    if (!output->HasSpill() && output->rows.empty() && end > begin) {
-      output->rows.reserve(end - begin);
-    }
-    std::vector<Value> finished_aggs;
-    finished_aggs.reserve(fusion->aggregates.size());
-    Row eval_row;
-    if (has_emit_program) {
-      eval_row.values_.resize(emit_row_width);
-    }
-    for (size_t index = begin; index < end; ++index) {
-      const FusedGroup& group = active_group_at(index);
-      Row output_row;
-      output_row.values_.reserve(direct_emit.size());
-      size_t row_bytes = 64;
-      RETURN_IF_FAIL(eval_direct_group(
-          group, nullptr, emit_own_pk_strings, &finished_aggs, &eval_row,
-          [&](size_t c, Value cell) {
-            if (col_tracks != nullptr && c < col_tracks->size()) {
-              (*col_tracks)[c].Observe(cell);
-            }
-            row_bytes += cell.type == ValueType::kArray
-                             ? EstimateValueBytes(cell)
-                             : EstimateScalarValueBytes(cell);
-            output_row.values_.push_back(std::move(cell));
-          }));
-      output->AddRowWithKnownBytes(std::move(output_row), row_bytes,
-                                   flush_granularity);
-    }
-    RETURN_IF_FAIL(output->FinishSpill());
-    return output->GetStatus();
-  };
-  const bool fast_col_emit =
-      (raw_count_fusion || raw_sum_fusion || fusion->aggregates.empty()) &&
-      !has_emit_program &&
-      std::ranges::none_of(direct_emit, [](const DirectEmitItem& item) {
-        return item.program.has_value();
-      });
-  const auto emit_direct_columnar =
-      [&](size_t begin, size_t end, std::vector<ColumnarChunk>* out_chunks,
-          std::vector<ColumnTypeTracker>* col_tracks) -> Status {
-    if (end <= begin) {
-      return Status::kSuccess;
-    }
-    std::vector<Value> finished_aggs;
-    finished_aggs.reserve(fusion->aggregates.size());
-    Row eval_row;
-    if (has_emit_program) {
-      eval_row.values_.resize(emit_row_width);
-    }
-    const auto track_uniform_col = [&](size_t c, const ColumnarColumn& col,
-                                       bool non_null_seen) {
-      if (!non_null_seen || col_tracks == nullptr || c >= col_tracks->size()) {
-        return;
-      }
-      ColumnTypeTracker& ct = (*col_tracks)[c];
-      if (!ct.seen_non_null) {
-        ct.seen_non_null = true;
-        ct.type = col.type;
-        ct.is_unsigned = col.is_unsigned;
-        ct.is_interval = col.is_interval;
-      } else if (ct.type != col.type || ct.is_unsigned != col.is_unsigned ||
-                 ct.is_interval != col.is_interval) {
-        ct.mixed = true;
-      }
-    };
-    const auto track_fallback_col = [&](size_t c, const ColumnarColumn& col) {
-      if (col_tracks == nullptr || c >= col_tracks->size()) {
-        return;
-      }
-      ColumnTypeTracker& ct = (*col_tracks)[c];
-      for (const Value& v : col.fallback) {
-        ct.Observe(v);
-      }
-    };
-    out_chunks->reserve((end - begin + kColumnarChunkRows - 1) /
-                        kColumnarChunkRows);
-    std::vector<uint32_t> chunk_rch;
-    std::vector<size_t> chunk_rr;
-    for (size_t c_begin = begin; c_begin < end; c_begin += kColumnarChunkRows) {
-      const size_t c_end = std::min(end, c_begin + kColumnarChunkRows);
-      const size_t chunk_rows = c_end - c_begin;
-      ColumnarChunk chunk;
-      chunk.rows = chunk_rows;
-      chunk.columns.resize(direct_emit.size());
-      std::vector<uint8_t> is_const_col(direct_emit.size(), 0);
-      for (size_t c = 0; c < direct_emit.size(); ++c) {
-        const DirectEmitItem& d = direct_emit[c];
-        if (!d.program.has_value() && d.constant.has_value() &&
-            TrySetConstantColumnarColumn(&chunk.columns[c], ValueType::kNull,
-                                         false, false, *d.constant, chunk_rows,
-                                         &chunk)) {
-          is_const_col[c] = 1;
-          if (col_tracks != nullptr && c < col_tracks->size()) {
-            (*col_tracks)[c].Observe(*d.constant);
-          }
-          continue;
-        }
-        ValueType init_vt = ValueType::kNull;
-        bool init_unsigned = false;
-        if (!d.program.has_value() && d.is_agg) {
-          if (raw_count_fusion) {
-            init_vt = ValueType::kInt64;
-          } else if (raw_sum_fusion && d.index < raw_agg_kinds.size()) {
-            switch (raw_agg_kinds[d.index]) {
-              case RawAggKind::kCountStar:
-              case RawAggKind::kCountValue:
-              case RawAggKind::kCountDistinctInt64:
-              case RawAggKind::kSumInt64:
-                init_vt = ValueType::kInt64;
-                break;
-              case RawAggKind::kSumDouble:
-              case RawAggKind::kAvgDouble:
-              case RawAggKind::kStddevSamp:
-              case RawAggKind::kStddevPop:
-              case RawAggKind::kVarSamp:
-              case RawAggKind::kVarPop:
-                init_vt = ValueType::kDouble;
-                break;
-              default:
-                break;
-            }
-          }
-        } else if (!d.program.has_value() && !d.is_agg) {
-          if (d.index < left_width) {
-            if (d.index < 16 && def_col_to_pk_lookup[d.index] >= 0) {
-              const auto& lkp = prepared_pk_lookups[static_cast<size_t>(
-                  def_col_to_pk_lookup[d.index])];
-              init_vt = lkp.payload_type;
-              init_unsigned = lkp.payload_unsigned;
-            } else if ((left.uniform_cell_types || left.HasColumnarOnly() ||
-                        deferred_left_probe != nullptr) &&
-                       (d.index >= def_overwritten_by_pk.size() ||
-                        def_overwritten_by_pk[d.index] == 0)) {
-              const Column& src_col = left.schema.GetColumn(d.index);
-              if (!src_col.IsInterval() &&
-                  (src_col.Type() == ValueType::kInt64 ||
-                   src_col.Type() == ValueType::kDate ||
-                   src_col.Type() == ValueType::kDouble ||
-                   src_col.Type() == ValueType::kVarChar)) {
-                init_vt = src_col.Type();
-                init_unsigned = src_col.IsUnsigned();
-              }
-            }
-          } else if (d.index - left_width < right_width &&
-                     (right.uniform_cell_types || right.HasColumnarOnly())) {
-            const Column& src_col =
-                right.schema.GetColumn(d.index - left_width);
-            if (!src_col.IsInterval() &&
-                (src_col.Type() == ValueType::kInt64 ||
-                 src_col.Type() == ValueType::kDate ||
-                 src_col.Type() == ValueType::kDouble ||
-                 src_col.Type() == ValueType::kVarChar)) {
-              init_vt = src_col.Type();
-              init_unsigned = src_col.IsUnsigned();
-            }
-          }
-        }
-        chunk.columns[c].Init(
-            init_vt, init_unsigned, false,
-            (!fast_col_emit && init_vt != ValueType::kNull) ? chunk_rows : 0);
-      }
-      ChunkStringArena* arena = chunk.string_arena.get();
-      if (fast_col_emit) {
-        if (raw_sum_fusion &&
-            (has_double_raw_agg || has_int_raw_agg || has_stat_raw_agg)) {
-          for (size_t index = c_begin; index < c_end; ++index) {
-            const FusedGroup& group = active_group_at(index);
-            for (size_t s = 0; s < raw_slot_count; ++s) {
-              if (group.RawInfFlags()[s] && slot_raises_inf[s]) {
-                return StatusError(StatusCode::kIsInfinity,
-                                   "SUM overflow: result is infinite");
-              }
-            }
-          }
-        }
-        bool all_hash_only = true;
-        for (size_t r = 0; r < chunk_rows; ++r) {
-          const FusedGroup& grp = active_group_at(c_begin + r);
-          if (grp.representative != nullptr || grp.rep_left != nullptr ||
-              grp.rep_col_chunk != std::numeric_limits<uint32_t>::max() ||
-              !grp.has_key_hash) {
-            all_hash_only = false;
-            break;
-          }
-        }
-        bool have_chunk_rlocs = false;
-        bool chunk_rlocs_ok = false;
-        bool right_keepalive_added = false;
-        for (size_t c = 0; c < direct_emit.size(); ++c) {
-          if (is_const_col[c] != 0) {
-            continue;
-          }
-          const DirectEmitItem& d = direct_emit[c];
-          ColumnarColumn& col = chunk.columns[c];
-          auto emit_col_via_rep = [&](size_t start_r) -> Status {
-            for (size_t r = start_r; r < chunk_rows; ++r) {
-              Value cell = direct_key_value(active_group_at(c_begin + r),
-                                            d.index, false);
-              if (col_tracks != nullptr && c < col_tracks->size()) {
-                (*col_tracks)[c].Observe(cell);
-              }
-              if (cell.type == ValueType::kVarChar && arena == nullptr) {
-                arena = chunk.EnsureArena();
-              }
-              col.AppendValue(cell, arena, r);
-            }
-            return Status::kSuccess;
-          };
-          if (d.is_agg) {
-            if (raw_count_fusion) {
-              col.ints.resize(chunk_rows);
-              int64_t* dst = col.ints.data();
-              for (size_t r = 0; r < chunk_rows; ++r) {
-                dst[r] = active_group_at(c_begin + r).raw_count;
-              }
-              track_uniform_col(c, col, true);
-              continue;
-            }
-            const size_t i = d.index;
-            if (!raw_const_folded[i]) {
-              const auto slot = static_cast<size_t>(
-                  static_cast<unsigned char>(raw_agg_slot[i]));
-              const RawAggKind kind = raw_agg_kinds[i];
-              if (kind == RawAggKind::kCountStar ||
-                  kind == RawAggKind::kCountValue) {
-                col.ints.resize(chunk_rows);
-                int64_t* dst = col.ints.data();
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  dst[r] = active_group_at(c_begin + r).RawCounts()[slot];
-                }
-                track_uniform_col(c, col, true);
-                continue;
-              }
-              if (kind == RawAggKind::kSumInt64) {
-                col.ints.resize(chunk_rows);
-                int64_t* dst = col.ints.data();
-                bool non_null_seen = false;
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const FusedGroup& g = active_group_at(c_begin + r);
-                  if (g.RawCounts()[slot] == 0) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0;
-                  } else {
-                    dst[r] = g.RawInts()[slot];
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-              if (kind == RawAggKind::kSumDouble ||
-                  kind == RawAggKind::kAvgDouble) {
-                col.doubles.resize(chunk_rows);
-                double* dst = col.doubles.data();
-                const bool is_avg = (kind == RawAggKind::kAvgDouble);
-                const bool scaled = d.has_agg_scale;
-                const double scale = d.agg_scale;
-                bool non_null_seen = false;
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const FusedGroup& g = active_group_at(c_begin + r);
-                  const int64_t cnt = g.RawCounts()[slot];
-                  if (cnt == 0) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0.0;
-                  } else {
-                    const double val =
-                        is_avg
-                            ? (g.RawDoubles()[slot] / static_cast<double>(cnt))
-                            : g.RawDoubles()[slot];
-                    dst[r] = scaled ? (val * scale) : val;
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-              if (kind == RawAggKind::kStddevSamp ||
-                  kind == RawAggKind::kStddevPop ||
-                  kind == RawAggKind::kVarSamp || kind == RawAggKind::kVarPop) {
-                col.doubles.resize(chunk_rows);
-                double* dst = col.doubles.data();
-                const bool is_samp = (kind == RawAggKind::kStddevSamp ||
-                                      kind == RawAggKind::kVarSamp);
-                const bool is_stddev = (kind == RawAggKind::kStddevSamp ||
-                                        kind == RawAggKind::kStddevPop);
-                const int64_t min_n = is_samp ? 2 : 1;
-                const bool scaled = d.has_agg_scale;
-                const double scale = d.agg_scale;
-                bool non_null_seen = false;
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const FusedGroup& g = active_group_at(c_begin + r);
-                  const int64_t n = g.RawCounts()[slot];
-                  if (n < min_n) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0.0;
-                  } else {
-                    const platform::ExtendedFloat mean = g.RawStatX()[slot] / n;
-                    const platform::ExtendedFloat ssd =
-                        g.RawStatXX()[slot] - (n * mean * mean);
-                    const platform::ExtendedFloat variance =
-                        ssd > 0 ? ssd / (is_samp ? n - 1 : n)
-                                : platform::ExtendedFloat{0};
-                    const auto val = static_cast<double>(
-                        is_stddev ? platform::Sqrt(variance) : variance);
-                    dst[r] = scaled ? (val * scale) : val;
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-            }
-            for (size_t r = 0; r < chunk_rows; ++r) {
-              Value cell;
-              if (raw_const_folded[i]) {
-                cell = raw_constants[i];
-              } else {
-                ASSIGN_OR_RETURN(
-                    Value, agg_cell,
-                    finish_raw_agg(active_group_at(c_begin + r), i));
-                cell = apply_agg_scale(d, std::move(agg_cell));
-              }
-              if (col_tracks != nullptr && c < col_tracks->size()) {
-                (*col_tracks)[c].Observe(cell);
-              }
-              if (cell.type == ValueType::kVarChar && arena == nullptr) {
-                arena = chunk.EnsureArena();
-              }
-              col.AppendValue(cell, arena, r);
-            }
-            continue;
-          }
-          if (all_hash_only && packed_2x32_unpack_only &&
-              (d.index == packed_2x32_slot0 || d.index == packed_2x32_slot1) &&
-              col.type != ValueType::kNull) {
-            col.ints.resize(chunk_rows);
-            int64_t* dst = col.ints.data();
-            const bool first = (d.index == packed_2x32_slot0);
-            for (size_t r = 0; r < chunk_rows; ++r) {
-              const uint64_t kh = active_group_at(c_begin + r).key_hash;
-              dst[r] = static_cast<int64_t>(static_cast<int32_t>(
-                  first ? (kh >> 32) : (kh & 0xffffffffULL)));
-            }
-            track_uniform_col(c, col, true);
-            continue;
-          }
-          if (all_hash_only && split_key_unpack_only && split_has_left_probe &&
-              split_left_slot.has_value() && d.index == *split_left_slot &&
-              col.type != ValueType::kNull) {
-            col.ints.resize(chunk_rows);
-            int64_t* dst = col.ints.data();
-            for (size_t r = 0; r < chunk_rows; ++r) {
-              dst[r] = static_cast<int64_t>(static_cast<int32_t>(
-                  active_group_at(c_begin + r).key_hash & 0xffffffffULL));
-            }
-            track_uniform_col(c, col, true);
-            continue;
-          }
-          if (all_hash_only && split_key_unpack_only && d.index < left_width &&
-              d.index < 16 && def_col_to_pk_lookup[d.index] >= 0 &&
-              col.type != ValueType::kNull) {
-            const auto li = static_cast<size_t>(
-                static_cast<unsigned char>(def_col_to_pk_lookup[d.index]));
-            const PreparedDeferredPkLookup& lkp = prepared_pk_lookups[li];
-            const PreparedDeferredPkGroup& pk_grp =
-                def_pk_groups[lkp.group_idx];
-            if (pk_grp.use_subgid && pk_grp.subgid_rep_ptr != nullptr &&
-                (col.type != ValueType::kVarChar ||
-                 pk_grp.store_owner != nullptr)) {
-              const uint32_t p_card = pk_grp.subgid_count;
-              const uint64_t p_mask =
-                  p_card <= 1
-                      ? 0ULL
-                      : ((uint64_t{1} << std::bit_width(p_card - 1)) - 1ULL);
-              const uint8_t p_shift = pk_grp.subgid_shift;
-              const auto* rep_ptrs = pk_grp.subgid_rep_ptr;
-              const auto* blk_ptr = lkp.blocks.data();
-              bool non_null_seen = false;
-              if (col.type == ValueType::kVarChar) {
-                col.encoding_owner = pk_grp.store_owner;
-                chunk.keepalives.push_back(pk_grp.store_owner);
-                col.strings.resize(chunk_rows);
-                std::string_view* dst = col.strings.data();
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const auto sg = static_cast<uint32_t>(
-                      (active_group_at(c_begin + r).key_hash >> p_shift) &
-                      p_mask);
-                  const auto [nb, rin] = rep_ptrs[sg];
-                  const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                  if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = {};
-                  } else {
-                    dst[r] = pb.pay_blk->VarcharAt(rin);
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-              if (col.type == ValueType::kDouble) {
-                col.doubles.resize(chunk_rows);
-                double* dst = col.doubles.data();
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const auto sg = static_cast<uint32_t>(
-                      (active_group_at(c_begin + r).key_hash >> p_shift) &
-                      p_mask);
-                  const auto [nb, rin] = rep_ptrs[sg];
-                  const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                  if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0.0;
-                  } else {
-                    const auto dv = std::bit_cast<double>(pb.pay_cells[rin]);
-                    dst[r] = dv == 0.0 ? 0.0 : dv;
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-              col.ints.resize(chunk_rows);
-              int64_t* dst = col.ints.data();
-              for (size_t r = 0; r < chunk_rows; ++r) {
-                const auto sg = static_cast<uint32_t>(
-                    (active_group_at(c_begin + r).key_hash >> p_shift) &
-                    p_mask);
-                const auto [nb, rin] = rep_ptrs[sg];
-                const PreparedDeferredPkBlock& pb = blk_ptr[nb];
-                if (pb.has_null_payload != 0 && pb.pay_blk->IsNull(rin)) {
-                  if (!col.has_null) {
-                    col.has_null = true;
-                    col.nulls.assign(chunk_rows, 0);
-                  }
-                  col.nulls[r] = 1;
-                  dst[r] = 0;
-                } else {
-                  dst[r] = pb.pay_cells[rin];
-                  non_null_seen = true;
-                }
-              }
-              track_uniform_col(c, col, non_null_seen);
-              continue;
-            }
-          }
-          if (all_hash_only && left_pack_unpack_only && d.index < left_width &&
-              col.type != ValueType::kNull) {
-            bool handled_lp = false;
-            for (const LeftPackedIntCol& lpi : left_pack_ints) {
-              if (lpi.col == d.index && (col.type == ValueType::kInt64 ||
-                                         col.type == ValueType::kDate)) {
-                col.ints.resize(chunk_rows);
-                int64_t* dst = col.ints.data();
-                bool non_null_seen = false;
-                const uint64_t mask = lpi.mask;
-                const uint8_t shift = lpi.shift;
-                const uint64_t null_code = lpi.null_code;
-                const auto min_u = static_cast<uint64_t>(lpi.min_val);
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const uint64_t kh = active_group_at(c_begin + r).key_hash;
-                  const uint64_t code = (kh >> shift) & mask;
-                  if (code == null_code) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = 0;
-                  } else {
-                    dst[r] = static_cast<int64_t>(min_u + code);
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                handled_lp = true;
-                break;
-              }
-            }
-            if (handled_lp) {
-              continue;
-            }
-            if (left_pack_uses_dict && left_col_only &&
-                col.type == ValueType::kVarChar &&
-                std::ranges::find(left_pack_dict_cols, d.index) !=
-                    left_pack_dict_cols.end()) {
-              if (arena == nullptr) {
-                arena = chunk.EnsureArena();
-              }
-              const size_t dict_n = left_pack_dict_rep_col_loc.size();
-              std::vector<std::pair<uint8_t, std::string_view>> dict_strs(
-                  dict_n, {uint8_t{1}, std::string_view{}});
-              bool bad_dict_type = false;
-              Value rep_tmp;
-              for (size_t di = 0; di < dict_n; ++di) {
-                const auto [rci, rr] = left_pack_dict_rep_col_loc[di];
-                if (rci == std::numeric_limits<uint32_t>::max()) {
-                  continue;
-                }
-                left.columnar->chunks[rci].columns[d.index].WriteValueInto(
-                    rr, &rep_tmp);
-                if (!rep_tmp.IsNull()) {
-                  if (rep_tmp.type != ValueType::kVarChar) {
-                    bad_dict_type = true;
-                    break;
-                  }
-                  dict_strs[di] = {uint8_t{0},
-                                   arena->Store(rep_tmp.value.varchar_value)};
-                }
-              }
-              if (!bad_dict_type) {
-                col.strings.resize(chunk_rows);
-                std::string_view* dst = col.strings.data();
-                bool non_null_seen = false;
-                for (size_t r = 0; r < chunk_rows; ++r) {
-                  const auto di = static_cast<size_t>(
-                      (active_group_at(c_begin + r).key_hash >>
-                       left_pack_dict_shift) &
-                      left_pack_dict_mask);
-                  const auto& entry = dict_strs[di];
-                  if (entry.first != 0) {
-                    if (!col.has_null) {
-                      col.has_null = true;
-                      col.nulls.assign(chunk_rows, 0);
-                    }
-                    col.nulls[r] = 1;
-                    dst[r] = {};
-                  } else {
-                    dst[r] = entry.second;
-                    non_null_seen = true;
-                  }
-                }
-                track_uniform_col(c, col, non_null_seen);
-                continue;
-              }
-            }
-          }
-          std::optional<size_t> eq_right_col;
-          if (d.index < left_width && join_type == JoinType::kInner &&
-              col.type != ValueType::kNull && col.type != ValueType::kVarChar &&
-              d.index < left.schema.ColumnCount()) {
-            const Column& lc = left.schema.GetColumn(d.index);
-            for (const EqualityKey& eq : equality_keys) {
-              if (eq.left == d.index && eq.left_offset == 0 &&
-                  eq.right_offset == 0 && !eq.null_safe &&
-                  eq.right < right.schema.ColumnCount()) {
-                const Column& rc = right.schema.GetColumn(eq.right);
-                if (lc.Type() == rc.Type() &&
-                    lc.IsUnsigned() == rc.IsUnsigned() &&
-                    lc.Type() != ValueType::kVarChar) {
-                  eq_right_col = eq.right;
-                  break;
-                }
-              }
-            }
-          }
-          if ((d.index >= left_width || eq_right_col.has_value()) &&
-              col.type != ValueType::kNull) {
-            const size_t rc =
-                d.index >= left_width ? (d.index - left_width) : *eq_right_col;
-            const bool can_split_right_rep =
-                all_hash_only && split_right_rep_ptr != nullptr &&
-                ((split_key_unpack_only && split_uses_right_subgid) ||
-                 (left_pack_unpack_only && left_pack_uses_right));
-            const uint64_t r_mask =
-                !can_split_right_rep
-                    ? 0ULL
-                    : ((left_pack_unpack_only && left_pack_uses_right)
-                           ? left_pack_right_mask
-                           : (split_right_subgid_count <= 1
-                                  ? 0ULL
-                                  : ((uint64_t{1} << std::bit_width(
-                                          split_right_subgid_count - 1)) -
-                                     1ULL)));
-            const auto get_right_idx =
-                [&](const FusedGroup& grp) noexcept -> uint32_t {
-              if (grp.rep_right_idx != kInvalidRightIdx) {
-                return grp.rep_right_idx;
-              }
-              if (can_split_right_rep && grp.has_key_hash &&
-                  grp.key.values_.empty()) {
-                const auto r_subgid = static_cast<size_t>(
-                    (grp.key_hash >> split_right_shift) & r_mask);
-                if (r_subgid < split_right_rep_count) {
-                  return split_right_rep_ptr[r_subgid];
-                }
-              }
-              return kInvalidRightIdx;
-            };
-            const auto get_right_val =
-                [&](const FusedGroup& grp) noexcept -> const Value* {
-              if (grp.representative != nullptr) {
-                return &grp.representative->values_[d.index];
-              }
-              const uint32_t r_idx = get_right_idx(grp);
-              if (r_idx != kInvalidRightIdx) {
-                return &right_ptr->rows[r_idx].values_[rc];
-              }
-              return nullptr;
-            };
-            if (right_col_only && !have_chunk_rlocs) {
-              have_chunk_rlocs = true;
-              chunk_rlocs_ok = true;
-              chunk_rch.resize(chunk_rows);
-              chunk_rr.resize(chunk_rows);
-              for (size_t r = 0; r < chunk_rows; ++r) {
-                const FusedGroup& grp = active_group_at(c_begin + r);
-                if (grp.representative != nullptr) {
-                  chunk_rlocs_ok = false;
-                  break;
-                }
-                const uint32_t r_idx = get_right_idx(grp);
-                if (r_idx == kInvalidRightIdx) {
-                  chunk_rlocs_ok = false;
-                  break;
-                }
-                const auto [rch, rr] = right_locator.Locate(r_idx);
-                chunk_rch[r] = static_cast<uint32_t>(rch);
-                chunk_rr[r] = rr;
-              }
-            }
-            bool non_null_seen = false;
-            bool demoted = false;
-            size_t resume_r = chunk_rows;
-            const auto demote_at = [&](size_t r) {
-              col.DemoteToFallback(r);
-              demoted = true;
-              resume_r = r;
-            };
-            const auto set_null_row = [&](size_t r) {
-              if (!col.has_null) {
-                col.has_null = true;
-                col.nulls.assign(chunk_rows, 0);
-              }
-              col.nulls[r] = 1;
-            };
-            const auto emit_uniform_loop = [&](auto col_tag, ValueType exp_vt,
-                                               bool exp_uns, auto* dst_ptr,
-                                               auto zero_val,
-                                               auto&& store_from_leaf,
-                                               auto&& store_from_val) {
-              constexpr bool kRightColOnly = decltype(col_tag)::value;
-              if constexpr (kRightColOnly) {
-                if (chunk_rlocs_ok) {
-                  const ColumnarChunk* const right_chunks =
-                      right_arg.columnar->chunks.data();
-                  const uint32_t* const rchs = chunk_rch.data();
-                  const size_t* const rrs = chunk_rr.data();
-                  for (size_t r = 0; r < chunk_rows; ++r) {
-                    const ColumnarColumn& sc =
-                        right_chunks[rchs[r]].columns[rc];
-                    const ColumnarColumn* leaf = &sc;
-                    size_t lr = rrs[r];
-                    const bool is_null =
-                        (leaf->encoding == ColumnarColumn::Encoding::kGathered)
-                            ? !sc.ResolveLeaf(lr, &leaf, &lr)
-                            : leaf->NonGatheredIsNull(lr);
-                    if (is_null) {
-                      set_null_row(r);
-                      dst_ptr[r] = zero_val;
-                    } else if (leaf->is_uniform && leaf->type == exp_vt &&
-                               leaf->is_unsigned == exp_uns &&
-                               !leaf->is_interval) {
-                      dst_ptr[r] = store_from_leaf(leaf, lr);
-                      non_null_seen = true;
-                    } else {
-                      demote_at(r);
-                      break;
-                    }
-                  }
-                  return;
-                }
-              }
-              for (size_t r = 0; r < chunk_rows; ++r) {
-                const FusedGroup& grp = active_group_at(c_begin + r);
-                if constexpr (kRightColOnly) {
-                  if (grp.representative != nullptr) {
-                    demote_at(r);
-                    break;
-                  }
-                  const uint32_t r_idx = get_right_idx(grp);
-                  if (r_idx == kInvalidRightIdx) {
-                    demote_at(r);
-                    break;
-                  }
-                  const auto [rch, rr] = right_locator.Locate(r_idx);
-                  const ColumnarColumn& sc =
-                      right_arg.columnar->chunks[rch].columns[rc];
-                  const ColumnarColumn* leaf = &sc;
-                  size_t lr = rr;
-                  const bool is_null =
-                      (leaf->encoding == ColumnarColumn::Encoding::kGathered)
-                          ? !sc.ResolveLeaf(rr, &leaf, &lr)
-                          : leaf->NonGatheredIsNull(lr);
-                  if (is_null) {
-                    set_null_row(r);
-                    dst_ptr[r] = zero_val;
-                  } else if (leaf->is_uniform && leaf->type == exp_vt &&
-                             leaf->is_unsigned == exp_uns &&
-                             !leaf->is_interval) {
-                    dst_ptr[r] = store_from_leaf(leaf, lr);
-                    non_null_seen = true;
-                  } else {
-                    demote_at(r);
-                    break;
-                  }
-                } else {
-                  const Value* cp = get_right_val(grp);
-                  if (cp == nullptr) {
-                    demote_at(r);
-                    break;
-                  }
-                  if (cp->IsNull()) {
-                    set_null_row(r);
-                    dst_ptr[r] = zero_val;
-                  } else if (cp->type == exp_vt &&
-                             cp->IsUnsigned() == exp_uns && !cp->IsInterval() &&
-                             (exp_uns || cp->Collation() == 0)) {
-                    dst_ptr[r] = store_from_val(cp);
-                    non_null_seen = true;
-                  } else {
-                    demote_at(r);
-                    break;
-                  }
-                }
-              }
-            };
-            const auto run_right_emit = [&](auto&& emit_with_tag) {
-              if (right_col_only) {
-                emit_with_tag(std::true_type{});
-              } else {
-                emit_with_tag(std::false_type{});
-              }
-            };
-            if (col.type == ValueType::kVarChar) {
-              col.strings.resize(chunk_rows);
-              std::string_view* dst = col.strings.data();
-              if (right_col_only) {
-                col.encoding_owner = right_col_owner;
-                if (!right_keepalive_added) {
-                  chunk.keepalives.push_back(right_col_owner);
-                  right_keepalive_added = true;
-                }
-              }
-              run_right_emit([&](auto col_tag) {
-                emit_uniform_loop(
-                    col_tag, ValueType::kVarChar, false, dst,
-                    std::string_view{},
-                    [](const ColumnarColumn* leaf, size_t lr) {
-                      switch (leaf->encoding) {
-                        case ColumnarColumn::Encoding::kDictionary: {
-                          const uint32_t code =
-                              leaf->borrowed_dict_u8 != nullptr
-                                  ? leaf->borrowed_dict_u8[lr]
-                                  : leaf->dict_codes[lr];
-                          return leaf->dict->StringEntryAt(code);
-                        }
-                        case ColumnarColumn::Encoding::kFlat:
-                          return leaf->strings[lr];
-                        case ColumnarColumn::Encoding::kConstant:
-                          return leaf->const_string;
-                        default:
-                          return leaf->StringAt(lr);
-                      }
-                    },
-                    [&](const Value* cp) {
-                      if (arena == nullptr) {
-                        arena = chunk.EnsureArena();
-                      }
-                      return arena->Store(cp->value.varchar_value);
-                    });
-              });
-            } else if (col.type == ValueType::kDouble) {
-              col.doubles.resize(chunk_rows);
-              double* dst = col.doubles.data();
-              run_right_emit([&](auto col_tag) {
-                emit_uniform_loop(
-                    col_tag, ValueType::kDouble, false, dst, 0.0,
-                    [](const ColumnarColumn* leaf, size_t lr) {
-                      return leaf->DoubleAt(lr);
-                    },
-                    [](const Value* cp) { return cp->value.double_value; });
-              });
-            } else {
-              col.ints.resize(chunk_rows);
-              int64_t* dst = col.ints.data();
-              const ValueType exp_vt = col.type;
-              const bool exp_uns = col.is_unsigned;
-              run_right_emit([&](auto col_tag) {
-                emit_uniform_loop(
-                    col_tag, exp_vt, exp_uns, dst, int64_t{0},
-                    [](const ColumnarColumn* leaf, size_t lr) {
-                      return leaf->IntAt(lr);
-                    },
-                    [](const Value* cp) { return cp->value.int_value; });
-              });
-            }
-            if (!demoted) {
-              track_uniform_col(c, col, non_null_seen);
-              continue;
-            }
-            track_fallback_col(c, col);
-            RETURN_IF_FAIL(emit_col_via_rep(resume_r));
-            continue;
-          }
-          RETURN_IF_FAIL(emit_col_via_rep(0));
-        }
-        out_chunks->push_back(std::move(chunk));
-        continue;
-      }
-      for (size_t index = c_begin, local_r = 0; index < c_end;
-           ++index, ++local_r) {
-        const FusedGroup& group = active_group_at(index);
-        RETURN_IF_FAIL(eval_direct_group(
-            group, &is_const_col, false, &finished_aggs, &eval_row,
-            [&](size_t c, const Value& cell) {
-              if (col_tracks != nullptr && c < col_tracks->size()) {
-                (*col_tracks)[c].Observe(cell);
-              }
-              if (cell.type == ValueType::kVarChar && arena == nullptr) {
-                arena = chunk.EnsureArena();
-              }
-              chunk.columns[c].AppendValue(cell, arena, local_r);
-            }));
-      }
-      out_chunks->push_back(std::move(chunk));
-    }
-    return Status::kSuccess;
-  };
-  bool finalized_output_types = false;
-  bool all_uniform_columns = false;
-  std::shared_ptr<ColumnarTable> out_columnar;
-  if (can_direct_emit && !pushed_output) {
-    const size_t emit_denom = direct_emit.size() >= 6 ? 2048 : 8192;
-    const size_t emit_workers =
-        (raw_count_fusion || raw_sum_fusion || fusion->aggregates.empty()) &&
-                ::tinylamb::platform::GetEnv(
-                    "TINYLAMB_DISABLE_PARALLEL_FUSED_EMIT") == nullptr
-            ? ParallelWorkerCount(total_out_groups / emit_denom)
-            : 1;
-    std::vector<std::vector<ColumnTypeTracker>> emit_col_tracks(
-        emit_workers, std::vector<ColumnTypeTracker>(output_columns.size()));
-    if (fusion->columnar_output) {
-      out_columnar = std::make_shared<ColumnarTable>();
-      if (emit_workers > 1) {
-        std::vector<std::vector<ColumnarChunk>> shard_chunks(emit_workers);
-        std::vector<Status> errors(emit_workers, Status::kSuccess);
-        RETURN_IF_FAIL(RunParallelTasks(emit_workers, [&](size_t w) {
-          errors[w] =
-              emit_direct_columnar((total_out_groups * w) / emit_workers,
-                                   (total_out_groups * (w + 1)) / emit_workers,
-                                   &shard_chunks[w], &emit_col_tracks[w]);
-        }));
-        for (const Status& err : errors) {
-          RETURN_IF_FAIL(err);
-        }
-        for (auto& chunks : shard_chunks) {
-          for (ColumnarChunk& chunk : chunks) {
-            out_columnar->AppendChunk(std::move(chunk));
-          }
-        }
-      } else {
-        std::vector<ColumnarChunk> chunks;
-        RETURN_IF_FAIL(emit_direct_columnar(0, total_out_groups, &chunks,
-                                            emit_col_tracks.data()));
-        for (ColumnarChunk& chunk : chunks) {
-          out_columnar->AppendChunk(std::move(chunk));
-        }
-      }
-      if (right_col_owner != nullptr) {
-        out_columnar->AppendKeepalive(right_col_owner);
-      }
-    } else if (emit_workers > 1) {
-      // Finishing independent raw states does not reassociate their inputs.
-      // Contiguous shards retain the historical group order after the merge.
-      std::vector<ExecutionRuntime> runtimes(emit_workers);
-      std::vector<Relation> shards(emit_workers);
-      std::vector<Status> errors(emit_workers, Status::kSuccess);
-      for (size_t w = 0; w < emit_workers; ++w) {
-        shards[w].set_runtime(&runtimes[w]);
-      }
-      RETURN_IF_FAIL(RunParallelTasks(emit_workers, [&](size_t w) {
-        errors[w] = emit_direct((total_out_groups * w) / emit_workers,
-                                (total_out_groups * (w + 1)) / emit_workers,
-                                &shards[w], &emit_col_tracks[w]);
-      }));
-      for (size_t w = 0; w < emit_workers; ++w) {
-        RETURN_IF_FAIL(errors[w]);
-        if (result.runtime() != nullptr) {
-          result.runtime()->relation_spills += runtimes[w].relation_spills;
-        }
-      }
-      RETURN_IF_FAIL(Relation::MergeShardsInto(shards, &result));
-    } else {
-      RETURN_IF_FAIL(
-          emit_direct(0, total_out_groups, &result, emit_col_tracks.data()));
-    }
-    all_uniform_columns =
-        ColumnTypeTracker::FinalizeColumns(emit_col_tracks, output_columns);
-    finalized_output_types = true;
-  }
-  Row eval_rep_row;
-  std::vector<ColumnTypeTracker> fallback_col_tracks;
-  if (!can_direct_emit) {
-    eval_rep_row.values_.resize(result.schema.ColumnCount());
-    fallback_col_tracks.resize(output_columns.size());
-  }
-  for (size_t group_index = can_direct_emit ? total_out_groups : 0;
-       group_index < total_out_groups; ++group_index) {
-    const FusedGroup& group = active_group_at(group_index);
-    AggregateResultMap aggregate_results;
-    aggregate_results.reserve(fusion->aggregates.size());
-    if (raw_count_fusion) {
-      for (auto& aggregate : fusion->aggregates) {
-        aggregate_results.emplace(aggregate, Value(group.raw_count));
-      }
-    } else if (raw_sum_fusion) {
-      for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-        ASSIGN_OR_RETURN(Value, finished, finish_raw_agg(group, i));
-        aggregate_results.emplace(fusion->aggregates[i], std::move(finished));
-      }
-    } else {
-      for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-        AggregateAccumulator& accumulator = states[group.state_offset + i];
-        ASSIGN_OR_RETURN(Value, finished, accumulator.TryFinish());
-        aggregate_results.emplace(accumulator.expression, std::move(finished));
-      }
-    }
-    const Row* scope_row = group.representative.get();
-    if (scope_row == nullptr) {
-      Value col_tmp;
-      for (size_t c = 0; c < result.schema.ColumnCount(); ++c) {
-        eval_rep_row.values_[c] = rep_cell(group, c, &col_tmp);
-      }
-      scope_row = &eval_rep_row;
-    }
-    Scope scope{.row = scope_row, .schema = &result.schema, .outer = outer};
-    if (fusion->having) {
-      ASSIGN_OR_RETURN(Value, keep,
-                       TryEvaluate(fusion->having, scope, &aggregate_results,
-                                   context, ctes));
-      if (!Truthy(keep)) {
-        continue;
-      }
-    }
-    Row output_row;
-    output_row.values_.reserve(fusion->select_items.size());
-    size_t row_bytes = 64;
-    for (size_t ci = 0; ci < fusion->select_items.size(); ++ci) {
-      ASSIGN_OR_RETURN(Value, value,
-                       (TryEvaluate(fusion->select_items[ci], scope,
-                                    &aggregate_results, context, ctes)));
-      if (ci < fallback_col_tracks.size()) {
-        fallback_col_tracks[ci].Observe(value);
-      }
-      row_bytes += value.type == ValueType::kArray
-                       ? EstimateValueBytes(value)
-                       : EstimateScalarValueBytes(value);
-      output_row.values_.push_back(std::move(value));
-    }
-    result.AddRowWithKnownBytes(std::move(output_row), row_bytes,
-                                flush_granularity);
-  }
-  if (!can_direct_emit) {
-    all_uniform_columns = ColumnTypeTracker::FinalizeColumns(
-        std::span<const std::vector<ColumnTypeTracker>>(&fallback_col_tracks,
-                                                        1),
-        output_columns);
-    finalized_output_types = true;
-  }
-  result.schema = Schema("", std::move(output_columns));
-  RETURN_IF_FAIL(result.FinishSpill());
-  RETURN_IF_FAIL(result.GetStatus());
-  if (finalized_output_types) {
-    result.uniform_cell_types =
-        !result.HasSpill() && all_uniform_columns && !result.rows.empty();
-  }
-  if (out_columnar != nullptr) {
-    const bool non_empty = out_columnar->total_rows > 0;
-    result.SetColumnarTable(std::move(out_columnar),
-                            all_uniform_columns && non_empty);
-  } else if (fusion->columnar_output && !pushed_output && !result.HasSpill()) {
-    const bool non_empty = !result.rows.empty();
-    std::shared_ptr<ColumnarTable> fallback_col;
-    if (non_empty) {
-      ASSIGN_OR_RETURN(std::shared_ptr<ColumnarTable>, built,
-                       BuildColumnarTableFromRows(result.schema, result.rows));
-      fallback_col = std::move(built);
-    } else {
-      fallback_col = std::make_shared<ColumnarTable>();
-    }
-    if (right_col_owner != nullptr) {
-      fallback_col->AppendKeepalive(right_col_owner);
-    }
-    result.SetColumnarTable(std::move(fallback_col),
-                            all_uniform_columns && non_empty);
-  }
+  RETURN_IF_FAIL(emitter.Emit());
   if (!result.HasColumnarOnly() && !result.HasSpill() && !result.rows.empty() &&
       (left.HasColumnarOnly() || right_holder.has_value() ||
        right_col_owner != nullptr ||
@@ -23484,7 +8860,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  const size_t final_group_count = active_group_count();
+  const size_t final_group_count = use_group_ptrs ? group_ptrs.size() : groups.size();
   if (!use_group_ptrs && workers > 1 && groups.size() >= 16384) {
     RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
       const size_t begin = (groups.size() * w) / workers;
@@ -23541,14 +8917,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               << " radix=" << use_radix_agg
               << " def_cell=" << def_group_cell_probe
               << " dense_split=" << use_dense_split_direct_gid
-              << " split_unpack=" << split_key_unpack_only
-              << " left_pack_unpack=" << left_pack_unpack_only
-              << " packed2x32_unpack=" << packed_2x32_unpack_only
+              << " split_unpack=" << layout.split_key_unpack_only
+              << " left_pack_unpack=" << layout.left_pack_unpack_only
+              << " packed2x32_unpack=" << layout.packed_2x32_unpack_only
               << " ordered_sum=" << static_cast<bool>(ordered_sum_charge)
               << " shared_gid=" << use_shared_direct_gid
               << " workers=" << workers
               << " single_double=" << single_double_sum
-              << " count_star=" << count_star_only
+              << " count_star=" << raw_aggregates.count_star_only
               << " preassigned=" << use_preassigned_build_groups
               << " right_keys=" << right_only_group_keys
               << " residual=" << residual_programs.size()
@@ -23557,7 +8933,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               << (deferred_left_probe == nullptr
                       ? 0
                       : deferred_left_probe->pk_lookups.size())
-              << " raw=" << raw_sum_fusion << " aggs=" << agg_count
+              << " raw=" << raw_aggregates.raw_sum_fusion << " aggs=" << agg_count
               << " darith="
               << (!double_arithmetic.empty() && double_arithmetic[0])
               << " width=" << left_width << " keys=";
@@ -23566,7 +8942,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
     std::cerr << " kinds=";
     for (size_t ai = 0; ai < agg_count && ai < 4; ++ai) {
-      std::cerr << static_cast<int>(raw_agg_kinds[ai]) << ":"
+      std::cerr << static_cast<int>(raw_aggregates.raw_agg_kinds[ai]) << ":"
                 << child_shapes[ai].mul_col0 << "/" << child_shapes[ai].mul_col1
                 << "/" << child_shapes[ai].direct_column << ",";
     }

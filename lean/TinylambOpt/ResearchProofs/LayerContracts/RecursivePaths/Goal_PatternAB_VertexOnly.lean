@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_PatternAB_VertexOnly
+
+open TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
+open TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths.PatternAB
+
+theorem refute : ¬ PatternAB.VertexOnly.Goal := by
+  intro h
+  let g : List Edge := [⟨0,0,1⟩, ⟨0,0,2⟩]
+  have hnot : ¬ (0 ∈ query PatternAB.model g 0 2 (fun p => (p.1,0)) ↔
+                 0 ∈ query PatternAB.model g 0 2 id) := by
+    native_decide
+  exact hnot (h g 0 2 0)
+
+end TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_PatternAB_VertexOnly

@@ -1502,6 +1502,57 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   } else {
     platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
+  if (report.empty() && ctx.txn_.PreCommit() == Status::kSuccess) {
+    ctx = db.BeginContext();
+    for (const char* tbl : {"fact", "dim"}) {
+      if (const Status cmp =
+              db.CompactTableToTlcs(ctx, tbl, /*write_checkpoint=*/false,
+                                    /*refresh_statistics=*/false);
+          cmp != Status::kSuccess) {
+        return std::string("[JOIN-TLCS SETUP FAILED] CompactTableToTlcs(") +
+               tbl + "): " + std::string(cmp.GetMessage()) + "\n";
+      }
+    }
+    if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+      return "[JOIN-TLCS SETUP FAILED] PreCommit after TLCS compaction: " +
+             std::string(pre.GetMessage()) + "\n";
+    }
+    ctx = db.BeginContext();
+    for (const QueryExpect& qe : t.queries) {
+      std::string error;
+      auto got = RunQuery(db, ctx, qe.sql, &error, /*force_relational=*/false);
+      if (!got.has_value()) {
+        return "[JOIN-TLCS ERROR] " + qe.sql + "\n  " + error + "\n";
+      }
+      std::vector<std::string> actual;
+      actual.reserve(got->size());
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      const bool ordered = qe.sql.find(" ORDER BY ") != std::string::npos;
+      std::vector<std::string> expected = qe.expected;
+      if (!ordered) {
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+      }
+      if (actual != expected) {
+        report += "[JOIN-TLCS MISMATCH] " + qe.sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
   return report;
 }
 
@@ -1630,6 +1681,24 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
   if (rep.empty() && trace.setup.size() > 4) {
     ScopedQueryMemory low_mem(512);
     rep = check_queries(false, "[JOIN-SPILL REPLAY MISMATCH]");
+  }
+  if (rep.empty() && ctx.txn_.PreCommit() == Status::kSuccess) {
+    ctx = db.BeginContext();
+    for (const char* tbl : {"fact", "dim"}) {
+      if (const Status cmp =
+              db.CompactTableToTlcs(ctx, tbl, /*write_checkpoint=*/false,
+                                    /*refresh_statistics=*/false);
+          cmp != Status::kSuccess) {
+        return std::string("[JOIN-TLCS SETUP FAILED] CompactTableToTlcs(") +
+               tbl + "): " + std::string(cmp.GetMessage()) + "\n";
+      }
+    }
+    if (const Status pre = ctx.txn_.PreCommit(); pre != Status::kSuccess) {
+      return "[JOIN-TLCS SETUP FAILED] PreCommit after TLCS compaction: " +
+             std::string(pre.GetMessage()) + "\n";
+    }
+    ctx = db.BeginContext();
+    rep = check_queries(false, "[JOIN-TLCS REPLAY MISMATCH]");
   }
   return rep;
 }

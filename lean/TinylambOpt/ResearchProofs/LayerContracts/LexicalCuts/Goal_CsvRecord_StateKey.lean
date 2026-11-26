@@ -1,0 +1,15 @@
+import TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
+import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Common
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_CsvRecord_StateKey
+
+open TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
+open TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Common
+
+theorem sound : CsvRecord.StateKey.Goal := by
+  exact Common.stateKey_of_injective CsvRecord.model (by intro a b h; exact h)
+
+end TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_CsvRecord_StateKey

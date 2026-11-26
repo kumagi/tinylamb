@@ -70,10 +70,131 @@ theorem code_some_lt_pow64 (x : Int64) : code ⟨some x, 0⟩ < 2^64 := by
   have hxo : x.toBitVec.toNat ^^^ (2^63 - 1) < 2^64 := Nat.xor_lt_two_pow hx hm
   simpa [code] using hxo
 
+theorem flip_low (x : Nat) (hx : x < 2^63) :
+    x ^^^ (2^63 - 1) = 2^63 - (x + 1) := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [Nat.testBit_xor, Nat.testBit_two_pow_sub_one]
+  rw [Nat.testBit_two_pow_sub_succ hx]
+  by_cases hi : i < 63
+  · simp [hi]
+  · have hxi : x.testBit i = false := by
+      apply Nat.testBit_lt_two_pow
+      have hp : 2^63 ≤ 2^i := Nat.pow_le_pow_right (by decide : 0 < 2) (by omega)
+      omega
+    simp [hi, hxi]
+
+theorem xor_two_pow_add (low mask : Nat) (hlow : low < 2^63) (hmask : mask < 2^63) :
+    (2^63 + low) ^^^ mask = 2^63 + (low ^^^ mask) := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [Nat.testBit_xor, Nat.testBit_two_pow_mul_add 1 hlow]
+  rw [Nat.testBit_two_pow_mul_add 1 (Nat.xor_lt_two_pow hlow hmask)]
+  rw [Nat.testBit_xor]
+  by_cases hi : i < 63
+  · simp [hi]
+  · have hmi : mask.testBit i = false := by
+      apply Nat.testBit_lt_two_pow
+      have hp : 2^63 ≤ 2^i := Nat.pow_le_pow_right (by decide : 0 < 2) (by omega)
+      omega
+    simp [hi, hmi]
+
+theorem flip_high (x : Nat) (hlo : 2^63 ≤ x) (hx : x < 2^64) :
+    x ^^^ (2^63 - 1) = 2^63 + ((x - 2^63) ^^^ (2^63 - 1)) := by
+  have hlow : x - 2^63 < 2^63 := by omega
+  have hxdecomp : x = 2^63 + (x - 2^63) := by omega
+  calc
+    x ^^^ (2^63 - 1) = (2^63 + (x - 2^63)) ^^^ (2^63 - 1) :=
+      congrArg (fun t : Nat => t ^^^ (2^63 - 1)) hxdecomp
+    _ = 2^63 + ((x - 2^63) ^^^ (2^63 - 1)) :=
+      xor_two_pow_add (x - 2^63) (2^63 - 1) hlow (by decide)
+
+theorem flip_bit63 (x : Nat) (hlo : 2^63 ≤ x) (hx : x < 2^64) :
+    (x ^^^ (2^63 - 1)).testBit 63 = true := by
+  rw [Nat.testBit_xor, Nat.testBit_two_pow_sub_one]
+  have hxbit : x.testBit 63 = true :=
+    Nat.testBit_of_two_pow_le_and_two_pow_add_one_gt hlo hx
+  simp [hxbit]
+
+theorem signed_flip_order (a b : Nat) (ha : a < 2^64) (hb : b < 2^64) :
+    ((if b < 2^63 then (b : Int) else (b : Int) - (2^64 : Nat)) ≤
+      (if a < 2^63 then (a : Int) else (a : Int) - (2^64 : Nat))) ↔
+    ((a ^^^ (2^63 - 1)) ≤ (b ^^^ (2^63 - 1))) := by
+  by_cases ha63 : a < 2^63
+  · by_cases hb63 : b < 2^63
+    · rw [flip_low a ha63, flip_low b hb63]
+      simp [ha63, hb63]
+      omega
+    · have hfa_lt : (a ^^^ (2^63 - 1)) < 2^63 := by
+        rw [flip_low a ha63]
+        omega
+      have hfb_ge : 2^63 ≤ (b ^^^ (2^63 - 1)) :=
+        Nat.ge_two_pow_of_testBit (flip_bit63 b (by omega) hb)
+      constructor
+      · intro _
+        omega
+      · intro _
+        simp [ha63, hb63]
+        omega
+  · by_cases hb63 : b < 2^63
+    · have hfa_ge : 2^63 ≤ (a ^^^ (2^63 - 1)) :=
+        Nat.ge_two_pow_of_testBit (flip_bit63 a (by omega) ha)
+      have hfb_lt : (b ^^^ (2^63 - 1)) < 2^63 := by
+        rw [flip_low b hb63]
+        omega
+      constructor
+      · intro h
+        simp [ha63, hb63] at h
+        omega
+      · intro _
+        omega
+    · have hage : 2^63 ≤ a := Nat.le_of_not_gt ha63
+      have hbge : 2^63 ≤ b := Nat.le_of_not_gt hb63
+      have hp64 : 2^64 = 2^63 + 2^63 := by
+        rw [show 64 = 63 + 1 by decide, Nat.pow_succ]
+      have hla : a - 2^63 < 2^63 := by
+        apply (Nat.sub_lt_iff_lt_add hage).2
+        rw [← hp64]
+        exact ha
+      have hlb : b - 2^63 < 2^63 := by
+        apply (Nat.sub_lt_iff_lt_add hbge).2
+        rw [← hp64]
+        exact hb
+      rw [flip_high a (by omega) ha, flip_high b (by omega) hb]
+      rw [flip_low (a - 2^63) hla, flip_low (b - 2^63) hlb]
+      simp [ha63, hb63]
+      constructor <;> intro h <;> omega
+
 theorem bv_code_order (u v : BitVec 64) :
     (v.sle u) = (((0#1 ++ u) ^^^ (((1 : BitVec 65) <<< 63) - 1)).ule
                   ((0#1 ++ v) ^^^ (((1 : BitVec 65) <<< 63) - 1))) := by
-  bv_decide
+  rw [BitVec.sle_eq_decide, BitVec.ule_eq_decide]
+  have hround (x : BitVec 64) :
+      (((0#1 ++ x) ^^^ (((1 : BitVec 65) <<< 63) - 1)).toNat) =
+        x.toNat ^^^ (2^63 - 1) := by
+    simp
+  rw [hround u, hround v]
+  rw [decide_eq_decide]
+  have hu : u.toNat < 2^64 := BitVec.isLt u
+  have hv : v.toNat < 2^64 := BitVec.isLt v
+  have htu : u.toInt =
+      (if u.toNat < 2^63 then (u.toNat : Int) else (u.toNat : Int) - (2^64 : Nat)) := by
+    rw [BitVec.toInt_eq_msb_cond, BitVec.msb_eq_decide]
+    by_cases h : u.toNat < 2^63
+    · have hnot : ¬ 2 ^ (64 - 1) ≤ u.toNat := by omega
+      simp [h, hnot]
+    · have hge : 2 ^ (64 - 1) ≤ u.toNat := by omega
+      simp [h, hge]
+  have htv : v.toInt =
+      (if v.toNat < 2^63 then (v.toNat : Int) else (v.toNat : Int) - (2^64 : Nat)) := by
+    rw [BitVec.toInt_eq_msb_cond, BitVec.msb_eq_decide]
+    by_cases h : v.toNat < 2^63
+    · have hnot : ¬ 2 ^ (64 - 1) ≤ v.toNat := by omega
+      simp [h, hnot]
+    · have hge : 2 ^ (64 - 1) ≤ v.toNat := by omega
+      simp [h, hge]
+  rw [htu, htv]
+  exact signed_flip_order u.toNat v.toNat hu hv
 
 theorem before_iff_code_le (a b : Row) : before a b = true ↔ code a ≤ code b := by
   rcases a with ⟨keya, pa⟩

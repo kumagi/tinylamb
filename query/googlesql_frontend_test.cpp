@@ -828,13 +828,16 @@ TEST(GoogleSqlFrontendTest, RetriesZygoteAfterMissingExitStatus) {
                                1);
   const auto first = GoogleSqlFrontend::Parse("SELECT 122650001");
   const auto cooldown = GoogleSqlFrontend::Parse("SELECT 122650002");
-  auto recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
+  int attempt = 122650003;
+  auto recovered =
+      GoogleSqlFrontend::Parse("SELECT " + std::to_string(attempt));
   const auto recovery_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(8);
   while (recovered.ast != kZygoteAst &&
          std::chrono::steady_clock::now() < recovery_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    recovered = GoogleSqlFrontend::Parse("SELECT 122650003");
+    // Each probe must reach the parser, including during the retry cooldown.
+    recovered = GoogleSqlFrontend::Parse("SELECT " + std::to_string(++attempt));
   }
   if (previous) {
     ::tinylamb::platform::SetEnv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK",

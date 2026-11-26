@@ -890,4 +890,203 @@ TEST(JitTest, JitRadixKeyDoubleAgg_AccumulateGrowAndInf) {
   EXPECT_TRUE(std::isinf(ht_sums[occupied[0]]));
 }
 
+// Lean proofs:
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/BailoutState/
+//     (Goal_CountRows_FullTableHit, Goal_SumValid_FullTableHit)
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/PredicateBallots_All.lean
+//     (LimitBeforeFault, Conjunction.MaskedTruth, Conjunction.NullOutput)
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/VectorMemory/
+//     (ForwardCopy.DisjointDistance)
+TEST(JitTest, JitFrontiersBailoutFullTableHitBallotFirstMatchAndDisjointGuard) {
+  // 1. BailoutState.FullTableHit: at capacity (n_occ == max_load), probing
+  //    existing keys that collide with other slots must NOT spuriously bail out
+  //    in either JitPacked2x32RadixDedup or JitRadixKeyDoubleAgg.
+  auto dedup = JitPacked2x32RadixDedup::CompileOpenAddrDedup();
+  if (!dedup) {
+    GTEST_SKIP() << "LLVM JIT unavailable";
+  }
+  constexpr uint32_t kCap = 8;
+  constexpr uint64_t kMask = kCap - 1;
+  constexpr uint32_t kMaxLoad = 4;
+  constexpr uint32_t kGen = 1;
+  std::vector<uint64_t> ht_keys(kCap, 0);
+  std::vector<uint32_t> ht_gens(kCap, 0);
+  std::vector<int64_t> out_k0(kMaxLoad, 0);
+  std::vector<int64_t> out_k1(kMaxLoad, 0);
+  uint32_t n_occ = 0;
+  // Insert 4 distinct keys to reach max_load, then replay all 4 keys multiple
+  // times (guaranteed collisions in an 8-slot table) -> all must commit!
+  const std::vector<uint64_t> dedup_in{10, 20, 30, 40, 10, 20, 30, 40, 40, 10};
+  const uint32_t done =
+      dedup->Run(static_cast<uint32_t>(dedup_in.size()), dedup_in.data(),
+                 ht_keys.data(), ht_gens.data(), kGen, kMask, kMaxLoad, &n_occ,
+                 out_k0.data(), out_k1.data());
+  EXPECT_EQ(done, dedup_in.size());
+  EXPECT_EQ(n_occ, 4U);
+  // A genuinely new 5th key must bail out at index 0 with exact uncommitted
+  // cursor (`BailReason` / `RestartRow`).
+  const uint64_t new_key = 999999ULL;
+  EXPECT_EQ(dedup->Run(1, &new_key, ht_keys.data(), ht_gens.data(), kGen, kMask,
+                       kMaxLoad, &n_occ, out_k0.data(), out_k1.data()),
+            0U);
+  EXPECT_EQ(n_occ, 4U);
+
+  // 2. PredicateBallots.LimitBeforeFault & VectorMemory.DisjointDistance:
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  // (a > 0) AND ((b % a) = 0): row 70 matches before a later row 150 divides
+  // by zero (in a later 64-lane slice -> LimitBeforeFault returns 70 without
+  // faulting!); if row 10 divides by zero before row 20 matches (same 64-lane
+  // slice), FilterFirstMatch bails out (returns false) so scalar handles exact
+  // earliest event.
+  auto pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0}))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kModulo,
+                              ColumnValueExp("a")),
+          BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))));
+  auto bc = BytecodeCompiler::Compile(pred, schema);
+  if (!bc.has_value()) {
+    ADD_FAILURE() << "bytecode compilation failed";
+    return;
+  }
+  auto prog = JitBranchlessProgram::Compile(*bc, schema);
+  if (!prog.has_value()) {
+    ADD_FAILURE() << "branchless JIT compilation failed";
+    return;
+  }
+
+  std::vector<int64_t> a_vals(200, 3);
+  std::vector<int64_t> b_vals(200, 1);  // 1 % 3 != 0
+  a_vals[70] = 5;
+  b_vals[70] = 15;  // match at row 70!
+  a_vals[150] = 0;  // would fault if reached, but short-circuited by a > 0
+  const std::array<JitColumnInput, 2> cols{
+      {{.values = a_vals.data()}, {.values = b_vals.data()}}};
+  size_t match_row = 0;
+  ASSERT_TRUE(prog->FilterFirstMatch(cols, a_vals.size(), &match_row));
+  EXPECT_EQ(match_row, 70U);
+
+  // No-match case returns count.
+  b_vals[70] = 16;
+  ASSERT_TRUE(prog->FilterFirstMatch(cols, a_vals.size(), &match_row));
+  EXPECT_EQ(match_row, a_vals.size());
+
+  // VectorMemory.DisjointDistance: aliasing out_values with an input column
+  // must be rejected cleanly instead of violating LLVM `noalias`.
+  std::vector<uint8_t> out_nulls(a_vals.size(), 0);
+  bool any_null = false;
+  EXPECT_FALSE(prog->Evaluate(cols, a_vals.size(), a_vals.data(),
+                              out_nulls.data(), &any_null));
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/RelationalGuards/
+//     (Goal_CorrelatedSub_FoldCompare, Goal_CorrelatedSub_DeadEdge,
+//      Goal_CorrelatedSub_OmitOverflow)
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/PrefixKernels/
+//     (Goal_SignedSum_PeakEnvelope, Goal_SignedSum_TwoEntryChecks)
+//   lean/TinylambOpt/ResearchProofs/JitFrontiers/PackedKeys/
+//     (Goal_OrderBiased_ReuseForSort, Goal_MixedDirection_ReverseTie,
+//      Goal_CorrelatedDelta_Recover)
+TEST(JitTest, JitFrontiersRelationalDeadEdgePrefixEnvelopeAndPackedKeys) {
+  // 1. RelationalGuards.FoldCompare + DeadEdge:
+  //    `(a <> 0) AND ((b % a) = 0)` on a block where ZoneMap proves `a == 0`.
+  //    Without DeadEdge pruning, `b % a` sees `0 in [a.lo, a.hi]` and forces
+  //    the slow checked kernel; with FoldCompare + DeadEdge, `a <> 0` folds to
+  //    [0, 0], kJumpIfFalse kills the `b % a` edge, and ProveOverflowFree
+  //    certifies the unchecked fast path!
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  auto pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kNotEquals,
+                          ConstantValueExp(Value(int64_t{0}))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kModulo,
+                              ColumnValueExp("a")),
+          BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{0}))));
+  auto bc = BytecodeCompiler::Compile(pred, schema);
+  if (!bc.has_value()) {
+    ADD_FAILURE() << "bytecode compilation failed";
+    return;
+  }
+  auto prog = JitBranchlessProgram::Compile(*bc, schema);
+  if (!prog.has_value()) {
+    GTEST_SKIP() << "LLVM JIT unavailable";
+  }
+
+  const std::vector<int64_t> a_zero(16, 0);
+  const std::vector<int64_t> b_any(16, 42);
+  const std::array<JitColumnInput, 2> cols_zero{
+      {{.values = a_zero.data(),
+        .has_nulls = false,
+        .has_bounds = true,
+        .min_value = 0,
+        .max_value = 0},
+       {.values = b_any.data(),
+        .has_nulls = false,
+        .has_bounds = true,
+        .min_value = 42,
+        .max_value = 42}}};
+  EXPECT_TRUE(prog->ProveOverflowFree(cols_zero));
+  std::vector<uint8_t> keep(16, 1);
+  bool used_unchecked = false;
+  ASSERT_TRUE(prog->Filter(cols_zero, 16, keep.data(), &used_unchecked));
+  EXPECT_TRUE(used_unchecked);
+  for (uint8_t k : keep) {
+    EXPECT_EQ(k, 0U);
+  }
+
+  // When `a` may be either 0 or 1, the fallthrough edge IS reachable, so
+  // `b % a` cannot be proved overflow-free.
+  const std::array<JitColumnInput, 2> cols_mixed{
+      {{.values = a_zero.data(),
+        .has_nulls = false,
+        .has_bounds = true,
+        .min_value = 0,
+        .max_value = 1},
+       {.values = b_any.data(),
+        .has_nulls = false,
+        .has_bounds = true,
+        .min_value = 42,
+        .max_value = 42}}};
+  EXPECT_FALSE(prog->ProveOverflowFree(cols_mixed));
+
+  // 2. PrefixKernels.SignedSum.PeakEnvelope & TwoEntryChecks:
+  constexpr int64_t kMaxI64 = std::numeric_limits<int64_t>::max();
+  EXPECT_TRUE(
+      JitInt64Kernels::CanUseUncheckedSumWithEnvelope(kMaxI64 - 10, -5, 10));
+  EXPECT_FALSE(
+      JitInt64Kernels::CanUseUncheckedSumWithEnvelope(kMaxI64 - 10, -5, 11));
+  EXPECT_TRUE(JitInt64Kernels::CanUseUncheckedSumForInitialRange(-100, 100, -50,
+                                                                 50, 1000));
+  EXPECT_FALSE(JitInt64Kernels::CanUseUncheckedSumForInitialRange(
+      -100, kMaxI64 - 5, -50, 50, 1000));
+
+  // 3. PackedKeys: OrderBiased (ASC/ASC), MixedDirection (ASC/DESC),
+  //    CorrelatedDelta (48-bit unsigned + 16-bit signed delta).
+  uint64_t p1 = 0;
+  uint64_t p2 = 0;
+  ASSERT_TRUE(TryPackOrderBiased2x32(-1, 5, &p1));
+  ASSERT_TRUE(TryPackOrderBiased2x32(0, -5, &p2));
+  EXPECT_LT(p1, p2);
+  EXPECT_EQ(UnpackOrderBiased2x32(p1), (std::pair<int64_t, int64_t>{-1, 5}));
+  EXPECT_EQ(UnpackOrderBiased2x32(p2), (std::pair<int64_t, int64_t>{0, -5}));
+  EXPECT_FALSE(TryPackOrderBiased2x32(int64_t{1} << 31, 0, &p1));
+
+  ASSERT_TRUE(TryPackMixedDirection2x32(7, 10, &p1));
+  ASSERT_TRUE(TryPackMixedDirection2x32(7, 20, &p2));
+  EXPECT_LT(p2, p1);  // DESC tie-break: 20 orders before 10!
+  EXPECT_EQ(UnpackMixedDirection2x32(p1), (std::pair<int64_t, int64_t>{7, 10}));
+
+  const int64_t big_base = (int64_t{1} << 48) - 1;
+  ASSERT_TRUE(TryPackCorrelatedDelta48x16(big_base, big_base - 123, &p1));
+  EXPECT_EQ(UnpackCorrelatedDelta48x16(p1),
+            (std::pair<int64_t, int64_t>{big_base, big_base - 123}));
+  EXPECT_FALSE(TryPackCorrelatedDelta48x16(100, 100 + 32768, &p1));
+}
+
 }  // namespace tinylamb

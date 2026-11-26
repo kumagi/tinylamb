@@ -1,0 +1,10 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795605934024279
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: check scan(t#) query failed | stream :: op 5 `check scan t0`: check scan(t0) query failed: SELECT k, g, v, t, pad FROM t0 |   stream: NotExists
+create t0 7 193 1226
+ins_bulk t0 16 279 673
+commit
+index t0 ix1 gv
+checkpoint
+check scan t0

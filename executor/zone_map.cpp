@@ -298,17 +298,11 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   if (!initialized_) {
     return true;
   }
-  // T1621: a NaN-bearing zone used to keep every row ("NaN compares false
-  // against everything, so envelope pruning is unsound").  But the engine's
-  // AST ground truth (binary_expression.cpp) is IEEE-unordered: EVERY
-  // comparison against a NaN -- ordered, `=`, and even `!=` -- evaluates to
-  // FALSE, so a NaN row can never satisfy a BinaryOperation predicate.
-  // AddDouble/AddDoubleRange already keep NaN out of the envelope, so the
-  // finite min/max remains a sound pruning envelope for the whole zone and
-  // the unconditional bail-out only cost pruning for the batch's finite
-  // rows.  Zones whose envelope was dropped as unreliable (mixed types,
-  // reversed ranges) or that saw ONLY NaN keep the conservative answer via
-  // the empty-envelope branch below.
+  // AddDouble/AddDoubleRange keep NaN out of the finite [minimum_, maximum_]
+  // envelope and set `has_nan_ = true`. Under IEEE-754 / GoogleSQL semantics,
+  // ordered comparisons (`<`, `<=`, `>`, `>=`) and `=` with NaN are FALSE, so
+  // the finite envelope remains sound for them; however `NaN != c` is TRUE for
+  // every non-NULL `c`, so `kNotEquals` must retain any zone with `has_nan_`.
   if (constant.IsNull()) {
     return false;
   }
@@ -345,7 +339,7 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
     case BinaryOperation::kEquals:
       return *minimum_ <= constant && constant <= *maximum_;
     case BinaryOperation::kNotEquals:
-      return !(*minimum_ == constant && *maximum_ == constant);
+      return has_nan_ || !(*minimum_ == constant && *maximum_ == constant);
     case BinaryOperation::kLessThan:
       return *minimum_ < constant;
     case BinaryOperation::kLessThanEquals:

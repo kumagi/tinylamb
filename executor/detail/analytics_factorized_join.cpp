@@ -1179,20 +1179,62 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   std::unordered_map<uint64_t, uint32_t> pack7_key_to_slot;
   TransparentStringSlotMap str_key_to_slot;
 
+  bool phase_a_done = false;
+  const bool all_build_aggs_direct = std::ranges::all_of(
+      build_agg_indices,
+      [&](slot_t ai) { return fusion->count_star[ai] || agg_direct_col[ai]; });
   if (is_int_join_key && build_rel.TotalRows() > 0) {
     int64_t bmin = std::numeric_limits<int64_t>::max();
     int64_t bmax = std::numeric_limits<int64_t>::min();
     bool bad = false;
-    ForEachRelationEntry(
-        build_rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
-          int64_t kv = 0;
-          if (ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
-                                  &bad)) {
-            bmin = std::min(bmin, kv);
-            bmax = std::max(bmax, kv);
-          }
-          return !bad;
-        });
+    const size_t build_workers = (build_rel.TotalRows() >= 32768)
+                                     ? ParallelWorkerCount(std::max<size_t>(
+                                           1, build_rel.TotalRows() / 16384))
+                                     : 1;
+    if (build_workers > 1) {
+      std::vector<int64_t> w_min(build_workers,
+                                 std::numeric_limits<int64_t>::max());
+      std::vector<int64_t> w_max(build_workers,
+                                 std::numeric_limits<int64_t>::min());
+      std::vector<uint8_t> w_bad(build_workers, 0);
+      RETURN_IF_FAIL(ParallelForEachRelationEntryRange(
+          build_rel, build_workers, [&](size_t w, auto&& iter_fn) {
+            int64_t lmin = std::numeric_limits<int64_t>::max();
+            int64_t lmax = std::numeric_limits<int64_t>::min();
+            bool lbad = false;
+            iter_fn([&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+              int64_t kv = 0;
+              if (ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type,
+                                      &kv, &lbad)) {
+                lmin = std::min(lmin, kv);
+                lmax = std::max(lmax, kv);
+              }
+              return !lbad;
+            });
+            w_min[w] = lmin;
+            w_max[w] = lmax;
+            w_bad[w] = lbad ? 1U : 0U;
+          }));
+      for (size_t w = 0; w < build_workers; ++w) {
+        if (w_bad[w] != 0U) {
+          bad = true;
+          break;
+        }
+        bmin = std::min(bmin, w_min[w]);
+        bmax = std::max(bmax, w_max[w]);
+      }
+    } else {
+      ForEachRelationEntry(
+          build_rel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+            int64_t kv = 0;
+            if (ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
+                                    &bad)) {
+              bmin = std::min(bmin, kv);
+              bmax = std::max(bmax, kv);
+            }
+            return !bad;
+          });
+    }
     if (bad) {
       return std::optional<Relation>{};
     }
@@ -1203,6 +1245,81 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
         use_dense_int = true;
         dense_min = bmin;
         dense_slots.assign(static_cast<size_t>(span), kAbsentSlot);
+        if (build_workers > 1 && all_build_aggs_direct) {
+          struct alignas(64) BuildLocal {
+            std::vector<uint64_t> cnt;
+            std::vector<AggSlotState> aggs;
+            bool invalid{false};
+          };
+          std::vector<BuildLocal> blocals(build_workers);
+          for (BuildLocal& bl : blocals) {
+            bl.cnt.assign(static_cast<size_t>(span), 0);
+            if (n_build_aggs > 0) {
+              bl.aggs.resize(static_cast<size_t>(span) * n_build_aggs);
+            }
+          }
+          RETURN_IF_FAIL(ParallelForEachRelationEntryRange(
+              build_rel, build_workers, [&](size_t w, auto&& iter_fn) {
+                BuildLocal& bl = blocals[w];
+                iter_fn([&](const ColumnarChunk* chunk, const Row* r,
+                            size_t ri) {
+                  int64_t kv = 0;
+                  if (!ReadIntKeyFromEntry(chunk, r, ri, build_key_col,
+                                           key_type, &kv, &bl.invalid)) {
+                    return !bl.invalid;
+                  }
+                  const auto off =
+                      static_cast<size_t>(static_cast<uint64_t>(kv) -
+                                          static_cast<uint64_t>(dense_min));
+                  ++bl.cnt[off];
+                  for (size_t ba = 0; ba < n_build_aggs; ++ba) {
+                    const slot_t ai = build_agg_indices[ba];
+                    if (!AddEntryCellWithWeight(
+                            &bl.aggs[(off * n_build_aggs) + ba], agg_kinds[ai],
+                            chunk, r, ri, agg_local_col[ai], 1)) {
+                      bl.invalid = true;
+                      return false;
+                    }
+                  }
+                  return true;
+                });
+              }));
+          for (const BuildLocal& bl : blocals) {
+            if (bl.invalid) {
+              return std::optional<Relation>{};
+            }
+          }
+          for (size_t off = 0; off < static_cast<size_t>(span); ++off) {
+            uint64_t total_c = 0;
+            for (const BuildLocal& bl : blocals) {
+              total_c += bl.cnt[off];
+            }
+            if (total_c == 0) {
+              continue;
+            }
+            const auto sid = static_cast<uint32_t>(collapsed_cnt.size());
+            dense_slots[off] = sid;
+            collapsed_cnt.push_back(total_c);
+            if (n_build_aggs > 0) {
+              const size_t dst_base = static_cast<size_t>(sid) * n_build_aggs;
+              collapsed_aggs.resize(dst_base + n_build_aggs);
+              for (const BuildLocal& bl : blocals) {
+                if (bl.cnt[off] == 0) {
+                  continue;
+                }
+                const size_t src_base = off * n_build_aggs;
+                for (size_t ba = 0; ba < n_build_aggs; ++ba) {
+                  const slot_t ai = build_agg_indices[ba];
+                  if (!MergeAggSlot(&collapsed_aggs[dst_base + ba],
+                                    bl.aggs[src_base + ba], agg_kinds[ai], 1)) {
+                    return std::optional<Relation>{};
+                  }
+                }
+              }
+            }
+          }
+          phase_a_done = true;
+        }
       }
     }
   }
@@ -1307,65 +1424,67 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   Value build_key_owned_tmp;
   bool build_invalid = false;
   Status build_status = Status::kSuccess;
-  ForEachRelationEntry(build_rel, [&](const ColumnarChunk* chunk, const Row* r,
-                                      size_t ri) {
-    uint32_t sid = kAbsentSlot;
-    if (is_int_join_key) {
-      int64_t kv = 0;
-      if (!ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
-                               &build_invalid)) {
-        return !build_invalid;
+  if (!phase_a_done) {
+    ForEachRelationEntry(build_rel, [&](const ColumnarChunk* chunk,
+                                        const Row* r, size_t ri) {
+      uint32_t sid = kAbsentSlot;
+      if (is_int_join_key) {
+        int64_t kv = 0;
+        if (!ReadIntKeyFromEntry(chunk, r, ri, build_key_col, key_type, &kv,
+                                 &build_invalid)) {
+          return !build_invalid;
+        }
+        get_or_alloc_slot(&sid, &kv, {});
+      } else {
+        std::string_view sv;
+        if (!ReadStringKeyFromEntry(chunk, r, ri, build_key_col, &sv,
+                                    &build_key_owned_tmp, &build_invalid)) {
+          return !build_invalid;
+        }
+        get_or_alloc_slot(&sid, nullptr, sv);
       }
-      get_or_alloc_slot(&sid, &kv, {});
-    } else {
-      std::string_view sv;
-      if (!ReadStringKeyFromEntry(chunk, r, ri, build_key_col, &sv,
-                                  &build_key_owned_tmp, &build_invalid)) {
-        return !build_invalid;
-      }
-      get_or_alloc_slot(&sid, nullptr, sv);
-    }
-    ++collapsed_cnt[sid];
-    if (n_build_aggs > 0) {
-      const size_t offset = probe_is_left ? left_width : 0;
-      for (size_t ba = 0; ba < n_build_aggs; ++ba) {
-        const slot_t ai = build_agg_indices[ba];
-        if (agg_direct_col[ai]) {
-          if (!AddEntryCellWithWeight(
-                  &collapsed_aggs[(sid * n_build_aggs) + ba], agg_kinds[ai],
-                  chunk, r, ri, agg_local_col[ai], 1)) {
-            build_invalid = true;
-            return false;
-          }
-        } else {
-          if (r != nullptr) {
-            for (size_t c = 0; c < r->Count(); ++c) {
-              build_eval_scratch.values_[offset + c] = (*r)[c];
+      ++collapsed_cnt[sid];
+      if (n_build_aggs > 0) {
+        const size_t offset = probe_is_left ? left_width : 0;
+        for (size_t ba = 0; ba < n_build_aggs; ++ba) {
+          const slot_t ai = build_agg_indices[ba];
+          if (agg_direct_col[ai]) {
+            if (!AddEntryCellWithWeight(
+                    &collapsed_aggs[(sid * n_build_aggs) + ba], agg_kinds[ai],
+                    chunk, r, ri, agg_local_col[ai], 1)) {
+              build_invalid = true;
+              return false;
             }
           } else {
-            for (size_t c = 0; c < build_rel.schema.ColumnCount(); ++c) {
-              chunk->columns[c].WriteValueInto(
-                  ri, &build_eval_scratch.values_[offset + c]);
+            if (r != nullptr) {
+              for (size_t c = 0; c < r->Count(); ++c) {
+                build_eval_scratch.values_[offset + c] = (*r)[c];
+              }
+            } else {
+              for (size_t c = 0; c < build_rel.schema.ColumnCount(); ++c) {
+                chunk->columns[c].WriteValueInto(
+                    ri, &build_eval_scratch.values_[offset + c]);
+              }
             }
-          }
-          StatusOr<Value> eval_or =
-              child_programs[ai].TryEvaluateRow(build_eval_scratch);
-          if (!eval_or.HasValue()) {
-            build_status = eval_or.GetStatus();
-            build_invalid = true;
-            return false;
-          }
-          Value val = eval_or.MoveValue();
-          if (!AddValueWithWeight(&collapsed_aggs[(sid * n_build_aggs) + ba],
-                                  agg_kinds[ai], val, 1)) {
-            build_invalid = true;
-            return false;
+            StatusOr<Value> eval_or =
+                child_programs[ai].TryEvaluateRow(build_eval_scratch);
+            if (!eval_or.HasValue()) {
+              build_status = eval_or.GetStatus();
+              build_invalid = true;
+              return false;
+            }
+            Value val = eval_or.MoveValue();
+            if (!AddValueWithWeight(&collapsed_aggs[(sid * n_build_aggs) + ba],
+                                    agg_kinds[ai], val, 1)) {
+              build_invalid = true;
+              return false;
+            }
           }
         }
       }
-    }
-    return true;
-  });
+      return true;
+    });
+  }
   RETURN_IF_FAIL(build_status);
   if (build_invalid) {
     return std::optional<Relation>{};
@@ -1507,15 +1626,31 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       probe_rel.schema.GetColumn(*direct_group_probe_cols[0]).Type() ==
           ValueType::kVarChar;
 
+  constexpr int64_t kDirectGroupKeyLimit = 16384;
+  const slot_t single_gk_col = (single_int_group_key || single_pack7_group_key)
+                                   ? *direct_group_probe_cols[0]
+                                   : 0;
+  const ValueType single_gk_type =
+      single_int_group_key ? probe_rel.schema.GetColumn(single_gk_col).Type()
+                           : ValueType::kNull;
+  bool has_non_direct_probe_agg = false;
+  for (const slot_t ai : probe_agg_indices) {
+    if (!fusion->count_star[ai] && !agg_direct_col[ai]) {
+      has_non_direct_probe_agg = true;
+      break;
+    }
+  }
+
   struct WorkerLocal {
     bool has_scalar{false};
     std::vector<AggSlotState> scalar_aggs;
+    std::vector<uint32_t> direct_gid;
     FlatIntKeyMap<uint32_t> int_map;
     std::unordered_map<uint64_t, uint32_t> pack7_map;
     TransparentStringSlotMap str_map;
     uint32_t null_group_idx{kAbsentSlot};
     std::vector<std::vector<Value>> group_keys;
-    std::vector<std::vector<AggSlotState>> group_aggs;
+    std::vector<AggSlotState> flat_group_aggs;
     std::vector<Value> null_or_scalar_key;
     uint64_t matched_comparisons{0};
     bool invalid{false};
@@ -1525,6 +1660,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   for (WorkerLocal& wl : locals) {
     if (n_gkeys == 0) {
       wl.scalar_aggs.resize(n_aggs);
+    } else if (single_int_group_key) {
+      wl.direct_gid.assign(static_cast<size_t>(kDirectGroupKeyLimit),
+                           kAbsentSlot);
     }
   }
 
@@ -1564,10 +1702,10 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
           }
 
           // Locate target group accumulators.
-          std::vector<AggSlotState>* dst_aggs = nullptr;
+          AggSlotState* dst_aggs = nullptr;
           if (n_gkeys == 0) {
             wl.has_scalar = true;
-            dst_aggs = &wl.scalar_aggs;
+            dst_aggs = wl.scalar_aggs.data();
           } else {
             bool populated_combined = false;
             auto ensure_combined = [&]() {
@@ -1594,77 +1732,88 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
               }
             };
             if (single_int_group_key) {
-              const slot_t gk_col = *direct_group_probe_cols[0];
-              const ValueType exp_t = probe_rel.schema.GetColumn(gk_col).Type();
               int64_t iv = 0;
               bool ginv = false;
-              if (!ReadIntKeyFromEntry(chunk, probe_row, ri, gk_col, exp_t, &iv,
-                                       &ginv)) {
+              if (!ReadIntKeyFromEntry(chunk, probe_row, ri, single_gk_col,
+                                       single_gk_type, &iv, &ginv)) {
                 if (ginv) {
                   wl.invalid = true;
                   return false;
                 }
                 if (wl.null_group_idx == kAbsentSlot) {
                   wl.null_group_idx =
-                      static_cast<uint32_t>(wl.group_aggs.size());
+                      static_cast<uint32_t>(wl.group_keys.size());
                   wl.group_keys.push_back({Value()});
-                  wl.group_aggs.emplace_back(n_aggs);
+                  wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
                 }
-                dst_aggs = &wl.group_aggs[wl.null_group_idx];
+                dst_aggs = wl.flat_group_aggs.data() +
+                           (static_cast<size_t>(wl.null_group_idx) * n_aggs);
               } else {
-                uint32_t gid = 0;
-                if (const uint32_t* found = wl.int_map.Find(iv)) {
+                uint32_t gid = kAbsentSlot;
+                if (iv >= 0 && iv < kDirectGroupKeyLimit) {
+                  gid = wl.direct_gid[static_cast<size_t>(iv)];
+                  if (gid == kAbsentSlot) {
+                    gid = static_cast<uint32_t>(wl.group_keys.size());
+                    wl.direct_gid[static_cast<size_t>(iv)] = gid;
+                    wl.group_keys.push_back({single_gk_type == ValueType::kDate
+                                                 ? Value::DateFromDays(iv)
+                                                 : Value(iv)});
+                    wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
+                  }
+                } else if (const uint32_t* found = wl.int_map.Find(iv)) {
                   gid = *found;
                 } else {
-                  gid = static_cast<uint32_t>(wl.group_aggs.size());
+                  gid = static_cast<uint32_t>(wl.group_keys.size());
                   *wl.int_map.TryEmplace(iv) = gid;
-                  wl.group_keys.push_back({exp_t == ValueType::kDate
+                  wl.group_keys.push_back({single_gk_type == ValueType::kDate
                                                ? Value::DateFromDays(iv)
                                                : Value(iv)});
-                  wl.group_aggs.emplace_back(n_aggs);
+                  wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
                 }
-                dst_aggs = &wl.group_aggs[gid];
+                dst_aggs = wl.flat_group_aggs.data() +
+                           (static_cast<size_t>(gid) * n_aggs);
               }
             } else if (single_pack7_group_key) {
-              const slot_t gk_col = *direct_group_probe_cols[0];
               std::string_view sv;
               bool ginv = false;
-              if (!ReadStringKeyFromEntry(chunk, probe_row, ri, gk_col, &sv,
-                                          &group_str_tmp, &ginv)) {
+              if (!ReadStringKeyFromEntry(chunk, probe_row, ri, single_gk_col,
+                                          &sv, &group_str_tmp, &ginv)) {
                 if (ginv) {
                   wl.invalid = true;
                   return false;
                 }
                 if (wl.null_group_idx == kAbsentSlot) {
                   wl.null_group_idx =
-                      static_cast<uint32_t>(wl.group_aggs.size());
+                      static_cast<uint32_t>(wl.group_keys.size());
                   wl.group_keys.push_back({Value()});
-                  wl.group_aggs.emplace_back(n_aggs);
+                  wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
                 }
-                dst_aggs = &wl.group_aggs[wl.null_group_idx];
+                dst_aggs = wl.flat_group_aggs.data() +
+                           (static_cast<size_t>(wl.null_group_idx) * n_aggs);
               } else {
                 uint32_t gid = kAbsentSlot;
                 if (auto p7 = PackShortString7(sv)) {
                   auto [it, inserted] = wl.pack7_map.emplace(
-                      *p7, static_cast<uint32_t>(wl.group_aggs.size()));
+                      *p7, static_cast<uint32_t>(wl.group_keys.size()));
                   if (inserted) {
                     Value owned{std::string(sv)};
                     wl.group_keys.push_back({std::move(owned)});
-                    wl.group_aggs.emplace_back(n_aggs);
+                    wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
                   }
                   gid = it->second;
                 } else {
                   if (auto it = wl.str_map.find(sv); it != wl.str_map.end()) {
                     gid = it->second;
                   } else {
-                    gid = static_cast<uint32_t>(wl.group_aggs.size());
+                    gid = static_cast<uint32_t>(wl.group_keys.size());
                     wl.str_map.emplace(std::string(sv), gid);
                     Value owned{std::string(sv)};
                     wl.group_keys.push_back({std::move(owned)});
-                    wl.group_aggs.emplace_back(n_aggs);
+                    wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
                   }
                 }
-                dst_aggs = &wl.group_aggs[gid];
+                dst_aggs = wl.flat_group_aggs.data() +
+                           (static_cast<size_t>(gid) * n_aggs);
               }
             } else {
               ensure_combined();
@@ -1688,7 +1837,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
               }
               std::string enc = EncodeKeyTuple(gk_vals);
               auto [it, inserted] = wl.str_map.emplace(
-                  std::move(enc), static_cast<uint32_t>(wl.group_aggs.size()));
+                  std::move(enc), static_cast<uint32_t>(wl.group_keys.size()));
               if (inserted) {
                 std::vector<Value> owned_keys = gk_vals;
                 for (Value& v : owned_keys) {
@@ -1699,30 +1848,28 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                   }
                 }
                 wl.group_keys.push_back(std::move(owned_keys));
-                wl.group_aggs.emplace_back(n_aggs);
+                wl.flat_group_aggs.resize(wl.group_keys.size() * n_aggs);
               }
-              dst_aggs = &wl.group_aggs[it->second];
+              dst_aggs = wl.flat_group_aggs.data() +
+                         (static_cast<size_t>(it->second) * n_aggs);
             }
 
             // For non-direct probe agg expressions, ensure combined_scratch.
-            for (const slot_t ai : probe_agg_indices) {
-              if (!fusion->count_star[ai] && !agg_direct_col[ai]) {
-                ensure_combined();
-                break;
-              }
+            if (has_non_direct_probe_agg) {
+              ensure_combined();
             }
           }
 
           // Accumulate probe aggregates weighted by `weight`.
           for (const slot_t ai : probe_agg_indices) {
             if (fusion->count_star[ai]) {
-              (*dst_aggs)[ai].count += weight;
+              dst_aggs[ai].count += weight;
               continue;
             }
             if (agg_direct_col[ai]) {
-              if (!AddEntryCellWithWeight(&(*dst_aggs)[ai], agg_kinds[ai],
-                                          chunk, probe_row, ri,
-                                          agg_local_col[ai], weight)) {
+              if (!AddEntryCellWithWeight(&dst_aggs[ai], agg_kinds[ai], chunk,
+                                          probe_row, ri, agg_local_col[ai],
+                                          weight)) {
                 wl.invalid = true;
                 return false;
               }
@@ -1744,8 +1891,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
                 return false;
               }
               agg_val_tmp = av.MoveValue();
-              if (!AddValueWithWeight(&(*dst_aggs)[ai], agg_kinds[ai],
-                                      agg_val_tmp, weight)) {
+              if (!AddValueWithWeight(&dst_aggs[ai], agg_kinds[ai], agg_val_tmp,
+                                      weight)) {
                 wl.invalid = true;
                 return false;
               }
@@ -1757,7 +1904,7 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
             const size_t base = sid * n_build_aggs;
             for (size_t ba = 0; ba < n_build_aggs; ++ba) {
               const slot_t ai = build_agg_indices[ba];
-              if (!MergeAggSlot(&(*dst_aggs)[ai], collapsed_aggs[base + ba],
+              if (!MergeAggSlot(&dst_aggs[ai], collapsed_aggs[base + ba],
                                 agg_kinds[ai], 1)) {
                 wl.invalid = true;
                 return false;
@@ -1824,12 +1971,19 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
           }
           EnsureOwnedStringValues(&rep);
           final_rep_rows.push_back(std::move(rep));
-          final_group_aggs.push_back(wl.group_aggs[gi]);
+          const size_t src_base = gi * n_aggs;
+          final_group_aggs.emplace_back(
+              wl.flat_group_aggs.begin() +
+                  static_cast<std::ptrdiff_t>(src_base),
+              wl.flat_group_aggs.begin() +
+                  static_cast<std::ptrdiff_t>(src_base + n_aggs));
         } else {
           const size_t dst_idx = it->second;
+          const size_t src_base = gi * n_aggs;
           for (size_t ai = 0; ai < n_aggs; ++ai) {
             if (!MergeAggSlot(&final_group_aggs[dst_idx][ai],
-                              wl.group_aggs[gi][ai], agg_kinds[ai], 1)) {
+                              wl.flat_group_aggs[src_base + ai], agg_kinds[ai],
+                              1)) {
               return std::optional<Relation>{};
             }
           }
@@ -3815,26 +3969,42 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     return std::optional<Relation>{};
   }
 
+  struct DimFlatIntCol {
+    slot_t dim_col{0};
+    std::vector<int64_t> vals;
+    std::vector<uint8_t> is_null;
+  };
+  struct LeafFilter {
+    size_t leaf_ar{0};
+    slot_t dim_fk_col{0};
+    slot_t leaf_pk_col{0};
+    ValueType key_type{ValueType::kInt64};
+    FlatIntKeyMap<uint8_t> pk_set;
+  };
   struct DimLink {
     size_t dim_ar{0};
     slot_t fact_col{0};
     slot_t dim_pk_col{0};
     ValueType key_type{ValueType::kInt64};
     int64_t min_pk{0};
+    uint64_t span{0};
+    size_t matched_rows{0};
+    bool existence_only{false};
+    bool flat_int_aggs_only{false};
+    std::vector<uint64_t> dense_exists_bits;
     std::vector<Row> dim_rows;
     std::vector<uint32_t> dense_row_idx;
+    std::vector<DimFlatIntCol> flat_int_cols;
+    std::vector<LeafFilter> leaf_filters;
   };
-  std::vector<DimLink> dims;
-  std::unordered_map<size_t, size_t> ar_to_dim_idx;
-  for (size_t ar = 0; ar < n_active; ++ar) {
-    if (ar != fact_ar) {
-      ar_to_dim_idx[ar] = dims.size();
-      DimLink dlk;
-      dlk.dim_ar = ar;
-      dims.push_back(std::move(dlk));
-    }
-  }
-  std::vector<bool> dim_has_edge(dims.size(), false);
+  struct RawEdge {
+    size_t a0{0};
+    slot_t c0{0};
+    size_t a1{0};
+    slot_t c1{0};
+    ValueType key_type{ValueType::kInt64};
+  };
+  std::vector<RawEdge> raw_edges;
   for (const PredicateInfo& p : predicates) {
     if (!p.resolved || p.sources.size() < 2) {
       continue;
@@ -3853,106 +4023,97 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     }
     const auto a0 = static_cast<size_t>(rel_to_active[s0]);
     const auto a1 = static_cast<size_t>(rel_to_active[s1]);
-    if (a0 != fact_ar && a1 != fact_ar) {
-      return std::optional<Relation>{};
-    }
-    const size_t f_side = (a0 == fact_ar) ? 0 : 1;
-    const size_t d_ar = (a0 == fact_ar) ? a1 : a0;
-    const size_t f_rel_idx = active_rels[fact_ar];
-    const size_t d_rel_idx = active_rels[d_ar];
+    const size_t r0_idx = active_rels[a0];
+    const size_t r1_idx = active_rels[a1];
 
     const BinaryExpression& bin = p.expression->AsBinaryExpression();
     const ColumnName& lhs = bin.Left()->AsColumnValue().GetColumnName();
     const ColumnName& rhs = bin.Right()->AsColumnValue().GetColumnName();
-    const auto fl = LocalColumnOffset(relations[f_rel_idx].schema, lhs);
-    const auto fr = LocalColumnOffset(relations[f_rel_idx].schema, rhs);
-    const auto dl = LocalColumnOffset(relations[d_rel_idx].schema, lhs);
-    const auto dr = LocalColumnOffset(relations[d_rel_idx].schema, rhs);
-    std::optional<slot_t> fc, dc;
-    if (fl.has_value() && dr.has_value() && !fr.has_value() &&
-        !dl.has_value()) {
-      fc = static_cast<slot_t>(*fl);
-      dc = static_cast<slot_t>(*dr);
-    } else if (fr.has_value() && dl.has_value() && !fl.has_value() &&
-               !dr.has_value()) {
-      fc = static_cast<slot_t>(*fr);
-      dc = static_cast<slot_t>(*dl);
+    const auto l0 = LocalColumnOffset(relations[r0_idx].schema, lhs);
+    const auto r0 = LocalColumnOffset(relations[r0_idx].schema, rhs);
+    const auto l1 = LocalColumnOffset(relations[r1_idx].schema, lhs);
+    const auto r1 = LocalColumnOffset(relations[r1_idx].schema, rhs);
+    std::optional<slot_t> c0, c1;
+    if (l0.has_value() && r1.has_value() && !r0.has_value() &&
+        !l1.has_value()) {
+      c0 = static_cast<slot_t>(*l0);
+      c1 = static_cast<slot_t>(*r1);
+    } else if (r0.has_value() && l1.has_value() && !l0.has_value() &&
+               !r1.has_value()) {
+      c0 = static_cast<slot_t>(*r0);
+      c1 = static_cast<slot_t>(*l1);
     } else {
       return std::optional<Relation>{};
     }
-    (void)f_side;
-    const Column& fcol = relations[f_rel_idx].schema.GetColumn(*fc);
-    const Column& dcol = relations[d_rel_idx].schema.GetColumn(*dc);
-    if (fcol.Type() != dcol.Type() || fcol.IsUnsigned() || dcol.IsUnsigned() ||
-        (fcol.Type() != ValueType::kInt64 && fcol.Type() != ValueType::kDate)) {
+    const Column& col0 = relations[r0_idx].schema.GetColumn(*c0);
+    const Column& col1 = relations[r1_idx].schema.GetColumn(*c1);
+    if (col0.Type() != col1.Type() || col0.IsUnsigned() || col1.IsUnsigned() ||
+        (col0.Type() != ValueType::kInt64 && col0.Type() != ValueType::kDate)) {
       return std::optional<Relation>{};
     }
-    DimLink& dlk = dims[ar_to_dim_idx[d_ar]];
-    if (dim_has_edge[ar_to_dim_idx[d_ar]]) {
-      if (dlk.fact_col == *fc && dlk.dim_pk_col == *dc) {
+    raw_edges.push_back(
+        {.a0 = a0, .c0 = *c0, .a1 = a1, .c1 = *c1, .key_type = col0.Type()});
+  }
+
+  std::vector<DimLink> dims;
+  std::unordered_map<size_t, size_t> ar_to_dim_idx;
+  for (const RawEdge& e : raw_edges) {
+    if (e.a0 != fact_ar && e.a1 != fact_ar) {
+      continue;
+    }
+    const size_t d_ar = (e.a0 == fact_ar) ? e.a1 : e.a0;
+    const slot_t fc = (e.a0 == fact_ar) ? e.c0 : e.c1;
+    const slot_t dc = (e.a0 == fact_ar) ? e.c1 : e.c0;
+    auto it = ar_to_dim_idx.find(d_ar);
+    if (it != ar_to_dim_idx.end()) {
+      const DimLink& dlk = dims[it->second];
+      if (dlk.fact_col == fc && dlk.dim_pk_col == dc) {
         continue;
       }
       return std::optional<Relation>{};  // multiple join edges to same dim
     }
-    dim_has_edge[ar_to_dim_idx[d_ar]] = true;
-    dlk.fact_col = *fc;
-    dlk.dim_pk_col = *dc;
-    dlk.key_type = fcol.Type();
+    ar_to_dim_idx[d_ar] = dims.size();
+    DimLink dlk;
+    dlk.dim_ar = d_ar;
+    dlk.fact_col = fc;
+    dlk.dim_pk_col = dc;
+    dlk.key_type = e.key_type;
+    dims.push_back(std::move(dlk));
   }
-  for (bool h : dim_has_edge) {
-    if (!h) {
-      return std::optional<Relation>{};
-    }
+  if (dims.empty()) {
+    return std::optional<Relation>{};
   }
 
-  // Validate dim PK uniqueness and bounded span <= 65536 (`#14`).
-  for (DimLink& dlk : dims) {
-    const Relation& drel = relations[active_rels[dlk.dim_ar]];
-    int64_t bmin = std::numeric_limits<int64_t>::max();
-    int64_t bmax = std::numeric_limits<int64_t>::min();
-    bool bad = false;
-    ForEachRelationEntry(drel, [&](const ColumnarChunk* chunk, const Row* r,
-                                   size_t ri) {
-      Row row_copy;
-      if (r != nullptr) {
-        row_copy = *r;
-      } else {
-        row_copy.values_.resize(chunk->columns.size());
-        for (size_t c = 0; c < chunk->columns.size(); ++c) {
-          chunk->columns[c].WriteValueInto(ri, &row_copy.values_[c]);
-        }
-      }
-      EnsureOwnedStringValues(&row_copy);
-      int64_t kv = 0;
-      if (ReadIntKeyCell(row_copy[dlk.dim_pk_col], dlk.key_type, &kv, &bad)) {
-        bmin = std::min(bmin, kv);
-        bmax = std::max(bmax, kv);
-      }
-      dlk.dim_rows.push_back(std::move(row_copy));
-      return !bad;
-    });
-    if (bad || bmin > bmax) {
-      return std::optional<Relation>{};
+  // Attach 1-hop snowflake leaf dims (e.g. kind_type joined to title in JOB J3)
+  // as exact PK-unique semijoin filters on their parent direct dim.
+  std::unordered_set<size_t> leaf_ars;
+  for (const RawEdge& e : raw_edges) {
+    if (e.a0 == fact_ar || e.a1 == fact_ar) {
+      continue;
     }
-    const uint64_t span =
-        static_cast<uint64_t>(bmax) - static_cast<uint64_t>(bmin) + 1ULL;
-    if (span == 0 || span > kMaxDenseKeySpan) {
-      return std::optional<Relation>{};
+    const bool a0_is_dim = ar_to_dim_idx.contains(e.a0);
+    const bool a1_is_dim = ar_to_dim_idx.contains(e.a1);
+    if (a0_is_dim == a1_is_dim) {
+      return std::optional<Relation>{};  // dim-dim edge or 2-hop leaf chain
     }
-    dlk.min_pk = bmin;
-    dlk.dense_row_idx.assign(static_cast<size_t>(span), kAbsentSlot);
-    for (size_t ri = 0; ri < dlk.dim_rows.size(); ++ri) {
-      int64_t kv = 0;
-      if (!ReadIntKeyCell(dlk.dim_rows[ri][dlk.dim_pk_col], dlk.key_type, &kv,
-                          &bad)) {
-        continue;
-      }
-      const auto off = static_cast<size_t>(static_cast<uint64_t>(kv) -
-                                           static_cast<uint64_t>(dlk.min_pk));
-      if (dlk.dense_row_idx[off] != kAbsentSlot) {
-        return std::optional<Relation>{};  // NOT strictly unique -> bail!
-      }
-      dlk.dense_row_idx[off] = static_cast<uint32_t>(ri);
+    const size_t d_ar = a0_is_dim ? e.a0 : e.a1;
+    const size_t l_ar = a0_is_dim ? e.a1 : e.a0;
+    const slot_t d_fk_col = a0_is_dim ? e.c0 : e.c1;
+    const slot_t l_pk_col = a0_is_dim ? e.c1 : e.c0;
+    if (!leaf_ars.insert(l_ar).second) {
+      return std::optional<Relation>{};  // leaf has multiple edges
+    }
+    LeafFilter lf;
+    lf.leaf_ar = l_ar;
+    lf.dim_fk_col = d_fk_col;
+    lf.leaf_pk_col = l_pk_col;
+    lf.key_type = e.key_type;
+    dims[ar_to_dim_idx[d_ar]].leaf_filters.push_back(std::move(lf));
+  }
+  for (size_t ar = 0; ar < n_active; ++ar) {
+    if (ar != fact_ar && !ar_to_dim_idx.contains(ar) &&
+        !leaf_ars.contains(ar)) {
+      return std::optional<Relation>{};  // disconnected relation
     }
   }
 
@@ -4036,48 +4197,311 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
     }
   }
 
-  // Parallel scan of `fact_rel` with O(1) dense dim lookups.
-  const size_t total_fact = fact_rel.TotalRows();
-  const size_t workers =
-      ParallelWorkerCount(std::max<size_t>(1, total_fact / 16384));
   const size_t n_aggs = agg_kinds.size();
   const size_t n_gkeys = gk_sources.size();
   const size_t n_dims = dims.size();
+  constexpr uint64_t kMaxStarDenseKeySpan = 1ULL << 20U;
 
-  // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave8Job.lean (FixedGender_sound)
-  // When the sole GROUP BY key comes from a dimension whose surviving rows all
-  // share one non-NULL, non-collated constant value (e.g. WHERE n.gender='F'
-  // ... GROUP BY n.gender), discharge GROUP BY to a 1-group scalar fold.
-  std::optional<Value> const_group_key;
-  if (n_gkeys == 1 && gk_sources[0].ar != fact_ar) {
-    const size_t di = ar_to_dim_idx[gk_sources[0].ar];
-    const auto& drows = dims[di].dim_rows;
-    if (!drows.empty()) {
-      const Value& first = drows[0][gk_sources[0].col];
-      if (!first.IsNull() && !first.IsCaseInsensitive() &&
-          !first.IsInterval()) {
-        bool all_same = true;
-        for (size_t ri = 1; ri < drows.size(); ++ri) {
-          const Value& v = drows[ri][gk_sources[0].col];
-          if (v.IsNull() || v.IsCaseInsensitive() || v.IsInterval() ||
-              !(v == first)) {
-            all_same = false;
-            break;
-          }
-        }
-        if (all_same) {
-          Value owned = first;
-          if (owned.type == ValueType::kVarChar && owned.owned_data.empty() &&
-              !owned.value.varchar_value.empty()) {
-            owned.owned_data.assign(owned.value.varchar_value);
-            owned.value.varchar_value = owned.owned_data;
-          }
-          const_group_key = std::move(owned);
+  // Leaf snowflake dims must be existence-only (no columns referenced by
+  // GROUP BY or aggregates; SELECT/HAVING are already checked against
+  // gk_sources by AllNonAggColumnsAllowed).
+  if (!leaf_ars.empty()) {
+    for (const ColSource& gs : gk_sources) {
+      if (leaf_ars.contains(gs.ar)) {
+        return std::optional<Relation>{};
+      }
+    }
+    for (size_t ai = 0; ai < n_aggs; ++ai) {
+      if (!fusion->count_star[ai] && leaf_ars.contains(agg_sources[ai].ar)) {
+        return std::optional<Relation>{};
+      }
+    }
+    for (DimLink& dlk : dims) {
+      for (LeafFilter& lf : dlk.leaf_filters) {
+        const Relation& lrel = relations[active_rels[lf.leaf_ar]];
+        bool bad = false;
+        bool dup = false;
+        size_t non_null_pks = 0;
+        ForEachRelationEntry(
+            lrel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+              int64_t kv = 0;
+              if (!ReadIntKeyFromEntry(chunk, r, ri, lf.leaf_pk_col,
+                                       lf.key_type, &kv, &bad)) {
+                return !bad;
+              }
+              if (lf.pk_set.Find(kv) != nullptr) {
+                dup = true;
+                return false;
+              }
+              *lf.pk_set.TryEmplace(kv) = 1U;
+              ++non_null_pks;
+              return true;
+            });
+        if (bad || dup || non_null_pks == 0) {
+          return std::optional<Relation>{};
         }
       }
     }
   }
+
+  // Lean proofs:
+  // - lean/TinylambOpt/ResearchProofs/Wave8Job.lean (FixedGender_sound):
+  //   discharge a sole constant-value dim GROUP BY key to a 1-group scalar
+  //   fold.
+  // - lean/TinylambOpt/ResearchProofs/RestartRaces/Goal_JobJ3_PersonPages.lean:
+  //   store existence-only dimensions as 1-bit dense bitsets (32x smaller, L1).
+  std::optional<Value> const_group_key;
+  std::vector<int> agg_flat_col_idx(n_aggs, -1);
+
+  for (size_t di = 0; di < n_dims; ++di) {
+    DimLink& dlk = dims[di];
+    const Relation& drel = relations[active_rels[dlk.dim_ar]];
+    const bool is_const_gk_candidate =
+        n_gkeys == 1 && gk_sources[0].ar == dlk.dim_ar;
+    auto passes_leaf_filters = [&](const ColumnarChunk* chunk, const Row* r,
+                                   size_t ri, bool* out_bad) -> bool {
+      for (const LeafFilter& lf : dlk.leaf_filters) {
+        int64_t fk = 0;
+        if (!ReadIntKeyFromEntry(chunk, r, ri, lf.dim_fk_col, lf.key_type, &fk,
+                                 out_bad)) {
+          return false;
+        }
+        if (lf.pk_set.Find(fk) == nullptr) {
+          return false;
+        }
+      }
+      return true;
+    };
+    int64_t bmin = std::numeric_limits<int64_t>::max();
+    int64_t bmax = std::numeric_limits<int64_t>::min();
+    bool bad = false;
+    bool saw_gk_row = false;
+    bool all_same_gk = is_const_gk_candidate;
+    Value first_gk_val;
+    Value scratch_gk_val;
+    ForEachRelationEntry(drel, [&](const ColumnarChunk* chunk, const Row* r,
+                                   size_t ri) {
+      if (!dlk.leaf_filters.empty() &&
+          !passes_leaf_filters(chunk, r, ri, &bad)) {
+        return !bad;
+      }
+      int64_t kv = 0;
+      if (ReadIntKeyFromEntry(chunk, r, ri, dlk.dim_pk_col, dlk.key_type, &kv,
+                              &bad)) {
+        bmin = std::min(bmin, kv);
+        bmax = std::max(bmax, kv);
+      }
+      if (bad) {
+        return false;
+      }
+      if (all_same_gk) {
+        ReadColValueOrRow(chunk, r, ri, gk_sources[0].col, &scratch_gk_val);
+        if (scratch_gk_val.IsNull() || scratch_gk_val.IsCaseInsensitive() ||
+            scratch_gk_val.IsInterval() ||
+            (saw_gk_row && !(scratch_gk_val == first_gk_val))) {
+          all_same_gk = false;
+        } else if (!saw_gk_row) {
+          first_gk_val = scratch_gk_val;
+          if (first_gk_val.type == ValueType::kVarChar &&
+              first_gk_val.owned_data.empty() &&
+              !first_gk_val.value.varchar_value.empty()) {
+            first_gk_val.owned_data.assign(first_gk_val.value.varchar_value);
+            first_gk_val.value.varchar_value = first_gk_val.owned_data;
+          }
+          saw_gk_row = true;
+        }
+      }
+      return true;
+    });
+    if (bad || bmin > bmax) {
+      return std::optional<Relation>{};
+    }
+    const uint64_t span =
+        static_cast<uint64_t>(bmax) - static_cast<uint64_t>(bmin) + 1ULL;
+    if (span == 0 || span > kMaxStarDenseKeySpan) {
+      return std::optional<Relation>{};
+    }
+    dlk.min_pk = bmin;
+    dlk.span = span;
+    if (is_const_gk_candidate && saw_gk_row && all_same_gk) {
+      const_group_key = std::move(first_gk_val);
+    }
+
+    bool has_live_gk = false;
+    for (size_t k = 0; k < n_gkeys; ++k) {
+      if (gk_sources[k].ar == dlk.dim_ar &&
+          (n_gkeys != 1 || !const_group_key.has_value())) {
+        has_live_gk = true;
+        break;
+      }
+    }
+    bool has_any_agg = false;
+    bool all_aggs_flat_int = true;
+    std::vector<size_t> dim_agg_indices;
+    for (size_t ai = 0; ai < n_aggs; ++ai) {
+      if (!fusion->count_star[ai] && agg_sources[ai].ar == dlk.dim_ar) {
+        has_any_agg = true;
+        dim_agg_indices.push_back(ai);
+        const Column& col = drel.schema.GetColumn(agg_sources[ai].col);
+        if ((agg_kinds[ai] != SimpleAggKind::kSum &&
+             agg_kinds[ai] != SimpleAggKind::kAvg &&
+             agg_kinds[ai] != SimpleAggKind::kCount) ||
+            col.Type() != ValueType::kInt64 || col.IsUnsigned() ||
+            col.IsInterval()) {
+          all_aggs_flat_int = false;
+        }
+      }
+    }
+
+    if (!has_live_gk && !has_any_agg) {
+      dlk.existence_only = true;
+      dlk.dense_exists_bits.assign(static_cast<size_t>((span + 63ULL) / 64ULL),
+                                   0ULL);
+      bool dup = false;
+      ForEachRelationEntry(
+          drel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+            if (!dlk.leaf_filters.empty() &&
+                !passes_leaf_filters(chunk, r, ri, &bad)) {
+              return !bad;
+            }
+            int64_t kv = 0;
+            if (!ReadIntKeyFromEntry(chunk, r, ri, dlk.dim_pk_col, dlk.key_type,
+                                     &kv, &bad)) {
+              return !bad;
+            }
+            const auto off = static_cast<size_t>(
+                static_cast<uint64_t>(kv) - static_cast<uint64_t>(dlk.min_pk));
+            const uint64_t mask = 1ULL << (off & 63U);
+            if ((dlk.dense_exists_bits[off >> 6U] & mask) != 0ULL) {
+              dup = true;
+              return false;
+            }
+            dlk.dense_exists_bits[off >> 6U] |= mask;
+            ++dlk.matched_rows;
+            return true;
+          });
+      if (bad || dup) {
+        return std::optional<Relation>{};
+      }
+    } else if (!has_live_gk && has_any_agg && all_aggs_flat_int) {
+      dlk.flat_int_aggs_only = true;
+      dlk.dense_row_idx.assign(static_cast<size_t>(span), kAbsentSlot);
+      for (const size_t ai : dim_agg_indices) {
+        int existing = -1;
+        for (size_t fi = 0; fi < dlk.flat_int_cols.size(); ++fi) {
+          if (dlk.flat_int_cols[fi].dim_col == agg_sources[ai].col) {
+            existing = static_cast<int>(fi);
+            break;
+          }
+        }
+        if (existing < 0) {
+          existing = static_cast<int>(dlk.flat_int_cols.size());
+          DimFlatIntCol fc;
+          fc.dim_col = agg_sources[ai].col;
+          fc.vals.reserve(drel.TotalRows());
+          fc.is_null.reserve(drel.TotalRows());
+          dlk.flat_int_cols.push_back(std::move(fc));
+        }
+        agg_flat_col_idx[ai] = existing;
+      }
+      bool dup = false;
+      ForEachRelationEntry(
+          drel, [&](const ColumnarChunk* chunk, const Row* r, size_t ri) {
+            if (!dlk.leaf_filters.empty() &&
+                !passes_leaf_filters(chunk, r, ri, &bad)) {
+              return !bad;
+            }
+            int64_t kv = 0;
+            if (!ReadIntKeyFromEntry(chunk, r, ri, dlk.dim_pk_col, dlk.key_type,
+                                     &kv, &bad)) {
+              return !bad;
+            }
+            const auto off = static_cast<size_t>(
+                static_cast<uint64_t>(kv) - static_cast<uint64_t>(dlk.min_pk));
+            if (dlk.dense_row_idx[off] != kAbsentSlot) {
+              dup = true;
+              return false;
+            }
+            const auto ridx = static_cast<uint32_t>(dlk.matched_rows++);
+            dlk.dense_row_idx[off] = ridx;
+            for (DimFlatIntCol& fc : dlk.flat_int_cols) {
+              int64_t av = 0;
+              const bool non_null = ReadIntKeyFromEntry(
+                  chunk, r, ri, fc.dim_col, ValueType::kInt64, &av, &bad);
+              if (bad) {
+                return false;
+              }
+              fc.vals.push_back(non_null ? av : 0);
+              fc.is_null.push_back(non_null ? 0U : 1U);
+            }
+            return true;
+          });
+      if (bad || dup) {
+        return std::optional<Relation>{};
+      }
+    } else {
+      dlk.dense_row_idx.assign(static_cast<size_t>(span), kAbsentSlot);
+      bool dup = false;
+      ForEachRelationEntry(drel, [&](const ColumnarChunk* chunk, const Row* r,
+                                     size_t ri) {
+        if (!dlk.leaf_filters.empty() &&
+            !passes_leaf_filters(chunk, r, ri, &bad)) {
+          return !bad;
+        }
+        Row row_copy;
+        if (r != nullptr) {
+          row_copy = *r;
+        } else {
+          row_copy.values_.resize(chunk->columns.size());
+          for (size_t c = 0; c < chunk->columns.size(); ++c) {
+            chunk->columns[c].WriteValueInto(ri, &row_copy.values_[c]);
+          }
+        }
+        EnsureOwnedStringValues(&row_copy);
+        int64_t kv = 0;
+        if (ReadIntKeyCell(row_copy[dlk.dim_pk_col], dlk.key_type, &kv, &bad)) {
+          const auto off = static_cast<size_t>(
+              static_cast<uint64_t>(kv) - static_cast<uint64_t>(dlk.min_pk));
+          if (dlk.dense_row_idx[off] != kAbsentSlot) {
+            dup = true;
+            return false;
+          }
+          dlk.dense_row_idx[off] = static_cast<uint32_t>(dlk.dim_rows.size());
+          ++dlk.matched_rows;
+        }
+        dlk.dim_rows.push_back(std::move(row_copy));
+        return !bad;
+      });
+      if (bad || dup) {
+        return std::optional<Relation>{};
+      }
+    }
+  }
+
+  // Static selectivity + L1-resident existence-only dimension probe ordering
+  // heuristic (note: Goal_JobJ3_ProbeSchedule.lean refuted greedy per-morsel
+  // cache-oblivious scheduling, so we use static whole-dim selectivity rather
+  // than per-morsel greedy switching).
+  std::vector<size_t> probe_order(n_dims);
+  for (size_t di = 0; di < n_dims; ++di) {
+    probe_order[di] = di;
+  }
+  std::ranges::sort(probe_order, [&](size_t a, size_t b) {
+    const double sel_a =
+        static_cast<double>(dims[a].matched_rows) /
+        static_cast<double>(std::max<uint64_t>(1, dims[a].span));
+    const double sel_b =
+        static_cast<double>(dims[b].matched_rows) /
+        static_cast<double>(std::max<uint64_t>(1, dims[b].span));
+    const double score_a = sel_a * (dims[a].existence_only ? 0.5 : 1.0);
+    const double score_b = sel_b * (dims[b].existence_only ? 0.5 : 1.0);
+    return score_a < score_b;
+  });
+
+  // Parallel scan of `fact_rel` with O(1) dense dim lookups.
+  const size_t total_fact = fact_rel.TotalRows();
+  const size_t workers =
+      ParallelWorkerCount(std::max<size_t>(1, total_fact / 16384));
 
   struct WorkerLocal {
     bool has_scalar{false};
@@ -4102,18 +4526,26 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
         std::vector<Value> gk_vals(n_gkeys);
         iter_fn([&](const ColumnarChunk* chunk, const Row* fr,
                     size_t ri) -> bool {
-          for (size_t di = 0; di < n_dims; ++di) {
+          for (const size_t di : probe_order) {
+            const DimLink& dlk = dims[di];
             int64_t fk = 0;
-            if (!ReadIntKeyFromEntry(chunk, fr, ri, dims[di].fact_col,
-                                     dims[di].key_type, &fk, &wl.invalid)) {
+            if (!ReadIntKeyFromEntry(chunk, fr, ri, dlk.fact_col, dlk.key_type,
+                                     &fk, &wl.invalid)) {
               return !wl.invalid;
             }
-            const uint64_t off = static_cast<uint64_t>(fk) -
-                                 static_cast<uint64_t>(dims[di].min_pk);
-            if (off >= dims[di].dense_row_idx.size()) return true;
-            const uint32_t ridx = dims[di].dense_row_idx[off];
-            if (ridx == kAbsentSlot) return true;
-            dim_ridx[di] = ridx;
+            const uint64_t off =
+                static_cast<uint64_t>(fk) - static_cast<uint64_t>(dlk.min_pk);
+            if (off >= dlk.span) return true;
+            if (dlk.existence_only) {
+              if (((dlk.dense_exists_bits[off >> 6U] >> (off & 63U)) & 1ULL) ==
+                  0ULL) {
+                return true;
+              }
+            } else {
+              const uint32_t ridx = dlk.dense_row_idx[off];
+              if (ridx == kAbsentSlot) return true;
+              dim_ridx[di] = ridx;
+            }
           }
           wl.comparisons += 1;
 
@@ -4165,6 +4597,30 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
                                           ri, agg_sources[ai].col, 1)) {
                 wl.invalid = true;
                 return false;
+              }
+            } else if (agg_flat_col_idx[ai] >= 0) {
+              const size_t di = ar_to_dim_idx[agg_sources[ai].ar];
+              const DimFlatIntCol& fc =
+                  dims[di]
+                      .flat_int_cols[static_cast<size_t>(agg_flat_col_idx[ai])];
+              const uint32_t ridx = dim_ridx[di];
+              if (fc.is_null[ridx] == 0U) {
+                AggSlotState& st = (*dst)[ai];
+                if (agg_kinds[ai] == SimpleAggKind::kCount) {
+                  ++st.count;
+                } else {
+                  if (st.numeric_mode == 0) {
+                    st.numeric_mode = 1;
+                  }
+                  const int64_t iv = fc.vals[ridx];
+                  st.sum_i128 += iv;
+                  if (iv > 0) {
+                    st.pos_i128 += iv;
+                  } else if (iv < 0) {
+                    st.neg_i128 += iv;
+                  }
+                  ++st.count;
+                }
               }
             } else {
               read_cell_into(agg_sources[ai], &agg_tmp);

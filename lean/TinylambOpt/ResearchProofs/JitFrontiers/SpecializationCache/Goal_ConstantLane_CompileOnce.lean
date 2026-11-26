@@ -1,0 +1,18 @@
+import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
+import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common_SpecializationCache
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+
+namespace TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_ConstantLane_CompileOnce
+
+open TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
+open TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache.ConstantLane
+open TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common
+open TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
+
+theorem sound : ConstantLane.CompileOnce.Goal := by
+  exact compileOnce shape
+
+end TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_ConstantLane_CompileOnce

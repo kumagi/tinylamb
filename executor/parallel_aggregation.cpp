@@ -1507,6 +1507,10 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
   const platform::ExtendedFloat syy = state.stat_syy[index];
   const platform::ExtendedFloat sxy = state.stat_sxy[index];
   const int64_t count = state.counts[index];
+  // Clamp tiny negative floating-point rounding dust to 0 while preserving NaN.
+  const auto clamp_nonneg = [](platform::ExtendedFloat v) {
+    return (v < 0) ? platform::ExtendedFloat{0} : v;
+  };
   switch (type) {
     case AggregationType::kVarPop: {
       if (count == 0) {
@@ -1514,8 +1518,7 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       }
       const platform::ExtendedFloat mean = sx / count;
       const platform::ExtendedFloat ssd =
-          std::max(platform::ExtendedFloat{0},
-                   sxx - (count * mean * mean));
+          clamp_nonneg(sxx - (count * mean * mean));
       return Value(static_cast<double>(ssd / count));
     }
     case AggregationType::kVarSamp: {
@@ -1524,8 +1527,7 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       }
       const platform::ExtendedFloat mean = sx / count;
       const platform::ExtendedFloat ssd =
-          std::max(platform::ExtendedFloat{0},
-                   sxx - (count * mean * mean));
+          clamp_nonneg(sxx - (count * mean * mean));
       return Value(static_cast<double>(ssd / (count - 1)));
     }
     case AggregationType::kStddevPop: {
@@ -1534,8 +1536,7 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       }
       const platform::ExtendedFloat mean = sx / count;
       const platform::ExtendedFloat ssd =
-          std::max(platform::ExtendedFloat{0},
-                   sxx - (count * mean * mean));
+          clamp_nonneg(sxx - (count * mean * mean));
       return Value(static_cast<double>(platform::Sqrt(ssd / count)));
     }
     case AggregationType::kStddevSamp: {
@@ -1544,8 +1545,7 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       }
       const platform::ExtendedFloat mean = sx / count;
       const platform::ExtendedFloat ssd =
-          std::max(platform::ExtendedFloat{0},
-                   sxx - (count * mean * mean));
+          clamp_nonneg(sxx - (count * mean * mean));
       return Value(static_cast<double>(platform::Sqrt(ssd / (count - 1))));
     }
     case AggregationType::kCovarPop: {
@@ -1573,12 +1573,10 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
       const platform::ExtendedFloat mx = sx / count;
       const platform::ExtendedFloat my = sy / count;
       const platform::ExtendedFloat sdd = sxy - (count * mx * my);
-      const platform::ExtendedFloat vx =
-          std::max(platform::ExtendedFloat{0}, sxx - (count * mx * mx));
-      const platform::ExtendedFloat vy =
-          std::max(platform::ExtendedFloat{0}, syy - (count * my * my));
+      const platform::ExtendedFloat vx = clamp_nonneg(sxx - (count * mx * mx));
+      const platform::ExtendedFloat vy = clamp_nonneg(syy - (count * my * my));
       if (vx == 0 || vy == 0) {
-        return {};
+        return Value(std::numeric_limits<double>::quiet_NaN());
       }
       return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }

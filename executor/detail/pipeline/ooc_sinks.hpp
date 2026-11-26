@@ -197,8 +197,10 @@ class OocGroupAggSink final : public PipelineSink {
   bool all_combinable_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
+  size_t single_distinct_agg_index_{0};
   // Owned DISTINCT-stripped clone for the O(1) sorted skew fallback when
-  // the aggregate list is one plain COUNT/SUM/AVG(DISTINCT expr).
+  // the aggregate list has one plain COUNT/SUM/AVG(DISTINCT expr) and only
+  // non-distinct non-collection siblings.
   std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
 
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
@@ -1142,8 +1144,9 @@ class OocCrossJoinBuildSink final : public PipelineSink {
   std::shared_ptr<OocCrossJoinContext> cross_ctx_;
 };
 
-class OocCrossJoinProbeSource final  // NOLINT(cppcoreguidelines-special-member-functions):
-                                     // scope-owned cleanup.
+class
+    OocCrossJoinProbeSource final  // NOLINT(cppcoreguidelines-special-member-functions):
+                                   // scope-owned cleanup.
     : public PipelineSource {
  public:
   OocCrossJoinProbeSource(std::shared_ptr<OocCrossJoinContext> cross_ctx,

@@ -603,6 +603,17 @@ TEST(SqlOracleFuzzer, ReplayReportsMissingTlpAggArmsAsSkipped) {
   EXPECT_NE(report.find("TLP_AGG"), std::string::npos) << report;
 }
 
+TEST(SqlOracleFuzzer, ReplayReportsIncompletePqsAsSkipped) {
+  OracleTrace trace;
+  trace.table = "t";
+  trace.setup = {"CREATE TABLE t (u INT64);"};
+  trace.pqs_count = "SELECT COUNT(*) FROM t;";
+  const auto report = ReplayOracleTrace(trace, false);
+  EXPECT_NE(report.find("skipped recorded oracle arm(s): PQS"),
+            std::string::npos)
+      << report;
+}
+
 // A failed Create/CrashAndReopen leaves db_ null while WAL segments,
 // checkpoint temps and LSM/TLCS companions may already be on disk. The sweep
 // must cover the whole Database::DeleteAll() family, not just five suffixes.

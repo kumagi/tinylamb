@@ -42,6 +42,7 @@
 #include "common/status_or.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
+#include "transaction/gc_wakeup.hpp"
 
 namespace tinylamb {
 
@@ -183,6 +184,29 @@ class TransactionManager {
   }
   void SetMetricsEnabled(bool enabled) {
     metrics_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  struct WaitEdgeWindow {
+    uint64_t start{0};
+    uint64_t end{0};
+  };
+
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/RestartRaces/Goal_Concurrency_CycleInstant.lean
+  // (sound): a non-empty set of closed wait-edge observation intervals
+  // [start, end] forces a simultaneous cycle instant iff max(start) <=
+  // min(end).
+  [[nodiscard]] static bool IsSimultaneousWaitCycle(
+      const std::vector<WaitEdgeWindow>& windows) noexcept {
+    if (windows.empty()) {
+      return false;
+    }
+    uint64_t max_start = windows[0].start;
+    uint64_t min_end = windows[0].end;
+    for (size_t i = 1; i < windows.size(); ++i) {
+      max_start = std::max(max_start, windows[i].start);
+      min_end = std::min(min_end, windows[i].end);
+    }
+    return max_start <= min_end;
   }
   // Deadlock prevention/detection policy for write-intent acquisition.
   //   kWaitDie       -- an older transaction may wait for a younger holder;
@@ -471,6 +495,12 @@ class TransactionManager {
   // Begin's registration and the ForgetTransaction at the end of
   // commit/abort).
   [[nodiscard]] bool IsActive(txn_id_t id) const;
+  // True when any active transaction other than |self| has uncommitted catalog
+  // changes (e.g. uncommitted CREATE INDEX / DROP INDEX / ALTER TABLE). Used
+  // by TLCS compaction to refuse rewriting page chains and recycling page IDs
+  // while another transaction holds uncommitted DDL/indexes referencing old
+  // RowPositions that are not yet visible in the committed catalog.
+  [[nodiscard]] bool HasOtherCatalogDirtyTransactions(txn_id_t self) const;
   // True when |id| names a live transaction that has started aborting.  The
   // registry lookup under transaction_table_lock keeps the Transaction*
   // dereference safe (the object cannot finish between the find and the
@@ -635,7 +665,8 @@ class TransactionManager {
   [[nodiscard]] Status CommitVersions(Transaction& txn, lsn_t commit_lsn);
   void AbortVersions(Transaction& txn);
   void ForgetTransaction(Transaction& txn);
-  void GarbageCollectVersions();
+  void GarbageCollectVersions(mvcc::GcSweepWakeupFence* out_fence = nullptr,
+                              bool* out_fence_valid = nullptr);
 
   // ---- commit sequencing ----
   // Timestamps are handed out with a plain atomic fetch_add; versions are
@@ -997,12 +1028,13 @@ class TransactionManager {
   // row. A cycle in this graph is a deadlock. Maintained under a single
   // global mutex because deadlock detection is a rare event, not a hot path.
   mutable std::mutex wait_for_mu_;
-  // Each entry: waiter_id -> (RowPosition, holder_id). When a waiter is
-  // granted, its entry is removed; when a holder commits/aborts, every entry
+  // Each entry: waiter_id -> (RowPosition, holder_id, since_gen). When a waiter
+  // is granted, its entry is removed; when a holder commits/aborts, every entry
   // whose holder_id matches is dropped.
   struct WaitForEdge {
     RowPosition row;
     txn_id_t holder{};
+    uint64_t since_gen{0};
   };
   std::unordered_map<txn_id_t, WaitForEdge> wait_for_edges_;
   // Cheap sleep predicate for the detector: updated under wait_for_mu_

@@ -1144,26 +1144,34 @@ TEST_F(AggregateHavingTest, MergeResolvesBothTableAliases) {
 TEST_F(AggregateHavingTest, TimedOutEagerMergeCannotBeCommitted) {
   RunSql(engine_.get(), context_.get(), "CREATE TABLE timeout_target(k INT64)");
   RunSql(engine_.get(), context_.get(), "CREATE TABLE timeout_source(k INT64)");
-  // 1 ms must elapse during Prepare for the cancel to fire deterministically;
-  // 2048 rows could plan under the deadline on fast machines, so size the
-  // source so the eager merge cannot finish inside it.
   RunSql(
       engine_.get(), context_.get(),
       "INSERT INTO timeout_source SELECT value FROM GENERATE_SERIES(1, 65536)");
   ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
 
-  auto timed = database_->BeginContext();
-  timed.txn_.SetStatementTimeout(std::chrono::milliseconds(1));
-  const auto prepared = engine_->Prepare(
-      timed,
-      "MERGE INTO timeout_target USING timeout_source "
-      "ON timeout_target.k = timeout_source.k "
-      "WHEN NOT MATCHED THEN INSERT (k) VALUES (timeout_source.k)");
-  ASSERT_EQ(prepared.GetStatus().GetCode(), StatusCode::kQueryCanceled)
-      << engine_->LastError();
-  EXPECT_GT(timed.txn_.WriteEpoch(), 0U);
-  EXPECT_TRUE(timed.txn_.IsFailed());
-  EXPECT_NE(timed.PreCommit(), Status::kSuccess);
+  bool canceled_after_write = false;
+  for (int timeout_ms : {1, 2, 4, 8, 16, 32, 64}) {
+    auto timed = database_->BeginContext();
+    timed.txn_.SetStatementTimeout(std::chrono::milliseconds(timeout_ms));
+    const auto prepared = engine_->Prepare(
+        timed,
+        "MERGE INTO timeout_target USING timeout_source "
+        "ON timeout_target.k = timeout_source.k "
+        "WHEN NOT MATCHED THEN INSERT (k) VALUES (timeout_source.k)");
+    ASSERT_EQ(prepared.GetStatus().GetCode(), StatusCode::kQueryCanceled)
+        << engine_->LastError();
+    if (timed.txn_.WriteEpoch() == 0) {
+      // Parsing or planning consumed the deadline. No eager write to undo.
+      ASSERT_FALSE(timed.txn_.IsFailed());
+      ASSERT_EQ(timed.PreCommit(), Status::kSuccess);
+      continue;
+    }
+    EXPECT_TRUE(timed.txn_.IsFailed());
+    EXPECT_NE(timed.PreCommit(), Status::kSuccess);
+    canceled_after_write = true;
+    break;
+  }
+  ASSERT_TRUE(canceled_after_write);
 
   auto reader = database_->BeginReadOnlyContext();
   EXPECT_EQ(

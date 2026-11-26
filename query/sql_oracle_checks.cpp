@@ -646,11 +646,11 @@ bool CheckTlp(Database& db, TransactionContext& ctx,
 bool CheckTlpAgg(Database& db, TransactionContext& ctx,
                  const std::vector<std::string>& tlp_agg, std::string* report,
                  bool verbose) {
+  if (tlp_agg.empty()) {
+    return true;  // Optional arm was not recorded.
+  }
   if (tlp_agg.size() != 4) {
-    *report += "[TLP AGG MISSING ARMS]\n";
-    *report += "  expected 4 aggregate arms, got " +
-               std::to_string(tlp_agg.size()) + "\n";
-    return true;
+    return false;  // Partial trace: report a skipped recorded arm.
   }
   std::string error;
   // Materialize each arm up front (a failed arm aborts the whole check), so
@@ -959,9 +959,7 @@ void AnalyzeCreatedTables(Database& db, TransactionContext& ctx,
 bool CheckPqs(Database& db, TransactionContext& ctx, const OracleTrace& t,
               std::string* report, bool verbose) {
   if (t.pqs_count.empty() || t.pqs_u.empty()) {
-    *report += "[PQS MISSING ARMS]\n";
-    *report += "  count=" + t.pqs_count + " pivot=" + t.pqs_u + "\n";
-    return true;
+    return t.pqs_count.empty() && t.pqs_u.empty();
   }
   std::string error;
   auto count = RunScalar(db, ctx, t.pqs_count, &error);

@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common_SeekIntervals
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Cores
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Specifics
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_MinClamp_ReverseWalk
+
+open TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Cores
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Specifics
+
+theorem sound : MinClamp.ReverseWalk.Goal := by
+  exact Common.reverseWalk_of_exact MinClamp.model Cores.minClamp_exact Cores.minClamp_sep
+
+end TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_MinClamp_ReverseWalk

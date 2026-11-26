@@ -1002,11 +1002,17 @@ GenType InferType(const Expression& expr) {
       }
     case TypeTag::kCaseExp: {
       const auto& c = expr->AsCaseExpression();
+      auto is_untyped_null = [](const Expression& e) {
+        return e && e->Type() == TypeTag::kConstantValue &&
+               e->AsConstantValue().GetValue().IsNull();
+      };
       GenType result = GenType::kInt;
       bool first = true;
-      for (const auto& [cond, value] : c.when_clauses_) {
-        (void)cond;
-        GenType t = InferType(value);
+      auto consider = [&](const Expression& branch) {
+        if (!branch || is_untyped_null(branch)) {
+          return;
+        }
+        GenType t = InferType(branch);
         if (first) {
           result = t;
           first = false;
@@ -1017,18 +1023,13 @@ GenType InferType(const Expression& expr) {
             result = GenType::kBool;
           }
         }
+      };
+      for (const auto& [cond, value] : c.when_clauses_) {
+        (void)cond;
+        consider(value);
       }
       if (c.else_clause_) {
-        GenType t = InferType(c.else_clause_);
-        if (first) {
-          result = t;
-        } else if (t != result) {
-          if (t == GenType::kFloat || result == GenType::kFloat) {
-            result = GenType::kFloat;
-          } else if (t == GenType::kBool || result == GenType::kBool) {
-            result = GenType::kBool;
-          }
-        }
+        consider(c.else_clause_);
       }
       return result;
     }
@@ -1040,7 +1041,10 @@ GenType InferType(const Expression& expr) {
       if (name == "upper" || name == "lower" || name == "concat" ||
           name == "substr" || name == "substring" || name == "trim" ||
           name == "ltrim" || name == "rtrim" || name == "replace" ||
-          name == "repeat" || name == "reverse") {
+          name == "repeat" || name == "reverse" || name == "chr" ||
+          name == "initcap" || name == "lpad" || name == "rpad" ||
+          name == "left" || name == "right" || name == "translate" ||
+          name == "soundex" || name == "normalize") {
         return GenType::kString;
       }
       if (name == "starts_with" || name == "ends_with") {
@@ -1092,22 +1096,25 @@ GenType InferType(const Expression& expr) {
         }
         return GenType::kInt;
       }
-      if (name == "nullif" || name == "ifnull") {
-        if (!call.Args().empty()) {
-          return InferType(call.Args().front());
-        }
-        return GenType::kInt;
-      }
-      if (name == "coalesce") {
+      if (name == "nullif" || name == "ifnull" || name == "coalesce") {
+        auto is_untyped_null = [](const Expression& e) {
+          return e && e->Type() == TypeTag::kConstantValue &&
+                 e->AsConstantValue().GetValue().IsNull();
+        };
+        std::optional<GenType> first_non_null;
         for (const auto& arg : call.Args()) {
-          if (InferType(arg) == GenType::kFloat) {
+          if (!arg || is_untyped_null(arg)) {
+            continue;
+          }
+          const GenType t = InferType(arg);
+          if (t == GenType::kFloat) {
             return GenType::kFloat;
           }
+          if (!first_non_null.has_value()) {
+            first_non_null = t;
+          }
         }
-        if (!call.Args().empty()) {
-          return InferType(call.Args().front());
-        }
-        return GenType::kInt;
+        return first_non_null.value_or(GenType::kInt);
       }
       if (name == "mod") {
         for (const auto& arg : call.Args()) {

@@ -49,6 +49,7 @@
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "transaction/mvcc_decisions.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
@@ -1523,8 +1524,9 @@ TEST_F(TransactionP6aTest,
 TEST_F(TransactionP6aTest,
        WriteSetSpillIoFailurePreservesStatusWithoutMaskingAsConflict) {
   tm_->SetWriteSetSpillThresholdForTest(64);
-  struct InjectResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
-                             // scope-owned cleanup.
+  struct
+      InjectResetGuard {  // NOLINT(cppcoreguidelines-special-member-functions):
+                          // scope-owned cleanup.
     ~InjectResetGuard() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
   } guard;
 
@@ -1608,6 +1610,94 @@ TEST_F(TransactionP6aTest,
     EXPECT_TRUE(after.TryAddWriteSet(rp));
     ASSERT_SUCCESS(after.Abort());
   }
+}
+
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/RestartRaces/Goal_Concurrency_CycleInstant.lean
+TEST(TransactionCycleInstantTest, SimultaneousWaitCycleCriterion) {
+  using W = TransactionManager::WaitEdgeWindow;
+  EXPECT_FALSE(TransactionManager::IsSimultaneousWaitCycle({}));
+  EXPECT_TRUE(TransactionManager::IsSimultaneousWaitCycle({W{1, 5}, W{3, 7}}));
+  EXPECT_TRUE(
+      TransactionManager::IsSimultaneousWaitCycle({W{1, 4}, W{4, 9}, W{2, 4}}));
+  EXPECT_FALSE(TransactionManager::IsSimultaneousWaitCycle({W{1, 3}, W{4, 5}}));
+  EXPECT_FALSE(TransactionManager::IsSimultaneousWaitCycle(
+      {W{1, 10}, W{2, 5}, W{6, 9}}));
+}
+
+// Lean proofs: EngineDecisions.MVCC.{PublicationHoles, UndoPeak, ChainSummary,
+// HistoricalCover, OverlayCache, GuardedDelete, ExistsDurability}
+TEST(TransactionMvccDecisionsTest, EngineDecisionsMvccPrimitives) {
+  // 1. PublicationHoles
+  const std::vector<mvcc::SealedWriteTx> hole = {
+      {.stamp = 8, .keys = {1}, .published = true},
+      {.stamp = 7, .keys = {1, 2}, .published = false},
+  };
+  const std::vector<uint64_t> k1 = {1};
+  const std::vector<uint64_t> k12 = {1, 2};
+  EXPECT_TRUE(mvcc::IsReadFootprintCertified(hole, 8, k1));
+  EXPECT_FALSE(mvcc::IsReadFootprintCertified(hole, 8, k12));
+
+  // 2. UndoPeak
+  const std::vector<std::vector<int64_t>> owners = {
+      {5, -5, 5},
+      {5, 4, -5, -4},
+  };
+  EXPECT_EQ(mvcc::OwnerUndoPeakBytes(owners[0]), 5U);
+  EXPECT_EQ(mvcc::OwnerUndoPeakBytes(owners[1]), 9U);
+  EXPECT_EQ(mvcc::TotalInterleavedUndoReserve(owners), 14U);
+
+  // 3. ChainSummary
+  const std::vector<mvcc::ChainVersionEntry> chain = {
+      {.ts = 4, .payload = 9, .wal_end = 20},
+      {.ts = 8, .payload = 9, .wal_end = 70},
+  };
+  const auto compacted = mvcc::CompactVersionChain(chain, /*durable=*/30);
+  EXPECT_EQ(compacted.payload_runs.size(), 1U);
+  EXPECT_EQ(compacted.dep_runs.size(), 2U);
+  EXPECT_EQ(compacted.PayloadAt(8), std::optional<int64_t>(9));
+  EXPECT_EQ(compacted.DependencyAt(4, 30), 0U);
+  EXPECT_EQ(compacted.DependencyAt(8, 30), 70U);
+  EXPECT_TRUE(compacted.HasWriteConflict(5));
+  EXPECT_FALSE(compacted.HasWriteConflict(8));
+
+  // 4. HistoricalCover
+  const std::vector<mvcc::CoveringChange> changes = {
+      {.rid = 0,
+       .before = mvcc::CoveringImage{.key = 7, .val = 42},
+       .after = mvcc::CoveringImage{.key = 8, .val = 42}},
+  };
+  const auto repaired = mvcc::RepairHistoricalCoveringScan(
+      [](uint64_t k) { return k == 7; }, {}, changes);
+  ASSERT_EQ(repaired.size(), 1U);
+  EXPECT_EQ(repaired[0], (mvcc::CoveringHit{.rid = 0, .key = 7, .val = 42}));
+
+  // 5. OverlayCache
+  const std::vector<mvcc::OverlayEdit> delta = {
+      {.key = 3, .value = 5},
+      {.key = 3, .value = std::nullopt},
+  };
+  const auto compact_delta = mvcc::CompactOverlayDelta(delta);
+  ASSERT_TRUE(compact_delta.contains(3));
+  EXPECT_FALSE(compact_delta.at(3).has_value());
+
+  // 6. GuardedDelete
+  const std::vector<uint64_t> snap_ids = {10, 20};
+  const std::vector<uint64_t> own_del = {10};
+  const std::vector<uint64_t> other_del = {20};
+  EXPECT_TRUE(mvcc::IsQuotaGuardedDeleteValid(snap_ids, own_del, {}, {}, 1));
+  EXPECT_FALSE(
+      mvcc::IsQuotaGuardedDeleteValid(snap_ids, own_del, other_del, {}, 1));
+
+  // 7. ExistsDurability
+  const std::vector<mvcc::ExistsEditBatch> batches = {
+      {.wal_end = 3, .edits = {{1, true}}},
+      {.wal_end = 9, .edits = {{1, false}, {2, true}}},
+  };
+  EXPECT_EQ(mvcc::ExistsDurabilityFence({}, batches), 3U);
+  auto batches2 = batches;
+  batches2.push_back({.wal_end = 12, .edits = {{2, false}}});
+  EXPECT_EQ(mvcc::ExistsDurabilityFence({}, batches2), 12U);
 }
 
 }  // namespace

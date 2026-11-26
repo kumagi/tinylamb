@@ -1,0 +1,45 @@
+import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+set_option linter.unnecessarySimpa false
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Minimum_PhysicalCount
+
+open TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+open TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common
+
+theorem sound : Minimum.PhysicalCount.Goal := by
+  intro rows x out hmem hlen hrem
+  let vals := rows.filterMap id
+  have hxvals : x ∈ vals := by simp [vals] at hmem ⊢; exact hmem
+  have hrem' : vals.min?.getD 0 < x ∧ vals.min?.getD 0 = out := by
+    simpa [Minimum.model, vals] using hrem
+  have hlt : vals.min?.getD 0 < x := hrem'.1
+  have hout : out = vals.min?.getD 0 := hrem'.2.symm
+  subst out
+  have hnevals : vals ≠ [] := by
+    intro h
+    have : x ∉ vals := by simp [h]
+    exact this hxvals
+  have hminmem : vals.min?.getD 0 ∈ vals := by
+    have hh := (List.min?_eq_some_iff (xs := vals)).mp (min_eq_getD hnevals)
+    exact hh.1
+  have hminne : vals.min?.getD 0 ≠ x := by omega
+  have herase := min_erase_of_lt hxvals hlt
+  have hneerase : (vals.erase x) ≠ [] := by
+    intro h
+    have : vals.min?.getD 0 ∉ vals.erase x := by simp [h]
+    exact this ((List.mem_erase_of_ne hminne).2 hminmem)
+  have his := isEmpty_false_of_ne_nil hneerase
+  rw [filterMap_id_erase_some hmem]
+  change (if (vals.erase x).isEmpty then Minimum.model.empty
+          else some (Minimum.model.result (vals.erase x))) = some (vals.min?.getD 0)
+  rw [his]
+  simp only [Bool.false_eq_true, ite_false, Option.some.injEq]
+  change (vals.erase x).min?.getD 0 = vals.min?.getD 0
+  exact herase
+
+end TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Minimum_PhysicalCount

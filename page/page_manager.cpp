@@ -567,8 +567,10 @@ Status DecodeCommittedBlockRecord(std::string_view buf, page_id_t expected_pid,
       !ConsumeU64(buf.data(), payload_size, &off, next_out) ||
       !ConsumeU64(buf.data(), payload_size, &off, link_lsn_out) ||
       !ConsumeU64(buf.data(), payload_size, &off, max_lsn_out) ||
+      // Hydrated columnar stub pages legitimately hold up to kMaxColumnarRows
+      // (32768) slots before being evicted to the blocks file.
       !ConsumeU32(buf.data(), payload_size, &off, &nslots) ||
-      nslots > RowPage::kMaxSlotsPerBlock) {
+      nslots > RowPage::kMaxColumnarRows) {
     return Status::kCorrupt;
   }
   const size_t arrays_bytes =
@@ -5666,12 +5668,11 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
       page_id_t prev_pid = 0;
       page_id_t next_pid = 0;
       lsn_t link_lsn = 0;
-      // These are ordinary row slots (PackedSlots elements), whose writer-side
-      // cap is kMaxSlotsPerBlock (4096), not the columnar-row cap (32768).
-      // Accepting a larger value would over-allocate committed_lsns_ and the
-      // slot array from a corrupt snapshot.
+      // Ordinary row pages cap inserts at kMaxSlotsPerBlock (4096), but a
+      // hydrated columnar stub page can legitimately carry up to
+      // kMaxColumnarRows (32768) slots into a checkpoint snapshot.
       if (!reader.ReadU64(&prev_pid) || !reader.ReadU64(&next_pid) ||
-          !reader.ReadU64(&link_lsn) || nslots > RowPage::kMaxSlotsPerBlock ||
+          !reader.ReadU64(&link_lsn) || nslots > RowPage::kMaxColumnarRows ||
           nslots > reader.Remaining() / (sizeof(uint64_t) + sizeof(uint32_t))) {
         return Status::kCorrupt;
       }

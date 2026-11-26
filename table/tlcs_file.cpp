@@ -1098,8 +1098,9 @@ Status FlushStagedBlock(const BlockStaging& stage,
         if (env == nullptr || env[0] == '\0') {
           return 3;
         }
-        const int v = std::atoi(env);
-        return (v >= 1 && v <= 19) ? v : 3;
+        char* end_ptr = nullptr;
+        const long v = std::strtol(env, &end_ptr, 10);
+        return (end_ptr != env && v >= 1 && v <= 19) ? static_cast<int>(v) : 3;
       }();
       return level;
     };
@@ -1823,7 +1824,7 @@ void MaterializeDictInts(const TlcsFile::ColumnMeta& meta,
                          std::span<const uint8_t> codes, uint32_t n,
                          int64_t* __restrict dst) noexcept {
   assert(n == 0 || (dst != nullptr && codes.size() >= n));
-  if (n == 0) {
+  if (n == 0 || dst == nullptr) {
     return;
   }
   if (meta.type == ValueType::kDouble) {
@@ -3744,7 +3745,8 @@ bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
     const ColumnMeta& meta = blk.columns[cid];
     if (meta.encoding == TlcsColumnEncoding::kVarChar ||
         IsCompressedVarCharEncoding(meta.encoding) ||
-        IsCompressedNumericEncoding(meta.encoding)) {
+        (IsCompressedNumericEncoding(meta.encoding) &&
+         meta.encoding != TlcsColumnEncoding::kBitPackedFor)) {
       return false;
     }
     if (meta.encoding == TlcsColumnEncoding::kNarrowDict &&
@@ -3752,9 +3754,10 @@ bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
          (meta.is_const_code && meta.data_size == 0))) {
       return false;
     }
-    if (meta.has_null && (meta.nulls_size != static_cast<uint64_t>(n) ||
-                          meta.nulls_offset > file_size_ ||
-                          meta.nulls_size > file_size_ - meta.nulls_offset)) {
+    if (meta.has_null &&
+        (meta.nulls_size == 0 || meta.nulls_size > static_cast<uint64_t>(n) ||
+         meta.nulls_offset > file_size_ ||
+         meta.nulls_size > file_size_ - meta.nulls_offset)) {
       return false;
     }
     if (meta.data_size > 0 &&
@@ -3786,9 +3789,15 @@ bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
     if (meta.has_null) {
       const uint8_t* const np = mmap_data + meta.nulls_offset;
       chunk.nulls.resize(k);
-      uint8_t* const dnp = chunk.nulls.data();
-      for (size_t j = 0; j < k; ++j) {
-        dnp[j] = np[rows[j]];
+      if (meta.nulls_size == static_cast<uint64_t>(n)) {
+        uint8_t* const dnp = chunk.nulls.data();
+        for (size_t j = 0; j < k; ++j) {
+          dnp[j] = np[rows[j]];
+        }
+      } else if (!tlcs_compression::GatherCompactNulls(
+                     std::span<const uint8_t>(np, meta.nulls_size), n, rows,
+                     chunk.nulls.data())) {
+        return false;
       }
     } else {
       chunk.nulls.clear();
@@ -3844,6 +3853,17 @@ bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
             std::memcpy(&dst[j], dp + (static_cast<size_t>(rows[j]) * 8U), 8U);
           }
         } else {
+          return false;
+        }
+        break;
+      }
+      case TlcsColumnEncoding::kBitPackedFor: {
+        // Lean proof:
+        //   lean/TinylambOpt/ResearchProofs/StorageExecution/BitLayoutsA.lean
+        //     (RowMajor.Lossless, RowMajor.SparseGather, RowMajor.PointSpan)
+        if (!tlcs_compression::GatherBitPackedFor(
+                std::span<const uint8_t>(dp, meta.data_size), n, meta.min_int,
+                rows, dst)) {
           return false;
         }
         break;
@@ -3936,20 +3956,28 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
     read_projected_streams_directly = true;
   }
 
-  // A block's column payloads are written contiguously (only AlignTo8 padding
-  // between them), but slicing them with one pread per nullmap/data/aux region
-  // costs 20-30 syscalls for a ten-column block.  Fetch the union of the
-  // requested columns' payload ranges in ONE pread and slice it in memory.
-  // A narrow projection can instead read the individual streams directly
-  // into their decoder buffers. This avoids any gaps between projected
-  // columns, and avoids allocating and copying through the union window.
-  // Lean proof: lean/TinylambOpt/QuotientFusion.lean (direct_projection_read)
-  std::vector<uint8_t> io_window;
-  uint64_t window_begin = std::numeric_limits<uint64_t>::max();
-  uint64_t window_end = 0;
+  // Lean proofs:
+  //   lean/TinylambOpt/QuotientFusion.lean (direct_projection_read)
+  //   lean/TinylambOpt/ResearchProofs/StorageExecution/GatherPlansA.lean
+  //     (Contiguous.LeastCost, Sector.LeastCost)
+  // Coalesce sorted requested stream slices into optimal covering extents:
+  // under startup-fee + transfer-byte pricing (`kExtraReadCostBytes + span`),
+  // merging adjacent slices iff `gap <= kExtraReadCostBytes` attains the
+  // globally minimum gather cost (`GatherPlans.Contiguous.LeastCost`), avoiding
+  // both giant cross-column gaps and excessive per-stream pread syscalls.
+  struct CoalescedExtent {
+    uint64_t begin{0};
+    uint64_t end{0};
+    std::vector<uint8_t> data;
+  };
+  std::vector<CoalescedExtent> io_extents;
   if (!have_mmap && !read_projected_streams_directly) {
-    uint64_t projected_bytes = 0;
-    uint64_t streams = 0;
+    struct StreamSpan {
+      uint64_t begin{0};
+      uint64_t end{0};
+    };
+    std::vector<StreamSpan> spans;
+    spans.reserve(column_ids.size() * 3);
     for (size_t i = 0; i < column_ids.size(); ++i) {
       const slot_t cid = column_ids[i];
       if (cid >= blk.columns.size()) {
@@ -3960,11 +3988,7 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
         if (size == 0 || offset > file_size_ || size > file_size_ - offset) {
           return;  // read_slice() reports the out-of-bounds slice
         }
-        window_begin = std::min(window_begin, offset);
-        window_end = std::max(window_end, offset + size);
-        const uint64_t room = UINT64_MAX - projected_bytes;
-        projected_bytes += std::min(size, room);
-        ++streams;
+        spans.push_back({.begin = offset, .end = offset + size});
       };
       if (m.has_null) {
         include(m.nulls_offset, m.nulls_size);
@@ -3977,25 +4001,54 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
       }
       include(m.aux_offset, m.aux_size);
     }
-    if (window_begin < window_end) {
+    if (!spans.empty()) {
       static const bool adaptive =
           ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_ADAPTIVE_TLCS_READ") ==
           nullptr;
-      const uint64_t window_bytes = window_end - window_begin;
       // Charge each additional system call one page of bytes. Large gaps
       // between requested streams can dwarf this cost even on a warm cache.
       constexpr uint64_t kExtraReadCostBytes = 4096;
       constexpr uint64_t kDirectStreamBytes = 65536;
-      read_projected_streams_directly =
-          adaptive &&
-          (streams == 1 || projected_bytes / streams >= kDirectStreamBytes ||
-           (window_bytes >= projected_bytes &&
-            window_bytes - projected_bytes >
-                (streams - 1) * kExtraReadCostBytes));
-      if (!read_projected_streams_directly) {
-        io_window.resize(static_cast<size_t>(window_bytes));
+      std::ranges::sort(spans, [](const StreamSpan& a, const StreamSpan& b) {
+        return a.begin < b.begin || (a.begin == b.begin && a.end < b.end);
+      });
+      if (!adaptive) {
+        uint64_t window_begin = spans.front().begin;
+        uint64_t window_end = spans.front().end;
+        for (const StreamSpan& s : spans) {
+          window_end = std::max(window_end, s.end);
+        }
+        io_extents.push_back(
+            {.begin = window_begin, .end = window_end, .data = {}});
+      } else {
+        for (const StreamSpan& s : spans) {
+          if (io_extents.empty()) {
+            io_extents.push_back({.begin = s.begin, .end = s.end, .data = {}});
+            continue;
+          }
+          CoalescedExtent& back = io_extents.back();
+          if (s.begin <= back.end ||
+              (s.begin - back.end) <= kExtraReadCostBytes) {
+            back.end = std::max(back.end, s.end);
+          } else {
+            io_extents.push_back({.begin = s.begin, .end = s.end, .data = {}});
+          }
+        }
+        // Single large stream or every extent is already a single large
+        // direct stream: read directly into decoder buffers without staging.
+        if (spans.size() == 1 ||
+            (io_extents.size() == spans.size() &&
+             std::ranges::all_of(io_extents, [](const CoalescedExtent& ext) {
+               return ext.end - ext.begin >= kDirectStreamBytes;
+             }))) {
+          io_extents.clear();
+          read_projected_streams_directly = true;
+        }
+      }
+      for (CoalescedExtent& ext : io_extents) {
+        ext.data.resize(static_cast<size_t>(ext.end - ext.begin));
         RETURN_IF_FAIL(
-            PreadAllFd(fd_, io_window.data(), io_window.size(), window_begin));
+            PreadAllFd(fd_, ext.data.data(), ext.data.size(), ext.begin));
       }
     }
   }
@@ -4014,13 +4067,15 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
     if (read_projected_streams_directly) {
       return PreadAllFd(fd_, dst, size, offset);
     }
-    if (offset < window_begin || offset - window_begin > io_window.size() ||
-        size > io_window.size() - (offset - window_begin)) {
-      return StatusError(StatusCode::kCorrupt,
-                         "tlcs stream outside block window");
+    for (const CoalescedExtent& ext : io_extents) {
+      if (offset >= ext.begin && offset - ext.begin <= ext.data.size() &&
+          size <= ext.data.size() - (offset - ext.begin)) {
+        std::memcpy(dst, ext.data.data() + (offset - ext.begin), size);
+        return Status::kSuccess;
+      }
     }
-    std::memcpy(dst, io_window.data() + (offset - window_begin), size);
-    return Status::kSuccess;
+    return StatusError(StatusCode::kCorrupt,
+                       "tlcs stream outside block window");
   };
   const auto read_raw64 = [&](const ColumnMeta& meta, int64_t* dst) -> Status {
     if (meta.data_size != static_cast<uint64_t>(n) * sizeof(int64_t)) {
@@ -4621,11 +4676,12 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
           chunk.varchar_ends.push_back(0);
           break;
         }
-        uint8_t packed[tlcs_compression::kTemporalTextPackedBytes];
+        std::array<uint8_t, tlcs_compression::kTemporalTextPackedBytes>
+            packed{};
         RETURN_IF_FAIL(read_slice(
             meta.data_offset + (static_cast<uint64_t>(row_idx) *
                                 tlcs_compression::kTemporalTextPackedBytes),
-            tlcs_compression::kTemporalTextPackedBytes, packed));
+            tlcs_compression::kTemporalTextPackedBytes, packed.data()));
         std::string s;
         if (!tlcs_compression::DecodeTemporalTextRow(packed, 0, &s)) {
           return StatusError(StatusCode::kCorrupt,
@@ -5369,11 +5425,10 @@ TlcsFile::BuildLazyColumnCacheEntries(
     auto lazy = std::make_shared<LSTableLazyColumnState>();
     lazy->backing_tlcs = self_tlcs;
     lazy->lazy_bytes_used = std::make_shared<std::atomic<size_t>>(0);
-    // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized atomic cache.
+    // NOLINTBEGIN(modernize-avoid-c-arrays)
     lazy->lazy_blocks =
-        std::make_unique<std::atomic<const LSTableColumnBlock*>[]>(
-            nblocks);  // NOLINT(modernize-avoid-c-arrays): runtime-sized atomic
-                       // cache.
+        std::make_unique<std::atomic<const LSTableColumnBlock*>[]>(nblocks);
+    // NOLINTEND(modernize-avoid-c-arrays)
     lazy->lazy_owners.resize(nblocks);
     lazy->block_meta.resize(nblocks);
     if (dict_kinds_[c] == TlcsDictKind::kCompleteNarrow) {
@@ -5499,7 +5554,7 @@ bool TlcsFile::DecodeSingleColumnBlockForCache(
   const auto row_bytes = static_cast<size_t>(n);
   switch (sm.encoding) {
     case TlcsColumnEncoding::kNarrowDict:
-      if (!(sm.is_const_code && sm.data_size == 0) &&
+      if ((!sm.is_const_code || sm.data_size != 0) &&
           sm.data_size < row_bytes) {
         return false;
       }
@@ -5610,9 +5665,9 @@ bool TlcsFile::DecodeSingleColumnBlockForCache(
       dict_kinds_[col] == TlcsDictKind::kCompleteNarrow) {
     if (sm.is_const_code && sm.data_size == 0) {
       if (n > 0) {
-        // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized buffer.
-        decoded->owned_dict_codes =
-            std::make_unique_for_overwrite<uint8_t[]>(n);
+        decoded->owned_dict_codes = std::make_unique_for_overwrite<
+            uint8_t[]>(  // NOLINT(modernize-avoid-c-arrays)
+            n);
         std::memset(decoded->owned_dict_codes.get(),
                     static_cast<uint8_t>(sm.const_code), n);
         dc.dict_codes = {decoded->owned_dict_codes.get(), n};

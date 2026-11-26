@@ -450,6 +450,31 @@ std::vector<Expression> SplitDisjuncts(const Expression& expression);
 
 Expression CombineDisjuncts(const std::vector<Expression>& expressions);
 
+// Raw comparison dispatch used by the column-vs-column fast path, constant
+// comparisons and columnar VARCHAR/DOUBLE checks. Higher-level matchers verify
+// the type pair before reaching this function; do not call it with arbitrary
+// mixed types assuming it is total.
+template <typename Left, typename Right>
+bool ComparePositional(BinaryOperation op, const Left& left,
+                       const Right& right) {
+  switch (op) {
+    case BinaryOperation::kEquals:
+      return left == right;
+    case BinaryOperation::kNotEquals:
+      return left != right;
+    case BinaryOperation::kLessThan:
+      return left < right;
+    case BinaryOperation::kLessThanEquals:
+      return left <= right;
+    case BinaryOperation::kGreaterThan:
+      return left > right;
+    case BinaryOperation::kGreaterThanEquals:
+      return left >= right;
+    default:
+      return false;
+  }
+}
+
 }  // namespace tinylamb::relational_detail
 
 #endif  // TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP

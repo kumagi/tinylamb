@@ -1165,178 +1165,287 @@ private theorem bow_sq_nat (n : Nat) (db : DB) (b : Bind) :
     grind
   exact ⟨hnat', hnat⟩
 
+
+/-! ## FractionalCap for the bowtie -/
+
+private theorem support_same_rel (n : Nat) (db : DB) (b : Bind) (a a' : Atom)
+    (hrel : a.rel = a'.rel)
+    (hs : a.src ∈ pattern.freeVars) (hd : a.dst ∈ pattern.freeVars)
+    (hs' : a'.src ∈ pattern.freeVars) (hd' : a'.dst ∈ pattern.freeVars) :
+    support n db a pattern b = support n db a' pattern b := by
+  simp [support, hs, hd, hs', hd', hrel]
+
+private theorem cover_bounds (n : Nat) (db : DB) (b : Bind) :
+    let L := (satBindings pattern n db b).length
+    let S0 := support n db a0 pattern b
+    let S1 := support n db a1 pattern b
+    let S2 := support n db a2 pattern b
+    L ≤ S0 * S1 ^ 2 ∧ L ≤ S0 * S1 * S2 ∧ L ≤ S1 ^ 2 * S2 ∧
+      L ≤ S0 ^ 2 * S2 ^ 2 ∧ L ^ 2 ≤ S0 * S1 ^ 3 * S2 := by
+  dsimp only
+  let L := (satBindings pattern n db b).length
+  let S0 := support n db a0 pattern b
+  let S1 := support n db a1 pattern b
+  let S2 := support n db a2 pattern b
+  have hS3 : support n db a3 pattern b = support n db a0 pattern b := by
+    exact support_same_rel n db b a3 a0 rfl
+      (by simp [a3, pattern]) (by simp [a3, pattern])
+      (by simp [a0, pattern]) (by simp [a0, pattern])
+  have hS4 : support n db a4 pattern b = support n db a1 pattern b := by
+    exact support_same_rel n db b a4 a1 rfl
+      (by simp [a4, pattern]) (by simp [a4, pattern])
+      (by simp [a1, pattern]) (by simp [a1, pattern])
+  have hS5 : support n db a5 pattern b = support n db a2 pattern b := by
+    exact support_same_rel n db b a5 a2 rfl
+      (by simp [a5, pattern]) (by simp [a5, pattern])
+      (by simp [a2, pattern]) (by simp [a2, pattern])
+  have h1 : L ≤ S0 * S1 ^ 2 := by
+    dsimp only [L, S0, S1]
+    simpa [C1, a0, a1, hS4, Nat.pow_succ, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using
+      (ordinary_cover_bound pattern n db b C1 cover_C1 atoms_C1 fv_nodup)
+  have h2 : L ≤ S0 * S1 * S2 := by
+    dsimp only [L, S0, S1, S2]
+    simpa [C6, a0, a2, hS4, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using
+      (ordinary_cover_bound pattern n db b C6 cover_C6 atoms_C6 fv_nodup)
+  have h3 : L ≤ S1 ^ 2 * S2 := by
+    dsimp only [L, S1, S2]
+    simpa [C2, a1, a2, hS4, Nat.pow_succ, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using
+      (ordinary_cover_bound pattern n db b C2 cover_C2 atoms_C2 fv_nodup)
+  have h4 : L ≤ S0 ^ 2 * S2 ^ 2 := by
+    dsimp only [L, S0, S2]
+    simpa [C7, a0, a2, hS3, hS5, Nat.pow_succ, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using
+      (ordinary_cover_bound pattern n db b C7 cover_C7 atoms_C7 fv_nodup)
+  have h5 : L ^ 2 ≤ S0 * S1 ^ 3 * S2 := by
+    have h := (bow_sq_nat n db b).2
+    dsimp only [L, S0, S1, S2]
+    simpa [hS4, Nat.pow_succ, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using h
+  exact ⟨h1, h2, h3, h4, h5⟩
+
+private theorem aggregated_bound (L S0 S1 S2 D W0 W1 W2 : Nat)
+    (hS0 : 0 < S0) (hS1 : 0 < S1) (hS2 : 0 < S2)
+    (hA : L ≤ S0 * S1 ^ 2) (hB : L ≤ S0 * S1 * S2)
+    (hC : L ≤ S1 ^ 2 * S2) (hDd : L ≤ S0 ^ 2 * S2 ^ 2)
+    (hE : L ^ 2 ≤ S0 * S1 ^ 3 * S2)
+    (h01 : 2 * D ≤ W0 + W1) (h12 : 2 * D ≤ W1 + W2) (h02 : D ≤ W0 + W2) :
+    L ^ D ≤ S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+  induction D using Nat.strongRecOn generalizing W0 W1 W2 with
+  | ind D ih =>
+      by_cases hD0 : D = 0
+      · subst D
+        simp
+        exact Nat.mul_le_mul (Nat.mul_le_mul (Nat.one_le_pow W0 S0 hS0)
+          (Nat.one_le_pow W1 S1 hS1)) (Nat.one_le_pow W2 S2 hS2)
+      · have hDpos : 0 < D := Nat.pos_of_ne_zero hD0
+        by_cases hEapp : 2 ≤ D ∧ 1 ≤ W0 ∧ 3 ≤ W1 ∧ 1 ≤ W2
+        · rcases hEapp with ⟨hD2, hW0, hW1, hW2⟩
+          have hrec := ih (D - 2) (by omega) (W0 - 1) (W1 - 3) (W2 - 1)
+            (by omega) (by omega) (by omega)
+          have hmul := Nat.mul_le_mul hE hrec
+          have hpow : L ^ D = L ^ 2 * L ^ (D - 2) := by
+            calc
+              L ^ D = L ^ (2 + (D - 2)) := by congr 1; omega
+              _ = L ^ 2 * L ^ (D - 2) := by rw [Nat.pow_add]
+          rw [hpow]
+          calc
+            L ^ 2 * L ^ (D - 2) ≤ (S0 * S1 ^ 3 * S2) *
+                (S0 ^ (W0 - 1) * S1 ^ (W1 - 3) * S2 ^ (W2 - 1)) := hmul
+            _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+                have e0 : 1 + (W0 - 1) = W0 := by omega
+                have e1 : 3 + (W1 - 3) = W1 := by omega
+                have e2 : 1 + (W2 - 1) = W2 := by omega
+                calc
+                  (S0 * S1 ^ 3 * S2) * (S0 ^ (W0 - 1) * S1 ^ (W1 - 3) * S2 ^ (W2 - 1))
+                      = S0 ^ (1 + (W0 - 1)) * S1 ^ (3 + (W1 - 3)) * S2 ^ (1 + (W2 - 1)) := by
+                          simp only [Nat.pow_add, Nat.pow_one]
+                          ac_rfl
+                  _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by rw [e0, e1, e2]
+        · by_cases hBapp : 1 ≤ W0 ∧ 1 ≤ W1 ∧ 1 ≤ W2
+          · rcases hBapp with ⟨hW0, hW1, hW2⟩
+            have hrec := ih (D - 1) (by omega) (W0 - 1) (W1 - 1) (W2 - 1)
+              (by omega) (by omega) (by omega)
+            have hmul := Nat.mul_le_mul hB hrec
+            have hpow : L ^ D = L * L ^ (D - 1) := by
+              calc
+                L ^ D = L ^ (1 + (D - 1)) := by congr 1; omega
+                _ = L * L ^ (D - 1) := by rw [Nat.pow_add, Nat.pow_one]
+            rw [hpow]
+            calc
+              L * L ^ (D - 1) ≤ (S0 * S1 * S2) *
+                  (S0 ^ (W0 - 1) * S1 ^ (W1 - 1) * S2 ^ (W2 - 1)) := hmul
+              _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+                  have e0 : 1 + (W0 - 1) = W0 := by omega
+                  have e1 : 1 + (W1 - 1) = W1 := by omega
+                  have e2 : 1 + (W2 - 1) = W2 := by omega
+                  calc
+                    (S0 * S1 * S2) * (S0 ^ (W0 - 1) * S1 ^ (W1 - 1) * S2 ^ (W2 - 1))
+                        = S0 ^ (1 + (W0 - 1)) * S1 ^ (1 + (W1 - 1)) * S2 ^ (1 + (W2 - 1)) := by
+                            simp only [Nat.pow_add, Nat.pow_one]
+                            ac_rfl
+                    _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by rw [e0, e1, e2]
+          · by_cases hW0z : W0 = 0
+            · have hW1 : 2 ≤ W1 := by omega
+              have hW2 : 1 ≤ W2 := by omega
+              have hrec := ih (D - 1) (by omega) 0 (W1 - 2) (W2 - 1)
+                (by omega) (by omega) (by omega)
+              have hmul := Nat.mul_le_mul hC hrec
+              have hpow : L ^ D = L * L ^ (D - 1) := by
+                calc
+                  L ^ D = L ^ (1 + (D - 1)) := by congr 1; omega
+                  _ = L * L ^ (D - 1) := by rw [Nat.pow_add, Nat.pow_one]
+              rw [hpow]
+              calc
+                L * L ^ (D - 1) ≤ (S1 ^ 2 * S2) *
+                    (S0 ^ 0 * S1 ^ (W1 - 2) * S2 ^ (W2 - 1)) := hmul
+                _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+                    have e1 : 2 + (W1 - 2) = W1 := by omega
+                    have e2 : 1 + (W2 - 1) = W2 := by omega
+                    calc
+                      (S1 ^ 2 * S2) * (S0 ^ 0 * S1 ^ (W1 - 2) * S2 ^ (W2 - 1))
+                          = S0 ^ 0 * S1 ^ (2 + (W1 - 2)) * S2 ^ (1 + (W2 - 1)) := by
+                              simp only [Nat.pow_add, Nat.pow_one, Nat.pow_zero]
+                              ac_rfl
+                      _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by rw [hW0z, e1, e2]
+            · by_cases hW2z : W2 = 0
+              · have hW0 : 1 ≤ W0 := by omega
+                have hW1 : 2 ≤ W1 := by omega
+                have hrec := ih (D - 1) (by omega) (W0 - 1) (W1 - 2) 0
+                  (by omega) (by omega) (by omega)
+                have hmul := Nat.mul_le_mul hA hrec
+                have hpow : L ^ D = L * L ^ (D - 1) := by
+                  calc
+                    L ^ D = L ^ (1 + (D - 1)) := by congr 1; omega
+                    _ = L * L ^ (D - 1) := by rw [Nat.pow_add, Nat.pow_one]
+                rw [hpow]
+                calc
+                  L * L ^ (D - 1) ≤ (S0 * S1 ^ 2) *
+                      (S0 ^ (W0 - 1) * S1 ^ (W1 - 2) * S2 ^ 0) := hmul
+                  _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+                      have e0 : 1 + (W0 - 1) = W0 := by omega
+                      have e1 : 2 + (W1 - 2) = W1 := by omega
+                      calc
+                        (S0 * S1 ^ 2) * (S0 ^ (W0 - 1) * S1 ^ (W1 - 2) * S2 ^ 0)
+                            = S0 ^ (1 + (W0 - 1)) * S1 ^ (2 + (W1 - 2)) * S2 ^ 0 := by
+                                simp only [Nat.pow_add, Nat.pow_one, Nat.pow_zero]
+                                ac_rfl
+                        _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by rw [e0, e1, hW2z]
+              · have hW1z : W1 = 0 := by omega
+                have hW0 : 2 ≤ W0 := by omega
+                have hW2 : 2 ≤ W2 := by omega
+                have hrec := ih (D - 1) (by omega) (W0 - 2) 0 (W2 - 2)
+                  (by omega) (by omega) (by omega)
+                have hmul := Nat.mul_le_mul hDd hrec
+                have hpow : L ^ D = L * L ^ (D - 1) := by
+                  calc
+                    L ^ D = L ^ (1 + (D - 1)) := by congr 1; omega
+                    _ = L * L ^ (D - 1) := by rw [Nat.pow_add, Nat.pow_one]
+                rw [hpow]
+                calc
+                  L * L ^ (D - 1) ≤ (S0 ^ 2 * S2 ^ 2) *
+                      (S0 ^ (W0 - 2) * S1 ^ 0 * S2 ^ (W2 - 2)) := hmul
+                  _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by
+                      have e0 : 2 + (W0 - 2) = W0 := by omega
+                      have e2 : 2 + (W2 - 2) = W2 := by omega
+                      calc
+                        (S0 ^ 2 * S2 ^ 2) * (S0 ^ (W0 - 2) * S1 ^ 0 * S2 ^ (W2 - 2))
+                            = S0 ^ (2 + (W0 - 2)) * S1 ^ 0 * S2 ^ (2 + (W2 - 2)) := by
+                                simp only [Nat.pow_add, Nat.pow_one, Nat.pow_zero]
+                                ac_rfl
+                        _ = S0 ^ W0 * S1 ^ W1 * S2 ^ W2 := by rw [e0, hW1z, e2]
+
 theorem sound_FractionalCap :
     TinylambOpt.ResearchGoals.Atlas.JoinPlans.ForumBowtie.FractionalCap.Goal := by
   intro n db b weights den hcov
   rcases hcov with ⟨hdenpos, hlen, hc⟩
-  rcases list6_of_length6 weights (by simpa [pattern] using hlen) with
-    ⟨w0, w1, w2, w3, w4, w5, rfl⟩
-  have h0 : den ≤ w0 + w2 + w3 + w5 := by
-    have hh := hc 0 (by simp [pattern])
-    simp [pattern] at hh
-    omega
-  have h1 : den ≤ w0 + w1 := by
-    have hh := hc 1 (by simp [pattern])
-    simp [pattern] at hh
-    omega
-  have h2 : den ≤ w1 + w2 := by
-    have hh := hc 2 (by simp [pattern])
-    simp [pattern] at hh
-    omega
-  have h3 : den ≤ w3 + w4 := by
-    have hh := hc 3 (by simp [pattern])
-    simp [pattern] at hh
-    omega
-  have h4 : den ≤ w4 + w5 := by
-    have hh := hc 4 (by simp [pattern])
-    simp [pattern] at hh
-    omega
-  rcases cover_decomp den w0 w1 w2 w3 w4 w5 h1 h2 h3 h4 h0 with
-    ⟨t1, t2, t3, t4, t5, t6, t7, s1, s4, hs, hu0, hu1, hu2, hu3, hu4, hu5⟩
+  have hlen6 : weights.length = 6 := by simpa [pattern] using hlen
+  rcases list6_of_length6 weights hlen6 with ⟨w0,w1,w2,w3,w4,w5, rfl⟩
+  have h0 : den ≤ w0 + w1 := by
+    have hh := hc 1 (by simp [pattern]); simpa [pattern] using hh
+  have h1 : den ≤ w1 + w2 := by
+    have hh := hc 2 (by simp [pattern]); simpa [pattern] using hh
+  have h2 : den ≤ w3 + w4 := by
+    have hh := hc 3 (by simp [pattern]); simpa [pattern] using hh
+  have h3 : den ≤ w4 + w5 := by
+    have hh := hc 4 (by simp [pattern]); simpa [pattern] using hh
+  have h4 : den ≤ w0 + w2 + w3 + w5 := by
+    have hh := hc 0 (by simp [pattern]); simpa [pattern, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hh
+  let L := (satBindings pattern n db b).length
   let S0 := support n db a0 pattern b
   let S1 := support n db a1 pattern b
   let S2 := support n db a2 pattern b
-  let S3 := support n db a3 pattern b
-  let S4 := support n db a4 pattern b
-  let S5 := support n db a5 pattern b
-  let L := (satBindings pattern n db b).length
-  have hb1 : L ≤ S0 * S1 * S4 := by
-    dsimp only [L, S0, S1, S4]
-    simpa [C1, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C1 cover_C1 atoms_C1 fv_nodup)
-  have hb2 : L ≤ S1 * S4 * S2 := by
-    dsimp only [L, S1, S4, S2]
-    simpa [C2, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C2 cover_C2 atoms_C2 fv_nodup)
-  have hb3 : L ≤ S1 * S4 * S3 := by
-    dsimp only [L, S1, S4, S3]
-    simpa [C3, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C3 cover_C3 atoms_C3 fv_nodup)
-  have hb4 : L ≤ S1 * S4 * S5 := by
-    dsimp only [L, S1, S4, S5]
-    simpa [C4, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C4 cover_C4 atoms_C4 fv_nodup)
-  have hb5 : L ≤ S1 * S3 * S5 := by
-    dsimp only [L, S1, S3, S5]
-    simpa [C5, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C5 cover_C5 atoms_C5 fv_nodup)
-  have hb6 : L ≤ S0 * S2 * S4 := by
-    dsimp only [L, S0, S2, S4]
-    simpa [C6, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C6 cover_C6 atoms_C6 fv_nodup)
-  have hb7 : L ≤ S0 * S2 * S3 * S5 := by
-    dsimp only [L, S0, S2, S3, S5]
-    simpa [C7, Nat.mul_assoc] using
-      (ordinary_cover_bound pattern n db b C7 cover_C7 atoms_C7 fv_nodup)
-  have hsq := bow_sq_nat n db b
-  dsimp only at hsq
-  have hsq1 : L ^ 2 ≤ S1 ^ 2 * S3 * S4 * S5 := by
-    simpa [L, S1, S3, S4, S5] using hsq.1
-  have hsq4 : L ^ 2 ≤ S0 * S1 * S2 * S4 ^ 2 := by
-    simpa [L, S0, S1, S2, S4] using hsq.2
+  have hbnd := cover_bounds n db b
+  dsimp only at hbnd
+  let L' := (satBindings pattern n db b).length
+  let S0' := support n db a0 pattern b
+  let S1' := support n db a1 pattern b
+  let S2' := support n db a2 pattern b
+  have hA : L ≤ S0 * S1 ^ 2 := hbnd.1
+  have hB : L ≤ S0 * S1 * S2 := hbnd.2.1
+  have hC : L ≤ S1 ^ 2 * S2 := hbnd.2.2.1
+  have hDd : L ≤ S0 ^ 2 * S2 ^ 2 := hbnd.2.2.2.1
+  have hE : L ^ 2 ≤ S0 * S1 ^ 3 * S2 := hbnd.2.2.2.2
   have href : (reference pattern n (fun r x y => if db r x y == 0 then 0 else 1) b).toNat = L := by
     have hbin : (fun r x y : Nat => if db r x y == 0 then (0 : Int) else 1) = bin db := by
       funext r x y
       simp [bin, beq_iff_eq]
     rw [hbin]
-    dsimp only [L]
+    dsimp [L]
     exact congrArg Int.toNat (reference_bin_count pattern n db b)
-  have hRHS :
-      ((pattern.atoms.zip [w0, w1, w2, w3, w4, w5]).map
-        (fun (a, w) => support n db a pattern b ^ w)).prod =
-      S0 ^ w0 * S1 ^ w1 * S2 ^ w2 * S3 ^ w3 * S4 ^ w4 * S5 ^ w5 := by
-    simp [pattern, S0, S1, S2, S3, S4, S5, a0, a1, a2, a3, a4, a5, Nat.mul_assoc]
-  rw [href, hRHS]
+  have hW : 2 * den ≤ (w0 + w3) + (w1 + w4) := by omega
+  have hW2 : 2 * den ≤ (w1 + w4) + (w2 + w5) := by omega
+  have hW3 : den ≤ (w0 + w3) + (w2 + w5) := by omega
   by_cases hL0 : L = 0
-  · rw [hL0]
-    simp [Nat.zero_pow hdenpos]
+  · rw [href, hL0]
+    simp [hdenpos]
   · have hLpos : 0 < L := Nat.pos_of_ne_zero hL0
-    have hSpos : ∀ a ∈ pattern.atoms, 0 < support n db a pattern b := by
-      intro a ha
-      have hlenpos : 0 < (satBindings pattern n db b).length := by simpa [L] using hLpos
-      obtain ⟨x, hx⟩ := List.exists_mem_of_ne_nil _ ((List.length_pos_iff).mp hlenpos)
-      have hxbind : x ∈ bindings n pattern.freeVars b := (List.mem_filter.mp hx).1
-      have hsat : satisfies pattern (bin db) x = true := (List.mem_filter.mp hx).2
-      have hnz : db a.rel (x a.src) (x a.dst) != 0 := by
-        have hall : pattern.atoms.all (fun t => value (bin db) t x != 0) = true := hsat
-        simpa [value, bin, beq_iff_eq] using (List.all_eq_true.mp hall a ha)
-      have hmemsl := supportList_mem pattern n db b a x hxbind hnz
-      have hslne : supportList pattern n db b a ≠ [] := by
-        intro hnil
-        have hnot : (x a.src, x a.dst) ∉ supportList pattern n db b a := by simp [hnil]
-        exact hnot hmemsl
-      have hslpos : 0 < (supportList pattern n db b a).length :=
-        (List.length_pos_iff).mpr hslne
-      rw [supportList_length] at hslpos
-      exact hslpos
-    have hS0p : 0 < S0 := by dsimp only [S0]; exact hSpos a0 (by simp [a0, pattern])
-    have hS1p : 0 < S1 := by dsimp only [S1]; exact hSpos a1 (by simp [a1, pattern])
-    have hS2p : 0 < S2 := by dsimp only [S2]; exact hSpos a2 (by simp [a2, pattern])
-    have hS3p : 0 < S3 := by dsimp only [S3]; exact hSpos a3 (by simp [a3, pattern])
-    have hS4p : 0 < S4 := by dsimp only [S4]; exact hSpos a4 (by simp [a4, pattern])
-    have hS5p : 0 < S5 := by dsimp only [S5]; exact hSpos a5 (by simp [a5, pattern])
-    let U0 := (t1 + t6 + t7) + s4
-    let U1 := (t1 + t2 + t3 + t4 + t5) + 2*s1
-    let U2 := (t2 + t6 + t7) + s4
-    let U3 := (t3 + t5 + t7) + s1
-    let U4 := (t1 + t2 + t3 + t4 + t6) + 2*s4
-    let U5 := (t4 + t5 + t7) + s1
-    have hU0 : U0 ≤ w0 := by dsimp only [U0]; exact hu0
-    have hU1 : U1 ≤ w1 := by dsimp only [U1]; exact hu1
-    have hU2 : U2 ≤ w2 := by dsimp only [U2]; exact hu2
-    have hU3 : U3 ≤ w3 := by dsimp only [U3]; exact hu3
-    have hU4 : U4 ≤ w4 := by dsimp only [U4]; exact hu4
-    have hU5 : U5 ≤ w5 := by dsimp only [U5]; exact hu5
-    have hbig : L ^ den ≤ S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 := by
-      have h1p := Nat.pow_le_pow_left hb1 t1
-      have h2p := Nat.pow_le_pow_left hb2 t2
-      have h3p := Nat.pow_le_pow_left hb3 t3
-      have h4p := Nat.pow_le_pow_left hb4 t4
-      have h5p := Nat.pow_le_pow_left hb5 t5
-      have h6p := Nat.pow_le_pow_left hb6 t6
-      have h7p := Nat.pow_le_pow_left hb7 t7
-      have hsp1 := Nat.pow_le_pow_left hsq1 s1
-      have hsp4 := Nat.pow_le_pow_left hsq4 s4
-      have hpoweq : L ^ den = L ^ t1 * L ^ t2 * L ^ t3 * L ^ t4 * L ^ t5 * L ^ t6 * L ^ t7 *
-          (L ^ 2) ^ s1 * (L ^ 2) ^ s4 := by
-        rw [show den = (t1 + t2 + t3 + t4 + t5 + t6 + t7) + 2*s1 + 2*s4 by omega]
-        simp only [Nat.pow_add]
-        rw [Nat.pow_mul, Nat.pow_mul]
-      rw [hpoweq]
-      have hm1 := Nat.mul_le_mul h1p h2p
-      have hm2 := Nat.mul_le_mul hm1 h3p
-      have hm3 := Nat.mul_le_mul hm2 h4p
-      have hm4 := Nat.mul_le_mul hm3 h5p
-      have hm5 := Nat.mul_le_mul hm4 h6p
-      have hm6 := Nat.mul_le_mul hm5 h7p
-      have hm7 := Nat.mul_le_mul hm6 hsp1
-      have hm8 := Nat.mul_le_mul hm7 hsp4
-      have hR : (S0 * S1 * S4) ^ t1 * (S1 * S4 * S2) ^ t2 * (S1 * S4 * S3) ^ t3 *
-          (S1 * S4 * S5) ^ t4 * (S1 * S3 * S5) ^ t5 * (S0 * S2 * S4) ^ t6 *
-          (S0 * S2 * S3 * S5) ^ t7 * (S1 ^ 2 * S3 * S4 * S5) ^ s1 *
-          (S0 * S1 * S2 * S4 ^ 2) ^ s4 =
-        S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 := by
-        dsimp only [U0, U1, U2, U3, U4, U5]
-        simp only [Nat.mul_pow, Nat.pow_add]
-        ac_rfl
-      rw [hR] at hm8
-      exact hm8
-    have hfinal : S0 ^ U0 * S1 ^ U1 * S2 ^ U2 * S3 ^ U3 * S4 ^ U4 * S5 ^ U5 ≤
+    have hp1 : 0 < S0 * S1 ^ 2 := by omega
+    have hp2 : 0 < S1 ^ 2 * S2 := by omega
+    have hS0pos : 0 < S0 := by
+      by_cases hz : S0 = 0
+      · simp [hz] at hp1
+      · exact Nat.pos_of_ne_zero hz
+    have hS1pos : 0 < S1 := by
+      by_cases hz : S1 = 0
+      · simp [hz] at hp1
+      · exact Nat.pos_of_ne_zero hz
+    have hS2pos : 0 < S2 := by
+      by_cases hz : S2 = 0
+      · simp [hz] at hp2
+      · exact Nat.pos_of_ne_zero hz
+    have hmain := aggregated_bound L S0 S1 S2 den (w0+w3) (w1+w4) (w2+w5)
+      hS0pos hS1pos hS2pos hA hB hC hDd hE hW hW2 hW3
+    let S3 := support n db a3 pattern b
+    let S4 := support n db a4 pattern b
+    let S5 := support n db a5 pattern b
+    have hs3 : S3 = S0 := by
+      dsimp only [S3, S0]
+      exact support_same_rel n db b a3 a0 rfl
+        (by simp [a3, pattern]) (by simp [a3, pattern])
+        (by simp [a0, pattern]) (by simp [a0, pattern])
+    have hs4 : S4 = S1 := by
+      dsimp only [S4, S1]
+      exact support_same_rel n db b a4 a1 rfl
+        (by simp [a4, pattern]) (by simp [a4, pattern])
+        (by simp [a1, pattern]) (by simp [a1, pattern])
+    have hs5 : S5 = S2 := by
+      dsimp only [S5, S2]
+      exact support_same_rel n db b a5 a2 rfl
+        (by simp [a5, pattern]) (by simp [a5, pattern])
+        (by simp [a2, pattern]) (by simp [a2, pattern])
+    rw [href]
+    have hRHS :
+        ((pattern.atoms.zip [w0, w1, w2, w3, w4, w5]).map
+          (fun (a, w) => support n db a pattern b ^ w)).prod =
         S0 ^ w0 * S1 ^ w1 * S2 ^ w2 * S3 ^ w3 * S4 ^ w4 * S5 ^ w5 := by
-      have hp0 := pow_mono_of_pos hS0p hU0
-      have hp1 := pow_mono_of_pos hS1p hU1
-      have hp2 := pow_mono_of_pos hS2p hU2
-      have hp3 := pow_mono_of_pos hS3p hU3
-      have hp4 := pow_mono_of_pos hS4p hU4
-      have hp5 := pow_mono_of_pos hS5p hU5
-      have hm1 := Nat.mul_le_mul hp0 hp1
-      have hm2 := Nat.mul_le_mul hm1 hp2
-      have hm3 := Nat.mul_le_mul hm2 hp3
-      have hm4 := Nat.mul_le_mul hm3 hp4
-      exact Nat.mul_le_mul hm4 hp5
-    exact Nat.le_trans hbig hfinal
+      simp [pattern, S0, S1, S2, S3, S4, S5, a0, a1, a2, a3, a4, a5, Nat.mul_assoc]
+    rw [hRHS]
+    calc
+      L ^ den ≤ S0 ^ (w0 + w3) * S1 ^ (w1 + w4) * S2 ^ (w2 + w5) := hmain
+      _ = S0 ^ w0 * S1 ^ w1 * S2 ^ w2 * S3 ^ w3 * S4 ^ w4 * S5 ^ w5 := by
+          rw [hs3, hs4, hs5, Nat.pow_add, Nat.pow_add, Nat.pow_add]
+          ac_rfl
 
 end ForumWork
+
 
 namespace CollisionWork
 
@@ -2178,8 +2287,8 @@ theorem sound_CollisionCorrection :
           intro bs hbs
           rw [hcoll bs hbs]
 
-
 end CollisionWork
+
 
 /-! ## Assigned goals -/
 

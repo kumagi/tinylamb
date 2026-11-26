@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Common
+import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_LastBlue_StateDomain
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_LastBlue_ProductDepth
+
+open TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
+
+theorem sound : LastBlue.ProductDepth.Goal :=
+  TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Generic.productDepth_of_stateDomain _
+    TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_LastBlue_StateDomain.sound
+
+end TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_LastBlue_ProductDepth

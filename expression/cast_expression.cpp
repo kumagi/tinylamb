@@ -445,10 +445,6 @@ std::string_view InferProtoWireType(std::string_view text) {
     if (field == "required_test_enum") {
       return "googlesql_test.KitchenSinkEnumPB";
     }
-    if (field == "str_value" || field == "int32_val1" ||
-        field == "int32_val2") {
-      return "googlesql_test.TestExtraPB";
-    }
     if (field == "test_enum") {
       type = "googlesql_test.Proto3KitchenSink";
     } else if (field == "value" && type.empty()) {

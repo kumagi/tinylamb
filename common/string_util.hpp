@@ -18,13 +18,13 @@ namespace tinylamb {
 // An empty search target matches all code-point boundaries, including the
 // boundary after the last character. Position is nonzero and occurrence is
 // positive. A negative position is one-based from the end (`-1` starts at the
-// last character), matching the non-empty-target search.
+// trailing boundary `length`, returning `length + 1`, per GoogleSQL).
 [[nodiscard]] inline int64_t InstrEmptyTargetPosition(size_t length,
                                                       int64_t position,
                                                       int64_t occurrence) {
   const uint64_t start =
       position > 0 ? static_cast<uint64_t>(position - 1)
-                   : static_cast<uint64_t>(-(position + 1)) + uint64_t{1};
+                   : static_cast<uint64_t>(-(position + 1));
   const auto extra = static_cast<uint64_t>(occurrence - 1);
   if (start > length || extra > length - start) {
     return 0;
@@ -275,16 +275,6 @@ inline constexpr char kDefaultTrimCutset[] =
     }
     return std::ranges::find(overflow_points, point) != overflow_points.end();
   };
-  const auto contains_single_byte_cutset_member = [&](std::string_view point) {
-    return std::ranges::any_of(point, [&](char c) {
-      const auto byte = static_cast<unsigned char>(c);
-      return ((single_byte_bits[byte >> 6] >> (byte & 63U)) & 1U) != 0U;
-    });
-  };
-  // A cutset byte that is not a complete sequence (e.g. a lone 0xAC from a
-  // BYTES literal) matches a valid edge code point when any of its bytes
-  // matches. Remove the complete code point so trimming does not leave broken
-  // UTF-8. Malformed text still falls back to byte-wise trimming.
   if (leading) {
     while (!text.empty()) {
       const size_t len = std::min(
@@ -293,16 +283,10 @@ inline constexpr char kDefaultTrimCutset[] =
         text.remove_prefix(len);
         continue;
       }
-      const std::string_view edge = text.substr(0, len);
-      const bool complete_sequence =
-          len > 1 && std::ranges::all_of(edge.substr(1), [](char c) {
-            return (static_cast<unsigned char>(c) & 0xC0U) == 0x80U;
-          });
-      if (complete_sequence && contains_single_byte_cutset_member(edge)) {
-        // Keep a valid UTF-8 edge code point intact. A one-byte BYTES cutset
-        // may match any byte within it, but trimming only that byte would
-        // leave a malformed prefix and differ from the trailing path.
-        text.remove_prefix(len);
+      // A one-byte cutset member (e.g. a lone byte from a BYTES literal) trims
+      // that leading byte directly.
+      if (len > 1 && in_cutset(text.substr(0, 1))) {
+        text.remove_prefix(1);
         continue;
       }
       break;
@@ -325,9 +309,8 @@ inline constexpr char kDefaultTrimCutset[] =
         text.remove_suffix(len);
         continue;
       }
-      if (len > 1 &&
-          contains_single_byte_cutset_member(text.substr(start, len))) {
-        text.remove_suffix(len);
+      if (len > 1 && in_cutset(text.substr(text.size() - 1, 1))) {
+        text.remove_suffix(1);
         continue;
       }
       break;

@@ -557,4 +557,63 @@ TEST(BandJoinTest, SemiJoinFallsBackToOutputSchemaForResidualPredicate) {
   EXPECT_EQ(join.GetStatus(), Status::kSuccess);
 }
 
+// Lean proof:
+//   lean/TinylambOpt/ResearchProofs/StorageExecution/PostingJoinsA.lean
+//     (Following.OrderedProbe, Following.OffsetCount, Following.PruneExtent)
+TEST(BandJoinTest, PostingJoinsTwoSidedBandAndSemiAntiBounds) {
+  const Schema combined = IntSchema("l", "x") + IntSchema("r", "x");
+  // l.x < r.x AND r.x <= l.x + 5 (Following two-sided band).
+  Expression pred = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "x")),
+                          BinaryOperation::kLessThan,
+                          ColumnValueExp(ColumnName("r", "x"))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("r", "x")),
+          BinaryOperation::kLessThanEquals,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("l", "x")),
+                              BinaryOperation::kAdd,
+                              ConstantValueExp(Value(int64_t{5})))));
+  const std::vector<Row> left_rows = {
+      Row({Value(int64_t{-100})}),  // pruned by PruneExtent (all right > -95)
+      Row({Value(int64_t{10})}),    // matches 11, 15 (not 10, not 16)
+      Row({Value(int64_t{20})}),    // matches nothing
+      Row({Value(int64_t{500})}),   // pruned by PruneExtent (all right <= 500)
+  };
+  const std::vector<Row> right_rows = {
+      Row({Value(int64_t{10})}), Row({Value(int64_t{11})}),
+      Row({Value(int64_t{15})}), Row({Value(int64_t{16})}),
+      Row({Value(int64_t{50})}),
+  };
+
+  {
+    BandJoin inner(Source(left_rows), {0}, Source(right_rows), {0},
+                   BinaryOperation::kLessThan, pred, combined, JoinKind::kInner,
+                   1, 1, combined);
+    EXPECT_EQ(IntPairs(Drain(&inner)),
+              (std::vector<std::pair<int64_t, int64_t>>{{10, 11}, {10, 15}}));
+    EXPECT_EQ(inner.GetStatus(), Status::kSuccess);
+  }
+  {
+    BandJoin semi(Source(left_rows), {0}, Source(right_rows), {0},
+                  BinaryOperation::kLessThan, pred, combined, JoinKind::kSemi,
+                  1, 1, IntSchema("l", "x"));
+    const std::vector<Row> out = Drain(&semi);
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_EQ(out[0][0], Value(int64_t{10}));
+    EXPECT_EQ(semi.GetStatus(), Status::kSuccess);
+  }
+  {
+    BandJoin anti(Source(left_rows), {0}, Source(right_rows), {0},
+                  BinaryOperation::kLessThan, pred, combined, JoinKind::kAnti,
+                  1, 1, IntSchema("l", "x"));
+    const std::vector<Row> out = Drain(&anti);
+    ASSERT_EQ(out.size(), 3U);
+    EXPECT_EQ(out[0][0], Value(int64_t{-100}));
+    EXPECT_EQ(out[1][0], Value(int64_t{20}));
+    EXPECT_EQ(out[2][0], Value(int64_t{500}));
+    EXPECT_EQ(anti.GetStatus(), Status::kSuccess);
+  }
+}
+
 }  // namespace tinylamb

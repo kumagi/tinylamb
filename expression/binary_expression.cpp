@@ -933,7 +933,10 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       uint64_t unsigned_result = 0;
       switch (op) {
         case BinaryOperation::kAdd:
-          unsigned_result = lhs + rhs;
+          if (__builtin_add_overflow(lhs, rhs, &unsigned_result)) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "integer overflow on '+'");
+          }
           break;
         case BinaryOperation::kSubtract:
           unsigned_result = lhs - rhs;

@@ -1,16 +1,20 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include "common/platform/process.hpp"
 #include "query/expr_oracle_fuzzer.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -77,11 +81,11 @@ TEST(ExprOracleFuzzer, ReplayPinnedUniformCaseThrowRegression) {
   static const char* kTrace =
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 9446931280153951730\n"
-      "-- sql: SELECT (CAST(((CASE WHEN ((CASE WHEN 0 THEN "
-      "(-9223372036854775807 - 1) WHEN 0 THEN -469341141271522 ELSE "
+      "-- sql: SELECT (CAST(((CASE WHEN ((CASE WHEN FALSE THEN "
+      "(-9223372036854775807 - 1) WHEN FALSE THEN -469341141271522 ELSE "
       "(-9223372036854775807 - 1) END) IN ((CAST((CAST('NaN' AS FLOAT64) * "
       "-1.0) AS INT64)))) THEN (CAST((-(CAST((--5) AS FLOAT64))) AS INT64)) "
-      "END) + (CAST(((CASE WHEN 1 THEN (-9223372036854775807 - 1) ELSE "
+      "END) + (CAST(((CASE WHEN TRUE THEN (-9223372036854775807 - 1) ELSE "
       "ABS(3954908965629019) END) + (CAST(LEAST((CAST('NaN' AS FLOAT64) / "
       "CAST(NULL AS FLOAT64)), (-1.9 * 0.0)) AS INT64))) AS FLOAT64))) AS "
       "INT64));\n"
@@ -137,8 +141,9 @@ TEST(ExprOracleFuzzer, ReplayPinnedModuloOverflowRegression) {
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 2051287015386227372\n"
       "-- sql: SELECT (CASE WHEN (ABS(MOD((-9223372036854775807 - 1), -1)) "
-      "= (CASE WHEN 1 THEN (-1) ELSE -3 END)) THEN ((CAST(ABS((CASE WHEN 0 "
-      "THEN 2635108465532378 WHEN 0 THEN 9223372036854775807 ELSE "
+      "= (CASE WHEN TRUE THEN (-1) ELSE -3 END)) THEN ((CAST(ABS((CASE WHEN "
+      "FALSE "
+      "THEN 2635108465532378 WHEN FALSE THEN 9223372036854775807 ELSE "
       "-3081505891392267 END)) AS FLOAT64)) - CAST(NULL AS FLOAT64)) END);\n"
       "-- sexpr: (case ((eq (abs (mod (i -9223372036854775808) (i -1))) "
       "(case ((b true) (neg (i 1))) (i -3))) (sub (cast-float (abs (case ((b "
@@ -204,8 +209,8 @@ TEST(ExprOracleFuzzer, ReplayPinnedNullifCoalesceThrowRegression) {
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 1638323354274135657\n"
       "-- sql: SELECT ((CAST(((CAST(((0 * 9223372036854775807) + "
-      "1803856200320681) AS FLOAT64)) * (-2959661964383290 - (CASE WHEN 0 "
-      "THEN CAST(NULL AS INT64) WHEN 0 THEN CAST(NULL AS INT64) END))) AS "
+      "1803856200320681) AS FLOAT64)) * (-2959661964383290 - (CASE WHEN FALSE "
+      "THEN CAST(NULL AS INT64) WHEN FALSE THEN CAST(NULL AS INT64) END))) AS "
       "INT64)) > (CAST(COALESCE(NULLIF((CAST((-1939353828762478 + "
       "-CAST('Infinity' AS FLOAT64)) AS INT64)), (CAST((-CAST('Infinity' AS "
       "FLOAT64) - -3425790469862174) AS INT64))), (CASE WHEN CAST(NULL AS "
@@ -246,7 +251,7 @@ TEST(ExprOracleFuzzer, ReplayPinnedNullEqCastThrowRegression) {
       "-- seed: 9506000356231616757\n"
       "-- sql: SELECT ((NOT CAST(NULL AS BOOL)) IN (NULLIF(((CAST(NULLIF("
       "CAST('Infinity' AS FLOAT64), 0.0) AS INT64)) >= (0.9 + CAST(NULL AS "
-      "FLOAT64))), 0)));\n"
+      "FLOAT64))), FALSE)));\n"
       "-- sexpr: (in (not (n bool)) (nullif (ge (cast-int (nullif (f inf) (f "
       "0))) (add (f 0.9) (n int))) (b false)))\n"
       "-- reference: THROW(cannot cast NaN/Inf float to int)\n"
@@ -269,7 +274,7 @@ TEST(ExprOracleFuzzer, ReplayPinnedModuloDoubleZeroRegression) {
       "-- seed: 9476934689035179491\n"
       "-- sql: SELECT (CAST(MOD((CAST(COALESCE(1.0, (0 / 1896039082833363)) "
       "AS INT64)), (CASE WHEN CAST(NULL AS BOOL) THEN ABS((CAST(((-922337203"
-      "6854775807 - 1) * (-9223372036854775807 - 1)) AS FLOAT64))) WHEN 0 "
+      "6854775807 - 1) * (-9223372036854775807 - 1)) AS FLOAT64))) WHEN FALSE "
       "THEN NULLIF((-CAST('NaN' AS FLOAT64)), (CAST(MOD(-2962346319136238, "
       "(-9223372036854775807 - 1)) AS FLOAT64))) ELSE 0.0 END)) AS FLOAT64));\n"
       "-- sexpr: (cast-float (mod (cast-int (coalesce (f 1) (div (i 0) (i "
@@ -294,7 +299,8 @@ TEST(ExprOracleFuzzer, ReplayPinnedModuloTwoFloat64ArgsRegression) {
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 1635809587224612903\n"
       "-- sql: SELECT (CAST(((CAST((CAST(MOD((CASE WHEN CAST(NULL AS BOOL) "
-      "THEN 2.5 ELSE -1.5 END), (CASE WHEN 0 THEN 0.5 WHEN 1 THEN -1.5 END)) "
+      "THEN 2.5 ELSE -1.5 END), (CASE WHEN FALSE THEN 0.5 WHEN TRUE THEN -1.5 "
+      "END)) "
       "AS FLOAT64)) AS INT64)) + (-(CAST(((CAST(COALESCE(-4.3, -4.8) AS "
       "INT64)) * (1.0 - -1305957821310940)) AS INT64)))) AS FLOAT64));\n"
       "-- sexpr: (cast-float (add (cast-int (cast-float (mod (case ((n bool) "
@@ -317,10 +323,11 @@ TEST(ExprOracleFuzzer, ReplayPinnedReassociateAddOverflowRegression) {
   static const char* kTrace =
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 6383078004781039520\n"
-      "-- sql: SELECT (CASE WHEN 0 THEN (CAST(MOD((-9223372036854775807 - "
+      "-- sql: SELECT (CASE WHEN FALSE THEN (CAST(MOD((-9223372036854775807 - "
       "1), (CAST(ABS(1.0) AS INT64))) AS FLOAT64)) ELSE (CAST(LEAST((CAST("
       "((CAST(((-9223372036854775807 - 1) / -CAST('Infinity' AS FLOAT64)) AS "
-      "INT64)) * (CASE WHEN 0 THEN -1.5 WHEN 1 THEN CAST(NULL AS FLOAT64) "
+      "INT64)) * (CASE WHEN FALSE THEN -1.5 WHEN TRUE THEN CAST(NULL AS "
+      "FLOAT64) "
       "ELSE CAST('NaN' AS FLOAT64) END)) AS INT64)), ((-1 + "
       "(-9223372036854775807 - 1)) - (CAST((-3160301361151923 + -3.1) AS "
       "INT64)))) AS FLOAT64)) END);\n"
@@ -354,8 +361,8 @@ TEST(ExprOracleFuzzer, ReplayPinnedDeadBranchCastOrderRegression) {
       "-- tinylamb-expr-oracle-test v1\n"
       "-- seed: 1638323354274135657\n"
       "-- sql: SELECT ((CAST(((CAST(((0 * 9223372036854775807) + "
-      "1803856200320681) AS FLOAT64)) * (-2959661964383290 - (CASE WHEN 0 "
-      "THEN CAST(NULL AS INT64) WHEN 0 THEN CAST(NULL AS INT64) END))) AS "
+      "1803856200320681) AS FLOAT64)) * (-2959661964383290 - (CASE WHEN FALSE "
+      "THEN CAST(NULL AS INT64) WHEN FALSE THEN CAST(NULL AS INT64) END))) AS "
       "INT64)) > (CAST(COALESCE(NULLIF((CAST((-1939353828762478 + -CAST("
       "'Infinity' AS FLOAT64)) AS INT64)), (CAST((-CAST('Infinity' AS "
       "FLOAT64) - -3425790469862174) AS INT64))), (CASE WHEN CAST(NULL AS "
@@ -594,6 +601,118 @@ TEST(ExprOracleFuzzer, RowAwareExtendedOpsEquivalence) {
   EXPECT_GT(null_reject_verified_count, 0)
       << "Expected null rejection verification to trigger on generated "
          "extended-op predicates";
+}
+
+TEST(ExprOracleFuzzer, ReplayPinnedFuzzFindingsRegressions) {
+  // Row-aware ABS(INT64_MIN) error-suppression regressions:
+  // - seed 1236065886992294752: CompileScanFilter disjunctive branch reordering
+  // - seed 6144139855833357989: FactorAndEnvelopeOneSelect absorption
+  for (uint64_t seed :
+       {uint64_t{1236065886992294752ULL}, uint64_t{6144139855833357989ULL}}) {
+    std::mt19937 rng(static_cast<uint32_t>(seed));
+    ExprGenConfig config;
+    config.extended_ops = true;
+    RowExprOracleTrace fresh;
+    fresh.seed = seed;
+    fresh.extended_ops = true;
+    EXPECT_EQ(RunRowExprOracleIteration(rng, false, &fresh, config), "")
+        << "row_expr_oracle seed=" << seed;
+  }
+
+  // Scalar expression regressions:
+  // - 11118779134808807094: __bit_xor unsignedness parity (AST vs
+  // function_eval)
+  // - 11580306021212848888: UINT64 + INT64 overflow in binary_expression
+  // - 14649602716663142413: CASE-lift over binary comparison throw order
+  // - 4199220810818691348:  StaticallyNonBoolean for CASE under x AND x -> x
+  // - 10137269684562481425: InferType missing CHR() in COALESCE NULL hint
+  // - 6016210131723607869:  CaseExpression::ResultType skipping kInvalid branch
+  for (const auto& [seed, extended] :
+       std::vector<std::pair<uint64_t, bool>>{{11118779134808807094ULL, true},
+                                              {11580306021212848888ULL, true},
+                                              {14649602716663142413ULL, true},
+                                              {4199220810818691348ULL, true},
+                                              {10137269684562481425ULL, true},
+                                              {6016210131723607869ULL, true}}) {
+    std::mt19937 rng(static_cast<uint32_t>(seed));
+    ExprGenConfig config;
+    config.extended_ops = extended;
+    ExprOracleTrace fresh;
+    fresh.seed = seed;
+    fresh.extended_ops = extended;
+    EXPECT_EQ(RunExprOracleIteration(rng, false, &fresh, config), "")
+        << "expr_oracle seed=" << seed;
+  }
+}
+
+TEST(ExprOracleFuzzer, ReplayRegressionDir) {
+  const char* dir =
+      ::tinylamb::platform::GetEnv("TINYLAMB_EXPR_REGRESSION_DIR");
+  if (dir == nullptr || *dir == '\0') {
+    GTEST_SKIP() << "set TINYLAMB_EXPR_REGRESSION_DIR to replay .test files";
+  }
+  std::vector<std::filesystem::path> files;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".test") {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  for (const auto& path : files) {
+    std::ifstream in(path);
+    ASSERT_TRUE(in.good()) << path;
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    if (text.starts_with("-- tinylamb-expr-oracle-test v1")) {
+      ExprOracleTrace trace;
+      if (ParseExprOracleTest(text, &trace)) {
+        EXPECT_EQ(ReplayExprOracleTrace(trace, false), "") << path;
+      } else {
+        // Traces whose SQL contains an unescaped newline fail line-based
+        // parsing; replay directly from the recorded seed + extended_ops.
+        uint64_t seed = 0;
+        bool extended = false;
+        std::istringstream iss(text);
+        std::string line;
+        while (std::getline(iss, line)) {
+          if (line.starts_with("-- seed: ")) {
+            seed = std::stoull(line.substr(9));
+          } else if (line.starts_with("-- extended_ops: ")) {
+            extended = (line.substr(17) == "true");
+          }
+        }
+        std::mt19937 rng(static_cast<uint32_t>(seed));
+        ExprGenConfig config;
+        config.extended_ops = extended;
+        ExprOracleTrace fresh;
+        fresh.seed = seed;
+        fresh.extended_ops = extended;
+        EXPECT_EQ(RunExprOracleIteration(rng, false, &fresh, config), "")
+            << path;
+      }
+    } else if (text.starts_with("-- tinylamb-row-expr-oracle-test v1")) {
+      uint64_t seed = 0;
+      bool extended = false;
+      std::istringstream iss(text);
+      std::string line;
+      while (std::getline(iss, line)) {
+        if (line.starts_with("-- seed: ")) {
+          seed = std::stoull(line.substr(9));
+        } else if (line.starts_with("-- extended_ops: ")) {
+          extended = (line.substr(17) == "true");
+        }
+      }
+      const auto seed32 = static_cast<uint32_t>(seed);
+      std::mt19937 rng(seed32);
+      ExprGenConfig config;
+      config.extended_ops = extended;
+      RowExprOracleTrace fresh;
+      fresh.seed = seed;
+      fresh.extended_ops = extended;
+      EXPECT_EQ(RunRowExprOracleIteration(rng, false, &fresh, config), "")
+          << path;
+    }
+  }
 }
 
 }  // namespace tinylamb

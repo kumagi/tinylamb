@@ -140,8 +140,12 @@ Type UnaryResultType(UnaryOperation operation, const Type& child) {
       child.GetType() != TypeTag::kDouble) {
     return {TypeTag::kInvalid};
   }
-  if (operation == UnaryOperation::kBitwiseNot &&
-      child.GetType() != TypeTag::kBigInt) {
+  if (operation == UnaryOperation::kBitwiseNot) {
+    if (child.GetType() == TypeTag::kBigInt ||
+        child.GetType() == TypeTag::kInteger ||
+        child.GetType() == TypeTag::kInvalid) {
+      return {TypeTag::kBigInt};
+    }
     return {TypeTag::kInvalid};
   }
   return child;

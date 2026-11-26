@@ -85,6 +85,33 @@
 
 namespace tinylamb::relational_detail {
 
+StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const Expression& having_expr,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, bool direct_children,
+    const RuntimeFilterGroup* stream_runtime_filter,
+    const PrebuiltMembershipPredicate* stream_prebuilt_membership,
+    size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin);
+
+StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const Expression& having_expr,
+    TransactionContext& context, const CteMap& ctes,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, bool direct_children,
+    const RuntimeFilterGroup* stream_runtime_filter,
+    const PrebuiltMembershipPredicate* stream_prebuilt_membership,
+    size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin);
+
 // Chunked storage for the flat per-group accumulator states.  A plain
 // std::vector<AggregateAccumulator> reallocates on geometric growth, and the
 // realloc transient (old buffer + new buffer live together) peaks at ~3x the

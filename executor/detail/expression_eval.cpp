@@ -1666,17 +1666,46 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
     }
     case TypeTag::kCaseExp: {
       const auto& value = expression->AsCaseExpression();
+      auto coerce_case = [&](StatusOr<Value> result) -> StatusOr<Value> {
+        if (!result.HasValue()) {
+          return result;
+        }
+        Value out = result.MoveValue();
+        if (out.IsNull() || out.type != ValueType::kInt64) {
+          return out;
+        }
+        try {
+          static const Schema kEmptySchema;
+          const Schema& type_schema =
+              scope.schema != nullptr ? *scope.schema : kEmptySchema;
+          if (value.ResultType(type_schema).GetType() == TypeTag::kDouble) {
+            const double converted =
+                out.IsUnsigned()
+                    ? static_cast<double>(
+                          static_cast<uint64_t>(out.value.int_value))
+                    : static_cast<double>(out.value.int_value);
+            return Value(converted);
+          }
+        } catch (const std::exception& e) {
+          // Outer-scope column references may not exist in scope.schema; keep
+          // the uncoerced branch value.
+          (void)e;
+        }
+        return out;
+      };
       for (const auto& [condition, result] : value.when_clauses_) {
         ASSIGN_OR_RETURN(
             Value, when_value,
             (TryEvaluate(condition, scope, aggregates, context, ctes)));
         if (Truthy(when_value)) {
-          return TryEvaluate(result, scope, aggregates, context, ctes);
+          return coerce_case(
+              TryEvaluate(result, scope, aggregates, context, ctes));
         }
       }
-      return value.else_clause_ ? TryEvaluate(value.else_clause_, scope,
-                                              aggregates, context, ctes)
-                                : Value();
+      return value.else_clause_
+                 ? coerce_case(TryEvaluate(value.else_clause_, scope,
+                                           aggregates, context, ctes))
+                 : Value();
     }
     case TypeTag::kInExp: {
       const auto& value = expression->AsInExpression();

@@ -32,6 +32,7 @@
 #include "common/status_or.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/incremental_sort.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
 #include "expression/column_value.hpp"
@@ -646,6 +647,71 @@ TEST(SortShapeExecutorTest,
           }
         }
       }
+    }
+  }
+}
+
+TEST(SortShapeExecutorTest, IncrementalSortRunOffsetSkipsCoveredRuns) {
+  // EngineDecisions.Executor.RunOffset: verify TryPushOffset skips sorting
+  // entire prefix-peer runs covered by OFFSET and matches full sort + drop
+  // for every offset from 0 through rows.size() + 2.
+  const Schema schema("run_off", {Column("p", ValueType::kInt64),
+                                  Column("s", ValueType::kInt64),
+                                  Column("id", ValueType::kInt64)});
+  std::vector<Row> input;
+  // Prefix runs of sizes 3, 1, 4, 2, 3 (total 13 rows), unsorted on suffix `s`.
+  const std::vector<std::pair<int64_t, std::vector<int64_t>>> groups = {
+      {1, {30, 10, 20}}, {2, {5}},       {3, {40, 20, 20, 10}},
+      {4, {99, 1}},      {5, {8, 3, 5}},
+  };
+  int64_t id = 0;
+  for (const auto& [p, ss] : groups) {
+    for (int64_t s : ss) {
+      input.emplace_back(std::vector<Value>{Value(p), Value(s), Value(id++)});
+    }
+  }
+  const std::vector<SortExecutor::Key> prefix_keys = {
+      {.expression = ColumnValueExp("p"), .ascending = true}};
+  const std::vector<SortExecutor::Key> suffix_keys = {
+      {.expression = ColumnValueExp("s"), .ascending = true},
+      {.expression = ColumnValueExp("id"), .ascending = true}};
+
+  auto collect_exec = [](const std::shared_ptr<IncrementalSortExecutor>& exec) {
+    Collected out;
+    Row row;
+    RowPosition pos;
+    while (exec->Next(&row, &pos)) {
+      out.rows.push_back(std::move(row));
+      out.positions.push_back(pos);
+    }
+    out.status = exec->GetStatus();
+    return out;
+  };
+
+  // Reference: full incremental sort with no offset.
+  auto ref_exec = std::make_shared<IncrementalSortExecutor>(
+      std::make_shared<PositionedRows>(input), schema, prefix_keys,
+      suffix_keys);
+  const Collected ref = collect_exec(ref_exec);
+  ASSERT_EQ(ref.status, Status::kSuccess);
+  ASSERT_EQ(ref.rows.size(), input.size());
+
+  for (size_t off = 1; off <= input.size() + 2; ++off) {
+    auto exec = std::make_shared<IncrementalSortExecutor>(
+        std::make_shared<PositionedRows>(input), schema, prefix_keys,
+        suffix_keys);
+    ASSERT_TRUE(exec->TryPushOffset(off));
+    const Collected got = collect_exec(exec);
+    ASSERT_EQ(got.status, Status::kSuccess) << "off=" << off;
+    const size_t expected_n =
+        off < ref.rows.size() ? (ref.rows.size() - off) : 0;
+    ASSERT_EQ(got.rows.size(), expected_n) << "off=" << off;
+    for (size_t i = 0; i < expected_n; ++i) {
+      EXPECT_EQ(got.rows[i], ref.rows[off + i]) << "off=" << off << " i=" << i;
+    }
+    if (off >= 4) {
+      // Runs 1 (size 3) and 2 (size 1) are completely covered by offset >= 4.
+      EXPECT_GE(exec->SkippedRuns(), size_t{2}) << "off=" << off;
     }
   }
 }

@@ -1,0 +1,24 @@
+import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+set_option linter.unnecessarySimpa false
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Minimum_AlwaysInvertible
+
+open TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
+open TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common
+
+-- Two frames [0,0] and [0,1] share their minimum and length, but dropping 0
+-- leaves minima 0 and 1.
+theorem refute : ¬ Minimum.AlwaysInvertible.Goal := by
+  apply alwaysInvertible_refute [0, 0] [0, 1] 0
+  · simp
+  · decide
+  · simp
+  · simp
+  · decide
+
+end TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Minimum_AlwaysInvertible

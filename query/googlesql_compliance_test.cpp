@@ -125,6 +125,14 @@ bool RowsMatch(const std::vector<Row>& actual,
   const bool golden_has_multi_field_rows = std::ranges::any_of(
       test_case.expected_rows,
       [](const std::vector<std::string>& fields) { return fields.size() > 1; });
+  // DISTINCT and GROUP BY can return either representative of a zero key.
+  // The upstream reference marks such result sets as nondeterministic.
+  const bool nondeterministic_group =
+      test_case.raw_result.find(
+          "\nNOTE: Reference implementation reports non-determinism.") !=
+          std::string::npos &&
+      (test_case.sql.find("SELECT DISTINCT") != std::string::npos ||
+       test_case.sql.find("GROUP BY") != std::string::npos);
   auto matches_expected = [&](const Row& row,
                               const std::vector<std::string>& expected) {
     // Value-table goldens print a whole-row NULL as a single "NULL" token;
@@ -152,6 +160,11 @@ bool RowsMatch(const std::vector<Row>& actual,
       return false;
     }
     for (size_t i = 0; i < expected.size(); ++i) {
+      if (nondeterministic_group && row.values_[i].type == ValueType::kDouble &&
+          row.values_[i].value.double_value == 0.0 &&
+          (expected[i] == "-0" || expected[i] == "0")) {
+        continue;
+      }
       if (!ComplianceValueMatches(row.values_[i], expected[i])) {
         return false;
       }
@@ -448,6 +461,23 @@ ARRAY<STRUCT<id INT64>>[{2}, {1}]
   EXPECT_EQ(cases[2].sql, "SELECT id FROM t");
 }
 
+TEST(GoogleSqlComplianceFile, ParameterSeparatorsRespectTypeArguments) {
+  const auto cases = ParseGoogleSqlComplianceFile("parameters.test", R"test(
+[parameters=ARRAY<STRUCT<int64, string>>[(1, 'x')] AS rows, 1 < 2 AS flag, 3 AS n]
+SELECT @rows, @flag, @n
+--
+ARRAY<INT64>[1]
+==
+)test");
+  ASSERT_EQ(cases.size(), 1U);
+  EXPECT_TRUE(cases[0].unparseable_parameters.empty());
+  EXPECT_EQ(cases[0].parameters,
+            (std::vector<std::pair<std::string, std::string>>{
+                {"rows", "ARRAY<STRUCT<int64, string>>[(1, 'x')]"},
+                {"flag", "1 < 2"},
+                {"n", "3"}}));
+}
+
 TEST(GoogleSqlComplianceFile, AuditNestedArrayScalarKeepsInnerBrackets) {
   const auto cases = ParseGoogleSqlComplianceFile("nested.test", R"test(
 [name=nested]
@@ -500,9 +530,10 @@ TEST(GoogleSqlComplianceFile, Int64GoldenRejectsPartialNumericParse) {
   EXPECT_FALSE(ComplianceValueMatches(Value(int64_t{0}), "-0.5"));
   // Fully consumed integers and UINT64 magnitudes still match.
   EXPECT_TRUE(ComplianceValueMatches(Value(int64_t{42}), "42"));
-  EXPECT_TRUE(ComplianceValueMatches(
-      Value(static_cast<int64_t>(UINT64_C(18446744073709551615))),
-      "18446744073709551615"));
+  EXPECT_FALSE(
+      ComplianceValueMatches(Value(int64_t{-1}), "18446744073709551615"));
+  EXPECT_TRUE(ComplianceValueMatches(Value(int64_t{-1}).WithUnsigned(),
+                                     "18446744073709551615"));
 }
 
 TEST(GoogleSqlComplianceFile, ParsesExplainPlanAssertions) {

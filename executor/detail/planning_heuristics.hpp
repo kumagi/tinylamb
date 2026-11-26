@@ -298,6 +298,8 @@ size_t SpillPartitionOfSalted(const std::string& key, size_t partitions,
 
 size_t SpillPartitionOfSalted(int64_t key, size_t partitions, uint64_t salt);
 
+StatusOr<bool> RequiresCollatedJoinComparison(const Relation& left, const Relation& right, const EqualityKey& key);
+
 }  // namespace tinylamb::relational_detail
 
 #endif  // TINYLAMB_EXECUTOR_DETAIL_PLANNING_HEURISTICS_HPP

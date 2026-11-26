@@ -47,6 +47,14 @@ if(MOLD_PROGRAM AND NOT APPLE)
         (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
          CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12.1")))
         add_link_options(-fuse-ld=mold)
+        # Links always run on the submit host. A distributed Ninja build can
+        # otherwise start dozens of multithreaded test links alongside Clang.
+        if(BUILD_TESTING AND CMAKE_GENERATOR MATCHES "^Ninja" AND
+           NOT DEFINED CMAKE_JOB_POOL_LINK)
+            set_property(GLOBAL APPEND PROPERTY JOB_POOLS tinylamb_link=4)
+            set(CMAKE_JOB_POOL_LINK tinylamb_link)
+            add_link_options("LINKER:--threads=4")
+        endif()
         message(STATUS "Linker: mold (${MOLD_PROGRAM})")
     endif()
 endif()
@@ -471,6 +479,7 @@ tinylamb_add_layer(tinylamb_database
         ALIAS tinylamb::database
         SOURCES
         database/database.cpp
+        database/database_files.cpp
         database/page_storage.cpp
         database/transaction_context.cpp
         DEPENDS tinylamb::table)
@@ -509,9 +518,14 @@ if(LLVM_FOUND AND TINYLAMB_ENABLE_LLVM_JIT)
     target_compile_definitions(tinylamb_expression PRIVATE TINYLAMB_HAS_LLVM=1)
     target_include_directories(tinylamb_expression SYSTEM PRIVATE
             ${LLVM_INCLUDE_DIRS})
-    llvm_map_components_to_libnames(TINYLAMB_LLVM_LIBS
-            Core OrcJIT ExecutionEngine RuntimeDyld Support Passes native)
-    target_link_libraries(tinylamb_expression PUBLIC ${TINYLAMB_LLVM_LIBS})
+    if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+        llvm_config(tinylamb_expression USE_SHARED
+                Core OrcJIT ExecutionEngine RuntimeDyld Support Passes native)
+    else()
+        llvm_map_components_to_libnames(TINYLAMB_LLVM_LIBS
+                Core OrcJIT ExecutionEngine RuntimeDyld Support Passes native)
+        target_link_libraries(tinylamb_expression PUBLIC ${TINYLAMB_LLVM_LIBS})
+    endif()
 endif()
 
 # Layer 8: plan + executor (+ query_data used by the optimizer).
@@ -553,6 +567,21 @@ tinylamb_add_layer(tinylamb_executor
         executor/recursive_cte.cpp
         executor/window.cpp
         executor/relational.cpp
+        executor/relational_derived.cpp
+        executor/relational_grouped_cte_joins.cpp
+        executor/relational_quotient_set_counts.cpp
+        executor/relational_set_ops.cpp
+        executor/relational_projection.cpp
+        executor/relational_ordered_limits.cpp
+        executor/relational_scalar_counts.cpp
+        executor/relational_preaggregation.cpp
+        executor/relational_return_counts.cpp
+        executor/relational_market_share.cpp
+        executor/relational_ordered_fetch.cpp
+        executor/relational_intersect_counts.cpp
+        executor/relational_group_thresholds.cpp
+        executor/relational_witness_counts.cpp
+        executor/relational_revenue_runs.cpp
         executor/relational_factory.cpp
         executor/pipeline_lowering.cpp
         executor/detail/columnar_table.cpp
@@ -565,21 +594,43 @@ tinylamb_add_layer(tinylamb_executor
         executor/detail/function_eval.cpp
         executor/detail/aggregate_accumulator.cpp
         executor/detail/scan_filter.cpp
+        executor/detail/scan_source.cpp
+        executor/detail/parallel_scan_filter.cpp
         executor/detail/parallel_table_scan.cpp
         executor/detail/planning_heuristics.cpp
+        executor/detail/row_join.cpp
+        executor/detail/inner_row_join.cpp
+        executor/detail/columnar_join.cpp
         executor/detail/planning_columnar_keys.cpp
         executor/detail/build_input.cpp
+        executor/detail/ordered_join_input.cpp
         executor/detail/build_input_joins.cpp
         executor/detail/analytics_factorized_join.cpp
         executor/detail/execution_strategies.cpp
+        executor/detail/fused_grouped_join_program.cpp
+        executor/detail/fused_dense_split.cpp
+        executor/detail/fused_group_emit.cpp
+        executor/detail/fused_dense_aggregates.cpp
+        executor/detail/fused_group_probe.cpp
+        executor/detail/fused_raw_aggregates.cpp
+        executor/detail/fused_compact_radix.cpp
+        executor/detail/fused_group_key_layout.cpp
+        executor/detail/fused_group_dictionary.cpp
+        executor/detail/fused_varchar_groups.cpp
         executor/detail/fused_grouped_join.cpp
         executor/detail/fused_grouped_join_stream.cpp
         executor/detail/typed_column_eval.cpp
         executor/detail/typed_stream_aggregate.cpp
+        executor/detail/typed_stream_aggregate_direct.cpp
         executor/detail/typed_stream_aggregate_compact.cpp
         executor/detail/typed_stream_aggregate_dict.cpp
         executor/detail/columnar_tlcs_fast_path.cpp
+        executor/detail/columnar_tlcs_block.cpp
+        executor/detail/columnar_tlcs_bindings.cpp
+        executor/detail/columnar_tlcs_predicates.cpp
+        executor/detail/columnar_tlcs_aggregate_state.cpp
         executor/detail/typed_stream_aggregate_partitioned.cpp
+        executor/detail/partitioned_aggregate_topk.cpp
         executor/columnar_tlcs_scan_executor.cpp
         executor/detail/explain_format.cpp
         executor/detail/work_table_index.cpp
@@ -618,6 +669,8 @@ tinylamb_add_layer(tinylamb_executor
         plan/relational_plan.cpp
         plan/optimizer.cpp
         plan/cascades.cpp
+        plan/cascades_predicate_rules.cpp
+        plan/cascades_aggregate_rules.cpp
         plan/cascades_search.cpp
         plan/limit_plan.cpp
         plan/sample_plan.cpp
@@ -685,6 +738,8 @@ add_library(tinylamb_sql
         query/sql_engine_statements.cpp
         query/grouped_pipeline_lowering.cpp
         query/select_rewrites.cpp
+        query/select_set_and_join_rewrites.cpp
+        query/select_grouped_rewrites.cpp
         query/tpch_select_rewrites.cpp
         query/join_reduction.cpp
         query/sql_oracle_fuzzer.cpp
@@ -930,6 +985,26 @@ if(BUILD_TESTING)
     endif()
     include(GoogleTest)
 
+    # An archive can satisfy an unresolved libstdc++ symbol such as
+    # std::string::reserve by extracting an unrelated SQL fuzzer object. That
+    # pulls the whole engine into even decoder_test. Let the runtime supplied
+    # by this toolchain satisfy those references before the project archives.
+    set(tinylamb_gtest_main GTest::gtest_main)
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" tinylamb_build_type_upper)
+    set(tinylamb_test_link_flags
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${tinylamb_build_type_upper}} ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_EXE_LINKER_FLAGS_${tinylamb_build_type_upper}}")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       "stdc++" IN_LIST CMAKE_CXX_IMPLICIT_LINK_LIBRARIES AND
+       NOT CMAKE_CONFIGURATION_TYPES AND NOT tinylamb_test_link_flags MATCHES "-static")
+        list(APPEND tinylamb_gtest_main stdc++)
+    endif()
+
+    # Link the registration object into each test executable so its GTest
+    # environment is installed even when no symbols in the TU are referenced.
+    add_library(tinylamb_test_workspace OBJECT database/test_workspace_cleanup_env.cpp)
+    tinylamb_apply_options(tinylamb_test_workspace)
+    target_link_libraries(tinylamb_test_workspace PRIVATE GTest::gtest tinylamb::database)
+
     function(add_simple_test file_path)
         # All unit tests must run within 60 seconds; reject longer waits via
         # CTest's per-test TIMEOUT property.
@@ -940,17 +1015,12 @@ if(BUILD_TESTING)
             get_filename_component(filename ${file_path} NAME)
             get_filename_component(target_name ${filename} NAME_WE)
         endif()
-# The workspace-cleanup environment (database/test_workspace_cleanup_env
-# .cpp) removes .db/.log files the tests left in the working directory;
-# it is compiled directly into every test binary (gtest environments
-# only fire if the TU is linked). TINYLAMB_KEEP_TEST_DATABASES=1 keeps
-# them for post-mortem inspection.
         # Positional sources (without a SOURCES: keyword) land in
         # UNPARSED_ARGUMENTS; pass them through so a new test's source is
         # never silently dropped (which shows up only as a link error).
         add_executable(${target_name} ${file_path} ${SIMPLE_TEST_SOURCES}
                 ${SIMPLE_TEST_UNPARSED_ARGUMENTS}
-                "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
+                $<TARGET_OBJECTS:tinylamb_test_workspace>)
         tinylamb_apply_options(${target_name})
         if(SIMPLE_TEST_LIBS)
             set(_test_libs ${SIMPLE_TEST_LIBS})
@@ -959,7 +1029,7 @@ if(BUILD_TESTING)
         endif()
         target_link_libraries(${target_name}
                 PRIVATE
-                GTest::gtest_main
+                ${tinylamb_gtest_main}
                 ${_test_libs}
                 tinylamb::test_util
         )
@@ -1024,7 +1094,7 @@ if(BUILD_TESTING)
         endif()
         add_executable(${target_name} ${file_path} ${SCALE_TEST_SOURCES}
                 ${SCALE_TEST_UNPARSED_ARGUMENTS}
-                "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
+                $<TARGET_OBJECTS:tinylamb_test_workspace>)
         tinylamb_apply_options(${target_name})
         if(SCALE_TEST_LIBS)
             set(_test_libs ${SCALE_TEST_LIBS})
@@ -1033,7 +1103,7 @@ if(BUILD_TESTING)
         endif()
         target_link_libraries(${target_name}
                 PRIVATE
-                GTest::gtest_main
+                ${tinylamb_gtest_main}
                 ${_test_libs}
                 tinylamb::test_util
         )
@@ -1097,6 +1167,14 @@ add_simple_test(type/column_test.cpp)
 add_simple_test(type/schema_test.cpp)
 add_simple_test(page/page_manager_test.cpp)
 add_simple_test(page/page_lsm_store_test.cpp)
+# These tests supply global allocation operators to count or fail allocations.
+# Keep TSan instrumentation and its C runtime, which intercepts malloc/free.
+if(TINYLAMB_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
+   CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(target decoder_test string_util_test page_lsm_store_test)
+        target_link_options(${target} PRIVATE -fno-sanitize-link-c++-runtime)
+    endforeach()
+endif()
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/logger_segment_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
@@ -1123,14 +1201,24 @@ add_simple_test(executor/executor_test_part1.cpp
         TARGET executor_test
         SOURCES
         executor/executor_test_part2.cpp
-        executor/executor_test_part3.cpp)
+        executor/executor_test_part3.cpp
+        executor/executor_test_part4.cpp
+        executor/executor_test_part5.cpp)
 add_simple_test(executor/parallel_index_scan_test.cpp)
 add_simple_test(executor/relational_regression_test_part1.cpp
         TARGET relational_regression_test
         SOURCES
         executor/relational_regression_test_part2.cpp
         executor/relational_regression_test_part3.cpp
-        executor/relational_regression_test_part4.cpp)
+        executor/relational_regression_test_part4.cpp
+        executor/relational_regression_test_part5.cpp
+        executor/relational_regression_test_part6.cpp
+        executor/relational_regression_test_part7.cpp
+        executor/relational_regression_test_part8.cpp
+        executor/relational_regression_test_part9.cpp
+        executor/relational_regression_test_part10.cpp
+        executor/relational_regression_test_part11.cpp
+        executor/relational_regression_test_part12.cpp)
 add_simple_test(common/sorted_distinct_runs_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/columnar_tlcs_fast_path_test.cpp)
@@ -1182,12 +1270,14 @@ add_simple_test(type/column_name_test.cpp)
 add_simple_test(plan/optimizer_test_part1.cpp
         TARGET optimizer_test
         SOURCES
-        plan/optimizer_test_part2.cpp)
+        plan/optimizer_test_part2.cpp
+        plan/optimizer_test_part3.cpp)
 add_simple_test(plan/cascades_test_part1.cpp
         TARGET cascades_test
         SOURCES
         plan/cascades_test_part2.cpp
-        plan/cascades_test_part3.cpp)
+        plan/cascades_test_part3.cpp
+        plan/cascades_test_part4.cpp)
 add_simple_test(plan/collation_property_test.cpp)
 add_simple_test(plan/sort_shape_test.cpp)
 add_simple_test(plan/aggregate_shape_test.cpp)
@@ -1269,7 +1359,8 @@ add_simple_test(query/sql_statement_sweep_test.cpp)
 add_simple_test(query/sql_plan_and_cast_sweep_test.cpp)
 add_simple_test(query/plan_cache_unit_test.cpp)
 add_simple_test(expression/proto_json_helpers_test.cpp)
-add_simple_test(query/sql_window_agg_coverage_test.cpp)
+add_simple_test(query/sql_window_agg_coverage_test.cpp
+        SOURCES query/sql_window_agg_coverage_test_part2.cpp)
 add_simple_test(query/sql_engine_coverage_test.cpp)
 add_simple_test(query/sql_grouping_sets_test.cpp)
 add_simple_test(executor/executor_feature_test_part1.cpp
@@ -1322,8 +1413,10 @@ add_dependencies(cli_main_test tinylamb)
 add_simple_test(common/spill/spill_store_test.cpp)
 add_simple_test(type/row_block_codec_test.cpp)
 add_simple_test(executor/detail/ooc/ooc_primitives_test.cpp)
-add_simple_test(executor/detail/pipeline/pipeline_p3a_test.cpp)
-add_simple_test(executor/detail/pipeline/pipeline_p3b_test.cpp)
+add_simple_test(executor/detail/pipeline/pipeline_p3a_test.cpp
+        SOURCES executor/detail/pipeline/pipeline_p3a_test_part2.cpp)
+add_simple_test(executor/detail/pipeline/pipeline_p3b_test.cpp
+        SOURCES executor/detail/pipeline/pipeline_p3b_test_part2.cpp)
 add_scale_test(common/ooc_scale_baseline_test.cpp)
 
 add_executable(rule_fuzzer plan/rule_fuzzer.cpp)
@@ -1378,6 +1471,7 @@ endfunction()
 add_fuzzer_test(recovery/logger_fuzzer.cpp)
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(type/date_interval_fuzzer.cpp)
+add_fuzzer_test(type/collation_sort_codec_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
 add_fuzzer_test(table/fuzz/row_codec_fuzzer.cpp)
 add_fuzzer_test(table/fuzz/memcmp_fuzzer.cpp)
@@ -1390,12 +1484,16 @@ add_fuzzer_test(table/fuzz/region_scheme_fuzzer.cpp)
 add_fuzzer_test(table/fuzz/nullmap_varchar_fuzzer.cpp)
 add_fuzzer_test(table/fuzz/footer_sections_fuzzer.cpp)
 add_fuzzer_test(table/fuzz/encode_agree_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/tlcs_compression_fuzzer.cpp)
 add_fuzzer_test(expression/expression_fuzzer.cpp)
 add_fuzzer_test(expression/cast_fuzzer.cpp)
 add_fuzzer_test(expression/function_fuzzer.cpp)
+add_fuzzer_test(expression/json_proto_fuzzer.cpp)
 add_fuzzer_test(server/postgres_protocol_fuzzer.cpp tinylamb::postgres_server)
 add_fuzzer_test(server/postgres_session_fuzzer.cpp tinylamb::postgres_server)
 add_fuzzer_test(executor/data_chunk_fuzzer.cpp)
+add_fuzzer_test(executor/zone_map_scan_filter_fuzzer.cpp)
+add_fuzzer_test(executor/ooc_spill_memory_fuzzer.cpp)
 add_fuzzer_test(query/googlesql_ast_fuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_join_fuzzer_libfuzzer.cpp tinylamb::sql)
@@ -1425,12 +1523,12 @@ function(add_replay_test file_path input_mode)
     get_filename_component(filename ${file_path} NAME)
     string(REPLACE ".cpp" "" target_name ${filename})
     add_executable(${target_name} ${file_path}
-            "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
+            $<TARGET_OBJECTS:tinylamb_test_workspace>)
 # -UNDEBUG keeps the harness assertions alive; see add_fuzzer_test.
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
             -UNDEBUG)
     target_link_options(${target_name} PRIVATE ${fuzzer_option})
-    target_link_libraries(${target_name} PRIVATE GTest::gtest_main ${ARGN}
+    target_link_libraries(${target_name} PRIVATE ${tinylamb_gtest_main} ${ARGN}
             tinylamb::core)
     if(input_mode STREQUAL "DIRECTORY")
         set(replay_input "${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay-${target_name}")
@@ -1454,10 +1552,10 @@ add_replay_test(query/googlesql_ast_fuzzer_replay.cpp DIRECTORY
 add_executable(postgres_session_fuzzer_replay_test
                server/postgres_session_fuzzer_replay_test.cpp
                server/postgres_session_fuzzer.cpp
-               "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
+               $<TARGET_OBJECTS:tinylamb_test_workspace>)
 tinylamb_apply_options(postgres_session_fuzzer_replay_test)
 target_link_libraries(postgres_session_fuzzer_replay_test PRIVATE
-        GTest::gtest_main tinylamb::postgres_server tinylamb::test_util)
+        ${tinylamb_gtest_main} tinylamb::postgres_server tinylamb::test_util)
 add_test(NAME postgres_session_fuzzer_replay_test
          COMMAND postgres_session_fuzzer_replay_test)
 endif()

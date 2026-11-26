@@ -60,14 +60,6 @@ private theorem lanes_pairwise (w : W) : List.Pairwise (fun a b => a < b) (lanes
   have h := List.pairwise_lt_range (n := 64)
   simpa [lanes] using List.Pairwise.filter w.getLsbD h
 
-/-- The `chosen` mask keeps the low bit only when source bit 0 is set. -/
-private theorem chosen_if (src low : W) :
-    low &&& (-(src &&& 1)) = if src.getLsbD 0 = true then low else 0 := by
-  bv_decide
-
-private theorem lowbit_xor (m : W) : m &&& (-m) = m ^^^ (m &&& (m - 1)) := by
-  bv_decide
-
 /-- Clearing the lowest set bit: `(m &&& (m-1))` has all of `m`'s bits except
 the lowest one, given `k` witnesses that lowest bit. -/
 private theorem getLsbD_sub_and (m : W) (k : Nat)
@@ -142,6 +134,109 @@ private theorem getLsbD_sub_and (m : W) (k : Nat)
       decide_eq_false (by omega : ¬ (j ≠ j))]
   · rw [BitVec.getLsbD_and, hb_gt hgt]
     rw [decide_eq_true (Nat.ne_of_gt hgt), Bool.and_true, Bool.and_self]
+
+private theorem getLsbD_one_and (src : W) (j : Nat) :
+    (src &&& 1).getLsbD j = (decide (j = 0) && src.getLsbD 0) := by
+  by_cases hj : j = 0
+  · subst j
+    simp
+  · simp [hj]
+
+/-- The `chosen` mask keeps the low bit only when source bit 0 is set. -/
+private theorem chosen_if (src low : W) :
+    low &&& (-(src &&& 1)) = if src.getLsbD 0 = true then low else 0 := by
+  refine BitVec.eq_of_getLsbD_eq_iff.mpr (fun i hi => ?_)
+  rw [BitVec.getLsbD_and, BitVec.getLsbD_neg, getLsbD_one_and, decide_eq_true hi]
+  by_cases hb : src.getLsbD 0 = true
+  · rw [if_pos hb]
+    by_cases hi0 : i = 0
+    · subst i
+      rw [decide_eq_false (by simp : ¬ ∃ j, j < 0 ∧ (src &&& 1).getLsbD j = true)]
+      simp [hb]
+    · have hex : ∃ j, j < i ∧ (src &&& 1).getLsbD j = true := by
+        refine ⟨0, by omega, ?_⟩
+        rw [getLsbD_one_and, hb]
+        simp
+      rw [decide_eq_true hex]
+      simp [hi0]
+  · rw [if_neg hb]
+    have hno : ¬ ∃ j, j < i ∧ (src &&& 1).getLsbD j = true := by
+      rintro ⟨j, hj, hjt⟩
+      rw [getLsbD_one_and] at hjt
+      have hj0 : j = 0 := by
+        cases h : decide (j = 0) <;> simp_all
+      subst j
+      simp_all
+    rw [decide_eq_false hno]
+    have hsrc0 : src[0] = false := by
+      rw [← BitVec.getLsbD_eq_getElem (show 0 < 64 by decide)]
+      exact bv_false hb
+    simp [hsrc0]
+
+/-- A nonzero vector's lanes split into the lowest set bit and strictly larger rest. -/
+private theorem lanes_decomp (m : W) (hm : ¬ m = 0) :
+    ∃ (k : Nat) (rest : List Nat),
+      lanes m = k :: rest ∧
+      (∀ x ∈ rest, k < x) ∧
+      (∀ j, j < k → m.getLsbD j = false) ∧
+      m.getLsbD k = true := by
+  have hnnil : lanes m ≠ [] := fun h => hm ((lanes_eq_nil_iff m).mp h)
+  obtain ⟨k, rest, hcons⟩ : ∃ (k : Nat) (rest : List Nat), lanes m = k :: rest := by
+    cases h : lanes m with
+    | nil => exact absurd h hnnil
+    | cons k rest => exact ⟨k, rest, rfl⟩
+  have hpair := lanes_pairwise m
+  rw [hcons] at hpair
+  have hrest : ∀ b ∈ rest, k < b := by
+    cases hpair with
+    | cons h1 _ => exact h1
+  have hkb : m.getLsbD k = true := by
+    have hmem : k ∈ lanes m := by rw [hcons]; exact List.mem_cons_self
+    exact (List.mem_filter.mp hmem).2
+  have hlow : ∀ j, j < k → m.getLsbD j = false := by
+    intro j hj
+    cases v : m.getLsbD j with
+    | false => rfl
+    | true =>
+      have hmem : j ∈ lanes m := lanes_mem (getLsbD_lt v) v
+      rw [hcons, List.mem_cons] at hmem
+      cases hmem with
+      | inl heq => subst heq; exact absurd hj (Nat.lt_irrefl _)
+      | inr hx => exact absurd (hrest j hx) (Nat.not_lt_of_ge (Nat.le_of_lt hj))
+  exact ⟨k, rest, hcons, hrest, hlow, hkb⟩
+
+private theorem lowbit_xor (m : W) : m &&& (-m) = m ^^^ (m &&& (m - 1)) := by
+  by_cases hm : m = 0
+  · subst m
+    rfl
+  · obtain ⟨k, rest, hcons, hrest, hlow, hkb⟩ := lanes_decomp m hm
+    have hsub := getLsbD_sub_and m k hlow hkb
+    refine BitVec.eq_of_getLsbD_eq_iff.mpr (fun i hi => ?_)
+    rw [show (m &&& -m).getLsbD i = (m.getLsbD i && (-m).getLsbD i) from BitVec.getLsbD_and]
+    rw [show (m ^^^ (m &&& (m - 1))).getLsbD i =
+        (m.getLsbD i ^^ (m &&& (m - 1)).getLsbD i) from BitVec.getLsbD_xor]
+    rw [hsub]
+    rw [BitVec.getLsbD_neg, decide_eq_true hi]
+    by_cases hik : i = k
+    · subst i
+      have hno : ¬ ∃ j, j < k ∧ m.getLsbD j = true := by
+        rintro ⟨j, hj, hjt⟩
+        rw [hlow j hj] at hjt
+        contradiction
+      rw [decide_eq_false hno, hkb]
+      simp
+    · by_cases hiklt : i < k
+      · have hmi : m.getLsbD i = false := hlow i hiklt
+        have hno : ¬ ∃ j, j < i ∧ m.getLsbD j = true := by
+          rintro ⟨j, hj, hjt⟩
+          rw [hlow j (by omega)] at hjt
+          contradiction
+        rw [decide_eq_false hno, hmi]
+        simp
+      · have hikgt : k < i := by omega
+        have hex : ∃ j, j < i ∧ m.getLsbD j = true := ⟨k, hikgt, hkb⟩
+        rw [decide_eq_true hex, decide_eq_true hik]
+        cases m.getLsbD i <;> simp
 
 /-- The low bit `m &&& -m` is the singleton `{k}`. -/
 private theorem getLsbD_lowbit (m : W) (k : Nat)
@@ -232,38 +327,6 @@ private theorem filter_mem_range : ∀ (l : List Nat),
         (fun j hj hjk => by rw [decide_eq_false hjk, Bool.false_or])
         (fun j hj => hgt j (of_decide_eq_true hj))
     rw [hmain, ih hbnd hpair']
-
-/-- A nonzero vector's lanes split into the lowest set bit and strictly larger rest. -/
-private theorem lanes_decomp (m : W) (hm : ¬ m = 0) :
-    ∃ (k : Nat) (rest : List Nat),
-      lanes m = k :: rest ∧
-      (∀ x ∈ rest, k < x) ∧
-      (∀ j, j < k → m.getLsbD j = false) ∧
-      m.getLsbD k = true := by
-  have hnnil : lanes m ≠ [] := fun h => hm ((lanes_eq_nil_iff m).mp h)
-  obtain ⟨k, rest, hcons⟩ : ∃ (k : Nat) (rest : List Nat), lanes m = k :: rest := by
-    cases h : lanes m with
-    | nil => exact absurd h hnnil
-    | cons k rest => exact ⟨k, rest, rfl⟩
-  have hpair := lanes_pairwise m
-  rw [hcons] at hpair
-  have hrest : ∀ b ∈ rest, k < b := by
-    cases hpair with
-    | cons h1 _ => exact h1
-  have hkb : m.getLsbD k = true := by
-    have hmem : k ∈ lanes m := by rw [hcons]; exact List.mem_cons_self
-    exact (List.mem_filter.mp hmem).2
-  have hlow : ∀ j, j < k → m.getLsbD j = false := by
-    intro j hj
-    cases v : m.getLsbD j with
-    | false => rfl
-    | true =>
-      have hmem : j ∈ lanes m := lanes_mem (getLsbD_lt v) v
-      rw [hcons, List.mem_cons] at hmem
-      cases hmem with
-      | inl heq => subst heq; exact absurd hj (Nat.lt_irrefl _)
-      | inr hx => exact absurd (hrest j hx) (Nat.not_lt_of_ge (Nat.le_of_lt hj))
-  exact ⟨k, rest, hcons, hrest, hlow, hkb⟩
 
 /-- Shifting both the rank bound and the source right by one preserves the map. -/
 private theorem bridge : ∀ (rest : List Nat) (k m : Nat) (src : W),

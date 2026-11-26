@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Common_PredicateBallots
+import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Lanes_PredicateBallots
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+
+namespace TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_AntiPredicate_LimitBeforeFault
+
+open TinylambOpt.ResearchGoals.JitFrontiers.PredicateBallots
+open TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Common
+open TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Lanes
+
+theorem sound : AntiPredicate.LimitBeforeFault.Goal := by
+  apply Common.limitBeforeFault_of AntiPredicate.test
+  exact Lanes.antipredicate_yes
+  exact Lanes.antipredicate_err
+
+end TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_AntiPredicate_LimitBeforeFault

@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace DecimalMod
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.DecimalMod
+theorem sound_DecimalSuffix : DecimalSuffix.Goal := Common.sound_DecimalMod_DecimalSuffix
+theorem sound_LeadingZero : LeadingZero.Goal := Common.sound_DecimalMod_LeadingZero
+end DecimalMod
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

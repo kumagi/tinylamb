@@ -75,7 +75,8 @@ TEST(IntervalTest, PlusMinusNegateMultiply) {
   EXPECT_FALSE(huge.TryPlus(Iv(1, 0, 0)).HasValue());
   const IntervalValue min = Iv(0, INT64_MIN, 0);
   EXPECT_FALSE(min.TryNegate().HasValue());
-  EXPECT_FALSE(Iv(1, 0, 0).TryMultiply(INT64_MAX).HasValue());
+  EXPECT_EQ(Iv(1, 0, 0).TryMultiply(INT64_MAX).MoveValue(), huge);
+  EXPECT_FALSE(Iv(2, 0, 0).TryMultiply(INT64_MAX).HasValue());
   EXPECT_FALSE(huge.TryTotalNanos().HasValue());
 
   // Throwing wrappers mirror the Try* forms.

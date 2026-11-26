@@ -4133,16 +4133,29 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() != 1 || !logical.predicate) {
             return std::vector<PlanAlternative>{};
           }
-          if ((*logical.predicate)->Type() == TypeTag::kConstantValue) {
-            const Value value =
-                (*logical.predicate)->AsConstantValue().GetValue();
-            if (value.IsNull() || !value.Truthy()) {
-              Plan empty = std::make_shared<EmptyPlan>(children[0].plan);
-              return std::vector<PlanAlternative>{
-                  PlanAlternative{.plan = std::move(empty),
-                                  .local_cost = 0,
-                                  .estimated_rows = 0}};
+          auto is_constant_false_or_null = [](const Expression& expr) {
+            if (!expr) {
+              return false;
             }
+            if (expr->Type() == TypeTag::kConstantValue) {
+              const Value value = expr->AsConstantValue().GetValue();
+              return value.IsNull() || !value.Truthy();
+            }
+            if (expr->Type() == TypeTag::kCastExp) {
+              const Expression& inner = expr->AsCastExpression().Child();
+              if (inner && inner->Type() == TypeTag::kConstantValue &&
+                  inner->AsConstantValue().GetValue().IsNull()) {
+                return true;
+              }
+            }
+            return false;
+          };
+          if (is_constant_false_or_null(*logical.predicate)) {
+            Plan empty = std::make_shared<EmptyPlan>(children[0].plan);
+            return std::vector<PlanAlternative>{
+                PlanAlternative{.plan = std::move(empty),
+                                .local_cost = 0,
+                                .estimated_rows = 0}};
           }
           // Calc merge: a scan implementation already wraps the group filter in
           // a SelectionPlan ("The group filter carries the single-relation

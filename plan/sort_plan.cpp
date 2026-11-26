@@ -10,9 +10,27 @@
 
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/parameter_slot.hpp"
 
 namespace tinylamb {
+
+namespace {
+
+// Collation compatibility is checked separately via OrderCollation() /
+// SatisfiesOrderingCollation(); unwrap an outer COLLATE(expr, spec) so a
+// collated SortKey matches a bare column ordering request.
+const ExpressionBase* UnwrapCollateKey(const Expression& expr) {
+  if (expr && expr->Type() == TypeTag::kFunctionCallExp) {
+    const auto& fn = expr->AsFunctionCallExpression();
+    if (fn.FuncName() == "collate" && !fn.Args().empty() && fn.Args()[0]) {
+      return fn.Args()[0].get();
+    }
+  }
+  return expr.get();
+}
+
+}  // namespace
 
 bool SortPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                            const std::vector<bool>& ascending) const {
@@ -23,7 +41,8 @@ bool SortPlan::IsOrderedBy(const std::vector<Expression>& expressions,
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (keys_[i].ascending != ascending[i] || !keys_[i].expression ||
         !expressions[i] ||
-        keys_[i].expression->ToString() != expressions[i]->ToString()) {
+        UnwrapCollateKey(keys_[i].expression)->ToString() !=
+            UnwrapCollateKey(expressions[i])->ToString()) {
       return false;
     }
   }
@@ -41,7 +60,8 @@ bool SortPlan::IsOrderedBy(
   for (size_t i = 0; i < expressions.size(); ++i) {
     if (keys_[i].ascending != ascending[i] || !keys_[i].expression ||
         !expressions[i] ||
-        keys_[i].expression->ToString() != expressions[i]->ToString()) {
+        UnwrapCollateKey(keys_[i].expression)->ToString() !=
+            UnwrapCollateKey(expressions[i])->ToString()) {
       return false;
     }
     // Unspecified sides resolve to the engine default (NULLS FIRST for ASC,

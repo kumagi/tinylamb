@@ -1,0 +1,19 @@
+import TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common_SeekIntervals
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Cores
+import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Specifics
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+
+namespace TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_Residue_Multiplicity
+
+open TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Cores
+open TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Specifics
+
+theorem sound : Residue.Multiplicity.Goal := by
+  exact Common.multiplicity_of_exact Residue.model Cores.residue_exact Cores.residue_sep
+
+end TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_Residue_Multiplicity

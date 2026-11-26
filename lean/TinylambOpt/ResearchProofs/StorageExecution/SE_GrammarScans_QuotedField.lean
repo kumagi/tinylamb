@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace QuotedField
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.QuotedField
+theorem sound_DoublePhrase : DoublePhrase.Goal := Common.sound_QuotedField_DoublePhrase
+theorem sound_QuoteParity : QuoteParity.Goal := Common.sound_QuotedField_QuoteParity
+end QuotedField
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

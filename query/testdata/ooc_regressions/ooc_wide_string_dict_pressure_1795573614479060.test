@@ -1,0 +1,9 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795573614479060
+-- profile: pool=0 columnar=262144 opmem=0 spill=0 temp=0 route=0
+-- failure: post-abort count(t#) mismatch :: op 4 `abort`: post-abort count(t0) mismatch: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t0 |   expected 1 rows, engine returned 1 |   row 0: expected [574|165025|268943|521|181050] got [574|165025|268943|521|0]
+create t0 52 264 96
+ins_bulk t0 1 454 404
+ins_copy t0 t0 75 194 380
+commit
+abort

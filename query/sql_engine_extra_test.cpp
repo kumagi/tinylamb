@@ -148,12 +148,20 @@ TEST_F(SqlEngineExtraTest, SqlCreateIndexMaintainsDuplicatesAndSurvivesReopen) {
 }
 
 TEST_F(SqlEngineExtraTest, SqlCreateIndexFailureAndAbortKeepCatalogAtomic) {
-  ExpectError("CREATE UNIQUE INDEX fail_unique ON t(s)");
-  ExpectError("CREATE INDEX missing_column ON t(missing)");
-  ExpectError("CREATE INDEX repeated_column ON t(k, k)");
-  auto table = context_->GetTable("t");
-  ASSERT_TRUE(table.HasValue());
-  EXPECT_EQ(table.Value()->IndexCount(), 0U);
+  // A failed unique-index build can make eager writes before it detects the
+  // duplicate. Keep the fixture committed and roll back each failed DDL.
+  ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
+  for (const char* sql : {"CREATE UNIQUE INDEX fail_unique ON t(s)",
+                          "CREATE INDEX missing_column ON t(missing)",
+                          "CREATE INDEX repeated_column ON t(k, k)"}) {
+    context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+    ExpectError(sql);
+    auto table = context_->GetTable("t");
+    ASSERT_TRUE(table.HasValue());
+    EXPECT_EQ(table.Value()->IndexCount(), 0U) << sql;
+    ASSERT_EQ(context_->Abort(), Status::kSuccess);
+  }
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
   ExpectScalar("SELECT COUNT(*) FROM t", Value(3));
   RunSql(engine_.get(), context_.get(), "CREATE UNIQUE INDEX good ON t(k)");
   ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
@@ -161,7 +169,7 @@ TEST_F(SqlEngineExtraTest, SqlCreateIndexFailureAndAbortKeepCatalogAtomic) {
   RunSql(engine_.get(), context_.get(), "CREATE INDEX aborted ON t(s)");
   EXPECT_EQ(context_->Abort(), Status::kSuccess);
   context_ = std::make_unique<TransactionContext>(database_->BeginContext());
-  table = context_->GetTable("t");
+  auto table = context_->GetTable("t");
   ASSERT_TRUE(table.HasValue());
   ASSERT_EQ(table.Value()->IndexCount(), 1U);
   EXPECT_EQ(table.Value()->GetIndex(0).sc_.name_, "good");

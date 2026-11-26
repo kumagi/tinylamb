@@ -1,5 +1,21 @@
 # SQL 最適化の証明課題
 
+[11月26日の敗北83クエリの未証明命題](research/november26-queries.md)。最新のクエリ別中央値と次回の計測項目。
+
+[速度・保存サイズの各敗北に対応する94件の未証明命題](research/benchmark-rematch.md)。各クエリと対戦相手ごとの逆転目標、候補演算、観測量。
+
+[リカバリ・並行制御・DDL 競合と JOB J3 の20題](research/restart-races.md)。WAL の選択再生、オンライン UNIQUE、キーの引渡し、JOB での結合順とキャッシュに関する仮説と追試。
+
+[ClickHouse との保存サイズ差から調べた圧縮・実行の12題](research/clickbench-layout.md)。ClickBench・TPC-H・TPC-DS の全量比較と、同じ98,304行での時刻・文字列の実験。
+
+[Optimizer・MVCC・Executor の実装判断を問う23題](research/engine-decisions.md)。適用条件、境界反例、実装に接続する箇所を掲載。
+
+[データ表現・SQL 実行・復旧の境界に関する 1,000 題](research/layer-contracts.md)。ページ配置、名前解決、参照制約、再帰経路など 100 モデルの索引と反例。
+
+[ストレージ・トランザクション・SQL 実行にまたがる 100 題](research/engine-boundaries.md)。WAL・待機グラフ・spill・統計・ウィンドウ関数など 10 分野の未証明命題と反例。
+
+[JIT コンパイルの境界条件を問う 1,000 件](research/jit-frontiers.md)。エラー順序、SIMD の別名参照、ガード失敗後の再開など、100 モデルの索引と反例を収録。
+
 [圧縮と SQL 実行の未証明命題 1,000 件](research/storage-execution.md)。100 モデルの索引と、ClickBench の選択ビットマップの実測を収録。
 
 [可逆圧縮の研究課題 228 件と DuckDB との保存サイズ比較](research/compression.md)。ClickBench・TPC-H・TPC-DS の全列ファイルで試作形式の復元を検証。

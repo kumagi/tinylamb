@@ -68,6 +68,37 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
       inner_idx_ = 0;
 
       if (inner_query_ != nullptr) {
+        // EngineDecisions.Executor.DemandCache: for pure correlated SEMI/ANTI
+        // filters without residual predicate, memoize the verdict (including
+        // deterministic errors) per demanded outer row so repeated outer keys
+        // avoid re-executing the correlated subquery while preserving exact
+        // LIMIT prefix and first-demanded fault ordering.
+        const bool use_demand_cache =
+            !predicate_ &&
+            (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti);
+        std::string demand_key;
+        if (use_demand_cache) {
+          demand_key.resize(current_outer_row_.Size());
+          current_outer_row_.Serialize(demand_key.data());
+          const auto cit = demand_cache_.find(demand_key);
+          if (cit != demand_cache_.end()) {
+            ++demand_cache_hits_;
+            if (cit->second.status != Status::kSuccess) {
+              return FailWith(cit->second.status);
+            }
+            has_outer_row_ = false;
+            const bool emit = (kind_ == JoinKind::kSemi) ? cit->second.matched
+                                                         : !cit->second.matched;
+            if (emit) {
+              *dst = current_outer_row_;
+              if (rp != nullptr) {
+                *rp = current_outer_rp_;
+              }
+              return true;
+            }
+            continue;
+          }
+        }
         relational_detail::Scope scope{.row = &current_outer_row_,
                                        .schema = &outer_schema_,
                                        .outer = nullptr};
@@ -75,6 +106,11 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
             relational_detail::ExecuteQuery(context_, *inner_query_, &scope,
                                             {});
         if (!executed.HasValue()) {
+          if (use_demand_cache && demand_cache_.size() < 4096) {
+            demand_cache_.emplace(std::move(demand_key),
+                                  DemandVerdict{.status = executed.GetStatus(),
+                                                .matched = false});
+          }
           return FailWith(executed.GetStatus());
         }
         relational_detail::Relation rel = executed.MoveValue();
@@ -88,10 +124,38 @@ bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
         const Status copied =
             rel.ForEachRow([&](const Row& r) { inner_rows_.push_back(r); });
         if (copied != Status::kSuccess) {
+          if (use_demand_cache && demand_cache_.size() < 4096) {
+            demand_cache_.emplace(
+                std::move(demand_key),
+                DemandVerdict{.status = copied, .matched = false});
+          }
           return FailWith(copied);
         }
         if (rel.GetStatus() != Status::kSuccess) {
+          if (use_demand_cache && demand_cache_.size() < 4096) {
+            demand_cache_.emplace(
+                std::move(demand_key),
+                DemandVerdict{.status = rel.GetStatus(), .matched = false});
+          }
           return FailWith(rel.GetStatus());
+        }
+        if (use_demand_cache) {
+          const bool has_match = !inner_rows_.empty();
+          if (demand_cache_.size() < 4096) {
+            demand_cache_.emplace(std::move(demand_key),
+                                  DemandVerdict{.status = Status::kSuccess,
+                                                .matched = has_match});
+          }
+          has_outer_row_ = false;
+          const bool emit = (kind_ == JoinKind::kSemi) ? has_match : !has_match;
+          if (emit) {
+            *dst = current_outer_row_;
+            if (rp != nullptr) {
+              *rp = current_outer_rp_;
+            }
+            return true;
+          }
+          continue;
         }
       } else if (inner_exec_ != nullptr) {
         if (!static_inner_cached_) {

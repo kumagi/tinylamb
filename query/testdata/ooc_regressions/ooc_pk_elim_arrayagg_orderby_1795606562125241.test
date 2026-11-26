@@ -1,0 +1,9 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795606562125241
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: reference execution (every memory knob relaxed) failed [join+arrayagg+orderby] | stream: InvalidArgument :: op 4 `q ord=0 heavy=1 take=-1 nv=1 vs=645912890 ex=1 snap=0 :: SELECT LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(a.k AS STRING) ORDER BY a.k), ',')) AS c1, SUM(b.v) AS c2 ...(192B)`: reference execution (every memory knob relaxed) failed [join+arrayagg+orderby]: SELECT LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(a.k AS STRING) ORDER BY a.k), ',')) AS c1, SUM(b.v) AS c2 FROM t1 a JOIN t0 b ON a.k = b.k |   stream: InvalidArgument: column a.k not found column a.k not found
+create t0 29 4128 3571
+create t1 2 6326 1 2 1000000 1
+ins_bulk t0 1 315 711
+ins_bulk t1 1 50 652
+q ord=0 heavy=1 take=-1 nv=1 vs=645912890 ex=1 snap=0 :: SELECT LENGTH(ARRAY_TO_STRING(ARRAY_AGG(CAST(a.k AS STRING) ORDER BY a.k), ',')) AS c1, SUM(b.v) AS c2 FROM t1 a JOIN t0 b ON a.k = b.k

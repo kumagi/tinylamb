@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace ContainsSlash
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.ContainsSlash
+theorem sound_SearchOnce : SearchOnce.Goal := Common.sound_ContainsSlash_SearchOnce
+theorem sound_SlashWitness : SlashWitness.Goal := Common.sound_ContainsSlash_SlashWitness
+end ContainsSlash
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

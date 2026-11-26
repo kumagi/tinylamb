@@ -1403,6 +1403,17 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
                                static_cast<int32_t>(program->Size()) -
                                    static_cast<int32_t>(branch_end));
       }
+      if (case_expression.ResultType(schema).GetType() == TypeTag::kDouble) {
+        uint16_t offset = 0;
+        if (!program->AddCast({.target_type_name = "FLOAT64",
+                               .target_value_type = ValueType::kDouble,
+                               .return_null_on_error = false},
+                              &offset)) {
+          return false;
+        }
+        program->AddInstruction(
+            {.opcode = BytecodeOp::kCast, .operand = offset});
+      }
       return true;
     }
     case TypeTag::kUnaryExp: {
@@ -1554,17 +1565,21 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
           program->SetJumpTarget(jump, static_cast<int32_t>(program->Size()) -
                                            static_cast<int32_t>(jump));
         }
-        if (call.FuncName() == "coalesce") {
+        {
           const auto common = call.CoalesceType(schema);
-          if (!common.HasValue()) { return false;
-}
+          if (!common.HasValue()) {
+            return false;
+          }
           if (common.Value() == TypeTag::kDouble) {
             uint16_t offset = 0;
             if (!program->AddCast({.target_type_name = "FLOAT64",
                                    .target_value_type = ValueType::kDouble,
-                                   .return_null_on_error = false}, &offset)) { return false;
-}
-            program->AddInstruction({.opcode = BytecodeOp::kCast, .operand = offset});
+                                   .return_null_on_error = false},
+                                  &offset)) {
+              return false;
+            }
+            program->AddInstruction(
+                {.opcode = BytecodeOp::kCast, .operand = offset});
           }
         }
         return true;

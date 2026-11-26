@@ -1,0 +1,12 @@
+import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
+import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
+
+namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
+
+namespace SlashDepth
+open TinylambOpt.ResearchGoals.StorageExecution.GrammarScans.SlashDepth
+theorem sound_RepeatedDelimiter : RepeatedDelimiter.Goal := Common.sound_SlashDepth_RepeatedDelimiter
+theorem sound_TwoDelimiters : TwoDelimiters.Goal := Common.sound_SlashDepth_TwoDelimiters
+end SlashDepth
+
+end TinylambOpt.ResearchProofs.StorageExecution.GrammarScans

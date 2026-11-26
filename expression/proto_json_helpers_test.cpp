@@ -12,6 +12,7 @@
 
 #include "common/status_or.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/proto_text.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -162,6 +163,21 @@ TEST(JsonStructHelpersTest, StructSetFieldThrowsShimMatchesStatus) {
       StructSetField(base, "z", Value(int64_t{3})).value.varchar_value);
   EXPECT_EQ(once, twice);
   EXPECT_EQ(EncodeStructMemberJson(Value(int64_t{8})), "8");
+}
+
+TEST(ProtoTextHelpersTest,
+     NormalizeProtoTextRejectsBracesInBareScalarAndIsIdempotent) {
+  // Fuzz-found (json_proto_fuzzer): bare scalar tokens inside `< ... >`
+  // previously absorbed `}` / `{`, so NormalizeProtoText rewrote `a < b: } >`
+  // to `a { b: } }` which failed on the second pass.
+  EXPECT_FALSE(NormalizeProtoText("a < b: } >").has_value());
+  EXPECT_FALSE(NormalizeProtoText("a < b: { >").has_value());
+  const auto norm1 = NormalizeProtoText("a < b: 1 >");
+  ASSERT_TRUE(norm1.has_value());
+  EXPECT_EQ(*norm1, "a { b: 1 }");
+  const auto norm2 = NormalizeProtoText(*norm1);
+  ASSERT_TRUE(norm2.has_value());
+  EXPECT_EQ(*norm2, *norm1);
 }
 
 }  // namespace tinylamb

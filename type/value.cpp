@@ -953,8 +953,12 @@ std::string FormatDoubleShortest(double value) {
         return std::to_string(static_cast<uint64_t>(value.int_value));
       }
       return std::to_string(value.int_value);
-    case ValueType::kDate:
-      return FormatDateDays(value.int_value);
+    case ValueType::kDate: {
+      StatusOr<std::string> formatted = TryFormatDateDays(value.int_value);
+      return formatted.HasValue()
+                 ? formatted.MoveValue()
+                 : ("DATE(" + std::to_string(value.int_value) + ")");
+    }
     case ValueType::kVarChar: {
       std::string escaped;
       escaped.reserve(value.varchar_value.size() + 2);
