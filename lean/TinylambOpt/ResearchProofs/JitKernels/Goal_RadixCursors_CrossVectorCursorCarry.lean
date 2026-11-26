@@ -13,7 +13,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_RadixCursors_CrossVectorCur
 
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 
-theorem sound : CrossVectorCursorCarry.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.RadixCursors.CrossVectorCursorCarry.Goal := by
   intro a b j k
   have htake : (a ++ b).take (a.length + j) = a ++ b.take j := by
     rw [List.take_append]

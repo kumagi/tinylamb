@@ -1,25 +1,24 @@
 import TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
-/-! Fingerprint hits after the first vacant lane are never valid candidates, so
-loading a whole control group can exceed the scalar candidate traffic; the
-first vacant lane is the fence for the scalar probe. -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_ProbeGroupSpeculativeReadBudget
+/-!
+A matching fingerprint beyond the first vacant control byte is not a probe
+candidate, so loading every speculative tag in the group can exceed the traffic
+of the scalar probe prefix.
+-/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_ProbeGroupSpeculativeReadBudget
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
-theorem refute : ¬ ProbeGroupSpeculativeReadBudget.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe.ProbeGroupSpeculativeReadBudget.Goal := by
   intro h
-  have hw := h [.live 1 9 7, .empty, .live 1 9 8] (fun _ => 1) 9
-  have hc : coherent (fun _ => 1) [.live 1 9 7, .empty, .live 1 9 8] := by
+  let slots : List Slot := [.empty, .live 3 9 7]
+  have hf : coherent (fun _ => 3) slots := by
     intro t k v hm
-    simp at hm
-    rcases hm with (⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩)
-    all_goals rfl
-  simp [untilEmpty, tagHit] at hw
-  exact hw hc
+    simp [slots] at hm
+    rcases hm with rfl | rfl <;> rfl
+  have h' := h slots (fun _ => 3) 9 hf
+  have hne : ¬ ((slots.filter (tagHit 3)).length ≤ ((untilEmpty slots).filter (tagHit 3)).length) := by
+    native_decide
+  exact hne h'
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_ProbeGroupSpeculativeReadBudget
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_ProbeGroupSpeculativeReadBudget

@@ -13,7 +13,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_RoundedDo
 
 open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-theorem refute : ¬ RoundedDownAddOne.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.RoundedDownAddOne.Goal := by
   intro h
   have got := h 1 2 1 (by decide) (by decide)
   simp at got

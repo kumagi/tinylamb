@@ -9,12 +9,12 @@ zero byte. A reverse delimiter scan must verify the candidate mask.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowReverseDelimiter
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowReverseDelimiter
 
 open TinylambOpt.ResearchGoals.SwarDigitBallot
 open TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
 
-theorem refute : ¬ BorrowReverseDelimiter.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BorrowMasks.BorrowReverseDelimiter.Goal := by
   intro h
   have heq := h 0x0202020202020100
   have hf : marked (fast 0x0202020202020100) = [0,1] := by native_decide
@@ -22,4 +22,4 @@ theorem refute : ¬ BorrowReverseDelimiter.Goal := by
   rw [hf, hz] at heq
   contradiction
 
-end TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowReverseDelimiter
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowReverseDelimiter

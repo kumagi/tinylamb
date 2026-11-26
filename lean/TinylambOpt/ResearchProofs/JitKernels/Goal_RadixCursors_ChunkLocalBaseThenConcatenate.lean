@@ -1,11 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 
-/-!
-Sorting two chunks independently and concatenating them does not produce a
-globally sorted stream: a larger key in the first chunk precedes a smaller key
-from the second. A merge pass remains necessary for ordered SQL output.
--/
-
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -13,9 +7,14 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_RadixCursors_ChunkLocalBase
 
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 
-theorem refute : ¬ ChunkLocalBaseThenConcatenate.Goal := by
+/-! Sorting two chunks separately and concatenating need not be sorted: a
+later chunk can contain a key smaller than the last key of the first chunk. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.RadixCursors.ChunkLocalBaseThenConcatenate.Goal := by
+  rw [ChunkLocalBaseThenConcatenate.Goal]
   intro h
-  have got := h [2] [1]
-  simp at got
+  have hh := h [0,0,1] [0]
+  have hbad : ¬ ([0,0,1].mergeSort ++ [0].mergeSort = ([0,0,1] ++ [0]).mergeSort) := by
+    native_decide
+  exact hbad hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_RadixCursors_ChunkLocalBaseThenConcatenate

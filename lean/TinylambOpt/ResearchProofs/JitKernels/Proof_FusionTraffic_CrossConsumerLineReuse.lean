@@ -1,225 +1,130 @@
 import TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.CrossConsumerLineReuse.Goal`. -/
+
+/-! SOUND: Fusing two projections over one payload charges each shared cache line once.
+The fused footprint is the deduplicated union `F(a++b) = F(a) ++ (lines of b off F(a))`,
+while the correction term `F(a).filter (· ∈ F(b))` counts exactly the shared lines; by
+inclusion–exclusion over the two duplicate-free line lists the total equals
+`|F(a)| + |F(b)|`. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_FusionTraffic_CrossConsumerLineReuse
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FusionTraffic_CrossConsumerLineReuse
 open TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
-open TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.CrossConsumerLineReuse
 
-theorem nodup_eraseDups {α : Type} [BEq α] [LawfulBEq α] : ∀ l : List α, l.eraseDups.Nodup
-  | [] => by simp
-  | a :: as => by
-      rw [List.eraseDups_cons]
-      rw [List.nodup_cons]
-      constructor
-      · intro hmem
-        have h : a ∈ as.filter (fun b => !b == a) := (List.mem_eraseDups.mp hmem)
-        simp at h
-      · exact nodup_eraseDups (as.filter (fun b => !b == a))
-termination_by l => l.length
-decreasing_by exact Nat.lt_of_le_of_lt (List.length_filter_le _ _) (Nat.lt_succ_self _)
+/-- `eraseDups` of any list is duplicate-free. -/
+private theorem nodup_eraseDups (l : List Nat) : l.eraseDups.Nodup := by
+  have key : ∀ n : Nat, ∀ l : List Nat, l.length ≤ n → l.eraseDups.Nodup := by
+    intro n
+    induction n with
+    | zero =>
+        intro m hle
+        match m with
+        | [] => exact List.Pairwise.nil
+        | a :: as =>
+          rw [List.length_cons] at hle
+          exact absurd hle (by omega)
+    | succ k ih =>
+        intro m hle
+        match m with
+        | [] => exact List.Pairwise.nil
+        | a :: as =>
+          have has : as.length ≤ k := by rw [List.length_cons] at hle; omega
+          rw [List.eraseDups_cons, List.nodup_cons]
+          refine ⟨fun hx => ?_,
+            ih (as.filter fun b => !(b == a)) (Nat.le_trans (List.length_filter_le _ as) has)⟩
+          rw [List.mem_eraseDups, List.mem_filter] at hx
+          obtain ⟨_, hp⟩ := hx
+          rw [Nat.not_beq_eq_true_eq] at hp
+          exact hp rfl
+  exact key l.length l (Nat.le_refl l.length)
 
-theorem eraseDups_eq_self_of_nodup {α : Type} [BEq α] [LawfulBEq α]
-    {l : List α} (h : l.Nodup) : l.eraseDups = l := by
+/-- Filtering preserves duplicate-freeness. -/
+private theorem nodup_filter {l : List Nat} (h : l.Nodup) (p : Nat → Bool) :
+    (l.filter p).Nodup := by
   induction l with
-  | nil => simp
+  | nil => exact List.Pairwise.nil
   | cons a as ih =>
-      have ha_not : a ∉ as := (List.nodup_cons.mp h).1
-      have hnd_tail : as.Nodup := (List.nodup_cons.mp h).2
-      rw [List.eraseDups_cons]
-      have hfilter : as.filter (fun b => !b == a) = as := by
-        apply List.filter_eq_self.mpr
-        intro b hb
-        have hba : b ≠ a := by intro heq; subst b; exact ha_not hb
-        simp [beq_iff_eq, hba]
-      rw [hfilter, ih hnd_tail]
+    rw [List.nodup_cons] at h
+    rw [List.filter_cons]
+    split
+    · rw [List.nodup_cons]
+      refine ⟨fun hx => h.1 ((List.mem_filter (p := p)).mp hx).1, ih h.2⟩
+    · exact ih h.2
 
-theorem nodup_filter {α : Type} (p : α → Bool) {l : List α} (h : l.Nodup) :
-    (l.filter p).Nodup := List.Nodup.sublist (List.filter_sublist (p := p)) h
-
-theorem count_eraseDups {α : Type} [BEq α] [LawfulBEq α] [DecidableEq α]
-    (a : α) : ∀ l : List α, List.count a l.eraseDups = if a ∈ l then 1 else 0
-  | [] => by simp
-  | b :: bs => by
-      rw [List.eraseDups_cons]
-      by_cases hab : a == b
-      · have heq : a = b := (beq_iff_eq.mp hab)
-        subst b
-        have hnot : a ∉ (bs.filter (fun b => !b == a)).eraseDups := by
-          rw [List.mem_eraseDups]
-          simp
-        rw [List.count_cons]
-        rw [List.count_eq_zero_of_not_mem hnot]
-        simp
-      · have hbfalse : (a == b) = false := Bool.eq_false_of_ne_true hab
-        have hne : a ≠ b := by intro he; subst b; exact hab ((beq_iff_eq).2 rfl)
-        rw [List.count_cons_of_ne (by intro hba; exact hne hba.symm)]
-        rw [count_eraseDups a (bs.filter (fun x => !x == b))]
-        have hmemfilter : a ∈ bs.filter (fun x => !x == b) ↔ a ∈ bs := by
-          simp [List.mem_filter, hbfalse]
-        by_cases has : a ∈ bs
-        · have hf : a ∈ bs.filter (fun x => !x == b) := hmemfilter.mpr has
-          simp [hf, has, hne]
-        · have hf : a ∉ bs.filter (fun x => !x == b) := by intro hx; exact has (hmemfilter.mp hx)
-          simp [hf, has, hne]
-termination_by l => l.length
-decreasing_by exact Nat.lt_of_le_of_lt (List.length_filter_le _ _) (Nat.lt_succ_self _)
-
-theorem count_eq_one_of_mem_of_nodup {α : Type} [BEq α] [LawfulBEq α] [DecidableEq α]
-    {a : α} {l : List α} (hnd : l.Nodup) (ha : a ∈ l) : List.count a l = 1 := by
-  have hself : l.eraseDups = l := eraseDups_eq_self_of_nodup hnd
-  rw [← hself, count_eraseDups]
-  simp [ha]
-
-theorem perm_eraseDups {α : Type} [BEq α] [LawfulBEq α] [DecidableEq α]
-    {l₁ l₂ : List α} (h : l₁.Perm l₂) : (l₁.eraseDups).Perm (l₂.eraseDups) := by
-  rw [List.perm_iff_count]
-  intro a
-  rw [count_eraseDups, count_eraseDups]
-  by_cases hm : a ∈ l₁
-  · have hm2 : a ∈ l₂ := h.mem_iff.mp hm
-    simp [hm, hm2]
-  · have hm2 : a ∉ l₂ := by intro h2; exact hm (h.mem_iff.mpr h2)
-    simp [hm, hm2]
-
-theorem length_le_of_subset_nodup {α : Type} [BEq α] [LawfulBEq α]
-    {l₁ l₂ : List α} (h₁ : l₁.Nodup) (h₂ : l₂.Nodup) (hsub : l₁ ⊆ l₂) :
-    l₁.length ≤ l₂.length := by
-  induction l₁ generalizing l₂ with
-  | nil => simp
-  | cons a l₁ ih =>
-      have ha_not : a ∉ l₁ := (List.nodup_cons.mp h₁).1
-      have hnd_tail : l₁.Nodup := (List.nodup_cons.mp h₁).2
-      have ha2 : a ∈ l₂ := hsub (by simp)
-      have hsub_tail : l₁ ⊆ l₂.erase a := by
-        intro x hx
-        have hx2 : x ∈ l₂ := hsub (by simp [hx])
-        exact (List.mem_erase_of_ne (by intro hxa; subst a; exact ha_not hx)).2 hx2
-      have ih' := ih hnd_tail (h₂.erase a) hsub_tail
-      rw [List.length_erase_of_mem ha2] at ih'
-      have hl2pos : 0 < l₂.length := List.length_pos_of_mem ha2
-      simp only [List.length_cons]
+/-- Splitting a list by a predicate and its negation preserves total length. -/
+private theorem partition (q : Nat → Bool) : ∀ l : List Nat,
+    (l.filter (fun x => q x)).length + (l.filter (fun x => (!(q x)))).length = l.length := by
+  intro l
+  induction l with
+  | nil => rfl
+  | cons a as ih =>
+    rw [List.filter_cons, List.filter_cons]
+    by_cases h : q a = true
+    · rw [if_pos h]
+      have hn : (!(q a)) = false := by rw [h]; rfl
+      rw [hn, if_neg Bool.false_ne_true, List.length_cons, List.length_cons]
+      omega
+    · have h2 : q a = false := Bool.of_not_eq_true h
+      rw [if_neg h, if_pos (by rw [h2]; rfl), List.length_cons, List.length_cons]
       omega
 
-theorem beq_add_cancel (k x a : Nat) : (k + x == k + a) = (x == a) := by
-  by_cases h : x == a
-  · have heq : x = a := (beq_iff_eq.mp h)
-    subst a
-    simp
-  · have hne : x ≠ a := by intro he; exact h ((beq_iff_eq).2 he)
-    have hne' : k + x ≠ k + a := by omega
-    have hb : (k + x == k + a) = false := by
-      apply Bool.eq_false_of_ne_true
-      intro ht
-      exact hne' ((beq_iff_eq).mp ht)
-    have hb' : (x == a) = false := Bool.eq_false_of_ne_true h
-    rw [hb, hb']
+/-- Lines of `b` that miss `a`'s raw line list are exactly the footprint lines of `b`
+that miss the footprint of `a`. -/
+private theorem removeAll_lines {A B : List Nat} :
+    List.Perm (B.removeAll A).eraseDups
+      (B.eraseDups.filter fun l => !(A.eraseDups).contains l) := by
+  refine ((List.perm_ext_iff_of_nodup (nodup_eraseDups _)
+    (nodup_filter (nodup_eraseDups _) _)).mpr) (fun x => ?_)
+  show x ∈ (B.removeAll A).eraseDups
+      ↔ x ∈ List.filter (fun l => !(A.eraseDups).contains l) B.eraseDups
+  rw [List.mem_eraseDups, List.removeAll, List.mem_filter, List.mem_filter,
+    List.mem_eraseDups]
+  simp [List.elem_eq_mem, List.contains_eq_mem]
 
-theorem map_eraseDups_shift (k : Nat) : ∀ l : List Nat,
-    (l.map (fun x => k + x)).eraseDups = l.eraseDups.map (fun x => k + x)
-  | [] => by simp
-  | a :: as => by
-      rw [List.map_cons, List.eraseDups_cons, List.eraseDups_cons, List.map_cons]
-      congr 1
-      rw [List.filter_map]
-      rw [map_eraseDups_shift k (as.filter ((fun b => !b == k + a) ∘ (fun x => k + x)))]
-      congr 1
-      apply congrArg List.eraseDups
-      apply List.filter_congr
-      intro b hb
-      simp only [Function.comp_apply]
-      rw [beq_add_cancel]
-termination_by l => l.length
-decreasing_by exact Nat.lt_of_le_of_lt (List.length_filter_le _ _) (Nat.lt_succ_self _)
+/-- The two overlap filters count the same lines. -/
+private theorem filter_swap {X Y : List Nat} (hX : X.Nodup) (hY : Y.Nodup) :
+    (X.filter (fun l => Y.contains l)).length = (Y.filter (fun l => X.contains l)).length := by
+  refine ((List.perm_ext_iff_of_nodup (nodup_filter hX _) (nodup_filter hY _)).mpr
+    (fun x => ?_)).length_eq
+  show x ∈ List.filter (fun l => Y.contains l) X
+      ↔ x ∈ List.filter (fun l => X.contains l) Y
+  rw [List.mem_filter, List.mem_filter]
+  simp [List.contains_eq_mem]
+  exact ⟨fun ⟨h1, h2⟩ => ⟨h2, h1⟩, fun ⟨h1, h2⟩ => ⟨h2, h1⟩⟩
 
-theorem length_filter_complement {α : Type} (p : α → Bool) : ∀ l : List α,
-    (l.filter p).length + (l.filter (fun x => !p x)).length = l.length
-  | [] => by simp
-  | a :: as => by
-      have ih := length_filter_complement p as
-      simp only [List.filter_cons, List.length_cons]
-      by_cases h : p a = true
-      · simp [h]; omega
-      · have hf : p a = false := Bool.eq_false_of_ne_true h
-        simp [hf]; omega
-
-theorem filter_intersection_perm {α : Type} [BEq α] [LawfulBEq α] [DecidableEq α]
-    {A B : List α} (hA : A.Nodup) (hB : B.Nodup) :
-    (A.filter fun x => B.contains x).Perm (B.filter fun x => A.contains x) := by
-  rw [List.perm_iff_count]
-  intro x
-  have hA' : (A.filter fun y => B.contains y).Nodup := nodup_filter _ hA
-  have hB' : (B.filter fun y => A.contains y).Nodup := nodup_filter _ hB
-  by_cases hxA : x ∈ A
-  · by_cases hxB : x ∈ B
-    · have hmemA : x ∈ A.filter (fun y => B.contains y) := by
-        rw [List.mem_filter]
-        exact ⟨hxA, List.elem_iff.mpr hxB⟩
-      have hmemB : x ∈ B.filter (fun y => A.contains y) := by
-        rw [List.mem_filter]
-        exact ⟨hxB, List.elem_iff.mpr hxA⟩
-      rw [count_eq_one_of_mem_of_nodup hA' hmemA, count_eq_one_of_mem_of_nodup hB' hmemB]
-    · have hnoA : x ∉ A.filter (fun y => B.contains y) := by
-        intro hx
-        exact hxB (List.elem_iff.mp (List.mem_filter.mp hx).2)
-      have hnoB : x ∉ B.filter (fun y => A.contains y) := by simp [List.mem_filter, hxB]
-      rw [List.count_eq_zero_of_not_mem hnoA, List.count_eq_zero_of_not_mem hnoB]
-  · by_cases hxB : x ∈ B
-    · have hnoA : x ∉ A.filter (fun y => B.contains y) := by simp [List.mem_filter, hxA]
-      have hnoB : x ∉ B.filter (fun y => A.contains y) := by
-        intro hx
-        exact hxA (List.elem_iff.mp (List.mem_filter.mp hx).2)
-      rw [List.count_eq_zero_of_not_mem hnoA, List.count_eq_zero_of_not_mem hnoB]
-    · have hnoA : x ∉ A.filter (fun y => B.contains y) := by simp [List.mem_filter, hxA]
-      have hnoB : x ∉ B.filter (fun y => A.contains y) := by simp [List.mem_filter, hxB]
-      rw [List.count_eq_zero_of_not_mem hnoA, List.count_eq_zero_of_not_mem hnoB]
-
-
-
-theorem sound : Goal := by
+/-- Inclusion–exclusion for fused footprints. -/
+theorem sound : CrossConsumerLineReuse.Goal := by
   intro base stride w a b
-  let ma := a.map (fun i => lineOf base stride w i)
-  let mb := b.map (fun i => lineOf base stride w i)
-  let A := ma.eraseDups
-  let B := mb.eraseDups
-  have hA : A.Nodup := by dsimp [A]; exact nodup_eraseDups _
-  have hB : B.Nodup := by dsimp [B]; exact nodup_eraseDups _
-  have hremNodup : (B.removeAll A).Nodup := by
-    dsimp [List.removeAll]
-    exact nodup_filter _ hB
-  have happ : footprint base stride w (a ++ b) = A ++ (mb.removeAll ma).eraseDups := by
-    dsimp [A, B, ma, mb, footprint]
+  show (footprint base stride w (a ++ b)).length
+      + ((footprint base stride w a).filter
+        (fun l => (footprint base stride w b).contains l)).length
+      = (footprint base stride w a).length + (footprint base stride w b).length
+  have hstruct : footprint base stride w (a ++ b)
+      = footprint base stride w a
+        ++ ((List.map (lineOf base stride w) b).removeAll
+          (List.map (lineOf base stride w) a)).eraseDups := by
+    show (List.map (lineOf base stride w) (a ++ b)).eraseDups
+        = (List.map (lineOf base stride w) a).eraseDups
+          ++ ((List.map (lineOf base stride w) b).removeAll
+            (List.map (lineOf base stride w) a)).eraseDups
     rw [List.map_append, List.eraseDups_append]
-  have htailNodup : (mb.removeAll ma).eraseDups.Nodup := by
-    dsimp [mb, ma]
-    exact nodup_eraseDups _
-  have hmem : ∀ x, (x ∈ (mb.removeAll ma).eraseDups) ↔ (x ∈ B.removeAll A) := by
-    intro x
-    simp [List.removeAll, List.mem_eraseDups, A, B, ma, mb]
-  have hperm_tail : ((mb.removeAll ma).eraseDups).Perm (B.removeAll A) := by
-    rw [List.perm_iff_count]
-    intro x
-    by_cases hx : x ∈ (mb.removeAll ma).eraseDups
-    · have hx2 : x ∈ B.removeAll A := (hmem x).mp hx
-      rw [count_eq_one_of_mem_of_nodup htailNodup hx,
-          count_eq_one_of_mem_of_nodup hremNodup hx2]
-    · have hx2 : x ∉ B.removeAll A := by intro h; exact hx ((hmem x).mpr h)
-      rw [List.count_eq_zero_of_not_mem hx, List.count_eq_zero_of_not_mem hx2]
-  have hlen_union : (footprint base stride w (a ++ b)).length = A.length + (B.removeAll A).length := by
-    rw [happ, List.length_append, hperm_tail.length_eq]
-  have hcomp : (B.removeAll A).length + (B.filter (fun x => A.contains x)).length = B.length := by
-    have hc := length_filter_complement (fun x => A.contains x) B
-    have hfilter : B.filter (fun x => !(A.contains x)) = B.removeAll A := rfl
-    rw [hfilter] at hc
-    omega
-  have hinter : (A.filter (fun x => B.contains x)).length = (B.filter (fun x => A.contains x)).length :=
-    (filter_intersection_perm hA hB).length_eq
-  change (footprint base stride w (a ++ b)).length + (A.filter (fun x => B.contains x)).length = A.length + B.length
-  rw [hlen_union]
+  have hT := (removeAll_lines (A := List.map (lineOf base stride w) a)
+    (B := List.map (lineOf base stride w) b)).length_eq
+  have hfa : footprint base stride w a = (List.map (lineOf base stride w) a).eraseDups := rfl
+  have hfb : footprint base stride w b = (List.map (lineOf base stride w) b).eraseDups := rfl
+  have hXY := filter_swap (X := footprint base stride w a) (Y := footprint base stride w b)
+    (nodup_eraseDups _) (nodup_eraseDups _)
+  have hpart : ((footprint base stride w b).filter
+        (fun l => (footprint base stride w a).contains l)).length
+      + ((footprint base stride w b).filter
+        (fun l => !((footprint base stride w a).contains l))).length
+      = (footprint base stride w b).length :=
+    partition (fun l => (footprint base stride w a).contains l) (footprint base stride w b)
+  rw [hstruct, List.length_append, hT, ← hfa, ← hfb, hXY]
   omega
 
-end Nov26.Proof_FusionTraffic_CrossConsumerLineReuse
+end TinylambOpt.ResearchProofs.JitKernels.FusionTraffic_CrossConsumerLineReuse

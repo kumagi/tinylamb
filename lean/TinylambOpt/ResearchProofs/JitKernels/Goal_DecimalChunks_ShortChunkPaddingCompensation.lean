@@ -8,7 +8,7 @@ constant compensation. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_ShortChunkPaddingCompensation
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_ShortChunkPaddingCompensation
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
@@ -36,9 +36,9 @@ theorem magnitudeReplicateZero : ∀ n, magnitude (List.replicate n 48) = 0 := b
   | zero => simp [magnitude]
   | succ n ih => simpa [magnitude, List.replicate_succ] using ih
 
-theorem sound : ShortChunkPaddingCompensation.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.ShortChunkPaddingCompensation.Goal := by
   intro s n
   rw [magnitudeAppend, magnitudeReplicateZero, List.length_replicate, Nat.add_zero]
   exact Nat.mul_div_cancel (magnitude s) (Nat.pow_pos (a := 10) (n := n) (by decide))
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_ShortChunkPaddingCompensation
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_ShortChunkPaddingCompensation

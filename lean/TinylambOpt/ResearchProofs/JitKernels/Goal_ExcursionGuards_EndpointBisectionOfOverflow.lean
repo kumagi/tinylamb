@@ -1,20 +1,14 @@
 import TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-/-! Refutation: endpoint representability is monotone only for nonnegative
-terms. A negative term after an overflowing prefix brings the later endpoint
-back in range, so bisection on endpoints misses the first overflow. -/
-
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_EndpointBisectionOfOverflow
 
-open TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
-
-theorem refute : ¬ EndpointBisectionOfOverflow.Goal := by
+/-- Exceeding the bound at an earlier prefix does not imply the later prefix
+also exceeds it: `[10,-10]` with bound 5 crosses at ordinal 1 but ends at 0. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.EndpointBisectionOfOverflow.Goal := by
   intro h
-  have hbad := h 0 0 [10, -10] 1 2 (by omega) (by decide) (by native_decide)
-  have hc : ¬ 0 < 0 + ([10, -10].take 2).sum := by native_decide
-  exact hc hbad
+  let xs : List Int := [10, -10]
+  have c := h 5 0 xs 1 2 (by native_decide) (by native_decide) (by native_decide)
+  have bad : ¬ ((5 : Int) < 0 + (xs.take 2).sum) := by native_decide
+  exact bad c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_EndpointBisectionOfOverflow

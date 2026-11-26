@@ -8,7 +8,7 @@ perform the guard before the multiply. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_ExactChunkOverflowDivision
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_ExactChunkOverflowDivision
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
@@ -24,4 +24,4 @@ theorem sound : ExactChunkOverflowDivision.Goal := by
     have hmul : a * 10 ^ k ≤ cap - b := (Nat.le_div_iff_mul_le hp).1 hadiv
     omega
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_ExactChunkOverflowDivision
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_ExactChunkOverflowDivision

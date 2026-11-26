@@ -1,19 +1,16 @@
 import TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+-- Refutation: a 63-bit field at bit phase 7 needs the high byte of a ninth byte window.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PackedFieldLoads_SingleWordUnalignedWidth
 
-open TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
-open TinylambOpt.ResearchGoals.Compression.Wire
-
-theorem refute : ¬ SingleWordUnalignedWidth.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.SingleWordUnalignedWidth.Goal := by
   intro h
-  have hcanon : ∀ b ∈ List.range 20, b < 256 := by native_decide
-  have hh := h (List.range 20) 63 1 (by omega) hcanon
-  have contra : ¬ (load (List.range 20) 63 1 8 = takeAt (List.range 20) 63 1) := by
-    native_decide
-  exact contra hh
+  have c := h (List.replicate 15 0 ++ [1] : List Nat) 63 1 (by native_decide) (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.load
+        (List.replicate 15 0 ++ [1] : List Nat) 63 1 8 =
+      TinylambOpt.ResearchGoals.Compression.Wire.takeAt
+        (List.replicate 15 0 ++ [1] : List Nat) 63 1)) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_PackedFieldLoads_SingleWordUnalignedWidth

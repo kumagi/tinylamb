@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
+set_option linter.unusedSimpArgs false
 
 /-! Multiplication by a rounded reciprocal is not bitwise equal to division:
 `3 / 5` and `3 * (1 / 5)` differ in the last bit. -/

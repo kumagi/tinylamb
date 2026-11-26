@@ -1,26 +1,21 @@
 import TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
 
-/-
-Refutes `BorrowBallotForCompaction`: a zero byte followed by byte `0x01`
-continues the borrow and makes the subtract mask flag a non-zero lane. The
-witness `0x0100` flags lane 1 in `fast` but not in `zeroBytes`, so a SQL scan
-cannot compact candidates with the raw subtract mask.
--/
-
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowBallotForCompaction
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowBallotForCompaction
 
-open TinylambOpt.ResearchGoals.SwarDigitBallot
 open TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
+open TinylambOpt.ResearchGoals.SwarDigitBallot
 
-theorem refute : ¬ BorrowBallotForCompaction.Goal := by
+/-! A zero byte followed by byte 1 borrows into the next lane. The subtract
+mask marks both lanes, while the exact zero-byte test marks only the first. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BorrowMasks.BorrowBallotForCompaction.Goal := by
+  rw [BorrowBallotForCompaction.Goal]
   intro h
-  have heq := h 0x0100
-  have hf : marked (fast 0x0100) = [0,1,2,3,4,5,6,7] := by native_decide
-  have hz : marked (zeroBytes 0x0100) = [0,2,3,4,5,6,7] := by native_decide
-  rw [hf, hz] at heq
-  contradiction
+  have hh := h (0x0100 : W)
+  have hbad : marked (fast (0x0100 : W)) ≠ marked (zeroBytes (0x0100 : W)) := by
+    native_decide
+  exact hbad hh
 
-end TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowBallotForCompaction
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowBallotForCompaction

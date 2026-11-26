@@ -1,61 +1,57 @@
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FiniteOverflowLaneReplay.Goal`. -/
+
+/-!
+Proves `FiniteOverflowLaneReplay.Goal`: a finite scalar prefix may be skipped
+when locating the first infinity on a delayed cold path. Formally, if no
+prefix-sum accumulator of `a` (seeded with `s`) is infinite — i.e.
+`firstInf s a = none` — then the first-infinity search over the concatenation
+`a ++ b` equals the search re-seeded at the true fold total `total s a`, with
+found indices shifted by `a.length`. The proof is pure list mechanics
+(`List.scanl_append`, `List.findIdx?_append`, `List.findIdx?_cons`): the
+dropped head of the re-seeded scan is exactly `total s a`, which is an
+element of the prefix scan and hence not infinite, so the head test fails and
+indices rebase by one. No IEEE-specific reasoning is required. This lets the
+JIT kernel resume an infinity scan at a chunk boundary without replaying the
+hot prefix, provided the prefix was already proven inf-free.
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+set_option linter.unusedVariables false
 
-namespace Nov26.Proof_FloatingReduction_FiniteOverflowLaneReplay
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FiniteOverflowLaneReplay
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FiniteOverflowLaneReplay
 
-theorem findIdx?_ne_none_of_mem {α : Type} (p : α → Bool) : ∀ {x : α} {l : List α},
-    x ∈ l → p x = true → List.findIdx? p l ≠ none
-  | x, [], hx, hp => by simp at hx
-  | x, y :: ys, hx, hp => by
-      rw [List.findIdx?_cons]
-      by_cases hy : p y = true
-      · simp [hy]
-      · rcases List.mem_cons.mp hx with hxy | hxys
-        · subst x
-          simp [hp]
-        · have ih := findIdx?_ne_none_of_mem p hxys hp
-          simp [hy, ih]
+private theorem foldl_mem_scanl (l : List Float) (s : Float) :
+    l.foldl (·+·) s ∈ l.scanl (·+·) s := by
+  induction l generalizing s with
+  | nil => rw [List.scanl_nil, List.foldl_nil]; exact List.mem_singleton_self _
+  | cons x t ih => rw [List.scanl_cons, List.foldl_cons]; exact List.mem_cons_of_mem _ (ih (s + x))
 
-theorem total_mem_scanl {β α : Type} (f : β → α → β) : ∀ (s : β) (l : List α),
-    List.foldl f s l ∈ List.scanl f s l
-  | s, [] => by simp
-  | s, x :: xs => by
-      rw [List.foldl_cons, List.scanl_cons]
-      exact List.mem_cons_of_mem s (total_mem_scanl f (f s x) xs)
-
-theorem sound : Goal := by
+theorem sound : FiniteOverflowLaneReplay.Goal := by
   intro s a b hnone
-  unfold firstInf at hnone
-  unfold firstInf total
-  let p : Float → Bool := Float.isInf
-  let f : Float → Float → Float := fun x y => x + y
-  have hfinalmem : List.foldl f s a ∈ List.scanl f s a := total_mem_scanl f s a
-  have hfinalnot : p (List.foldl f s a) ≠ true := by
-    intro hp
-    have hn := findIdx?_ne_none_of_mem p hfinalmem hp
-    exact hn hnone
-  have hfinalfalse : p (List.foldl f s a) = false := Bool.eq_false_of_ne_true hfinalnot
-  rw [List.scanl_append]
-  rw [List.findIdx?_append]
-  dsimp [p, f] at hnone hfinalfalse ⊢
-  rw [hnone]
-  simp only [Option.none_or]
+  have hfor := List.findIdx?_eq_none_iff.mp hnone
+  have hacc : Float.isInf (a.foldl (·+·) s) = false := by
+    simpa using hfor (a.foldl (·+·) s) (foldl_mem_scanl a s)
+  have hnone' : List.findIdx? Float.isInf (List.scanl (·+·) s a) = none := hnone
+  show ((a ++ b).scanl (·+·) s).findIdx? Float.isInf
+      = ((b.scanl (·+·) (a.foldl (·+·) s)).findIdx? Float.isInf).map (fun i => a.length + i)
+  rw [List.scanl_append, List.findIdx?_append, hnone', List.length_scanl, Option.none_or]
+  show Option.map (fun i => i + (a.length + 1))
+      (((b.scanl (·+·) (a.foldl (·+·) s)).tail).findIdx? Float.isInf)
+      = ((b.scanl (·+·) (a.foldl (·+·) s)).findIdx? Float.isInf).map (fun i => a.length + i)
   cases b with
-  | nil => simp [hfinalfalse]
-  | cons bx bxes =>
-      rw [List.scanl_cons, List.findIdx?_cons]
-      rw [hfinalfalse]
-      simp
-      congr 1
-      funext i
-      simp only [Function.comp_apply]
-      omega
+  | nil =>
+    rw [List.scanl_nil, List.tail_cons, List.findIdx?_nil, List.findIdx?_cons,
+      ite_eq_right (by simpa using hacc), List.findIdx?_nil]
+    rfl
+  | cons x t =>
+    rw [List.scanl_cons, List.tail_cons, List.findIdx?_cons,
+      ite_eq_right (by simpa using hacc), Option.map_map]
+    refine congrArg (fun g => Option.map g
+      (List.findIdx? Float.isInf (List.scanl (·+·) (a.foldl (·+·) s + x) t))) ?_
+    funext i
+    show i + (a.length + 1) = a.length + (i + 1)
+    omega
 
-end Nov26.Proof_FloatingReduction_FiniteOverflowLaneReplay
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FiniteOverflowLaneReplay

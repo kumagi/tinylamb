@@ -1,18 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-! Low-nibble range and a 7-bit bound do not force an ASCII decimal digit:
-byte 16 has low nibble zero but is not in the `'0'..'9'` range. -/
-
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_PackedLowNibblesValidateDigits
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_PackedLowNibblesValidateDigits
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-theorem refute : ¬ PackedLowNibblesValidateDigits.Goal := by
+/-! Low nibble zero is not sufficient: byte 0 is not an ASCII digit. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.PackedLowNibblesValidateDigits.Goal := by
+  rw [PackedLowNibblesValidateDigits.Goal]
   intro h
-  have hw := h [16] (by simp) (by simp)
-  simp [digits] at hw
+  have hp := h [0] (by simp) (by decide)
+  simp [digits] at hp
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_PackedLowNibblesValidateDigits
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_PackedLowNibblesValidateDigits

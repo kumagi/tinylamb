@@ -14,7 +14,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_WorstResi
 
 open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-theorem sound : WorstResidueGuard.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.WorstResidueGuard.Goal := by
   intro bound d s hd hguard x hx
   let N := 2 ^ s
   let m := magic d s

@@ -1,23 +1,25 @@
 import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.EndpointsCertifyCheckedSquareDifference.Goal`. -/
+
+/-! FALSE: Corner evaluations do not certify a fused square-difference `x*(c-x)`.
+Counterexample: domain `[0,3]` with stride 1, `c = 4`, width 2 (`fits` range `[-4,4)`);
+`first = 0` gives `0*(4-0) = 0` and `last = 3` gives `3*(4-3) = 3`, both fitting, but the
+interior vertex `x = 2` gives `2*(4-2) = 4`, which overflows. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_GuardCertificates_EndpointsCertifyCheckedSquareDifference
-
+namespace TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_EndpointsCertifyCheckedSquareDifference
 open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.EndpointsCertifyCheckedSquareDifference
 
-theorem refute : ¬ Goal := by
+/-- Refutation of corner-only certification for the fused quadratic. -/
+theorem refute : ¬ EndpointsCertifyCheckedSquareDifference.Goal := by
   intro h
-  let d : Domain := { lo := 0, hi := 10, modulus := 1, residue := 0 }
-  have hd : inside d (5 : Int) := by unfold inside d; native_decide
-  have hf : fits 4 (first d * (10 - first d)) := by unfold fits first d; native_decide
-  have hl : fits 4 (last d * (10 - last d)) := by unfold fits last d; native_decide
-  have h' := h d 10 4 (5 : Int) (by native_decide) hd hf hl
-  have hbad : ¬ fits 4 ((5 : Int) * (10 - 5)) := by unfold fits; native_decide
-  exact hbad h'
+  have key := h ⟨0, 3, 1, 0⟩ 4 2 2 (by decide)
+    (by simp only [inside]; decide) (by simp only [fits]; decide)
+    (by simp only [fits]; decide)
+  exact absurd key (by simp only [fits]; decide)
 
-end Nov26.Proof_GuardCertificates_EndpointsCertifyCheckedSquareDifference
+end TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_EndpointsCertifyCheckedSquareDifference

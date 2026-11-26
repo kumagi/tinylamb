@@ -546,7 +546,8 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
 
     // Positions refer to the full Query message, including earlier SQL,
     // UTF-8 characters, CRLFs and leading whitespace removed by the splitter.
-    ASSERT_TRUE(SendAll(client, QueryMessage("SELECT '雪';\r\n \tSELECT\n\t)")));
+    ASSERT_TRUE(
+        SendAll(client, QueryMessage("SELECT '雪';\r\n \tSELECT\n\t)")));
     const std::string multiline = ErrorPayloads(ReadUntilReady(client));
     EXPECT_NE(multiline.find(std::string("P24\0", 4)), std::string::npos)
         << multiline;
@@ -3706,6 +3707,105 @@ TEST(PostgresServerTest, ProtocolViolationAbortsExplicitBlock) {
     ASSERT_TRUE(SendAll(client, QueryMessage("SELECT 7;")));
     EXPECT_NE(ReadUntilReady(client).find('7'),
               std::string::npos);  // NOLINT(performance-faster-string-find)
+
+    close(client);
+    server.RequestStop();
+    server_thread.join();
+    EXPECT_EQ(run_result, 0) << run_error;
+  }
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  Database& database = *database_holder;
+  database.DeleteAll();
+}
+
+TEST(PostgresServerTest, ExtendedQueryBinaryFormatEndToEnd) {
+  const std::string path = "postgres_server_ext_bin_test-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    ASSERT_TRUE(server.Listen(&listen_error)) << listen_error;
+    std::string run_error;
+    int run_result = -1;
+    std::jthread server_thread([&] { run_result = server.Run(&run_error); });
+    StopGuard stop_guard{&server};
+
+    const int client = ConnectClient(server.BoundPort());
+    ASSERT_GE(client, 0);
+
+    ASSERT_TRUE(SendAll(
+        client,
+        QueryMessage("CREATE TABLE ext_bin (k INT64, v FLOAT64); "
+                     "INSERT INTO ext_bin VALUES (10, 2.5), (20, 7.25);")));
+    ASSERT_FALSE(ReadUntilReady(client).empty());
+
+    auto frame = [](char tag, const std::string& body) {
+      std::string out;
+      out.push_back(tag);
+      pgwire::AppendUint32(&out, static_cast<uint32_t>(body.size() + 4));
+      out += body;
+      return out;
+    };
+
+    std::string parse_body;
+    parse_body.append("q1", 3);
+    const std::string sql = "SELECT k, v FROM ext_bin WHERE k >= $1 ORDER BY k";
+    parse_body.append(sql.c_str(), sql.size() + 1);
+    pgwire::AppendUint16(&parse_body, 1);
+    pgwire::AppendUint32(&parse_body, 20);  // int8
+
+    std::string bind_body;
+    bind_body.append("p1", 3);
+    bind_body.append("q1", 3);
+    pgwire::AppendUint16(&bind_body, 1);
+    pgwire::AppendUint16(&bind_body, 0);  // param text
+    pgwire::AppendUint16(&bind_body, 1);
+    pgwire::AppendUint32(&bind_body, 2);
+    bind_body.append("10", 2);
+    pgwire::AppendUint16(&bind_body, 1);
+    pgwire::AppendUint16(&bind_body, 1);  // all columns binary
+
+    std::string desc_body;
+    desc_body.push_back('P');
+    desc_body.append("p1", 3);
+
+    std::string exec_body;
+    exec_body.append("p1", 3);
+    pgwire::AppendUint32(&exec_body, 0);  // unlimited
+
+    std::string close_body;
+    close_body.push_back('S');
+    close_body.append("q1", 3);
+
+    const std::string pipeline =
+        frame('P', parse_body) + frame('B', bind_body) + frame('D', desc_body) +
+        frame('E', exec_body) + frame('C', close_body) + frame('S', {});
+    ASSERT_TRUE(SendAll(client, pipeline));
+    const std::string reply = ReadUntilReady(client);
+
+    size_t pos = 0;
+    std::string tags;
+    std::vector<std::string> data_rows;
+    while (pos + 5 <= reply.size()) {
+      const char tag = reply[pos];
+      auto len_or = pgwire::ReadUint32(reply, pos + 1);
+      ASSERT_TRUE(len_or.HasValue());
+      const size_t body_len = len_or.Value() - 4;
+      ASSERT_LE(pos + 5 + body_len, reply.size());
+      tags.push_back(tag);
+      if (tag == 'D') {
+        data_rows.emplace_back(reply.substr(pos + 5, body_len));
+      }
+      pos += 5 + body_len;
+    }
+    EXPECT_EQ(tags, "12TDDC3Z");
+    ASSERT_EQ(data_rows.size(), 2U);
+    EXPECT_EQ(data_rows[0].size(), 26U);
+    EXPECT_EQ(data_rows[1].size(), 26U);
+    EXPECT_EQ(pgwire::ReadUint32(data_rows[0], 2).Value(), 8U);
+    EXPECT_EQ(pgwire::ReadUint32(data_rows[0], 14).Value(), 8U);
 
     close(client);
     server.RequestStop();

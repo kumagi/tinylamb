@@ -1,18 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-! Dropping all leading zeros can make the input empty, and the empty input is
-rejected by the parser, while an all-zero decimal word parses as zero. -/
+/-! Trimming a single zero digit produces the empty input, which the parser
+    rejects, while the original all-zero input parses successfully. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_TrimZerosPreservesAllZeroInput
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_TrimZerosPreservesAllZeroInput
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-theorem refute : ¬ TrimZerosPreservesAllZeroInput.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.TrimZerosPreservesAllZeroInput.Goal := by
   intro h
-  have hw := h 0 false [48] (by simp [digits])
-  simp [parse, digits, magnitude] at hw
+  have hh := h 1 false [48] (by native_decide)
+  have hne : (parse 1 false ([48].dropWhile (fun c => c == 48)) ≠ parse 1 false [48]) := by
+    native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_TrimZerosPreservesAllZeroInput
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_TrimZerosPreservesAllZeroInput

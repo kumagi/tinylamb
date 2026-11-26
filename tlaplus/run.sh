@@ -23,6 +23,8 @@ declare -A EXPECT=(
   [barrier_tree_late]=fail [barrier_snapshot]=pass [barrier_buffered]=pass
   [objgc_design]=pass [objgc_bug_timebased]=fail [objgc_bug_tail]=fail [objgc_bug_late_seal]=fail
   [objgc_bug_dedupe]=fail [objgc_bug_settle_early]=fail
+  [gcreg_design]=pass [gcreg_bug_norecord]=fail [gcreg_bug_stalemark]=fail
+  [manifestgc_design]=pass [manifestgc_bug_headfirst]=fail [manifestgc_bug_sibling]=fail
 )
 # config -> invariant the README promises to trip (fail configs only; configs
 # absent here accept any violation, matching the README's "違反" entries).
@@ -38,6 +40,8 @@ declare -A EXPECT_INV=(
   [barrier_tree_late]=ObservedDurable
   [objgc_bug_timebased]=RefsResolve [objgc_bug_tail]=RefsResolve [objgc_bug_late_seal]=RefsResolve
   [objgc_bug_dedupe]=RefsResolve [objgc_bug_settle_early]=RefsResolve
+  [gcreg_bug_norecord]=HeldExists [gcreg_bug_stalemark]=HeldExists
+  [manifestgc_bug_headfirst]=HeadResolves [manifestgc_bug_sibling]=PublishedChain
 )
 # config name prefix -> module
 module_for() {
@@ -45,6 +49,8 @@ module_for() {
     s3wal_*) echo S3Wal.tla ;;
     barrier_*) echo ReplyBarrier.tla ;;
     objgc_*) echo ObjectGc.tla ;;
+    gcreg_*) echo GcRegistry.tla ;;
+    manifestgc_*) echo ManifestGc.tla ;;
     *) echo TxSpill.tla ;;
   esac
 }
@@ -54,7 +60,9 @@ ORDER=(current current_harm bug_record bug_record_harm fixed bug_stale bug_gen b
   s3wal_bug_ckpt s3wal_bug_chase s3wal_bug_t2race s3wal_bug_sealgc s3wal_bug_tail
   barrier_version barrier_version_heap barrier_version_gc barrier_tree barrier_tree_late
   barrier_snapshot barrier_buffered
-  objgc_design objgc_bug_timebased objgc_bug_tail objgc_bug_late_seal objgc_bug_dedupe objgc_bug_settle_early)
+  objgc_design objgc_bug_timebased objgc_bug_tail objgc_bug_late_seal objgc_bug_dedupe objgc_bug_settle_early
+  gcreg_design gcreg_bug_norecord gcreg_bug_stalemark
+  manifestgc_design manifestgc_bug_headfirst manifestgc_bug_sibling)
 TARGETS=("${@:-${ORDER[@]}}")
 mkdir -p out || { echo "cannot create output directory: out" >&2; exit 2; }
 status=0

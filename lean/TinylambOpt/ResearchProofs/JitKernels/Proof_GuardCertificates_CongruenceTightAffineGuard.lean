@@ -1,108 +1,75 @@
 import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.CongruenceTightAffineGuard.Goal`. -/
+
+/-! SOUND: For a strided domain `d` and affine map `x ↦ m*x + c`, checking width-fitting at
+the first and last realizable values `first d`, `last d` implies every realizable value
+`x` fits: `first d ≤ x ≤ last d` and the affine map is monotone in either direction, so the
+JIT can eliminate impossible interval endpoints and guard only the extremal products. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_GuardCertificates_CongruenceTightAffineGuard
-
+namespace TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_CongruenceTightAffineGuard
 open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.CongruenceTightAffineGuard
 
-theorem emod_le_self_of_nonneg {y m : Int} (hy : 0 ≤ y) (hm : 0 < m) : y % m ≤ y := by
-  have hdecomp := Int.ediv_mul_add_emod y m
-  have hq : 0 ≤ y / m := Int.ediv_nonneg hy (Int.le_of_lt hm)
-  have hp : 0 ≤ (y / m) * m := Int.mul_nonneg hq (Int.le_of_lt hm)
+/-- Every inside value is at least the rounded first representative. -/
+private theorem first_le (d : Domain) {x : Int} (hm : 0 < d.modulus) (hlo : d.lo ≤ x)
+    (hc : (x - d.residue) % (d.modulus:Int) = 0) : first d ≤ x := by
+  have hmd : (d.modulus:Int) ≠ 0 := by omega
+  have ht : (d.residue - d.lo) % (d.modulus:Int) = (x - d.lo) % (d.modulus:Int) := by
+    rw [Int.emod_eq_emod_iff_emod_sub_eq_zero]
+    have hz : (d.residue - d.lo) - (x - d.lo) = -(x - d.residue) := by omega
+    rw [hz, Int.emod_eq_zero_of_dvd (Int.dvd_neg.mpr (Int.dvd_of_emod_eq_zero hc))]
+  have hge : 0 ≤ x - d.lo := by omega
+  have hdiv : (x - d.lo) % (d.modulus:Int)
+      + ((x - d.lo) / (d.modulus:Int)) * (d.modulus:Int) = x - d.lo :=
+    Int.emod_add_ediv_mul _ _
+  have hqm : 0 ≤ ((x - d.lo) / (d.modulus:Int)) * (d.modulus:Int) :=
+    Int.mul_nonneg (Int.ediv_nonneg hge (by omega)) (by omega)
+  show d.lo + (d.residue - d.lo) % (d.modulus:Int) ≤ x
+  rw [ht]
   omega
 
-theorem first_congruent (d : Domain) : (first d - d.residue) % (d.modulus : Int) = 0 := by
-  unfold first
-  let a : Int := d.residue - d.lo
-  let m : Int := (d.modulus : Int)
-  have hdecomp := Int.ediv_mul_add_emod a m
-  rw [Int.mul_comm (a / m) m] at hdecomp
-  apply Int.emod_eq_zero_of_dvd
-  refine ⟨-((a / m)), ?_⟩
-  dsimp [a, m] at hdecomp ⊢
-  rw [Int.mul_neg]
+/-- Every inside value is at most the rounded last representative. -/
+private theorem le_last (d : Domain) {x : Int} (hm : 0 < d.modulus) (hhi : x ≤ d.hi)
+    (hc : (x - d.residue) % (d.modulus:Int) = 0) : x ≤ last d := by
+  have hmd : (d.modulus:Int) ≠ 0 := by omega
+  have ht : (d.hi - d.residue) % (d.modulus:Int) = (d.hi - x) % (d.modulus:Int) := by
+    rw [Int.emod_eq_emod_iff_emod_sub_eq_zero]
+    have hz : (d.hi - d.residue) - (d.hi - x) = x - d.residue := by omega
+    rw [hz, Int.emod_eq_zero_of_dvd (Int.dvd_of_emod_eq_zero hc)]
+  have hge : 0 ≤ d.hi - x := by omega
+  have hdiv : (d.hi - x) % (d.modulus:Int)
+      + ((d.hi - x) / (d.modulus:Int)) * (d.modulus:Int) = d.hi - x :=
+    Int.emod_add_ediv_mul _ _
+  have hqm : 0 ≤ ((d.hi - x) / (d.modulus:Int)) * (d.modulus:Int) :=
+    Int.mul_nonneg (Int.ediv_nonneg hge (by omega)) (by omega)
+  have hle : (d.hi - x) % (d.modulus:Int) ≤ d.hi - x := by omega
+  show x ≤ d.hi - (d.hi - d.residue) % (d.modulus:Int)
+  rw [ht]
   omega
 
-theorem first_ge_lo (d : Domain) (hm : 0 < d.modulus) : d.lo ≤ first d := by
-  unfold first
-  have hnonneg : 0 ≤ (d.residue - d.lo) % (d.modulus : Int) :=
-    Int.emod_nonneg _ (by omega)
-  omega
-
-theorem first_le_of_inside (d : Domain) (hm : 0 < d.modulus) {x : Int}
-    (hx : inside d x) : first d ≤ x := by
-  unfold first
-  unfold inside at hx
-  let a : Int := d.residue - d.lo
-  let m : Int := (d.modulus : Int)
-  have hmpos : 0 < m := by dsimp [m]; omega
-  have hzero : ((x - d.lo) - a) % m = 0 := by
-    have heq : (x - d.lo) - a = x - d.residue := by dsimp [a]; omega
-    rw [heq]
-    dsimp [m]
-    exact hx.2.2
-  have hcong : (x - d.lo) % m = a % m := (Int.emod_eq_emod_iff_emod_sub_eq_zero).2 hzero
-  have hle := emod_le_self_of_nonneg (by omega : 0 ≤ x - d.lo) hmpos
-  dsimp [a, m] at hcong hle ⊢
-  omega
-
-theorem last_congruent (d : Domain) : (last d - d.residue) % (d.modulus : Int) = 0 := by
-  unfold last
-  let a : Int := d.hi - d.residue
-  let m : Int := (d.modulus : Int)
-  have hdecomp := Int.ediv_mul_add_emod a m
-  rw [Int.mul_comm (a / m) m] at hdecomp
-  apply Int.emod_eq_zero_of_dvd
-  refine ⟨(a / m), ?_⟩
-  dsimp [a, m] at hdecomp ⊢
-  omega
-
-theorem le_last_of_inside (d : Domain) (hm : 0 < d.modulus) {x : Int}
-    (hx : inside d x) : x ≤ last d := by
-  unfold last
-  unfold inside at hx
-  let a : Int := d.hi - d.residue
-  let m : Int := (d.modulus : Int)
-  have hmpos : 0 < m := by dsimp [m]; omega
-  have hzero : ((d.hi - x) - a) % m = 0 := by
-    have hz : (x - d.residue) % m = 0 := by dsimp [m]; exact hx.2.2
-    -- (hi-x) - (hi-res) = res - x = -(x-res)
-    have hdvd : m ∣ ((d.hi - x) - a) := by
-      have hdvd1 : m ∣ (x - d.residue) := Int.dvd_of_emod_eq_zero hz
-      have hdvd2 : m ∣ -(x - d.residue) := (Int.dvd_neg).2 hdvd1
-      have heq : (d.hi - x) - a = -(x - d.residue) := by dsimp [a]; omega
-      rw [heq]
-      exact hdvd2
-    exact Int.emod_eq_zero_of_dvd hdvd
-  have hcong : (d.hi - x) % m = a % m := (Int.emod_eq_emod_iff_emod_sub_eq_zero).2 hzero
-  have hle := emod_le_self_of_nonneg (by omega : 0 ≤ d.hi - x) hmpos
-  dsimp [a, m] at hcong hle ⊢
-  omega
-
-theorem sound : Goal := by
-  intro d m c w x hm hx hf hl
-  have hfl := first_le_of_inside d hm hx
-  have hll := le_last_of_inside d hm hx
-  unfold fits at hf hl ⊢
-  by_cases hm0 : 0 ≤ m
-  · have hlow : m * first d + c ≤ m * x + c := by
-      have := Int.mul_le_mul_of_nonneg_left hfl hm0
-      omega
-    have hup : m * x + c ≤ m * last d + c := by
-      have := Int.mul_le_mul_of_nonneg_left hll hm0
-      omega
+/-- Tight affine guard: endpoint fits certify every inside value. -/
+theorem sound : CongruenceTightAffineGuard.Goal := by
+  intro d m c w x hm hx hf1 hf2
+  obtain ⟨hlo, hhi, hc⟩ := hx
+  have hfle : first d ≤ x := first_le d hm hlo hc
+  have hxle : x ≤ last d := le_last d hm hhi hc
+  simp only [fits] at hf1 hf2 ⊢
+  obtain ⟨h1l, h1u⟩ := hf1
+  obtain ⟨h2l, h2u⟩ := hf2
+  by_cases hmsign : (0:Int) ≤ m
+  · have t1 : 0 ≤ m * (x - first d) := Int.mul_nonneg hmsign (by omega)
+    have t2 : 0 ≤ m * (last d - x) := Int.mul_nonneg hmsign (by omega)
+    rw [Int.mul_sub] at t1 t2
     omega
-  · have hmneg : m ≤ 0 := by omega
-    have hlow : m * last d + c ≤ m * x + c := by
-      have := Int.mul_le_mul_of_nonpos_left hmneg hll
-      omega
-    have hup : m * x + c ≤ m * first d + c := by
-      have := Int.mul_le_mul_of_nonpos_left hmneg hfl
-      omega
+  · have hn : 0 ≤ -m := by omega
+    have t1 : 0 ≤ -m * (x - first d) := Int.mul_nonneg hn (by omega)
+    have t2 : 0 ≤ -m * (last d - x) := Int.mul_nonneg hn (by omega)
+    rw [Int.neg_mul, Int.mul_sub] at t1
+    rw [Int.neg_mul, Int.mul_sub] at t2
     omega
-end Nov26.Proof_GuardCertificates_CongruenceTightAffineGuard
+
+end TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_CongruenceTightAffineGuard

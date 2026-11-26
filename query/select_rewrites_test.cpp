@@ -2083,10 +2083,10 @@ TEST_F(SelectRewritesTest, FoldNestedSumUnionAllBranchesDeduplicatesLeaves) {
   // 5 total nested leaves collapse into 2 unique branches (k=1 x3, k=2 x2).
   const SelectStatement& inner = *stmt->Sources()[0].query;
   EXPECT_EQ(inner.UnionAll().size(), 1U);
-  EXPECT_NE(inner.SelectList()[0].expression->ToString().find("3"),
+  EXPECT_NE(inner.SelectList()[0].expression->ToString().find('3'),
             std::string::npos);
   EXPECT_NE(
-      inner.UnionAll()[0]->SelectList()[0].expression->ToString().find("2"),
+      inner.UnionAll()[0]->SelectList()[0].expression->ToString().find('2'),
       std::string::npos);
 }
 

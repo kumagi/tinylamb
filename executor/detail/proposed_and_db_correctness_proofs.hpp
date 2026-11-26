@@ -156,7 +156,7 @@ namespace tinylamb::benchmark_rematch {
   if (rank == 0) {
     return size_t{0};
   }
-  const size_t idx = static_cast<size_t>(rank - 1U);
+  const auto idx = static_cast<size_t>(rank - 1U);
   return idx < n ? idx : (n - 1U);
 }
 

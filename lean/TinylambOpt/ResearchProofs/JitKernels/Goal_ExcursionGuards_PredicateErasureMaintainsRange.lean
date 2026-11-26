@@ -1,20 +1,14 @@
 import TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-/-! Refutation: erasing terms changes prefix sums, not just samples of the
-original path. A safe chunk can contain a negative term followed by a positive
-one; keeping only the negative term produces an unsafe filtered scan. -/
+-- Refutation: filtering away a compensating term can break a certified prefix range.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_PredicateErasureMaintainsRange
 
-open TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
-
-theorem refute : ¬ PredicateErasureMaintainsRange.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.PredicateErasureMaintainsRange.Goal := by
   intro h
-  have hbad := h 0 10 0 [10, -10, 10] (fun v => v < 0) (by native_decide)
-  have hc : safe 0 10 0 ([10, -10, 10].filter (fun v => v < 0)) ≠ true := by native_decide
-  exact hc hbad
+  have c := h 0 10 0 ([(5 : Int), -5]) (fun x : Int => x < 0) (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.safe 0 10 0
+      ([(5 : Int), -5].filter (fun x : Int => x < 0)))) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_PredicateErasureMaintainsRange

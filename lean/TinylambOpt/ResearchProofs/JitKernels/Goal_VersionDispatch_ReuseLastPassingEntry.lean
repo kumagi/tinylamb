@@ -1,24 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 
-/-! The last matching entry for an old word may be outranked by an earlier entry on a fresh word. -/
+-- Refutation: a previously selected entry may be shadowed by a higher-priority guard on a new row.
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_ReuseLastPassingEntry
 
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_ReuseLastPassingEntry
-
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.ReuseLastPassingEntry
-
-theorem refute : ¬ ReuseLastPassingEntry.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.ReuseLastPassingEntry.Goal := by
   intro h
-  let hi : Entry := { mask := 2, value := 0, code := 1 }
-  let e : Entry := { mask := 0, value := 0, code := 2 }
-  let es : List Entry := [hi, e]
-  have hfind : es.find? (accepts · 2) = some e := by
-    simp [es, hi, e, accepts]
-  have hfresh : accepts e 0 := by simp [e, accepts]
-  have h' := h es 2 0 e hfind hfresh
-  simp [dispatch, es, hi, e, accepts] at h'
+  have c := h
+    ([⟨1, 1, 1⟩, ⟨2, 2, 2⟩] : List TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.Entry)
+    (2 : BitVec 64) (3 : BitVec 64) ⟨2, 2, 2⟩ (by native_decide) (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.dispatch
+      ([⟨1, 1, 1⟩, ⟨2, 2, 2⟩] : List TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.Entry)
+      (3 : BitVec 64) = some (2 : Nat))) c
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_ReuseLastPassingEntry
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_ReuseLastPassingEntry

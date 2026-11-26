@@ -1,18 +1,15 @@
 import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 
-/-! Two masks with the same population count can select different values; positions, not the count, matter. -/
+-- Refutation: equal mask populations at different positions select different rows.
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_PopulationOnlyShuffleCache
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_PopulationOnlyShuffleCache
-
-open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
-open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.PopulationOnlyShuffleCache
-
-theorem refute : ¬ PopulationOnlyShuffleCache.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.PopulationOnlyShuffleCache.Goal := by
   intro h
-  have h' := h [10, 20] [true, false] [false, true] (by simp) (by simp) (by simp)
-  simp [compress, gather, positions] at h'
+  have c := h ([1, 2] : List Nat) [true, false] [false, true]
+    (by native_decide) (by native_decide) (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.compress ([1, 2] : List Nat) [true, false] =
+    TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.compress ([1, 2] : List Nat) [false, true])) c
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_PopulationOnlyShuffleCache
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_PopulationOnlyShuffleCache

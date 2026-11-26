@@ -1,49 +1,31 @@
 import TinylambOpt.ResearchGoals.JitKernels.PredicatedStores
 
-/-!
-Generated stores with disjoint byte intervals may be reordered. The proof checks
-each memory address against both store ranges; disjointness ensures at most one
-store can write the address, so the two orders agree byte by byte.
-
-Proved
-
-- `StorePairDisjointReorder` — reordering disjoint stores preserves modeled
-  memory, allowing the JIT to schedule stores freely across the two ranges.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+/-! Two generated stores whose byte intervals are disjoint commute. At every
+    address at most one store can replace the original byte, so SQL may emit
+    the pair in either order without changing the memory image observed by a
+    later read. -/
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PredicatedStores_StorePairDisjointReorder
 
 open TinylambOpt.ResearchGoals.JitKernels.PredicatedStores
 
-theorem sound : StorePairDisjointReorder.Goal := by
-  intro m a b xs ys h
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PredicatedStores.StorePairDisjointReorder.Goal := by
+  intro m a b xs ys hdisj
   funext i
-  rcases h with hab | hba
-  · by_cases h1 : a ≤ i
-    · by_cases h2 : i - a < xs.length
-      · have hnb : ¬ b ≤ i := by omega
-        simp [store, h1, h2, hnb]
-      · by_cases h3 : b ≤ i
-        · by_cases h4 : i - b < ys.length
-          · simp [store, h1, h2, h3, h4]
-          · simp [store, h1, h2, h3, h4]
-        · simp [store, h1, h2, h3]
-    · have hnb : ¬ b ≤ i := by omega
-      simp [store, h1, hnb]
-  · by_cases h3 : b ≤ i
-    · by_cases h4 : i - b < ys.length
-      · have hna : ¬ a ≤ i := by omega
-        simp [store, h3, h4, hna]
-      · by_cases h1 : a ≤ i
-        · by_cases h2 : i - a < xs.length
-          · simp [store, h3, h4, h1, h2]
-          · simp [store, h3, h4, h1, h2]
-        · simp [store, h3, h4, h1]
-    · have hna : ¬ a ≤ i := by omega
-      simp [store, h3, hna]
+  rcases hdisj with hab | hba
+  · by_cases hbi : b ≤ i
+    · have hai : a ≤ i := by omega
+      have hxs : xs[i - a]? = none := List.getElem?_eq_none (by omega)
+      simp [store, hbi, hai, hxs]
+    · by_cases hai : a ≤ i
+      · simp [store, hbi, hai]
+      · simp [store, hbi, hai]
+  · by_cases hai : a ≤ i
+    · have hbi : b ≤ i := by omega
+      have hys : ys[i - b]? = none := List.getElem?_eq_none (by omega)
+      simp [store, hai, hbi, hys]
+    · by_cases hbi : b ≤ i
+      · simp [store, hai, hbi]
+      · simp [store, hai, hbi]
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_PredicatedStores_StorePairDisjointReorder

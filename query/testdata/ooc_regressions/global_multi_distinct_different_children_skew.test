@@ -1,0 +1,7 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795632326501403
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: query fails under memory pressure but runs without it [join+distinct] | stream: TooBigData :: op 2 `q ord=0 heavy=0 take=6 nv=2 vs=381541005 ex=0 snap=0 :: SELECT COUNT(DISTINCT a.t) AS c1, MAX(a.t) AS c2, SUM(DISTINCT a.v) AS c3, LOGICAL_OR(a.v > 938) AS c4, ...(207B)`: query fails under memory pressure but runs without it [join+distinct]: SELECT COUNT(DISTINCT a.t) AS c1, MAX(a.t) AS c2, SUM(DISTINCT a.v) AS c3, LOGICAL_OR(a.v > 938) AS c4, SUM(b.v) AS c5 FROM t2 a JOIN t2 b ON a.k = b.k |   stream: TooBigData: Single aggregate group exceeds operator memory budget Single aggregate group exce
+create t2 15 8 7
+ins_bulk t2 1 2914 43
+q ord=0 heavy=0 take=6 nv=2 vs=381541005 ex=0 snap=0 :: SELECT COUNT(DISTINCT a.t) AS c1, MAX(a.t) AS c2, SUM(DISTINCT a.v) AS c3, LOGICAL_OR(a.v > 938) AS c4, SUM(b.v) AS c5 FROM t2 a JOIN t2 b ON a.k = b.k

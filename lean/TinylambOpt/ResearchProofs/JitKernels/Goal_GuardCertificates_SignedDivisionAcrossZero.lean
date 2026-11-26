@@ -1,18 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+-- Refutation: a congruence class modulo 2^k does not make truncating and floored division agree.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_GuardCertificates_SignedDivisionAcrossZero
 
-open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-
-theorem refute : ¬ SignedDivisionAcrossZero.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.SignedDivisionAcrossZero.Goal := by
   intro h
-  let d : Domain := { lo := -1, hi := 0, modulus := 2, residue := 1 }
-  have hd : inside d (-1 : Int) := by unfold inside d; native_decide
-  have h' := h d (-1 : Int) 1 (by native_decide) hd
-  have hbad : ¬ ((-1 : Int).tdiv (2 : Int) = (-1 : Int) / (2 : Int)) := by native_decide
-  exact hbad h'
+  let d : TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.Domain := ⟨(-10 : Int), 10, 2, 1⟩
+  have hmod : d.modulus = 2 ^ 1 := by native_decide
+  have hin' : (-10 : Int) ≤ -1 ∧ -1 ≤ 10 ∧ ((-1 : Int) - 1) % (2 : Int) = 0 := by native_decide
+  have hin : TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.inside d (-1 : Int) := by
+    simpa [TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.inside, d] using hin'
+  have c := h d (-1 : Int) 1 hmod hin
+  exact (by native_decide : ¬ ((-1 : Int).tdiv (2 ^ 1) = (-1 : Int) / (2 ^ 1))) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_GuardCertificates_SignedDivisionAcrossZero

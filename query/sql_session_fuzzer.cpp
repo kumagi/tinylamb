@@ -2709,7 +2709,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         break;
       }
       case Op::kForUpdate: {
-        const size_t pos = static_cast<size_t>(
+        const auto pos = static_cast<size_t>(
             g.Pick(0, static_cast<int>(target->rows.size()) - 1));
         const int64_t u = RowU(target->rows[pos]);
         const std::string sql = "SELECT u FROM " + target->name +
@@ -2717,8 +2717,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
                                 " FOR UPDATE;";
         std::string why;
         // FOR UPDATE is rejected on the relational fallback route by design,
-        // so always run on the normal route (route_flip = false).
-        if (!RunSqlWhy(*db, ctx, sql, /*route_flip=*/false, &why)) {
+        // so always run on the normal route (force_relational = false).
+        if (!RunSqlWhy(*db, ctx, sql, /*force_relational=*/false, &why)) {
           t.steps.push_back({.sql = sql});
           std::string err = "SELECT FOR UPDATE rejected: ";
           err += sql;

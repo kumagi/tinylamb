@@ -92,7 +92,8 @@ thread_local const IoCpuMasks* current_io_masks = nullptr;
 class ScopedIoCpuAffinity {
  public:
   ScopedIoCpuAffinity() {
-    if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) {
+    if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_IO_AFFINITY") !=
+        nullptr) {
       return;
     }
     const std::optional<platform::CpuSet> available =
@@ -507,7 +508,8 @@ class PostgresServer::
       // next COMMIT/ROLLBACK messages are queued. Keep admission nonblocking
       // even when writes run in workers, so the pool cannot starve its owners.
       database_->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
-      metrics_enabled_ = ::tinylamb::platform::GetEnv("TINYLAMB_SERVER_METRICS") != nullptr;
+      metrics_enabled_ =
+          ::tinylamb::platform::GetEnv("TINYLAMB_SERVER_METRICS") != nullptr;
       database_->SetTransactionMetricsEnabled(metrics_enabled_);
     } else {
       startup_error_ = "failed to open database " + database_path + ": " +
@@ -1877,9 +1879,9 @@ class PostgresServer::
     ExecuteStatements(client, statements);
   }
 
-  void FailExtendedProtocol(Client& client, std::string_view message,
-                            std::string_view sqlstate,
-                            bool abort_tx_block = true) {
+  static void FailExtendedProtocol(Client& client, std::string_view message,
+                                   std::string_view sqlstate,
+                                   bool abort_tx_block = true) {
     client.extended_query_failed = true;
     Queue(client, pgwire::ErrorResponse(message, sqlstate));
     if (abort_tx_block) {
@@ -1887,7 +1889,7 @@ class PostgresServer::
     }
   }
 
-  void HandleParseMessage(Client& client, std::string_view payload) {
+  static void HandleParseMessage(Client& client, std::string_view payload) {
     auto parsed = pgwire::ParseParseMessage(payload);
     if (!parsed.HasValue()) {
       FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
@@ -1903,7 +1905,7 @@ class PostgresServer::
     Queue(client, pgwire::ParseComplete());
   }
 
-  void HandleBindMessage(Client& client, std::string_view payload) {
+  static void HandleBindMessage(Client& client, std::string_view payload) {
     auto parsed = pgwire::ParseBindMessage(payload);
     if (!parsed.HasValue()) {
       FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
@@ -1913,12 +1915,14 @@ class PostgresServer::
     const auto it = client.prepared_statements.find(msg.statement_name);
     if (it == client.prepared_statements.end()) {
       FailExtendedProtocol(
-          client, "prepared statement \"" + msg.statement_name + "\" does not exist",
+          client,
+          "prepared statement \"" + msg.statement_name + "\" does not exist",
           "26000");
       return;
     }
-    auto bound = pgwire::BindSqlParameters(
-        it->second.query, it->second.param_types, msg.param_formats, msg.params);
+    auto bound =
+        pgwire::BindSqlParameters(it->second.query, it->second.param_types,
+                                  msg.param_formats, msg.params);
     if (!bound.HasValue()) {
       FailExtendedProtocol(client, StatusMessage(bound.GetStatus()), "08P01");
       return;
@@ -1931,7 +1935,7 @@ class PostgresServer::
     Queue(client, pgwire::BindComplete());
   }
 
-  void HandleCloseMessage(Client& client, std::string_view payload) {
+  static void HandleCloseMessage(Client& client, std::string_view payload) {
     auto parsed = pgwire::ParseCloseMessage(payload);
     if (!parsed.HasValue()) {
       FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
@@ -1997,8 +2001,8 @@ class PostgresServer::
           const std::string error = engine.LastError().empty()
                                         ? StatusMessage(executed.GetStatus())
                                         : engine.LastError();
-          FailExtendedProtocol(client, error,
-                               SqlStateForStatus(executed.GetStatus(), "42601"));
+          FailExtendedProtocol(
+              client, error, SqlStateForStatus(executed.GetStatus(), "42601"));
           return;
         }
         QueryResult result = std::move(executed.Value());
@@ -2007,10 +2011,9 @@ class PostgresServer::
           Queue(client, pgwire::NoData());
           return;
         }
-        Queue(client,
-              pgwire::RowDescription(BuildColumnDescriptions(
-                  result.ColumnNames(), Row(), result.ColumnNames().size(),
-                  result.ColumnTypes())));
+        Queue(client, pgwire::RowDescription(BuildColumnDescriptions(
+                          result.ColumnNames(), Row(),
+                          result.ColumnNames().size(), result.ColumnTypes())));
       } catch (const std::exception&) {
         const Status failure =
             StatusFromCurrentException("statement describe failed");
@@ -2023,8 +2026,7 @@ class PostgresServer::
     // Describe Portal ('P').
     const auto it = client.portals.find(msg.name);
     if (it == client.portals.end()) {
-      FailExtendedProtocol(client,
-                           "portal \"" + msg.name + "\" does not exist",
+      FailExtendedProtocol(client, "portal \"" + msg.name + "\" does not exist",
                            "34000");
       return;
     }
@@ -2116,16 +2118,17 @@ class PostgresServer::
           return;
         }
         Queue(client, pgwire::RowDescription(
-                          BuildColumnDescriptions(
-                              stream->column_names, Row(),
-                              stream->column_names.size(), stream->column_types),
+                          BuildColumnDescriptions(stream->column_names, Row(),
+                                                  stream->column_names.size(),
+                                                  stream->column_types),
                           stream->result_formats));
       } else {
-        Queue(client, pgwire::RowDescription(
-                          BuildColumnDescriptions(
-                              stream->column_names, stream->chunk.RowAt(0),
-                              stream->column_names.size(), stream->column_types),
-                          stream->result_formats));
+        Queue(client,
+              pgwire::RowDescription(
+                  BuildColumnDescriptions(
+                      stream->column_names, stream->chunk.RowAt(0),
+                      stream->column_names.size(), stream->column_types),
+                  stream->result_formats));
       }
       stream->header_sent = true;
       portal.described = true;
@@ -2148,9 +2151,8 @@ class PostgresServer::
     const pgwire::ExecuteMessage msg = std::move(parsed).MoveValue();
     const auto it = client.portals.find(msg.portal_name);
     if (it == client.portals.end()) {
-      FailExtendedProtocol(client,
-                           "portal \"" + msg.portal_name + "\" does not exist",
-                           "34000");
+      FailExtendedProtocol(
+          client, "portal \"" + msg.portal_name + "\" does not exist", "34000");
       return;
     }
     Client::PortalState& portal = it->second;
@@ -2191,9 +2193,9 @@ class PostgresServer::
               if (!stream->header_sent) {
                 if (stream->emit_row_description) {
                   wire += pgwire::RowDescription(
-                      BuildColumnDescriptions(
-                          stream->column_names, Row(),
-                          stream->column_names.size(), stream->column_types),
+                      BuildColumnDescriptions(stream->column_names, Row(),
+                                              stream->column_names.size(),
+                                              stream->column_types),
                       stream->result_formats);
                 }
                 stream->header_sent = true;
@@ -2215,9 +2217,10 @@ class PostgresServer::
               stream->header_sent = true;
             }
           }
-          const size_t avail = stream->chunk_row_count - stream->chunk_row_offset;
-          const size_t want =
-              std::min(avail, static_cast<size_t>(msg.max_rows) - sent_this_call);
+          const size_t avail =
+              stream->chunk_row_count - stream->chunk_row_offset;
+          const size_t want = std::min(
+              avail, static_cast<size_t>(msg.max_rows) - sent_this_call);
           size_t written = 0;
           const Status row_st = pgwire::AppendDataRowsFromChunk(
               &wire, stream->chunk, stream->chunk_row_offset,
@@ -2280,10 +2283,9 @@ class PostgresServer::
         RecordReplyDependency(client, *stream->owned_txn);
         const Status commit = CommitForReply(client, *stream->owned_txn);
         if (commit != Status::kSuccess) {
-          FailExtendedProtocol(client,
-                               "transaction commit failed: " +
-                                   StatusMessage(commit),
-                               SqlStateForStatus(commit, "40001"));
+          FailExtendedProtocol(
+              client, "transaction commit failed: " + StatusMessage(commit),
+              SqlStateForStatus(commit, "40001"));
           return;
         }
       }
@@ -2307,8 +2309,7 @@ class PostgresServer::
     }
     if (split.Value().size() > 1) {
       FailExtendedProtocol(
-          client,
-          "cannot insert multiple commands into a prepared statement",
+          client, "cannot insert multiple commands into a prepared statement",
           "42601");
       return;
     }
@@ -2317,9 +2318,8 @@ class PostgresServer::
     TransactionContext* context = client.transaction.get();
     if (context == nullptr) {
       automatic = std::make_unique<TransactionContext>(
-          IsReadOnly(split.Value())
-              ? database_->BeginReadOnlyContext()
-              : database_->BeginContext());
+          IsReadOnly(split.Value()) ? database_->BeginReadOnlyContext()
+                                    : database_->BeginContext());
       context = automatic.get();
     }
     try {
@@ -2911,7 +2911,8 @@ class PostgresServer::
                          "too many columns for PostgreSQL protocol");
     }
     static const bool disable_chunked_wire =
-        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CHUNKED_PGWIRE") != nullptr;
+        ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_CHUNKED_PGWIRE") !=
+        nullptr;
     if (!disable_chunked_wire) {
       // Lean proof:
       // lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean

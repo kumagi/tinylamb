@@ -31,7 +31,7 @@ theorem window_set_eq (l : List UInt8) (i o : Nat) (c : UInt8)
     · simp [hei]
   · simp [hj]
 
-theorem sound : UnobservedMiddlePatch.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SampledEquality.UnobservedMiddlePatch.Goal := by
   intro s i c hi hcov
   simp [covered, offsets] at hcov
   have h0 : ¬ (0 ≤ i && i < 0 + 4) := by

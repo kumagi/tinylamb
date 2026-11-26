@@ -89,7 +89,7 @@ theorem safe_serial_eq_parallel : ∀ ms : List Move, Safe ms → ∀ s : File,
       have hcongr := foldl_src_congr ht (put s m.1 (s m.2))
       simpa [serial, parallelCopy, t] using hih.trans hcongr
 
-theorem sound : NoEarlierClobberSchedule.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ParallelMoves.NoEarlierClobberSchedule.Goal := by
   intro ms s h
   exact safe_serial_eq_parallel ms (hyp_to_safe h) s
 

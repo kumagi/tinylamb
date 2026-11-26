@@ -894,7 +894,7 @@ bool CanSkipLikeBlockByTrigrams(std::string_view like_pattern,
   // Parse literal runs between `%` and `_` wildcards (honoring escape_char).
   // Any literal run of length >= 3 yields mandatory trigrams that MUST appear
   // in every matching row (`TrigramSkip.trigram_skip_sound`).
-  uint8_t win[3] = {0, 0, 0};
+  std::array<uint8_t, 3> win = {0, 0, 0};
   size_t run_len = 0;
   for (size_t i = 0; i < like_pattern.size(); ++i) {
     char ch = like_pattern[i];
@@ -908,7 +908,7 @@ bool CanSkipLikeBlockByTrigrams(std::string_view like_pattern,
       run_len = 0;
       continue;
     }
-    const uint8_t b = static_cast<uint8_t>(ch);
+    const auto b = static_cast<uint8_t>(ch);
     if (run_len < 3) {
       win[run_len++] = b;
     } else {

@@ -1,45 +1,44 @@
 import TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
-/-!
-If the hot partition of the IN list accepts a probe, the unpartitioned list also
-accepts it: the hot partition is a sublist, and acceptance of a non-NULL probe
-is membership. A NULL probe is never accepted by either list. This licenses
-short-circuiting the cold residual scan after a hot hit without changing the
-WHERE result.
--/
+/-! A positive result from the hot range-filtered IN test short-circuits the
+    cold residual: the same probe is present in the original key list, so the
+    unfiltered three-valued test also accepts it. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_SkipColdResidualOnHotHit
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_SkipColdResidualOnHotHit
 
 open TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
-theorem test_some (xs : Keys) (x : Int) :
-    test xs (some x) =
-      if some x ∈ xs then some true else if none ∈ xs then none else some false := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.InListLowering.SkipColdResidualOnHotHit.Goal := by
+  intro xs lo hi v hk
+  let ys : Keys := rangeKeys xs lo hi
+  have htest : test ys v = some true := by
+    simpa [keep, ys] using hk
+  have hysne : ys ≠ [] := by
+    intro hnil
+    rw [hnil] at htest
+    simp [test] at htest
+  have hysEmpty : ys.isEmpty = false := by
+    cases h : ys.isEmpty
+    · rfl
+    · exfalso
+      exact hysne (List.isEmpty_iff.mp h)
+  have hvnotNone : v ≠ none := by
+    intro hvnone
+    rw [hvnone] at htest
+    simp [test, hysEmpty] at htest
+  have hmemHot : v ∈ ys := by
+    unfold test at htest
+    simp [hysEmpty, hvnotNone] at htest
+    exact htest
+  have hmem : v ∈ xs := (List.mem_filter.mp (by simpa [ys, rangeKeys] using hmemHot)).1
+  have hxsEmpty : xs.isEmpty = false := by
+    cases h : xs.isEmpty
+    · rfl
+    · exfalso
+      have hnil : xs = [] := List.isEmpty_iff.mp h
+      rw [hnil] at hmem
+      simp at hmem
   unfold test
-  by_cases h : xs = []
-  · simp [h]
-  · simp [h]
+  simp [hxsEmpty, hvnotNone, List.elem_eq_mem, hmem]
 
-theorem sound : SkipColdResidualOnHotHit.Goal := by
-  intro xs lo hi v h
-  cases v with
-  | none =>
-      unfold keep test at h
-      simp at h
-  | some x =>
-      have hx : some x ∈ rangeKeys xs lo hi := by
-        unfold keep at h
-        rw [test_some] at h
-        by_cases hm : some x ∈ rangeKeys xs lo hi
-        · exact hm
-        · simp [hm] at h
-      have hx' : some x ∈ xs := by
-        have hx2 : some x ∈ xs ∧ lo ≤ x ∧ x < hi := by simpa [rangeKeys] using hx
-        exact hx2.1
-      rw [test_some]
-      simp [hx']
-
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_SkipColdResidualOnHotHit
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_SkipColdResidualOnHotHit

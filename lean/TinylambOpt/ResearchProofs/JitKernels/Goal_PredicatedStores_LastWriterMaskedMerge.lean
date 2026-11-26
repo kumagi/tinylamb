@@ -19,7 +19,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PredicatedStores_LastWriter
 
 open TinylambOpt.ResearchGoals.JitKernels.PredicatedStores
 
-theorem sound : LastWriterMaskedMerge.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PredicatedStores.LastWriterMaskedMerge.Goal := by
   intro m a xs ys hlen
   funext i
   by_cases ha : a ≤ i

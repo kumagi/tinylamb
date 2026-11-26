@@ -1,24 +1,14 @@
 import TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-/-!
-A narrow wrapped remainder can look plausible even when the reciprocal guess
-overshoots the quotient. The SQL kernel still needs the explicit overestimate
-comparison before accepting its candidate.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+-- Refutation: a small wrapped low residual does not certify a rounded-up reciprocal guess.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_ResidualFromWrappedLowProduct
 
-open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
-
-theorem refute : ¬ ResidualFromWrappedLowProduct.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.ResidualFromWrappedLowProduct.Goal := by
   intro h
-  have got := h 1 2 0 1 (by decide)
-  have cond : (1 + 2 ^ 1 - (guess 1 2 0 * 2) % 2 ^ 1) % 2 ^ 1 < 2 := by
+  have c := h 63 5 0 8 (by native_decide) (by native_decide) (by native_decide)
+  have bad : ¬ (TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.guess 63 5 0 = 63 / 5) := by
     native_decide
-  have bad := got cond
-  simp [exactAt, guess, magic] at bad
+  exact bad (by simpa [TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.exactAt] using c)
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_ResidualFromWrappedLowProduct

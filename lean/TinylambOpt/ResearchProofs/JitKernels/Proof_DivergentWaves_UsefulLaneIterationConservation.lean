@@ -1,131 +1,160 @@
 import TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.UsefulLaneIterationConservation.Goal`. -/
+
+/-! SOUND: The area under the active-mask population curve equals exactly the scalar lane
+work. For each iteration `t < peak xs`, the mask counts lanes with more than `t` steps
+left; summing over all iterations charges each lane `x` exactly once per `t < x`, i.e.
+`x` times. Formally, for every bound `m` the curve area up to `m` equals
+`(xs.map (min · m)).sum`; instantiating `m = peak xs` (so `min x (peak xs) = x` for all
+lanes) gives the scalar total. This validates using the mask-popcount integral as a
+cost model for masked divergent vector loops. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-/-! The area under the active-mask population curve equals the scalar lane work: every lane contributes once per iteration it is active, so vectorized masked probes preserve the exact work count. -/
-
-namespace Nov26.Proof_DivergentWaves_UsefulLaneIterationConservation
-
+namespace TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_UsefulLaneIterationConservation
 open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.UsefulLaneIterationConservation
 
-theorem max?_some_of_mem_nat : ∀ (l : List Nat) (a : Nat), a ∈ l → ∃ m, l.max? = some m := by
-  intro l
+/-- `count true` of a consed boolean list peels one element. -/
+private theorem count_true_cons (b : Bool) (l : List Bool) :
+    (b :: l).count true = (if b then 1 else 0) + l.count true := by
+  have key : ∀ (m : List Bool) (acc : Nat),
+      List.countP.go (fun x => x == true) m acc = m.count true + acc := by
+    intro m
+    induction m with
+    | nil =>
+        intro acc
+        rw [show List.count true [] = 0 from rfl, Nat.zero_add]
+        rfl
+    | cons x xs ih =>
+        intro acc
+        cases x with
+        | true =>
+          show List.countP.go (fun y => y == true) xs (acc + 1)
+              = List.countP.go (fun y => y == true) xs 1 + acc
+          rw [ih (acc + 1), ih 1]; omega
+        | false =>
+          show List.countP.go (fun y => y == true) xs acc
+              = List.countP.go (fun y => y == true) xs 0 + acc
+          rw [ih acc, ih 0]; omega
+  cases b with
+  | true =>
+    show List.countP.go (fun y => y == true) l 1 = 1 + l.count true
+    rw [key l 1]; omega
+  | false =>
+    show List.countP.go (fun y => y == true) l 0 = 0 + l.count true
+    rw [key l 0]; omega
+
+/-- A `0`-valued map sums to zero. -/
+private theorem sum_map_zero (l : List Nat) : (l.map (fun _ => 0)).sum = 0 := by
   induction l with
-  | nil => simp
-  | cons x xs ih =>
-      intro a ha
-      cases xs with
-      | nil => simp
-      | cons y ys => simp [List.max?_cons]
+  | nil => rfl
+  | cons a as ih => rw [List.map_cons]; simp [ih]
 
-theorem le_peak : ∀ (l : List Nat) (a : Nat), a ∈ l → a ≤ peak l := by
-  intro l
+/-- Sums of pointwise additions of two maps split. -/
+private theorem sum_map_add (l : List Nat) (f g : Nat → Nat) :
+    (l.map (fun t => f t + g t)).sum = (l.map f).sum + (l.map g).sum := by
   induction l with
-  | nil => simp
-  | cons x xs ih =>
-      intro a ha
-      simp only [List.mem_cons] at ha
-      rcases ha with rfl | ha
-      · cases xs with
-        | nil => simp [peak]
-        | cons y ys =>
-            obtain ⟨m, hm⟩ := max?_some_of_mem_nat (y :: ys) y (by simp)
-            simp [peak, List.max?_cons, hm]
-            exact Nat.le_max_left a m
-      · cases xs with
-        | nil => simp at ha
-        | cons y ys =>
-            obtain ⟨m, hm⟩ := max?_some_of_mem_nat (y :: ys) y (by simp)
-            have hle := ih a ha
-            simp [peak, List.max?_cons, hm] at hle ⊢
-            omega
+  | nil => rfl
+  | cons a as ih =>
+    rw [List.map_cons, List.sum_cons, ih, List.map_cons, List.map_cons,
+      List.sum_cons, List.sum_cons]
+    omega
 
-theorem sum_indicator_lt : ∀ T n : Nat, ((List.range T).map (fun t => if t < n then 1 else 0)).sum = min n T := by
-  intro T
-  induction T with
-  | zero => intro n; simp
-  | succ T ih =>
-      intro n
-      rw [List.range_succ, List.map_append, List.sum_append]
-      simp only [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil, Nat.add_zero, ih]
-      by_cases h : T < n
-      · by_cases h' : n ≤ T + 1
-        · have hn : n = T + 1 := by omega
-          subst n
-          simp
-        · have hn : T + 1 < n := by omega
-          have hle : T ≤ n := Nat.le_of_lt h
-          simp [h, h', Nat.min_def, hle]
-      · have hn : n ≤ T := by omega
-        simp [h, Nat.min_def, hn]
+/-- The number of iterations below `a` inside the first `m` iterations is `min a m`. -/
+private theorem sum_ite_range : ∀ a m : Nat,
+    ((List.range m).map (fun t => if t < a then 1 else 0)).sum = Nat.min a m := by
+  intro a m
+  induction m with
+  | zero =>
+      rw [List.range_zero, List.map_nil, List.sum_nil]
+      have h0 : Nat.min a 0 = 0 := Nat.min_eq_right (Nat.zero_le a)
+      rw [h0]
+  | succ k ih =>
+      rw [List.range_succ, List.map_append, List.sum_append, ih,
+        show (List.map (fun t => if t < a then 1 else 0) [k]).sum
+            = (if k < a then 1 else 0) from rfl]
+      by_cases h : k < a
+      · have h1 : Nat.min a k = k := Nat.min_eq_right (by omega)
+        have h2 : Nat.min a (k + 1) = k + 1 := Nat.min_eq_right (by omega)
+        rw [if_pos h, h1, h2]
+      · have h1 : Nat.min a k = a := Nat.min_eq_left (by omega)
+        have h2 : Nat.min a (k + 1) = a := Nat.min_eq_left (by omega)
+        rw [if_neg h, h1, h2]
         omega
 
-theorem sum_range_add : ∀ (T : Nat) (f g : Nat → Nat),
-    ((List.range T).map (fun t => f t + g t)).sum =
-      ((List.range T).map f).sum + ((List.range T).map g).sum := by
-  intro T
-  induction T with
-  | zero => intro f g; simp
-  | succ T ih =>
-      intro f g
-      simp [List.range_succ, List.map_append, List.sum_append, ih]
-      omega
-
-theorem count_mask_cons (n t : Nat) (xs : List Nat) :
-    (maskAt (n :: xs) t).count true = (maskAt xs t).count true + (if t < n then 1 else 0) := by
-  simp [maskAt, List.count_cons]
-
-theorem sum_map_zero : ∀ T : Nat, ((List.range T).map (fun _ : Nat => 0)).sum = 0 := by
-  intro T
-  induction T with
-  | zero => simp
-  | succ T ih => simp [List.range_succ, ih]
-
-theorem f_eq_min_sum : ∀ (xs : List Nat) (T : Nat),
-    ((List.range T).map (fun t => (maskAt xs t).count true)).sum =
-      (xs.map (fun n => min n T)).sum := by
+/-- The curve area below any bound `m` equals the clamped lane work. -/
+private theorem F_main : ∀ xs : List Nat, ∀ m : Nat,
+    ((List.range m).map (fun t => (maskAt xs t).count true)).sum
+      = (xs.map (fun x => Nat.min x m)).sum := by
   intro xs
   induction xs with
   | nil =>
-      intro T
-      rw [show (List.map (fun t => (maskAt [] t).count true) (List.range T)) =
-          (List.map (fun _ : Nat => 0) (List.range T)) by
-        apply List.map_congr_left
-        intro t ht
-        simp [maskAt]]
-      simp [sum_map_zero]
-  | cons n xs ih =>
-      intro T
-      have hmap : (List.map (fun t => (maskAt (n :: xs) t).count true) (List.range T)) =
-          (List.map (fun t => (maskAt xs t).count true + (if t < n then 1 else 0)) (List.range T)) := by
-        apply List.map_congr_left
-        intro t ht
-        exact count_mask_cons n t xs
-      rw [hmap, sum_range_add, ih, sum_indicator_lt]
+      intro m
+      rw [show (fun t => (maskAt [] t).count true) = (fun _ => 0) from rfl,
+        sum_map_zero, List.map_nil, List.sum_nil]
+  | cons a as ih =>
+      intro m
+      have hp : ∀ t : Nat, (maskAt (a :: as) t).count true
+          = (if t < a then 1 else 0) + (maskAt as t).count true := by
+        intro t
+        show (decide (t < a) :: maskAt as t).count true
+            = (if t < a then 1 else 0) + (maskAt as t).count true
+        rw [count_true_cons]
+        by_cases h : t < a <;> simp [h]
+      rw [congrArg List.sum (List.map_congr_left fun t _ => hp t), sum_map_add, sum_ite_range,
+        ih]
       rw [List.map_cons, List.sum_cons]
-      omega
 
-theorem sum_min_eq_sum : ∀ (xs : List Nat) (T : Nat), (∀ n ∈ xs, n ≤ T) →
-    (xs.map (fun n => min n T)).sum = xs.sum := by
+/-- The fold accumulator never exceeds the running maximum. -/
+private theorem le_foldl_max :
+    ∀ (as : List Nat) (init : Nat), init ≤ as.foldl max init := by
+  intro as
+  induction as with
+  | nil => intro init; exact Nat.le_refl init
+  | cons a as ih =>
+      intro init
+      show init ≤ as.foldl max (max init a)
+      exact Nat.le_trans (Nat.le_max_left init a) (ih (max init a))
+
+/-- Every element never exceeds the running maximum. -/
+private theorem mem_foldl_max :
+    ∀ (as : List Nat) (init x : Nat), x ∈ as → x ≤ as.foldl max init := by
+  intro as
+  induction as with
+  | nil => intro init x h; cases h
+  | cons a as ih =>
+      intro init x h
+      show x ≤ as.foldl max (max init a)
+      rw [List.mem_cons] at h
+      cases h with
+      | inl he =>
+          rw [he]
+          exact Nat.le_trans (Nat.le_max_right init a) (le_foldl_max as (max init a))
+      | inr hx => exact ih (max init a) x hx
+
+/-- Every lane's work is bounded by the peak. -/
+private theorem peak_le_mem : ∀ (x : Nat) (xs : List Nat), x ∈ xs → x ≤ peak xs := by
+  intro x xs h
+  cases xs with
+  | nil => cases h
+  | cons a as =>
+      rw [List.mem_cons] at h
+      cases h with
+      | inl he => rw [he]; exact le_foldl_max as a
+      | inr hx => exact mem_foldl_max as a x hx
+
+/-- The mask-popcount integral equals the total scalar lane work. -/
+theorem sound : UsefulLaneIterationConservation.Goal := by
   intro xs
-  induction xs with
-  | nil => simp
-  | cons n xs ih =>
-      intro T hbound
-      have hn : min n T = n := Nat.min_eq_left (hbound n (by simp))
-      have htail : ∀ m ∈ xs, m ≤ T := by intro m hm; exact hbound m (by simp [hm])
-      simp only [List.map_cons, List.sum_cons]
-      rw [hn, ih T htail]
+  show ((List.range (peak xs)).map (fun t => (maskAt xs t).count true)).sum = xs.sum
+  rw [F_main]
+  have hmin : xs.map (fun x => Nat.min x (peak xs)) = xs.map (fun x => x) :=
+    List.map_congr_left (fun x hx => Nat.min_eq_left (peak_le_mem x xs hx))
+  rw [hmin]
+  show (xs.map (fun x => x)).sum = xs.sum
+  exact congrArg List.sum (List.map_id xs)
 
-theorem conservation : UsefulLaneIterationConservation.Goal := by
-  intro xs
-  rw [f_eq_min_sum]
-  apply sum_min_eq_sum
-  intro n hn
-  exact le_peak xs n hn
-
-end Nov26.Proof_DivergentWaves_UsefulLaneIterationConservation
+end TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_UsefulLaneIterationConservation

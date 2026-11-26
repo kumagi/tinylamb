@@ -3999,7 +3999,10 @@ TEST(ColumnarTlcsFastPathTest, AnalyticalOperatorsProofKernelsParity) {
   const auto replaced = bm::ReplaceSymbolState({.cnt = 3, .nn = 2, .sum = 125},
                                                {.cnt = 2, .nn = 1, .sum = 100},
                                                {.cnt = 1, .nn = 1, .sum = 40});
-  ASSERT_TRUE(replaced.has_value());
+  if (!replaced.has_value()) {
+    ADD_FAILURE() << "expected replaced to have a value";
+    return;
+  }
   EXPECT_EQ(*replaced, (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 65}));
   EXPECT_FALSE(bm::ReplaceSymbolState({.cnt = 1, .nn = 1, .sum = 10},
                                       {.cnt = 1, .nn = 1, .sum = 10}, {})
@@ -4238,7 +4241,10 @@ TEST(ColumnarTlcsFastPathTest, SocialGraphAndCloudBiProofKernelsParity) {
       /*snapshot=*/2);
   EXPECT_EQ(merged_q, (bm::NullableTotals{.cnt = 3, .nn = 2, .sum = 102}));
   const auto close = bm::ReduceCloseRun(qticks);
-  ASSERT_TRUE(close.has_value());
+  if (!close.has_value()) {
+    ADD_FAILURE() << "expected close to have a value";
+    return;
+  }
   EXPECT_EQ(*close, (bm::CloseWinner{.ts = 100, .tie = 2, .price = 52}));
   const auto spread = bm::ComputeSpreadMoments(qticks);
   EXPECT_EQ(spread.count, 2U);
@@ -4377,7 +4383,8 @@ TEST(ColumnarTlcsFastPathTest, EngineDecisionsProofKernelsParity) {
   // Goal_DistinctExcludeTies: keep current row value while excluding peers.
   const std::unordered_map<int64_t, size_t> frame = {{10, 2}, {20, 1}, {30, 2}};
   const std::unordered_map<int64_t, size_t> peers = {{10, 2}, {20, 1}};
-  EXPECT_EQ(bm::CountDistinctExcludeTies(frame, peers, /*current=*/10), 2U);
+  EXPECT_EQ(bm::CountDistinctExcludeTies(frame, peers, /*current_row_val=*/10),
+            2U);
 
   // Goal_RangeFingers: monotone two-finger band spans.
   const std::vector<int64_t> left = {10, 20, 30};
@@ -4642,8 +4649,8 @@ TEST(ColumnarTlcsFastPathTest, BenchmarkRematchBatch5AndJitFrontiersParity) {
   EXPECT_TRUE(bm::CheckedAddRangeSafe(-100, 100, 50));
   EXPECT_FALSE(
       bm::CheckedAddRangeSafe(0, std::numeric_limits<int64_t>::max(), 1));
-  EXPECT_FALSE(bm::DemandSsaGuardNeeded(/*known_false=*/true, true));
-  EXPECT_TRUE(bm::DemandSsaGuardNeeded(/*known_false=*/false, true));
+  EXPECT_FALSE(bm::DemandSsaGuardNeeded(/*known_false_prefix=*/true, true));
+  EXPECT_TRUE(bm::DemandSsaGuardNeeded(/*known_false_prefix=*/false, true));
   EXPECT_EQ(bm::TryPackKeyPair64(3, 5, 8),
             std::optional<uint64_t>((3ULL << 8U) | 5ULL));
   EXPECT_EQ(bm::AntiPredicateBallot(0b1111ULL, 0b0101ULL), 0b1010ULL);

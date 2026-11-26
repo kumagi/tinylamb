@@ -160,6 +160,15 @@ class
       return false;
     }
     while (out->Empty()) {
+      if (multi_distinct_ready_row_.has_value()) {
+        out->Reserve(1);
+        out->Append(std::move(*multi_distinct_ready_row_));
+        multi_distinct_ready_row_.reset();
+        if (output_groups_ != nullptr) {
+          output_groups_->fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+      }
       if (active_table_ != nullptr) {
         const size_t start = active_table_cursor_;
         const size_t end = std::min(active_table_->size(), start + max_rows);
@@ -355,6 +364,7 @@ class
   void ReleaseResources() noexcept {
     active_table_.reset();
     active_table_cursor_ = 0;
+    multi_distinct_ready_row_.reset();
     skew_table_.reset();
     skew_sorter_.reset();
     if (leaf_grant_cache_.has_value()) {
@@ -374,9 +384,177 @@ class
     return b;
   }
 
+  // O(1)-memory fallback for ungrouped (global) skew leaves that combine
+  // multiple DISTINCT aggregates over DIFFERENT child expressions (e.g.
+  // COUNT(DISTINCT a.t), SUM(DISTINCT a.v), plus arbitrary non-DISTINCT
+  // non-collection siblings). Each distinct child group gets its own
+  // ExternalSorter pass over the already-spilled leaf, so resident state stays
+  // bounded by budget_bytes_ even when the distinct cardinality exceeds it.
+  StatusOr<bool> TryRunMultiDistinctGlobalSkewLeaf(const PartitionLeaf& leaf) {
+    if (!group_keys_.empty() || partial_mode_ || has_collection_agg_ ||
+        !has_distinct_state_agg_ || UseSingleCountDistinctSort()) {
+      return false;
+    }
+    struct DistinctChildGroup {
+      std::string key;
+      Expression child;
+      std::optional<slot_t> slot;
+      std::vector<size_t> agg_indices;
+    };
+    std::vector<DistinctChildGroup> distinct_groups;
+    std::vector<uint8_t> distinct_skip_mask(aggregates_.size(), 0);
+    std::vector<std::shared_ptr<AggregateExpression>> stripped_owners;
+    std::vector<const AggregateExpression*> table_aggs = aggregates_;
+    size_t non_distinct_count = 0;
+
+    for (size_t i = 0; i < aggregates_.size(); ++i) {
+      const AggregateExpression* agg = aggregates_[i];
+      if (agg == nullptr) {
+        return false;
+      }
+      if (!agg->Distinct()) {
+        ++non_distinct_count;
+        continue;
+      }
+      const AggregationType t = agg->GetType();
+      if (agg->HasWhereFilter() || agg->NeedsGroupContext() ||
+          agg->HasInnerGroupBy() || agg->Child() == nullptr ||
+          (t != AggregationType::kCount && t != AggregationType::kSum &&
+           t != AggregationType::kAvg)) {
+        return false;
+      }
+      auto stripped = std::make_shared<AggregateExpression>(
+          agg->GetType(), agg->Child(), false);
+      stripped->SetIgnoreNulls(agg->IgnoreNulls());
+      table_aggs[i] = stripped.get();
+      stripped_owners.push_back(std::move(stripped));
+      distinct_skip_mask[i] = 1;
+
+      const std::string child_key = agg->Child()->ToString();
+      auto it = std::ranges::find_if(
+          distinct_groups,
+          [&](const DistinctChildGroup& g) { return g.key == child_key; });
+      if (it == distinct_groups.end()) {
+        std::optional<slot_t> child_slot;
+        if (agg->Child()->Type() == TypeTag::kColumnValue) {
+          const int off = input_schema_.Offset(
+              agg->Child()->AsColumnValue().GetColumnName());
+          if (off >= 0 &&
+              std::cmp_less_equal(off, std::numeric_limits<slot_t>::max())) {
+            child_slot = static_cast<slot_t>(off);
+          }
+        }
+        distinct_groups.push_back(DistinctChildGroup{
+            .key = child_key,
+            .child = agg->Child(),
+            .slot = child_slot,
+            .agg_indices = {i},
+        });
+      } else {
+        it->agg_indices.push_back(i);
+      }
+    }
+    if (distinct_groups.empty()) {
+      return false;
+    }
+
+    auto table =
+        std::make_unique<AggregateGroupTable>(&input_schema_, &table_aggs);
+    bool any_row = false;
+    if (non_distinct_count > 0) {
+      RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
+          store_, leaf, [&](Row&& raw) -> Status {
+            if (!any_row) {
+              ASSIGN_OR_RETURN(size_t, gid, table->FindOrCreate(Row{}));
+              (void)gid;
+              any_row = true;
+            }
+            return table->AccumulateExcludingMask(0, raw, distinct_skip_mask);
+          }));
+    }
+
+    for (const DistinctChildGroup& dg : distinct_groups) {
+      ExternalSorter::Options opts;
+      opts.spill_store = store_;
+      opts.memory_budget_bytes = budget_bytes_;
+      opts.grant = grant_;
+      opts.keys = {OocSortKey{.column_index = 0}};
+      ExternalSorter sorter(std::move(opts));
+      RETURN_IF_FAIL(RecursivePartitioner::ReadLeafRows(
+          store_, leaf, [&](Row&& raw) -> Status {
+            if (!any_row) {
+              ASSIGN_OR_RETURN(size_t, gid, table->FindOrCreate(Row{}));
+              (void)gid;
+              any_row = true;
+            }
+            Value dv;
+            if (dg.slot.has_value() && *dg.slot < raw.Count()) {
+              dv = raw[*dg.slot];
+            } else {
+              ASSIGN_OR_RETURN(Value, ev,
+                               EvalRowExpression(dg.child, input_schema_, raw));
+              dv = std::move(ev);
+            }
+            if (dv.IsNull()) {
+              return Status::kSuccess;
+            }
+            Row single;
+            single.values_.push_back(
+                relational_detail::CanonicalDistinctValue(dv));
+            return sorter.AddRow(std::move(single));
+          }));
+      RETURN_IF_FAIL(sorter.Finish());
+      bool have_prev = false;
+      Value prev_val;
+      Row sorted_row;
+      while (true) {
+        ASSIGN_OR_RETURN(bool, has, sorter.NextRow(&sorted_row));
+        if (!has) {
+          break;
+        }
+        if (sorted_row.Count() == 0) {
+          return StatusError(StatusCode::kCorrupt,
+                             "multi-distinct skew spill row empty");
+        }
+        const Value& dval = sorted_row[0];
+        if (dval.IsNull()) {
+          continue;
+        }
+        if (!have_prev ||
+            !relational_detail::DistinctValueEqual{}(prev_val, dval)) {
+          prev_val = dval;
+          have_prev = true;
+          if (budget_bytes_ > 0 &&
+              EstimateValueMemoryBytes(prev_val) > budget_bytes_) {
+            return StatusError(
+                StatusCode::kTooBigData,
+                "Single aggregate group exceeds operator memory budget");
+          }
+          for (const size_t idx : dg.agg_indices) {
+            ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
+                             table->StateFor(0, idx));
+            RETURN_IF_FAIL(state->Add(dval));
+          }
+        }
+      }
+    }
+
+    leaves_.DropLeaf(leaf_idx_ - 1);
+    if (any_row) {
+      ASSIGN_OR_RETURN(Row, finished, table->Finish(0));
+      multi_distinct_ready_row_ = std::move(finished);
+    }
+    return true;
+  }
+
   Status StartSkewLeaf(const PartitionLeaf& leaf) {
     if (leaf_grant_cache_.has_value()) {
       leaf_grant_cache_->ReleaseAll();
+    }
+    ASSIGN_OR_RETURN(bool, handled_multi_distinct,
+                     TryRunMultiDistinctGlobalSkewLeaf(leaf));
+    if (handled_multi_distinct) {
+      return Status::kSuccess;
     }
     // Keep our ActiveConsumerGuard active for the skew sorter: ExternalSorter
     // does not register one of its own (it only consults the grant), and
@@ -660,6 +838,7 @@ class
   size_t leaf_idx_{0};
   std::unique_ptr<AggregateGroupTable> active_table_;
   size_t active_table_cursor_{0};
+  std::optional<Row> multi_distinct_ready_row_;
 
   std::unique_ptr<ExternalSorter> skew_sorter_;
   std::unique_ptr<AggregateGroupTable> skew_table_;

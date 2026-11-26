@@ -1,23 +1,25 @@
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.MultiplyMaskInsteadOfSelect.Goal`. -/
 
-/-! IEEE multiplication by `+0.0` preserves the sign of a negative operand,
-so masking by multiplication produces `-0.0` rather than canonical `+0.0`. -/
+/-!
+Refutes `MultiplyMaskInsteadOfSelect.Goal`: multiplying a finite payload by
+positive zero does NOT always yield the canonical `+0.0` inactive-lane bit
+pattern. With `x = -1.0` (finite), IEEE gives `x * 0.0 = -0.0`, whose bit
+pattern `0x8000000000000000` differs from the pattern of `+0.0`. The witness
+is a closed ground expression checked by kernel `decide`. Inactive lanes must
+therefore be produced by a select/blending step rather than by `x * 0`
+whenever downstream bit comparisons treat signed zeros as distinct.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+set_option linter.unusedVariables false
 
-namespace Nov26.Proof_FloatingReduction_MultiplyMaskInsteadOfSelect
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_MultiplyMaskInsteadOfSelect
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.MultiplyMaskInsteadOfSelect
 
-theorem refute : ¬ Goal := by
+theorem refute : ¬ MultiplyMaskInsteadOfSelect.Goal := by
   intro h
-  have h' := h (-1 : Float) (by native_decide)
-  have hbad : ¬ same ((-1 : Float) * 0) 0 := by
-    unfold same bits
-    native_decide
-  exact hbad h'
+  have h' : ((-1.0 : Float) * 0).toBits ≠ (0 : Float).toBits := by decide
+  exact h' (h (-1.0) (show (-1.0 : Float).isFinite = true from by decide))
 
-end Nov26.Proof_FloatingReduction_MultiplyMaskInsteadOfSelect
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_MultiplyMaskInsteadOfSelect

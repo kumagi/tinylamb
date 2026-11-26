@@ -7,13 +7,13 @@ single unsigned magnitude cutoff is not shared by both signs. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_SignedMagnitudeSharedLimit
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_SignedMagnitudeSharedLimit
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-theorem refute : ¬ SignedMagnitudeSharedLimit.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.SignedMagnitudeSharedLimit.Goal := by
   intro h
   have hw := h 0 [49]
   simp [parse, digits, magnitude] at hw
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_SignedMagnitudeSharedLimit
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_SignedMagnitudeSharedLimit

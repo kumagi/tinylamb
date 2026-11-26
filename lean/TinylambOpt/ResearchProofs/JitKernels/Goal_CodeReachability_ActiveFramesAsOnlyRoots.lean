@@ -10,7 +10,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_ActiveFram
 
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 
-theorem refute : ¬ ActiveFramesAsOnlyRoots.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.CodeReachability.ActiveFramesAsOnlyRoots.Goal := by
   intro h
   have bad := h [{ key := (0, 0), calls := [(1, 0)], bytes := 0 }] [(0, 0)] (1, 0)
     (by native_decide)

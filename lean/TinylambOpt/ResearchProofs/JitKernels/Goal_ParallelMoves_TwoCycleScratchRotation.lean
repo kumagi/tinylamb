@@ -20,7 +20,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ParallelMoves_TwoCycleScrat
 
 open TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
 
-theorem sound : TwoCycleScratchRotation.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ParallelMoves.TwoCycleScratchRotation.Goal := by
   intro s a b tmp hta htb r hr
   have hat : a ≠ tmp := by omega
   have hbt : b ≠ tmp := by omega

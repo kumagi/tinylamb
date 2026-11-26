@@ -1,20 +1,21 @@
 import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 
-/-! A word mixing values from two multi-bit guards can match neither even though it matches all common requirements. -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_CommonRequirementsCoverUnion
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_CommonRequirementsCoverUnion
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.CommonRequirementsCoverUnion
 
-theorem refute : ¬ CommonRequirementsCoverUnion.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.CommonRequirementsCoverUnion.Goal := by
   intro h
-  let a : Entry := { mask := 3, value := 0, code := 0 }
-  let b : Entry := { mask := 3, value := 3, code := 0 }
-  have h' := h a b 1 (by simp [a, b]) (by simp [a, b])
-  simp [dispatch, accepts, a, b] at h'
+  let a : Entry := ⟨3, 0, 7⟩
+  let b : Entry := ⟨3, 3, 7⟩
+  let w : Word := 1
+  have hm : a.mask = b.mask := by rfl
+  have hc : a.code = b.code := by rfl
+  have hres := h a b w hm hc
+  have hbad :
+      dispatch [a, b] w ≠
+        dispatch [{a with mask := a.mask &&& ~~~(a.value ^^^ b.value)}] w := by
+    native_decide
+  exact hbad hres
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_CommonRequirementsCoverUnion
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_CommonRequirementsCoverUnion

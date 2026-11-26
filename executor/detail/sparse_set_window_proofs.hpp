@@ -87,7 +87,7 @@ struct RankPageMeta {
   if (sorted_totals.empty()) {
     return {};
   }
-  const int64_t n = static_cast<int64_t>(sorted_totals.size());
+  const auto n = static_cast<int64_t>(sorted_totals.size());
   const auto it =
       std::upper_bound(sorted_totals.begin(), sorted_totals.end(), total_sum,
                        [n](int64_t s, int64_t x) { return 5 * n * x > 6 * s; });
@@ -156,7 +156,8 @@ template <typename HourFn>
 [[nodiscard]] inline bool CanAbandonNonPositivePriorYearGroup(
     int64_t seen_sum, size_t pending_rows,
     int64_t per_row_upper_bound) noexcept {
-  return seen_sum + static_cast<int64_t>(pending_rows) * per_row_upper_bound <=
+  return seen_sum +
+             (static_cast<int64_t>(pending_rows) * per_row_upper_bound) <=
          0;
 }
 

@@ -1,19 +1,23 @@
 import TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.PageGuardAmortizedByLineHit.Goal`. -/
+
+/-! FALSE: Sharing a cache line does not amortize the page guard. Counterexample: base 0,
+stride 1, width 4, rows `i = 0` and `j = 1` sit on line `0`, and row `0` is below limit 1,
+but row `1` is not — the line spans the page boundary, so each speculative load in the
+line still needs its own bound check. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_FusionTraffic_PageGuardAmortizedByLineHit
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FusionTraffic_PageGuardAmortizedByLineHit
 open TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
-open TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.PageGuardAmortizedByLineHit
 
-theorem refute : ¬ Goal := by
+/-- Refutation of line-level amortization of page guards. -/
+theorem refute : ¬ PageGuardAmortizedByLineHit.Goal := by
   intro h
-  have h' := h 0 1 8 0 7 1 (by decide) (by decide) (by decide)
-  have hbad : ¬ (0 + 1 * 7 < 1) := by decide
-  exact hbad h'
+  have key := h 0 1 4 0 1 1 (by decide) (by decide) (by decide)
+  exact absurd key (by decide)
 
-end Nov26.Proof_FusionTraffic_PageGuardAmortizedByLineHit
+end TinylambOpt.ResearchProofs.JitKernels.FusionTraffic_PageGuardAmortizedByLineHit

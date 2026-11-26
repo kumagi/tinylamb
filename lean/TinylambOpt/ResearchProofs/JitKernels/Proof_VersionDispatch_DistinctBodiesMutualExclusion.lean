@@ -1,21 +1,38 @@
 import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unnecessarySimpa false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-/-! Permuting entries preserves the dispatched code when any two simultaneously accepting versions are required to name the same code. -/
-namespace Nov26.Proof_VersionDispatch_DistinctBodiesMutualExclusion
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion
+/-! Permuting entries preserves the dispatched code when any two simultaneously accepting
+versions are required to name the same code. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch_DistinctBodiesMutualExclusion
+open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch DistinctBodiesMutualExclusion
 
+/-- A guard accepts exactly the words whose masked bits equal the masked value. -/
 private theorem acc_eq (e : Entry) (w : Word) :
     accepts e w = true ↔ (w &&& e.mask) = (e.value &&& e.mask) := by
   simp [accepts]
 
+/-- Boolean core: a word satisfying both guard equations forces the two guard values to agree
+on every bit both masks test, so the masked xor vanishes there. -/
+private theorem agree_common_bool (A B W U V : Bool)
+    (ha : (W && A) = (U && A)) (hb : (W && B) = (V && B)) :
+    (((U ^^ V) && A) && B) = false := by
+  revert A B W U V ha hb
+  decide
+
+/--
+`DistinctBodiesMutualExclusion.Goal`: if every pair of versions in the chain that can accept
+the same input row names the same code body, then reordering the cache (permuting the list)
+never changes which code `dispatch` returns — so the optimizer may freely reorder the
+specialization cache, e.g. by cost, without touching semantics. The first-match entry of one
+order is present in the permuted list (permutation preserves membership), and the two
+first-matches agree on the row, hence clash-free, hence equal by hypothesis.
+-/
 theorem sound : Goal := by
   intro a b w hp hcompat
   have noclash_of (e f : Entry) (he : accepts e w = true) (hf : accepts f w = true) :
@@ -23,7 +40,17 @@ theorem sound : Goal := by
     have hee := (acc_eq e w).mp he
     have hff := (acc_eq f w).mp hf
     have hz : ((e.value ^^^ f.value) &&& e.mask &&& f.mask) = 0 := by
-      bv_decide
+      apply BitVec.eq_of_getLsbD_eq_iff.mpr
+      intro i hi
+      have he' : (w.getLsbD i && e.mask.getLsbD i)
+          = (e.value.getLsbD i && e.mask.getLsbD i) := by
+        simpa [BitVec.getLsbD_and] using congrArg (fun v : Word => v.getLsbD i) hee
+      have hf' : (w.getLsbD i && f.mask.getLsbD i)
+          = (f.value.getLsbD i && f.mask.getLsbD i) := by
+        simpa [BitVec.getLsbD_and] using congrArg (fun v : Word => v.getLsbD i) hff
+      simp only [BitVec.getLsbD_and, BitVec.getLsbD_xor]
+      rw [agree_common_bool _ _ _ _ _ he' hf']
+      exact (BitVec.getLsbD_zero (w := 64) (i := i)).symm
     simpa [clash] using hz
   cases hfa : a.find? (accepts · w) with
   | none =>
@@ -50,4 +77,4 @@ theorem sound : Goal := by
             hcompat ea heam fb hfbm (noclash_of ea fb hea hfbacc)
           simp [dispatch, hfa, hfb, hver]
 
-end Nov26.Proof_VersionDispatch_DistinctBodiesMutualExclusion
+end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch_DistinctBodiesMutualExclusion

@@ -4,7 +4,7 @@ import TinylambOpt.ResearchGoals.JitKernels.PlanePredicates
 A plane on which the threshold and the residual agree carries no comparison
 information, so flipping it in both operands leaves the ballot unchanged. The
 proof splits on whether the flipped plane lies inside the folded width and uses
-a congruence lemma for the fold when it does not.
+a congruence result for the fold when it does not.
 
 Proved
 
@@ -40,7 +40,7 @@ theorem foldBits_congr {x c x' c' : Nat} {w : Nat}
       · simp [hcond, ih (fun j hj => hx j (by omega)) (fun j hj => hc j (by omega))]
       · simp [hcond]
 
-theorem sound : CommonPlaneElision.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PlanePredicates.CommonPlaneElision.Goal := by
   intro x c j w h
   induction w with
   | zero => simp [foldBits]

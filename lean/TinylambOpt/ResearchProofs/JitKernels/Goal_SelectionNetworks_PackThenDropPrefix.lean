@@ -1,11 +1,12 @@
 import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
+set_option linter.unusedSimpArgs false
 
 /-! Dropping k packed rows is the same as dropping source bits through the k-th selected ordinal and packing the remainder. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_PackThenDropPrefix
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_PackThenDropPrefix
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.PackThenDropPrefix
@@ -100,4 +101,4 @@ theorem sound : PackThenDropPrefix.Goal := by
                   have hrec := ih (xs.drop 1) k j hlen' hopt
                   simpa [List.drop_drop, Nat.add_comm] using hrec
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_PackThenDropPrefix
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_PackThenDropPrefix

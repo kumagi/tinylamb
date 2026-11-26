@@ -537,14 +537,14 @@ struct AffinePatch {
   int64_t add{0};
 
   [[nodiscard]] constexpr int64_t Apply(int64_t x) const noexcept {
-    return mul * x + add;
+    return (mul * x) + add;
   }
 };
 
 [[nodiscard]] constexpr AffinePatch FuseAffinePatches(
     AffinePatch first, AffinePatch second) noexcept {
   return {.mul = second.mul * first.mul,
-          .add = second.mul * first.add + second.add};
+          .add = (second.mul * first.add) + second.add};
 }
 
 // ReferenceEdits / ScopeLookup: resolve innermost non-empty scope binding.

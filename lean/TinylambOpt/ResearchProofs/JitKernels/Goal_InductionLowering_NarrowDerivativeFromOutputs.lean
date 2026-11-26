@@ -1,23 +1,23 @@
 import TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
-/-!
-A signed difference of two in-range values need not be in range: the extreme
-outputs `-8` and `7` fit in 3 bits but their difference `15` does not. The
-derivative register width therefore needs its own range analysis.
--/
+/-! A signed derivative can need one more bit than either endpoint: the
+    output-only width check is refuted by the jump from the minimum to a
+    large positive value. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_NarrowDerivativeFromOutputs
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_NarrowDerivativeFromOutputs
 
 open TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
-theorem refute : ¬ NarrowDerivativeFromOutputs.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.InductionLowering.NarrowDerivativeFromOutputs.Goal := by
   intro h
-  have hv : signedFits 3 (-8) := by simp [signedFits]
-  have hn : signedFits 3 7 := by simp [signedFits]
-  have t := h 3 (-8) 7 hv hn
-  simp [signedFits] at t
+  have hlo : signedFits 2 (-4 : Int) := by
+    unfold signedFits
+    native_decide
+  have hhi : signedFits 2 (3 : Int) := by
+    unfold signedFits
+    native_decide
+  have hh := h 2 (-4 : Int) (3 : Int) hlo hhi
+  have hbad : ¬ (-(2^2:Int) ≤ (7:Int) ∧ (7:Int) < (2^2:Int)) := by native_decide
+  exact hbad (by simpa [signedFits] using hh)
 
-end TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_NarrowDerivativeFromOutputs
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_NarrowDerivativeFromOutputs

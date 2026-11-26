@@ -81,7 +81,7 @@ theorem le_last_of_inside (d : Domain) (hm : 0 < d.modulus) {x : Int}
   dsimp [a, m] at hcong hle ⊢
   omega
 
-theorem sound : CongruenceTightAffineGuard.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.CongruenceTightAffineGuard.Goal := by
   intro d m c w x hm hx hf hl
   have hfl := first_le_of_inside d hm hx
   have hll := le_last_of_inside d hm hx

@@ -1,22 +1,20 @@
 import TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
 /-!
-Negating a three-valued disjunction is not the same as negating each `WHERE`
-acceptance bit: two NULL-producing partitions make the SQL disjunction NULL,
-which is not accepted but also is not FALSE. Both partitions `[NULL]` witness
-the missing distinction.
+SQL three-valued OR returns UNKNOWN when one side is UNKNOWN and the other is
+FALSE, so negated WHERE acceptance is not the conjunction of the two negated
+acceptance bits.
 -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_CompositeAntiPredicateBooleanization
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_CompositeAntiPredicateBooleanization
 
 open TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
-theorem refute : ¬ CompositeAntiPredicateBooleanization.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.InListLowering.CompositeAntiPredicateBooleanization.Goal := by
   intro h
-  have t := h [none] [none] (some (0 : Int))
-  simp [test, disj, keep] at t
+  have h' := h [some 1] [none] (some 2)
+  have hne : ¬ ((disj (test [some 1] (some 2)) (test [none] (some 2)) == some false) =
+      (!(keep [some 1] (some 2)) && !(keep [none] (some 2)))) := by
+    native_decide
+  exact hne h'
 
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_CompositeAntiPredicateBooleanization
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_CompositeAntiPredicateBooleanization

@@ -1,21 +1,36 @@
 import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
-import TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
-
-/-! Filtering the heap down to marked objects keeps every direct-call table
-that is reachable from the roots: the first object with a live key survives
-the filter at the same position. -/
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_EvictionPreservesDirectTargets
 
-open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
-open TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
+open TinylambOpt.ResearchGoals.JitKernels
 
-theorem sound : EvictionPreservesDirectTargets.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.CodeReachability.EvictionPreservesDirectTargets.Goal := by
   intro heap roots
-  dsimp
+  dsimp only
   intro k hk
-  exact edges_retain heap (mark heap roots heap.length) k hk
+  let live := CodeReachability.mark heap roots heap.length
+  have hk' : k ∈ live := by simpa [live] using hk
+  have hfind : ∀ (xs : List CodeReachability.Obj) (k : CodeReachability.Key), k ∈ live →
+      (xs.filter (fun o => live.contains o.key)).find? (fun o => o.key == k) =
+        xs.find? (fun o => o.key == k) := by
+    intro xs k hk
+    induction xs generalizing k with
+    | nil => simp
+    | cons o os ih =>
+        by_cases hok : o.key == k
+        · have hokeq : o.key = k := beq_iff_eq.mp hok
+          have holive : live.contains o.key = true := by simpa [hokeq] using hk
+          simp [hok, hokeq, hk]
+        · have hok' : o.key ≠ k := by
+            intro h
+            exact hok (by simp [h])
+          by_cases holive : live.contains o.key
+          · simp [hok', holive]
+            simpa [beq_iff_eq] using ih k hk
+          · simp [hok', holive]
+            simpa [beq_iff_eq] using ih k hk
+  have hf := hfind heap k hk'
+  simpa [CodeReachability.edges, CodeReachability.retain, live, beq_iff_eq] using
+    congrArg (fun o => (o.map CodeReachability.Obj.calls).getD []) hf
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_EvictionPreservesDirectTargets

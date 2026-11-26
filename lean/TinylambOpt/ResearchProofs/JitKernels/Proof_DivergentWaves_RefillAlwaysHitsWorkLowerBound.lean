@@ -1,24 +1,24 @@
 import TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.RefillAlwaysHitsWorkLowerBound.Goal`. -/
+
+/-! REFUTED: Persistent lanes do not always finish exactly at the trivial work lower
+bound `max(longest task, ceil(total work / width))`. Greedy first-free-lane assignment is
+list scheduling, which is within the bound but need not equal it. Counterexample:
+`steps = [2, 2, 3]` at width `2`: greedy piles `2 + 3` onto one lane, finishing in `5`
+ticks, whereas the lower bound is `max(3, ceil(7/2)) = 4`. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-/-! Refutation: greedy lane refill can exceed the larger of the longest task and
-the rounded mean. Load balance is restricted to prefixes of the input order, so
-an early long task can keep one lane busy after the other has drained. -/
-
-namespace Nov26.Proof_DivergentWaves_RefillAlwaysHitsWorkLowerBound
-
+namespace TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_RefillAlwaysHitsWorkLowerBound
 open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.RefillAlwaysHitsWorkLowerBound
 
-theorem refute : ¬ Goal := by
+/-- Greedy refill takes 5 ticks on `[2, 2, 3]` at width 2, above the bound of 4. -/
+theorem refute : ¬ RefillAlwaysHitsWorkLowerBound.Goal := by
   intro h
-  have hbad := h [1, 1, 2] 2 (by omega)
-  have hc : refill 2 [1, 1, 2] ≠ max (peak [1, 1, 2]) (([1, 1, 2].sum + 2 - 1) / 2) := by
-    native_decide
-  exact hc hbad
+  have hc := h [2, 2, 3] 2 (by decide)
+  exact absurd hc (by decide)
 
-end Nov26.Proof_DivergentWaves_RefillAlwaysHitsWorkLowerBound
+end TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_RefillAlwaysHitsWorkLowerBound

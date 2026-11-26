@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
+set_option linter.unusedSimpArgs false
 
 /-!
 After a bad-character miss, the distance to the last earlier occurrence of the
@@ -10,7 +11,7 @@ justifies skipping intermediate start offsets without changing matches.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_BadCharacterSkipWindow
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_BadCharacterSkipWindow
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
@@ -113,4 +114,4 @@ theorem sound : BadCharacterSkipWindow.Goal := by
   have hdminus_lt_r : d - 1 < r := by omega
   exact (idxOf_first rev c (d - 1) hdminus_lt_r) hrevget
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_BadCharacterSkipWindow
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_BadCharacterSkipWindow

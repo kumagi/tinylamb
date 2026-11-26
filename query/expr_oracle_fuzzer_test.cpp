@@ -627,13 +627,15 @@ TEST(ExprOracleFuzzer, ReplayPinnedFuzzFindingsRegressions) {
   // - 4199220810818691348:  StaticallyNonBoolean for CASE under x AND x -> x
   // - 10137269684562481425: InferType missing CHR() in COALESCE NULL hint
   // - 6016210131723607869:  CaseExpression::ResultType skipping kInvalid branch
+  // - 8560459556290616476:  inner_join_not_null_inference in scalar rewrite
   for (const auto& [seed, extended] :
        std::vector<std::pair<uint64_t, bool>>{{11118779134808807094ULL, true},
                                               {11580306021212848888ULL, true},
                                               {14649602716663142413ULL, true},
                                               {4199220810818691348ULL, true},
                                               {10137269684562481425ULL, true},
-                                              {6016210131723607869ULL, true}}) {
+                                              {6016210131723607869ULL, true},
+                                              {8560459556290616476ULL, true}}) {
     std::mt19937 rng(static_cast<uint32_t>(seed));
     ExprGenConfig config;
     config.extended_ops = extended;

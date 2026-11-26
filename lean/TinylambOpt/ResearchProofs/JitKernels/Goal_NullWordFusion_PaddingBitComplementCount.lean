@@ -1,18 +1,13 @@
 import TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_PaddingBitComplementCount
 
-open TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
+open TinylambOpt.ResearchGoals.JitKernels
 
-theorem refute : ¬ PaddingBitComplementCount.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.PaddingBitComplementCount.Goal := by
   intro h
-  have hpad : (0 : W) &&& ~~~(window 0) = 0 := by native_decide
-  have hh := h 0 (0 : W) (by omega) hpad
-  have contra : ¬ ((ords (valid 0 (0 : W))).length = 64 - (ords (0 : W)).length) := by
-    native_decide
-  exact contra hh
+  have c := h 0 0 (by decide) (by decide)
+  exact (by native_decide : ¬ (
+    (NullWordFusion.ords (NullWordFusion.valid 0 0)).length = 64 - (NullWordFusion.ords 0).length)) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_PaddingBitComplementCount

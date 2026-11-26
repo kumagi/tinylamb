@@ -1,49 +1,43 @@
 import TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-/-! One CASE arm can be split at a vector boundary into two adjacent half-open
-arms without changing any key's dispatch result. Both halves keep the original
-result and their union is the original range, so surrounding arms keep their
-first-match priority. -/
-
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_SplitRangeAtVectorBoundary
 
-open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
-
-theorem sound : SplitRangeAtVectorBoundary.Goal := by
-  intro before a after mid x hlo hhi
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.SplitRangeAtVectorBoundary.Goal := by
+  intro before a after mid x hlo hmid
+  unfold TinylambOpt.ResearchGoals.JitKernels.DispatchTables.pick
   induction before with
   | nil =>
-      simp only [pick, List.nil_append, List.find?_cons]
-      by_cases hax : holds a x
-      · have hax' : a.lo ≤ x ∧ x < a.hi := by simpa [holds] using hax
-        by_cases hxm : x < mid
-        · have hp : holds { a with hi := mid } x = true := by
-            simp [holds, hxm]
-            omega
-          simp [hax, hp]
-        · have hp : holds { a with hi := mid } x = false := by
-            simp [holds]
-            omega
-          have hp2 : holds { a with lo := mid } x = true := by
-            simp [holds]
-            omega
-          simp [hax, hp, hp2]
-      · have hax' : ¬ (a.lo ≤ x ∧ x < a.hi) := by
-          intro h
-          exact hax (by simpa [holds] using h)
-        have hp : holds { a with hi := mid } x = false := by
-          simp [holds]
-          omega
-        have hp2 : holds { a with lo := mid } x = false := by
-          simp [holds]
-          omega
-        simp [hax, hp, hp2]
+      by_cases ha : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds a x = true
+      · have haInt : a.lo ≤ x ∧ x < a.hi := by
+          simpa [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] using ha
+        by_cases hxmid : x < mid
+        · have h1 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with hi := mid } x = true := by
+            simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+          have h2 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with lo := mid } x = false := by
+            simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+          simp [ha, h1, h2]
+        · have hxge : mid ≤ x := by omega
+          have h1 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with hi := mid } x = false := by
+            simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+          have h2 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with lo := mid } x = true := by
+            simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+          simp [ha, h1, h2]
+      · have haInt : ¬ (a.lo ≤ x ∧ x < a.hi) := by
+          simpa [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] using ha
+        have h1 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with hi := mid } x = false := by
+          simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+        have h2 : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds { a with lo := mid } x = false := by
+          simp [TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds] <;> omega
+        simp [ha, h1, h2]
   | cons b bs ih =>
-      by_cases hb : holds b x
-      · simp [pick, hb]
-      · simpa [pick, hb] using ih
+      cases hb : (bs.find? (fun arm => TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds arm x)) with
+      | none =>
+          by_cases hbh : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds b x = true
+          · simp [hb, hbh]
+          · simpa [hb, hbh] using ih
+      | some arm =>
+          by_cases hbh : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.holds b x = true
+          · simp [hbh]
+          · simpa [hb, hbh] using ih
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_SplitRangeAtVectorBoundary

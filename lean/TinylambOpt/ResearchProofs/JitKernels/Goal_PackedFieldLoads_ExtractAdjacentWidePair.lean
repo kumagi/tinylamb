@@ -11,7 +11,7 @@ open TinylambOpt.ResearchGoals.Compression.Wire
 open TinylambOpt.ResearchProofs.Compression.Wire
 
 
-theorem sound : ExtractAdjacentWidePair.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.ExtractAdjacentWidePair.Goal := by
   intro bs w j hcanon
   rw [sound_LocalRead bs (2*w) j hcanon,
       sound_LocalRead bs w (2*j) hcanon,

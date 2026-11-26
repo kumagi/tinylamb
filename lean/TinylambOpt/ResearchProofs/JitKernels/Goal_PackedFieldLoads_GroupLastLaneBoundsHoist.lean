@@ -1,5 +1,9 @@
 import TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
 
+/-!
+Proves `GroupLastLaneBoundsHoist`: the last active lane of a packed field group is bounded by the group extent, making the hoisted bounds check safe.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

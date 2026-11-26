@@ -7,7 +7,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_SharedUnpack
 
 open TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
 
-theorem refute : ¬ SharedUnpackCacheCount.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.SharedUnpackCacheCount.Goal := by
   intro h
   have hcnt : (ords (1 : W)).length = (ords (2 : W)).length := by native_decide
   have hh := h (1 : W) (2 : W) [0] hcnt

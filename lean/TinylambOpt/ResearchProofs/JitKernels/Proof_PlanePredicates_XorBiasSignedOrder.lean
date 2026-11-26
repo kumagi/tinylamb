@@ -62,7 +62,7 @@ theorem sound : XorBiasSignedOrder.Goal := by
     intro v
     have hvnat : v.toNat < 2^32 := v.isLt
     have hconst : (0x80000000 : BitVec 32).toNat = 2^31 := by
-      native_decide
+      rfl
     rw [BitVec.toNat_xor, hconst]
     rw [BitVec.toInt]
     by_cases h : 2 * v.toNat < 2^32

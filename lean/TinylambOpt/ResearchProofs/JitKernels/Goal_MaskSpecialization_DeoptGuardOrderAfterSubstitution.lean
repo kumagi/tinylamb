@@ -1,7 +1,6 @@
 import TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization
 
 set_option maxHeartbeats 0
-set_option linter.unusedSimpArgs false
 set_option maxRecDepth 10000
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_MaskSpecialization_DeoptGuardOrderAfterSubstitution
@@ -679,7 +678,7 @@ theorem subst_run (env : List V) (e : E) (i : Nat) (v : V)
               simp [specialize, run, reads, after, hrunP, hrunB, ihpR, ihbR, List.filter_append, vbeq]
 
 
-theorem sound : DeoptGuardOrderAfterSubstitution.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization.DeoptGuardOrderAfterSubstitution.Goal := by
   intro env e i j x y hs hg2
   have h1 := subst_run env e i x (fun _ => hs)
   have h2 := subst_run env (specialize i x e) j y hg2

@@ -12,7 +12,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_IdentityPr
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 open TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
 
-theorem sound : IdentityPreservingRelocation.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.CodeReachability.IdentityPreservingRelocation.Goal := by
   intro heap roots f hf n k
   exact mark_map_of_injective heap roots f hf n k
 

@@ -10,7 +10,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_LastLaneRmw
 
 open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
 
-theorem refute : ¬ LastLaneRmwSubstitution.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.LastLaneRmwSubstitution.Goal := by
   intro h
   have bad := h [(0, 1), (0, 2)] (fun _ => 0) 0 (by native_decide)
   simp [sequential, delta, lastLane] at bad

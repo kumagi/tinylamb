@@ -21,14 +21,19 @@
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
+#include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/batch_nested_loop_join.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/columnar_table.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/planning_heuristics.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/hash_join.hpp"
 #include "executor/minmax_index.hpp"
 #include "executor/parallel_aggregation.hpp"
@@ -46,13 +51,7 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
-#include "common/random_string.hpp"
-#include "database/database.hpp"
-#include "database/transaction_context.hpp"
 #include "expression/window_function_expression.hpp"
-#include "executor/detail/columnar_table.hpp"
-#include "executor/detail/relation.hpp"
-#include "executor/detail/window_eval.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -1684,15 +1683,15 @@ TEST(WindowEvalTest, EmptyArgsCountMatchesColumnar) {
   ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, db,
                         Database::Create("win_count_empty_" + RandomString()));
   TransactionContext ctx = db->BeginReadOnlyContext();
-  const Schema schema("t", {Column("p", ValueType::kInt64),
-                            Column("x", ValueType::kInt64)});
+  const Schema schema(
+      "t", {Column("p", ValueType::kInt64), Column("x", ValueType::kInt64)});
   std::vector<Row> rows = {
       Row({Value(), Value()}),
       Row({Value(int64_t{1}), Value()}),
       Row({Value(int64_t{1}), Value(int64_t{42})}),
   };
-  Expression win_expr = WindowFunctionCallExp(
-      "COUNT", {}, {ColumnValueExp("p")}, {});
+  Expression win_expr =
+      WindowFunctionCallExp("COUNT", {}, {ColumnValueExp("p")}, {});
   const auto* win_ptr =
       dynamic_cast<const WindowFunctionCallExpression*>(win_expr.get());
   ASSERT_NE(win_ptr, nullptr);

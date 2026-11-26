@@ -9,7 +9,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_ZeroDeltaOc
 
 open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
 
-theorem refute : ¬ ZeroDeltaOccupancyElision.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.ZeroDeltaOccupancyElision.Goal := by
   intro h
   have bad := h [(0, 1), (0, -1)]
   have hc : combine [(0, 1), (0, -1)] = [(0, 0)] := by native_decide

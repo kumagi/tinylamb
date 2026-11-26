@@ -10,7 +10,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CivilTextGathers_WholeHourO
 
 open TinylambOpt.ResearchGoals.JitKernels.CivilTextGathers
 
-theorem sound : WholeHourOffsetKeyRotation.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.CivilTextGathers.WholeHourOffsetKeyRotation.Goal := by
   intro d h m z hm hm'
   unfold utcHour utcMinute
   omega

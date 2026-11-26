@@ -7,7 +7,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_FusionTraffic_SelectionCoun
 
 open TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
 
-theorem refute : ¬ SelectionCountOnlyFusionGuard.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.SelectionCountOnlyFusionGuard.Goal := by
   intro h
   have h' := h [0, 1] [0, 8] 0 1 8 (by decide) (by decide) (by decide) (by decide)
   have hbad : (footprint 0 1 8 [0, 1]).length ≠ (footprint 0 1 8 [0, 8]).length := by decide

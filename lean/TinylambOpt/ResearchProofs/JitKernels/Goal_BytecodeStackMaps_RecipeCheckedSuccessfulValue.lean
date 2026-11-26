@@ -9,7 +9,7 @@ rematerialization results as the logical slot values.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_RecipeCheckedSuccessfulValue
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_RecipeCheckedSuccessfulValue
 
 open TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
@@ -93,8 +93,8 @@ theorem filterMap_optionMap (regs : Regs) (stack : List Recipe) (wanted : List N
       cases hi : stack[i]? <;> simp [hi, ih]
 
 
-theorem proof : RecipeCheckedSuccessfulValue.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps.RecipeCheckedSuccessfulValue.Goal := by
   intro w regs r v h
   exact checked_value w regs r v h
 
-end TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_RecipeCheckedSuccessfulValue
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_RecipeCheckedSuccessfulValue

@@ -190,7 +190,7 @@ theorem min_min_min (a b c : Int) : min a (min b c) = min (min a b) c := by
 theorem max_max_max (a b c : Int) : max a (max b c) = max (max a b) c := by
   by_cases hab : a ≤ b <;> by_cases hbc : b ≤ c <;> by_cases hac : a ≤ c <;> simp [Int.max_def, hab, hbc, hac] <;> omega
 
-theorem excursion_concat : ExcursionSummaryConcatenation.Goal := by
+theorem excursion_concat : TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.ExcursionSummaryConcatenation.Goal := by
   intro a b
   have hlowb : low b ≤ 0 := by
     have h := min_le_mem (path b) 0 (path_zero_mem b)
@@ -325,6 +325,7 @@ theorem path_length : ∀ xs : List Int, (path xs).length = xs.length + 1 := by
   intro xs
   simp [path]
 
-theorem sound : ExcursionSummaryConcatenation.Goal := excursion_concat
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.ExcursionSummaryConcatenation.Goal := by
+  exact excursion_concat
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_ExcursionSummaryConcatenation

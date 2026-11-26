@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.InductionLowering
+set_option linter.unusedSimpArgs false
 
 /-!
 A selection vector may leave gaps in the input ordinals. Running the
@@ -11,7 +12,7 @@ row at ordinal 1 is a concrete counterexample.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_SkippedIterationRecurrence
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_SkippedIterationRecurrence
 
 open TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
@@ -20,7 +21,7 @@ theorem refute : ¬ SkippedIterationRecurrence.Goal := by
   have t := h 1 0 0 2 (fun i => i == 1)
   have hbad : ¬ (let sel := (List.range 2).filter (fun i => i == 1);
       differences 1 0 0 0 1 sel.length = sel.map (fun (i : Nat) => poly 1 0 0 i)) := by
-    decide
+    native_decide
   exact hbad t
 
-end TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_SkippedIterationRecurrence
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_SkippedIterationRecurrence

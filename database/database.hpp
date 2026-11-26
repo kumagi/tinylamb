@@ -25,8 +25,8 @@
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -119,6 +119,9 @@ class Database final : public CatalogReader {
   [[nodiscard]] TransactionRuntimeStats TransactionStats() const {
     return storage_->tm_->RuntimeStats();
   }
+  [[nodiscard]] bool FailStopped() const {
+    return storage_->tm_->FailStopped();
+  }
   [[nodiscard]] uint64_t CacheHits() const noexcept;
   [[nodiscard]] uint64_t CacheMisses() const noexcept;
   [[nodiscard]] size_t PinnedPageCount() const noexcept;
@@ -191,7 +194,8 @@ class Database final : public CatalogReader {
   Status RefreshStatistics(TransactionContext& ctx,
                            std::string_view schema_name);
 
-  StatusOr<bool> TableExists(TransactionContext& ctx, std::string_view name) override;
+  StatusOr<bool> TableExists(TransactionContext& ctx,
+                             std::string_view name) override;
   StatusOr<Table> GetTable(TransactionContext& ctx,
                            std::string_view schema_name) override;
 
@@ -289,7 +293,8 @@ class Database final : public CatalogReader {
   mutable std::mutex tlcs_attach_mu_;
   std::unordered_set<page_id_t> tlcs_probed_pids_;
 
-  StatusOr<std::string> ReadTableCatalogEntry(TransactionContext& ctx, std::string_view name);
+  StatusOr<std::string> ReadTableCatalogEntry(TransactionContext& ctx,
+                                              std::string_view name);
   void MaybeAttachBackingTlcs(Table& table);
 
   // Compiled-plan invalidation epoch; see SchemaEpoch()/BumpSchemaEpoch().

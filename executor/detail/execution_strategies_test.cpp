@@ -441,7 +441,7 @@ TEST(ExecutionStrategiesTest, SelectionAndBlockSkipProofsMatchReference) {
   build_sig.AddNull();
   probe_miss.AddNull();
   EXPECT_FALSE(CanSkipBlockByBloomIntersection(build_sig, probe_miss,
-                                               /*null_safe=*/true));
+                                               /*null_safe_eq=*/true));
 
   // SnapshotZoneMap
   EXPECT_TRUE(SnapshotZoneMapValid(10, 12, false));

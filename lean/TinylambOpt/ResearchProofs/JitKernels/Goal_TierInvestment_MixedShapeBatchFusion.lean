@@ -1,21 +1,16 @@
 import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 
-/-! A passing batch fused with a failing one can lose the passing batch's specialization benefit. -/
+-- Refutation: losing specialization on a mixed pair can cost more than the saved dispatch fee.
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_MixedShapeBatchFusion
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_MixedShapeBatchFusion
-
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.MixedShapeBatchFusion
-
-theorem refute : ¬ MixedShapeBatchFusion.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.TierInvestment.MixedShapeBatchFusion.Goal := by
   intro h
-  let t : Tariff := { compile := 0, guardFee := 0, slow := 1, fast := 0, replay := 0 }
-  let a : Batch := ⟨0, false⟩
-  let b : Batch := ⟨1, true⟩
-  have h' := h t a b (by simp [t])
-  simp [compiled, t, a, b] at h'
+  have c := h ⟨0, 0, 2, 1, 0⟩ ⟨10, true⟩ ⟨0, false⟩ (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.TierInvestment.compiled ⟨0, 0, 2, 1, 0⟩
+        ⟨10 + 0, true && false⟩ ≤
+      TinylambOpt.ResearchGoals.JitKernels.TierInvestment.compiled ⟨0, 0, 2, 1, 0⟩ ⟨10, true⟩ +
+      TinylambOpt.ResearchGoals.JitKernels.TierInvestment.compiled ⟨0, 0, 2, 1, 0⟩ ⟨0, false⟩)) c
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_MixedShapeBatchFusion
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_MixedShapeBatchFusion

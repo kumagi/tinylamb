@@ -1,31 +1,15 @@
 import TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
 
-/-! A prefix scan across concatenated frames seeds the second frame with the
-first frame's endpoint. The scan accumulator is the base plus the frame sum, so
-SQL can resume a morsel from one carry value. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_HorizontalScanChunkSeed
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+open TinylambOpt.ResearchGoals.JitKernels
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_HorizontalScanChunkSeed
-
-open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
-
-theorem foldlAdd (b : Int) (a : List Int) : List.foldl (· + ·) b a = b + a.sum := by
-  induction a generalizing b with
-  | nil => simp
-  | cons x xs ih => simp [ih, List.sum_cons, Int.add_assoc]
-
-theorem sound : HorizontalScanChunkSeed.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.HorizontalScanChunkSeed.Goal := by
   intro b a c
-  unfold values
-  rw [List.scanl_append]
-  rw [foldlAdd]
-  simp only [List.drop_append]
-  have hz : 1 - (List.scanl (fun x y : Int => x + y) b a).length = 0 := by
-    rw [List.length_scanl]
-    omega
-  rw [hz]
-  simp [List.drop_one]
+  have hfold : a.foldl (fun x y : Int => x + y) b = b + a.sum := by
+    induction a generalizing b with
+    | nil => simp
+    | cons x xs ih => simp [ih, Int.add_assoc]
+  simp [DeltaLaneScan.values, List.scanl_append, hfold]
 
-end TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_HorizontalScanChunkSeed
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_HorizontalScanChunkSeed

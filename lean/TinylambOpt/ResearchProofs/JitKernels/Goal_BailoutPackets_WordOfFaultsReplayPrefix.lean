@@ -9,7 +9,7 @@ kernel may replay only the failing suffix after a clean vector word.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_WordOfFaultsReplayPrefix
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_WordOfFaultsReplayPrefix
 
 open TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
@@ -176,7 +176,7 @@ theorem gather_get {xs : List Cell} {sel : List Nat} (h : ∀ i ∈ sel, i < xs.
       | zero => simp [hg]
       | succ j => simp [hg, ih h' j]
 
-theorem proof : WordOfFaultsReplayPrefix.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.BailoutPackets.WordOfFaultsReplayPrefix.Goal := by
   intro a b h
   have hn := (first_none_iff a).mp h
   have hta := takeWhile_notBad_eq_self a hn
@@ -184,4 +184,4 @@ theorem proof : WordOfFaultsReplayPrefix.Goal := by
   rw [List.takeWhile_append]
   simp [hta, List.filterMap_append]
 
-end TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_WordOfFaultsReplayPrefix
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_WordOfFaultsReplayPrefix

@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_CascadeMaskCoordinates
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_CascadeMaskCoordinates
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.CascadeMaskCoordinates
@@ -38,7 +38,7 @@ theorem getElem_gather_valid (xs a : List Nat) (hvalid : ∀ i ∈ a, i < xs.len
       | succ j =>
           simpa [gather, hi] using ih htail j
 
-theorem sound : CascadeMaskCoordinates.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.CascadeMaskCoordinates.Goal := by
   intro xs a b hlen
   let P := positions a
   have hP : ∀ i ∈ P, i < xs.length := by
@@ -53,4 +53,4 @@ theorem sound : CascadeMaskCoordinates.Goal := by
   rw [hcomp]
   simp [compress, gather, List.filterMap_filterMap, hget', P]
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_CascadeMaskCoordinates
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_CascadeMaskCoordinates

@@ -8,7 +8,7 @@ for the whole ring probe prefix. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_RingMirrorUnalignedFetch
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_RingMirrorUnalignedFetch
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
@@ -31,7 +31,7 @@ theorem filterMapGetElemOfSome {α β : Type} (f : α → Option β) (l : List �
           | zero => simp [hfa, Option.bind]
           | succ i => simp [hfa, ih ht i]
 
-theorem sound : RingMirrorUnalignedFetch.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe.RingMirrorUnalignedFetch.Goal := by
   intro xs h n hh hn
   let len := xs.length
   have hlen : 0 < len := by omega
@@ -63,4 +63,4 @@ theorem sound : RingMirrorUnalignedFetch.Goal := by
       simp [len, hsum, hmod]
   · simp [hin]
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_RingMirrorUnalignedFetch
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_RingMirrorUnalignedFetch

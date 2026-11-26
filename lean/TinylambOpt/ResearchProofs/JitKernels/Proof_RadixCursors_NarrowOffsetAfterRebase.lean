@@ -16,7 +16,7 @@ namespace Nov26.Proof_RadixCursors_NarrowOffsetAfterRebase
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors.NarrowOffsetAfterRebase
 
-theorem drop_eq_cons_of_getElem?_eq_some {α : Type} (xs : List α) (i : Nat) (v : α)
+private theorem drop_eq_cons_of_getElem?_eq_some {α : Type} (xs : List α) (i : Nat) (v : α)
     (h : xs[i]? = some v) : ∃ t, xs.drop i = v :: t := by
   induction xs generalizing i with
   | nil => simp at h
@@ -31,7 +31,7 @@ theorem drop_eq_cons_of_getElem?_eq_some {α : Type} (xs : List α) (i : Nat) (v
           obtain ⟨t, ht⟩ := ih i h
           exact ⟨t, by simp [ht]⟩
 
-theorem active_split (xs : List (Option Nat)) (i k : Nat)
+private theorem active_split (xs : List (Option Nat)) (i k : Nat)
     (h : xs[i]? = some (some k)) :
     active xs = active (xs.take i) ++ k :: active (xs.drop i).tail := by
   obtain ⟨t, ht⟩ := drop_eq_cons_of_getElem?_eq_some xs i (some k) h
@@ -43,7 +43,7 @@ theorem active_split (xs : List (Option Nat)) (i k : Nat)
       rw [List.filterMap_append]
     _ = active (xs.take i) ++ k :: active (xs.drop i).tail := by rw [ht]; simp [active]
 
-theorem rank_lt_count (xs : List (Option Nat)) (i k : Nat)
+private theorem rank_lt_count (xs : List (Option Nat)) (i k : Nat)
     (h : xs[i]? = some (some k)) : rank xs i k < (active xs).count k := by
   rw [active_split xs i k h, List.count_append]
   simp [rank]

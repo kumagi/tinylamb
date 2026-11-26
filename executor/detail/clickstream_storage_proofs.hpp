@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -116,9 +117,9 @@ struct RunSidecarEncoded {
             cur_prev = w;
           }
         } else {
-          for (auto it = group.rbegin(); it != group.rend(); ++it) {
-            cost += FrontCodeTransitionBytes(cur_prev, *it);
-            cur_prev = *it;
+          for (const std::string& w : std::views::reverse(group)) {
+            cost += FrontCodeTransitionBytes(cur_prev, w);
+            cur_prev = w;
           }
         }
         best_cost = std::min(best_cost, cost);
@@ -238,7 +239,7 @@ struct ClockWindowChoice {
         ++misses;
       }
     }
-    return 1U + SVarintBytes(low) + packed_bytes + misses * exception_bytes;
+    return 1U + SVarintBytes(low) + packed_bytes + (misses * exception_bytes);
   };
   ClockWindowChoice best{.low = 0, .total_bytes = eval_cost(0)};
   auto try_anchor = [&](int64_t cand) {

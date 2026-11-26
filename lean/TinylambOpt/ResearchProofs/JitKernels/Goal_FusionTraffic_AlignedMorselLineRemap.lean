@@ -176,7 +176,7 @@ theorem filter_intersection_perm {α : Type} [BEq α] [LawfulBEq α] [DecidableE
       rw [List.count_eq_zero_of_not_mem hnoA, List.count_eq_zero_of_not_mem hnoB]
 
 
-theorem sound : AlignedMorselLineRemap.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.AlignedMorselLineRemap.Goal := by
   intro base stride width sel k hw
   unfold footprint
   have hline : ∀ i, lineOf (base + k * width) stride width i = k + lineOf base stride width i := by

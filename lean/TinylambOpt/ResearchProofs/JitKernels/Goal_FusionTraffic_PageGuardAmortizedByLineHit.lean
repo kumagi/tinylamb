@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
+set_option linter.unusedSimpArgs false
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000

@@ -1,22 +1,22 @@
 import TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-/-!
-An exact quotient for the largest dividend does not certify the whole range:
-a rounded-up reciprocal can be exact at a multiple of the divisor and
-overestimate a smaller dividend in the same window.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+/-! Exactness at the range maximum does not imply exactness at every smaller
+    dividend: an overestimate can later be caught up by the true quotient. -/
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_LastDividendCertifiesRange
 
 open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-theorem refute : ¬ LastDividendCertifiesRange.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.LastDividendCertifiesRange.Goal := by
   intro h
-  have got := h 3 3 1 (by decide) (by simp [exactAt, guess, magic])
-  have bad := got 2 (by decide)
-  simp [exactAt, guess, magic] at bad
+  have hpos : 0 < (3 : Nat) := by omega
+  have hlast : exactAt 3 3 1 := by
+    unfold exactAt guess magic
+    native_decide
+  have hh := h 3 3 1 hpos hlast 2 (by omega)
+  have hbad : ¬ exactAt 2 3 1 := by
+    unfold exactAt guess magic
+    native_decide
+  exact hbad hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_LastDividendCertifiesRange

@@ -1,5 +1,9 @@
 import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
 
+/-!
+Proves `StridedRangeNonempty`: a nonempty guard interval over consecutive rows contains a representative at the requested stride. The witness is constructed arithmetically from the interval bounds.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

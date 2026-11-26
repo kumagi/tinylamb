@@ -1,21 +1,20 @@
 import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 
-/-! A profitable prefix does not lock the tier: later guard misses can make the full trace cheaper interpreted. -/
+/-! A profitable prefix does not lock in tier-up: a later failing batch with
+    a large replay fee and no rows can make the compiled suffix more expensive. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_ProfitablePrefixLocksTier
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_ProfitablePrefixLocksTier
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.ProfitablePrefixLocksTier
 
-theorem refute : ¬ ProfitablePrefixLocksTier.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.TierInvestment.ProfitablePrefixLocksTier.Goal := by
   intro h
-  let t : Tariff := { compile := 0, guardFee := 0, slow := 1, fast := 0, replay := 1 }
-  let a : List Batch := [⟨1, true⟩]
-  let b : List Batch := [⟨0, false⟩, ⟨0, false⟩]
-  have h' := h t a b
-  simp [bill, scalar, compiled, t, a, b] at h'
+  let t : Tariff := { compile := 0, guardFee := 0, slow := 1, fast := 0, replay := 100 }
+  let a : List Batch := [{ rows := 1, passes := true }]
+  let b : List Batch := [{ rows := 0, passes := false }]
+  have hprofit : bill t a 0 < bill t a a.length := by native_decide
+  have hh := h t a b hprofit
+  have hne : ¬ bill t (a++b) 0 ≤ bill t (a++b) (a++b).length := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_ProfitablePrefixLocksTier
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_ProfitablePrefixLocksTier

@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
+set_option linter.unusedSimpArgs false
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -132,7 +133,7 @@ theorem sum_map_add_const : ∀ (l : List Nat) (f : Nat → Nat) (e : Nat),
       rw [Nat.succ_mul]
       omega
 
-theorem prediction : PredictionErrorWaveEnvelope.Goal := by
+theorem sound : PredictionErrorWaveEnvelope.Goal := by
   intro a b w e hw hlen hpt
   unfold ticks waves
   have hK : (a.length + w - 1) / w = (b.length + w - 1) / w := by rw [hlen]

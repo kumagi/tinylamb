@@ -14,7 +14,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_ResidueSe
 
 open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-theorem sound : ResidueSensitiveNoCorrection.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.ResidueSensitiveNoCorrection.Goal := by
   intro x d s hd
   let N := 2 ^ s
   let m := magic d s

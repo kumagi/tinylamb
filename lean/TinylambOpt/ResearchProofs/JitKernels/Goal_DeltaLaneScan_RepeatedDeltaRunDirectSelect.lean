@@ -7,7 +7,7 @@ runs arithmetically instead of materializing the prefix scan. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_RepeatedDeltaRunDirectSelect
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_RepeatedDeltaRunDirectSelect
 
 open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
 
@@ -18,4 +18,4 @@ theorem sound : RepeatedDeltaRunDirectSelect.Goal := by
   rw [hmin]
   simp
 
-end TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_RepeatedDeltaRunDirectSelect
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_RepeatedDeltaRunDirectSelect

@@ -1,18 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 
-/-! A repeated ordinal contributes its value twice to a SUM gather but only once to a membership bitmap. -/
+/-! A membership bitmap loses multiplicity, so a selection vector with a
+    repeated ordinal cannot be replaced by a compress for SUM. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_BitmapSelectionMultiplicity
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_BitmapSelectionMultiplicity
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
-open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.BitmapSelectionMultiplicity
 
-theorem refute : ¬ BitmapSelectionMultiplicity.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.BitmapSelectionMultiplicity.Goal := by
   intro h
-  have h' := h [5] [0, 0]
-  simp [gather, compress, positions] at h'
+  have hh := h [1] [0,0]
+  have hne : ((gather [1] [0,0]).sum ≠
+      (compress [1] ((List.range [1].length).map [0,0].contains)).sum) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_BitmapSelectionMultiplicity
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_BitmapSelectionMultiplicity

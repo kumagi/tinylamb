@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.CivilTextGathers
+set_option linter.unusedSimpArgs false
 
 /-! A guard for two bytes does not license a four-byte load: the row may end
 immediately after the validated pair. This refutation keeps SQL execution from

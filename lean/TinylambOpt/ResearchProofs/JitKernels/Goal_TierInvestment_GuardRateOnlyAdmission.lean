@@ -1,21 +1,21 @@
 import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 
-/-! The same row total and pass count can charge different costs when rows sit in different guard outcomes. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_GuardRateOnlyAdmission
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_GuardRateOnlyAdmission
-
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.GuardRateOnlyAdmission
-
-theorem refute : ¬ GuardRateOnlyAdmission.Goal := by
+/-- Two traces with the same length, row total and passing-batch count can put
+those rows on opposite sides of the guard, changing the compiled bill. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.TierInvestment.GuardRateOnlyAdmission.Goal := by
   intro h
-  let t : Tariff := { compile := 0, guardFee := 0, slow := 0, fast := 1, replay := 0 }
-  let a : List Batch := [⟨1, true⟩, ⟨0, false⟩]
-  let b : List Batch := [⟨0, true⟩, ⟨1, false⟩]
-  have h' := h t a b (by simp [a, b]) (by simp [a, b]) (by simp [a, b])
-  simp [bill, compiled, t, a, b] at h'
+  let t : TinylambOpt.ResearchGoals.JitKernels.TierInvestment.Tariff := ⟨0, 0, 1, 2, 0⟩
+  let a : List TinylambOpt.ResearchGoals.JitKernels.TierInvestment.Batch :=
+    [⟨10, true⟩, ⟨0, false⟩]
+  let b : List TinylambOpt.ResearchGoals.JitKernels.TierInvestment.Batch :=
+    [⟨0, true⟩, ⟨10, false⟩]
+  have c := h t a b (by native_decide) (by native_decide) (by native_decide)
+  have bad :
+      TinylambOpt.ResearchGoals.JitKernels.TierInvestment.bill t a 0 ≠
+        TinylambOpt.ResearchGoals.JitKernels.TierInvestment.bill t b 0 := by
+    native_decide
+  exact bad c
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_GuardRateOnlyAdmission
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_GuardRateOnlyAdmission

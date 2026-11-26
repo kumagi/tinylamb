@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+set_option linter.unusedSimpArgs false
 
 /-! The initial and final counters can both be in range while an intermediate
 lane update leaves the range. A checked scatter must inspect every partial sum,

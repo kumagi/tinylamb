@@ -8,7 +8,7 @@ selection without decoding every row. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_SparseGatherWeightedPrefix
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_SparseGatherWeightedPrefix
 
 open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
 
@@ -68,10 +68,10 @@ theorem swapSums (ds : List Int) (sel : List Nat) :
       rw [zipIndicatorAux]
       simp [Int.add_comm]
 
-theorem sound : SparseGatherWeightedPrefix.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.SparseGatherWeightedPrefix.Goal := by
   intro b ds sel hsel
   unfold TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.get
   rw [sumMapAddConst]
   rw [swapSums]
 
-end TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_SparseGatherWeightedPrefix
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_SparseGatherWeightedPrefix

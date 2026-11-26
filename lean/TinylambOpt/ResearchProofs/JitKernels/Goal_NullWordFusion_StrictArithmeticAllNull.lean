@@ -1,5 +1,9 @@
 import TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
 
+/-!
+Refutes `StrictArithmeticAllNull`: strict arithmetic over a null-containing word can produce a non-null result, so all-null propagation is not a valid fusion rule.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

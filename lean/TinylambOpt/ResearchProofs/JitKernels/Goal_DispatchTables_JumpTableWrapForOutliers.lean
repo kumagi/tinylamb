@@ -12,7 +12,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_JumpTableWra
 
 open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-theorem refute : ¬ JumpTableWrapForOutliers.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DispatchTables.JumpTableWrapForOutliers.Goal := by
   intro h
   have hbad := h [{ lo := 0, hi := 1, result := some 7 }] 0 1 1 (by omega) (by simp)
   have hc : (tab [{ lo := 0, hi := 1, result := some 7 }] 0 1)[((1 : Int) - 0).toNat % 1]?.join ≠

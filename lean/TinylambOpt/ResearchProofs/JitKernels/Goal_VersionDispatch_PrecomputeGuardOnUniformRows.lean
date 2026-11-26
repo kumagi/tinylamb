@@ -1,11 +1,12 @@
 import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
+set_option linter.unusedSimpArgs false
 
 /-! Two rows agreeing on the union of all guarded bits select the same first version; the proof shows each mask is contained in that union. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_PrecomputeGuardOnUniformRows
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_PrecomputeGuardOnUniformRows
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.PrecomputeGuardOnUniformRows
@@ -23,8 +24,14 @@ theorem dispatch_cons_of_false (e : Entry) (l : List Entry) (w : Word) (he : ¬ 
 
 theorem accepts_of_union (e : Entry) (a b m : Word) (he : e.mask &&& m = e.mask) (hab : a &&& m = b &&& m) :
     accepts e a ↔ accepts e b := by
-  simp [accepts]
-  bv_decide
+  unfold accepts
+  have hae : a &&& e.mask = b &&& e.mask := by
+    ext i
+    have h1 := congrArg (fun v : Word => v.getLsbD i) he
+    have h2 := congrArg (fun v : Word => v.getLsbD i) hab
+    simp only [BitVec.getLsbD_and] at h1 h2 ⊢
+    cases hmk : e.mask.getLsbD i <;> simp_all
+  rw [hae]
 
 theorem foldl_or_mem (acc : Word) (l : List Word) (x : Word) (hx : x &&& acc = x ∨ x ∈ l) :
     x &&& l.foldl (fun p q => p ||| q) acc = x := by
@@ -37,11 +44,15 @@ theorem foldl_or_mem (acc : Word) (l : List Word) (x : Word) (hx : x &&& acc = x
       apply ih (acc ||| y)
       rcases hx with hx | hx
       · left
-        bv_decide
+        ext i
+        have hxi := congrArg (fun v : Word => v.getLsbD i) hx
+        simp only [BitVec.getLsbD_and] at hxi ⊢
+        cases xb : x.getLsbD i <;> simp_all
       · simp only [List.mem_cons] at hx
         rcases hx with rfl | hx
         · left
-          bv_decide
+          ext i
+          cases x.getLsbD i <;> simp_all
         · right
           exact hx
 
@@ -77,4 +88,4 @@ theorem sound : PrecomputeGuardOnUniformRows.Goal := by
   right
   exact List.mem_map.mpr ⟨e, he, rfl⟩
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_PrecomputeGuardOnUniformRows
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_PrecomputeGuardOnUniformRows

@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_DistinctBodiesMutualExclusion
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_DistinctBodiesMutualExclusion
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion
@@ -54,13 +54,23 @@ theorem dispatch_none_of_all_false (l : List Entry) (w : Word) (h : ∀ e ∈ l,
       rw [dispatch_cons_of_false e l w he]
       exact ih ht
 
-theorem sound : DistinctBodiesMutualExclusion.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.DistinctBodiesMutualExclusion.Goal := by
   intro a b w hperm hcode
   have noClashOfAccepts : ∀ e f : Entry, accepts e w → accepts f w → !clash e f := by
     intro e f he hf
-    simp [clash] at ⊢
-    simp [accepts] at he hf
-    bv_decide
+    have heq : w &&& e.mask = e.value &&& e.mask := by
+      simpa [accepts] using he
+    have hfq : w &&& f.mask = f.value &&& f.mask := by
+      simpa [accepts] using hf
+    have hzero : ((e.value ^^^ f.value) &&& e.mask &&& f.mask) = 0 := by
+      apply BitVec.eq_of_getLsbD_eq
+      intro i hi
+      have hebit := congrArg (fun x : Word => x.getLsbD i) heq
+      have hfbit := congrArg (fun x : Word => x.getLsbD i) hfq
+      simp only [BitVec.getLsbD_and] at hebit hfbit ⊢
+      cases hme : e.mask.getLsbD i <;> cases hmf : f.mask.getLsbD i <;> simp [hme, hmf] at hebit hfbit ⊢
+      · rw [← hebit, ← hfbit]
+    simp [clash, hzero]
   by_cases hexa : ∃ e ∈ a, accepts e w
   · rcases hexa with ⟨ea, hea_mem, hea⟩
     have hallA : ∀ e ∈ a, accepts e w → e.code = ea.code := by
@@ -83,4 +93,4 @@ theorem sound : DistinctBodiesMutualExclusion.Goal := by
       exact hnoa e (hperm.mem_iff.mpr he) hacc
     rw [dispatch_none_of_all_false a w hnoa, dispatch_none_of_all_false b w hnob]
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_DistinctBodiesMutualExclusion
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_DistinctBodiesMutualExclusion

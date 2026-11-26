@@ -5,15 +5,33 @@ import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_ShadowChainPruning
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_ShadowChainPruning
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.ShadowChainPruning
 
 theorem weaker_imp (a b : Entry) (h : weaker a b = true) : ∀ w, accepts b w → accepts a w := by
-  intro w
-  simp [weaker, accepts, clash] at h ⊢
-  bv_decide
+  intro w hb
+  simp [weaker, accepts, clash] at h hb ⊢
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  have hm : a.mask.getLsbD i = true → b.mask.getLsbD i = true := by
+    intro ham
+    have hbit := congrArg (fun z : Word => z.getLsbD i) h.1
+    simpa [BitVec.getLsbD_and, ham] using hbit
+  have hc : a.mask.getLsbD i = true → b.mask.getLsbD i = true →
+      a.value.getLsbD i = b.value.getLsbD i := by
+    intro ham hbm
+    have hbit := congrArg (fun z : Word => z.getLsbD i) h.2
+    simpa [BitVec.getLsbD_and, BitVec.getLsbD_xor, ham, hbm] using hbit
+  have hbw := congrArg (fun z : Word => z.getLsbD i) hb
+  simp [BitVec.getLsbD_and] at hbw ⊢
+  by_cases ham : a.mask.getLsbD i
+  · have hbm := hm ham
+    have hval := hc ham hbm
+    simp [ham, hbm] at hbw ⊢
+    exact hbw.trans hval.symm
+  · simp [ham]
 
 theorem bool_false_of_not {p : Bool} (h : ¬ p) : p = false := by
   cases p <;> simp_all
@@ -35,7 +53,7 @@ theorem dispatch_append_first_of_accepts (a : Entry) (rest tail : List Entry) (w
   rw [dispatch, List.find?_append]
   simp [List.find?, ha]
 
-theorem sound : ShadowChainPruning.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.ShadowChainPruning.Goal := by
   intro a b rest tail w hw
   by_cases ha : accepts a w
   · rw [dispatch_append_first_of_accepts a rest (b :: tail) w ha]
@@ -45,4 +63,4 @@ theorem sound : ShadowChainPruning.Goal := by
       exact ha ((weaker_imp a b hw) w hb)
     exact dispatch_remove_second b (a :: rest) tail w hb
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_ShadowChainPruning
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_ShadowChainPruning

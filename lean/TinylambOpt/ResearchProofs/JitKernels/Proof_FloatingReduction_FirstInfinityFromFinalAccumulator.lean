@@ -14,7 +14,7 @@ set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
 
-namespace Nov26.Proof_FloatingReduction_FirstInfinityFromFinalAccumulator
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FirstInfinityFromFinalAccumulator
 
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FirstInfinityFromFinalAccumulator
@@ -80,4 +80,4 @@ theorem sound : Goal := by
   unfold firstInf total
   exact aux s xs (finite_not_nan hs) hxs
 
-end Nov26.Proof_FloatingReduction_FirstInfinityFromFinalAccumulator
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FirstInfinityFromFinalAccumulator

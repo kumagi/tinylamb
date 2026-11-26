@@ -1,24 +1,18 @@
 import TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
-/-
-Refutes `SuccessfulNullLaneProgress`: NULL-producing rows are dropped by
-`filterMap`, so the materialized output length is not the failing ordinal.
+/-!
+Null-producing packets before the first fault are skipped by `prefixOut`, so the
+number of materialized outputs need not equal the physical ordinal of the fault.
+This counterexample keeps a SQL NULL row before an error row.
 -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_SuccessfulNullLaneProgress
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_SuccessfulNullLaneProgress
 
 open TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
-theorem refute : ¬ SuccessfulNullLaneProgress.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BailoutPackets.SuccessfulNullLaneProgress.Goal := by
   intro h
-  let xs : List Cell := [.ok none, .error 3]
-  have hf : first xs = some (1, 3) := by native_decide
-  have hbad := h xs 1 3 hf
-  have hp : (prefixOut xs).length = 0 := by native_decide
-  rw [hp] at hbad
-  omega
+  have h' := h ([.ok none, .error 3] : List Cell) 1 3 (by native_decide)
+  have hne : ¬ ((prefixOut ([.ok none, .error 3] : List Cell)).length = 1) := by native_decide
+  exact hne h'
 
-end TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_SuccessfulNullLaneProgress
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_SuccessfulNullLaneProgress

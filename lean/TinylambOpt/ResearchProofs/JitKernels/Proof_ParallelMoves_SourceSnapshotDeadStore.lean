@@ -1,136 +1,220 @@
 import TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
 
 /-!
-In a parallel bundle only the last move to each destination is observable,
-because every move snapshots its source from the original register file. This
-file proves that redundant earlier writes to the same destination may be erased
-before code generation.
-
-Proved
-
-- `SourceSnapshotDeadStore` — keeping one move per destination in a parallel
-  bundle preserves the whole register file, so duplicate destination moves can
-  be dropped without changing the transferred values.
+**Proved: in a parallel bundle, keeping only the last move to each
+destination preserves the transfer.**
+`ms.reverse.eraseDupsBy (fun a b => a.1 == b.1)` drops every move whose
+destination is repeated by a *later* move, and reversing back restores the
+original order of the survivors; the claim is that `parallelCopy` is
+unchanged. The proof keeps an explicit accumulator file `file` through a
+helper `pcopy_prune`: when the dropped move's destination is written again
+later, `put_kill` shows the earlier write is overwritten
+(`put_overwrite` plus commuting independent writes with `put_comm`), and the
+combinatorics of `eraseDupsBy` on a snoc is settled by
+`eraseDupsBy_append_last` (strong induction on the list length). This justifies
+dead-store elimination in parallel move sequences at OSR stubs and PHI
+lowering: fewer machine moves, identical observable register file.
 -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
+set_option linter.unnecessarySimpa false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_ParallelMoves_SourceSnapshotDeadStore
-
+namespace TinylambOpt.ResearchProofs.JitKernels.ParallelMoves_SourceSnapshot
 open TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
 
-/-- A parallel bundle with a separately chosen source file and starting file. -/
-def pcFrom (src acc : File) (ms : List Move) : File :=
-  ms.foldl (fun t (d, r) => put t d (src r)) acc
+private theorem put_apply (s : File) (d v r : Nat) :
+    put s d v r = if r == d then v else s r := rfl
 
-theorem pcFrom_append (src acc : File) (l₁ l₂ : List Move) :
-    pcFrom src acc (l₁ ++ l₂) = pcFrom src (pcFrom src acc l₁) l₂ := by
-  simp [pcFrom, List.foldl_append]
+private theorem put_same (s : File) (d v : Nat) : put s d v d = v := by
+  simp [put_apply]
 
-theorem put_put_same (s : File) (d v w : Nat) : put (put s d v) d w = put s d w := by
-  funext i
-  by_cases h : i = d <;> simp [put, h]
+private theorem put_other (s : File) (d v r : Nat) (h : r ≠ d) : put s d v r = s r := by
+  simp [put_apply, h]
 
-theorem pcFrom_swap (src acc : File) (m₁ m₂ : Move) (hd : m₁.1 ≠ m₂.1) :
-    pcFrom src acc [m₁, m₂] = pcFrom src acc [m₂, m₁] := by
-  funext i
-  by_cases h1 : i = m₁.1
-  · have h2 : i ≠ m₂.1 := by omega
-    simp [pcFrom, put, h1, h2, hd, Ne.symm hd]
-  · by_cases h2 : i = m₂.1
-    · simp [pcFrom, put, h1, h2, hd, Ne.symm hd]
-    · simp [pcFrom, put, h1, h2, hd, Ne.symm hd]
+private theorem put_comm (s : File) (d₁ d₂ v₁ v₂ : Nat) (h : d₁ ≠ d₂) :
+    put (put s d₁ v₁) d₂ v₂ = put (put s d₂ v₂) d₁ v₁ := by
+  funext r
+  by_cases h₁ : r = d₁
+  · have L : put (put s d₁ v₁) d₂ v₂ r = v₁ := by
+      rw [put_other (put s d₁ v₁) d₂ v₂ r (fun he => h (h₁.symm.trans he)), h₁, put_same]
+    have R : put (put s d₂ v₂) d₁ v₁ r = v₁ := by
+      rw [h₁, put_same]
+    rw [L, R]
+  · by_cases h₂ : r = d₂
+    · have L : put (put s d₁ v₁) d₂ v₂ r = v₂ := by
+        rw [h₂, put_same]
+      have R : put (put s d₂ v₂) d₁ v₁ r = v₂ := by
+        rw [h₂, put_other (put s d₂ v₂) d₁ v₁ d₂ (fun he => h he.symm), put_same]
+      rw [L, R]
+    · have L : put (put s d₁ v₁) d₂ v₂ r = s r := by
+        rw [put_other (put s d₁ v₁) d₂ v₂ r h₂, put_other s d₁ v₁ r h₁]
+      have R : put (put s d₂ v₂) d₁ v₁ r = s r := by
+        rw [put_other (put s d₂ v₂) d₁ v₁ r h₁, put_other s d₂ v₂ r h₂]
+      rw [L, R]
 
-theorem pcFrom_swap_cons (src acc : File) (m₁ m₂ : Move) (rest : List Move) (hd : m₁.1 ≠ m₂.1) :
-    pcFrom src acc (m₁ :: m₂ :: rest) = pcFrom src acc (m₂ :: m₁ :: rest) := by
-  have hacc : put (put acc m₁.1 (src m₁.2)) m₂.1 (src m₂.2) =
-      put (put acc m₂.1 (src m₂.2)) m₁.1 (src m₁.2) := by
-    simpa [pcFrom] using pcFrom_swap src acc m₁ m₂ hd
-  simpa [pcFrom] using
-    congrArg (fun t => List.foldl (fun f (x : Move) => put f x.1 (src x.2)) t rest) hacc
+private theorem put_overwrite (s : File) (d v w : Nat) :
+    put (put s d v) d w = put s d w := by
+  funext r
+  by_cases h : r = d
+  · subst h
+    simp [put_apply]
+  · simp [put_apply, h]
 
-/-- An earlier move is dead when a later move writes the same destination. -/
-theorem pcFrom_drop_earlier (src acc : File) (m : Move) (after : List Move)
-    (h : ∃ m' ∈ after, m'.1 = m.1) :
-    pcFrom src acc (m :: after) = pcFrom src acc after := by
-  induction after generalizing acc m with
-  | nil => simp at h
-  | cons m' rest ih =>
-      by_cases hd : m'.1 = m.1
-      · have hacc : put (put acc m.1 (src m.2)) m'.1 (src m'.2) = put acc m'.1 (src m'.2) := by
-          rw [← hd]
-          exact put_put_same acc m'.1 (src m.2) (src m'.2)
-        simp [pcFrom, hacc]
-      · have hrest : ∃ m'' ∈ rest, m''.1 = m.1 := by
-          rcases h with ⟨m'', hm'', heq''⟩
-          simp only [List.mem_cons] at hm''
-          rcases hm'' with heq' | hmrest
-          · subst m''
-            exact False.elim (hd heq'')
-          · exact ⟨m'', hmrest, heq''⟩
-        rw [pcFrom_swap_cons src acc m m' rest (Ne.symm hd)]
-        simpa [pcFrom] using ih (put acc m'.1 (src m'.2)) m hrest
+private def pcopy (s file : File) (u : List Move) : File :=
+  u.foldl (fun acc (d, r) => put acc d (s r)) file
 
-/-- Moves to a destination that is written again by the final move are dead. -/
-theorem pcFrom_filter_last (src acc : File) (a : Move) (L : List Move) :
-    pcFrom src acc (L ++ [a]) =
-      pcFrom src acc (L.filter (fun b => b.1 ≠ a.1) ++ [a]) := by
-  induction L generalizing acc with
-  | nil => simp
-  | cons b rest ih =>
-      by_cases hb : b.1 = a.1
-      · have hdrop : pcFrom src acc (b :: (rest ++ [a])) = pcFrom src acc (rest ++ [a]) := by
-          apply pcFrom_drop_earlier
-          exact ⟨a, by simp, hb.symm⟩
-        simpa [hb] using hdrop.trans (ih acc)
-      · simpa [pcFrom, hb] using ih (put acc b.1 (src b.2))
+private theorem pcopy_cons (s file : File) (m : Move) (u : List Move) :
+    pcopy s file (m :: u) = pcopy s (put file m.1 (s m.2)) u := rfl
 
-/-- A bundle stored in reverse program order. -/
-def pcRev (src acc : File) (L : List Move) : File := pcFrom src acc L.reverse
+private theorem pcopy_eq_parallelCopy (s : File) (u : List Move) :
+    parallelCopy s u = pcopy s s u := rfl
 
-/-- Erasing duplicate destinations from a reversed bundle (keeping the first,
-which is the last move in program order) does not change the resulting file. -/
-theorem pcRev_eraseDups (L : List Move) : ∀ src acc : File,
-    pcRev src acc (L.eraseDupsBy (fun a b => a.1 == b.1)) = pcRev src acc L := by
-  let P : Nat → Prop := fun n => ∀ (L : List Move), L.length = n → ∀ src acc : File,
-    pcRev src acc (L.eraseDupsBy (fun a b => a.1 == b.1)) = pcRev src acc L
-  have hP : ∀ n, P n := by
-    intro n
-    induction n using Nat.strongRecOn with
-    | ind n ih =>
-        intro L hlen src acc
-        cases L with
-        | nil => rfl
-        | cons a as =>
-            rw [List.eraseDupsBy_cons]
-            let F := as.filter (fun b => decide ((b.1 == a.1) = false))
-            have hlenF : F.length < n := by
-              have hle : F.length ≤ as.length := List.length_filter_le _ as
-              have has : as.length < n := by
-                simp at hlen
-                omega
-              omega
-            have ihF := ih F.length hlenF F rfl src acc
-            have hTail : pcFrom src acc ((F.eraseDupsBy (fun a b => a.1 == b.1)).reverse ++ [a]) =
-                pcFrom src acc (F.reverse ++ [a]) := by
-              rw [pcFrom_append, pcFrom_append]
-              exact congrArg (fun f : File => pcFrom src f [a]) ihF
-            have hFreverse : F.reverse = as.reverse.filter (fun b => b.1 ≠ a.1) := by
-              simp [F, List.filter_reverse]
-            have hfilter := (pcFrom_filter_last src acc a as.reverse).symm
-            calc
-              pcFrom src acc ((a :: (F.eraseDupsBy (fun a b => a.1 == b.1))).reverse) =
-                  pcFrom src acc ((F.eraseDupsBy (fun a b => a.1 == b.1)).reverse ++ [a]) := by simp
-              _ = pcFrom src acc (F.reverse ++ [a]) := hTail
-              _ = pcFrom src acc (as.reverse.filter (fun b => b.1 ≠ a.1) ++ [a]) := by rw [hFreverse]
-              _ = pcFrom src acc (as.reverse ++ [a]) := hfilter
-              _ = pcFrom src acc ((a :: as).reverse) := by simp
-  exact hP L.length L rfl
+private theorem eraseDupsBy_append_last_helper :
+    ∀ (n : Nat) (v : List Move), v.length = n → ∀ x : Move,
+      (v ++ [x]).eraseDupsBy (fun a b => a.1 == b.1) =
+        if (v.any fun z => z.1 == x.1) = true
+        then v.eraseDupsBy (fun a b => a.1 == b.1)
+        else v.eraseDupsBy (fun a b => a.1 == b.1) ++ [x] := by
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro v hv x
+    cases v with
+    | nil => rfl
+    | cons y u =>
+      subst hv
+      have hlt : (u.filter fun b => (fun a b => a.1 == b.1) b y = false).length <
+          (y :: u).length := by
+        have h1 := List.length_filter_le (fun b => (fun a b => a.1 == b.1) b y = false) u
+        rw [List.length_cons]
+        omega
+      have hrec :=
+          ih _ hlt (u.filter fun b => (fun a b => a.1 == b.1) b y = false) rfl x
+      rw [List.cons_append, List.eraseDupsBy_cons, List.eraseDupsBy_cons,
+        List.any_cons, List.filter_append]
+      cases hxy : (x.1 == y.1) with
+      | true =>
+        have hfy : (y.1 == x.1) = true := by
+          rw [Bool.beq_comm]
+          exact hxy
+        rw [show (([x] : List Move).filter
+              fun b => (fun a b => a.1 == b.1) b y = false) = []
+          from by
+            rw [List.filter_eq_nil_iff]
+            intro a ha
+            have e := List.eq_of_mem_singleton ha
+            subst e
+            simp [hxy], List.append_nil, hfy, Bool.true_or]
+        rfl
+      | false =>
+        rw [show (([x] : List Move).filter
+              fun b => (fun a b => a.1 == b.1) b y = false) = [x]
+          from by
+            rw [List.filter_cons, List.filter_nil]
+            simp [hxy]]
+        rw [hrec]
+        have hfy : (y.1 == x.1) = false := by
+          rw [Bool.beq_comm]
+          exact hxy
+        have heq : (u.filter fun b => (fun a b => a.1 == b.1) b y = false).any
+            (fun z => z.1 == x.1) = u.any (fun z => z.1 == x.1) := by
+          cases hfu : u.any (fun z => z.1 == x.1) with
+          | true =>
+            obtain ⟨z, hz, hzp⟩ := List.any_eq_true.mp hfu
+            refine List.any_eq_true.mpr ⟨z, List.mem_filter.mpr ⟨hz, ?_⟩, hzp⟩
+            simp [Nat.eq_of_beq_eq_true hzp, hxy]
+          | false =>
+            cases hff : (u.filter fun b => (fun a b => a.1 == b.1) b y = false).any
+                (fun z => z.1 == x.1) with
+            | true =>
+              obtain ⟨z, hz, hzp⟩ := List.any_eq_true.mp hff
+              have hzu : z ∈ u := (List.mem_filter.mp hz).1
+              have h1 : u.any (fun z => z.1 == x.1) = true :=
+                List.any_eq_true.mpr ⟨z, hzu, hzp⟩
+              rw [h1] at hfu
+              exact absurd hfu (by simp)
+            | false => rfl
+        rw [heq, hfy, Bool.false_or]
+        split <;> simp_all
+
+private theorem eraseDupsBy_append_last (v : List Move) (x : Move) :
+    (v ++ [x]).eraseDupsBy (fun a b => a.1 == b.1) =
+      if (v.any fun z => z.1 == x.1) = true
+      then v.eraseDupsBy (fun a b => a.1 == b.1)
+      else v.eraseDupsBy (fun a b => a.1 == b.1) ++ [x] :=
+  eraseDupsBy_append_last_helper v.length v rfl x
+
+private theorem eraseDupsBy_append_last_true (v : List Move) (x : Move)
+    (h : (v.any fun z => z.1 == x.1) = true) :
+    (v ++ [x]).eraseDupsBy (fun a b => a.1 == b.1) =
+      v.eraseDupsBy (fun a b => a.1 == b.1) := by
+  rw [eraseDupsBy_append_last v x, h]
+  exact ite_eq_left rfl
+
+private theorem eraseDupsBy_append_last_false (v : List Move) (x : Move)
+    (h : (v.any fun z => z.1 == x.1) = false) :
+    (v ++ [x]).eraseDupsBy (fun a b => a.1 == b.1) =
+      v.eraseDupsBy (fun a b => a.1 == b.1) ++ [x] := by
+  rw [eraseDupsBy_append_last v x, h]
+  exact ite_eq_right (by simp)
+
+private theorem put_kill (s : File) (d v : Nat) :
+    ∀ (file : File) (u : List Move), d ∈ u.map Prod.fst →
+      pcopy s (put file d v) u = pcopy s file u := by
+  intro file u
+  induction u generalizing file with
+  | nil => intro h; simp at h
+  | cons m t ih =>
+    intro h
+    cases hmd : (m.1 == d) with
+    | true =>
+      rw [pcopy_cons, pcopy_cons]
+      rw [show m.1 = d from Nat.eq_of_beq_eq_true hmd]
+      rw [put_overwrite file d v (s m.2)]
+    | false =>
+      have hne : ¬(m.1 = d) := by
+        intro he
+        rw [he] at hmd
+        simp at hmd
+      rw [pcopy_cons, pcopy_cons,
+        put_comm file d m.1 v (s m.2) (fun he => hne he.symm)]
+      refine ih (put file m.1 (s m.2)) ?_
+      rw [List.map_cons] at h
+      cases List.mem_cons.mp h with
+      | inl e => exact False.elim (hne e.symm)
+      | inr e => exact e
+
+private theorem pcopy_prune (s : File) :
+    ∀ (ms : List Move) (file : File),
+      pcopy s file ((ms.reverse.eraseDupsBy (fun a b => a.1 == b.1)).reverse) =
+        pcopy s file ms := by
+  intro ms
+  induction ms with
+  | nil => intro file; rfl
+  | cons m t ih =>
+    intro file
+    rw [List.reverse_cons]
+    cases hcond : (t.reverse).any (fun z => z.1 == m.1) with
+    | true =>
+      have hd : m.1 ∈ t.map Prod.fst := by
+        obtain ⟨z, hz, hzx⟩ := List.any_eq_true.mp hcond
+        exact List.mem_map.mpr ⟨z, List.mem_reverse.mp hz, Nat.eq_of_beq_eq_true hzx⟩
+      rw [eraseDupsBy_append_last_true t.reverse m hcond, ih file, pcopy_cons]
+      exact (put_kill s m.1 (s m.2) file t hd).symm
+    | false =>
+      rw [eraseDupsBy_append_last_false t.reverse m hcond]
+      rw [show ((t.reverse.eraseDupsBy (fun a b => a.1 == b.1)) ++ [m]).reverse =
+            m :: (t.reverse.eraseDupsBy (fun a b => a.1 == b.1)).reverse
+        from by rw [List.reverse_append]; rfl]
+      rw [pcopy_cons, pcopy_cons, ih (put file m.1 (s m.2))]
 
 theorem sound : SourceSnapshotDeadStore.Goal := by
   intro s ms
-  simpa [pcRev, pcFrom, parallelCopy] using pcRev_eraseDups ms.reverse s s
+  rw [pcopy_eq_parallelCopy, pcopy_eq_parallelCopy]
+  exact pcopy_prune s ms s
 
-end Nov26.Proof_ParallelMoves_SourceSnapshotDeadStore
+end TinylambOpt.ResearchProofs.JitKernels.ParallelMoves_SourceSnapshot

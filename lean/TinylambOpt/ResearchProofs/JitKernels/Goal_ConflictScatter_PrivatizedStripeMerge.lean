@@ -11,7 +11,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_PrivatizedS
 open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
 open TinylambOpt.ResearchProofs.JitKernels.Common_ConflictScatter
 
-theorem sound : PrivatizedStripeMerge.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.PrivatizedStripeMerge.Goal := by
   intro us k
   exact zipIdx_delta_partition us 0 k
 

@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_GatherByTileRestoreOrdinal
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_GatherByTileRestoreOrdinal
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.GatherByTileRestoreOrdinal
@@ -35,7 +35,7 @@ theorem filterMap_congr {α β : Type} (f g : α → Option β) (l : List α) (h
       have ht : ∀ y ∈ xs, f y = g y := by intro y hy; exact h y (by simp [hy])
       rw [List.filterMap_cons, List.filterMap_cons, hx, ih ht]
 
-theorem sound : GatherByTileRestoreOrdinal.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.GatherByTileRestoreOrdinal.Goal := by
   intro xs sel n hn hvalid
   let T := tile sel n
   have hperm : T.Perm sel := by
@@ -63,4 +63,4 @@ theorem sound : GatherByTileRestoreOrdinal.Goal := by
     simpa [gather] using hmap
   simpa [T] using htarget
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_GatherByTileRestoreOrdinal
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_GatherByTileRestoreOrdinal

@@ -45,7 +45,7 @@ theorem rank_lt_count (xs : List (Option Nat)) (i k : Nat)
   rw [active_split xs i k h, List.count_append]
   simp [rank]
 
-theorem sound : NarrowOffsetAfterRebase.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.RadixCursors.NarrowOffsetAfterRebase.Goal := by
   intro xs i k hxi hcount
   have hlt : rank xs i k < 65536 := by
     have hr := rank_lt_count xs i k hxi

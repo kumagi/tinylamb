@@ -162,7 +162,7 @@ theorem waves_length_mul_ge : ∀ (xs : List Nat) (w : Nat), 0 < w → xs.length
   have hd := (Nat.div_le_iff_le_mul hw).mp (show (xs.length + w - 1) / w ≤ (xs.length + w - 1) / w from Nat.le_refl _)
   omega
 
-theorem padding : HomogeneousBucketPaddingBound.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.HomogeneousBucketPaddingBound.Goal := by
   intro steps w l h hw hbound
   by_cases hempty : steps = []
   · subst steps

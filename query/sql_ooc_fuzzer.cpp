@@ -1,6 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include "common/platform/process.hpp"
 #include "query/sql_ooc_fuzzer.hpp"
 
 #include <algorithm>
@@ -21,8 +20,8 @@
 #include <optional>
 #include <random>
 #include <set>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -32,6 +31,7 @@
 
 #include "common/digest.hpp"
 #include "common/memory_budget.hpp"
+#include "common/platform/process.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "page/page_manager.hpp"
@@ -1407,8 +1407,29 @@ class OocSession {
   std::string ResolveAmbiguousCommit(const Status& st) {
     DisarmAndDetect();
     Bump(&OocStats::tolerated_failures);
-    std::ignore = ActiveContext().txn_.Abort();
-    ctx_.emplace(db_->BeginContext());
+    if (db_->FailStopped()) {
+      // Mid-publication spill/memory fault tripped fail-stop: the in-memory
+      // engine intentionally refuses further work, so crash-reopen and verify
+      // that WAL recovery restores an atomic image (pre- or post-transaction).
+      PauseEvictThread pause(this);
+      evict_pm_ = nullptr;
+      if (!sdb_->CrashAndReopen() || !*sdb_) {
+        return "commit fail-stop crash recovery failed to reopen the database\n"
+               "  status: " +
+               ToString(sdb_->last_reopen_status()) + "\n";
+      }
+      snap_.reset();
+      snap_tables_.clear();
+      ctx_.reset();
+      Bump(&OocStats::crashes);
+      db_ = sdb_->get();
+      ctx_.emplace(db_->BeginContext());
+      ResetFdBaseline();
+      RebindEvictThreadLocked();
+    } else {
+      std::ignore = ActiveContext().txn_.Abort();
+      ctx_.emplace(db_->BeginContext());
+    }
     // The ambiguous-commit probes must run with relaxed knobs: under the
     // session's tight budgets a count/sum probe legitimately fails with
     // kMemoryLimitExceeded, which ImageMatches would misread as "image does
@@ -1417,8 +1438,10 @@ class OocSession {
     SetKnobs(Knobs{});
     // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions) guard type is
     // non-copyable by design
-    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): local scope guard.
-    struct RestoreKnobs {  // NOLINT(cppcoreguidelines-special-member-functions): local scope guard.
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): local scope
+    // guard.
+    struct RestoreKnobs {  // NOLINT(cppcoreguidelines-special-member-functions):
+                           // local scope guard.
       OocSession* self;
       Knobs knobs;
       ~RestoreKnobs() { self->SetKnobs(knobs); }
@@ -1555,7 +1578,8 @@ class OocSession {
     if (std::string r = OpCommit(); !r.empty()) {
       return "after compaction: " + r;
     }
-    return QuickCheck(*FindTable(work_, tok[1]), ActiveContext(), "post-compact");
+    return QuickCheck(*FindTable(work_, tok[1]), ActiveContext(),
+                      "post-compact");
   }
 
   std::string OpSnap(const std::vector<std::string>& tok) {

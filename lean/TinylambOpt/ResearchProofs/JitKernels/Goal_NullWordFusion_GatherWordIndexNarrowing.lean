@@ -1,19 +1,18 @@
 import TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_GatherWordIndexNarrowing
 
-open TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
-
-theorem refute : ¬ GatherWordIndexNarrowing.Goal := by
+/-- Lane indices starting near a word boundary can cross into the next null
+word, so the first word alone cannot describe a 32-lane gather. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.GatherWordIndexNarrowing.Goal := by
   intro h
-  have hh := h ([0, 1] : List W) 63
-  have contra : ¬
-      (((List.range 32).map (fun j => (lanes ([0, 1] : List W) 95)[63 + j]?)) =
-        ((List.range 32).map (fun j => some ((([0, 1] : List W)[63 / 64]?.getD 0).getLsbD ((63 + j) % 64))))) := by
+  let words : List TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.W := [0, 1]
+  have c := h words 60
+  have h4 := congrArg (fun l => l[4]?) c
+  have bad :
+      (TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.lanes words 92)[64]? ≠
+        some ((words[60 / 64]?.getD 0).getLsbD ((60 + 4) % 64)) := by
     native_decide
-  exact contra hh
+  exact bad (by simpa using h4)
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_GatherWordIndexNarrowing

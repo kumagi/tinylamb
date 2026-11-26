@@ -11,7 +11,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_SplitTableAt
 
 open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-theorem sound : SplitTableAtHotBoundary.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.SplitTableAtHotBoundary.Goal := by
   intro as base a b
   simp [tab, List.range_add]
   intro i hi

@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_AdjacentTierCutDifference
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_AdjacentTierCutDifference
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.AdjacentTierCutDifference
@@ -25,7 +25,7 @@ theorem drop_eq_cons_drop_succ (xs : List Batch) (i : Nat) (b : Batch) (h : xs[i
           simp only [List.drop]
           exact ih i h
 
-theorem sound : AdjacentTierCutDifference.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.TierInvestment.AdjacentTierCutDifference.Goal := by
   intro t xs i b hlen hget
   have hi : i < xs.length := by omega
   have htake : xs.take (i + 1) = xs.take i ++ [b] := by
@@ -35,4 +35,4 @@ theorem sound : AdjacentTierCutDifference.Goal := by
   simp [bill, hlen, hi, htake, hdrop, net]
   omega
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_AdjacentTierCutDifference
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_AdjacentTierCutDifference

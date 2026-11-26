@@ -1,21 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 
-/-! Weaker does not require equal codes, so equally weak guards with different bodies are order-sensitive. -/
+/-! The stated guard relation points from the broader guard to the more
+    specific one, so reordering by it does not preserve first-match dispatch. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_SpecificitySortDispatch
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_SpecificitySortDispatch
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.SpecificitySortDispatch
 
-theorem refute : ¬ SpecificitySortDispatch.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.SpecificitySortDispatch.Goal := by
   intro h
-  let a : Entry := { mask := 0, value := 0, code := 0 }
-  let b : Entry := { mask := 0, value := 0, code := 1 }
-  have hw : weaker a b := by simp [weaker, clash, a, b]
-  have h' := h a b 0 hw
-  simp [dispatch, accepts, a, b] at h'
+  let a : Entry := { mask := 0, value := 0, code := 1 }
+  let b : Entry := { mask := 1, value := 1, code := 2 }
+  have hw : weaker a b = true := by native_decide
+  have hh := h a b (1 : Word) hw
+  have hne : (dispatch [a,b] (1 : Word) ≠ dispatch [b,a] (1 : Word)) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_SpecificitySortDispatch
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_SpecificitySortDispatch

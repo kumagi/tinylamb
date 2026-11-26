@@ -1,16 +1,17 @@
 import TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+-- Refutation: substituting a non-NULL literal for an actually-read NULL slot changes the result.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_MaskSpecialization_FinalNullImpliesUnusedArguments
 
-open TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization
 open TinylambOpt.ResearchGoals.JitFrontiers.DemandSSA
 
-theorem refute : ¬ FinalNullImpliesUnusedArguments.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization.FinalNullImpliesUnusedArguments.Goal := by
   intro h
-  have hh := h [.null] (.arg 0) 0 .yes
-  simp [answer, run, specialize] at hh
+  have c := h ([V.null] : List V) (.arg 0) 0 .yes (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization.answer
+      ([V.null] : List V)
+      (TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization.specialize 0 .yes (.arg 0)) = .null)) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_MaskSpecialization_FinalNullImpliesUnusedArguments

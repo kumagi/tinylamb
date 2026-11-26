@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.SampledEquality
+set_option linter.unusedSimpArgs false
 
 /-!
 The sampled suffix is not the lexicographic suffix: unsampled bytes can sit

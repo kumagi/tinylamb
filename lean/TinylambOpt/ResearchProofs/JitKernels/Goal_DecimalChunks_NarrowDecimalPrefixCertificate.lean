@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+set_option linter.unusedSimpArgs false
 
 /-! Every decimal prefix has magnitude at most the full magnitude: the fold only
 adds nonnegative contributions. If the full word fits a width, every earlier
@@ -7,7 +8,7 @@ prefix fits too, so delayed checks on prefixes can be omitted. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_NarrowDecimalPrefixCertificate
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_NarrowDecimalPrefixCertificate
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
@@ -42,4 +43,4 @@ theorem sound : NarrowDecimalPrefixCertificate.Goal := by
     simpa [magnitude] using foldlTakeLe 0 s n
   omega
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_NarrowDecimalPrefixCertificate
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_NarrowDecimalPrefixCertificate

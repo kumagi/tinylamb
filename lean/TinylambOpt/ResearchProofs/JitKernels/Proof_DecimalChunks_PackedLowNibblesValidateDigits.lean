@@ -1,14 +1,24 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
-import TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_PackedLowNibblesValidateDigits
 
-/-! REFUTE: verified DecimalChunks.PackedLowNibblesValidateDigits. -/
+/-!
+Refutation: checking only `c < 128 ∧ c % 16 < 10` does not verify ASCII
+digit-ness. The byte `0` satisfies `0 < 128 ∧ 0 % 16 < 10`, but it is not an
+ASCII digit (`48 ≤ 0` fails), so `digits [0] = false`. Skipping the
+high-nibble check lets non-digit control bytes through.
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
+set_option linter.unnecessarySimpa false
 set_option linter.unusedSimpArgs false
-namespace Nov26.Proof_DecimalChunks_PackedLowNibblesValidateDigits
+set_option linter.deprecated false
+
+namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks_PackedLowNibblesValidateDigits
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
-open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.PackedLowNibblesValidateDigits
-theorem refute : ¬ Goal := by
-  exact TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_PackedLowNibblesValidateDigits.refute
-end Nov26.Proof_DecimalChunks_PackedLowNibblesValidateDigits
+
+theorem refute : ¬ PackedLowNibblesValidateDigits.Goal := by
+  intro h
+  exact absurd (h [0] (by decide) (by decide)) (by decide)
+
+end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks_PackedLowNibblesValidateDigits

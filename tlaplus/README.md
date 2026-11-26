@@ -126,8 +126,9 @@ snap より後に追記されたコミットがこの穴を通る。
 | `S3Wal.tla` | WAL のパイプライン送信（条件付き PUT、遅れた到着、応答の喪失、再送）、連続した接頭部での応答、エポックの封印と作成、追い越し、ゾンビ writer、再起動時のローカル状態（正式な履歴の末尾で切り詰める）、S3 チェックポイント、封印の削除（外した版だけ） |
 | `ReplyBarrier.tla` | 応答のバリア。現行の D4（版の依存）と、木ごとの公開済み変更 LSN・公開済みコミット LSN・`BufferedLSN` の各規則 |
 | `ObjectGc.tla` | データオブジェクトのアップロード・参照と、マーク・スイープの GC。消せるのは、マークの時点で確定済み（作成エポックが封印済みか、writer が確定を宣言した）のものだけ |
+| `GcRegistry.tla` | 読者の登録と GC の削除の競合。削除する集合の記録、GC の停止と引き継ぎ、遅れて届く DELETE |
 
-設定名の接頭辞でモデルを選ぶ（`s3wal_*`、`barrier_*`、`objgc_*`）。`*_design*` と通過を期待する設定は全不変条件が成り立つこと、`*_bug_*` は設計の規則を 1 つ外すと狙った不変条件が落ちることを確かめる。
+設定名の接頭辞でモデルを選ぶ（`s3wal_*`、`barrier_*`、`objgc_*`、`gcreg_*`）。`*_design*` と通過を期待する設定は全不変条件が成り立つこと、`*_bug_*` は設計の規則を 1 つ外すと狙った不変条件が落ちることを確かめる。
 
 | 設定 | 期待 | 落ちる不変条件 |
 |---|---|---|
@@ -144,6 +145,8 @@ snap より後に追記されたコミットがこの穴を通る。
 | `barrier_version`、`barrier_version_gc`、`barrier_tree_late` | 違反 | `ObservedDurable` |
 | `objgc_design` | 通過 | — |
 | `objgc_bug_timebased`、`objgc_bug_tail`、`objgc_bug_late_seal`、`objgc_bug_dedupe`、`objgc_bug_settle_early` | 違反 | `RefsResolve` |
+| `gcreg_design` | 通過 | — |
+| `gcreg_bug_norecord`、`gcreg_bug_stalemark` | 違反 | `HeldExists` |
 
 `s3wal_design` は 32 コアで約 1.5 分（約 300 万状態）、`s3wal_design_nofsync` は約 3 分（約 380 万状態）かかる。`run.sh` は `-noGenerateSpecTE` を付けて実行するので、反例は `out/<設定名>.log` にだけ出て、`<Module>_TTrace_*` のファイルは残らない。
 

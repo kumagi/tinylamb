@@ -27,7 +27,7 @@ theorem total_mem_scanl {β α : Type} (f : β → α → β) : ∀ (s : β) (l 
       rw [List.foldl_cons, List.scanl_cons]
       exact List.mem_cons_of_mem s (total_mem_scanl f (f s x) xs)
 
-theorem sound : FiniteOverflowLaneReplay.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FiniteOverflowLaneReplay.Goal := by
   intro s a b hnone
   unfold firstInf at hnone
   unfold firstInf total

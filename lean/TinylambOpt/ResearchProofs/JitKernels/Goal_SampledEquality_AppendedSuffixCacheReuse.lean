@@ -14,7 +14,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SampledEquality_AppendedSuf
 open TinylambOpt.ResearchGoals.JitKernels.SampledEquality
 open TinylambOpt.SimdGroupHash (byteSamples)
 
-theorem refute : ¬ AppendedSuffixCacheReuse.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.SampledEquality.AppendedSuffixCacheReuse.Goal := by
   intro h
   have got := h (List.replicate 13 (0 : UInt8))
     (List.replicate 8 (0 : UInt8) ++ [1] ++ List.replicate 4 (0 : UInt8))

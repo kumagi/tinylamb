@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.DispatchTables
+set_option linter.unusedSimpArgs false
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000

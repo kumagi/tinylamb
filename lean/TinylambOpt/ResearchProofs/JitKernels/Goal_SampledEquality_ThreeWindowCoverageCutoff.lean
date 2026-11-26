@@ -15,7 +15,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SampledEquality_ThreeWindow
 open TinylambOpt.ResearchGoals.JitKernels.SampledEquality
 open TinylambOpt.SimdGroupHash (byteSamples)
 
-theorem sound : ThreeWindowCoverageCutoff.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SampledEquality.ThreeWindowCoverageCutoff.Goal := by
   intro a b halen hsig
   let n := a.length
   have hlen : b.length = n := by

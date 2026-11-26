@@ -118,7 +118,7 @@ struct XorSignificantWindow {
   for (size_t i = 0; i < n; ++i) {
     const uint64_t w = words[i];
     for (size_t b = 0; b < 8; ++b) {
-      out[b * n + i] = static_cast<uint8_t>((w >> (b * 8U)) & 0xffU);
+      out[(b * n) + i] = static_cast<uint8_t>((w >> (b * 8U)) & 0xffU);
     }
   }
   return out;
@@ -132,7 +132,7 @@ struct XorSignificantWindow {
   }
   for (size_t b = 0; b < 8; ++b) {
     for (size_t i = 0; i < n; ++i) {
-      out[i] |= static_cast<uint64_t>(shuffled[b * n + i]) << (b * 8U);
+      out[i] |= static_cast<uint64_t>(shuffled[(b * n) + i]) << (b * 8U);
     }
   }
   return out;
@@ -150,7 +150,7 @@ struct XorSignificantWindow {
     } else if (i == 1) {
       res.push_back(xs[1] - xs[0]);
     } else {
-      const int64_t pred = 2 * xs[i - 1] - xs[i - 2];
+      const int64_t pred = (2 * xs[i - 1]) - xs[i - 2];
       res.push_back(xs[i] - pred);
     }
   }
@@ -167,7 +167,7 @@ struct XorSignificantWindow {
     } else if (i == 1) {
       xs.push_back(xs[0] + res[1]);
     } else {
-      const int64_t pred = 2 * xs[i - 1] - xs[i - 2];
+      const int64_t pred = (2 * xs[i - 1]) - xs[i - 2];
       xs.push_back(pred + res[i]);
     }
   }
@@ -179,7 +179,7 @@ struct XorSignificantWindow {
 [[nodiscard]] constexpr bool BitPackBeatsRaw(size_t rows, unsigned new_bits,
                                              size_t old_bytes_per_row,
                                              size_t header_overhead) noexcept {
-  const size_t new_bytes = (rows * new_bits + 7U) / 8U + header_overhead;
+  const size_t new_bytes = (((rows * new_bits) + 7U) / 8U) + header_overhead;
   return new_bytes < rows * old_bytes_per_row;
 }
 

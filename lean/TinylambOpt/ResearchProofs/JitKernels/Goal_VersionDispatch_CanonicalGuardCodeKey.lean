@@ -2,17 +2,16 @@ import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
 
 /-! Clearing the bits outside a guard's mask from its value leaves acceptance unchanged, so a specialization cache key can ignore those bits. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_CanonicalGuardCodeKey
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_CanonicalGuardCodeKey
 
 open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
-open TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.CanonicalGuardCodeKey
 
-theorem sound : CanonicalGuardCodeKey.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.VersionDispatch.CanonicalGuardCodeKey.Goal := by
   intro e w
-  simp [accepts]
-  bv_decide
+  unfold accepts
+  have h : (e.value &&& e.mask) &&& e.mask = e.value &&& e.mask := by
+    ext i
+    simp
+  rw [h]
 
-end TinylambOpt.ResearchProofs.JitKernels.VersionDispatch.Goal_VersionDispatch_CanonicalGuardCodeKey
+end TinylambOpt.ResearchProofs.JitKernels.Goal_VersionDispatch_CanonicalGuardCodeKey

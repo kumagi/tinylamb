@@ -11,7 +11,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_DisjointWav
 open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
 open TinylambOpt.ResearchProofs.JitKernels.Common_ConflictScatter
 
-theorem sound : DisjointWaveCommit.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.DisjointWaveCommit.Goal := by
   intro a b k hdisj
   rw [delta_append]
   by_cases hka : k ∈ leaders a

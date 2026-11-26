@@ -11,7 +11,7 @@ set_option maxHeartbeats 0
 set_option linter.unusedSimpArgs false
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_LaneInterleavedInduction
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_LaneInterleavedInduction
 
 open TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
@@ -91,7 +91,7 @@ theorem quadSound : QuadraticFiniteDifferenceLoop.Goal := by
   rw [List.range_succ]
   simp [st]
 
-theorem sound : LaneInterleavedInduction.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.InductionLowering.LaneInterleavedInduction.Goal := by
   intro a b c start stride lane width n hw hlane
   have hquad := quadSound a b c (start + stride * (lane : Int)) (stride * (width : Int)) n
   rw [hquad]
@@ -106,4 +106,4 @@ theorem sound : LaneInterleavedInduction.Goal := by
   simp [hpt]
 
 
-end TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_LaneInterleavedInduction
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_LaneInterleavedInduction

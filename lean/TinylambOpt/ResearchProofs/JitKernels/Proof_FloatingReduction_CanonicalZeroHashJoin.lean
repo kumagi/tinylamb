@@ -1,306 +1,369 @@
-import Std
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-import TinylambOpt.ResearchProofs.JitKernels.Common_FloatingReduction
 
 /-!
-Certificate for `CanonicalZeroHashJoin.Goal`: canonicalizing IEEE-equal floats before
-hashing gives identical bits. Equal nonzero unpacked representations determine equal
-`Float.Model` values, and both signs of zero are canonicalized to positive zero. This
-allows a JIT hash join to replace signed-zero inputs with `+0` without changing the
-hash key.
+Establishes `CanonicalZeroHashJoin.Goal`: when two `Float` values are IEEE-equal
+(`a == b`), normalizing every IEEE zero to the positive-zero bit pattern before
+hashing yields congruent bits. `Float` is a structure over `Float.Model`, a valid
+`UInt64` bit pattern; `==` unfolds through `Float.beq` / `Model.beq` to
+`UnpackedFloat.compare` on the inductive unpacked form. Case analysis on the
+unpacked shape (`eq_dichotomy`) shows the IEEE-equality classes are singletons
+except for `{+0.0, -0.0}` — which the normalization branch folds to one pattern —
+and `NaN`, which is never `==`-equal and is the only family of bit patterns where
+the roundtrip `pack ∘ unpack` loses information (`pack_unpack` needs
+`isNaN = false`). For every other IEEE-equal pair the observable bits are
+reconstructible from the unpacked value, so the two normalized patterns agree
+bitwise. This justifies folding `-0.0` into `0.0` before computing hash-join
+keys. All helpers are private; core `Init` + `Std` only, no Mathlib.
 -/
 
 set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+set_option maxRecDepth 100000
 set_option linter.unusedSimpArgs false
-set_option linter.unnecessarySimpa false
 
-namespace Nov26.Proof_FloatingReduction_CanonicalZeroHashJoin
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_CanonicalZeroHashJoin
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.CanonicalZeroHashJoin
-set_option linter.unusedSimpArgs false
-open Float.Model
-open Float.Model.UnpackedFloat
-open TinylambOpt.ResearchProofs.JitKernels.FloatingReductionCommon
+open Float.Model UnpackedFloat Format Sign
 
-theorem bv_eq_of_unpack_fields {b1 b2 : BitVec 64}
-  (hs : unpackSign (spec := Format.binary64) b1 = unpackSign (spec := Format.binary64) b2)
-  (he : unpackExponent (spec := Format.binary64) b1 = unpackExponent (spec := Format.binary64) b2)
-  (hm : unpackMantissa (spec := Format.binary64) b1 = unpackMantissa (spec := Format.binary64) b2) : b1 = b2 := by
-  apply BitVec.eq_of_getLsbD_eq
-  intro i hi
-  by_cases h0 : i < 52
-  · have hm_i := congrArg (fun x : BitVec 52 => x.getLsbD i) hm
-    simpa [unpackMantissa, h0] using hm_i
-  · by_cases h1 : i < 63
-    · have he_i := congrArg (fun x : BitVec 11 => x.getLsbD (i-52)) he
-      have hidx : i - 52 < 11 := by omega
-      have hEq : 52 + (i - 52) = i := by omega
-      simpa [unpackExponent, hidx, hEq] using he_i
-    · have hs_i := congrArg (fun x : BitVec 1 => x.getLsbD (i-63)) hs
-      have hidx : i - 63 < 1 := by omega
-      have hEq : 63 + (i - 63) = i := by omega
-      simpa [unpackSign, hidx, hEq] using hs_i
+/-- Reconstructing a one-bit sign from its bit reading is the identity. -/
+private theorem signRT (v : BitVec 1) : Sign.toBitVec (Sign.ofBitVec v) = v := by
+  have h : v = 0#1 ∨ v = 1#1 := by revert v; decide
+  rcases h with rfl | rfl <;> rfl
 
-theorem pack_unpack_valid_bv (b : BitVec 64) (hv : Format.Valid Format.binary64 b) :
-    UnpackedFloat.pack Format.binary64 (UnpackedFloat.unpack Format.binary64 b) = b := by
-  let E : BitVec 11 := unpackExponent (spec := Format.binary64) b
-  let M : BitVec 52 := unpackMantissa (spec := Format.binary64) b
-  have hEdef : unpackExponent (spec := Format.binary64) b = E := rfl
-  have hMdef : unpackMantissa (spec := Format.binary64) b = M := rfl
-  by_cases hEall : E = (-1#11)
-  · by_cases hM0 : M = (0#52)
-    · have hs : unpackSign (spec := Format.binary64) (packedInfinity Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-          unpackSign (spec := Format.binary64) b := by
-        simp [packedInfinity, unpackSign_pc64, signBit_ofBitVec]
-      have he : unpackExponent (spec := Format.binary64) (packedInfinity Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-          unpackExponent (spec := Format.binary64) b := by
-        simpa [packedInfinity, unpackExponent_packComponents, E] using hEall.symm
-      have hm : unpackMantissa (spec := Format.binary64) (packedInfinity Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-          unpackMantissa (spec := Format.binary64) b := by
-        simpa [packedInfinity, unpackMantissa_packComponents, M] using hM0.symm
-      have hb : packedInfinity Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b)) = b :=
-        bv_eq_of_unpack_fields hs he hm
-      rw [← hb]
-      have hsign : Sign.ofBitVec (unpackSign (spec := Format.binary64) (packedInfinity Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b)))) =
-          Sign.ofBitVec (unpackSign (spec := Format.binary64) b) := congrArg Sign.ofBitVec hs
-      simp [UnpackedFloat.unpack, UnpackedFloat.pack, hEdef, hMdef, hEall, hM0, Format.binary64, packedInfinity,
-        unpackExponent_packComponents, unpackMantissa_packComponents, unpackSign_pc64, sign_of_toBitVec, hsign]
-    · have hb : b = packedNaN Format.binary64 := hv.eq_packedNaN (by simpa [E] using hEall) (by simpa [M] using hM0)
-      rw [hb]
-      rw [show UnpackedFloat.unpack Format.binary64 (packedNaN Format.binary64) = .notANumber by
-        simp [packedNaN, UnpackedFloat.unpack, unpackExponent_packComponents, unpackMantissa_packComponents]]
-      rfl
-  · by_cases hE0 : E = (0#11)
-    · by_cases hM0 : M = (0#52)
-      · have hs : unpackSign (spec := Format.binary64) (packedZero Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-            unpackSign (spec := Format.binary64) b := by
-          simp [packedZero, unpackSign_pc64, signBit_ofBitVec]
-        have he : unpackExponent (spec := Format.binary64) (packedZero Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-            unpackExponent (spec := Format.binary64) b := by
-          simpa [packedZero, unpackExponent_packComponents, E] using hE0.symm
-        have hm : unpackMantissa (spec := Format.binary64) (packedZero Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b))) =
-            unpackMantissa (spec := Format.binary64) b := by
-          simpa [packedZero, unpackMantissa_packComponents, M] using hM0.symm
-        have hb : packedZero Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b)) = b :=
-          bv_eq_of_unpack_fields hs he hm
-        rw [← hb]
-        have hsign : Sign.ofBitVec (unpackSign (spec := Format.binary64) (packedZero Format.binary64 (Sign.ofBitVec (unpackSign (spec := Format.binary64) b)))) =
-            Sign.ofBitVec (unpackSign (spec := Format.binary64) b) := congrArg Sign.ofBitVec hs
-        simp [UnpackedFloat.unpack, UnpackedFloat.pack, hEdef, hMdef, hEall, hE0, hM0, Format.binary64, packedZero,
-          unpackExponent_packComponents, unpackMantissa_packComponents, unpackSign_pc64, sign_of_toBitVec, hsign]
-      · have hlog2 : M.toNat.log2 ≠ 52 := by
-          intro hl
-          have hlt : M.toNat < 2^52 := BitVec.toNat_lt_twoPow_of_le (by omega : 52 ≤ 52)
-          have hmn : M.toNat ≠ 0 := by
-            intro hz
-            apply hM0
-            apply BitVec.eq_of_toNat_eq
-            simpa using hz
-          have hlt' : M.toNat.log2 < 52 := (Nat.log2_lt hmn).mpr hlt
+private theorem hbias (b : BitVec 64) :
+    ((((b.extractLsb' 52 11).toNat : Int) - (1023 + 52)) + 1023 + 52).toNat
+      = (b.extractLsb' 52 11).toNat := by omega
+
+private theorem hlog (b : BitVec 64) : (1#1 ++ b.extractLsb' 0 52).toNat.log2 = 52 := by
+  rw [BitVec.toNat_append_eq_mul_add]
+  have h1n : ((1#1 : BitVec 1).toNat) = 1 := rfl
+  have hlt := BitVec.isLt (b.extractLsb' 0 52)
+  rw [h1n, Nat.one_mul, Nat.log2_eq_iff (by omega : (2 : Nat)^52 + (b.extractLsb' 0 52).toNat ≠ 0)]
+  omega
+
+/-- The `pack ∘ unpack` roundtrip is the identity on every non-`NaN` bit pattern:
+the unpacked form stores the full payload except for `NaN`, whose mantissa bits
+collapse to a single value. -/
+private theorem pack_unpack (b : BitVec 64) (hn : (UnpackedFloat.unpack binary64 b).isNaN = false) :
+    (UnpackedFloat.pack binary64 (UnpackedFloat.unpack binary64 b) : BitVec 64) = b := by
+  have nest : UnpackedFloat.unpack binary64 b =
+      (if b.extractLsb' 52 11 = (-1 : BitVec 11) then
+        if b.extractLsb' 0 52 = (0 : BitVec 52) then .infinity (Sign.ofBitVec (b.extractLsb' 63 1))
+        else .notANumber
+      else if b.extractLsb' 52 11 = (0 : BitVec 11) then
+        if h : b.extractLsb' 0 52 = (0 : BitVec 52) then .zero (Sign.ofBitVec (b.extractLsb' 63 1))
+        else .finite (Sign.ofBitVec (b.extractLsb' 63 1)) (b.extractLsb' 0 52).toNat
+          (((b.extractLsb' 52 11).toNat : Int) - (1023 + 52) + 1)
+          (BitVec.toNat_pos_of_ne_zero h)
+      else .finite (Sign.ofBitVec (b.extractLsb' 63 1)) (1#1 ++ b.extractLsb' 0 52).toNat
+        (((b.extractLsb' 52 11).toNat : Int) - (1023 + 52))
+        (by have h : (1#1 ++ b.extractLsb' 0 52).toNat
+              = (1#1 : BitVec 1).toNat * 2^52 + (b.extractLsb' 0 52).toNat
+            := BitVec.toNat_append_eq_mul_add _ _
+            have h1 : ((1#1 : BitVec 1).toNat) = 1 := rfl
+            rw [h, h1]; omega)) := rfl
+  by_cases h1 : b.extractLsb' 52 11 = (-1 : BitVec 11)
+  · by_cases h2 : b.extractLsb' 0 52 = (0 : BitVec 52)
+    · -- ±infinity
+      have hu : UnpackedFloat.unpack binary64 b = .infinity (Sign.ofBitVec (b.extractLsb' 63 1)) := by
+        rw [nest]; rw [ite_eq_left h1, ite_eq_left h2]
+      rw [hu]
+      show (packedInfinity binary64 _ : BitVec 64) = b
+      show (Sign.toBitVec (Sign.ofBitVec (b.extractLsb' 63 1)) ++ (-1 : BitVec 11) ++ (0 : BitVec 52) : BitVec 64) = b
+      rw [signRT]
+      apply BitVec.eq_of_toNat_eq
+      have h1t : b.toNat >>> 52 % 2^11 = 2047 := by
+        have := congrArg BitVec.toNat h1
+        simp only [BitVec.extractLsb'_toNat] at this
+        simpa using this
+      have h2t : b.toNat % 2^52 = 0 := by
+        have := congrArg BitVec.toNat h2
+        simp only [BitVec.extractLsb'_toNat, Nat.shiftRight_zero] at this
+        simpa using this
+      simp only [BitVec.toNat_append_eq_mul_add, BitVec.extractLsb'_toNat, Nat.shiftRight_zero,
+        show ((-1 : BitVec 11).toNat) = 2047 from rfl, show ((0 : BitVec 52).toNat) = 0 from rfl,
+        Nat.mul_zero, Nat.add_zero, Nat.zero_add]
+      omega
+    · -- NaN: excluded by hypothesis
+      have hu : UnpackedFloat.unpack binary64 b = .notANumber := by
+        rw [nest]; rw [ite_eq_left h1, ite_eq_right h2]
+      rw [hu] at hn
+      simp only [UnpackedFloat.isNaN] at hn
+      exact absurd hn (by decide)
+  · by_cases h2 : b.extractLsb' 52 11 = (0 : BitVec 11)
+    · by_cases h3 : b.extractLsb' 0 52 = (0 : BitVec 52)
+      · -- signed zero
+        have hu : UnpackedFloat.unpack binary64 b = .zero (Sign.ofBitVec (b.extractLsb' 63 1)) := by
+          rw [nest]; rw [ite_eq_right h1, ite_eq_left h2, dite_eq_left h3]
+        rw [hu]
+        show (packedZero binary64 _ : BitVec 64) = b
+        show (Sign.toBitVec (Sign.ofBitVec (b.extractLsb' 63 1)) ++ (0 : BitVec 11) ++ (0 : BitVec 52) : BitVec 64) = b
+        rw [signRT]
+        apply BitVec.eq_of_toNat_eq
+        have h2t : b.toNat >>> 52 % 2^11 = 0 := by
+          have := congrArg BitVec.toNat h2
+          simp only [BitVec.extractLsb'_toNat] at this
+          simpa using this
+        have h3t : b.toNat % 2^52 = 0 := by
+          have := congrArg BitVec.toNat h3
+          simp only [BitVec.extractLsb'_toNat, Nat.shiftRight_zero] at this
+          simpa using this
+        simp only [BitVec.toNat_append_eq_mul_add, BitVec.extractLsb'_toNat, Nat.shiftRight_zero,
+          show ((0 : BitVec 52).toNat) = 0 from rfl, show ((0 : BitVec 11).toNat) = 0 from rfl,
+          Nat.mul_zero, Nat.add_zero, Nat.zero_add, Nat.zero_mul]
+        omega
+      · -- subnormal
+        have hne : 0 < (b.extractLsb' 0 52).toNat := BitVec.toNat_pos_of_ne_zero h3
+        have hu : UnpackedFloat.unpack binary64 b =
+            .finite (Sign.ofBitVec (b.extractLsb' 63 1)) (b.extractLsb' 0 52).toNat (-1074) hne := by
+          rw [nest]; rw [ite_eq_right h1, ite_eq_left h2, dite_eq_right h3]
+          rw [h2]
+          show UnpackedFloat.finite (Sign.ofBitVec (b.extractLsb' 63 1)) (b.extractLsb' 0 52).toNat
+              ((((0 : BitVec 11).toNat : Int) - (1023 + 52)) + 1) _ = _
+          show UnpackedFloat.finite (Sign.ofBitVec (b.extractLsb' 63 1)) (b.extractLsb' 0 52).toNat
+              ((0 : Int) - (1023 + 52) + 1) _ = _
+          rfl
+        rw [hu]
+        have h53 : (b.extractLsb' 0 52).toNat.log2 + 1 ≠ 53 := by
+          intro hc
+          have h0 : (b.extractLsb' 0 52).toNat ≠ 0 := by
+            intro hc0; exact h3 (BitVec.eq_of_toNat_eq (by simpa using hc0))
+          have hlt := BitVec.isLt (b.extractLsb' 0 52)
+          have hle := (Nat.log2_eq_iff h0).mp (by omega : (b.extractLsb' 0 52).toNat.log2 = 52)
           omega
-        have he0 : unpackExponent (spec := Format.binary64) b = (0#11) := by simpa [E] using hE0
-        simp [E, M, UnpackedFloat.unpack, UnpackedFloat.pack, hEall, he0, hM0, hlog2,
-          Format.exponentBias, Format.mantissaBits, Format.binary64]
-        apply bv_eq_of_unpack_fields
-        · simp [unpackSign_pc64, signBit_ofBitVec]
-        · simpa [unpackExponent_packComponents] using he0.symm
-        · simp [unpackMantissa_packComponents]
-    · have hElt2048 : E.toNat < 2048 := BitVec.toNat_lt_twoPow_of_le (by omega : 11 ≤ 11)
-      have hEne2047 : E.toNat ≠ 2047 := by
-        intro heq
-        apply hEall
+        show (if (2 : Nat)^11 ≤ 2 then
+            packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1)) (-1 : BitVec 11) (0 : BitVec 52)
+          else if (b.extractLsb' 0 52).toNat.log2 + 1 = 53 then
+            packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1))
+              (BitVec.ofNat 11 ((((-1074 : Int) + 1023 + 52)).toNat)) (BitVec.ofNat 52 (b.extractLsb' 0 52).toNat)
+          else
+            packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1)) (0 : BitVec 11)
+              (BitVec.ofNat 52 (b.extractLsb' 0 52).toNat) : BitVec 64) = b
+        rw [ite_eq_right (by decide : ¬ ((2 : Nat)^11 ≤ 2)), ite_eq_right h53]
+        show (Sign.toBitVec (Sign.ofBitVec (b.extractLsb' 63 1)) ++ (0 : BitVec 11)
+            ++ BitVec.ofNat 52 (b.extractLsb' 0 52).toNat : BitVec 64) = b
+        rw [signRT]
         apply BitVec.eq_of_toNat_eq
-        simp [heq]
-      have hEpos : 0 < E.toNat := by
-        by_cases hEz : E.toNat = 0
-        · exfalso
-          apply hE0
-          apply BitVec.eq_of_toNat_eq
-          simp [hEz]
-        · omega
-      have hbiased : (-(↑Format.binary64.exponentBias + (52 : Int)) + (E.toNat : Int) + ↑Format.binary64.exponentBias + 52).toNat = E.toNat := by
-        simp [Format.exponentBias]
+        have h2t : b.toNat >>> 52 % 2^11 = 0 := by
+          have := congrArg BitVec.toNat h2
+          simp only [BitVec.extractLsb'_toNat] at this
+          simpa using this
+        have h0lt : b.toNat % 2^52 < 2^52 := by
+          have := BitVec.isLt (b.extractLsb' 0 52)
+          simpa [BitVec.extractLsb'_toNat, Nat.shiftRight_zero] using this
+        simp only [BitVec.toNat_append_eq_mul_add, BitVec.toNat_ofNat, BitVec.extractLsb'_toNat,
+          Nat.shiftRight_zero, show ((0 : BitVec 11).toNat) = 0 from rfl, Nat.mul_zero, Nat.add_zero,
+          Nat.zero_add]
         omega
-      have hmval : ((1#1 : BitVec 1) ++ M).toNat = 2^52 + M.toNat := by
-        rw [BitVec.toNat_append_eq_mul_add]
-        simp
-      have hmlog2 : ((1#1 : BitVec 1) ++ M).toNat.log2 = 52 := by
-        rw [hmval]
-        apply (Nat.log2_eq_iff (by omega)).mpr
-        constructor
-        · omega
-        · have hlt : M.toNat < 2^52 := BitVec.toNat_lt_twoPow_of_le (by omega : 52 ≤ 52)
-          omega
-      have hmant : BitVec.ofNat 52 (((1#1 : BitVec 1) ++ M).toNat) = M := by
+    · -- normal (finite)
+      have hu : UnpackedFloat.unpack binary64 b =
+          .finite (Sign.ofBitVec (b.extractLsb' 63 1))
+            (1#1 ++ b.extractLsb' 0 52).toNat (((b.extractLsb' 52 11).toNat : Int) - (1023 + 52))
+            (by simp) := by
+        rw [nest]; rw [ite_eq_right h1, ite_eq_right h2]
+      rw [hu]
+      have h1t : (b.extractLsb' 52 11).toNat ≠ 2047 := by
+        intro hc; apply h1
         apply BitVec.eq_of_toNat_eq
-        rw [hmval]
-        have hlt : M.toNat < 2^52 := BitVec.toNat_lt_twoPow_of_le (by omega : 52 ≤ 52)
-        simp [Nat.add_mod, Nat.mod_eq_of_lt hlt]
-      have hEofNat : BitVec.ofNat 11 E.toNat = E := by
-        apply BitVec.eq_of_toNat_eq
-        simp [Nat.mod_eq_of_lt E.isLt]
-      have hEall' : unpackExponent (spec := Format.binary64) b ≠ (-1#11) := by simpa [E] using hEall
-      have hEall'' : unpackExponent (spec := Format.binary64) b ≠ (2047#11) := hEall'
-      have hE2047bits : E ≠ (2047#11) := by
-        intro h
-        apply hEne2047
-        simpa using congrArg BitVec.toNat h
-      have hEne2047raw : (unpackExponent (spec := Format.binary64) b).toNat ≠ 2047 := by
-        simpa [hEdef] using hEne2047
-      have hE0' : unpackExponent (spec := Format.binary64) b ≠ (0#11) := by simpa [E] using hE0
-      have hbiasedNum : ((E.toNat : Int) - 1075 + 1023 + 52).toNat = E.toNat := by
-        simp [Format.exponentBias] at hbiased ⊢
+        rw [hc, show ((-1 : BitVec 11).toNat) = 2047 from rfl]
+      have hg1 : ¬ ((2 : Nat)^11 ≤ ((b.extractLsb' 52 11).toNat + 1)) := by
+        intro hc
+        have hlt : (b.extractLsb' 52 11).toNat < 2048 := by
+          simpa using BitVec.isLt (b.extractLsb' 52 11)
         omega
-      have hnotE : ¬ 2047 ≤ ((E.toNat : Int) - 1075 + 1023 + 52).toNat := by
-        rw [hbiasedNum]
-        omega
-      have hnotE' : ¬ 2047 ≤ E.toNat := by omega
-      have hlogM : (4503599627370496 ||| M.toNat).log2 = 52 := by
-        simpa [BitVec.toNat_append] using hmlog2
-      simp [UnpackedFloat.unpack, UnpackedFloat.pack, hEdef, hMdef, hEall, hEall', hEall'', hE0, hE0',
-        hE2047bits, hbiased, hbiasedNum, hnotE, hnotE', hlogM, Format.exponentBias, Format.mantissaBits, Format.binary64]
-      apply bv_eq_of_unpack_fields
-      · simp [unpackSign_pc64, signBit_ofBitVec]
-      · simpa [unpackExponent_packComponents, hEofNat, hbiasedNum]
-      · simpa [unpackMantissa_packComponents, hmant, hMdef]
+      show (if (2 : Nat)^11 ≤ ((((b.extractLsb' 52 11).toNat : Int) - (1023 + 52)) + 1023 + 52).toNat + 1 then
+          packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1)) (-1 : BitVec 11) (0 : BitVec 52)
+        else if (1#1 ++ b.extractLsb' 0 52).toNat.log2 + 1 = 53 then
+          packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1))
+            (BitVec.ofNat 11 ((((b.extractLsb' 52 11).toNat : Int) - (1023 + 52)) + 1023 + 52).toNat)
+            (BitVec.ofNat 52 (1#1 ++ b.extractLsb' 0 52).toNat)
+        else
+          packComponents binary64 (Sign.ofBitVec (b.extractLsb' 63 1)) (0 : BitVec 11)
+            (BitVec.ofNat 52 (1#1 ++ b.extractLsb' 0 52).toNat) : BitVec 64) = b
+      rw [hbias b]
+      rw [ite_eq_right hg1]
+      rw [hlog b, ite_eq_left (rfl : (52 : Nat) + 1 = 53)]
+      show (Sign.toBitVec (Sign.ofBitVec (b.extractLsb' 63 1))
+          ++ BitVec.ofNat 11 (b.extractLsb' 52 11).toNat
+          ++ BitVec.ofNat 52 (1#1 ++ b.extractLsb' 0 52).toNat : BitVec 64) = b
+      rw [signRT]
+      apply BitVec.eq_of_toNat_eq
+      have h52lt : b.toNat >>> 52 % 2^11 < 2^11 := by
+        have := BitVec.isLt (b.extractLsb' 52 11); simpa [BitVec.extractLsb'_toNat] using this
+      have h0lt : b.toNat % 2^52 < 2^52 := by
+        have := BitVec.isLt (b.extractLsb' 0 52)
+        simpa [BitVec.extractLsb'_toNat, Nat.shiftRight_zero] using this
+      simp only [BitVec.toNat_append_eq_mul_add, BitVec.toNat_ofNat, BitVec.extractLsb'_toNat,
+        Nat.shiftRight_zero, show ((1#1 : BitVec 1).toNat) = 1 from rfl, Nat.one_mul, Nat.add_zero,
+        Nat.zero_add]
+      omega
 
-theorem model_ofBits_toBits (m : Float.Model) : Float.Model.ofBits m.toBits = m := by
-  cases m with
-  | mk bits valid =>
-      rw [Float.Model.mk.injEq]
-      change UInt64.ofBitVec (UnpackedFloat.pack Format.binary64 (UnpackedFloat.unpack Format.binary64 bits.toBitVec)) = bits
-      have hp := pack_unpack_valid_bv bits.toBitVec (by simpa using valid)
-      rw [hp]
+/-- `compareOfLessAndEq` returns `eq` only for equal arguments. -/
+private theorem cmpEq {α} {x y : α} [LT α] [Decidable (x < y)] [DecidableEq α]
+    (h : compareOfLessAndEq x y = Ordering.eq) : x = y := by
+  by_cases hlt : x < y
+  · have h1 : compareOfLessAndEq x y = Ordering.lt := by
+      show (if x < y then Ordering.lt else if x = y then Ordering.eq else Ordering.gt) = _
+      rw [ite_eq_left hlt]
+    rw [h1] at h; exact absurd h (by decide)
+  · have h1 : compareOfLessAndEq x y = (if x = y then Ordering.eq else Ordering.gt) := by
+      show (if x < y then Ordering.lt else if x = y then Ordering.eq else Ordering.gt) = _
+      rw [ite_eq_right hlt]
+    rw [h1] at h
+    by_cases heq : x = y
+    · exact heq
+    · rw [ite_eq_right heq] at h; exact absurd h (by decide)
 
-set_option linter.unusedSimpArgs false
-open Float.Model
-open Float.Model.UnpackedFloat
+private theorem then_eq {a b : Ordering} :
+    a.then b = Ordering.eq ↔ a = Ordering.eq ∧ b = Ordering.eq := by
+  cases a <;> cases b <;> decide
 
-theorem model_eq_of_unpack_eq (m1 m2 : Float.Model) (h : m1.unpack = m2.unpack) : m1 = m2 := by
-  rw [← model_ofBits_toBits m1, ← model_ofBits_toBits m2]
-  change Float.Model.pack m1.unpack = Float.Model.pack m2.unpack
-  rw [h]
+/-- Two positive finite unpacked values are IEEE-equal only when identical. -/
+private theorem posPosEq {m m' : Nat} {e e' : Int} {hm hm'}
+    (h : UnpackedFloat.beq (.finite .positive m e hm) (.finite .positive m' e' hm') = true) :
+    m = m' ∧ e = e' := by
+  have h2 : (compareOfLessAndEq e e').then (compareOfLessAndEq m m') = Ordering.eq := by
+    cases hO : (compareOfLessAndEq e e').then (compareOfLessAndEq m m') with
+    | eq => rfl
+    | lt =>
+        have h1 : (some ((compareOfLessAndEq e e').then (compareOfLessAndEq m m')) ==
+            some Ordering.eq) = true := h
+        rw [hO] at h1; exact absurd h1 (by decide)
+    | gt =>
+        have h1 : (some ((compareOfLessAndEq e e').then (compareOfLessAndEq m m')) ==
+            some Ordering.eq) = true := h
+        rw [hO] at h1; exact absurd h1 (by decide)
+  have ⟨h1, h2'⟩ := then_eq.mp h2
+  exact ⟨cmpEq h2', cmpEq h1⟩
 
-theorem unpack_eq_of_beq_of_unpack_ne_zero {a b : Float}
-    (h : a == b) (haNZ : a.toModel.unpack ≠ .zero .positive)
-    (haNZ' : a.toModel.unpack ≠ .zero .negative) :
-    a.toModel.unpack = b.toModel.unpack := by
-  change a.toModel.unpack.beq b.toModel.unpack = true at h
-  cases hxa : a.toModel.unpack with
-  | notANumber =>
-      simp [UnpackedFloat.beq, UnpackedFloat.compare, hxa] at h
-  | infinity sa =>
-      unfold UnpackedFloat.beq at h
-      unfold UnpackedFloat.compare at h
-      cases hxb : b.toModel.unpack with
-      | notANumber => rw [hxa, hxb] at h; simp at h
-      | infinity sb =>
-          rw [hxa, hxb] at h
-          cases sa <;> cases sb <;> simp at h ⊢
-      | zero sb => rw [hxa, hxb] at h; cases sa <;> simp at h
-      | finite sb mb eb hmb => rw [hxa, hxb] at h; cases sa <;> simp at h
-  | zero sa =>
-      rw [hxa] at haNZ haNZ'
-      cases sa <;> simp at haNZ haNZ'
-  | finite sa ma ea hma =>
-      unfold UnpackedFloat.beq at h
-      unfold UnpackedFloat.compare at h
-      cases hxb : b.toModel.unpack with
-      | notANumber => rw [hxa, hxb] at h; simp at h
-      | infinity sb => rw [hxa, hxb] at h; cases sb <;> simp at h
-      | zero sb => rw [hxa, hxb] at h; cases sa <;> simp at h
-      | finite sb mb eb hmb =>
-          rw [hxa, hxb] at h
-          cases sa <;> cases sb <;> simp at h
-          · rcases h with ⟨he, hm⟩
-            subst he
-            subst hm
-            rfl
-          · rcases h with ⟨he, hm⟩
-            subst he
-            subst hm
-            rfl
+/-- Two negative finite unpacked values are IEEE-equal only when identical. -/
+private theorem negNegEq {m m' : Nat} {e e' : Int} {hm hm'}
+    (h : UnpackedFloat.beq (.finite .negative m e hm) (.finite .negative m' e' hm') = true) :
+    m = m' ∧ e = e' := by
+  have h2 : (compareOfLessAndEq e e').then (compareOfLessAndEq m m') = Ordering.eq := by
+    cases hO : (compareOfLessAndEq e e').then (compareOfLessAndEq m m') with
+    | eq => rfl
+    | lt =>
+        have h1 : (((compareOfLessAndEq e e').then (compareOfLessAndEq m m')).swap ==
+            Ordering.eq) = true := h
+        rw [hO] at h1; exact absurd h1 (by decide)
+    | gt =>
+        have h1 : (((compareOfLessAndEq e e').then (compareOfLessAndEq m m')).swap ==
+            Ordering.eq) = true := h
+        rw [hO] at h1; exact absurd h1 (by decide)
+  have ⟨h1, h2'⟩ := then_eq.mp h2
+  exact ⟨cmpEq h2', cmpEq h1⟩
 
-theorem zero_unpack : (0 : Float).toModel.unpack = .zero .positive := by
-  change UnpackedFloat.unpack Format.binary64 (0#64) = .zero .positive
-  have hE : unpackExponent (spec := Format.binary64) (0#64) = (0#11) := by simp [unpackExponent]
-  have hM : unpackMantissa (spec := Format.binary64) (0#64) = (0#52) := by simp [unpackMantissa]
-  have hS : unpackSign (spec := Format.binary64) (0#64) = (0#1) := by simp [unpackSign]
-  simp [UnpackedFloat.unpack, hE, hM, hS, Sign.ofBitVec]
+/-- IEEE equality between unpacked values pairs them identically, except that any
+two signed zeros are equal and `NaN` never compares equal. -/
+private theorem eq_dichotomy {u v : UnpackedFloat} (h : u.beq v = true) :
+    (∃ s t : Sign, u = .zero s ∧ v = .zero t) ∨ (u = v ∧ u.isNaN = false) := by
+  cases u with
+  | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+  | infinity su =>
+      cases su with
+      | positive =>
+          cases v with
+          | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | infinity sv =>
+              cases sv with
+              | positive => exact Or.inr ⟨rfl, rfl⟩
+              | negative => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | zero sv => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | finite sv m e hm => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+      | negative =>
+          cases v with
+          | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | infinity sv =>
+              cases sv with
+              | negative => exact Or.inr ⟨rfl, rfl⟩
+              | positive => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | zero sv => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | finite sv m e hm => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+  | zero su =>
+      cases v with
+      | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+      | infinity sv => cases sv <;> exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+      | zero sv => exact Or.inl ⟨su, sv, rfl, rfl⟩
+      | finite sv m e hm => cases sv <;> exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+  | finite su m e hm =>
+      cases su with
+      | positive =>
+          cases v with
+          | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | infinity sv => cases sv <;> exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | zero sv => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | finite sv m' e' hm' =>
+              cases sv with
+              | positive =>
+                  have ⟨hmeq, heeq⟩ := posPosEq h
+                  subst hmeq; subst heeq
+                  exact Or.inr ⟨congrArg (fun p => UnpackedFloat.finite Sign.positive m e p)
+                    (Subsingleton.elim hm hm'), rfl⟩
+              | negative => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+      | negative =>
+          cases v with
+          | notANumber => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | infinity sv => cases sv <;> exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | zero sv => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
+          | finite sv m' e' hm' =>
+              cases sv with
+              | negative =>
+                  have ⟨hmeq, heeq⟩ := negNegEq h
+                  subst hmeq; subst heeq
+                  exact Or.inr ⟨congrArg (fun p => UnpackedFloat.finite Sign.negative m e p)
+                    (Subsingleton.elim hm hm'), rfl⟩
+              | positive => exact absurd h (by simp [UnpackedFloat.beq, UnpackedFloat.compare])
 
-theorem unpack_zero_of_beq_zero {a : Float} (h : a == 0) :
-    a.toModel.unpack = .zero .positive ∨ a.toModel.unpack = .zero .negative := by
-  change a.toModel.unpack.beq (0 : Float).toModel.unpack = true at h
-  rw [zero_unpack] at h
-  cases hxa : a.toModel.unpack with
-  | notANumber => rw [hxa] at h; simp [UnpackedFloat.beq, UnpackedFloat.compare] at h
-  | infinity sa => rw [hxa] at h; unfold UnpackedFloat.beq at h; unfold UnpackedFloat.compare at h; cases sa <;> simp at h
-  | zero sa => cases sa <;> simp
-  | finite sa ma ea hma => rw [hxa] at h; unfold UnpackedFloat.beq at h; unfold UnpackedFloat.compare at h; cases sa <;> simp at h
+/-- Both signed zeros are IEEE-equal to positive zero. -/
+private theorem zero_beq (s : Sign) :
+    UnpackedFloat.beq (UnpackedFloat.zero s) (UnpackedFloat.zero Sign.positive) = true := by
+  cases s <;> rfl
 
-theorem beq_zero_of_unpack_zero {a : Float}
-    (h : a.toModel.unpack = .zero .positive ∨ a.toModel.unpack = .zero .negative) : a == 0 := by
-  change a.toModel.unpack.beq (0 : Float).toModel.unpack = true
-  rw [zero_unpack]
-  rcases h with h | h <;> rw [h] <;> simp [UnpackedFloat.beq, UnpackedFloat.compare]
-
-theorem beq_zero_of_beq_of_beq_zero_left {a b : Float} (hab : a == b) (ha : a == 0) : b == 0 := by
-  change a.toModel.unpack.beq b.toModel.unpack = true at hab
-  change b.toModel.unpack.beq (0 : Float).toModel.unpack = true
-  rw [zero_unpack]
-  have haz := unpack_zero_of_beq_zero ha
-  rcases haz with haz | haz
-  · rw [haz] at hab
-    cases hxb : b.toModel.unpack with
-    | notANumber => rw [hxb] at hab; simp [UnpackedFloat.beq, UnpackedFloat.compare] at hab
-    | infinity sb => rw [hxb] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sb <;> simp at hab
-    | zero sb => cases sb <;> simp [UnpackedFloat.beq, UnpackedFloat.compare]
-    | finite sb mb eb hmb => rw [hxb] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sb <;> simp at hab
-  · rw [haz] at hab
-    cases hxb : b.toModel.unpack with
-    | notANumber => rw [hxb] at hab; simp [UnpackedFloat.beq, UnpackedFloat.compare] at hab
-    | infinity sb => rw [hxb] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sb <;> simp at hab
-    | zero sb => cases sb <;> simp [UnpackedFloat.beq, UnpackedFloat.compare]
-    | finite sb mb eb hmb => rw [hxb] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sb <;> simp at hab
-
-theorem beq_zero_of_beq_of_beq_zero_right {a b : Float} (hab : a == b) (hb : b == 0) : a == 0 := by
-  change a.toModel.unpack.beq b.toModel.unpack = true at hab
-  change a.toModel.unpack.beq (0 : Float).toModel.unpack = true
-  rw [zero_unpack]
-  have hbz := unpack_zero_of_beq_zero hb
-  rcases hbz with hbz | hbz
-  · rw [hbz] at hab
-    cases hxa : a.toModel.unpack with
-    | notANumber => rw [hxa] at hab; simp [UnpackedFloat.beq, UnpackedFloat.compare] at hab
-    | infinity sa => rw [hxa] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sa <;> simp at hab
-    | zero sa => cases sa <;> simp [UnpackedFloat.beq, UnpackedFloat.compare]
-    | finite sa ma ea hma => rw [hxa] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sa <;> simp at hab
-  · rw [hbz] at hab
-    cases hxa : a.toModel.unpack with
-    | notANumber => rw [hxa] at hab; simp [UnpackedFloat.beq, UnpackedFloat.compare] at hab
-    | infinity sa => rw [hxa] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sa <;> simp at hab
-    | zero sa => cases sa <;> simp [UnpackedFloat.beq, UnpackedFloat.compare]
-    | finite sa ma ea hma => rw [hxa] at hab; unfold UnpackedFloat.beq at hab; unfold UnpackedFloat.compare at hab; cases sa <;> simp at hab
-
-theorem sound : Goal := by
+theorem sound : CanonicalZeroHashJoin.Goal := by
   intro a b hab
-  by_cases ha : a == 0
-  · have hb : b == 0 := beq_zero_of_beq_of_beq_zero_left hab ha
-    simp [ha, hb]
-  · have hb : ¬ (b == 0) := by
-      intro hb
-      exact ha (beq_zero_of_beq_of_beq_zero_right hab hb)
-    have haNZp : a.toModel.unpack ≠ .zero .positive := by
-      intro hz
-      exact ha (beq_zero_of_unpack_zero (Or.inl hz))
-    have haNZn : a.toModel.unpack ≠ .zero .negative := by
-      intro hz
-      exact ha (beq_zero_of_unpack_zero (Or.inr hz))
-    have hup : a.toModel.unpack = b.toModel.unpack :=
-      unpack_eq_of_beq_of_unpack_ne_zero hab haNZp haNZn
-    have hm : a.toModel = b.toModel := model_eq_of_unpack_eq a.toModel b.toModel hup
-    simp [ha, hb, TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.bits]
-    exact congrArg Float.Model.toBits hm
-end Nov26.Proof_FloatingReduction_CanonicalZeroHashJoin
+  have hbeq : a.toModel.unpack.beq b.toModel.unpack = true := hab
+  by_cases hza : (a == (0 : Float)) = true
+  · by_cases hzb : (b == (0 : Float)) = true
+    · -- Both sides normalize to `0`.
+      rw [ite_eq_left hza, ite_eq_left hzb]
+    · -- `a` is an IEEE zero but `b` is not: impossible under `a == b`.
+      have hza' : a.toModel.unpack.beq (UnpackedFloat.zero Sign.positive) = true := hza
+      rcases eq_dichotomy hbeq with ⟨s, t, ha, ht⟩ | ⟨huv, _⟩
+      · have hb0 : (b == (0 : Float)) = true := by
+          show UnpackedFloat.beq b.toModel.unpack (UnpackedFloat.zero Sign.positive) = true
+          rw [ht]; exact zero_beq t
+        contradiction
+      · have hb0 : (b == (0 : Float)) = true := by
+          show UnpackedFloat.beq b.toModel.unpack (UnpackedFloat.zero Sign.positive) = true
+          rw [← huv]; exact hza'
+        contradiction
+  · by_cases hzb : (b == (0 : Float)) = true
+    · -- `b` is an IEEE zero but `a` is not: impossible under `a == b`.
+      have hzb' : b.toModel.unpack.beq (UnpackedFloat.zero Sign.positive) = true := hzb
+      rcases eq_dichotomy hbeq with ⟨s, t, ha, ht⟩ | ⟨huv, _⟩
+      · have ha0 : (a == (0 : Float)) = true := by
+          show UnpackedFloat.beq a.toModel.unpack (UnpackedFloat.zero Sign.positive) = true
+          rw [ha]; exact zero_beq s
+        contradiction
+      · have ha0 : (a == (0 : Float)) = true := by
+          show UnpackedFloat.beq a.toModel.unpack (UnpackedFloat.zero Sign.positive) = true
+          rw [huv]; exact hzb'
+        contradiction
+    · -- Neither side normalizes: IEEE equality forces identical bit patterns.
+      rw [ite_eq_right hza]
+      rw [ite_eq_right hzb]
+      rcases eq_dichotomy hbeq with ⟨s, t, ha, ht⟩ | ⟨huv, hn⟩
+      · have ha0 : (a == (0 : Float)) = true := by
+          show UnpackedFloat.beq a.toModel.unpack (UnpackedFloat.zero Sign.positive) = true
+          rw [ha]; exact zero_beq s
+        contradiction
+      · show a.toModel.toBits = b.toModel.toBits
+        apply UInt64.toBitVec_inj.mp
+        have hna : (UnpackedFloat.unpack binary64 (a.toModel.toBits.toBitVec)).isNaN = false := hn
+        have hnb' : b.toModel.unpack.isNaN = false := by rw [← huv]; exact hn
+        have hnb : (UnpackedFloat.unpack binary64 (b.toModel.toBits.toBitVec)).isNaN = false := hnb'
+        rw [← pack_unpack (a.toModel.toBits.toBitVec) hna,
+          ← pack_unpack (b.toModel.toBits.toBitVec) hnb]
+        exact congrArg (pack binary64) huv
+
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_CanonicalZeroHashJoin

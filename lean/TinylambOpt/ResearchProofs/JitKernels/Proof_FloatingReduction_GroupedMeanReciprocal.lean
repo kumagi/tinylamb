@@ -1,24 +1,29 @@
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.GroupedMeanReciprocal.Goal`. -/
 
-/-! Multiplication by a rounded reciprocal is not bitwise equal to division:
-`3 / 5` and `3 * (1 / 5)` differ in the last bit. -/
+/-!
+Refutes `GroupedMeanReciprocal.Goal`: replacing the division in `AVG` by a
+precomputed reciprocal is NOT bit-exact in general. With `s = 333.0` and
+`count = 49`, the direct quotient `333.0 / 49.0` rounds once, whereas
+`333.0 * (1 / 49.0)` rounds `1/49` first and rounds again on the multiply;
+for this pair the two results differ in the last bit. All witness terms are
+closed ground expressions checked by kernel `decide`. SQL execution may hoist
+`AVG` to a reciprocal multiply only when an explicit ULP tolerance is
+accepted, not when bit-identical means are required.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+set_option linter.unusedVariables false
 
-namespace Nov26.Proof_FloatingReduction_GroupedMeanReciprocal
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_GroupedMeanReciprocal
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.GroupedMeanReciprocal
 
-theorem refute : ¬ Goal := by
+theorem refute : ¬ GroupedMeanReciprocal.Goal := by
   intro h
-  have h' := h (3 : Float) (5 : UInt64) (by native_decide) (by decide)
-  have hbad : ¬ same ((3 : Float) / (5 : UInt64).toFloat)
-      ((3 : Float) * (1 / (5 : UInt64).toFloat)) := by
-    unfold same bits
-    native_decide
-  exact hbad h'
+  have hf : (333.0 : Float).isFinite = true := by decide
+  have hne : (49 : UInt64) ≠ 0 := by decide
+  have h' : (333.0 / (49 : UInt64).toFloat).toBits
+            ≠ (333.0 * (1 / (49 : UInt64).toFloat)).toBits := by decide
+  exact h' (h 333.0 49 hf hne)
 
-end Nov26.Proof_FloatingReduction_GroupedMeanReciprocal
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_GroupedMeanReciprocal

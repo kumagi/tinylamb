@@ -1,21 +1,15 @@
 import TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
 
-/-! Initial and final values fitting a narrow signed range do not constrain the
-intermediate prefixes. Base five with deltas `[-10, 10]` ends at five but
-passes through minus five. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_ScanWithModularCarry
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_ScanWithModularCarry
-
-open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
-
-theorem refute : ¬ ScanWithModularCarry.Goal := by
+/-- The endpoint may be in range while an interior prefix is not: base 0 with
+deltas `[10,-5]` and width 3 reaches 10 before returning to 5. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.ScanWithModularCarry.Goal := by
   intro h
-  have hw := h 5 [-10, 10] 3 (by decide) (by native_decide) (by native_decide)
-  have hm : (-5 : Int) ∈ values 5 [-10, 10] := by native_decide
-  have hb := hw (-5) hm
-  simp at hb
+  let ds : List Int := [10, -5]
+  have c := h 0 ds 3 (by native_decide) (by native_decide) (by native_decide)
+    10 (by native_decide)
+  have bad : ¬ (0 ≤ (10 : Int) ∧ (10 : Int) < (2 : Int) ^ 3) := by native_decide
+  exact bad c
 
-end TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_ScanWithModularCarry
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_ScanWithModularCarry

@@ -1,28 +1,33 @@
 import TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-/-
-Refutes `SignedZeroCostDoubleNegation`: removing paired negations can hide a
-width violation at the intermediate negation. For width 2 and value -4, the
-double negation faults while the original recipe succeeds.
+/-!
+Signed widths are asymmetric, so eliminating a double negation is unsound at the
+minimum representable value: the inner negation faults even though the original
+recipe and the double-negated result are in range. SQL execution must keep the
+intermediate guard, otherwise a side exit would silently discard an overflow.
 -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
+set_option linter.unnecessarySimpa false
+set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_SignedZeroCostDoubleNegation
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_SignedZeroCostDoubleNegation
 
 open TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-theorem refute : ¬ SignedZeroCostDoubleNegation.Goal := by
-  intro h
-  let r : Recipe := .lit (-4)
-  have hc : checked 2 (fun _ => 0) r = some (eval (fun _ => 0) r) := by native_decide
-  have hw : widthOK 2 (eval (fun _ => 0) r) = true := by native_decide
-  have hbad := h 2 (fun _ => 0) r hc hw
-  have hn : checked 2 (fun _ => 0) (.neg (.neg r)) = none := by native_decide
-  rw [hn] at hbad
-  have hs : checked 2 (fun _ => 0) r = some (-4 : Int) := by native_decide
-  rw [hs] at hbad
-  contradiction
+private def regs : Regs := fun _ => -2
 
-end TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_SignedZeroCostDoubleNegation
+private theorem ok1 : checked 1 regs (.reg 0) = some (eval regs (.reg 0)) := by decide
+private theorem ok2 : widthOK 1 (eval regs (.reg 0)) := by decide
+private theorem dbl : checked 1 regs (.neg (.neg (.reg 0))) = none := by decide
+
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps.SignedZeroCostDoubleNegation.Goal := by
+  intro h
+  have hcon := h 1 regs (.reg 0) ok1 ok2
+  rw [dbl, ok1] at hcon
+  exact absurd hcon (by simp)
+
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_SignedZeroCostDoubleNegation

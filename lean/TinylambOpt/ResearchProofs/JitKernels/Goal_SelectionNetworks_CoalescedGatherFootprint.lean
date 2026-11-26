@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_CoalescedGatherFootprint
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_CoalescedGatherFootprint
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.CoalescedGatherFootprint
@@ -87,7 +87,7 @@ theorem pairwise_map_div (l : List Nat) (n : Nat)
         simpa using hx'
       · exact ih
 
-theorem sound : CoalescedGatherFootprint.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.CoalescedGatherFootprint.Goal := by
   intro sel n hn
   have htrans : ∀ a b c : Nat, decide (a / n ≤ b / n) = true → decide (b / n ≤ c / n) = true → decide (a / n ≤ c / n) = true := by
     intro a b c hab hbc
@@ -109,4 +109,4 @@ theorem sound : CoalescedGatherFootprint.Goal := by
   rw [hcount]
   exact changes_none_eq_eraseDups ((tile sel n).map (fun x => x / n)) hpair
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_CoalescedGatherFootprint
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_CoalescedGatherFootprint

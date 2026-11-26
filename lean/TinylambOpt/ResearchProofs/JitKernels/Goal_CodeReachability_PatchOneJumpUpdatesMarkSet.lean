@@ -12,7 +12,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_PatchOneJu
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 open TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
 
-theorem sound : PatchOneJumpUpdatesMarkSet.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.CodeReachability.PatchOneJumpUpdatesMarkSet.Goal := by
   intro a b roots hedges n k hk
   exact mark_edges_mono a b roots hedges n k hk
 

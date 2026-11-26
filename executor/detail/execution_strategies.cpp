@@ -1396,14 +1396,16 @@ std::vector<int64_t> RankedJoinTopKSums(const std::vector<int64_t>& desc_a,
   std::priority_queue<Node> pq;
   const size_t init_rows = std::min(k, desc_a.size());
   for (size_t i = 0; i < init_rows; ++i) {
-    pq.push(Node{desc_a[i] + desc_b[0], i, 0});
+    pq.push(Node{.sum = desc_a[i] + desc_b[0], .i = i, .j = 0});
   }
   while (!pq.empty() && out.size() < k) {
     Node cur = pq.top();
     pq.pop();
     out.push_back(cur.sum);
     if (cur.j + 1 < desc_b.size()) {
-      pq.push(Node{desc_a[cur.i] + desc_b[cur.j + 1], cur.i, cur.j + 1});
+      pq.push(Node{.sum = desc_a[cur.i] + desc_b[cur.j + 1],
+                   .i = cur.i,
+                   .j = cur.j + 1});
     }
   }
   return out;
@@ -1460,24 +1462,25 @@ std::pair<int64_t, uint64_t> RepeatedScoreCheckedAdd(int64_t acc, int64_t v,
     return {acc, reps};
   }
   if (v > 0) {
-    const uint64_t room = static_cast<uint64_t>(
+    const auto room = static_cast<uint64_t>(
         static_cast<__int128>(std::numeric_limits<int64_t>::max()) -
         static_cast<__int128>(acc));
     const uint64_t max_steps = room / static_cast<uint64_t>(v);
     const uint64_t steps = std::min(reps, max_steps);
     const __int128 res =
         static_cast<__int128>(acc) +
-        static_cast<__int128>(steps) * static_cast<__int128>(v);
+        (static_cast<__int128>(steps) * static_cast<__int128>(v));
     return {static_cast<int64_t>(res), steps};
   }
-  const uint64_t room = static_cast<uint64_t>(
+  const auto room = static_cast<uint64_t>(
       static_cast<__int128>(acc) -
       static_cast<__int128>(std::numeric_limits<int64_t>::min()));
-  const uint64_t abs_v = static_cast<uint64_t>(-static_cast<__int128>(v));
+  const auto abs_v = static_cast<uint64_t>(-static_cast<__int128>(v));
   const uint64_t max_steps = room / abs_v;
   const uint64_t steps = std::min(reps, max_steps);
-  const __int128 res = static_cast<__int128>(acc) +
-                       static_cast<__int128>(steps) * static_cast<__int128>(v);
+  const __int128 res =
+      static_cast<__int128>(acc) +
+      (static_cast<__int128>(steps) * static_cast<__int128>(v));
   return {static_cast<int64_t>(res), steps};
 }
 
@@ -1517,7 +1520,7 @@ size_t RestartedDeltaRankLE(const std::vector<int64_t>& sorted_values,
   size_t lo = 0;
   size_t hi = num_blocks;
   while (lo < hi) {
-    const size_t mid = lo + (hi - lo) / 2;
+    const size_t mid = lo + ((hi - lo) / 2);
     if (sorted_values[mid * stride] <= target) {
       lo = mid + 1;
     } else {

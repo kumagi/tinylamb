@@ -2124,11 +2124,19 @@ bool MatchZstdVarCharUnpackedContains(
   }
   const uint8_t* const base = packed.data();
   const size_t packed_size = packed.size();
-  if (FastMemmem(base, packed_size, needle.data(), needle.size()) == nullptr) {
+  const size_t nlen = needle.size();
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/ClickstreamLayout/Goal_Exec_ConcatSearch.lean
+  // (sound): search the packed byte stream once per hit and jump straight to
+  // the next byte-stream occurrence, skipping FastMemmem on non-hitting rows
+  // and rejecting cross-row boundary matches via `hit_off + nlen <= row_end`.
+  const uint8_t* next_hit_ptr =
+      FastMemmem(base, packed_size, needle.data(), nlen);
+  if (next_hit_ptr == nullptr) {
     return true;
   }
+  auto next_hit = static_cast<size_t>(next_hit_ptr - base);
   size_t pos = 0;
-  const size_t nlen = needle.size();
   for (uint32_t r = 0; r < n; ++r) {
     uint32_t len = 0;
     if (pos < packed_size && base[pos] < 0x80U) {
@@ -2141,11 +2149,48 @@ bool MatchZstdVarCharUnpackedContains(
       matching_rows_out->clear();
       return false;
     }
-    if ((nulls == nullptr || nulls[r] == 0) && len >= nlen &&
-        FastMemmem(base + pos, len, needle.data(), nlen) != nullptr) {
-      matching_rows_out->push_back(r);
+    const size_t row_end = pos + len;
+    if (next_hit < row_end) {
+      while (next_hit < pos) {
+        // Previous hit started inside a length varint or spanned a prior row
+        // boundary; advance to the next occurrence at or after `pos`.
+        next_hit_ptr =
+            FastMemmem(base + pos, packed_size - pos, needle.data(), nlen);
+        if (next_hit_ptr == nullptr) {
+          next_hit = packed_size;
+          break;
+        }
+        next_hit = static_cast<size_t>(next_hit_ptr - base);
+      }
+      if (next_hit < row_end) {
+        if (next_hit + nlen <= row_end) {
+          if (nulls == nullptr || nulls[r] == 0) {
+            matching_rows_out->push_back(r);
+          }
+          if (row_end < packed_size) {
+            next_hit_ptr = FastMemmem(base + row_end, packed_size - row_end,
+                                      needle.data(), nlen);
+            next_hit = next_hit_ptr == nullptr
+                           ? packed_size
+                           : static_cast<size_t>(next_hit_ptr - base);
+          } else {
+            next_hit = packed_size;
+          }
+        } else if (next_hit + 1 < packed_size) {
+          // Cross-row match: advance past `next_hit` so a match starting
+          // later in the next row is not skipped.
+          next_hit_ptr =
+              FastMemmem(base + next_hit + 1, packed_size - (next_hit + 1),
+                         needle.data(), nlen);
+          next_hit = next_hit_ptr == nullptr
+                         ? packed_size
+                         : static_cast<size_t>(next_hit_ptr - base);
+        } else {
+          next_hit = packed_size;
+        }
+      }
     }
-    pos += len;
+    pos = row_end;
   }
   return pos == packed_size;
 }

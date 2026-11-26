@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SuffixReturnTierUp
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SuffixReturnTierUp
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.SuffixReturnTierUp
@@ -26,4 +26,4 @@ theorem sound : SuffixReturnTierUp.Goal := by
   simp [bill, hcut] at hsum htake ⊢
   omega
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SuffixReturnTierUp
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SuffixReturnTierUp

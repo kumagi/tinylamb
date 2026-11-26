@@ -599,9 +599,9 @@ TEST(PostgresProtocolTest, ExtendedQueryParsersAndBinaryDataRows) {
   ASSERT_EQ(bound.Value().result_formats.size(), 1U);
   EXPECT_EQ(bound.Value().result_formats[0], 1U);
 
-  auto sql = BindSqlParameters(parsed.Value().query, parsed.Value().param_types,
-                               bound.Value().param_formats,
-                               bound.Value().params);
+  auto sql =
+      BindSqlParameters(parsed.Value().query, parsed.Value().param_types,
+                        bound.Value().param_formats, bound.Value().params);
   ASSERT_TRUE(sql.HasValue());
   EXPECT_EQ(sql.Value(), "SELECT 41 + 1");
 
@@ -609,10 +609,10 @@ TEST(PostgresProtocolTest, ExtendedQueryParsersAndBinaryDataRows) {
   DataChunk fixed_chunk;
   fixed_chunk.Initialize(
       {ValueType::kInt64, ValueType::kDouble, ValueType::kDate});
-  fixed_chunk.Append(Row({Value(int64_t{42}), Value(3.25),
-                          Value::DateFromDays(10957 + 10)}));
-  fixed_chunk.Append(Row({Value(int64_t{-7}), Value(-0.5),
-                          Value::DateFromDays(10957 - 5)}));
+  fixed_chunk.Append(
+      Row({Value(int64_t{42}), Value(3.25), Value::DateFromDays(10957 + 10)}));
+  fixed_chunk.Append(
+      Row({Value(int64_t{-7}), Value(-0.5), Value::DateFromDays(10957 - 5)}));
   const std::vector<uint16_t> all_bin = {1};
   std::string batch_wire;
   size_t written = 0;
@@ -632,8 +632,8 @@ TEST(PostgresProtocolTest, ExtendedQueryParsersAndBinaryDataRows) {
       {ValueType::kInt64, ValueType::kDouble, ValueType::kVarChar});
   mixed_chunk.Append(Row({Value(int64_t{100}), Value(12.5), Value("ok")}));
   mixed_chunk.Append(Row({Value(), Value(0.0), Value()}));
-  for (const auto& fmts : std::vector<std::vector<uint16_t>>{
-           {}, {1}, {1, 0, 1}}) {
+  for (const auto& fmts :
+       std::vector<std::vector<uint16_t>>{{}, {1}, {1, 0, 1}}) {
     std::string got;
     size_t n = 0;
     ASSERT_EQ(AppendDataRowsFromChunk(&got, mixed_chunk, 0, mixed_chunk.Size(),

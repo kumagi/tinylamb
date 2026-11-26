@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.InListLowering
+set_option linter.unusedSimpArgs false
 
 /-!
 Combining a hot bitset partition and a cold residual partition with SQL
@@ -11,7 +12,7 @@ long as the two results are combined with three-valued OR.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_InSetChunkedThreeValueOr
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_InSetChunkedThreeValueOr
 
 open TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
@@ -42,4 +43,4 @@ theorem sound : InSetChunkedThreeValueOr.Goal := by
         by_cases hxN : none ∈ xs <;> by_cases hyN : none ∈ ys <;>
         simp [disj, hxA, hxB, hxN, hyN]
 
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_InSetChunkedThreeValueOr
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_InSetChunkedThreeValueOr

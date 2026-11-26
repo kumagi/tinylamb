@@ -9,11 +9,11 @@ in their interior value, so sharing one cached bitset changes the IN result.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_SameCardinalityConstantSetCache
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_SameCardinalityConstantSetCache
 
 open TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
-theorem refute : ¬ SameCardinalityConstantSetCache.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.InListLowering.SameCardinalityConstantSetCache.Goal := by
   intro h
   have hmn : ([some (0 : Int), some 1, some 2].filterMap (fun z => z)).min? =
       ([some (0 : Int), some 0, some 2].filterMap (fun z => z)).min? := by decide
@@ -25,4 +25,4 @@ theorem refute : ¬ SameCardinalityConstantSetCache.Goal := by
     (by decide) hmn hmx hc
   simp [test] at t
 
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_SameCardinalityConstantSetCache
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_SameCardinalityConstantSetCache

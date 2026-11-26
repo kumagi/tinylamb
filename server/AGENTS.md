@@ -1,4 +1,4 @@
-# `server/` — Layer 12 PostgreSQL wire protocol (Simple Query only)
+# `server/` — Layer 12 PostgreSQL wire protocol (Simple Query + Extended Query / Binary Format)
 
 Top of the layer DAG; may include anything below. The runtime uses
 `common/platform` event polling and sockets on Linux, macOS and Windows;
@@ -8,17 +8,22 @@ the server CMake target is not restricted to Linux.
 
 - `postgres_protocol.{hpp,cpp}` — thin v3 encoder/decoder: startup packet,
   auth-ok, ParameterStatus, BackendKeyData, ReadyForQuery, Error/EmptyQuery,
-  RowDescription/DataRow, CommandComplete, `SplitSqlStatements` (shared with
-  the CLI so statement splitting never diverges). Text format,
-  int8/float8/date-centric. Startup advertises `standard_conforming_strings=off`
-  because the GoogleSQL frontend interprets backslash escapes in string literals.
+  RowDescription/DataRow, CommandComplete, Extended Query messages
+  (`Parse`/`Bind`/`Describe`/`Execute`/`Close`, `ParseComplete`,
+  `BindComplete`, `CloseComplete`, `ParameterDescription`, `NoData`,
+  `PortalSuspended`), `SplitSqlStatements` (shared with the CLI so statement
+  splitting never diverges). Supports both Text (`format=0`) and Binary
+  (`format=1`, big-endian int8/float8/date + raw UTF-8 text) result formats,
+  including a zero-allocation fixed-width columnar binary encoder. Startup
+  advertises `standard_conforming_strings=off` because the GoogleSQL frontend
+  interprets backslash escapes in string literals.
 - `postgres_server.{hpp,cpp}` + `postgres_server_main.cpp` — platform event loop +
   read-worker pool (`PostgresServerOptions`: `port 54321`, `max_connections
   1024`, `max_message 16 MiB`,   `idle_timeout 3600s`, `force_recovery` for torn
-  WAL tails). Executes **`Q` (Simple Query) only** — `Parse/Bind/Describe/
-  Execute` (extended protocol) are rejected with an ErrorResponse only;
-  while `Sync` is tolerated as a no-op that only answers
-  ReadyForQuery and `Flush` is a silent no-op. Read-only Query messages may
+  WAL tails). Executes both **`Q` (Simple Query)** and **Extended Query
+  (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Sync`/`Flush`)** with Text and
+  Binary result formats; unsupported frontend message types are rejected with
+  `0A000`. Read-only Query messages may
   be offloaded to the shared worker pool; ordinary INSERT/UPDATE/DELETE and
   BEGIN/COMMIT/ROLLBACK messages also use that pool, with one in-flight task
   per session. TransactionContext ownership moves to the task and returns in

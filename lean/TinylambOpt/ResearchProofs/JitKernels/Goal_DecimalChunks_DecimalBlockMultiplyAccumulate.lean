@@ -1,33 +1,27 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-! A decimal chunk append is a left fold of `10*n + digit`. Splitting the fold
-at the chunk boundary yields one multiply-add by a power of ten: SQL may parse
-digit groups independently and concatenate them without changing the value. -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_DecimalBlockMultiplyAccumulate
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_DecimalBlockMultiplyAccumulate
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-- The accumulator after a fold over `b` started at `n`. -/
-theorem foldlDigitAccumulator (n : Nat) (b : List Nat) :
-    List.foldl (fun n c => 10 * n + (c - 48)) n b = n * 10 ^ b.length + magnitude b := by
-  induction b generalizing n with
-  | nil => simp [magnitude]
-  | cons c b ih =>
-      dsimp [magnitude]
-      simp only [Nat.zero_add]
-      rw [ih (n := 10 * n + (c - 48))]
-      rw [ih (n := c - 48)]
-      rw [Nat.pow_succ]
-      simp only [Nat.mul_add, Nat.mul_assoc, Nat.mul_comm, Nat.add_assoc]
-
-theorem sound : DecimalBlockMultiplyAccumulate.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.DecimalBlockMultiplyAccumulate.Goal := by
+  have hfold : ∀ (s : List Nat) (acc : Nat),
+      s.foldl (fun n c => 10 * n + (c - 48)) acc = acc * 10 ^ s.length + magnitude s := by
+    intro s
+    induction s with
+    | nil => intro acc; simp [magnitude]
+    | cons c s ih =>
+        intro acc
+        dsimp [magnitude]
+        change s.foldl (fun n c => 10 * n + (c - 48)) (10 * acc + (c - 48)) =
+          acc * 10 ^ (s.length + 1) + s.foldl (fun n c => 10 * n + (c - 48)) (0 + (c - 48))
+        rw [ih (10 * acc + (c - 48)), ih (0 + (c - 48))]
+        rw [Nat.add_mul, Nat.pow_succ]
+        ac_rfl
   intro a b
-  unfold magnitude
-  rw [List.foldl_append]
-  exact foldlDigitAccumulator (magnitude a) b
+  rw [show magnitude (a ++ b) = b.foldl (fun n c => 10 * n + (c - 48)) (magnitude a) by
+    unfold magnitude
+    rw [List.foldl_append]]
+  rw [hfold b (magnitude a)]
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_DecimalBlockMultiplyAccumulate
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_DecimalBlockMultiplyAccumulate

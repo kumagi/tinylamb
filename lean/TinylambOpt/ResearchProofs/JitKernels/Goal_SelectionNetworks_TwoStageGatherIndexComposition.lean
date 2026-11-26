@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_TwoStageGatherIndexComposition
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_TwoStageGatherIndexComposition
 
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
 open TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks.TwoStageGatherIndexComposition
@@ -36,4 +36,4 @@ theorem sound : TwoStageGatherIndexComposition.Goal := by
   intro j
   simp [gather, List.filterMap_filterMap, hget']
 
-end TinylambOpt.ResearchProofs.JitKernels.SelectionNetworks.Goal_SelectionNetworks_TwoStageGatherIndexComposition
+end TinylambOpt.ResearchProofs.JitKernels.Goal_SelectionNetworks_TwoStageGatherIndexComposition

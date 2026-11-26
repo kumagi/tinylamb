@@ -11,17 +11,17 @@ candidates and the second only one.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SparseAnchorCostChoice
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SparseAnchorCostChoice
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
-theorem refute : ¬ SparseAnchorCostChoice.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.SparseAnchorCostChoice.Goal := by
   intro h
   have t := h ([0, 1, 0, 0] : B) ([0, 0, 1, 1, 1] : B) 0 1 0 1
-    (by decide) (by decide) (by decide)
+    (by native_decide) (by native_decide) (by native_decide)
   have hbad : ¬ ((cand ([0, 1, 0, 0] : B) ([0, 0, 1, 1, 1] : B) 0).length ≤
       (cand ([0, 1, 0, 0] : B) ([0, 0, 1, 1, 1] : B) 1).length) := by
-    decide
+    native_decide
   exact hbad t
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SparseAnchorCostChoice
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SparseAnchorCostChoice

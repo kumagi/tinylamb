@@ -13,7 +13,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ReciprocalWindows_LastResid
 
 open TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
 
-theorem sound : LastResidueRepresentative.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows.LastResidueRepresentative.Goal := by
   intro bound d s hd hlast x hx
   have char : ∀ z, exactAt z d s ↔ z * excess d s < (d - z % d) * 2 ^ s := by
     intro z

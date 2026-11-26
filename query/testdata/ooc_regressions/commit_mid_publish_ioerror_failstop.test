@@ -1,0 +1,17 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795633014085837
+-- profile: pool=131072 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: commit failed with IOError :: op 12 `commit`: commit failed with IOError: injected spill I/O failure during read under an injected fault and left a torn image: the tables match neither the pre-transaction nor the post-transaction state
+create t0 19 1 17
+create t2 1 156 2 1 1000000 1
+ins_bulk t0 1 5763 730
+ins_bulk t2 1 165 643
+ins_bulk t2 170 535 837
+commit
+upd t0 range 5509 5751 1 0 vadd 18 0 padapp 0 0
+ins_bulk t2 641 866 745
+ins_copy t2 t2 82 305 785
+upd t0 range 5381 5449 1 0 padapp 0 0 gmod 25 0
+q ord=0 heavy=0 take=-1 nv=2 vs=549538421 ex=0 snap=0 :: SELECT DISTINCT LENGTH(pad) AS c1, SUBSTR(pad, 1, 4) AS c2 FROM t2
+inject io 23
+commit

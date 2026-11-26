@@ -47,10 +47,10 @@ private theorem beq_inj (f : Key → Key) (inj : ∀ a b, f a = f b → a = b) (
   | true =>
       cases hfab : (f a == f b) with
       | true => rfl
-      | false => exact absurd (h.mp hfab) (by rw [hab]; simp)
+      | false => exact absurd (h.mpr hab) (by rw [hfab]; simp)
   | false =>
       cases hfab : (f a == f b) with
-      | true => exact absurd (h.mpr hab) (by rw [hfab]; simp)
+      | true => exact absurd (h.mp hfab) (by rw [hab]; simp)
       | false => rfl
 
 private theorem filter_map_eq (f : Key → Key) (p : Key → Bool) (r : Key → Bool)
@@ -96,11 +96,18 @@ private theorem find?_map (f : Key → Key) (inj : ∀ a b, f a = f b → a = b)
         (heap.find? (fun o => o.key == k)).map (relabel f)
   | [] => rfl
   | o :: os => by
-      rw [List.map_cons, List.find?_cons, List.find?_cons,
-        show ((relabel f o).key == f k) = (o.key == k) from beq_inj f inj o.key k]
+      rw [List.map_cons]
+      have hk : ((relabel f o).key == f k) = (o.key == k) := beq_inj f inj o.key k
       by_cases h : (o.key == k) = true
-      · rw [h]
-      · rw [not_true_eq_false h, find?_map f inj k os]
+      · rw [List.find?_cons_of_pos (p := fun o => o.key == f k) (a := relabel f o)
+            (show ((relabel f o).key == f k) = true from by rw [hk]; exact h),
+          List.find?_cons_of_pos (p := fun o => o.key == k) (a := o) h,
+          Option.map_some]
+      · rw [List.find?_cons_of_neg (p := fun o => o.key == f k) (a := relabel f o)
+            (show ¬((relabel f o).key == f k) = true from by
+              intro hc; rw [hk] at hc; exact h hc),
+          List.find?_cons_of_neg (p := fun o => o.key == k) (a := o) h,
+          find?_map f inj k os]
 
 private theorem edges_map (f : Key → Key) (inj : ∀ a b, f a = f b → a = b)
     (heap : List Obj) (x : Key) :

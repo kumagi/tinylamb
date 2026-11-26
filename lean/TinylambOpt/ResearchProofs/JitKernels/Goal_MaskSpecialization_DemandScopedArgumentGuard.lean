@@ -4,7 +4,6 @@ open TinylambOpt.ResearchGoals.JitFrontiers.DemandSSA
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_MaskSpecialization_DemandScopedArgumentGuard
 set_option maxHeartbeats 0
-set_option linter.unusedSimpArgs false
 set_option maxRecDepth 10000
 
 private theorem vbeq (a b : V) : (a == b) = decide (a = b) := by
@@ -676,7 +675,7 @@ theorem subst_run (env : List V) (e : E) (i : Nat) (v : V)
               simp [specialize, run, reads, after, hrunP, hrunB, ihpR, ihbR, List.filter_append, vbeq]
 
 
-theorem sound : DemandScopedArgumentGuard.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization.DemandScopedArgumentGuard.Goal := by
   intro env e i v hguard
   have h := subst_run env e i v hguard
   simpa [answer] using congrArg Prod.fst h

@@ -7,13 +7,13 @@ byte, so SQL lookup must still return that payload. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_WholeControlGroupTermination
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_WholeControlGroupTermination
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
-theorem refute : ¬ WholeControlGroupTermination.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe.WholeControlGroupTermination.Goal := by
   intro h
   have hw := h [.live 1 9 7, .empty] 9
   simp [probe, untilEmpty, value] at hw
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_WholeControlGroupTermination
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_WholeControlGroupTermination

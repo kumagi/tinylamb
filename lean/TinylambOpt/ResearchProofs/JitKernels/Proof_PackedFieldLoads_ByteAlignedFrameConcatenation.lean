@@ -1,132 +1,119 @@
 import TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
-import TinylambOpt.ResearchProofs.Compression.Wire
 
 /-!
-When a packed page boundary falls on a byte boundary, the bitstream splice is
-also a byte-splice: the high part is an exact byte shift of the second page's
-encoding. Concatenating the physical page bytes therefore produces the same
-bitstream as repacking the concatenated lanes. This lets the compiler emit one
-decoder across adjacent aligned frames without copying or re-encoding lanes.
+**Proved: byte-aligned packed frames concatenate without re-encoding.** If the
+first column's payload `word w a` occupies an exact number `q` of bytes
+(`8 ∣ a.length * w`), then `pack w (a ++ b) = pack w a ++ pack w b`: the packed
+integer splits as `word w a + 256^q * word w b` with `word w a < 256^q`, and
+`little` of such a split is the concatenation of the two digit streams. SQL
+execution may store packed columns page-by-page padded to whole bytes and let
+scanners concatenate the byte streams of successive pages (or rows groups)
+without re-packing across boundaries, preserving every decoded value.
 -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
+set_option linter.unnecessarySimpa false
 set_option linter.unusedSimpArgs false
-namespace Nov26.Proof_PackedFieldLoads_ByteAlignedFrameConcatenation
+set_option linter.deprecated false
+
+namespace TinylambOpt.ResearchProofs.JitKernels.PackedFieldLoads_ByteAlignedFrameConcatenation
 open TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
 open TinylambOpt.ResearchGoals.Compression.Wire
-open TinylambOpt.ResearchProofs.Compression.Wire
 
-private theorem little_succ (n k : Nat) : little n (k + 1) = (n % 256) :: little (n / 256) k := by
-  apply List.ext_getElem
-  · simp [little]
-  · intro i hi₁ hi₂
-    cases i with
-    | zero => simp [little]
-    | succ i =>
-        simp [little, List.getElem_map, List.getElem_range, Nat.div_div_eq_div_mul, Nat.pow_succ, Nat.mul_comm]
+private theorem word_nil (w : Nat) : word w [] = 0 := rfl
+private theorem word_cons (w x : Nat) (xs : List Nat) :
+    word w (x :: xs) = x % 2 ^ w + 2 ^ w * word w xs := rfl
 
-private theorem little_of_canonical (bs : Bytes) (hbs : ∀ b ∈ bs, b < 256) :
-    little (fromLittle bs) bs.length = bs := by
-  induction bs with
-  | nil => simp [little, fromLittle]
-  | cons b bs ih =>
-      have hb : b < 256 := hbs b (by simp)
-      have hbs' : ∀ x ∈ bs, x < 256 := by intro x hx; exact hbs x (by simp [hx])
-      rw [List.length_cons, little_succ]
-      simp only [fromLittle]
-      have hhead : (b + 256 * fromLittle bs) % 256 = b := by
-        rw [Nat.add_mul_mod_self_left b 256 (fromLittle bs)]
-        exact Nat.mod_eq_of_lt hb
-      have hdiv : (b + 256 * fromLittle bs) / 256 = fromLittle bs := by
-        rw [Nat.add_mul_div_left b (fromLittle bs) (by decide : 0 < 256)]
-        rw [Nat.div_eq_of_lt hb, Nat.zero_add]
-      rw [hhead, hdiv, ih hbs']
+private theorem word_append (w : Nat) (l₁ l₂ : List Nat) :
+    word w (l₁ ++ l₂) = word w l₁ + 2 ^ (w * l₁.length) * word w l₂ := by
+  induction l₁ with
+  | nil =>
+    rw [List.nil_append, word_nil, List.length_nil, Nat.mul_zero, Nat.pow_zero,
+      Nat.one_mul, Nat.zero_add]
+  | cons x t ih =>
+    rw [List.cons_append, word_cons, ih, word_cons, List.length_cons, Nat.mul_add,
+      ← Nat.mul_assoc, ← Nat.pow_add, Nat.add_comm w (w * t.length), ← Nat.mul_succ,
+      ← Nat.add_assoc]
 
-private theorem fromLittle_lt_pow (bs : Bytes) (hbs : ∀ b ∈ bs, b < 256) :
-    fromLittle bs < 256 ^ bs.length := by
-  induction bs with
-  | nil => simp [fromLittle]
-  | cons b bs ih =>
-      have hb : b < 256 := hbs b (by simp)
-      have hbs' : ∀ x ∈ bs, x < 256 := by intro x hx; exact hbs x (by simp [hx])
-      have ih' := ih hbs'
-      simp only [fromLittle, List.length_cons, Nat.pow_succ]
-      have hle : fromLittle bs + 1 ≤ 256 ^ bs.length := Nat.succ_le_of_lt ih'
+private theorem word_lt (w : Nat) (l : List Nat) : word w l < 2 ^ (w * l.length) := by
+  induction l with
+  | nil => rw [word_nil, List.length_nil, Nat.mul_zero, Nat.pow_zero]; omega
+  | cons x t ih =>
+    have h1 : x % 2 ^ w < 2 ^ w :=
+      Nat.mod_lt _ (Nat.pow_pos (by omega : (0 : Nat) < 2))
+    have h4 : 1 ≤ 2 ^ (w * t.length) - word w t := by omega
+    have h5 : 2 ^ w ≤ 2 ^ w * (2 ^ (w * t.length) - word w t) := by
+      have h5' := Nat.mul_le_mul_left (2 ^ w) h4
+      rw [Nat.mul_one (2 ^ w)] at h5'
+      exact h5'
+    have h3 : 2 ^ (w * (t.length + 1)) = 2 ^ w * 2 ^ (w * t.length) := by
+      rw [Nat.mul_succ, Nat.pow_add, Nat.mul_comm]
+    have hB : word w t + (2 ^ (w * t.length) - word w t) = 2 ^ (w * t.length) := by
       omega
+    have h6 : 2 ^ w * 2 ^ (w * t.length) =
+        2 ^ w * word w t + 2 ^ w * (2 ^ (w * t.length) - word w t) := by
+      rw [← Nat.mul_add, hB]
+    rw [word_cons, List.length_cons, h3, h6]
+    omega
 
-private theorem little_add_shift (x y m k : Nat) (hx : x < 256 ^ m) :
-    little (x + 256 ^ m * y) (m + k) = little x m ++ little y k := by
-  induction m generalizing x with
-  | zero =>
-      have hx0 : x = 0 := by simpa using hx
-      subst x
-      simp [little]
-  | succ m ih =>
-      have hx' : x / 256 < 256 ^ m := by
-        rw [Nat.div_lt_iff_lt_mul (by decide : 0 < 256)]
-        simpa [Nat.pow_succ, Nat.mul_comm] using hx
-      have hhead : (x + 256 ^ (m + 1) * y) % 256 = x % 256 := by
-        have hpow : 256 ^ (m + 1) * y = 256 * (256 ^ m * y) := by
-          rw [Nat.pow_succ, Nat.mul_comm (256 ^ m) 256, Nat.mul_assoc]
-        rw [hpow]
-        exact Nat.add_mul_mod_self_left x 256 (256 ^ m * y)
-      have hdiv : (x + 256 ^ (m + 1) * y) / 256 = x / 256 + 256 ^ m * y := by
-        have hpow : 256 ^ (m + 1) * y = 256 * (256 ^ m * y) := by
-          rw [Nat.pow_succ, Nat.mul_comm (256 ^ m) 256, Nat.mul_assoc]
-        rw [hpow]
-        exact Nat.add_mul_div_left x (256 ^ m * y) (by decide : 0 < 256)
-      rw [show m + 1 + k = (m + k) + 1 by omega]
-      rw [little_succ, little_succ, hhead, hdiv]
-      rw [ih (x / 256) hx']
-      simp
+private theorem low_digit (v w i q : Nat) (hv : v < 256 ^ q) (hi : i < q) :
+    (v + 256 ^ q * w) / 256 ^ i % 256 = v / 256 ^ i % 256 := by
+  obtain ⟨d, rfl⟩ : ∃ d, q = i + (d + 1) := ⟨q - i - 1, by omega⟩
+  have hp : 256 ^ (i + (d + 1)) = 256 ^ i * (256 ^ d * 256) := by
+    rw [Nat.pow_add, Nat.pow_succ]
+  have hpos : 0 < (256 : Nat) ^ i := Nat.pow_pos (by decide : (0 : Nat) < 256)
+  rw [hp, Nat.mul_assoc, Nat.add_mul_div_left _ _ hpos]
+  rw [show 256 ^ d * 256 * w = 256 * (256 ^ d * w) from
+    by rw [Nat.mul_comm (256 ^ d) 256, ← Nat.mul_assoc],
+    Nat.add_mul_mod_self_left]
 
-private theorem pack_canonical (w : Nat) (xs : List Nat) : ∀ b ∈ pack w xs, b < 256 := by
-  intro b hb
-  unfold pack little at hb
-  rw [List.mem_map] at hb
-  rcases hb with ⟨i, hi, rfl⟩
-  exact Nat.mod_lt _ (by decide : 0 < 256)
+private theorem high_digit (v w i q : Nat) (hv : v < 256 ^ q) :
+    (v + 256 ^ q * w) / 256 ^ (q + i) % 256 = w / 256 ^ i % 256 := by
+  have hq : 0 < (256 : Nat) ^ q := Nat.pow_pos (by decide : (0 : Nat) < 256)
+  have hdiv : (v + 256 ^ q * w) / 256 ^ q = w := by
+    rw [Nat.add_comm, Nat.mul_add_div hq, Nat.div_eq_of_lt hv, Nat.add_zero]
+  rw [Nat.pow_add, ← Nat.div_div_eq_div_mul, hdiv]
 
-theorem sound : ByteAlignedFrameConcatenation.Goal := by
-  intro w a b halign
-  rw [sound_BitSplice w a b]
-  have ha_length : byteCount (a.length * w) = a.length * w / 8 := by
+private theorem little_split (v q w k : Nat) (hv : v < 256 ^ q) :
+    little (v + 256 ^ q * w) (q + k) = little v q ++ little w k := by
+  have h1 : (List.range q).map (fun i => (v + 256 ^ q * w) / 256 ^ i % 256) =
+      (List.range q).map (fun i => v / 256 ^ i % 256) :=
+    List.map_congr_left (fun i hi => low_digit v w i q hv (List.mem_range.mp hi))
+  have h2 : (List.map (q + ·) (List.range k)).map
+      (fun i => (v + 256 ^ q * w) / 256 ^ i % 256) =
+      (List.range k).map (fun i => w / 256 ^ i % 256) := by
+    rw [List.map_map]
+    exact List.map_congr_left (fun i _ => high_digit v w i q hv)
+  rw [little, little, little, List.range_add, List.map_append, h1, h2]
+
+theorem byteAligned : ByteAlignedFrameConcatenation.Goal := by
+  intro w a b hdvd
+  obtain ⟨q, hq⟩ := hdvd
+  unfold pack
+  have hlen : (a ++ b).length = a.length + b.length := List.length_append
+  have h256 : 256 ^ q = 2 ^ (a.length * w) := by
+    rw [hq, Nat.pow_mul]
+  have hw' : word w (a ++ b) = word w a + 256 ^ q * word w b := by
+    rw [word_append, Nat.mul_comm w a.length, ← h256]
+  have hbc1 : byteCount (a.length * w) = q := by
     unfold byteCount
-    rcases halign with ⟨k, hk⟩
-    rw [hk]
-    rw [show 8 * k + 7 = 7 + 8 * k by omega]
-    rw [Nat.add_mul_div_left 7 k (by decide : 0 < 8)]
-    simp
-  have hab_length : byteCount ((a.length + b.length) * w) = a.length * w / 8 + byteCount (b.length * w) := by
-    unfold byteCount at ha_length ⊢
-    rw [Nat.add_mul]
-    rcases halign with ⟨k, hk⟩
-    rw [hk]
-    rw [show 8 * k + b.length * w + 7 = (b.length * w + 7) + 8 * k by omega]
-    rw [Nat.add_mul_div_left (b.length * w + 7) k (by decide : 0 < 8)]
-    simp [Nat.add_comm]
-  let m := a.length * w / 8
-  have hcancel : 8 * m = a.length * w := by
-    dsimp [m]
-    exact Nat.mul_div_cancel' halign
-  have hm_pow : 256 ^ m = 2 ^ (a.length * w) := by
-    rw [← hcancel]
-    have h256 : (256 : Nat) = 2 ^ 8 := by decide
-    rw [h256, Nat.pow_mul]
-  have hlen' : (pack w a).length = m := by
-    rw [sound_PackedCharge w a, ha_length]
-  have hfroma_lt : fromLittle (pack w a) < 256 ^ m := by
-    rw [← hlen']
-    exact fromLittle_lt_pow (pack w a) (pack_canonical w a)
-  rw [hab_length]
-  rw [Nat.mul_comm w a.length, ← hm_pow]
-  rw [← hlen']
-  rw [show a.length * w / 8 = (pack w a).length by exact hlen'.symm]
-  rw [little_add_shift (fromLittle (pack w a)) (fromLittle (pack w b))
-    ((pack w a).length) (byteCount (b.length * w)) (by rw [hlen']; exact hfroma_lt)]
-  rw [little_of_canonical (pack w a) (pack_canonical w a)]
-  rw [← sound_PackedCharge w b]
-  rw [little_of_canonical (pack w b) (pack_canonical w b)]
+    rw [hq]
+    rw [show 8 * q + 7 = 7 + 8 * q from by omega,
+      Nat.add_mul_div_left _ _ (by decide : (0 : Nat) < 8)]
+    omega
+  have hbc2 : byteCount ((a.length + b.length) * w) = q + byteCount (b.length * w) := by
+    unfold byteCount
+    have h : (a.length + b.length) * w = 8 * q + b.length * w := by
+      rw [Nat.add_mul, hq]
+    rw [h, show 8 * q + b.length * w + 7 = b.length * w + 7 + 8 * q from by omega,
+      Nat.add_mul_div_left _ _ (by decide : (0 : Nat) < 8)]
+    omega
+  have hv : word w a < 256 ^ q := by
+    rw [h256, Nat.mul_comm a.length w]
+    exact word_lt w a
+  rw [hlen, hw', hbc2,
+    little_split (word w a) q (word w b) (byteCount (b.length * w)) hv, hbc1]
 
-end Nov26.Proof_PackedFieldLoads_ByteAlignedFrameConcatenation
+end TinylambOpt.ResearchProofs.JitKernels.PackedFieldLoads_ByteAlignedFrameConcatenation

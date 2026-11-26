@@ -8,12 +8,15 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PackedFieldLoads_LastFieldR
 open TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
 open TinylambOpt.ResearchGoals.Compression.Wire
 
-theorem refute : ¬ LastFieldReadFootprint.Goal := by
+/-! A one-bit column packs into a single byte, so an eight-byte speculative
+read is not inside its allocation. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.LastFieldReadFootprint.Goal := by
+  rw [LastFieldReadFootprint.Goal]
   intro h
   have hh := h 1 [0] 0 (by decide) (by decide) (by decide)
-  have contra : ¬ within (pack 1 [0]) 1 0 8 := by
+  have hbad : ¬ within (pack 1 [0]) 1 0 8 := by
     unfold within
     native_decide
-  exact contra hh
+  exact hbad hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_PackedFieldLoads_LastFieldReadFootprint

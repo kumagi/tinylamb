@@ -9,7 +9,7 @@ candidates for a longer literal therefore preserves the set of starts.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SharedNeedlePrefixFilter
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SharedNeedlePrefixFilter
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
@@ -39,7 +39,7 @@ theorem prefix_append_iff (a b t : B) :
       exact hv.symm
     exact ⟨v, by simpa [List.append_assoc, hdrop] using hu⟩
 
-theorem sound : SharedNeedlePrefixFilter.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.SharedNeedlePrefixFilter.Goal := by
   intro a b s
   have hpred : (fun i : Nat =>
       b.isPrefixOf (s.drop (i + a.length)) && a.isPrefixOf (s.drop i)) =
@@ -56,4 +56,4 @@ theorem sound : SharedNeedlePrefixFilter.Goal := by
   simp only [starts, List.filter_filter]
   rw [hpred]
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SharedNeedlePrefixFilter
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SharedNeedlePrefixFilter

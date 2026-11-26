@@ -10,11 +10,11 @@ reversed. SQL execution may therefore validate only the two loop endpoints.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_IntervalTripEndpointGuard
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_IntervalTripEndpointGuard
 
 open TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
-theorem sound : IntervalTripEndpointGuard.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.InductionLowering.IntervalTripEndpointGuard.Goal := by
   intro w base step n i hi hb he
   unfold signedFits at hb he ⊢
   rcases hb with ⟨hb1, hb2⟩
@@ -35,4 +35,4 @@ theorem sound : IntervalTripEndpointGuard.Goal := by
       Int.mul_nonpos_of_nonneg_of_nonpos (by omega) hs'
     omega
 
-end TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_IntervalTripEndpointGuard
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_IntervalTripEndpointGuard

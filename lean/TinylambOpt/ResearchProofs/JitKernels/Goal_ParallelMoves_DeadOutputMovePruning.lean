@@ -1,28 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
 
-/-!
-Dead-output pruning removes moves whose destination is not live at the exit.
-This file refutes the claim that such pruning is always safe: a removed move
-may clobber a register that a later, live move reads, changing the value of the
-live output.
-
-Refuted by counterexample: with `live = [2]`, the dead move `(1,0)` writes the
-register that the live move `(2,1)` reads.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+-- Refutation: a move to a dead register can still feed a later move to a live register.
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ParallelMoves_DeadOutputMovePruning
 
-open TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
-
-theorem refute : ¬ DeadOutputMovePruning.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ParallelMoves.DeadOutputMovePruning.Goal := by
   intro h
-  have heq := h (fun r => r) [(1, 0), (2, 1)] [2] 2 (by native_decide)
-  exact (by native_decide :
-    serial (fun r => r) ([(1, 0), (2, 1)].filter (fun m => [2].contains m.1)) 2 ≠
-      serial (fun r => r) [(1, 0), (2, 1)] 2) heq
+  have c := h (fun r : Nat => if r == 0 then 5 else 7) ([(0, 1), (1, 0)] : List (Nat × Nat))
+    [1] 1 (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.ParallelMoves.serial
+      (fun r : Nat => if r == 0 then 5 else 7)
+      (([(0, 1), (1, 0)] : List (Nat × Nat)).filter
+        (fun m => [1].contains m.1)) 1 =
+    TinylambOpt.ResearchGoals.JitKernels.ParallelMoves.serial
+      (fun r : Nat => if r == 0 then 5 else 7) ([(0, 1), (1, 0)] : List (Nat × Nat)) 1)) c
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_ParallelMoves_DeadOutputMovePruning

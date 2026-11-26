@@ -18,7 +18,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PlanePredicates_UnsignedThr
 
 open TinylambOpt.ResearchGoals.JitKernels.PlanePredicates
 
-theorem refute : ¬ UnsignedThresholdTruncation.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.PlanePredicates.UnsignedThresholdTruncation.Goal := by
   intro h
   have heq := h 0 2 1 (by native_decide)
   exact (by native_decide : foldBits 0 2 1 ≠ decide (0 < 2)) heq

@@ -141,17 +141,18 @@ std::string DataRow(const Row& row,
 // Lean proof:
 // lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
 // (sound)
-Status AppendDataRowFromChunk(
-    std::string* wire_out, const DataChunk& chunk, size_t row_idx,
-    const std::vector<uint16_t>& result_formats = {});
+Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
+                              size_t row_idx,
+                              const std::vector<uint16_t>& result_formats = {});
 // Appends DataRow wire frames for rows `[row_begin, row_end)` up to `max_bytes`
 // (writing at least one row when `row_begin < row_end`). Sets `*rows_written`
 // to the number of rows encoded. Uses a specialized zero-allocation fixed-width
 // fast path when all columns are fixed-width binary (int8/float8/date).
-Status AppendDataRowsFromChunk(
-    std::string* wire_out, const DataChunk& chunk, size_t row_begin,
-    size_t row_end, size_t max_bytes,
-    const std::vector<uint16_t>& result_formats, size_t* rows_written);
+Status AppendDataRowsFromChunk(std::string* wire_out, const DataChunk& chunk,
+                               size_t row_begin, size_t row_end,
+                               size_t max_bytes,
+                               const std::vector<uint16_t>& result_formats,
+                               size_t* rows_written);
 std::string CommandComplete(std::string_view tag);
 std::string NegotiateProtocolVersion(
     uint32_t newest_minor,

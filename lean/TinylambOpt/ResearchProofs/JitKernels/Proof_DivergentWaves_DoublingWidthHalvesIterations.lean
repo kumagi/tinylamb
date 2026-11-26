@@ -1,23 +1,23 @@
 import TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.DoublingWidthHalvesIterations.Goal`. -/
+
+/-! REFUTED: Doubling the SIMD width does not in general halve the rounded wave-iteration
+count. With lanes of unequal remaining work, a wider wave still waits for its slowest
+lane, so the tick total need not shrink at all. Counterexample: `steps = [5, 0]` at
+width `1` takes `5` ticks and at width `2` still takes `5` ticks, not `(5+1)/2 = 3`. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-/-! Refutation: doubling SIMD width does not halve the iteration count after
-rounding. Packet maxima are data-dependent; two waves can merge into one wave
-whose max is close to the larger input instead of half the total work. -/
-
-namespace Nov26.Proof_DivergentWaves_DoublingWidthHalvesIterations
-
+namespace TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_DoublingWidthHalvesIterations
 open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
-open TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.DoublingWidthHalvesIterations
 
-theorem refute : ¬ Goal := by
+/-- Width doubling keeps the same 5 ticks for `[5, 0]`, refuting the halving formula. -/
+theorem refute : ¬ DoublingWidthHalvesIterations.Goal := by
   intro h
-  have hbad := h [1, 2, 3] 1 (by omega)
-  have hc : ticks 2 [1, 2, 3] ≠ (ticks 1 [1, 2, 3] + 1) / 2 := by native_decide
-  exact hc hbad
+  have hc := h [5, 0] 1 (by decide)
+  exact absurd hc (by decide)
 
-end Nov26.Proof_DivergentWaves_DoublingWidthHalvesIterations
+end TinylambOpt.ResearchProofs.JitKernels.DivergentWaves_DoublingWidthHalvesIterations

@@ -1,11 +1,12 @@
 import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
+set_option linter.unusedSimpArgs false
 
 /-! A positive-net trace amortizes any finite compilation cost after enough repetitions. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_CompiledSuffixDuplication
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_CompiledSuffixDuplication
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.CompiledSuffixDuplication
@@ -53,4 +54,4 @@ theorem sound : CompiledSuffixDuplication.Goal := by
     simpa using hmul
   omega
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_CompiledSuffixDuplication
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_CompiledSuffixDuplication

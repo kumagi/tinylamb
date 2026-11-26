@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.RadixCursors
+set_option linter.unusedSimpArgs false
 
 /-!
 Within one bucket, live lanes receive consecutive destination ordinals in

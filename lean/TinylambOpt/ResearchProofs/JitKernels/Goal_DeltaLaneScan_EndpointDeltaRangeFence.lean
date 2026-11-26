@@ -1,50 +1,50 @@
 import TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
 
-/-! With nonnegative deltas every decoded prefix is at most the final endpoint.
-An endpoint below the bound therefore fences every row, letting SQL replace a
-per-row range check with one check on the frame sum. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_EndpointDeltaRangeFence
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_EndpointDeltaRangeFence
-
-open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
-
-theorem sumNonneg (ds : List Int) (h : ∀ d ∈ ds, 0 ≤ d) : 0 ≤ ds.sum := by
-  induction ds with
-  | nil => simp
-  | cons d ds ih =>
-      have hd : 0 ≤ d := h d (by simp)
-      have ht : ∀ e ∈ ds, 0 ≤ e := by intro e he; exact h e (by simp [he])
-      have hs := ih ht
-      simp [List.sum_cons]
-      omega
-
-theorem scanlEqConsValues (b : Int) (ds : List Int) :
-    List.scanl (· + ·) b ds = b :: values b ds := by
-  cases ds with
-  | nil => simp [values]
-  | cons d ds => simp [values, List.scanl_cons]
-
-theorem sound : EndpointDeltaRangeFence.Goal := by
-  intro b ds threshold hnonneg hlt
-  induction ds generalizing b with
-  | nil => simp [values]
-  | cons d ds ih =>
-      have hd : 0 ≤ d := hnonneg d (by simp)
-      have ht : ∀ e ∈ ds, 0 ≤ e := by intro e he; exact hnonneg e (by simp [he])
-      have htailNonneg : 0 ≤ ds.sum := sumNonneg ds ht
-      have hbd_le : b + d ≤ b + (d :: ds).sum := by simp [List.sum_cons]; omega
-      have hbd : b + d < threshold := by omega
-      have htail_lt : (b + d) + ds.sum < threshold := by
-        simp [List.sum_cons] at hlt
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.EndpointDeltaRangeFence.Goal := by
+  intro b ds threshold hnonneg hfinal
+  have hsumNonneg : ∀ ds : List Int, (∀ d ∈ ds, 0 ≤ d) → 0 ≤ ds.sum := by
+    intro ds
+    induction ds with
+    | nil => intro h; simp
+    | cons d ds ih =>
+        intro h
+        have hd : 0 ≤ d := h d (by simp)
+        have hds : 0 ≤ ds.sum := ih (by intro z hz; exact h z (by simp [hz]))
+        simp only [List.sum_cons]
         omega
-      have ihres := ih (b + d) ht htail_lt
-      simp only [values, List.scanl_cons]
-      rw [List.drop_one]
-      rw [scanlEqConsValues]
-      simp only [List.tail_cons]
-      simp [hbd, ihres]
+  have hscan : ∀ (ds : List Int) (acc : Int),
+      (∀ d ∈ ds, 0 ≤ d) → acc + ds.sum < threshold →
+      (ds.scanl (· + ·) acc).all (fun v => v < threshold) := by
+    intro ds
+    induction ds with
+    | nil =>
+        intro acc hds hacc
+        simpa using hacc
+    | cons d ds ih =>
+        intro acc hds hacc
+        have hd : 0 ≤ d := hds d (by simp)
+        have hds' : ∀ z ∈ ds, 0 ≤ z := by
+          intro z hz
+          exact hds z (by simp [hz])
+        have hsum : acc + (d + ds.sum) < threshold := by
+          simpa only [List.sum_cons] using hacc
+        have hdsSum : 0 ≤ ds.sum := hsumNonneg ds hds'
+        have hacc' : acc + d + ds.sum < threshold := by omega
+        have hstep : acc + d < threshold := by omega
+        have hhead : acc < threshold := by omega
+        have htail := ih (acc + d) hds' hacc'
+        simpa [List.scanl_cons, hhead, hstep, htail]
+  have hfull := hscan ds b hnonneg hfinal
+  simp at hfull
+  simp [TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.values]
+  intro x hx
+  apply hfull x
+  cases hsl : ds.scanl (fun acc d => acc + d) b with
+  | nil => simp [TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.values, hsl] at hx
+  | cons y ys =>
+      simp [TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.values, hsl] at hx ⊢
+      exact Or.inr hx
 
-end TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_EndpointDeltaRangeFence
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_EndpointDeltaRangeFence

@@ -1,28 +1,22 @@
 import TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-/-
-Refutes `ArithmeticEquivalenceStackMerge`: two recipes with identical
-unbounded results can differ in checked results when one overflows an
-intermediate operation. The witness overflows a width-2 intermediate but
-returns to range.
--/
+/-! Unbounded equivalence does not license merging checked recipes: an
+    intermediate overflow can make one recipe fail while a literal succeeds. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_ArithmeticEquivalenceStackMerge
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_ArithmeticEquivalenceStackMerge
 
 open TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-theorem refute : ¬ ArithmeticEquivalenceStackMerge.Goal := by
+theorem refute :
+    ¬ TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps.ArithmeticEquivalenceStackMerge.Goal := by
   intro h
-  let a : Recipe := .plus (.plus (.lit 3) (.lit 1)) (.neg (.lit 4))
-  let b : Recipe := .lit 0
-  have heval : ∀ regs, eval regs a = eval regs b := by intro regs; simp [a, b, eval]
-  have hc := h a b heval 2 (fun _ => 0)
-  have hn : checked 2 (fun _ => 0) a = none := by native_decide
-  have hs : checked 2 (fun _ => 0) b = some 0 := by native_decide
-  rw [hn, hs] at hc
-  contradiction
+  let a : Recipe := .plus (.lit 3) (.lit 1)
+  let b : Recipe := .lit 4
+  have hab : ∀ regs, eval regs a = eval regs b := by
+    intro regs
+    simp [a, b, eval]
+  have hh := h a b hab 2 (fun _ => 0)
+  have hne : (checked 2 (fun _ => 0) a ≠ checked 2 (fun _ => 0) b) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_ArithmeticEquivalenceStackMerge
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_ArithmeticEquivalenceStackMerge

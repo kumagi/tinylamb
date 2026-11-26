@@ -1,22 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 
-/-!
-A monotone radix stream may contain several distinct buckets. A live lane in a
-later bucket has fewer same-bucket predecessors than total live predecessors, so
-a single popcount of all preceding live lanes overestimates its destination rank.
-This counterexample keeps the SQL scatter kernel from dropping the bucket filter.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+/-! A monotone radix stream can contain several distinct buckets, so the
+    same-bucket rank is not the total number of preceding live lanes. -/
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_RadixCursors_PrefixMaskAsBucketRank
 
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 
-theorem refute : ¬ PrefixMaskAsBucketRank.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.RadixCursors.PrefixMaskAsBucketRank.Goal := by
   intro h
-  have got := h [some 0, some 1] 1 1
-  simp [active, rank] at got
+  let xs : List (Option Nat) := [some 1, some 2]
+  have hmono : (active xs).Pairwise (fun a b => a ≤ b) := by native_decide
+  have hsel : xs[1]? = some (some 2) := by native_decide
+  have hh := h xs 1 2 hmono hsel
+  have hne : (rank xs 1 2 ≠ (active (xs.take 1)).length) := by native_decide
+  exact hne hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_RadixCursors_PrefixMaskAsBucketRank

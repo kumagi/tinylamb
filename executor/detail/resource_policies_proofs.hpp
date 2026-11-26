@@ -622,7 +622,7 @@ namespace tinylamb::benchmark_rematch {
 [[nodiscard]] inline size_t SelectBestFitSlabClass(
     std::span<const size_t> class_sizes, size_t request_bytes) noexcept {
   size_t best_idx = class_sizes.size();
-  size_t best_size = static_cast<size_t>(-1);
+  auto best_size = static_cast<size_t>(-1);
   for (size_t i = 0; i < class_sizes.size(); ++i) {
     if (class_sizes[i] >= request_bytes && class_sizes[i] < best_size) {
       best_size = class_sizes[i];

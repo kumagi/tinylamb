@@ -9,7 +9,7 @@ fits a 3-bit signed range, but the next emitted value `8` does not.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_FinalIterationStrengthOverflow
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_FinalIterationStrengthOverflow
 
 open TinylambOpt.ResearchGoals.JitKernels.InductionLowering
 
@@ -18,7 +18,7 @@ theorem refute : ¬ FinalIterationStrengthOverflow.Goal := by
   have hfit : ∀ x ∈ differences 0 1 0 0 1 8, signedFits 3 x := by
     intro x hx
     have hdiff : differences 0 1 0 0 1 8 = ([0, 1, 2, 3, 4, 5, 6, 7] : List Int) := by
-      decide
+      native_decide
     rw [hdiff] at hx
     simp at hx
     simp [signedFits]
@@ -28,4 +28,4 @@ theorem refute : ¬ FinalIterationStrengthOverflow.Goal := by
     simp [signedFits, poly]
   exact hbad t
 
-end TinylambOpt.ResearchProofs.JitKernels.InductionLowering.Goal_FinalIterationStrengthOverflow
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InductionLowering_FinalIterationStrengthOverflow

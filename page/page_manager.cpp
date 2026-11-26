@@ -1903,12 +1903,51 @@ StatusOr<std::shared_ptr<Page>> PageManager::EnsureEvictedPageResident(
 
     if (uncommitted_seg_id.has_value()) {
       SpillStore* sp_store = GetOrCreateUncommittedSpillStore();
-      ASSIGN_OR_RETURN(uint64_t, overlay_bytes,
-                       sp_store->SegmentSize(*uncommitted_seg_id));
+      auto check_concurrent_reload =
+          [&]() -> std::pair<bool, std::shared_ptr<Page>> {
+        std::scoped_lock lk(blocks_mu_);
+        if (auto it = blocks_.find(pid);
+            it != blocks_.end() && it->second != nullptr) {
+          return {true, it->second};
+        }
+        const auto uit = uncommitted_spills_.find(pid);
+        if (uit == uncommitted_spills_.end() ||
+            uit->second != *uncommitted_seg_id) {
+          return {true, nullptr};
+        }
+        return {false, nullptr};
+      };
+      StatusOr<uint64_t> overlay_bytes_or =
+          sp_store->SegmentSize(*uncommitted_seg_id);
+      if (!overlay_bytes_or.HasValue()) {
+        if (overlay_bytes_or.GetStatus().GetCode() == StatusCode::kNotExists) {
+          auto [retry_or_hit, hit] = check_concurrent_reload();
+          if (hit != nullptr) {
+            return hit;
+          }
+          if (retry_or_hit) {
+            continue;
+          }
+        }
+        return overlay_bytes_or.GetStatus();
+      }
+      const uint64_t overlay_bytes = overlay_bytes_or.Value();
       std::string overlay_raw(static_cast<size_t>(overlay_bytes), '\0');
       if (overlay_bytes > 0) {
-        RETURN_IF_FAIL(sp_store->Read(*uncommitted_seg_id, 0,
-                                      overlay_raw.data(), overlay_raw.size()));
+        Status read_st = sp_store->Read(*uncommitted_seg_id, 0,
+                                        overlay_raw.data(), overlay_raw.size());
+        if (!read_st.ok()) {
+          if (read_st.GetCode() == StatusCode::kNotExists) {
+            auto [retry_or_hit, hit] = check_concurrent_reload();
+            if (hit != nullptr) {
+              return hit;
+            }
+            if (retry_or_hit) {
+              continue;
+            }
+          }
+          return read_st;
+        }
       }
       // DecodeUncommittedOverlay returns kCorrupt for a bad CRC/length; keep
       // propagating it so a corrupt spill segment never becomes a valid page.
@@ -1920,43 +1959,55 @@ StatusOr<std::shared_ptr<Page>> PageManager::EnsureEvictedPageResident(
     fresh->MarkReferenced();
 
     uint64_t seg_to_drop = kInvalidSpillSegmentId;
+    bool retry_stale_overlay = false;
     {
       std::scoped_lock lk(blocks_mu_);
       if (auto it = blocks_.find(pid);
           it != blocks_.end() && it->second != nullptr) {
         return it->second;
       }
-      const EvictedPageDesc* latest = evicted_pages_.Find(pid);
-      if (latest == nullptr) {
-        return Status::kNotExists;
-      }
-      if (latest->HasCommittedDiskBlock()) {
-        fresh->body.row_page.disk_offset_ = latest->disk_offset;
-        fresh->body.row_page.disk_length_ = latest->disk_length;
-        fresh->body.row_page.disk_file_gen_ = latest->file_gen;
+      const auto uit = uncommitted_spills_.find(pid);
+      const bool overlay_changed = uncommitted_seg_id.has_value()
+                                       ? (uit == uncommitted_spills_.end() ||
+                                          uit->second != *uncommitted_seg_id)
+                                       : (uit != uncommitted_spills_.end());
+      if (overlay_changed) {
+        retry_stale_overlay = true;
       } else {
-        fresh->body.row_page.disk_offset_ = RowPage::kInvalidDiskOffset;
-        fresh->body.row_page.disk_length_ = 0;
-        fresh->body.row_page.disk_file_gen_ = 0;
+        const EvictedPageDesc* latest = evicted_pages_.Find(pid);
+        if (latest == nullptr) {
+          return Status::kNotExists;
+        }
+        if (latest->HasCommittedDiskBlock()) {
+          fresh->body.row_page.disk_offset_ = latest->disk_offset;
+          fresh->body.row_page.disk_length_ = latest->disk_length;
+          fresh->body.row_page.disk_file_gen_ = latest->file_gen;
+        } else {
+          fresh->body.row_page.disk_offset_ = RowPage::kInvalidDiskOffset;
+          fresh->body.row_page.disk_length_ = 0;
+          fresh->body.row_page.disk_file_gen_ = 0;
+        }
+        const auto [erased, dir_delta] = evicted_pages_.Erase(pid);
+        if (erased) {
+          evicted_page_count_.fetch_sub(1, std::memory_order_relaxed);
+          AccountEvictedDirDeltaLocked(dir_delta);
+        }
+        if (uit != uncommitted_spills_.end()) {
+          seg_to_drop = uit->second;
+          uncommitted_spills_.erase(uit);
+          uncommitted_spill_faults_.fetch_add(1, std::memory_order_relaxed);
+        }
+        max_page_id_ = std::max(max_page_id_, pid);
+        if (has_committed_disk) {
+          committed_max_page_id_ = std::max(committed_max_page_id_, pid);
+        }
+        blocks_[pid] = fresh;
+        NotePageTouchedLocked(*fresh);
+        AccountPageMemoryLocked(*fresh);
       }
-      const auto [erased, dir_delta] = evicted_pages_.Erase(pid);
-      if (erased) {
-        evicted_page_count_.fetch_sub(1, std::memory_order_relaxed);
-        AccountEvictedDirDeltaLocked(dir_delta);
-      }
-      if (const auto uit = uncommitted_spills_.find(pid);
-          uit != uncommitted_spills_.end()) {
-        seg_to_drop = uit->second;
-        uncommitted_spills_.erase(uit);
-        uncommitted_spill_faults_.fetch_add(1, std::memory_order_relaxed);
-      }
-      max_page_id_ = std::max(max_page_id_, pid);
-      if (has_committed_disk) {
-        committed_max_page_id_ = std::max(committed_max_page_id_, pid);
-      }
-      blocks_[pid] = fresh;
-      NotePageTouchedLocked(*fresh);
-      AccountPageMemoryLocked(*fresh);
+    }
+    if (retry_stale_overlay) {
+      continue;
     }
     DropUncommittedSpillSegment(seg_to_drop);
     return fresh;
@@ -2020,12 +2071,12 @@ size_t PageManager::TryEvictForReclaim(size_t bytes_needed) noexcept {
       // reclaimed byte count is measured from resident_bytes_ below.
       const Status evict_status = EvictBatch(target, /*try_locks_only=*/true);
       if (evict_status != Status::kSuccess) {
-        // NOLINTBEGIN(bugprone-empty-catch): preserve the noexcept reclaim path.
+        // NOLINTBEGIN(bugprone-empty-catch): preserve the noexcept reclaim
+        // path.
         try {
           LOG(WARN) << "TryEvictForReclaim: EvictBatch(" << target
                     << " bytes) failed: " << evict_status;
-        } catch (
-            ...) {
+        } catch (...) {
           // This reclaim path is noexcept and may run while memory is tight;
           // a diagnostic allocation failure must not terminate the process.
         }

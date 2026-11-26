@@ -1,23 +1,25 @@
 import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.IntersectionByLargerStride.Goal`. -/
+
+/-! FALSE: With only `a.modulus ≤ b.modulus` and compatible residues, `b`'s class need not
+refine `a`'s class; divisibility of strides is missing. Counterexample: `a` has stride 2
+(class of even numbers), `b` has stride 3 (multiples of 3); `x = 3` satisfies `inside b x`
+and lies within `a`'s bounds `[0,10]`, but is not a multiple of 2. -/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace Nov26.Proof_GuardCertificates_IntersectionByLargerStride
-
+namespace TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_IntersectionByLargerStride
 open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
-open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.IntersectionByLargerStride
 
-theorem refute : ¬ Goal := by
+/-- Refutation of intersecting strides by mere size comparison. -/
+theorem refute : ¬ IntersectionByLargerStride.Goal := by
   intro h
-  let a : Domain := { lo := 0, hi := 10, modulus := 2, residue := 0 }
-  let b : Domain := { lo := 0, hi := 10, modulus := 3, residue := 2 }
-  have hb : inside b (5 : Int) := by unfold inside b; native_decide
-  have h' := h a b (5 : Int) (by native_decide) (by native_decide) (by native_decide) hb
-    (by native_decide) (by native_decide)
-  have hbad : ¬ inside a (5 : Int) := by unfold inside a; native_decide
-  exact hbad h'
+  have key := h ⟨0, 10, 2, 0⟩ ⟨0, 10, 3, 0⟩ 3
+    (by decide) (by decide) (by decide)
+    (by simp only [inside]; decide) (by decide) (by decide)
+  exact absurd key (by simp only [inside]; decide)
 
-end Nov26.Proof_GuardCertificates_IntersectionByLargerStride
+end TinylambOpt.ResearchProofs.JitKernels.GuardCertificates_IntersectionByLargerStride

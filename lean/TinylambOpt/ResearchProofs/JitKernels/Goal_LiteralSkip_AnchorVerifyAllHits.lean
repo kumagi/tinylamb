@@ -10,7 +10,7 @@ losing a match. SQL execution may use one compiled byte to nominate candidates.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_AnchorVerifyAllHits
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_AnchorVerifyAllHits
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
@@ -45,7 +45,7 @@ theorem filter_eq_of_pred (l : List Nat) (p q : Nat → Bool)
       rw [List.filter_cons, List.filter_cons, ih (by intro i hi; exact h i (by simp [hi]))]
       rw [h a (by simp)]
 
-theorem sound : AnchorVerifyAllHits.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.AnchorVerifyAllHits.Goal := by
   intro p s j hj
   by_cases hp : p = []
   · subst p
@@ -117,4 +117,4 @@ theorem sound : AnchorVerifyAllHits.Goal := by
     rw [hstarts_small]
     exact hcand_eq
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_AnchorVerifyAllHits
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_AnchorVerifyAllHits

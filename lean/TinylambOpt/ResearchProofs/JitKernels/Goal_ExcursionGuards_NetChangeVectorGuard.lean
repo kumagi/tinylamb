@@ -11,7 +11,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_NetChangeVe
 
 open TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
 
-theorem refute : ¬ NetChangeVectorGuard.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.NetChangeVectorGuard.Goal := by
   intro h
   have hbad := h (-5) 10 0 [-10, 10] (by native_decide) (by omega) (by native_decide)
   have hc : safe (-5) 10 0 [-10, 10] ≠ true := by native_decide

@@ -5,13 +5,13 @@ import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SameShapeBatchFusion
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SameShapeBatchFusion
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.SameShapeBatchFusion
 
-theorem sound : SameShapeBatchFusion.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.TierInvestment.SameShapeBatchFusion.Goal := by
   intro t a b hp
   cases ha : a.passes <;> cases hb : b.passes <;> simp [compiled, ha, hb] at hp ⊢ <;> rw [Nat.mul_add] <;> omega
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SameShapeBatchFusion
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SameShapeBatchFusion

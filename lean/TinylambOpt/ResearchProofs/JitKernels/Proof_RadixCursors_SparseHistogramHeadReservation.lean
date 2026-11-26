@@ -17,7 +17,7 @@ namespace Nov26.Proof_RadixCursors_SparseHistogramHeadReservation
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors.SparseHistogramHeadReservation
 
-theorem count_filter_ne_add (l : List Nat) (a cutoff : Nat) (ha : a < cutoff) :
+private theorem count_filter_ne_add (l : List Nat) (a cutoff : Nat) (ha : a < cutoff) :
     l.countP (fun x => x < cutoff) =
       l.count a + (l.filter (fun b => !b == a)).countP (fun x => x < cutoff) := by
   induction l with
@@ -34,7 +34,7 @@ theorem count_filter_ne_add (l : List Nat) (a cutoff : Nat) (ha : a < cutoff) :
         simp [List.countP_cons]
         omega
 
-theorem countP_filter_ne_of_not (l : List Nat) (a cutoff : Nat) (ha : ¬ a < cutoff) :
+private theorem countP_filter_ne_of_not (l : List Nat) (a cutoff : Nat) (ha : ¬ a < cutoff) :
     l.countP (fun x => x < cutoff) =
       (l.filter (fun b => !b == a)).countP (fun x => x < cutoff) := by
   induction l with
@@ -50,7 +50,7 @@ theorem countP_filter_ne_of_not (l : List Nat) (a cutoff : Nat) (ha : ¬ a < cut
         rw [ih]
         simp [List.countP_cons]
 
-theorem countP_eq_sum_counts (l : List Nat) (cutoff : Nat) :
+private theorem countP_eq_sum_counts (l : List Nat) (cutoff : Nat) :
     l.countP (fun x => x < cutoff) =
       ((l.eraseDups.filter (fun x => x < cutoff)).map (fun k => l.count k)).sum := by
   cases l with
@@ -97,7 +97,7 @@ decreasing_by
   have hle := List.length_filter_le (fun b => !b == a) l
   omega
 
-theorem sound : Goal := by
+theorem sound: Goal := by
   intro xs cutoff
   unfold base
   exact countP_eq_sum_counts (active xs) cutoff

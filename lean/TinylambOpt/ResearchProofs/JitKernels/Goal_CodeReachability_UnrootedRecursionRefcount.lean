@@ -1,26 +1,27 @@
 import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 
-/-! An object can appear as a direct-call target without being reachable from
-the roots: its caller may itself be dead. Reference counting by appearance in
-call tables would therefore keep unreachable code alive. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_UnrootedRecursionRefcount
 
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 
-theorem refute : ¬ UnrootedRecursionRefcount.Goal := by
+/-! A call target of an unreachable object is in the flat map of call lists,
+but it is not reachable from the roots. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.CodeReachability.UnrootedRecursionRefcount.Goal := by
+  rw [UnrootedRecursionRefcount.Goal]
   intro h
-  let heap : List Obj := [
-    { key := (0, 0), calls := [], bytes := 0 },
-    { key := (0, 1), calls := [(0, 2)], bytes := 0 },
-    { key := (0, 2), calls := [], bytes := 0 }]
-  let o : Obj := { key := (0, 2), calls := [], bytes := 0 }
-  have bad := h heap [(0, 0)] o (by native_decide)
-  have hnot : (0, 2) ∉ mark heap [(0, 0)] heap.length := by native_decide
-  have hrhs : (0, 2) ∈ ([(0, 0)] : List Key) ∨ (0, 2) ∈ heap.flatMap Obj.calls := by
+  let o : Obj := ⟨(1,0),[(2,0)],3⟩
+  let heap := [⟨(0,0),[],0⟩, o, ⟨(2,0),[],0⟩]
+  have hrhs : (2,0) ∈ [(0,0)] ∨ (2,0) ∈ heap.flatMap Obj.calls := by
+    change (2,0) ∈ [(0,0)] ∨ (2,0) ∈ ([] ++ [(2,0)] ++ [])
+    simp
+  have hf : (2,0) ∈ mark heap [(0,0)] heap.length :=
+    (h heap [(0,0)] ⟨(2,0),[],0⟩ (by simp [heap])).mpr hrhs
+  have hnot : (2,0) ∉ mark heap [(0,0)] heap.length := by
     native_decide
-  exact hnot (bad.mpr hrhs)
+  exact hnot hf
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_UnrootedRecursionRefcount

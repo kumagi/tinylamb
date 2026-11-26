@@ -1,6 +1,6 @@
 import TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
-/-
+/-!
 Refutes `LowestSourceOrdinalIsFirstFault`: a selection vector that reorders
 faulty rows can report a later source ordinal as the first compacted fault.
 The witness uses `sel = [1,0]` with errors at both sources.
@@ -9,7 +9,7 @@ The witness uses `sel = [1,0]` with errors at both sources.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_LowestSourceOrdinalIsFirstFault
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_LowestSourceOrdinalIsFirstFault
 
 open TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
@@ -23,4 +23,4 @@ theorem refute : ¬ LowestSourceOrdinalIsFirstFault.Goal := by
   have hbad := h xs sel 0 5 hf 1 0 7 hs hx
   simp [sel] at hbad
 
-end TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_LowestSourceOrdinalIsFirstFault
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_LowestSourceOrdinalIsFirstFault

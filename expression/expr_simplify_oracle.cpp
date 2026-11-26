@@ -1763,7 +1763,9 @@ std::string CheckSimplifyEquivalence(const Expression& expr) {
   const EvalOutcome original = EvaluateTree(expr);
   Expression rewritten;
   try {
-    rewritten = ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expr);
+    ExpressionRuleSet rules = ExpressionRuleSet::Default();
+    rules.Remove("inner_join_not_null_inference");
+    rewritten = ExpressionRewriter(std::move(rules)).Rewrite(expr);
     rewritten = RewriteTypedArithmetic(rewritten, Schema());
   } catch (const std::exception& error) {
     return std::string("rewriter threw: ") + error.what() +

@@ -1,5 +1,4 @@
 import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
-import TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
 import TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_BoundedCodeClosure
 
 /-! A second collection after the roots shrink can reuse the already trimmed
@@ -14,7 +13,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_SnapshotEv
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 open TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
 
-theorem sound : SnapshotEvictionThenRootShrinks.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.CodeReachability.SnapshotEvictionThenRootShrinks.Goal := by
   intro heap a b hsub
   let liveA := mark heap a heap.length
   let kept := retain heap liveA

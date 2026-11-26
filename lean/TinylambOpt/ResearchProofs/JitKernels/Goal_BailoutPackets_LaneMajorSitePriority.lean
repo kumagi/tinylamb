@@ -1,24 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
-/-
-Refutes `LaneMajorSitePriority`: lane-major merging lets a later site's error
-win over an earlier row's error from the other pass. The witness puts an error
-at row 1 of `a` and row 0 of `b`.
--/
+/-! The lane-major fallback is refuted: an error in an earlier lane of the
+    primary packet can be hidden by a fault selected from the secondary packet. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_LaneMajorSitePriority
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_LaneMajorSitePriority
 
 open TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
 
-theorem refute : ¬ LaneMajorSitePriority.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BailoutPackets.LaneMajorSitePriority.Goal := by
   intro h
   let a : List Cell := [.ok (some 0), .error 5]
-  let b : List Cell := [.error 7, .ok (some 0)]
-  have hlen : a.length = b.length := by native_decide
-  have hbad := h a b hlen
-  simp [first, bad, a, b] at hbad
+  let b : List Cell := [.error 7, .ok (some 1)]
+  have hh := h a b (by native_decide)
+  have hne : (((first a).orElse (fun _ => first b)) ≠
+      (first (a.zipWith (fun x y => if bad x then x else y) b))) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.BailoutPackets.Goal_LaneMajorSitePriority
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BailoutPackets_LaneMajorSitePriority

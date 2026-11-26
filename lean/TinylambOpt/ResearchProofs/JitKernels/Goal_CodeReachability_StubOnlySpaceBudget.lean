@@ -1,28 +1,26 @@
 import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 
-/-! A chain of one-call bodies can be longer than one callee per root. The
-one-extra-callee-per-root budget therefore undercharges reachable code and
-cannot bound reclamation by root count alone. -/
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+/-! An out-degree-one call chain can be longer than one callee per root, so
+    the proposed stub-only space budget is refuted. -/
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_StubOnlySpaceBudget
 
 open TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 
-theorem refute : ¬ StubOnlySpaceBudget.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.CodeReachability.StubOnlySpaceBudget.Goal := by
   intro h
-  let heap : List Obj := [
-    { key := (0, 0), calls := [(0, 1)], bytes := 1 },
-    { key := (0, 1), calls := [(0, 2)], bytes := 1 },
-    { key := (0, 2), calls := [], bytes := 1 }]
-  let roots : List Key := [(0, 0)]
-  have bad := h heap roots (by native_decide) (by native_decide)
-  have hleft : ((retain heap (mark heap roots heap.length)).map Obj.bytes).sum = 3 := by
+  let k0 : Key := (0,0)
+  let k1 : Key := (1,0)
+  let k2 : Key := (2,0)
+  let k3 : Key := (3,0)
+  let heap : List Obj := [{ key := k0, calls := [k1], bytes := 1 },
+    { key := k1, calls := [k2], bytes := 1 },
+    { key := k2, calls := [k3], bytes := 1 },
+    { key := k3, calls := [], bytes := 1 }]
+  have hh := h heap [k0] (by native_decide) (by native_decide)
+  have hne : ¬ (((retain heap (mark heap [k0] heap.length)).map Obj.bytes).sum ≤
+      ((retain heap [k0]).map Obj.bytes).sum + [k0].length * ((heap.map Obj.bytes).max?.getD 0)) := by
     native_decide
-  have hright : ((retain heap roots).map Obj.bytes).sum + roots.length * ((heap.map Obj.bytes).max?.getD 0) = 2 := by
-    native_decide
-  rw [hleft, hright] at bad
-  omega
+  exact hne hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_CodeReachability_StubOnlySpaceBudget

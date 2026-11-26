@@ -118,7 +118,7 @@ theorem sum_min_eq_sum : ∀ (xs : List Nat) (T : Nat), (∀ n ∈ xs, n ≤ T) 
       simp only [List.map_cons, List.sum_cons]
       rw [hn, ih T htail]
 
-theorem conservation : UsefulLaneIterationConservation.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DivergentWaves.UsefulLaneIterationConservation.Goal := by
   intro xs
   rw [f_eq_min_sum]
   apply sum_min_eq_sum

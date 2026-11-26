@@ -10,7 +10,7 @@ needle has no nonempty proper border.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_UnborderedHitAdvance
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_UnborderedHitAdvance
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
@@ -64,4 +64,4 @@ theorem sound : UnborderedHitAdvance.Goal := by
     rw [hkd]
     exact hov.symm
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_UnborderedHitAdvance
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_UnborderedHitAdvance

@@ -7,7 +7,7 @@ exact key match under coherence. No payload read is needed: the probe result is
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_TagNegativeSkipsPayloadPage
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_TagNegativeSkipsPayloadPage
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
@@ -38,7 +38,7 @@ theorem takeWhileMem (p : Slot → Bool) :
         · simp [ih a ha]
       · simp [hp] at ha
 
-theorem sound : TagNegativeSkipsPayloadPage.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe.TagNegativeSkipsPayloadPage.Goal := by
   intro xs f k hc hneg
   have hno : ¬ ∃ s ∈ xs, tagHit (f k) s = true := by
     intro hex
@@ -63,4 +63,4 @@ theorem sound : TagNegativeSkipsPayloadPage.Goal := by
   unfold probe
   exact findSomeEqNoneMem (value k) xs hval (untilEmpty xs) (takeWhileMem _ xs)
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_TagNegativeSkipsPayloadPage
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_TagNegativeSkipsPayloadPage

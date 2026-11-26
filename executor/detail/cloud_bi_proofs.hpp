@@ -157,16 +157,12 @@ using EqualityDeleteHorizon =
 [[nodiscard]] inline bool CanPruneEqDeleteByBounds(
     int64_t file_lo, int64_t file_hi, bool file_has_null,
     std::span<const IcebergEqDelete> eq_deletes) {
-  for (const auto& d : eq_deletes) {
+  return std::ranges::all_of(eq_deletes, [&](const auto& d) {
     if (!d.key.has_value()) {
-      if (file_has_null) {
-        return false;
-      }
-    } else if (*d.key >= file_lo && *d.key <= file_hi) {
-      return false;
+      return !file_has_null;
     }
-  }
-  return true;
+    return *d.key < file_lo || *d.key > file_hi;
+  });
 }
 
 // FieldIdProbe.Goal: resolve equality-delete field IDs into physical column
@@ -183,9 +179,9 @@ using EqualityDeleteHorizon =
   for (const uint64_t fid : probe_fields) {
     const auto it = pos.find(fid);
     if (it != pos.end()) {
-      offsets.push_back(it->second);
+      offsets.emplace_back(it->second);
     } else {
-      offsets.push_back(std::nullopt);
+      offsets.emplace_back(std::nullopt);
     }
   }
   return offsets;

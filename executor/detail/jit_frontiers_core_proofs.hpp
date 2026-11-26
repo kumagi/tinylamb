@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace tinylamb::benchmark_rematch {
@@ -472,13 +473,13 @@ struct JitBailoutCheckpoint {
 [[nodiscard]] constexpr bool BallotLimitReachedBeforeFault(
     uint64_t pass_mask, uint64_t fault_mask, size_t limit) noexcept {
   if (fault_mask == 0) {
-    return static_cast<size_t>(std::popcount(pass_mask)) >= limit;
+    return std::cmp_greater_equal(std::popcount(pass_mask), limit);
   }
-  const unsigned first_fault_bit =
+  const auto first_fault_bit =
       static_cast<unsigned>(std::countr_zero(fault_mask));
   const uint64_t before_fault =
       first_fault_bit == 0 ? 0ULL : ((uint64_t{1} << first_fault_bit) - 1U);
-  return static_cast<size_t>(std::popcount(pass_mask & before_fault)) >= limit;
+  return std::cmp_greater_equal(std::popcount(pass_mask & before_fault), limit);
 }
 
 }  // namespace tinylamb::benchmark_rematch

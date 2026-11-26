@@ -155,7 +155,7 @@ void ValidityBitmap::ToContiguousRanges(std::vector<RowRange>* out,
       continue;
     }
     const uint32_t word_base = base + static_cast<uint32_t>(word_idx * 64);
-    const size_t valid_bits = std::min<size_t>(64, size_ - word_idx * 64);
+    const size_t valid_bits = std::min<size_t>(64, size_ - (word_idx * 64));
     if (valid_bits < 64) {
       w &= (uint64_t{1} << valid_bits) - 1ULL;
     }
@@ -164,22 +164,22 @@ void ValidityBitmap::ToContiguousRanges(std::vector<RowRange>* out,
           out->back().start + out->back().length == word_base) {
         out->back().length += 64;
       } else {
-        out->push_back(RowRange{word_base, 64});
+        out->push_back(RowRange{.start = word_base, .length = 64});
       }
       continue;
     }
     uint32_t bit_offset = 0;
     while (w != 0) {
-      const uint32_t zeros = static_cast<uint32_t>(std::countr_zero(w));
+      const auto zeros = static_cast<uint32_t>(std::countr_zero(w));
       w >>= zeros;
       bit_offset += zeros;
-      const uint32_t ones = static_cast<uint32_t>(std::countr_one(w));
+      const auto ones = static_cast<uint32_t>(std::countr_one(w));
       const uint32_t run_start = word_base + bit_offset;
       if (!out->empty() &&
           out->back().start + out->back().length == run_start) {
         out->back().length += ones;
       } else {
-        out->push_back(RowRange{run_start, ones});
+        out->push_back(RowRange{.start = run_start, .length = ones});
       }
       if (ones >= 64) {
         break;

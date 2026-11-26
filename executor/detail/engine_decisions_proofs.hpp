@@ -121,9 +121,7 @@ ComputeSortedRangeFingerSpans(std::span<const int64_t> sorted_left,
     while (lo_idx < sorted_right.size() && sorted_right[lo_idx] < lo_key) {
       ++lo_idx;
     }
-    if (hi_idx < lo_idx) {
-      hi_idx = lo_idx;
-    }
+    hi_idx = std::max(hi_idx, lo_idx);
     while (hi_idx < sorted_right.size() && sorted_right[hi_idx] <= hi_key) {
       ++hi_idx;
     }

@@ -17,26 +17,26 @@ namespace Nov26.Proof_RadixCursors_SwizzleBucketOrder
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors.SwizzleBucketOrder
 
-theorem countP_swap_heads (a b : Nat) (l : List Nat) (p : Nat → Bool) :
+private theorem countP_swap_heads (a b : Nat) (l : List Nat) (p : Nat → Bool) :
     (a :: b :: l).countP p = (b :: a :: l).countP p := by
   simp only [List.countP_cons]
   omega
-theorem count_swap_heads (a b k : Nat) (l : List Nat) :
+private theorem count_swap_heads (a b k : Nat) (l : List Nat) :
     (a :: b :: l).count k = (b :: a :: l).count k := by
   simp only [List.count_cons]
   omega
-theorem countP_swap_pref (A : List Nat) (a b : Nat) (l : List Nat) (p : Nat → Bool) :
+private theorem countP_swap_pref (A : List Nat) (a b : Nat) (l : List Nat) (p : Nat → Bool) :
     (A ++ a :: b :: l).countP p = (A ++ b :: a :: l).countP p := by
   induction A with
   | nil => exact countP_swap_heads a b l p
   | cons z A ih => change (z :: (A ++ a :: b :: l)).countP p = (z :: (A ++ b :: a :: l)).countP p; simp [List.countP_cons, ih]
-theorem count_swap_pref (A : List Nat) (a b k : Nat) (l : List Nat) :
+private theorem count_swap_pref (A : List Nat) (a b k : Nat) (l : List Nat) :
     (A ++ a :: b :: l).count k = (A ++ b :: a :: l).count k := by
   induction A with
   | nil => exact count_swap_heads a b k l
   | cons z A ih => change (z :: (A ++ a :: b :: l)).count k = (z :: (A ++ b :: a :: l)).count k; simp [List.count_cons, ih]
 
-theorem active_swap_base_pref (pre : List (Option Nat)) (x y : Option Nat)
+private theorem active_swap_base_pref (pre : List (Option Nat)) (x y : Option Nat)
     (rest : List (Option Nat)) (k : Nat) :
     base (pre ++ x :: y :: rest) k = base (pre ++ y :: x :: rest) k := by
   unfold base active
@@ -48,7 +48,7 @@ theorem active_swap_base_pref (pre : List (Option Nat)) (x y : Option Nat)
       | none => simp
       | some b => exact countP_swap_pref _ a b _ _
 
-theorem active_swap_rank_pref (pre : List (Option Nat)) (x y : Option Nat)
+private theorem active_swap_rank_pref (pre : List (Option Nat)) (x y : Option Nat)
     (rest : List (Option Nat)) (p k : Nat) :
     rank (pre ++ x :: y :: rest) (pre.length + 2 + p) k =
       rank (pre ++ y :: x :: rest) (pre.length + 2 + p) k := by
@@ -71,7 +71,7 @@ theorem active_swap_rank_pref (pre : List (Option Nat)) (x y : Option Nat)
       | none => simp
       | some b => exact count_swap_pref _ a b k _
 
-theorem dst_swap_pref_prefix (pre : List (Option Nat)) (x y : Option Nat)
+private theorem dst_swap_pref_prefix (pre : List (Option Nat)) (x y : Option Nat)
     (rest : List (Option Nat)) (i : Nat) (hi : i < pre.length) :
     dst (pre ++ x :: y :: rest) i = dst (pre ++ y :: x :: rest) i := by
   have hget : (pre ++ x :: y :: rest)[i]? = pre[i]? := by
@@ -97,7 +97,7 @@ theorem dst_swap_pref_prefix (pre : List (Option Nat)) (x y : Option Nat)
             rw [htake, htake']
           simp [dst, h1, h2, hrank, active_swap_base_pref]
 
-theorem dst_swap_pref_tail (pre : List (Option Nat)) (x y : Option Nat)
+private theorem dst_swap_pref_tail (pre : List (Option Nat)) (x y : Option Nat)
     (rest : List (Option Nat)) (p : Nat) :
     dst (pre ++ x :: y :: rest) (pre.length + 2 + p) =
       dst (pre ++ y :: x :: rest) (pre.length + 2 + p) := by
@@ -133,7 +133,7 @@ theorem dst_swap_pref_tail (pre : List (Option Nat)) (x y : Option Nat)
           have h2 : (pre ++ y :: x :: rest)[pre.length + 2 + p]? = some (some k) := by simpa [h] using hget'
           simp [dst, h1, h2, active_swap_base_pref, active_swap_rank_pref]
 
-theorem range_add_two (n : Nat) :
+private theorem range_add_two (n : Nat) :
     List.range (n + 2) = 0 :: 1 :: (List.range n).map (fun p => p + 2) := by
   rw [show n + 2 = (n + 1) + 1 by omega]
   rw [List.range_succ_eq_map]
@@ -142,7 +142,7 @@ theorem range_add_two (n : Nat) :
   rw [List.range_succ_eq_map]
   simp [List.map_map, Function.comp_def, Nat.succ_eq_add_one]
 
-theorem filterMap_eq_of_mem {α β : Type} (f g : α → Option β) (l : List α)
+private theorem filterMap_eq_of_mem {α β : Type} (f g : α → Option β) (l : List α)
     (h : ∀ a ∈ l, f a = g a) : l.filterMap f = l.filterMap g := by
   induction l with
   | nil => simp
@@ -153,14 +153,14 @@ theorem filterMap_eq_of_mem {α β : Type} (f g : α → Option β) (l : List α
         exact h b (by simp [hb])
       simp [List.filterMap_cons, ha, ih hl]
 
-theorem range_append_two (p t : Nat) :
+private theorem range_append_two (p t : Nat) :
     List.range (p + (t + 2)) =
       List.range p ++ (p :: (p + 1) :: (List.range t).map (fun i => p + (i + 2))) := by
   rw [List.range_add]
   rw [range_add_two t]
   simp [List.map_append, List.map_cons, List.map_map, Function.comp_def, Nat.add_assoc]
 
-theorem head_dst_none_some (pre rest : List (Option Nat)) (c : Nat) :
+private theorem head_dst_none_some (pre rest : List (Option Nat)) (c : Nat) :
     dst (pre ++ none :: some c :: rest) (pre.length + 1) =
       dst (pre ++ some c :: none :: rest) pre.length := by
   have ht : (pre ++ none :: some c :: rest).take (pre.length + 1) = pre ++ [none] := by
@@ -169,7 +169,7 @@ theorem head_dst_none_some (pre rest : List (Option Nat)) (c : Nat) :
     simp
   simp [dst, base, rank, active, List.countP_append, ht]
 
-theorem head_dst_some_none (pre rest : List (Option Nat)) (a : Nat) :
+private theorem head_dst_some_none (pre rest : List (Option Nat)) (a : Nat) :
     dst (pre ++ some a :: none :: rest) pre.length =
       dst (pre ++ none :: some a :: rest) (pre.length + 1) := by
   have ht : (pre ++ none :: some a :: rest).take (pre.length + 1) = pre ++ [none] := by
@@ -178,7 +178,7 @@ theorem head_dst_some_none (pre rest : List (Option Nat)) (a : Nat) :
     simp
   simp [dst, base, rank, active, List.countP_append, ht]
 
-theorem head_dst_some_some_1 (pre rest : List (Option Nat)) (a b : Nat) (hne : b ≠ a) :
+private theorem head_dst_some_some_1 (pre rest : List (Option Nat)) (a b : Nat) (hne : b ≠ a) :
     dst (pre ++ some a :: some b :: rest) pre.length =
       dst (pre ++ some b :: some a :: rest) (pre.length + 1) := by
   have ht1 : (pre ++ some a :: some b :: rest).take pre.length = pre := by
@@ -194,7 +194,7 @@ theorem head_dst_some_some_1 (pre rest : List (Option Nat)) (a b : Nat) (hne : b
   have hna : ¬ a < a := by omega
   simp [hna]
 
-theorem head_dst_some_some_2 (pre rest : List (Option Nat)) (a b : Nat) (hne : a ≠ b) :
+private theorem head_dst_some_some_2 (pre rest : List (Option Nat)) (a b : Nat) (hne : a ≠ b) :
     dst (pre ++ some a :: some b :: rest) (pre.length + 1) =
       dst (pre ++ some b :: some a :: rest) pre.length := by
   have ht1 : (pre ++ some a :: some b :: rest).take (pre.length + 1) = pre ++ [some a] := by
@@ -210,7 +210,7 @@ theorem head_dst_some_some_2 (pre rest : List (Option Nat)) (a b : Nat) (hne : a
   have hnb : ¬ b < b := by omega
   simp [hnb]
 
-theorem addresses_swap_pref (pre : List (Option Nat)) (x y : Option Nat)
+private theorem addresses_swap_pref (pre : List (Option Nat)) (x y : Option Nat)
     (rest : List (Option Nat)) :
     (addresses (pre ++ x :: y :: rest)).Perm (addresses (pre ++ y :: x :: rest)) := by
   unfold addresses
@@ -259,7 +259,7 @@ theorem addresses_swap_pref (pre : List (Option Nat)) (x y : Option Nat)
             simp [dst]
             exact List.Perm.append (List.Perm.refl _) (List.Perm.swap _ _ _)
 
-theorem sound : Goal := by
+theorem sound: Goal := by
   intro a b hp
   have hgen : ∀ (pre : List (Option Nat)) (l m : List (Option Nat)), l.Perm m →
       (addresses (pre ++ l)).Perm (addresses (pre ++ m)) := by

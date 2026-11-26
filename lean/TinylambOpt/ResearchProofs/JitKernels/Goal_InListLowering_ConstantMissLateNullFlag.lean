@@ -10,7 +10,7 @@ until after the value comparison fails.
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_ConstantMissLateNullFlag
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_ConstantMissLateNullFlag
 
 open TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
@@ -22,9 +22,9 @@ theorem test_some (xs : Keys) (x : Int) :
   · simp [h]
   · simp [h]
 
-theorem sound : ConstantMissLateNullFlag.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.InListLowering.ConstantMissLateNullFlag.Goal := by
   intro xs x h
   rw [test_some]
   simp [h]
 
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_ConstantMissLateNullFlag
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_ConstantMissLateNullFlag

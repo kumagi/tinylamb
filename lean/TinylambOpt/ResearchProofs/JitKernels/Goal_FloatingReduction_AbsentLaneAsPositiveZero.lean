@@ -9,7 +9,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_FloatingReduction_AbsentLan
 
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
 
-theorem refute : ¬ AbsentLaneAsPositiveZero.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.AbsentLaneAsPositiveZero.Goal := by
   intro h
   have h' := h (Float.ofBits 0x8000000000000000) ([none] : List (Option Float))
     (by native_decide)

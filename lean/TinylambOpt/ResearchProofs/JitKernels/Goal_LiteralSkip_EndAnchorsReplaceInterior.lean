@@ -1,26 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
-/-!
-Pairwise distinct needle bytes do not make the two endpoint anchors sufficient.
-The needle `[0,1,2]` and haystack `[0,9,2]` agree at both endpoints of offset
-zero although the interior byte differs, so endpoint-only verification yields a
-spurious start.
--/
+-- Refutation: matching first and last bytes of a nodup needle does not verify interior bytes.
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_EndAnchorsReplaceInterior
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_EndAnchorsReplaceInterior
-
-open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
-
-theorem refute : ¬ EndAnchorsReplaceInterior.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.EndAnchorsReplaceInterior.Goal := by
   intro h
-  have t := h ([0, 1, 2] : B) ([0, 9, 2] : B) (by decide) (by decide)
-  have hbad : ¬ (((cand ([0, 1, 2] : B) ([0, 9, 2] : B) 0).filter
-      (anchor ([0, 1, 2] : B) ([0, 9, 2] : B) (([0, 1, 2] : B).length - 1))) =
-      starts ([0, 1, 2] : B) ([0, 9, 2] : B)) := by
-    decide
-  exact hbad t
+  have c := h ([0, 1, 2] : List UInt8) ([0, 9, 2] : List UInt8)
+    (by native_decide) (by native_decide)
+  exact (by native_decide : ¬ (
+    ((TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.cand ([0, 1, 2] : List UInt8)
+      ([0, 9, 2] : List UInt8) 0).filter
+      (TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.anchor
+        ([0, 1, 2] : List UInt8) ([0, 9, 2] : List UInt8) (([0, 1, 2] : List UInt8).length - 1))) =
+    TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.starts
+      ([0, 1, 2] : List UInt8) ([0, 9, 2] : List UInt8))) c
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_EndAnchorsReplaceInterior
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_EndAnchorsReplaceInterior

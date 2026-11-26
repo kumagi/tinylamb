@@ -31,7 +31,7 @@ private theorem fromLittle_drop_append_zeros (bs : List Nat) (s n k : Nat) :
       | nil => simp [fromLittle_replicate_zero, fromLittle]
       | cons b rest => simp [ih rest]
 
-theorem sound : ZeroPaddingMaskedWord.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.ZeroPaddingMaskedWord.Goal := by
   intro w xs i hi
   unfold load
   rw [fromLittle_drop_append_zeros]

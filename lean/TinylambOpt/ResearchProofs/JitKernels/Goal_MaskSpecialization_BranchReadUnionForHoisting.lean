@@ -1,5 +1,9 @@
 import TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization
 
+/-!
+Refutes `BranchReadUnionForHoisting`: a branch that reads a union of mask bits can observe a lane whose value is not determined by the hoisted branch mask alone.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

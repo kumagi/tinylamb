@@ -15,8 +15,6 @@
 //     sanity query ("SELECT 1") must still return exactly one row.
 #include "server/postgres_session_fuzzer.hpp"
 
-#include "common/platform/socket.hpp"
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -40,6 +38,7 @@
 #include <vector>
 
 #include "common/byte_stream.hpp"
+#include "common/platform/socket.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "server/postgres_protocol.hpp"
 #include "server/postgres_server.hpp"
@@ -69,8 +68,8 @@ class Conn {
     while (sent < bytes.size()) {
       // send()+MSG_NOSIGNAL (via the platform wrapper): a bare write() on a
       // socket delivers EPIPE as SIGPIPE and kills the fuzzer on peer close.
-      const ssize_t n = platform::SendNoSignal(
-          fd_, bytes.data() + sent, bytes.size() - sent);
+      const ssize_t n =
+          platform::SendNoSignal(fd_, bytes.data() + sent, bytes.size() - sent);
       if (n < 0 && errno == EINTR) {
         continue;
       }
@@ -201,8 +200,8 @@ int Connect(uint16_t port) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  int connected = connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                          sizeof(addr));
+  int connected =
+      connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
   if (connected != 0 && errno == EINTR) {
     struct pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
     if (poll(&pfd, 1, -1) > 0) {
@@ -784,8 +783,8 @@ void TryWriteRace(ByteStream& stream) {
           !length.HasValue() || length.Value() != b.size() - kDataOffset) {
         __builtin_trap();
       }
-      const auto [end, error] = std::from_chars(b.data() + kDataOffset,
-                                                b.data() + b.size(), value);
+      const auto [end, error] =
+          std::from_chars(b.data() + kDataOffset, b.data() + b.size(), value);
       if (error != std::errc{} || end != b.data() + b.size()) {
         (void)fprintf(stderr, "post-race DataRow value is not an integer\n");
         __builtin_trap();
@@ -936,24 +935,15 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
         return false;  // Flush answered
       }
     } else if (kind == 8) {
-      // Extended-protocol messages must be rejected as unsupported and
-      // must not change the transaction status.
-      static constexpr std::array<char, 4> kExtended = {'P', 'B', 'D', 'E'};
-      const char type = kExtended[stream.U8() % 4U];
-      std::string body;
-      if (type == 'P') {
-        body = CString("") + CString("SELECT 1");
-        pgwire::AppendUint16(&body, 0);
-      } else if (type == 'B') {
-        body = CString("") + CString("");
-        pgwire::AppendUint16(&body, 0);
-        pgwire::AppendUint16(&body, 0);
-        pgwire::AppendUint16(&body, 0);
-      }
+      // Unsupported frontend message types (outside Simple Query 'Q',
+      // Extended Query 'P'/'B'/'D'/'E'/'C', Sync 'S', Flush 'H', Terminate 'X')
+      // must be rejected with 0A000 and must not change the transaction status.
+      static constexpr std::array<char, 4> kUnsupported = {'F', 'f', 'p', 'd'};
+      const char type = kUnsupported[stream.U8() % 4U];
+      const std::string body;
       std::vector<std::pair<char, std::string>> exchange;
-      // Extended-protocol messages are answered with ErrorResponse only;
-      // ReadyForQuery is owed by the closing Sync, exactly like a real
-      // driver pipeline (Parse/Bind/.../Sync).
+      // Unsupported frontend messages are answered with ErrorResponse only;
+      // ReadyForQuery is owed by the closing Sync.
       if (!conn.Send(Frame(type, body) + Frame('S', ""))) {
         break;
       }
@@ -962,20 +952,24 @@ bool TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       }
       error_seen = false;
       const char next = CheckExchange(exchange, &error_seen, &ready_count);
-      if (next != status || ready_count != 1) {
+      // P1660: an unsupported message inside an explicit block aborts the
+      // block ('T' -> 'E'); outside one the status is unchanged ('I' / 'E').
+      const char expected_next = (status == 'T') ? 'E' : status;
+      if (next != expected_next || ready_count != 1) {
         (void)fprintf(stderr,
-                      "extended message '%c' changed status %c -> %c "
-                      "(ready=%zu)\n",
-                      type, status, next, ready_count);
+                      "unsupported message '%c' changed status %c -> %c "
+                      "(expected %c, ready=%zu)\n",
+                      type, status, next, expected_next, ready_count);
         return false;
       }
+      status = next;
       bool saw_error = false;
       for (const auto& [t, b] : exchange) {
         (void)b;
         saw_error |= t == 'E';
       }
       if (!saw_error) {
-        return false;  // extended protocol silently accepted
+        return false;  // unsupported message silently accepted
       }
     } else {
       // Malformed frame: bogus length (<4 or > limit).  The server must

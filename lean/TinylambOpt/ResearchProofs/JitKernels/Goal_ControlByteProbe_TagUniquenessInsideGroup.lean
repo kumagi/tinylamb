@@ -7,7 +7,7 @@ false hit. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_TagUniquenessInsideGroup
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_TagUniquenessInsideGroup
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
@@ -21,4 +21,4 @@ theorem refute : ¬ TagUniquenessInsideGroup.Goal := by
   have hw := h [.live 1 5 7] 9 (fun _ => 1) hc
   simp [untilEmpty, tagHit, probe, value] at hw
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_TagUniquenessInsideGroup
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_TagUniquenessInsideGroup

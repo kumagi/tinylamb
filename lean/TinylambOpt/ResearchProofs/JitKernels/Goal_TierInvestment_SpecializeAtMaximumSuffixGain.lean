@@ -5,7 +5,7 @@ import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SpecializeAtMaximumSuffixGain
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SpecializeAtMaximumSuffixGain
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.SpecializeAtMaximumSuffixGain
@@ -38,9 +38,9 @@ theorem bill_sub_bill (t : Tariff) (xs : List Batch) (i j : Nat) (hi : i < xs.le
   simp [bill, hi, hj, S, C, List.map_drop, List.map_take] at hni hnj hsc_i hsc_j hco_i hco_j ⊢
   omega
 
-theorem sound : SpecializeAtMaximumSuffixGain.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.TierInvestment.SpecializeAtMaximumSuffixGain.Goal := by
   intro t xs i j hi hj
   have hs := bill_sub_bill t xs i j hi hj
   constructor <;> intro h <;> omega
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_SpecializeAtMaximumSuffixGain
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_SpecializeAtMaximumSuffixGain

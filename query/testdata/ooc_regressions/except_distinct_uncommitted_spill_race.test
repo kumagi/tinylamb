@@ -1,0 +1,16 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1795627881370544
+-- profile: pool=65536 columnar=0 opmem=16384 spill=0 temp=0 route=0
+-- failure: query fails under memory pressure but runs without it [except+distinct] | stream: NotExists :: op 11 `q ord=0 heavy=0 take=23 nv=1 vs=720441978 ex=0 snap=0 :: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XOR(FARM_FINGERPRINT(s)) FROM (SELECT CONC...(395B)`: query fails under memory pressure but runs without it [except+distinct]: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XOR(FARM_FINGERPRINT(s)) FROM (SELECT CONCAT(IFNULL(CAST(c1 AS STRING), '~'), '|') AS s FROM (SELECT v AS c1 FROM t1 EXCEPT DISTINCT SELECT v AS c1 FROM t1 WHERE (v IS NOT NULL OR MOD(k, 2) = 
+create t0 2 274 2 1 1 1
+create t1 52 4483 3932 1000 2 0
+index t1 ix0 gv
+ins_bulk t0 75 332 314
+ins_bulk t0 333 713 991
+ins_bulk t1 195 488 197
+commit
+commit
+crash
+upd t1 all 0 0 1 0 vset 966 0 padapp 0 0
+del t1 vgt 710 0 1 0
+q ord=0 heavy=0 take=23 nv=1 vs=720441978 ex=0 snap=0 :: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XOR(FARM_FINGERPRINT(s)) FROM (SELECT CONCAT(IFNULL(CAST(c1 AS STRING), '~'), '|') AS s FROM (SELECT v AS c1 FROM t1 EXCEPT DISTINCT SELECT v AS c1 FROM t1 WHERE (v IS NOT NULL OR MOD(k, 2) = 0) EXCEPT DISTINCT SELECT v AS c1 FROM t1 WHERE k BETWEEN 1 AND 1 AND pad LIKE '3%'))

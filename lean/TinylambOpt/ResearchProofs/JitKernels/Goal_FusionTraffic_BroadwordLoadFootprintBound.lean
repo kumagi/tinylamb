@@ -238,7 +238,7 @@ theorem map_sub_nodup {l : List Nat} (c : Nat) (h : l.Nodup) (hc : ∀ x ∈ l, 
         exact hnot hx
       · exact ih (List.nodup_cons.mp h).2 has_c
 
-theorem sound : BroadwordLoadFootprintBound.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.FusionTraffic.BroadwordLoadFootprintBound.Goal := by
   intro base n w hw
   by_cases hn : n = 0
   · subst n

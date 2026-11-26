@@ -11,7 +11,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ExcursionGuards_HorizontalT
 
 open TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
 
-theorem refute : ¬ HorizontalTreeSafety.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards.HorizontalTreeSafety.Goal := by
   intro h
   have hbad := h (-150) 150 0 [-100] [200] [-100] (by omega) (by omega) (by native_decide)
   have hc : safe (-150) 150 0 [200] ≠ true := by native_decide

@@ -1,5 +1,6 @@
 import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
 import TinylambOpt.ResearchProofs.JitKernels.Common_CodeReachability
+set_option linter.unusedSimpArgs false
 
 /-! Marking worker stacks and parked continuations separately and taking the
 union equals one traversal from their concatenation: growth distributes over

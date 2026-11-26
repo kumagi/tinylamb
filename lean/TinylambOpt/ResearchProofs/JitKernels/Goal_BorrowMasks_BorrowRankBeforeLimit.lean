@@ -1,25 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
 
-/-
-Refutes `BorrowRankBeforeLimit`: borrow-contaminated lanes inflate the
-popcount of the subtract mask before a LIMIT boundary. The witness `0x0100`
-with `n = 2` counts two subtract-mask lanes but one zero byte.
--/
+/-! The subtract mask is refuted as a ballot: a zero byte propagates a borrow
+    into the following byte, creating an extra marked lane. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowRankBeforeLimit
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowRankBeforeLimit
-
-open TinylambOpt.ResearchGoals.SwarDigitBallot
 open TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
+open TinylambOpt.ResearchGoals.SwarDigitBallot
 
-theorem refute : ¬ BorrowRankBeforeLimit.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.BorrowMasks.BorrowRankBeforeLimit.Goal := by
   intro h
-  have heq := h 0x0202020202020100 2 (by omega)
-  have hf : marked (fast 0x0202020202020100) = [0,1] := by native_decide
-  have hz : marked (zeroBytes 0x0202020202020100) = [0] := by native_decide
-  rw [hf, hz] at heq
-  contradiction
+  let x : W := 0x0100
+  have hh := h x 2 (by omega)
+  have hne : (((marked (fast x)).filter (fun i => i < 2)).length ≠
+      ((marked (zeroBytes x)).filter (fun i => i < 2)).length) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.BorrowMasks.Goal_BorrowRankBeforeLimit
+end TinylambOpt.ResearchProofs.JitKernels.Goal_BorrowMasks_BorrowRankBeforeLimit

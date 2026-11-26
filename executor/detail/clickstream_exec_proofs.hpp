@@ -138,25 +138,26 @@ struct LexPairKey {
 }
 
 [[nodiscard]] constexpr LexPairKey LeastKeyInRectAboveFence(
-    LexPairKey fence, uint64_t xl, uint64_t yl, uint64_t yh) noexcept {
-  if (fence.x < xl) {
-    return {.x = xl, .y = yl};
+    LexPairKey fence, uint64_t x_lo, uint64_t y_lo, uint64_t y_hi) noexcept {
+  if (fence.x < x_lo) {
+    return {.x = x_lo, .y = y_lo};
   }
-  if (fence.y <= yh) {
-    return {.x = fence.x, .y = std::max(yl, fence.y)};
+  if (fence.y <= y_hi) {
+    return {.x = fence.x, .y = std::max(y_lo, fence.y)};
   }
-  return {.x = fence.x + 1, .y = yl};
+  return {.x = fence.x + 1, .y = y_lo};
 }
 
 [[nodiscard]] constexpr bool GranuleIntersectsRect(LexPairKey first,
-                                                   LexPairKey last, uint64_t xl,
-                                                   uint64_t xh, uint64_t yl,
-                                                   uint64_t yh) noexcept {
-  if (xl > xh || yl > yh) {
+                                                   LexPairKey last,
+                                                   uint64_t x_lo, uint64_t x_hi,
+                                                   uint64_t y_lo,
+                                                   uint64_t y_hi) noexcept {
+  if (x_lo > x_hi || y_lo > y_hi) {
     return false;
   }
-  const LexPairKey cand = LeastKeyInRectAboveFence(first, xl, yl, yh);
-  return cand.x <= xh && LexPairLe(cand, last);
+  const LexPairKey cand = LeastKeyInRectAboveFence(first, x_lo, y_lo, y_hi);
+  return cand.x <= x_hi && LexPairLe(cand, last);
 }
 
 // DefaultGroups.Goal: compute exact GROUP BY multiplicity of a target tuple

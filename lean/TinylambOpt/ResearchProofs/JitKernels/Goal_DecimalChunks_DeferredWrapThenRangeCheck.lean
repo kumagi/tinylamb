@@ -1,19 +1,14 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-! A wrapped accumulator can have a small residue while its true magnitude is
-out of range. Decimal `"8"` at width two has residue 8 modulo 8, yet 8 does not
-fit the signed width, so the final range check cannot be deferred this way. -/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_DeferredWrapThenRangeCheck
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_DeferredWrapThenRangeCheck
-
-open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
-
-theorem refute : ¬ DeferredWrapThenRangeCheck.Goal := by
+/-- A wrapped magnitude can be small even when the true decimal value is out of range:
+`4 = 2^(1+1)` wraps to zero but `parse 1 false "4"` must fail. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.DeferredWrapThenRangeCheck.Goal := by
   intro h
-  have hw := h [56] 2 (by simp [digits]) (by native_decide) (by simp)
-  simp [parse, digits, magnitude] at hw
+  have c := h [52] 1 (by native_decide) (by native_decide) (by decide)
+  have bad : ¬ (TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.parse 1 false [52]).isSome := by
+    native_decide
+  exact bad c
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_DeferredWrapThenRangeCheck
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_DeferredWrapThenRangeCheck

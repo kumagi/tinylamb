@@ -16,7 +16,7 @@ namespace Nov26.Proof_RadixCursors_BucketSliceStableOrdinals
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors
 open TinylambOpt.ResearchGoals.JitKernels.RadixCursors.BucketSliceStableOrdinals
 
-theorem rank_succ_cons (a : Option Nat) (rest : List (Option Nat)) (i k : Nat) :
+private theorem rank_succ_cons (a : Option Nat) (rest : List (Option Nat)) (i k : Nat) :
     rank (a :: rest) (i + 1) k = (if a = some k then 1 else 0) + rank rest i k := by
   cases a with
   | none => simp [rank, active]
@@ -28,7 +28,7 @@ theorem rank_succ_cons (a : Option Nat) (rest : List (Option Nat)) (i k : Nat) :
       · simp [rank, active, h]
 
 /-- The same-bucket ranks of the matching lanes are exactly `0 … count-1`. -/
-theorem rank_filter_range : ∀ (xs : List (Option Nat)) (k : Nat),
+private theorem rank_filter_range : ∀ (xs : List (Option Nat)) (k : Nat),
     ((List.range xs.length).filter (fun i => xs[i]? == some (some k))).map (fun i => rank xs i k) =
       List.range ((active xs).count k) := by
   intro xs
@@ -97,7 +97,7 @@ theorem rank_filter_range : ∀ (xs : List (Option Nat)) (k : Nat),
             rw [hm, ih k]
             simp [active, hbk]
 
-theorem sound : Goal := by
+theorem sound: Goal := by
   intro xs k
   let idx := (List.range xs.length).filter (fun i => xs[i]? == some (some k))
   have hmem : ∀ i ∈ idx, xs[i]? = some (some k) := by

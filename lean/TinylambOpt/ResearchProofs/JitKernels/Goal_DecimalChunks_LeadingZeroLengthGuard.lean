@@ -1,19 +1,13 @@
 import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-/-! A leading zero makes the digit-count lower bound useless: `"01"` has two
-digits but magnitude one. It passes the length guard for width three while
-still fitting the signed range, so rejection by length alone is unsound. -/
+-- Refutation: leading zeros keep the magnitude small even when the digit count exceeds the width.
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_LeadingZeroLengthGuard
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_LeadingZeroLengthGuard
-
-open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
-
-theorem refute : ¬ LeadingZeroLengthGuard.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.LeadingZeroLengthGuard.Goal := by
   intro h
-  have hw := h 3 [48, 49] (by simp [digits]) (by native_decide)
-  simp [parse, digits, magnitude] at hw
+  have c := h 5 (List.replicate 4 48) (by native_decide) (by native_decide)
+  exact (by native_decide : ¬ (
+    TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.parse 5 false (List.replicate 4 48) = none)) c
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_LeadingZeroLengthGuard
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_LeadingZeroLengthGuard

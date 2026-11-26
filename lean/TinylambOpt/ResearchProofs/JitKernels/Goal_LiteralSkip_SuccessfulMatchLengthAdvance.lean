@@ -1,23 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
-/-!
-A self-overlapping needle has matches closer than its own length: `[0,0]`
-matches at offsets 0 and 1 of `[0,0,0]`. Advancing by the whole needle length
-after a hit would skip the second match.
--/
-
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SuccessfulMatchLengthAdvance
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SuccessfulMatchLengthAdvance
 
 open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
-theorem refute : ¬ SuccessfulMatchLengthAdvance.Goal := by
+/-! A self-overlapping needle has matches closer than its own length. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.SuccessfulMatchLengthAdvance.Goal := by
+  rw [SuccessfulMatchLengthAdvance.Goal]
   intro h
-  have t := h ([0, 0] : B) ([0, 0, 0] : B) 0 1 (by decide)
-    (by decide) (by decide) (by omega)
-  have hbad : ¬ (0 + ([0, 0] : B).length ≤ 1) := by decide
-  exact hbad t
+  have hh := h ([0,0] : B) ([0,0,0] : B) 0 1 (by native_decide)
+    (by native_decide) (by native_decide) (by omega)
+  have hbad : ¬ (0 + ([0,0] : B).length ≤ 1) := by native_decide
+  exact hbad hh
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_SuccessfulMatchLengthAdvance
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_SuccessfulMatchLengthAdvance

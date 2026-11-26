@@ -173,10 +173,16 @@ TEST(ProtoTextHelpersTest,
   EXPECT_FALSE(NormalizeProtoText("a < b: } >").has_value());
   EXPECT_FALSE(NormalizeProtoText("a < b: { >").has_value());
   const auto norm1 = NormalizeProtoText("a < b: 1 >");
-  ASSERT_TRUE(norm1.has_value());
+  if (!norm1.has_value()) {
+    ADD_FAILURE() << "expected norm1 to have a value";
+    return;
+  }
   EXPECT_EQ(*norm1, "a { b: 1 }");
   const auto norm2 = NormalizeProtoText(*norm1);
-  ASSERT_TRUE(norm2.has_value());
+  if (!norm2.has_value()) {
+    ADD_FAILURE() << "expected norm2 to have a value";
+    return;
+  }
   EXPECT_EQ(*norm2, *norm1);
 }
 

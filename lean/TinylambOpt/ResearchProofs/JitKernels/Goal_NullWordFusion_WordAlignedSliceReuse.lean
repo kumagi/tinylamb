@@ -7,7 +7,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_NullWordFusion_WordAlignedS
 
 open TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
 
-theorem sound : WordAlignedSliceReuse.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.WordAlignedSliceReuse.Goal := by
   intro ws base n
   unfold lanes
   rw [List.range_add]

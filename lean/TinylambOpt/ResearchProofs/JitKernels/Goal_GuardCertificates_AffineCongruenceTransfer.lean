@@ -8,7 +8,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_GuardCertificates_AffineCon
 open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
 
 
-theorem sound : AffineCongruenceTransfer.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.AffineCongruenceTransfer.Goal := by
   intro d m c x hmne hm hx
   have hdiv : (d.modulus : Int) ∣ x - d.residue := Int.dvd_of_emod_eq_zero hx.2.2
   rcases hdiv with ⟨t, ht⟩

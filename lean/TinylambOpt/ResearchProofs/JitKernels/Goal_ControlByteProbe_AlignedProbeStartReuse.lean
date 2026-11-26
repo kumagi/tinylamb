@@ -1,20 +1,18 @@
 import TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
-/-! Two homes in the same alignment block need not see the same lanes: starting
-at the second slot puts the vacancy ahead of the key, so the result differs. -/
+/-! Two homes in the same aligned block need not have the same probe result:
+    the first home may terminate at a vacant slot before the second home. -/
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_AlignedProbeStartReuse
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_AlignedProbeStartReuse
 
 open TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
 
-theorem refute : ¬ AlignedProbeStartReuse.Goal := by
+theorem refute :
+    ¬ TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe.AlignedProbeStartReuse.Goal := by
   intro h
-  have hw := h [.live 1 9 7, .empty] 0 1 2 9 (by decide) (by decide) (by decide) (by decide)
-  have hdiff : probe (ring [.live 1 9 7, .empty] 0) 9 ≠ probe (ring [.live 1 9 7, .empty] 1) 9 := by
-    native_decide
-  exact hdiff hw
+  let xs : List Slot := [.empty, .live 1 9 7, .live 1 9 8]
+  have hh := h xs 0 1 2 9 (by omega) (by native_decide) (by native_decide) (by omega)
+  have hne : (probe (ring xs 0) 9 ≠ probe (ring xs 1) 9) := by native_decide
+  exact hne hh
 
-end TinylambOpt.ResearchProofs.JitKernels.ControlByteProbe.Goal_AlignedProbeStartReuse
+end TinylambOpt.ResearchProofs.JitKernels.Goal_ControlByteProbe_AlignedProbeStartReuse

@@ -37,7 +37,7 @@ theorem mod_pow_cancel (A B : Nat) (shift w k : Nat) (hk : shift + w ≤ 8*k) :
   rw [show 2^w * 2^(8*k - shift - w) * B = 2^w * (2^(8*k-shift-w)*B) by simp [Nat.mul_assoc]]
   rw [Nat.add_mul_mod_self_left]
 
-theorem sound : TwoWordCrossingDecode.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads.TwoWordCrossingDecode.Goal := by
   intro bs w i hw hcanon
   unfold load takeAt
   let s := i*w/8

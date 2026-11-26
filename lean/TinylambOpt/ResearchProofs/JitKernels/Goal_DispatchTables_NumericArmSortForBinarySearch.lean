@@ -1,22 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-/-! Refutation: sorting CASE arms by lower bound destroys first-match priority
-when ranges overlap. A narrow arm listed first wins at its key; after sorting, a
-wider arm with a smaller lower bound wins instead, changing the SQL result. -/
+/-! Sorting CASE arms by lower bound is refuted: an overlapping arm with a
+    larger lower bound can lose first-match priority at an interior key. -/
 
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_NumericArmSortForBinarySearch
 
 open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-theorem refute : ¬ NumericArmSortForBinarySearch.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.DispatchTables.NumericArmSortForBinarySearch.Goal := by
   intro h
-  let arms : List Arm := [{ lo := 2, hi := 3, result := some 2 }, { lo := 0, hi := 10, result := some 1 }]
-  have hbad := h arms 2
-  have hc : pick (arms.mergeSort (fun a b => decide (a.lo ≤ b.lo))) 2 ≠ pick arms 2 := by
+  let a : Arm := { lo := 1, hi := 10, result := some 1 }
+  let b : Arm := { lo := 0, hi := 5, result := some 2 }
+  have hh := h [a,b] 1
+  have hne : (pick ([a,b].mergeSort (fun x y => decide (x.lo ≤ y.lo))) 1 ≠ pick [a,b] 1) := by
     native_decide
-  exact hc hbad
+  exact hne hh
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_NumericArmSortForBinarySearch

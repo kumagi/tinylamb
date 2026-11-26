@@ -1,20 +1,19 @@
 import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
 
-/-! A majority of passing rows does not pay for compilation when guard fees are large. -/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_CompileIfHotRowsDominate
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_CompileIfHotRowsDominate
 
 open TinylambOpt.ResearchGoals.JitKernels.TierInvestment
-open TinylambOpt.ResearchGoals.JitKernels.TierInvestment.CompileIfHotRowsDominate
 
-theorem refute : ¬ CompileIfHotRowsDominate.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.TierInvestment.CompileIfHotRowsDominate.Goal := by
   intro h
-  let t : Tariff := { compile := 0, guardFee := 0, slow := 1, fast := 0, replay := 1 }
-  let xs : List Batch := [⟨0, false⟩, ⟨0, false⟩, ⟨1, true⟩]
-  have h' := h t xs (by simp [t]) (by simp [t, xs]) (by simp [xs])
-  simp [bill, scalar, compiled, t, xs] at h'
+  let t : Tariff := ⟨1, 100, 2, 1, 0⟩
+  let xs : List Batch := [⟨2, true⟩, ⟨1, false⟩]
+  have hfast : t.fast < t.slow := by native_decide
+  have hcomp : t.compile ≤ (xs.map Batch.rows).sum := by native_decide
+  have hhot : (xs.filter Batch.passes |>.map Batch.rows).sum * 2 > (xs.map Batch.rows).sum := by
+    native_decide
+  have hres := h t xs hfast hcomp hhot
+  have hbad : ¬ bill t xs 0 ≤ bill t xs xs.length := by native_decide
+  exact hbad hres
 
-end TinylambOpt.ResearchProofs.JitKernels.TierInvestment.Goal_TierInvestment_CompileIfHotRowsDominate
+end TinylambOpt.ResearchProofs.JitKernels.Goal_TierInvestment_CompileIfHotRowsDominate

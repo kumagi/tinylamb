@@ -8,7 +8,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_GuardCertificates_Congruenc
 open TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
 
 
-theorem sound : CongruenceRulesOutZeroDivisor.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.GuardCertificates.CongruenceRulesOutZeroDivisor.Goal := by
   intro d x hm hres hx
   intro hx0
   subst x

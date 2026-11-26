@@ -17,7 +17,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_PredicatedStores_AddressIne
 
 open TinylambOpt.ResearchGoals.JitKernels.PredicatedStores
 
-theorem refute : ¬ AddressInequalityIsNoAlias.Goal := by
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.PredicatedStores.AddressInequalityIsNoAlias.Goal := by
   intro h
   have heq := h (fun _ => (0 : UInt8)) 0 4 (List.replicate 5 1) (List.replicate 5 2)
     (by omega) (by omega) (by omega) (by native_decide) (by native_decide)

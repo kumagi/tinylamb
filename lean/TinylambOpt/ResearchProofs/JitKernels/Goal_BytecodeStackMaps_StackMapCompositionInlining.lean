@@ -1,100 +1,36 @@
 import TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-/-
-Proves `StackMapCompositionInlining`: substituting rematerialization recipes
-composes tier transitions without materializing an intermediate frame. A SQL
-JIT may inline two deopt maps while preserving every logical stack value.
--/
-
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
+set_option linter.unusedVariables false
+set_option linter.unnecessarySimpa false
+set_option linter.unusedSimpArgs false
+set_option linter.deprecated false
 
-namespace TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_StackMapCompositionInlining
+/-!
+# StackMapCompositionInlining
 
+Composing two tier transitions by substituting rematerialization recipes into a
+stack map is the same as re-pointing the register file at the values of those
+recipes: `eval regs (subst f r) = eval (fun i => eval regs (f i)) r` for every
+recipe, hence the two reconstructions of a logical stack agree entry by entry.
+This lets the JIT fuse a deopt-into-deopt chain without materializing the
+intermediate frame. -/
+
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_BytecodeStackMaps_StackMapCompositionInlining
 open TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
 
-theorem eval_subst (regs : Regs) (f : Nat → Recipe) (r : Recipe) :
-    eval regs (subst f r) = eval (fun i => eval regs (f i)) r := by
+private theorem eval_subst (regs : Regs) (f : Nat → Recipe) :
+    ∀ r : Recipe, eval regs (subst f r) = eval (fun i => eval regs (f i)) r := by
+  intro r
   induction r with
   | reg i => rfl
   | lit v => rfl
-  | plus a b ihA ihB => simp [subst, eval, ihA, ihB]
-  | neg a ihA => simp [subst, eval, ihA]
+  | plus a b iha ihb => simp [eval, subst, iha, ihb]
+  | neg a ih => simp [eval, subst, ih]
 
-theorem eval_eq_of_uses (a b : Regs) (r : Recipe) (h : ∀ x ∈ uses r, a x = b x) :
-    eval a r = eval b r := by
-  induction r with
-  | reg i => exact h i (by simp [uses])
-  | lit v => rfl
-  | plus p q ihp ihq =>
-      have hp : ∀ i ∈ uses p, a i = b i := by intro i hi; exact h i (by simp [uses]; exact Or.inl hi)
-      have hq : ∀ i ∈ uses q, a i = b i := by intro i hi; exact h i (by simp [uses]; exact Or.inr hi)
-      simp [eval]
-      rw [ihp hp, ihq hq]
-  | neg p ihp =>
-      have hp : ∀ i ∈ uses p, a i = b i := by intro i hi; exact h i (by simpa [uses] using hi)
-      simp [eval]
-      rw [ihp hp]
-
-theorem idxOf_get? (r : Recipe) : ∀ l : List Recipe, r ∈ l → l[l.idxOf r]? = some r
-| [], h => by simp at h
-| a :: l, h => by
-    by_cases har : a == r
-    · have haeq : a = r := eq_of_beq har
-      subst a
-      simp
-    · have hrl : r ∈ l := by
-        simp at h
-        rcases h with hra | hrl
-        · subst a
-          simp at har
-        · exact hrl
-      rw [List.idxOf_cons, ite_eq_right har]
-      rw [List.getElem?_cons_succ]
-      exact idxOf_get? r l hrl
-
-theorem compact_get (regs : Regs) (r : Recipe) (l : List Recipe) (hr : r ∈ l) :
-    ((l.map (eval regs))[l.idxOf r]? = some (eval regs r)) := by
-  rw [List.getElem?_map, idxOf_get? r l hr]
-  rfl
-
-theorem checked_value : ∀ (w : Nat) (regs : Regs) (r : Recipe) (v : Int),
-    checked w regs r = some v → v = eval regs r := by
-  intro w regs r
-  induction r with
-  | reg i => intro v h; simpa [checked, eval] using h.symm
-  | lit v' => intro v h; simpa [checked, eval] using h.symm
-  | plus a b iha ihb =>
-      intro v h
-      cases hca : checked w regs a with
-      | none => simp [checked, hca] at h
-      | some x =>
-          cases hcb : checked w regs b with
-          | none => simp [checked, hca, hcb] at h
-          | some y =>
-              simp [checked, hca, hcb] at h
-              rcases h with ⟨hw, rfl⟩
-              simp [eval, iha x hca, ihb y hcb]
-  | neg a iha =>
-      intro v h
-      cases hca : checked w regs a with
-      | none => simp [checked, hca] at h
-      | some x =>
-          simp [checked, hca] at h
-          rcases h with ⟨hw, rfl⟩
-          simp [eval, iha x hca]
-
-theorem filterMap_optionMap (regs : Regs) (stack : List Recipe) (wanted : List Nat) :
-    wanted.filterMap (fun i => Option.map (eval regs) stack[i]?) =
-    (wanted.filterMap (fun i => stack[i]?)).map (eval regs) := by
-  induction wanted with
-  | nil => simp
-  | cons i is ih =>
-      cases hi : stack[i]? <;> simp [hi, ih]
-
-
-theorem proof : StackMapCompositionInlining.Goal := by
+theorem sound : StackMapCompositionInlining.Goal := by
   intro regs f stack
-  simp [eval_subst]
-
-end TinylambOpt.ResearchProofs.JitKernels.BytecodeStackMaps.Goal_StackMapCompositionInlining
+  induction stack with
+  | nil => rfl
+  | cons r rs ih => simp [List.map_cons, ih, eval_subst regs f r]

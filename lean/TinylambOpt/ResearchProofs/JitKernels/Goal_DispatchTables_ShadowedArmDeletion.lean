@@ -12,7 +12,7 @@ namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_ShadowedArmD
 
 open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
 
-theorem sound : ShadowedArmDeletion.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DispatchTables.ShadowedArmDeletion.Goal := by
   intro a b middle tail x hablo habhi
   have hbsub : holds b x = true → holds a x = true := by
     intro hb

@@ -1,43 +1,46 @@
 import TinylambOpt.ResearchGoals.JitKernels.InListLowering
 
-/-!
-For `WHERE IN` only acceptance (`some true`) is observed, so NULL build rows can
-be dropped. Acceptance of a non-NULL probe is exactly membership of that probe
-in the build list, and membership is unaffected by filtering out NULL entries;
-a NULL probe is never accepted. SQL execution may therefore prune NULL build
-keys from the hot set when only the positive IN result is consumed.
--/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_NullEntryFilterElision
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.InListLowering.NullEntryFilterElision.Goal := by
+  intro xs
+  induction xs with
+  | nil =>
+      intro v
+      simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+        TinylambOpt.ResearchGoals.JitKernels.InListLowering.test]
+  | cons y ys ih =>
+      cases y with
+      | none =>
+          intro v
+          cases v with
+          | none =>
+              simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                TinylambOpt.ResearchGoals.JitKernels.InListLowering.test]
+          | some val =>
+              by_cases hmem : some val ∈ ys
+              · have hna : ¬ (∀ a ∈ ys, a = none) := by
+                  intro hall
+                  have := hall (some val) hmem
+                  simp at this
+                simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                  TinylambOpt.ResearchGoals.JitKernels.InListLowering.test, hmem, hna]
+              · simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                  TinylambOpt.ResearchGoals.JitKernels.InListLowering.test, hmem]
+      | some z =>
+          intro v
+          cases v with
+          | none =>
+              simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                TinylambOpt.ResearchGoals.JitKernels.InListLowering.test]
+          | some val =>
+              by_cases hz : z = val
+              · subst z
+                simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                  TinylambOpt.ResearchGoals.JitKernels.InListLowering.test]
+              · have hz' : val ≠ z := fun h => hz h.symm
+                by_cases hmem : some val ∈ ys <;>
+                  simp [TinylambOpt.ResearchGoals.JitKernels.InListLowering.keep,
+                    TinylambOpt.ResearchGoals.JitKernels.InListLowering.test, hz, hz', hmem]
 
-namespace TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_NullEntryFilterElision
-
-open TinylambOpt.ResearchGoals.JitKernels.InListLowering
-
-theorem keep_some_eq (xs : Keys) (x : Int) :
-    keep xs (some x) = decide (some x ∈ xs) := by
-  unfold keep test
-  by_cases hm : some x ∈ xs
-  · have hn : xs ≠ [] := by
-      intro he
-      subst xs
-      simp at hm
-    simp [hm, hn]
-  · by_cases he : xs = []
-    · simp [he]
-    · simp [hm, he]
-
-theorem keep_none_false (xs : Keys) : keep xs none = false := by
-  unfold keep test
-  by_cases h : xs.isEmpty = true
-  · simp [h]
-  · simp [h]
-
-theorem sound : NullEntryFilterElision.Goal := by
-  intro xs v
-  cases v with
-  | none => rw [keep_none_false, keep_none_false]
-  | some x => rw [keep_some_eq, keep_some_eq]; simp
-
-end TinylambOpt.ResearchProofs.JitKernels.InListLowering.Goal_NullEntryFilterElision
+end TinylambOpt.ResearchProofs.JitKernels.Goal_InListLowering_NullEntryFilterElision

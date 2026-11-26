@@ -13,7 +13,7 @@ theorem window_bit (n i : Nat) (hi : i < 64) (hn : n ≤ 64) :
   rw [BitVec.getLsbD_ofNat, Nat.testBit_two_pow_sub_one, Nat.min_eq_right hn]
   simp [hi]
 
-theorem sound : NoNullsFromTailWord.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.NullWordFusion.NoNullsFromTailWord.Goal := by
   intro n m hn
   constructor
   · intro heq i hi

@@ -1,31 +1,33 @@
 import TinylambOpt.ResearchGoals.JitKernels.SampledEquality
 
-/-!
-Inside a dictionary with unique signatures, two members with equal sampled
-signatures must be the same string. This licenses reuse of an equality class
-for known build rows without a full byte comparison.
--/
-
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
 namespace TinylambOpt.ResearchProofs.JitKernels.Goal_SampledEquality_ClosedDictionarySampleEquality
 
 open TinylambOpt.ResearchGoals.JitKernels.SampledEquality
 
-theorem sound : ClosedDictionarySampleEquality.Goal := by
-  intro pool a b hnodup ha hb hs
-  rcases List.mem_iff_getElem.mp ha with ⟨i, hi, hpi⟩
-  rcases List.mem_iff_getElem.mp hb with ⟨j, hj, hpj⟩
-  have hki : (keys pool)[i]? = some (sig a) := by
-    simp [keys, List.getElem?_eq_getElem hi, hpi]
-  have hkj : (keys pool)[j]? = some (sig b) := by
-    simp [keys, List.getElem?_eq_getElem hj, hpj]
-  have hsame : (keys pool)[i]? = (keys pool)[j]? := by
-    rw [hki, hkj, hs]
-  have hij : i = j :=
-    (List.Nodup.getElem?_inj (by simpa [keys] using hi) hnodup).mp hsame
-  subst j
-  exact hpi.symm.trans hpj
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.SampledEquality.ClosedDictionarySampleEquality.Goal := by
+  have hnode : ∀ (pool : List Bytes) (x y : Bytes), (pool.map sig).Nodup →
+      x ∈ pool → y ∈ pool → sig x = sig y → x = y := by
+    intro pool
+    induction pool with
+    | nil => intro x y hnd hx hy hsig; simp at hx
+    | cons z pool ih =>
+        intro x y hnd hx hy hsig
+        simp only [List.map_cons, List.nodup_cons] at hnd
+        simp only [List.mem_cons] at hx hy
+        rcases hx with rfl | hx
+        · rcases hy with rfl | hy
+          · rfl
+          · exfalso
+            apply hnd.1
+            rw [hsig]
+            exact List.mem_map.mpr ⟨y, hy, rfl⟩
+        · rcases hy with rfl | hy
+          · exfalso
+            apply hnd.1
+            rw [← hsig]
+            exact List.mem_map.mpr ⟨x, hx, rfl⟩
+          · exact ih x y hnd.2 hx hy hsig
+  intro pool a b hnd ha hb hsig
+  exact hnode pool a b hnd ha hb hsig
 
 end TinylambOpt.ResearchProofs.JitKernels.Goal_SampledEquality_ClosedDictionarySampleEquality

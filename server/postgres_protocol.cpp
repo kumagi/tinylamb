@@ -246,7 +246,7 @@ StatusOr<std::string> RenderParamAsSqlLiteral(
                          (static_cast<uint64_t>(p[5]) << 16U) |
                          (static_cast<uint64_t>(p[6]) << 8U) |
                          static_cast<uint64_t>(p[7]);
-      const double d = std::bit_cast<double>(u);
+      const auto d = std::bit_cast<double>(u);
       if (std::isnan(d)) {
         return std::string("CAST('NaN' AS FLOAT64)");
       }
@@ -315,11 +315,10 @@ void AppendBinaryValue(std::string* wire_out, const Value& value) {
       return;
     case ValueType::kDouble:
       AppendUint32(wire_out, 8);
-      AppendUint64(wire_out,
-                   std::bit_cast<uint64_t>(value.value.double_value));
+      AppendUint64(wire_out, std::bit_cast<uint64_t>(value.value.double_value));
       return;
     case ValueType::kDate: {
-      const int32_t pg_days =
+      const auto pg_days =
           static_cast<int32_t>(value.DateDays() - kPgDateEpochOffsetDays);
       AppendUint32(wire_out, 4);
       AppendUint32(wire_out, std::bit_cast<uint32_t>(pg_days));
@@ -398,9 +397,9 @@ StatusOr<BindMessage> ParseBindMessage(std::string_view payload) {
   for (uint16_t i = 0; i < param_count; ++i) {
     ASSIGN_OR_RETURN(uint32_t, raw_len, ReadUint32(payload, cursor));
     cursor += 4;
-    const int32_t len = std::bit_cast<int32_t>(raw_len);
+    const auto len = std::bit_cast<int32_t>(raw_len);
     if (len == -1) {
-      msg.params.push_back(std::nullopt);
+      msg.params.emplace_back(std::nullopt);
       continue;
     }
     if (len < 0 || payload.size() - cursor < static_cast<size_t>(len)) {
@@ -497,7 +496,7 @@ StatusOr<std::string> BindSqlParameters(
     rendered.push_back(std::move(lit));
   }
   std::string out;
-  out.reserve(sql.size() + params.size() * 8);
+  out.reserve(sql.size() + (params.size() * 8));
   bool single_quote = false;
   bool double_quote = false;
   bool line_comment = false;
@@ -564,7 +563,7 @@ StatusOr<std::string> BindSqlParameters(
       size_t idx = 0;
       while (j < sql.size() &&
              std::isdigit(static_cast<unsigned char>(sql[j])) != 0) {
-        idx = idx * 10 + static_cast<size_t>(sql[j] - '0');
+        idx = (idx * 10) + static_cast<size_t>(sql[j] - '0');
         ++j;
       }
       if (idx == 0 || idx > rendered.size()) {
@@ -723,7 +722,8 @@ std::optional<size_t> SqlErrorPosition(std::string_view message,
   const char* const end = location.data() + location.size();
   size_t line = 0;
   size_t column = 0;
-  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): from_chars receives the explicit end pointer.
+  // from_chars receives the explicit end pointer.
+  // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
   const auto parsed_line = std::from_chars(location.data(), split, line);
   const auto parsed_col = std::from_chars(split + 1, end, column);
   if (parsed_line.ptr != split || parsed_line.ec != std::errc{} || line == 0 ||
@@ -785,7 +785,7 @@ std::string PortalSuspended() { return Message('s', {}); }
 
 std::string ParameterDescription(const std::vector<uint32_t>& param_oids) {
   std::string payload;
-  payload.reserve(2 + param_oids.size() * 4);
+  payload.reserve(2 + (param_oids.size() * 4));
   AppendUint16(&payload, static_cast<uint16_t>(param_oids.size()));
   for (const uint32_t oid : param_oids) {
     AppendUint32(&payload, oid);
@@ -910,7 +910,7 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
             continue;
           }
           case ValueType::kDate: {
-            const int32_t pg_days = static_cast<int32_t>(
+            const auto pg_days = static_cast<int32_t>(
                 col.IntegerData()[row_idx] - kPgDateEpochOffsetDays);
             std::array<char, 8> cell{};
             WriteBe32(cell.data(), 4);
@@ -1060,12 +1060,13 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
   return Status::kSuccess;
 }
 
-Status AppendDataRowsFromChunk(
-    std::string* wire_out, const DataChunk& chunk, size_t row_begin,
-    size_t row_end, size_t max_bytes,
-    const std::vector<uint16_t>& result_formats, size_t* rows_written) {
-  if (wire_out == nullptr || rows_written == nullptr ||
-      row_begin > row_end || row_end > chunk.Size()) {
+Status AppendDataRowsFromChunk(std::string* wire_out, const DataChunk& chunk,
+                               size_t row_begin, size_t row_end,
+                               size_t max_bytes,
+                               const std::vector<uint16_t>& result_formats,
+                               size_t* rows_written) {
+  if (wire_out == nullptr || rows_written == nullptr || row_begin > row_end ||
+      row_end > chunk.Size()) {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid DataChunk row range for PostgreSQL DataRow");
   }
@@ -1125,13 +1126,12 @@ Status AppendDataRowsFromChunk(
     if (max_bytes > 0) {
       const size_t rem_bytes =
           wire_out->size() < max_bytes ? (max_bytes - wire_out->size()) : 0;
-      const size_t budget_rows =
-          std::max<size_t>(1, (rem_bytes + fixed_row_bytes - 1) /
-                                  fixed_row_bytes);
+      const size_t budget_rows = std::max<size_t>(
+          1, (rem_bytes + fixed_row_bytes - 1) / fixed_row_bytes);
       count = std::min(avail, budget_rows);
     }
     const size_t base = wire_out->size();
-    wire_out->resize(base + count * fixed_row_bytes);
+    wire_out->resize(base + (count * fixed_row_bytes));
     char* dst = wire_out->data() + base;
     const auto frame_len = static_cast<uint32_t>(fixed_row_bytes - 1);
     const auto ncols = static_cast<uint16_t>(col_count);
@@ -1155,8 +1155,8 @@ Status AppendDataRowsFromChunk(
             dst += 12;
             break;
           case ValueType::kDate: {
-            const int32_t pg_days = static_cast<int32_t>(
-                col.IntegerData()[r] - kPgDateEpochOffsetDays);
+            const auto pg_days = static_cast<int32_t>(col.IntegerData()[r] -
+                                                      kPgDateEpochOffsetDays);
             WriteBe32(dst, 4);
             WriteBe32(dst + 4, std::bit_cast<uint32_t>(pg_days));
             dst += 8;
@@ -1175,8 +1175,7 @@ Status AppendDataRowsFromChunk(
     if (*rows_written > 0 && max_bytes > 0 && wire_out->size() >= max_bytes) {
       break;
     }
-    RETURN_IF_FAIL(
-        AppendDataRowFromChunk(wire_out, chunk, r, result_formats));
+    RETURN_IF_FAIL(AppendDataRowFromChunk(wire_out, chunk, r, result_formats));
     ++(*rows_written);
   }
   return Status::kSuccess;

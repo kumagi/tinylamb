@@ -1,25 +1,30 @@
 import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-/-! Certificate for `TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FinitePairwiseAccumulators.Goal`. -/
 
-/-! Floating-point addition is not associative even at finite values:
-`2^53 + 1` rounds back to `2^53`, while `1 + (-1)` is exact. -/
+/-!
+Refutes `FinitePairwiseAccumulators.Goal`: bit-identical horizontal reduction
+of two finite partial accumulators fails for the merge order. With
+`a = b = 1e308` and `c = -1e308` (all finite), the left order overflows:
+`(a + b) = +Inf`, and `+Inf + c = +Inf`; the right order cancels first:
+`b + c = +0.0` and `a + 0.0 = 1e308`. The observable bit patterns differ
+(`+Inf` vs `1e308`), so `same` fails. All witnesses are closed ground
+expressions checked by kernel `decide`. SQL execution must not horizontally
+reassociate finite accumulator lanes when a downstream negation would cancel
+the intermediate overflow.
+-/
+
 set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-set_option linter.unusedSimpArgs false
+set_option maxRecDepth 100000
+set_option exponentiation.threshold 400
+set_option linter.unusedVariables false
 
-namespace Nov26.Proof_FloatingReduction_FinitePairwiseAccumulators
-
+namespace TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FinitePairwiseAccumulators
 open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
-open TinylambOpt.ResearchGoals.JitKernels.FloatingReduction.FinitePairwiseAccumulators
 
-theorem refute : ¬ Goal := by
+theorem refute : ¬ FinitePairwiseAccumulators.Goal := by
   intro h
-  have h' := h (9007199254740992 : Float) 1 (-1)
-    (by native_decide) (by native_decide) (by native_decide)
-  have hbad : ¬ same (((9007199254740992 : Float) + 1) + (-1))
-      ((9007199254740992 : Float) + (1 + (-1))) := by
-    unfold same bits
-    native_decide
-  exact hbad h'
+  have hf : (1e308 : Float).isFinite = true := by decide
+  have h' : (((1e308 : Float) + 1e308) + -1e308).toBits
+            ≠ (1e308 + (1e308 + -1e308)).toBits := by decide
+  exact h' (h 1e308 1e308 (-1e308) hf hf hf)
 
-end Nov26.Proof_FloatingReduction_FinitePairwiseAccumulators
+end TinylambOpt.ResearchProofs.JitKernels.FloatingReduction_FinitePairwiseAccumulators

@@ -8,11 +8,11 @@ without a separate signed endpoint check. -/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
-namespace TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_NegativeAccumulatorThreshold
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_NegativeAccumulatorThreshold
 
 open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
 
-theorem sound : NegativeAccumulatorThreshold.Goal := by
+theorem sound : TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.NegativeAccumulatorThreshold.Goal := by
   intro w s hd hne
   have hp : (0 : Int) < (2 ^ w : Int) := by
     have hn : (0 : Nat) < 2 ^ w := Nat.pow_pos (a := 2) (n := w) (by decide)
@@ -30,4 +30,4 @@ theorem sound : NegativeAccumulatorThreshold.Goal := by
       exact hle hc'
     simp [parse, hne, hd, hleI, hle]
 
-end TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_NegativeAccumulatorThreshold
+end TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_NegativeAccumulatorThreshold

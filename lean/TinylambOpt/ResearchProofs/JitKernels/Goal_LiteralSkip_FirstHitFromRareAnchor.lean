@@ -1,25 +1,18 @@
 import TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
 
-/-!
-A single anchor candidate need not be an actual match. For needle `[0,1]` and
-haystack `[0,9]` the only anchor candidate at offset zero is spurious while
-there is no true start at all, so the two `head?` values differ.
--/
+namespace TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_FirstHitFromRareAnchor
 
-set_option maxHeartbeats 0
-set_option maxRecDepth 10000
-
-namespace TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_FirstHitFromRareAnchor
-
-open TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
-
-theorem refute : ¬ FirstHitFromRareAnchor.Goal := by
+/-- A unique anchor-matching candidate need not be a full match: needle `[1,2]`
+in haystack `[1,3]` has one candidate at offset 0 but no real start. -/
+theorem refute : ¬ TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.FirstHitFromRareAnchor.Goal := by
   intro h
-  have hl : (cand ([0, 1] : B) ([0, 9] : B) 0).length = 1 := by decide
-  have t := h ([0, 1] : B) ([0, 9] : B) 0 (by decide) hl
-  have hbad : ¬ ((cand ([0, 1] : B) ([0, 9] : B) 0).head? =
-      (starts ([0, 1] : B) ([0, 9] : B)).head?) := by
-    decide
-  exact hbad t
+  have c := h ([1, 2] : List UInt8) ([1, 3] : List UInt8) 0 (by decide) (by native_decide)
+  have bad :
+      (TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.cand
+          ([1, 2] : List UInt8) ([1, 3] : List UInt8) 0).head? ≠
+        (TinylambOpt.ResearchGoals.JitKernels.LiteralSkip.starts
+          ([1, 2] : List UInt8) ([1, 3] : List UInt8)).head? := by
+    native_decide
+  exact bad c
 
-end TinylambOpt.ResearchProofs.JitKernels.LiteralSkip.Goal_FirstHitFromRareAnchor
+end TinylambOpt.ResearchProofs.JitKernels.Goal_LiteralSkip_FirstHitFromRareAnchor

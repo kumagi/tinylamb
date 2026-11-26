@@ -1,4 +1,5 @@
 import TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
+set_option linter.unusedSimpArgs false
 
 /-!
 An exact reciprocal for the odd part of a divisor also gives the quotient for
