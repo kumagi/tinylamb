@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.SqlFetchWithTies
 
+/-!
+These claims compare incremental consumption of page runs with an expanded reference
+stream. An ordered SQL scan can consume runs while preserving output row order.
+
+Modeled claims
+
+- `Goal` — `∀ off k (files : List (List Row)), PrefixSorted files.flatten →
+  files.flatten.Pairwise (fun a b => a.id < b.id) → let s := run off k files s.output
+  = SqlFetchWithTies.pageSQL off k files.flatten ∧ s.peak ≤ maxRunLen (splitRuns
+  files.flatten) ∧ (k = 0 → s.peak = 0)`
+-/
+
 namespace TinylambOpt.ResearchGoals.StreamingRunPage
 
 open Research.IncrementalSortPage

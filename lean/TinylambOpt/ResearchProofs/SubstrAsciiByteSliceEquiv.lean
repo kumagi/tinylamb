@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.SubstrAsciiByteSliceEquiv
 
+/-!
+Proved
+
+- `Goal` — Signed-start 1-based ASCII `SUBSTR` O(1) byte-slice equivalence
+  (`expression/bytecode.cpp` `TryEvalSubstrView`,
+  `executor/detail/columnar_tlcs_fast_path.cpp`): on any all-ASCII input, signed
+  `start` (positive, `0`, negative, clamped) and optional `len` (negative -> error)
+  match full UTF-8 code-point slicing byte-for-byte.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.SubstrAsciiByteSliceEquiv`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SubstrAsciiByteSliceEquiv
 
 open TinylambOpt.ResearchGoals.SubstrAsciiByteSliceEquiv
@@ -73,3 +85,6 @@ theorem sound : TinylambOpt.ResearchGoals.SubstrAsciiByteSliceEquiv.Goal := by
         flatten_map_single]
 
 end TinylambOpt.ResearchProofs.SubstrAsciiByteSliceEquiv
+
+-- C++ references to this model or its proof.
+-- expression/bytecode.cpp

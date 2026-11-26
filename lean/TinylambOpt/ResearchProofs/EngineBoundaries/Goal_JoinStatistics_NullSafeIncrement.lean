@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Proved
+
+- `NullSafeIncrement` — An equality join's NULL-safe variant adds precisely the
+  NULL-by-NULL rectangle.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
-import TinylambOpt.ResearchProofs.Atlas_JoinPlans_SupplierClique_Remaining_Round2
+import TinylambOpt.ResearchProofs.Atlas.JoinPlans.SupplierCliqueCollisionAndOrbit
+
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `SupplierClique.CollisionCorrection` — `∀ n db b, injective pattern n db b =
+  ((partitions pattern.freeVars).map (fun bs => mobius bs * collapsed pattern n db b
+  bs)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -17,6 +28,6 @@ open TinylambOpt.ResearchGoals.Atlas.JoinPlans.SupplierClique
 
 theorem sound_SupplierClique_CollisionCorrection :
     SupplierClique.CollisionCorrection.Goal := by
-  exact TinylambOpt.ResearchProofs.Round2.Task79.sound_CollisionCorrection
+  exact TinylambOpt.ResearchProofs.Atlas.JoinPlans.SupplierCliqueCollisionAndOrbit.sound_CollisionCorrection
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_SupplierClique_CollisionCorrection

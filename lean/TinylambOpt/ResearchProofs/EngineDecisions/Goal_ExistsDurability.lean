@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `ExistsDurability` — The WAL end of the last *committed* truth change is the minimum
+  fence that makes this reply reproducible at every possible subsequent WAL prefix.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `CStringEnd.DictionaryMask` — Cache acceptance once per phrase; a missing local
+  dictionary code is rejected.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

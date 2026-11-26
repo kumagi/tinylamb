@@ -1208,9 +1208,12 @@ StatusOr<Value> WindowRuntime::AggregateOverFrame(
   }
   // The window expression carries an optional row-level WHERE filter.
   int64_t row_count = 0;
-  bool count_star = fn == "COUNT" && window.args.size() == 1 &&
-                    window.args[0]->Type() == TypeTag::kColumnValue &&
-                    window.args[0]->AsColumnValue().GetColumnName().name == "*";
+  bool count_star =
+      fn == "COUNT" &&
+      (window.args.empty() ||
+       (window.args.size() == 1 &&
+        window.args[0]->Type() == TypeTag::kColumnValue &&
+        window.args[0]->AsColumnValue().GetColumnName().name == "*"));
   std::vector<Value> values;
   // ARRAY_AGG(x ORDER BY k LIMIT n) keeps each row's key tuple until
   // the values have been ordered and the inner limit applied.

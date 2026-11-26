@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Common_ArrayOffsets
 
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+
+Proved
+
+- `AppendFields.LeftPrefix` — `∀ s, (model.rows s).take s.left.length = (ids
+  s.left).map lpos`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

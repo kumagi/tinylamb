@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `UnorderedPair.SymmetricMultiplicity` — `∀ rs a b, a<b → ((physical key rs).map
+  key).count (a,b) = rs.count (a,b) + rs.count (b,a)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

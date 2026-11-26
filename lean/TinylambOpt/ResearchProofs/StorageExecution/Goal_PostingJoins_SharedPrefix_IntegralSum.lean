@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `SharedPrefix.IntegralSum` — Subtraction on a stored prefix-sum column yields the
+  right payload sum.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

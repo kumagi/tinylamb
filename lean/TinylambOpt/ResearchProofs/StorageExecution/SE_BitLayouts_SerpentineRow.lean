@@ -1,6 +1,20 @@
 import Std
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved (10 claims, including the following)
+
+- `SerpentineRow.DictionaryProbe` — Read only lanes requested by a probe and translate
+  them through a possibly short dictionary.
+- `SerpentineRow.DoubleStride` — `∀ n w i b, layout.bit n w (i+2) b = layout.bit n w i
+  b + 2*w`
+- `SerpentineRow.FacingEndpoints` — `∀ n w i, i%2=0 → 0<w → layout.bit n w i (w-1)+1 =
+  layout.bit n w (i+1) (w-1)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.BitLayouts.SerpentineRow
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.Compression.Wire

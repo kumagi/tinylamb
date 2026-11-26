@@ -286,7 +286,7 @@ bool TryFilterColumnarTable(TransactionContext& context,
 
   // Fast path for `col_a op (col_b +/- const_int)` over DATE or signed INT64
   // columns (e.g. TPC-DS Q72 `d3.d_date > d1.d_date + 5`).
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (date_offset_cmp_filter_sound)
   struct FastDateOffsetCmp {
     bool active{false};

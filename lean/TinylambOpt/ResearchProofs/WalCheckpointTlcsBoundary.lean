@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.WalCheckpointTlcsBoundary
 
+/-!
+Proved
+
+- `Goal` — WAL checkpoint vs persistent TLCS boundary
+  (`recovery/checkpoint_manager.cpp`, `recovery/recovery_manager.cpp`): under
+  writes-before-commit and MVCC write-intent commit serialization, TLCS snapshot at
+  `cpLsn` plus WAL replay from `minActiveWriteLsn` agrees with full WAL replay from
+  LSN 0.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.WalCheckpointTlcsBoundary`.
+-/
+
 namespace TinylambOpt.ResearchProofs.WalCheckpointTlcsBoundary
 open TinylambOpt.ResearchGoals.WalCheckpointTlcsBoundary
 open List

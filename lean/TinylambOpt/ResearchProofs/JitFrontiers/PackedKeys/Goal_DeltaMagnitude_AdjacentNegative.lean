@@ -4,6 +4,16 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.BackFields_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Specific_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Refutations_PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Proved
+
+- `DeltaMagnitude.AdjacentNegative` — `∀ x, 0≤x → x<2^52 → encode codec (pair x
+  (x-1))=some (BitVec.ofNat 64 (x.toNat*4096+1))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

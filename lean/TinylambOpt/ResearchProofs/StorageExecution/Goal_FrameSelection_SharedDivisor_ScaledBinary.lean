@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `SharedDivisor.ScaledBinary` — `∀ g xs, 0<g → g∈xs → (∀ x∈xs, x=0 ∨ x=g) → (write
+  xs).length = ubytes g+1+byteCount xs.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

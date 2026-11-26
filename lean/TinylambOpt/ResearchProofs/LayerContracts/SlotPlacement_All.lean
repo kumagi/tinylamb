@@ -100,3 +100,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement.Goal_TwoFragments
 import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement.Goal_TwoFragments_NextBoundary
 import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement.Goal_TwoFragments_PayloadMonotone
 import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement.Goal_TwoFragments_Reservation
+
+/-!
+This module collects proofs for Model Facts Fence Stripe, Goal Aligned Word After Free,
+Goal Aligned Word Capacity Only, Goal Aligned Word Exact Failure and related cases.
+
+Page allocation for stored SQL rows must preserve the byte ranges, alignment, and live
+data required by the modeled layout.
+-/

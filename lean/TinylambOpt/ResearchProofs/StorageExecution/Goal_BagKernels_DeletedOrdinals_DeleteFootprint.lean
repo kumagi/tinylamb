@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `DeletedOrdinals.DeleteFootprint` — `∀ xs ds, weighted bag (xs,ds) (fun _ => 1) =
+  xs.length-(ds.eraseDups.filter (· < xs.length)).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

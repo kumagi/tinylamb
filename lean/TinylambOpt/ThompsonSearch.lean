@@ -1,5 +1,15 @@
 import TinylambOpt.RegexBitsetNfa
 
+/-!
+Executing one labeled graph edge advances the consumed prefix, and an epsilon edge stays
+at the same boundary. Each port has a valid index.
+
+End-to-end statement for every source AST and input, including nullable nested stars and
+matches that end strictly inside a row.
+
+Named results include `machine_search`, `compiled_search_iff`.
+-/
+
 namespace TinylambOpt.RegexBitsetNfa.Thompson
 
 private theorem snocInd {m : Word → Prop} (empty : m []) (step : ∀ w b, m w → m (w ++ [b]))
@@ -151,3 +161,7 @@ theorem compiled_search_iff (r : Regex) (w : Word) (width : Nat) (fit : (compile
   (assemble r).machine_search w width fit
 
 end TinylambOpt.RegexBitsetNfa.Thompson
+
+-- C++ references to this model or its proof.
+-- common/regex_guard.cpp
+-- common/regex_guard.hpp

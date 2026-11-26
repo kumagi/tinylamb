@@ -293,7 +293,7 @@ StatusOr<std::optional<Relation>> TryExecuteColumnarNullMaskScalarCounts(
   return std::optional<Relation>(std::move(out));
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (packed_2x32_join_key_bijection_sound,
 //   radix_partitioned_union_distinct_sound)
 StatusOr<std::optional<Relation>> TryExecuteRadixPacked2x32JoinCount(

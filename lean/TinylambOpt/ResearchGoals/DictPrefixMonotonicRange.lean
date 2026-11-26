@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Naive last-byte increment `b + 1` wraps `0xFF` to `0x00`, yielding an upper bound
+strictly smaller than `pref`.
+
+Modeled claims
+
+- `Goal` — Monotone prefix interval on sorted dictionary
+  (`columnar_tlcs_fast_path.cpp`, `pax_chunk_codecs.cpp`): binary-searching `pref`
+  and carry-aware `nextPrefix pref` produces the exact contiguous dictionary ID
+  interval `[cLo, cHi)` matching `LIKE 'prefix%'` (handling trailing `0xFF` bytes).
+-/
+
 namespace TinylambOpt.ResearchGoals.DictPrefixMonotonicRange
 
 def lexLt : List UInt8 → List UInt8 → Bool

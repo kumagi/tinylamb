@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims connect row membership and its mask representation. A vector SQL filter can
+use the mask to select exactly the modeled row positions.
+
+Modeled claims
+
+- `Goal` — `∀ enabled cols, vector enabled cols = scalar enabled cols`
+-/
+
 namespace TinylambOpt.ResearchGoals.RowInMask
 
 abbrev W := BitVec 64

@@ -2161,7 +2161,7 @@ bool SubqueryEnvDisabled(const char* name) {
   return v != nullptr && std::strcmp(v, "1") == 0;
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/IntervalCountSweep.lean (sound)
 std::unique_ptr<CorrelatedIndex> TryBuildIntervalCountSweep(
     TransactionContext& context, const SelectStatement& statement,
     const Scope& outer, const CteMap& ctes, const RelationPtr& source_cte,
@@ -4171,7 +4171,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                                                     .expression->AsColumnValue()
                                                     .GetColumnName())
                    .has_value()) {
-      // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+      // Lean proof: lean/TinylambOpt/ResearchProofs/QuantifiedRangeSummary.lean
       // (sound)
       const size_t proj_slot =
           *LocalColumnOffset(source.schema, statement.SelectList()[0]
@@ -4250,7 +4250,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                                                     .expression->AsColumnValue()
                                                     .GetColumnName())
                    .has_value()) {
-      // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+      // Lean proof: lean/TinylambOpt/ResearchProofs/DemandScalar.lean (sound)
       const size_t proj_slot =
           *LocalColumnOffset(source.schema, statement.SelectList()[0]
                                                 .expression->AsColumnValue()
@@ -4330,7 +4330,7 @@ probe_cached_index:
   ++context.execution_runtime()->correlated_index_probes;
 
   if (index->has_interval_count_sweep) {
-    // Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean
+    // Lean proof: lean/TinylambOpt/ResearchProofs/IntervalCountSweep.lean
     // (sound)
     if (scalar_answer == nullptr) {
       return std::nullopt;
@@ -4428,7 +4428,7 @@ probe_cached_index:
     }
     const Value& v0 = *v0_ptr;
     if (index->has_quantified_int_summaries) {
-      // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+      // Lean proof: lean/TinylambOpt/ResearchProofs/QuantifiedRangeSummary.lean
       // (sound)
       if (v0.IsNull()) {
         index->null_parameter_seen = true;
@@ -4519,7 +4519,7 @@ probe_cached_index:
       }
       return Relation{};
     }
-    // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+    // Lean proof: lean/TinylambOpt/ResearchProofs/DemandScalar.lean (sound)
     if (v0.IsNull()) {
       index->null_parameter_seen = true;
       *scalar_answer = Value();

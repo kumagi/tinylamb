@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Reference: flatten all chunks, group-sum all keys, sort descending by sum (tie-breaking
+ascending by key), and take `K`.
+
+Process one worker's monotonic chunk in a single streaming pass keeping at most `K`
+closed entries (`interiorTop`) plus at most 2 seam groups (`first` and `last`).
+
+Modeled claims
+
+- `Goal` — Streaming monotonic-key Top-K group-by (TPC-H Q03 on `lineitem.l_orderkey`
+  joining `orders`): under globally non-decreasing keys across worker chunks, each
+  worker buffers at most `K` closed groups while boundary seam stitching reproduces
+  exact full-table grouped Top-K.
+-/
+
 namespace TinylambOpt.ResearchGoals.MonotonicKeyStreamTopK
 
 abbrev Entry := Int × Int  -- (key, sum)

@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved (10 claims, including the following)
+
+- `Following.IntegralSum` — Subtraction on a stored prefix-sum column yields the right
+  payload sum.
+- `Following.KthMatch` — Top offset within the matching postings preserves tie
+  multiplicity and right ordering.
+- `Following.LeftMultiplicity` — Charge one left placeholder when zero right keys
+  match, including a NULL left key.
+-/
+
 set_option maxHeartbeats 0
 
 namespace Helpers_Following

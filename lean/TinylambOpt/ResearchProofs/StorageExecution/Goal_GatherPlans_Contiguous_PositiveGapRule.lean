@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `Contiguous.PositiveGapRule` — `∀ fee xs, let ks := points xs let gaps := ks.zip
+  (ks.drop 1) cost (price fee) (choose (price fee) xs) = ks.length + (if ks.isEmpty
+  then 0 else fee) + (gaps.map (fun (a,b) => min fee (b-a-1))).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

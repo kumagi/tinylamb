@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.DistinctAggMergeContract
 
+/-!
+Proved
+
+- `Goal` — `∀ (parts : List (List V)), let rows := parts.flatten let merged :=
+  mergePartial parts values merged = values rows ∧ sumValues merged = sumValues rows`
+
+The reference model is defined in `TinylambOpt.ProposedGoals.DistinctAggMergeContract`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

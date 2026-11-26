@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims compute or compare ranks for paired values. An ordered SQL operator must
+preserve the pair ordering and the rank boundaries used in its result.
+
+Modeled claims
+
+- `Goal` — `∀ left right k, selectSum left right k = reference left right k`
+-/
+
 namespace TinylambOpt.ResearchGoals.PairRank
 
 abbrev Column := List (Option UInt8)

@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.CompressedStringPrefixHashEquiv
 
+/-!
+Proved
+
+- `Goal` — Short-string inline packed prefix+length equivalence
+  (DictionaryJoinsAndLateLabels B1, B2 / STATS-CEB C4 / JOB J4 / LDBC L1, L5): for
+  every byte sequence with `s.length ≤ 7`, `pack7` is both injective (`pack7 s1 =
+  pack7 s2 ↔ s1 = s2`) and strictly order-preserving for byte-lexicographic order
+  (`pack7 s1 < pack7 s2 ↔ byteLexLt s1 s2`), whereas omitting the length byte
+  (`beWord7`) collides `[]` and `[0]`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.CompressedStringPrefixHashEquiv`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CompressedStringPrefixHashEquiv
 
 set_option maxRecDepth 100000
@@ -361,3 +375,7 @@ theorem sound : TinylambOpt.ResearchGoals.CompressedStringPrefixHashEquiv.Goal :
   · constructor <;> decide
 
 end TinylambOpt.ResearchProofs.CompressedStringPrefixHashEquiv
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp
+-- executor/detail/typed_stream_aggregate_partitioned.cpp

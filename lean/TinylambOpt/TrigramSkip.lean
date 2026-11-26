@@ -223,3 +223,6 @@ theorem raw_trigram_skip (rows : List (List Byte)) (pattern lit tri : List Byte)
       ⟨_,hr,trigrams3_of_infix a lit b tri ht⟩)))
 
 end TinylambOpt.TrigramSkip
+
+-- C++ references to this model or its proof.
+-- executor/zone_map.hpp

@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.ReciprocalDivMod
 
+/-!
+Proved
+
+- `Goal` — `∀ x d, run (prepare d) x = reference x d`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.ReciprocalDivMod`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ReciprocalDivMod
 
 open TinylambOpt.ResearchGoals.ReciprocalDivMod
@@ -414,3 +422,8 @@ theorem sound : TinylambOpt.ResearchGoals.ReciprocalDivMod.Goal := by
             exact multiply_correct a b hm2
 
 end TinylambOpt.ResearchProofs.ReciprocalDivMod
+
+-- C++ references to this model or its proof.
+-- expression/bytecode.cpp
+-- expression/bytecode.hpp
+-- expression/jit.cpp

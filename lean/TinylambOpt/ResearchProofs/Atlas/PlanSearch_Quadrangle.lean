@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `AlphabeticMerge.Quadrangle` — `∀ a b c, b ≠ [] → best (a++b) + best (b++c) ≤ best
+  (a++b++c) + best b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

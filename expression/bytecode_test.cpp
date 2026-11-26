@@ -1658,7 +1658,7 @@ TEST(BytecodeTest, SubstrAcceptsUnsignedArgumentsLikeAst) {
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/RowInMask.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/RowInMask.lean (sound)
 TEST(BytecodeTest, RowInMaskMatchesAstAcrossNullsWideTuplesAndMultiWord) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions): scoped environment restore.
     const char* name;

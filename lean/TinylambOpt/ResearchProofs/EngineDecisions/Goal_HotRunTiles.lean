@@ -1,4 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `HotRunTiles` — Split a single hot key across workers in pair-ordinal space and union
+  matched occurrence bits *after* residual evaluation before outer emission.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

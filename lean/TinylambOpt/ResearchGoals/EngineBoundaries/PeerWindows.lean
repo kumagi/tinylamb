@@ -1,5 +1,9 @@
 import Std
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
 /-! A single window partition. Keys are projected SQL ordering values with

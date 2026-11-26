@@ -1,5 +1,27 @@
 import TinylambOpt.ResearchGoals.Frontiers.DecisionTables
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `AddressFirst` — `∀ n, (classes [mux n] (oneHot n) (binaryRows n)).length ≤ n`
+- `Coarsening` — `∀ qs heads (old new : List Row), (∀ t ∈ new, t ∈ old) → (classes qs
+  heads new).length ≤ (classes qs heads old).length`
+- `GroupDispatch` — `∀ (rows : List (Row × Int)) (key : Row → Nat) (q : Query), (∀ x ∈
+  rows, ∀ y ∈ rows, key x.1 = key y.1 → (q x.1).inWhere = (q y.1).inWhere) →
+  ((rows.filter (fun r => (q r.1).inWhere)).map Prod.snd).sum = (((rows.map (fun r =>
+  key r.1)).eraseDups).map (fun k => let g := rows.filter (fun r => key r.1 == k) if
+  g.head?.any (fun r => (q r.1).inWhere) then (g.map Prod.snd).sum else 0)).sum`
+
+Refuted by counterexample
+
+- `NegatedConsumer` — `∀ (p q : Query) (rows : List Row), (∀ r ∈ rows, (p r).inWhere =
+  (q r).inWhere) → rows.filter (fun r => (p r).not.inWhere) = rows.filter (fun r =>
+  (q r).not.inWhere)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `QuadraticDecode.EqualLengthSplit` — `∀ fee a n, 0<n → (price fee a (a+2*n-1) ≤ price
+  fee a (a+n-1)+price fee (a+n) (a+2*n-1) ↔ 2*n^2≤fee)`
+- `QuadraticDecode.GatherOrder` — `∀ (fixedFee : Nat), gatherOrder (price fixedFee)`
+- `QuadraticDecode.LatencyCap` — `∀ (fixedFee : Nat), latencyCap (price fixedFee)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.QuadraticDecode
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

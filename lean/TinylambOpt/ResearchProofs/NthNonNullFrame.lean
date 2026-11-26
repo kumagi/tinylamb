@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.NthNonNullFrame
 
+/-!
+Proved
+
+- `Goal` — `∀ xs (requests : List Request), requests.map (selectNth (build xs)) =
+  requests.map (reference xs)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.NthNonNullFrame`.
+-/
+
 namespace TinylambOpt.ResearchProofs.NthNonNullFrame
 
 open ResearchGoals.NthNonNullFrame
@@ -761,3 +770,7 @@ theorem sound : TinylambOpt.ResearchGoals.NthNonNullFrame.Goal := by
   | cons r rs ih => simp [ih, request_eq xs r]
 
 end TinylambOpt.ResearchProofs.NthNonNullFrame
+
+-- C++ references to this model or its proof.
+-- executor/detail/window_eval.cpp
+-- executor/relational_regression_test_part11.cpp

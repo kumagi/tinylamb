@@ -1,5 +1,16 @@
 import Std
 
+/-!
+One input row: two grouping columns (NULL forms its own group) and a payload.
+
+Reference: rescan the input once for every grouping set.
+
+Modeled claims
+
+- `Goal` — All four grouping sets agree with a fresh scan, and the reuse path never
+  reads the input more than once.
+-/
+
 namespace TinylambOpt.ProposedGoals.GroupingSetsReuse
 
 /-- One input row: two grouping columns (NULL forms its own group) and a payload. -/

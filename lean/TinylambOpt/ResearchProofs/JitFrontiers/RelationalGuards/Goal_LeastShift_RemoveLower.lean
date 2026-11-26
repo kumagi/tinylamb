@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.RelationalGuards
 
+/-!
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+
+Refuted by counterexample
+
+- `LeastShift.RemoveLower` — Strong hypothesis: checking just the upper extremum also
+  licenses a signed no-wrap claim.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

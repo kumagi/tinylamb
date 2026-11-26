@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.SegmentedXor
 
+/-!
+Proved
+
+- `Goal` — `∀ carry t, parallel carry t = stream carry (flatten t)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.SegmentedXor`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SegmentedXor
 
 open TinylambOpt.ResearchGoals.SegmentedXor

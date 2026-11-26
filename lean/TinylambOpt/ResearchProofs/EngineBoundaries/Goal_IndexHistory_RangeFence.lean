@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `RangeFence` — An interval-specific eviction summary can recover precision on cold
+  keys.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

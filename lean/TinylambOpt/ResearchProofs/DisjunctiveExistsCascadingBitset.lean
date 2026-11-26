@@ -1,6 +1,18 @@
 import Std
 import TinylambOpt.ResearchGoals.DisjunctiveExistsCascadingBitset
 
+/-!
+Proved
+
+- `Goal` — Disjunctive `EXISTS` cascading short-circuit bitset narrowing (TPC-DS
+  Q10/Q35): rows satisfying `EXISTS(S1) ∧ EXISTS(S2)` never probe `S3`, preserving
+  exact filtered output across NULLs while executing zero `S3` probes whenever `B_1 ⊆
+  B_2`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.DisjunctiveExistsCascadingBitset`.
+-/
+
 open TinylambOpt.ResearchGoals.DisjunctiveExistsCascadingBitset
 
 namespace TinylambOpt.ResearchProofs.DisjunctiveExistsCascadingBitset

@@ -844,7 +844,7 @@ uint64_t EstimateBranchMaxScanRows(TransactionContext& context,
   return best;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 // (prebuilt_exists_outer_domain_filter_sound)
 std::shared_ptr<SelectStatement> TryRestrictGroupedCteByPeerEquijoinDomain(
     const SelectStatement& consumer, const std::string& name,
@@ -1635,7 +1635,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       // which has no GROUP BY keys but is still produced from the same input.
       // It is a legitimate coarsest level of the state-reuse chain
       // (PlanExactIntegerGroupingSets handles IsGroupAll sets explicitly).
-      // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+      // Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
       //   (rollup_two_level_state_combine_sound,
       //    rollup_three_level_state_combine_sound,
       //    rollup_grand_total_requires_coalesce)
@@ -1973,7 +1973,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     if (all_intersect_distinct && unshared_ptrs.size() >= 2 &&
         context.execution_runtime() != nullptr) {
       // INTERSECT DISTINCT is commutative & associative (Lean proof:
-      // lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      // lean/TinylambOpt/VectorizedJoinAndPruning.lean
       // intersect_dim_key_semifilter_sound). Evaluate the smallest-fact branch
       // first, then project its surviving dimension attribute tuples back to
       // matching dimension PKs as an exact runtime filter for each subsequent
@@ -2211,7 +2211,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           // FROM: NULLs hash to a distinct tag). A 64-bit hash match is a sound
           // superset for a runtime filter (false positives are harmlessly
           // filtered by the exact INTERSECT; false negatives are impossible).
-          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+          // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
           //   (intersect_dim_key_semifilter_sound)
           auto hash_mix = [](uint64_t h, uint64_t v) noexcept -> uint64_t {
             v += 0x9e3779b97f4a7c15ULL;
@@ -3670,7 +3670,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
                    statement.Offset() == 0 && statement.WithQueries().empty() &&
                    statement.UnionAll().empty() &&
                    statement.GetSetOperationTree() == nullptr) {
-          // Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+          // Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
           //   (grouped_having_global_sum_fubini_sound,
           //    grouped_having_distinct_sum_fubini_bug)
           // Match HAVING SUM(e) <cmp> (SELECT SUM(e) * factor FROM <same>

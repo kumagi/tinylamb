@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Refuted by counterexample
+
+- `Versions.DropTombstones` — `∀ es k t v, readAt (es.filter (fun e =>
+  e.payload.isSome)) k t v = readAt es k t v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

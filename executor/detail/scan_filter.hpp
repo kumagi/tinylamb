@@ -70,7 +70,7 @@ struct MembershipStringHash {
 using MembershipStringSet =
     std::unordered_set<std::string, MembershipStringHash, std::equal_to<>>;
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (packed_ascii_prefix_set_matches_iff)
 struct PrefixInPredicate {
   slot_t column{0};
@@ -172,7 +172,7 @@ struct PrebuiltMembershipPredicate {
   // Plain string members use byte equality; unusual probe collations fall
   // back to the canonical comparison against these owned member values.
   std::shared_ptr<const MembershipStringSet> string_values;
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   // (distinct_witness_exists_to_minmax_sound)
   // Optional (min_w, max_w) map for `EXISTS (... WHERE inner.k = outer.k AND
   // inner.w <> outer.w [AND local_preds])`: a non-null witness differing from
@@ -181,7 +181,7 @@ struct PrebuiltMembershipPredicate {
       distinct_witness_minmax;
   slot_t witness_column{0};
   ValueType witness_type{ValueType::kNull};
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (packed_int32_pair_bijection_sound)
   // Optional second correlation column for 2-key CTE EXISTS membership
   // (`(uint64_t(uint32_t(int32_t(k0))) << 32) | uint32_t(int32_t(k1))`).

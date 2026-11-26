@@ -344,7 +344,7 @@ ProgramShape ClassifyProgram(const BytecodeProgram& program,
         double vconst = 1.0;
         std::shared_ptr<const BytecodeProgram> vprog_shared;
         if (ck != ProgramShape::CaseCondKind::kNone && val) {
-          // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+          // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
           //   (count_case_one_else_null_sound)
           if ((else_zero_int || ev.IsNull()) &&
               val->Type() == TypeTag::kConstantValue) {

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.PackedOrderKey
 
+/-!
+Proved
+
+- `Goal` — `∀ a b, before a b = decide ((encode a).toNat < (encode b).toNat) ∧ (encode
+  a = encode b ↔ a.major = b.major ∧ a.minor = b.minor)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.PackedOrderKey`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PackedOrderKey
 
 open TinylambOpt.ResearchGoals.PackedOrderKey
@@ -257,3 +266,9 @@ theorem sound : TinylambOpt.ResearchGoals.PackedOrderKey.Goal := by
           rfl
 
 end TinylambOpt.ResearchProofs.PackedOrderKey
+
+-- C++ references to this model or its proof.
+-- executor/detail/ooc/external_sorter.cpp
+-- executor/relational_regression_test_part11.cpp
+-- executor/sort.cpp
+-- executor/sort_shape_executor_test.cpp

@@ -950,7 +950,7 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
   // only fall back to the output name (qualified by the sole relation) when
   // no target list is available. A multi-relation branch with a bare column
   // has no provable owner, so the caller must decline the rewrite.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (repaired_intersect_to_semijoin_sound, repaired_except_to_antijoin_sound,
   //    cpp_intersect_except_nan_isNotDistinctFrom_bug,
   //    cpp_intersect_computed_alias_bug)
@@ -3309,7 +3309,7 @@ const RuleSet& RuleSet::Default() {
                                                     bindings.at("right")}});
         },
         LogicalOperator::kJoin));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (not_null_and_trivial_selection_sound)
     built.Add(Rule(
         "eliminate_false_selection", Selection(Any()),
@@ -3434,7 +3434,7 @@ const RuleSet& RuleSet::Default() {
     // predicate such as t1.a > 0 must NOT be pushed into a branch that lacks
     // relation t1. Row-wise filtering commutes with duplicate elimination,
     // so this holds for UNION/INTERSECT/EXCEPT including ALL variants.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (push_filter_past_setop_sound)
     built.Add(Rule(
         "push_filter_past_setop", Selection(Any("input")),
@@ -3558,7 +3558,7 @@ const RuleSet& RuleSet::Default() {
     // Selection(Distinct(R)) is equivalent to Distinct(Selection(R)): the
     // predicate depends only on row values, so duplicate elimination and
     // filtering commute without changing the distinct result.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (push_filter_through_distinct_sound)
     built.Add(Rule(
         "push_filter_through_distinct", Selection(Distinct(Any(), "input")),
@@ -4092,7 +4092,7 @@ const RuleSet& RuleSet::Default() {
     // Selection(Aggregation(X), p) for conjuncts that only mention grouping
     // keys: push them below the aggregate (FilterAggregateTranspose). Residual
     // HAVING conjuncts stay above.
-    // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+    // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
     //   (repaired_push_sel_through_agg_sound,
     //    cpp_push_sel_through_agg_drops_grouping_bug)
     built.Add(Rule(
@@ -4216,7 +4216,8 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kJoin));
     // Limit(Limit(X)): compose offset and take the tighter remaining count
     // (LimitMerge).
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean (merge_limits_sound)
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
+    // (merge_limits_sound)
     built.Add(Rule(
         "merge_limits", Limit(Limit(Any(), "inner")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -4326,7 +4327,7 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kSort));
     // Selection(true, X) ≡ X (FilterTrue). Copy child alternatives into this
     // group so costing can skip a residual filter.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (not_null_and_trivial_selection_sound)
     built.Add(Rule(
         "eliminate_true_selection", Selection(Any("input")),
@@ -4380,7 +4381,7 @@ const RuleSet& RuleSet::Default() {
     // the result as an Empty expression in the target group; the target
     // relation set can differ from the individual set-operation branches, so
     // the empty node receives a base group with the complete relation set.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (setop_empty_simplification_sound)
     built.Add(Rule(
         "setop_empty_simplification", Pattern::Any(),
@@ -4442,7 +4443,7 @@ const RuleSet& RuleSet::Default() {
     // Keeping these alternatives in the memo lets costing choose the cheap
     // branch without making the rewrite depend on a particular physical
     // implementation.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (setop_identity_and_union_rules_sound)
     built.Add(Rule(
         "setop_empty_identity", Pattern::Any(),
@@ -4603,7 +4604,7 @@ const RuleSet& RuleSet::Default() {
     // elimination. Keeping both forms in the memo lets the implementation
     // rules choose the direct set operator or the reusable append + distinct
     // pipeline independently.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (setop_identity_and_union_rules_sound)
     built.Add(Rule(
         "union_to_union_all_plus_distinct",
@@ -4623,7 +4624,7 @@ const RuleSet& RuleSet::Default() {
         },
         LogicalOperator::kUnion));
     // Flatten nested UNION ALL branches into one n-ary append node.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (setop_identity_and_union_rules_sound)
     built.Add(Rule(
         "union_all_merge", Pattern::Op(LogicalOperator::kUnionAll, {}),
@@ -4662,7 +4663,7 @@ const RuleSet& RuleSet::Default() {
     // the right. For RIGHT/FULL outer joins L is the NULL-supplying side:
     // filtering it before the join would drop padded output rows, so the
     // rule must not fire there.
-    // Lean proof: lean/TinylambOpt/AggJoinDiscovery.lean
+    // Lean proof: lean/TinylambOpt/JoinPreaggregation.lean
     //   (leftOuterJoin_filter_left)
     built.Add(Rule(
         "push_filter_through_left_join_left_side",
@@ -4916,7 +4917,7 @@ const RuleSet& RuleSet::Default() {
     // distinct_over_group_by: Distinct(Aggregate(...GROUP BY keys...)) ->
     //   Aggregate(...GROUP BY keys...) since GROUP BY already eliminates
     //   duplicates by the grouping keys.
-    // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+    // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
     //   (repaired_distinct_over_group_by_nodup,
     //    cpp_distinct_over_group_by_skips_expr_key_bug)
     built.Add(Rule(
@@ -5437,7 +5438,7 @@ const RuleSet& RuleSet::Default() {
     // column the predicate can name is already available below the sort.
     // No explicit check is needed, and adding one would only reject
     // constant-only predicates.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (push_filter_through_sort_perm_sound)
     built.Add(Rule(
         "push_filter_through_sort", Selection(Sort(Any(), "sort")),
@@ -5490,7 +5491,7 @@ const RuleSet& RuleSet::Default() {
     // aggregate into a scalar one, and order-sensitive aggregates
     // (string_agg / array_agg / WITHIN GROUP / ANY_VALUE / sketches) could
     // observe a different input order after the Sort disappears.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (repaired_elim_sort_under_agg_sound,
     //    cpp_elim_sort_under_agg_drops_having_bug)
     built.Add(Rule(
@@ -5587,7 +5588,7 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kAggregation));
 
     // distinct_over_distinct: Distinct(Distinct(X)) -> Distinct(X)
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (distinct_over_distinct_sound)
     built.Add(Rule(
         "distinct_over_distinct", Distinct(Distinct(Any(), "inner")),
@@ -5611,7 +5612,7 @@ const RuleSet& RuleSet::Default() {
     // inner join on p, whether or not p references both sides (a one-sided
     // or constant p just makes a trivial join condition; pushdown rules
     // handle it from there).  No both-sides inspection is needed.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (cross_and_empty_join_simplification_sound)
     built.Add(Rule(
         "cross_to_inner_with_predicate",
@@ -5630,7 +5631,7 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kSelection));
 
     // join_empty_simplification: Join/CrossJoin with an Empty child -> Empty
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (cross_and_empty_join_simplification_sound)
     built.Add(Rule(
         "join_empty_simplification", Pattern::Any(),
@@ -5668,7 +5669,7 @@ const RuleSet& RuleSet::Default() {
 
     // intersect_to_semijoin: Intersect(L, R) -> SemiJoin(L, R,
     // equality_on_all_columns)
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (repaired_intersect_to_semijoin_sound,
     //    cpp_intersect_except_nan_isNotDistinctFrom_bug,
     //    cpp_intersect_computed_alias_bug)
@@ -5731,7 +5732,7 @@ const RuleSet& RuleSet::Default() {
 
     // except_to_antijoin: Except(L, R) -> AntiJoin(L, R,
     // equality_on_all_columns)
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (repaired_except_to_antijoin_sound,
     //    cpp_intersect_except_nan_isNotDistinctFrom_bug)
     built.Add(Rule(
@@ -5790,7 +5791,7 @@ const RuleSet& RuleSet::Default() {
     // distinct_and_group_by_interchange: Convert Distinct(Projection(X)) to
     // Aggregation(X, GROUP BY projection_columns) as an alternative
     // representation for hash aggregation.
-    // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+    // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
     //   (repaired_distinct_over_group_by_nodup,
     //    cpp_distinct_over_group_by_skips_expr_key_bug)
     built.Add(Rule(
@@ -5906,7 +5907,7 @@ const RuleSet& RuleSet::Default() {
     // self_join_elimination: When Join(T1, T2) joins the same table on its
     // primary key / unique key with identical predicates and schema projection,
     // eliminate redundant scan.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (self_join_elimination_sound, self_join_elim_nullable_unique_bug)
     built.Add(Rule(
         "self_join_elimination", Join(Any("left"), Any("right")),
@@ -6011,7 +6012,7 @@ const RuleSet& RuleSet::Default() {
     // proven from the catalog-published schema: the predicate must be
     // exactly the key equality and the right-side column must carry a
     // UNIQUE/PRIMARY KEY constraint.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (unique_semi_to_inner_sound)
     built.Add(Rule(
         "unique_semi_to_inner", SemiJoin(Any("left"), Any("right")),
@@ -6051,7 +6052,7 @@ const RuleSet& RuleSet::Default() {
     // (wrapped in Selection(left_residual) when left-only conjuncts remain).
     // Sound when R.key is declared NOT NULL OR when ON predicate p rejects
     // NULLs on R.key.
-    // Lean proof: lean/TinylambOpt/Discovery.lean
+    // Lean proof: lean/TinylambOpt/OuterJoinToAntiJoin.lean
     //   (outer_to_anti_join_aggressive, outer_to_anti_join_equi_nullable_sound,
     //    bug_when_testing_non_join_nullable_col,
     //    bug_when_join_allows_null_match)
@@ -6220,7 +6221,7 @@ const RuleSet& RuleSet::Default() {
 
     // right_to_left_outer_join: Normalize RightOuterJoin(L, R, p) ->
     // LeftOuterJoin(R, L, p).
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (right_to_left_outer_join_sound)
     built.Add(Rule(
         "right_to_left_outer_join", OuterJoin(Any("left"), Any("right")),
@@ -6247,7 +6248,7 @@ const RuleSet& RuleSet::Default() {
 
     // full_outer_join_decomposition: Decompose FullOuterJoin(L, R) into
     // UnionAll(LeftOuter(L, R), AntiJoin(R, L)) alternative.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (full_outer_join_decomposition_sound)
     built.Add(Rule(
         "full_outer_join_decomposition", OuterJoin(Any("left"), Any("right")),
@@ -6377,8 +6378,9 @@ const RuleSet& RuleSet::Default() {
     // relations, rewrite to InnerJoin with the same join condition.
     // Lean proof: lean/TinylambOpt/BagRel.lean (outer_to_inner_join_sound,
     //   coalesce_filter_breaks_outer_to_inner) &
-    //   lean/TinylambOpt/CppRuleAudit.lean (repairedIsStrict_sound,
-    //   repairedRejectsAndNeverFalse_sound, cpp_empty_in_isFalse_bug)
+    //   lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
+    //   (repairedIsStrict_sound, repairedRejectsAndNeverFalse_sound,
+    //   cpp_empty_in_isFalse_bug)
     built.Add(Rule(
         "outer_to_inner_join_on_null_rejecting_filter", Selection(Any("input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -6444,7 +6446,7 @@ const RuleSet& RuleSet::Default() {
 
     // outer_join_associativity: (A LEFT JOIN B ON p1) LEFT JOIN C ON p2 ->
     // A LEFT JOIN (B LEFT JOIN C ON p2) ON p1 when p2 rejects nulls on B.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (outer_join_assoc_when_p2_rejects_null_sound,
     //    outer_join_assoc_fails_without_null_reject_bug)
     built.Add(Rule(
@@ -6513,7 +6515,7 @@ const RuleSet& RuleSet::Default() {
 
     // semi_join_inner_join_reorder: (R SEMI JOIN S ON p1) JOIN T ON p2 ->
     // (R JOIN T ON p2) SEMI JOIN S ON p1.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (semi_join_reorder_and_pushdown_sound)
     built.Add(Rule(
         "semi_join_inner_join_reorder", Join(Any("semi_child"), Any("t")),
@@ -6579,7 +6581,7 @@ const RuleSet& RuleSet::Default() {
 
     // semi_join_commutativity: (R SEMI JOIN S ON p1) SEMI JOIN T ON p2 ->
     // (R SEMI JOIN T ON p2) SEMI JOIN S ON p1.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (semi_join_reorder_and_pushdown_sound)
     built.Add(Rule(
         "semi_join_commutativity", SemiJoin(Any("inner_semi"), Any("t")),
@@ -6797,7 +6799,7 @@ const RuleSet& RuleSet::Default() {
     // infer_filter_from_equivalence_class: Given an equality condition between
     // tables (an equivalence class {T1.c, T2.d}) and a filter on T1.c (e.g.
     // T1.c OP Const), infer T2.d OP Const and push it into the selection group.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (eq_transitivity_and_redundancy_sound)
     built.Add(Rule(
         "infer_filter_from_equivalence_class", Selection(Any("input")),
@@ -6945,7 +6947,7 @@ const RuleSet& RuleSet::Default() {
     // p_semi -> (A SEMI JOIN C ON p_semi) JOIN B ON p_ab (if p_semi touches
     // only A and C) or A JOIN (B SEMI JOIN C ON p_semi) ON p_ab (if p_semi
     // touches only B and C).
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (semi_join_reorder_and_pushdown_sound)
     built.Add(Rule(
         "push_semi_join_through_inner_join",

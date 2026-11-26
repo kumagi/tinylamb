@@ -1,6 +1,18 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.BV64
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `DisjointOr.DeadInputs` — Build the guard mask on live inputs only; changes to
+  inactive operands cannot change the selected words.
+- `DisjointOr.GuardExact` — A concrete machine-bit test recognizes precisely the
+  defined domain.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

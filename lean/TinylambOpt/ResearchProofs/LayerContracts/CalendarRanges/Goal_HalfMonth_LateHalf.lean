@@ -3,6 +3,15 @@ import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarR
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Facts_HalfMonth
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved
+
+- `HalfMonth.LateHalf` — `∀ m, span model (2*m+1) = monthStart (m+1)-monthStart m-15`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

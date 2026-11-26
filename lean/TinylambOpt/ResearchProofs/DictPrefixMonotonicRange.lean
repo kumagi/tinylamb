@@ -848,3 +848,6 @@ theorem sound : Goal := by
         match hb : startsWith pref w with
         | true => exact (decide_eq_true (hiff.1 hb)).symm
         | false => exact (decide_eq_false (fun hp => bconf (hiff.2 hp) hb)).symm
+
+-- C++ references to this model or its proof.
+-- table/pax_chunk/pax_chunk.cpp

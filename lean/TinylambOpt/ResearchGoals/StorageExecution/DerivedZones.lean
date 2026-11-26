@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 open TinylambOpt.ResearchGoals.Compression.Wire
 

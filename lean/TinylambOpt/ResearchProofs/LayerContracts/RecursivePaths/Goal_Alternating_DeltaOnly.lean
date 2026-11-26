@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Proved
+
+- `Alternating.DeltaOnly` — Expand only new full-state work-table rows.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

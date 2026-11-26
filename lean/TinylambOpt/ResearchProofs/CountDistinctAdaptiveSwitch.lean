@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.CountDistinctAdaptiveSwitch
 
+/-!
+Proved
+
+- `Goal` — Adaptive 4-state `COUNT(DISTINCT)` (`empty`/`single`/`small`/`large`)
+  (`executor/detail/typed_stream_aggregate_compact.cpp`,
+  `executor/detail/aggregate_accumulator.cpp`): ignoring `none` (SQL NULL) and
+  promoting through `empty -> single -> small -> large` across worker fold + tree
+  merge preserves exact distinct cardinality and invariants.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.CountDistinctAdaptiveSwitch`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CountDistinctAdaptiveSwitch
 
 open TinylambOpt.ResearchGoals.CountDistinctAdaptiveSwitch

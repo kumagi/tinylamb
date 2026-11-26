@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.GatheredSmallDictFastPath
 
+/-!
+Proved
+
+- `Goal` — Compact gathered dictionary remap (`executor/detail/fused_grouped_join.cpp`
+  `left_pack` `kGathered` `total_rows ≤ 4096`): remapping active canonical dictionary
+  IDs to dense IDs `0..m-1` while keeping `none` (NULL) separate from unreferenced
+  entries preserves grouped `SUM` for every key `k`.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.GatheredSmallDictFastPath`.
+-/
+
 namespace TinylambOpt.ResearchProofs.GatheredSmallDictFastPath
 open TinylambOpt.ResearchGoals.GatheredSmallDictFastPath
 
@@ -497,3 +508,6 @@ theorem sound : TinylambOpt.ResearchGoals.GatheredSmallDictFastPath.Goal := by
               · simp [hc, refDecodeRow, hdp, hcu]
               · simp [hc, refDecodeRow, hkey, hcu]
 end TinylambOpt.ResearchProofs.GatheredSmallDictFastPath
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_dense_split.hpp

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Refuted by counterexample
+
+- `VictimEdgeOnly` — The victim still waiting on its old holder alone validates a stale
+  detector snapshot.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

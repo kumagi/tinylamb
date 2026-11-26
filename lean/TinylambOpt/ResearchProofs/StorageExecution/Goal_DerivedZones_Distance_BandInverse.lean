@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `Distance.BandInverse` — `∀ t x y, kernel.score 0 (x,y)≤t ↔ x≤y+t ∧ y≤x+t`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

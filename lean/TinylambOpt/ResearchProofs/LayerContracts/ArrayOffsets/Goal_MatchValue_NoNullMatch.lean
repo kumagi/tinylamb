@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Common_ArrayOffsets
 
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+
+Proved
+
+- `MatchValue.NoNullMatch` — `∀ s i j, both i j ∈ model.rows s →
+  (s.left[i]?.join).isSome`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

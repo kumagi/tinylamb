@@ -269,3 +269,6 @@ theorem cursor_after_switch (bits : List Bool) (first next : Nat) :
         List.drop_succ_cons, Nat.succ_add, ih]
 
 end TinylambOpt.AdaptiveSelection
+
+-- C++ references to this model or its proof.
+-- executor/selection_vector.hpp

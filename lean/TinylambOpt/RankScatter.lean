@@ -248,3 +248,6 @@ theorem packed_scatter_slot (word : BitVec w) (rows : List α) (base i : Nat)
       (by simp [hlen]) (by simp [hi,sel]) value
 
 end TinylambOpt.RankScatter
+
+-- C++ references to this model or its proof.
+-- executor/selection_vector.hpp

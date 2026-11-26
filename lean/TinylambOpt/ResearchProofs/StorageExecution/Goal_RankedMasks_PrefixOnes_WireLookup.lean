@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved
+
+- `PrefixOnes.WireLookup` — A rank packed into whole bytes decodes despite byte
+  padding.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

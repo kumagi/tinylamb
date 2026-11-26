@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.CanonicalEquivIdSetAlgebra
 
+/-!
+Proved
+
+- `Goal` — Canonical integer equivalence-ID set algebra for `INTERSECT` / `EXCEPT`
+  (TPC-DS Q38/Q87/Q14): mapping projected join attributes via an injective canonical
+  ID preserves exact `INTERSECT` and `EXCEPT` cardinalities under smallest-channel
+  probing and direct deletion, whereas comparing raw surrogate keys is unsound when
+  multiple SKs share the same attribute.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.CanonicalEquivIdSetAlgebra`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CanonicalEquivIdSetAlgebra
 
 open TinylambOpt.ResearchGoals.CanonicalEquivIdSetAlgebra

@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.OrderedStreams
 
 abbrev Row := Int × Nat  -- ORDER BY key, observable payload

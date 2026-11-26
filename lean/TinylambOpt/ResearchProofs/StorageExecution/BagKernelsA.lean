@@ -58,3 +58,8 @@ namespace TinylambOpt.ResearchProofs.StorageExecution.BagKernelsA
 set_option maxHeartbeats 0
 
 end TinylambOpt.ResearchProofs.StorageExecution.BagKernelsA
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/detail/columnar_tlcs_fast_path.cpp
+-- executor/relational_scalar_counts.cpp

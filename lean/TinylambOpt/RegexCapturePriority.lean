@@ -1,5 +1,15 @@
 import Std.Tactic
 
+/-!
+Greedy candidate endpoints in descending order, including p and len.
+
+Split at the first delimiter, returning (captured bytes, delimiter::tail). This is the
+same first-delimiter run as `DelimitedCaptureJit.beforeDelimiter`.
+
+Named results include `firstResult_append`, `descendingEnds_mem`,
+`descendingEnds_decreasing`.
+-/
+
 namespace TinylambOpt.RegexCapturePriority
 
 /-- Formal model of ordered backtracking with captures.

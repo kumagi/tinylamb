@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `DyadicTile.TileDecode` — `∀ x y, (key (x,y)).2/16 = x%16 ∧ (key (x,y)).2%16 = y%16`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

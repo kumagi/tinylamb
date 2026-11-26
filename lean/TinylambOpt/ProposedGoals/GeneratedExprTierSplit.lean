@@ -1,5 +1,16 @@
 import Std
 
+/-!
+A deterministic stand-in for a Tier-1 host call (VARCHAR / JSON / UDF).
+
+Reference: tree-walking AST evaluator (semantic ground truth).
+
+Modeled claims
+
+- `Goal` — Staging an unsupported expression into a bytecode pipeline plus host calls
+  preserves values, NULL and the first error.
+-/
+
 namespace TinylambOpt.ProposedGoals.GeneratedExprTierSplit
 
 inductive Val where

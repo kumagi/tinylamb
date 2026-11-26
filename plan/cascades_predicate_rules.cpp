@@ -247,7 +247,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
       },
       {LogicalOperator::kWindow, LogicalOperator::kProjection}));
 
-  // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+  // Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
   // (filter_transfer_preserves_matches,
   // filter_transfer_two_hop_preserves_matches,
   //  transfer_filter_through_dimension_sound)
@@ -498,7 +498,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
   // join_predicate_transitivity: Infer non-constant equality transitive
   // chains across multi-way joins (t1.a = t2.b and t2.b = t3.c -> t1.a =
   // t3.c).
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (eq_transitivity_and_redundancy_sound)
   built.Add(Rule(
       "join_predicate_transitivity", Join(),
@@ -600,7 +600,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // redundant_join_predicate_elimination: Eliminate redundant join conditions
   // already satisfied by transitivity.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (eq_transitivity_and_redundancy_sound,
   //    cpp_redundant_join_eq_drops_self_eq_null_bug)
   built.Add(Rule(
@@ -1097,7 +1097,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // in_list_to_semi_join: Transform large IN list predicates into SemiJoin
   // with a Values group.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (in_list_to_semi_join_sound, cpp_in_list_fingerprint_collision_bug)
   built.Add(Rule(
       "in_list_to_semi_join", Selection(Any("child")),
@@ -1220,7 +1220,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // functional_dependency_filter_reduction: Simplify filters using known
   // functional dependencies and equality keys.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (eq_transitivity_and_redundancy_sound)
   built.Add(Rule(
       "functional_dependency_filter_reduction", Selection(Any("child")),
@@ -1337,7 +1337,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
       LogicalOperator::kSelection));
   // filter_aggregate_pushdown: Push filtering conditions directly into
   // aggregate FILTER (WHERE ...) clauses where advantageous.
-  // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+  // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
   //   (repaired_filter_aggregate_pushdown_sound,
   //    cpp_filter_agg_pushdown_compound_target_bug)
   built.Add(Rule(
@@ -1435,7 +1435,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // aggregate_union_transpose: Push Aggregation below UnionAll when
   // aggregates are distributable (SUM, COUNT, MIN, MAX).
-  // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+  // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
   //   (repaired_agg_union_sum_and_count_sound,
   //    cpp_agg_union_compound_sum_plus_one_bug,
   //    cpp_agg_union_having_pushed_to_branch_bug) &
@@ -1626,7 +1626,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // pk_unique_distinct_elimination: Eliminate DISTINCT when input columns
   // form a primary key or unique key.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (pk_unique_distinct_elim_sound)
   built.Add(Rule(
       "pk_unique_distinct_elimination", Distinct(Any("input")),
@@ -1688,7 +1688,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
 
   // not_null_is_not_null_elimination: Rewrite col IS NOT NULL to TRUE when
   // col has a NOT NULL constraint.
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (not_null_and_trivial_selection_sound)
   built.Add(Rule(
       "not_null_is_not_null_elimination", Selection(Any("input")),
@@ -1817,7 +1817,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
   // constraint alone does not survive NULL extension or projection.
   // Aggregates with DISTINCT,
   // FILTER, HAVING modifiers or inner ORDER BY / LIMIT keep their shape.
-  // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+  // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
   //   (count_star_rewrite_on_not_null_sound)
   built.Add(Rule(
       "count_star_rewrite_on_not_null", Aggregation(Any("input")),
@@ -2394,7 +2394,7 @@ void RegisterPredicateAndJoinRules(RuleSet& built) {
   // the null-supplying side would collapse fan-out matches. v1 scope:
   // full-row DISTINCT directly above the join (a Projection in between
   // keeps the existing path).
-  // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+  // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
   //   (distinct_eager_over_join_sound,
   //    cpp_distinct_eager_self_eq_uniqueness_bug)
   built.Add(Rule(

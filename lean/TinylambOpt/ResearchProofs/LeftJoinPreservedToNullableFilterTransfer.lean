@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.LeftJoinPreservedToNullableFilterTransfer
 
+/-!
+Proved
+
+- `Goal` — Left-join preserved-side join-key filter transfer (TPC-DS Q78) and `UNION
+  DISTINCT` key-filter pushdown (TPC-DS Q75): (1) filtering nullable right table `R`
+  by a predicate on the join key already implied by preserved side `L` produces the
+  exact same `LEFT JOIN` output, whereas (2) filtering `R` on a non-join column
+  breaks semantics, and (3) a filter on `UNION DISTINCT` output commutes into both
+  inputs.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.LeftJoinPreservedToNullableFilterTransfer`.
+-/
+
 namespace TinylambOpt.ResearchProofs.LeftJoinPreservedToNullableFilterTransfer
 
 open TinylambOpt.ResearchGoals.LeftJoinPreservedToNullableFilterTransfer
@@ -157,3 +171,6 @@ theorem sound : TinylambOpt.ResearchGoals.LeftJoinPreservedToNullableFilterTrans
     decide
 
 end TinylambOpt.ResearchProofs.LeftJoinPreservedToNullableFilterTransfer
+
+-- C++ references to this model or its proof.
+-- query/tpch_select_rewrites.cpp

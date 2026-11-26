@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Refuted by counterexample
+
+- `StaleCheckpoint` — Aggressive: reuse the original saved older-byte count after a
+  short write.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

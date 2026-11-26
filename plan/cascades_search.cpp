@@ -619,7 +619,7 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
           const auto& right_props =
               groups_[expr.children[1]].logical_properties;
           if (expr.join_type == 0) {  // LeftOuter
-            // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+            // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
             //   (cpp_outerJoin_selfEq_candidateKey_bug, repairedPinsRightPk)
             for (const auto& nn : left_props.not_null_columns) {
               props.not_null_columns.insert(nn);

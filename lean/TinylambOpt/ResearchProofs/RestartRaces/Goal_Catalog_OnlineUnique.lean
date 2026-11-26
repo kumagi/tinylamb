@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `OnlineUnique` — Publish an online UNIQUE index from fuzzy backfill plus per-RID last
+  images, deferring duplicate checking to the atomic publication fence. Check both
+  covering IDs and the same uniqueness verdict as a fresh build.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

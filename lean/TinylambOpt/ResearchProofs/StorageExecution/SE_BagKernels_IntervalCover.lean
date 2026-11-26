@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_BagKernels_Common
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved (10 claims, including the following)
+
+- `IntervalCover.AntiRevenue` — Compute revenue of all left rows whose key is absent on
+  the right.
+- `IntervalCover.ClipRanges` — `∀ rs lim, weighted bag rs (fun x => (decide
+  (x<lim)).toNat) = (rs.map (fun (s,n) => min n (lim-s))).sum`
+- `IntervalCover.CoverageIntegral` — `∀ rs, weighted bag rs (fun _ => 1) = (rs.map
+  Prod.snd).sum`
+-/
+
 open TinylambOpt.ResearchProofs.StorageExecution.BagKernels
 open TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 open TinylambOpt.ResearchGoals.Compression.Wire

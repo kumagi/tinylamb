@@ -56,7 +56,8 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
 //   (SurrogateKeyPreAggRollup_sound)
 // When an exact-integer ROLLUP/GROUPING SETS partial aggregation groups only by
 // attributes of a single small/medium dimension table joined on a unique INT64
@@ -1070,7 +1071,7 @@ StatusOr<std::optional<Relation>> TrySurrogatePreAggExactGroupingInput(
 }
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
 //   (SingleScanConditionalCountDistinct_sound)
 // Collapse a cross join of K scalar-aggregate derived tables over the same base
 // table T (e.g. TPC-DS Q28's 6 buckets B1..B6 over store_sales computing

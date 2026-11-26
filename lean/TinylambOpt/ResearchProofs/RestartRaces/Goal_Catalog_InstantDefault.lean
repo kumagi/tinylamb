@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `InstantDefault` — Compact retained schema history into at most k slots. Is it enough
+  to color epochs that require different values at a common visible schema
+  differently? The decoder can choose one value per (schema,slot), even where no
+  original epoch has the desired value at *all* schemas.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

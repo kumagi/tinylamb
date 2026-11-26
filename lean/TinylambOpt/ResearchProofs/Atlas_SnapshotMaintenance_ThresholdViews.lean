@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `ThresholdViews.Coalesce` — `∀ old a b k, weight (changes old (a++b)) k = weight
+  (changes old a ++ changes (old++a) b) k`
+- `ThresholdViews.MarginCertificate` — `∀ old patch k, (weight old k).natAbs >
+  ((patch.filter (fun r => r.1 == k)).map (fun r => r.2.natAbs)).sum → active old k =
+  active (old++patch) k`
+- `ThresholdViews.ReplayLedger` — `∀ old p k, indicator (active old k) + weight
+  (changes old p) k = indicator (active (old++p) k)`
+- `ThresholdViews.SemijoinRepair` — `∀ left right patch, semi left (right++patch) -
+  semi left right = ((changes right patch).map (fun (k,d) => d*weight left k)).sum`
+- `ThresholdViews.ZeroCrossing` — `∀ old patch, (count (old++patch):Int) - count old =
+  ((changes old patch).map Prod.snd).sum`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.SnapshotMaintenance.ThresholdViews
 
 open TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance.ThresholdViews

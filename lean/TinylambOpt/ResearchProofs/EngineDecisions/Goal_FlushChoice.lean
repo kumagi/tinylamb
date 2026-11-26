@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `FlushChoice` — An admission controller can price the cheapest subset with a DP keyed
+  by partition ordinal and remaining grant deficit. Covers infeasibility, and asks
+  for a realizable cost as well as a lower bound.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -862,7 +862,7 @@ TEST_F(RelationalRegressionTest,
   EXPECT_EQ(sset_rel, sset_opt);
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/NthNonNullFrame.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/NthNonNullFrame.lean (sound)
 TEST_F(RelationalRegressionTest,
        NthNonNullFrameMatchesFallbackAcrossIgnoreNullsAndExclusions) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
@@ -975,7 +975,7 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/RangeDistinctIndex.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/RangeDistinctIndex.lean (sound)
 TEST_F(RelationalRegressionTest,
        RangeDistinctIndexMatchesFallbackAcrossArbitraryFrames) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
@@ -1081,7 +1081,7 @@ TEST_F(RelationalRegressionTest,
   EXPECT_EQ(run_direct(nullptr), run_direct("1"));
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+// Lean proof: lean/TinylambOpt/ResearchProofs/QuantifiedRangeSummary.lean
 // (sound)
 TEST_F(RelationalRegressionTest,
        QuantifiedRangeSummaryMatchesFallbackAllOpsAndNulls) {
@@ -1158,7 +1158,7 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/DemandScalar.lean (sound)
 TEST_F(RelationalRegressionTest,
        DemandScalarDefersUnusedMultiRowErrorAndErrorsOnActive) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
@@ -1235,7 +1235,7 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/SkylineAntiJoin.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/SkylineAntiJoin.lean (sound)
 TEST_F(RelationalRegressionTest,
        SkylineAntiJoinMatchesFallbackTiesNullsAndExtremes) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
@@ -1298,7 +1298,7 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/IntervalCountSweep.lean (sound)
 TEST_F(RelationalRegressionTest,
        IntervalCountSweepMatchesFallbackBoundariesNullsAndClosedOpen) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):
@@ -1373,7 +1373,7 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/PackedOrderKey.lean (sound)
 // Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
 TEST_F(RelationalRegressionTest,
        ExternalSorterPackedOrderKeyMatchesFallbackViaSql) {

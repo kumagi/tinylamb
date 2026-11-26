@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `AlternatingBalance.ShiftResidue` — `∀ b x, measure (shifted b x) = measure x +
+  ((x.length%2:Nat):Int)*b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

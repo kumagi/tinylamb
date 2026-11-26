@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Common_PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+Proved
+
+- `DifferenceFromBase.RebiasCount` — `∀ rs, (whole update rs).2=(rs.filterMap id).sum -
+  100*((rs.filterMap id).length:Int)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

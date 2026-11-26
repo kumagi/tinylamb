@@ -19,3 +19,11 @@ import TinylambOpt.ResearchProofs.RestartRaces.Goal_Recovery_DestroySummary
 import TinylambOpt.ResearchProofs.RestartRaces.Goal_Recovery_FuzzyTransfer
 import TinylambOpt.ResearchProofs.RestartRaces.Goal_Recovery_GenerationGC
 import TinylambOpt.ResearchProofs.RestartRaces.Goal_Recovery_RetentionProbe
+
+/-!
+This module collects proofs for Goal Catalog Cascade Fence, Goal Catalog Instant
+Default, Goal Catalog Online Unique, Goal Catalog Rename Moves and related cases.
+
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+-/

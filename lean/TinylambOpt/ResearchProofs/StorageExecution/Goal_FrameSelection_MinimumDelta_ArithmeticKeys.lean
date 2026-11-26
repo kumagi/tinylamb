@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `MinimumDelta.ArithmeticKeys` — `∀ d n, 0<n → (write ((List.range n).map (fun i =>
+  (i+1)*d))).length = ubytes (2*d)+1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

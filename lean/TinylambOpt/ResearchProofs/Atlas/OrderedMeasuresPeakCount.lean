@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Refuted by counterexample
+
+- `PeakCount.DuplicateLoss` — `∀ x, measure (x.flatMap (repeated 2)) = measure x`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.OrderedMeasuresPeakCount
 
 private def m := TinylambOpt.ResearchGoals.Atlas.OrderedMeasures.PeakCount.measure

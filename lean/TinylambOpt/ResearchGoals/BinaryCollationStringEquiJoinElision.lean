@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Reference hash join with full residual predicate verification (`collEq c`).
+
+Optimized join with residual predicate elided into exact hash-table byte equality
+(skipping bytecode/collation residual dispatch).
+
+Modeled claims
+
+- `Goal` — Binary collation residual-predicate elision for string equi-joins (STATS-CEB
+  C4 / DictionaryJoinsAndLateLabels B2): under `Collation.binary`, eliding residual
+  string equality into exact byte-equality inside the hash join matches `refJoin` for
+  all hash functions (including total hash collisions) on both INNER and LEFT JOIN,
+  whereas `asciiCaseInsensitive` and `padSpace` collations must keep residual checks.
+-/
+
 namespace TinylambOpt.ResearchGoals.BinaryCollationStringEquiJoinElision
 
 inductive Collation where
@@ -76,7 +91,7 @@ private def padA : List UInt8 := [97] -- "a"
 private def padASpace : List UInt8 := [97, 32] -- "a "
 
 /-- Binary collation residual-predicate elision for string equi-joins (STATS-CEB
-    C4 / BigBench B2): under `Collation.binary`, eliding residual string equality
+    C4 / DictionaryJoinsAndLateLabels B2): under `Collation.binary`, eliding residual string equality
     into exact byte-equality inside the hash join matches `refJoin` for all hash
     functions (including total hash collisions) on both INNER and LEFT JOIN,
     whereas `asciiCaseInsensitive` and `padSpace` collations must keep residual checks. -/

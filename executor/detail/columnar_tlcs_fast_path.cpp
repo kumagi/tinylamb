@@ -207,7 +207,7 @@ class SingleIntWorkerTable {
   int64_t null_count_only_{0};
 };
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (dense_group_block_accum_monoid_eq, finite_sum_implies_no_inf,
 //    nonnull_avg_count_eq_count_star)
 struct CompiledFastAgg {
@@ -1131,7 +1131,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
       return std::optional<Relation>(std::move(empty_out));
     }
 
-    // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+    // Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
     // (timestampTrunc_monotone, contiguous_prefix_preserves_complete_buckets,
     // periodic_extract_breaks_monotone_runs_bug)
     // CB-6: Monotone `TIMESTAMP_TRUNC` sorted-block early cutoff (ClickBench
@@ -1507,7 +1507,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                              {QueryParallelWorkerLimit(
                                   std::thread::hardware_concurrency()),
                               mblocks.size(), size_t{16}}));
-        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
         //   (count_distinct_gt_one_iff_min_lt_max,
         //    count_distinct_eq_one_iff_min_eq_max)
         // Ultra-fast register-only streaming path for:
@@ -2253,7 +2253,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
         table_schema, preds, key_specs, plan_agg_specs);
 
-    // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+    // Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
     //   (bounded_int64_sum_parallel_sound, const_block_sum_fold_sound,
     //    unbounded_int64_sum_reordering_overflow_bug)
     bool has_unbounded_checked_int_sum = false;
@@ -2346,7 +2346,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     const CompiledFastAggPlan fast_agg_plan =
         CompileFastAggPlan(plan_agg_specs);
 
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (direct_int_key_injective, direct_int_key_in_bounds,
     //    parallel_direct_array_merge_eq, finite_sum_implies_no_inf)
     // Direct-indexed dense array for single bounded INT64/DATE group key with
@@ -2550,7 +2550,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 (cm.encoding == TlcsColumnEncoding::kConstNull ||
                  (!cm.has_null && cm.has_min_max && cm.min_int == cm.max_int));
             // Lean proof:
-            // lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+            // lean/TinylambOpt/ResearchProofs/AnalyticalOperators/DictionarySlicesAndExtrema.lean
             //   (sound_DominatedColumn).
             // On an all-pass block, signed INT64/DATE MIN/MAX can be answered
             // directly from block metadata (cm.min_int / cm.max_int) without
@@ -4069,7 +4069,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
           !bounded_topk && fast_order_kind == FastSingleOrderKind::kInt &&
           plan_order.size() == 1 && survivors.size() >= 1024 &&
           // Lean proof:
-          // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+          // lean/TinylambOpt/ResearchProofs/StableRadix.lean
           // (sound)
           TryStableRadixSortNullableInt64(
               survivors, plan_order[0].order.Ascending(),
@@ -4161,7 +4161,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
     return std::optional<Relation>(std::move(output));
   };
 
-  // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+  // Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
   // (two_stage_topn_late_agg_materialization_sound,
   // two_stage_late_agg_sql_in_null_group_bug)
   // CB-3: Two-Stage Top-N Late Aggregate Materialization (ClickBench Q10, Q22,
@@ -4170,7 +4170,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
   // defer expensive payload aggregates (`MIN/MAX(VARCHAR)`, `COUNT(DISTINCT)`,
   // and provably non-overflowing unreferenced aggregates) to a second pass over
   // ONLY the `W <= K` winning group keys using NULL-safe key membership!
-  // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+  // Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
   //   (having_count_markov_bound_sound, having_two_stage_late_agg_sound,
   //    having_sum_signed_unbounded_groups_bug)
   uint64_t min_having_count = 0;
@@ -5049,7 +5049,7 @@ StatusOr<std::optional<Relation>> TryRunColumnarTlcsAggregate(
                 }
 
                 // Lean proofs:
-                //   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+                //   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean
                 //     (OwnerDistinct_sound, OrderedCodeMin_sound)
                 auto& my_aggs = p2_worker_aggs[tid];
                 // OrderedCodeMin_sound: for dictionary-encoded VARCHAR

@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims compute interval counts from ordered endpoints. A SQL range operator can
+use a sweep instead of visiting every interval-row pair.
+
+Modeled claims
+
+- `Goal` — `∀ spans points, sweep spans points = reference spans points`
+-/
+
 namespace TinylambOpt.ResearchGoals.IntervalCountSweep
 
 abbrev Cell := Option Int

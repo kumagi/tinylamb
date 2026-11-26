@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Optimizer
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `JoinPrefix` — Push a variable prefix demand through a one-to-many join for
+  OFFSET/LIMIT, even when particular left keys have zero matches. No upper fanout is
+  needed.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -87,3 +98,6 @@ theorem sound : Goal := by
   simpa [k] using hgoal
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Opt_JoinPrefix
+
+-- C++ references to this model or its proof.
+-- plan/optimizer_decisions.hpp

@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Exact integer numerator `n * ∑ x^2 - (∑ x)^2 = n^2 * Var_pop(X) * n`.
+
+Exact `(numerator, denominator)` for `AVG` (`none` iff `n = 0`).
+
+Modeled claims
+
+- `Goal` — Shared Chan/Welford statistical accumulator for `(COUNT, AVG, STDDEV_SAMP)`
+  (TPC-DS Q17/Q39): (1) computing one shared tuple state yields exact `COUNT`, `AVG`,
+  and `VAR_SAMP` (matching `n ≤ 1 → none`), (2) `n * sumSq - sum^2` equals the scaled
+  sum of squared deviations `∑ (n * x - sum)^2 / n`, and (3) parallel chunks satisfy
+  the exact integer Chan cross-term identity `n1 * n2 * M2_num(xs ++ ys) =
+  n2*(n1+n2)*M2_num(xs) + n1*(n1+n2)*M2_num(ys) + (n2*s1 - n1*s2)^2`.
+-/
+
 namespace TinylambOpt.ResearchGoals.ChanWelfordSharedVarianceState
 
 def validValues (xs : List (Option Int)) : List Int :=

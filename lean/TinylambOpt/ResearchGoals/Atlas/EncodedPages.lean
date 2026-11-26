@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.PairAggregates
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
 /-! A page maps physical ordinals to optional integer values. Missing ordinals

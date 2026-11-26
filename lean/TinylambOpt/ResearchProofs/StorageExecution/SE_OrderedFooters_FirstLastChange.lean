@@ -1,5 +1,20 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_OrderedFooters_Common
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved (10 claims, including the following)
+
+- `FirstLastChange.AmendLeaf` — Update one cached block using the left and right
+  partial states.
+- `FirstLastChange.DuplicateBlock` — `∀ xs k, xs≠[] → 0<k → let n := ((agg.reference
+  xs).map (fun r => r.2.2)).getD 0 ((agg.reference (List.replicate k xs).flatten).map
+  (fun r => r.2.2)).getD 0 = k*n-(if xs.head?==xs.getLast? then k-1 else 0)`
+- `FirstLastChange.FrameSlice` — Use only the two ragged boundaries and whole-page
+  summaries for a window.
+-/
+
 set_option linter.unusedVariables false
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.OrderedFooters.FirstLastChange

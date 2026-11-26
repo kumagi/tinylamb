@@ -1,5 +1,19 @@
 import Std
 
+/-!
+Capped-group early-freeze aggregation (`GROUP BY ... LIMIT K` without `ORDER
+BY`/`HAVING`): once `K` distinct keys exist, ignore new unseen keys while still updating
+counts for already-inserted keys.
+
+Modeled claims
+
+- `Goal` — Early-frozen hash aggregation for un-ordered `GROUP BY ... LIMIT K`
+  (ClickBench Q18): stopping new key allocation at `K` distinct keys while continuing
+  updates for existing keys yields `min K (#distinct)` unique groups whose counts
+  match exact full-table `COUNT(*)`, whereas stopping the scan prematurely misses
+  trailing increments (and adding `ORDER BY`/`HAVING` breaks early freeze).
+-/
+
 namespace TinylambOpt.ResearchGoals.CappedGroupEarlyFreeze
 
 def addGroupCount (m : List (Int × Nat)) (k : Int) : List (Int × Nat) :=

@@ -1,5 +1,10 @@
 import Std
 
+/-!
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
 
 /-! Compile a non-NULL natural-key predicate into index seeks on [0,cap).

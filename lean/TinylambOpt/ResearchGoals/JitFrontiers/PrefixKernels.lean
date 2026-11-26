@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 
 open TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites (fits limit)

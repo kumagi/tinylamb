@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `PagedTombstones.SkipEpochs` — `∀ c, (rows layout c).length = (c.n/(2*width c))*width
+  c + min (width c) (c.n%(2*width c))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

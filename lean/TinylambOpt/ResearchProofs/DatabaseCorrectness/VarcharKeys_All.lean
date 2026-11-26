@@ -1,0 +1,13 @@
+-- Proof aggregation for DatabaseCorrectness.VarcharKeys
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_BinaryKeySelfDelimiting
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_AcceptedKeyPrefixCanonical
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_IncompleteFieldIsNotEmpty
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_EmptyTerminatorOnlyAtStart
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_CompoundKeyComponentIdentity
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_BinaryKeyOrderEmbedding
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_VarcharKeys_CompoundSuffixCannotReverseKey
+
+/-! Aggregates the seven proofs for binary VARCHAR keys: field boundaries,
+canonical accepted prefixes, truncated-field rejection, the first-block-only
+empty terminator, compound-key component identity, and block-wise order
+embedding with compound-suffix independence. -/

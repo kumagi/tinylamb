@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+import TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_TrimZerosPreservesAllZeroInput
+
+/-! REFUTE: verified DecimalChunks.TrimZerosPreservesAllZeroInput. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_DecimalChunks_TrimZerosPreservesAllZeroInput
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.TrimZerosPreservesAllZeroInput
+theorem refute : ¬ Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_TrimZerosPreservesAllZeroInput.refute
+end Nov26.Proof_DecimalChunks_TrimZerosPreservesAllZeroInput

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `ChannelBridge.TripleOverlap` — `∀ n db b, reference pattern n db b = total n (fun y
+  => overlap n db 0 (b 0) y * overlap n db 1 (b 0) y * overlap n db 2 (b 0) y)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

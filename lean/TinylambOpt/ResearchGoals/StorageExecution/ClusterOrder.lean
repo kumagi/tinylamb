@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 open TinylambOpt.ResearchGoals.Compression.Wire
 

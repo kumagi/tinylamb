@@ -1,0 +1,11 @@
+-- Proof aggregation for DatabaseCorrectness.WalReread
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_ReverseOwnerChainMatchesForwardWindow
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_InterleavedForeignWritesDoNotShadowOwn
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_ZeroFirstLsnIsARealRecord
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_PendingTombstoneShadowsValue
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_SegmentedOwnerCommitOrder
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WalReread_BadBacklinkNeverReplaysRecordTwice
+
+/-! Aggregates the six WAL re-read proofs: reverse owner-chain traversal,
+foreign-write independence, the zero first LSN, tombstone shadowing, segmented
+commit order, and duplicate-free fallback traversal. -/

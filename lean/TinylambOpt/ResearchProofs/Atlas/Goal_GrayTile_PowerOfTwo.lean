@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `GrayTile.PowerOfTwo` — `∀ c (d : Nat), width c = 2^d → c.n%width c = 0 → ((rows
+  layout c).map Prod.snd).Perm ((rows LinearOrdinal.layout c).map Prod.snd)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

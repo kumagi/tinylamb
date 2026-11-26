@@ -103,3 +103,11 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Goal_ShardLocal_SqlNul
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Goal_ShardLocal_ReuseForSort
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Goal_ShardLocal_WrongShard
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Goal_ShardLocal_LastLocal
+
+/-!
+This module collects proofs for Common Packed Keys, Back Fields Packed Keys, Specific
+Packed Keys, Refutations Packed Keys and related cases.
+
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+-/

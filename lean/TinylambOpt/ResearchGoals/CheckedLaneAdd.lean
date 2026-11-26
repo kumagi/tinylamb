@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims compare packed or vector lane additions with checked scalar addition. A SQL
+expression fast path must preserve active-lane results and overflow.
+
+Modeled claims
+
+- `Goal` — `∀ m a b, (∀ i < 64, observe m a b i = reference m a b i) ∧ (List.range
+  64).find? (errors m a b).getLsbD = (List.range 64).find? (fun i => decide
+  (reference m a b i = .overflow))`
+-/
+
 namespace TinylambOpt.ResearchGoals.CheckedLaneAdd
 
 abbrev W := BitVec 64

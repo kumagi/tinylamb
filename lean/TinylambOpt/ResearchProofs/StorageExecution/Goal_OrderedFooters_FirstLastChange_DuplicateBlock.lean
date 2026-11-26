@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `FirstLastChange.DuplicateBlock` — `∀ xs k, xs≠[] → 0<k → let n := ((agg.reference
+  xs).map (fun r => r.2.2)).getD 0 ((agg.reference (List.replicate k xs).flatten).map
+  (fun r => r.2.2)).getD 0 = k*n-(if xs.head?==xs.getLast? then k-1 else 0)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.ExceptAllDebt
 
+/-!
+Proved
+
+- `Goal` — `∀ p, (output p).Perm (reference p)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.ExceptAllDebt`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ExceptAllDebt
 
 open TinylambOpt.ResearchGoals.ExceptAllDebt

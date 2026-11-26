@@ -1,5 +1,19 @@
 import Std
 
+/-!
+These claims describe the write-ahead ordering between checkpoint state and encoded
+column data. SQL recovery depends on reading data and redo records from a consistent
+modeled boundary.
+
+Modeled claims
+
+- `Goal` — WAL checkpoint vs persistent TLCS boundary
+  (`recovery/checkpoint_manager.cpp`, `recovery/recovery_manager.cpp`): under
+  writes-before-commit and MVCC write-intent commit serialization, TLCS snapshot at
+  `cpLsn` plus WAL replay from `minActiveWriteLsn` agrees with full WAL replay from
+  LSN 0.
+-/
+
 namespace TinylambOpt.ResearchGoals.WalCheckpointTlcsBoundary
 
 inductive Record where

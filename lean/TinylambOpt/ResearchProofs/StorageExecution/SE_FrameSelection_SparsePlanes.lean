@@ -1,6 +1,25 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_FrameSelection_Common
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved (9 claims, including the following)
+
+- `SparsePlanes.BoundedRaw` — A forced frame cap still limits worst-case expansion to
+  raw cells and per-frame overhead.
+- `SparsePlanes.ByteFrontier` — Use the actual codec and raw fallback in the size/seek
+  optimum.
+- `SparsePlanes.HotPointReads` — Raising point-read cost can only reduce the squared
+  decoded lengths of optimal pages.
+
+Refuted by counterexample
+
+- `SparsePlanes.GreedyCut` — Aggressive hypothesis: the cheapest two adjacent groups
+  never need reconsideration when a third arrives.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

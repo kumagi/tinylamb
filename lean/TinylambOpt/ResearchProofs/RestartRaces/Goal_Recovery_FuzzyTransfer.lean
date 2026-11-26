@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `FuzzyTransfer` — Restart can crash between the two page installations. From
+  arbitrary per-page cuts, interrupt redo at any record and replay from the start;
+  both balances converge even for self-transfers and signed deltas.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

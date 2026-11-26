@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.BitPlaneSum
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.PlaneKernels
 open BitPlaneSum (W B pack count)
 

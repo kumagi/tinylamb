@@ -429,5 +429,114 @@ TEST(TlcsCompressionTest, ClickBenchLayoutStorageCodecs) {
   }
 }
 
+TEST(TlcsCompressionTest, CompressedVarCharContainsLengthsAndSparseDecode) {
+  constexpr uint32_t kRows = 256;
+  std::vector<std::string> src(kRows);
+  std::vector<uint8_t> nulls(kRows, 0U);
+  std::string flat;
+  std::vector<uint32_t> ends;
+  ends.reserve(kRows);
+  for (uint32_t r = 0; r < kRows; ++r) {
+    if (r % 17 == 0) {
+      nulls[r] = 1U;
+      ends.push_back(static_cast<uint32_t>(flat.size()));
+      continue;
+    }
+    if (r % 19 == 0) {
+      src[r] = "https://www.google.com/search?q=item_" + std::to_string(r % 7);
+    } else if (r % 23 == 0) {
+      // Cross-boundary trap: ends with "goo", next sorted entry may start "gle"
+      src[r] = "https://example.org/goo";
+    } else {
+      src[r] = "https://gle.example.net/page/" + std::to_string(r % 11);
+    }
+    flat.append(src[r]);
+    ends.push_back(static_cast<uint32_t>(flat.size()));
+  }
+
+  std::vector<uint32_t> expected_hits;
+  for (uint32_t r = 0; r < kRows; ++r) {
+    if (nulls[r] == 0U && src[r].find("google") != std::string::npos) {
+      expected_hits.push_back(r);
+    }
+  }
+  ASSERT_FALSE(expected_hits.empty());
+
+  // 1. VarCharFrontDict: contains, lengths_only, and sparse selected_rows.
+  std::vector<uint8_t> front_enc;
+  ASSERT_TRUE(
+      TryEncodeVarCharFrontDict(flat, ends, nulls.data(), kRows, &front_enc));
+  std::vector<uint32_t> front_hits;
+  ASSERT_TRUE(MatchVarCharFrontDictContains(front_enc, nulls.data(), kRows,
+                                            "google", &front_hits));
+  EXPECT_EQ(front_hits, expected_hits);
+
+  std::vector<uint32_t> no_hits;
+  ASSERT_TRUE(MatchVarCharFrontDictContains(front_enc, nulls.data(), kRows,
+                                            "not-present-xyz", &no_hits));
+  EXPECT_TRUE(no_hits.empty());
+
+  std::vector<uint8_t> len_bytes;
+  std::vector<uint32_t> len_ends;
+  ASSERT_TRUE(DecodeVarCharFrontDictBytes(front_enc, nulls.data(), kRows,
+                                          &len_bytes, &len_ends,
+                                          /*lengths_only=*/true));
+  EXPECT_TRUE(len_bytes.empty());
+  EXPECT_EQ(len_ends, ends);
+
+  std::vector<uint8_t> sparse_bytes;
+  std::vector<uint32_t> sparse_ends;
+  ASSERT_TRUE(DecodeVarCharFrontDictBytes(
+      front_enc, nulls.data(), kRows, &sparse_bytes, &sparse_ends,
+      /*lengths_only=*/false, expected_hits));
+  for (const uint32_t r : expected_hits) {
+    const uint32_t b = r == 0 ? 0U : sparse_ends[r - 1];
+    const uint32_t e = sparse_ends[r];
+    EXPECT_EQ(
+        std::string_view(reinterpret_cast<const char*>(sparse_bytes.data() + b),
+                         e - b),
+        src[r]);
+  }
+
+  // 2. ZstdVarChar unpacked: contains, lengths_only, and sparse selected_rows.
+  if (HasZstdSupport()) {
+    std::vector<uint8_t> zstd_enc;
+    ASSERT_TRUE(TryEncodeZstdVarChar(
+        flat, ends, nulls.data(), kRows,
+        flat.size() + (static_cast<size_t>(kRows) * 4U), 1, &zstd_enc));
+    uint8_t tag = 0;
+    uint8_t subtag = 0;
+    std::span<const uint8_t> unpacked;
+    ASSERT_TRUE(DecompressZstdFrameRaw(zstd_enc, &tag, &subtag, &unpacked));
+    EXPECT_EQ(tag, 0U);
+    std::vector<uint32_t> zstd_hits;
+    ASSERT_TRUE(MatchZstdVarCharUnpackedContains(unpacked, nulls.data(), kRows,
+                                                 "google", &zstd_hits));
+    EXPECT_EQ(zstd_hits, expected_hits);
+
+    std::vector<uint8_t> zlen_bytes;
+    std::vector<uint32_t> zlen_ends;
+    ASSERT_TRUE(DecodeZstdVarCharUnpackedBytes(unpacked, nulls.data(), kRows,
+                                               &zlen_bytes, &zlen_ends,
+                                               /*lengths_only=*/true));
+    EXPECT_TRUE(zlen_bytes.empty());
+    EXPECT_EQ(zlen_ends, ends);
+
+    std::vector<uint8_t> zsparse_bytes;
+    std::vector<uint32_t> zsparse_ends;
+    ASSERT_TRUE(DecodeZstdVarCharUnpackedBytes(
+        unpacked, nulls.data(), kRows, &zsparse_bytes, &zsparse_ends,
+        /*lengths_only=*/false, expected_hits));
+    for (const uint32_t r : expected_hits) {
+      const uint32_t b = r == 0 ? 0U : zsparse_ends[r - 1];
+      const uint32_t e = zsparse_ends[r];
+      EXPECT_EQ(
+          std::string_view(
+              reinterpret_cast<const char*>(zsparse_bytes.data() + b), e - b),
+          src[r]);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace tinylamb::tlcs_compression

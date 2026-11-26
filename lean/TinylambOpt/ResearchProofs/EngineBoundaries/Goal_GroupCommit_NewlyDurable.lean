@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `NewlyDurable` — Replies newly eligible after a sync occupy an exact half-open/closed
+  interval.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

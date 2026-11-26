@@ -1,6 +1,22 @@
 import TinylambOpt.ResearchGoals.CloudBI.Quotes
 import TinylambOpt.ResearchProofs.CloudBI.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+
+Proved (10 claims, including the following)
+
+- `CandleFringe` — Answer arbitrary half-open time windows from whole fixed-width
+  candles and the two partial edges. Each event belongs to a tile by its event time,
+  including late arrivals.
+- `CloseTournament` — `∀ (runs : List (List Tick)) (input : List Tick),
+  runs.flatten.Perm input → (∀ a ∈ runs.flatten, ∀ b ∈ runs.flatten, a.ts = b.ts →
+  a.tie = b.tie → a.bid = b.bid) → latest (runs.filterMap lastBid) = lastBid input`
+- `FenceRead` — Prune a physically clustered run using its symbol fence. An overlapping
+  fence can have holes; rows still undergo the exact symbol and time predicate.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -99,3 +99,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits.Goal_SwapReferen
 import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits.Goal_SwapReferences_SecondSeesFirst
 import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits.Goal_RekeyLate_Repaired
 import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits.Goal_RekeyLate_PrefixFault
+
+/-!
+This module collects proofs for Goal Parent First Delta Check, Goal Parent First Frame
+Keys, Goal Parent First Defer, Goal Parent First Replay and related cases.
+
+Foreign-key checking must respect the observation point of the constraint and the parent
+keys still present after each modeled edit.
+-/

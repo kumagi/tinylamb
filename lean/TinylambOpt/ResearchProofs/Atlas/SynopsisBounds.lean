@@ -2,6 +2,26 @@ import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 import TinylambOpt.ResearchProofs.Atlas.Goal_Couplings_Rearrangement
 import TinylambOpt.ResearchProofs.Atlas.Goal_Couplings_TransportLower
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved (17 claims, including the following)
+
+- `Couplings.FarRows` — `∀ rs d, (d+1) * rs.countP (fun (a,b) => d < (a-b).natAbs) ≤
+  cost rs`
+- `Couplings.Rearrangement` — `∀ rs, dotRows (counter rs) ≤ dotRows rs ∧ dotRows rs ≤
+  dotRows (monotone rs)`
+- `Couplings.TransportLower` — `∀ rs, cost (monotone rs) ≤ cost rs`
+
+Refuted by counterexample
+
+- `Couplings.AlignedMarginals` — `∀ rs, (rs.map Prod.fst).Perm (rs.map Prod.snd) → cost
+  rs = 0`
+- `PageMoments.MomentHistogram` — `∀ (a b : Page), a.length = b.length → a.sum = b.sum
+  → energy a 0 = energy b 0 → ∀ (cut : Int), a.countP (· ≥ cut) = b.countP (· ≥ cut)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.SynopsisBounds
 
 open TinylambOpt.ResearchGoals.Atlas.SynopsisBounds

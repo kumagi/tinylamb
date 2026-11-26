@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.StarHubMultiwayWeightedProduct
 
+/-!
+Proved
+
+- `Goal` — Star-hub 3-way FK-FK weighted-product factorization (STATS-CEB C1, C5 / JOB
+  J5 / LDBC L2 / DictionaryJoinsAndLateLabels B3): independent pre-aggregation of
+  value branch `B1` and multiplicity branch `B2` keyed by hub FK `k`, combined in a
+  single scan over `H`, avoids intermediate FK-FK tuple blowup while preserving exact
+  `(COUNT(*), COUNT(B1.v), SUM(B1.v))`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.StarHubMultiwayWeightedProduct`.
+-/
+
 namespace TinylambOpt.ResearchProofs.StarHubMultiwayWeightedProduct
 
 open TinylambOpt.ResearchGoals.StarHubMultiwayWeightedProduct
@@ -451,3 +464,7 @@ theorem sound : TinylambOpt.ResearchGoals.StarHubMultiwayWeightedProduct.Goal :=
   rfl
 
 end TinylambOpt.ResearchProofs.StarHubMultiwayWeightedProduct
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.cpp
+-- executor/detail/analytics_factorized_join.hpp

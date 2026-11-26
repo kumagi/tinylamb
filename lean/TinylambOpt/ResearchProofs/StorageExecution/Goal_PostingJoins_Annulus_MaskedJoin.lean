@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `Annulus.MaskedJoin` — A point-delete bitmap on the right can subtract removed
+  multiplicities from the offset count.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

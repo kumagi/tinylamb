@@ -2079,19 +2079,20 @@ TEST(PostgresServerTest, ExtendedQueryMessagesRejectedKeepSessionAlive) {
         SendAll(client, QueryMessage("CREATE TABLE ext_rows (id INT64);")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
-    // Act -- the extended query protocol is not implemented: Parse, Bind, and
-    // Execute messages are each rejected with an error; the closing Sync
-    // answers ReadyForQuery (exactly one RFQ per Sync).
+    // Act -- Extended Query Protocol: Parse + Bind (binary result format) +
+    // Describe + Execute + Sync executes cleanly and returns binary-encoded
+    // DataRow frames; malformed Bind/Execute return protocol errors and keep
+    // the session alive across Sync.
     const std::string parse =
         std::string("P\0\0\0\21", 5) + std::string("\0", 1) +
         std::string("SELECT 1;\0", 10) + std::string("\0\0", 2) +
         std::string("S\0\0\0\4", 5);
     ASSERT_TRUE(SendAll(client, parse));
     const std::string parsed = ReadUntilReady(client);
-    EXPECT_NE(parsed.find('E'), std::string::npos);
-    EXPECT_NE(parsed.find("not supported"), std::string::npos);
+    EXPECT_NE(parsed.find('1'), std::string::npos);  // ParseComplete
     EXPECT_NE(parsed.find('Z'), std::string::npos);
 
+    // Malformed Bind / Execute frames produce 08P01 and keep session alive.
     ASSERT_TRUE(SendAll(client, std::string("B\0\0\0\5", 5) + '\0' +
                                     std::string("S\0\0\0\4", 5)));
     const std::string bound = ReadUntilReady(client);
@@ -3688,15 +3689,15 @@ TEST(PostgresServerTest, ProtocolViolationAbortsExplicitBlock) {
     EXPECT_NE(ReadUntilReady(client).find(std::string("Z\0\0\0\5I", 6)),
               std::string::npos);
 
-    // And again with an extended-protocol message: Parse gets 0A000 and
-    // Sync's RFQ must report the aborted state.
+    // And again with a malformed extended-protocol message: truncated Parse
+    // gets 08P01 and Sync's RFQ must report the aborted state.
     ASSERT_TRUE(SendAll(client, QueryMessage("BEGIN;")));
     EXPECT_NE(ReadUntilReady(client).find(std::string("Z\0\0\0\5T", 6)),
               std::string::npos);
     ASSERT_TRUE(SendAll(client, std::string("P\0\0\0\4", 5)));
     ASSERT_TRUE(SendAll(client, std::string("S\0\0\0\4", 5)));
     const std::string extended = ReadUntilReady(client);
-    EXPECT_NE(extended.find("0A000"), std::string::npos);
+    EXPECT_NE(extended.find("08P01"), std::string::npos);
     EXPECT_NE(extended.find(std::string("Z\0\0\0\5E", 6)), std::string::npos)
         << extended;
 

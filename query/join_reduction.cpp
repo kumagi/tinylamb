@@ -43,7 +43,7 @@ bool RejectsNulls(const Expression& expression,
 bool NeverFalse(const Expression& expression,
                 const std::unordered_set<std::string>& qualifiers);
 
-// Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+// Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
 //   (repairedIsStrict_sound, cpp_empty_in_isFalse_bug)
 bool IsStrictOnQualifiers(const Expression& expression,
                           const std::unordered_set<std::string>& qualifiers) {
@@ -120,7 +120,7 @@ bool IsStrictOnQualifiers(const Expression& expression,
 // NULL-padded rows of an outer join therefore never survive a WHERE conjunct
 // with this property, which makes the outer join reducible to an inner join.
 // Lean proof: lean/TinylambOpt/BagRel.lean (outer_to_inner_join_sound) &
-//   lean/TinylambOpt/CppRuleAudit.lean (repairedRejectsAndNeverFalse_sound,
+//   lean/TinylambOpt/NullRejectionAndGroupRewrites.lean (repairedRejectsAndNeverFalse_sound,
 //   cpp_empty_in_isFalse_bug, cpp_neverFalse_sub_and_bitNot_bug)
 bool RejectsNulls(const Expression& expression,
                   const std::unordered_set<std::string>& qualifiers) {

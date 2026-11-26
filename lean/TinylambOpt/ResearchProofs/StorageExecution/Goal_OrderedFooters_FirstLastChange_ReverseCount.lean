@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `FirstLastChange.ReverseCount` — `∀ xs, (agg.reference xs.reverse).map (fun r =>
+  r.2.2) = (agg.reference xs).map (fun r => r.2.2)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

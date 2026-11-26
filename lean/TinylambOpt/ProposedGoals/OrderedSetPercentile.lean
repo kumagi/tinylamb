@@ -1,5 +1,16 @@
 import Std
 
+/-!
+1-based rank (ceil of num/den * n).
+
+Optimized: sort once and index the requested rank.
+
+Modeled claims
+
+- `Goal` — `∀ (rows : List V) (num den : Nat), den > 0 → num <= den → sortedPick rows
+  num den = rankPick rows num den`
+-/
+
 namespace TinylambOpt.ProposedGoals.OrderedSetPercentile
 
 abbrev V := Option Int

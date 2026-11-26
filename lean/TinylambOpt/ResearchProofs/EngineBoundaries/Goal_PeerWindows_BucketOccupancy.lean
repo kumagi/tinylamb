@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `BucketOccupancy` — Exact bucket occupancy also handles more buckets than rows.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

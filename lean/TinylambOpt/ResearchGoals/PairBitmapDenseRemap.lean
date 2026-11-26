@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Naive modulo remapping `outer % 2` collides distinct keys and causes false positives on
+unseen pairs.
+
+Modeled claims
+
+- `Goal` — Exact 2D dense outer-key remap + bit-matrix
+  (`executor/detail/build_input.cpp` `pair_bits` / `pair_outer_dense`): remapping
+  sparse outer keys injectively via `eraseDups`/`findIdx?` and optionally swapping
+  axes yields an exact filter with zero false positives and zero false negatives.
+-/
+
 namespace TinylambOpt.ResearchGoals.PairBitmapDenseRemap
 
 def normPair (swap : Bool) (p : Int × Int) : Int × Int :=

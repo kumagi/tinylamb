@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `RecenterAbs.FoldValue` — Algebraic replacement remains exact in the widened IR
+  domain.
+- `RecenterAbs.NarrowVersion` — A narrow version may widen its result only when both
+  the internal and final operations are safe.
+- `RecenterAbs.Sufficient` — The proposed strength-reduced guard excludes every fault
+  of the removed instruction.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

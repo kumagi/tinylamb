@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Newton forward reconstruction for every function whose `(k+1)`-st forward difference
+vanishes identically.
+
+Named results include `sound_SupplierClique_DeltaForecast`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

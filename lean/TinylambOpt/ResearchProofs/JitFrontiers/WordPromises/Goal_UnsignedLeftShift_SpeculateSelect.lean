@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `UnsignedLeftShift.GuardExact` — A concrete machine-bit test recognizes precisely the
+  defined domain.
+- `UnsignedLeftShift.SpeculateSelect` — Do not propagate poison from an unselected arm
+  when evaluating lanes speculatively.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

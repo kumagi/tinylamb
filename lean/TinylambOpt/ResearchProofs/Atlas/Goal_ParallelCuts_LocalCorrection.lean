@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `ParallelCuts.LocalCorrection` — `∀ xs cs i d, peak (groups (xs.modify i (·+d)) cs) ≤
+  peak (groups xs cs)+d`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

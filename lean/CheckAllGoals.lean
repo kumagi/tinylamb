@@ -1,30 +1,38 @@
 import TinylambOpt
-import TinylambOpt.ResearchGoals.EngineDecisions
-import TinylambOpt.ResearchProofs.RestartRaces.AllGoalProofs
-import TinylambOpt.ResearchProofs.EngineDecisions.AllGoalProofs
-import TinylambOpt.ResearchProofs.ClickBenchLayout.AllGoalProofs
-import TinylambOpt.ResearchProofs.BenchmarkRematch.AllGoalProofs
+import TinylambOpt.ProposedProofs.BenchmarkRematch.AllGoalProofs
 import TinylambOpt.ResearchProofs.JitFrontiers.AllGoalProofs
 import TinylambOpt.ResearchProofs.Compression.Text_All
 import TinylambOpt.ResearchProofs.Frontiers.WorkloadBases_All
 import TinylambOpt.ResearchProofs.Atlas.RangePlans_All
 import TinylambOpt.ResearchProofs.EngineBoundaries.AllGoalProofs
 import TinylambOpt.ResearchProofs.LayerContracts.AllGoalProofs
+import TinylambOpt.ResearchProofs.EngineDecisions.AllGoalProofs
+import TinylambOpt.ResearchProofs.ClickBenchLayout.AllGoalProofs
+import TinylambOpt.ResearchProofs.BenchmarkRematch.AllGoalProofs
+import TinylambOpt.ResearchProofs.RestartRaces.AllGoalProofs
+import TinylambOpt.ResearchProofs.November26.AllGoalProofs
+import TinylambOpt.ResearchProofs.Batch5.AllGoalProofs
+import TinylambOpt.ResearchProofs.QueryRewrites.AllGoalProofs
+import TinylambOpt.ResearchProofs.ResourcePolicies.AllGoalProofs
+import TinylambOpt.ResearchProofs.JitKernels.AllGoalProofs
+import TinylambOpt.ResearchProofs.ProposedGoals.ClickBench.AllGoalProofs
+import TinylambOpt.ResearchProofs.ProposedGoals.TpcdsPart2.AllGoalProofs
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.AllGoalProofs
 import Lean.Util.CollectAxioms
 import Lean.Elab.Command
 
-/-! Global coverage audit for every `…Goal` defined in the project. Reports
-proven/refuted/missing counts grouped by top-level domain and lists missing
-goals (capped). -/
+/-! Global coverage audit for every research and proposed `…Goal` in the
+project. Reports proven/refuted/missing counts grouped by top-level domain and
+lists missing goals. -/
 
 open Lean
 
 run_cmd do
   let env ← getEnv
   let mut goals : Array Name := #[]
-  let researchPrefix := `TinylambOpt.ResearchGoals
+  let goalPrefixes := #[`TinylambOpt.ResearchGoals, `TinylambOpt.ProposedGoals]
   for (name, _) in env.constants.toList do
-    if researchPrefix.isPrefixOf name && (name.toString.splitOn ".").getLast? == some "Goal" then
+    if goalPrefixes.any (fun pfx => pfx.isPrefixOf name) && name.toString.endsWith "Goal" then
       goals := goals.push name
   goals := goals.qsort (fun a b => a.toString < b.toString)
   let goalSet := Std.HashSet.ofArray goals
@@ -54,6 +62,8 @@ run_cmd do
   let groupArr := (groups.toList.toArray).qsort (fun a b => a.1 < b.1)
   for (k, v) in groupArr do
     logInfo m!"MISSING-GROUP {k}: {v}"
-  for g in missing.take 40 do logInfo m!"MISSING {g}"
-  if missing.size > 40 then logInfo m!"... and {missing.size - 40} more"
-  if !bad.isEmpty then for n in bad.take 20 do logInfo m!"BADAX {n}"
+  for g in missing do logInfo m!"MISSING {g}"
+  if !bad.isEmpty then for n in bad do logInfo m!"BADAX {n}"
+  let conflicts := goals.filter (fun g => proven.contains g && refuted.contains g)
+  logInfo m!"CONFLICTS {conflicts.size}"
+  for g in conflicts do logInfo m!"CONFLICT {g}"

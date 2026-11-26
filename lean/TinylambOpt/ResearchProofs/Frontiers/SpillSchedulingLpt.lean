@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Frontiers.SpillScheduling
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `LargestFirst` — `∀ (assignment : List (List Nat)), 0 < assignment.length → let m :=
+  assignment.length let jobs := assignment.flatten.mergeSort (fun a b => a ≥ b)
+  3*m*makespan (dispatch (List.replicate m 0) jobs) ≤ (4*m-1)*makespan
+  (assignment.map List.sum)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.SpillSchedulingLpt
 
 def makespan (l : List Nat) : Nat := l.max?.getD 0
@@ -1419,5 +1431,5 @@ theorem LargestFirst_sound :
 
 end TinylambOpt.ResearchProofs.Frontiers.SpillSchedulingLpt
 
-
-
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

@@ -1,5 +1,9 @@
 import Std
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
 /-! One active outgoing write-intent wait per transaction. Edges point from

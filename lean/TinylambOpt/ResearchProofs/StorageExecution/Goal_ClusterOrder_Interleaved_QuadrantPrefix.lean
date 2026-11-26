@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Interleaved.QuadrantPrefix` — `∀ x y h, (key (x,y)).1/4^h = morton (x/2^h) (y/2^h)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

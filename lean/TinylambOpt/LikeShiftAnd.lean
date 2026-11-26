@@ -1,4 +1,10 @@
 import Std.Tactic
+
+/-!
+One pass with early termination on the first accepting boundary.
+
+Named results include `packNat_testBit`, `pack_getLsbD`, `pack_unpack`.
+-/
 -- C++ counterpart: expression/jit.cpp (see issues/README.md).
 
 /-
@@ -503,3 +509,9 @@ theorem shift_and_contains (needle input : List Byte) (hne : needle ≠ [])
     exact ⟨_,t,rfl,(like_shift_and_sound needle hne w k hw hfit _).mpr ⟨p,rfl⟩⟩
 
 end TinylambOpt.LikeShiftAnd
+
+-- C++ references to this model or its proof.
+-- common/literal_like_pattern.hpp
+-- executor/detail/expression_eval.cpp
+-- executor/detail/scan_filter.cpp
+-- expression/binary_expression.cpp

@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims describe ordering and stability under radix partitioning. SQL can use radix
+passes where the encoded order and tie behavior match the requested ordering.
+
+Modeled claims
+
+- `Goal` — `∀ rows, radix rows = rows.mergeSort before`
+-/
+
 namespace TinylambOpt.ResearchGoals.StableRadix
 
 structure Row where

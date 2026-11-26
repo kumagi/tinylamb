@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 import TinylambOpt.ResearchProofs.Atlas_TextExecution_Grammar
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Grammar.BoundaryHits` — `∀ a b p, p ≠ [] → (positions (a++b) p).length = (positions
+  a p).length + (positions b p).length + crossing a b p`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

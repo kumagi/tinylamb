@@ -1,5 +1,23 @@
 import Std
 
+/-!
+Naive flat inner join followed by 5-aggregate computation for group `g`.
+
+Weight-pushdown scan for inner equi-join without right-column references: summarizes
+`σ_pred(R)` to non-NULL key multiplicities `w(k)`, skips rows with `w == 0` (preserving
+`MIN`/`MAX` invariance), multiplies additive measures by `w`, and ignores multiplicity
+for idempotent `MIN`/`MAX`.
+
+Modeled claims
+
+- `Goal` — Unreferenced right-side multiplicity pushdown for inner equi-joins
+  (DictionaryJoinsAndLateLabels B2 / JOB J4, J5 / STATS-CEB C5 / LDBC L5): replacing
+  the right-hand input of an inner join whose columns are unreferenced by a per-key
+  count weight table matches flat post-join `(COUNT(*), COUNT(v), SUM(v), MIN(v),
+  MAX(v))` for all groups, provided zero-weight rows are skipped rather than passed
+  to `MIN`/`MAX`.
+-/
+
 namespace TinylambOpt.ResearchGoals.InnerJoinUnreferencedSideWeightPushdown
 
 structure LRow where
@@ -75,7 +93,7 @@ def optAgg5 (ls : List LRow) (rs : List RRow) (g : Int) : Agg5 :=
       | some lk => addValWeighted acc (rightWeight rsFilt lk) l.v)
     emptyAgg5
 
-/-- Unreferenced right-side multiplicity pushdown for inner equi-joins (BigBench
+/-- Unreferenced right-side multiplicity pushdown for inner equi-joins (DictionaryJoinsAndLateLabels
     B2 / JOB J4, J5 / STATS-CEB C5 / LDBC L5): replacing the right-hand input of
     an inner join whose columns are unreferenced by a per-key count weight table
     matches flat post-join `(COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v))` for

@@ -1010,3 +1010,9 @@ import TinylambOpt.ResearchProofs.StorageExecution.Goal_RankedMasks_SingleIsland
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_RankedMasks_SingleIsland_SpaceTest
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_RankedMasks_SingleIsland_SplitCode
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_RankedMasks_SingleIsland_WireLookup
+
+/-!
+This module collects proofs for Goal Bag Kernels Additive Product Anti Revenue, Goal Bag
+Kernels Additive Product Distinct Output, Goal Bag Kernels Additive Product Filtered
+Moment, Goal Bag Kernels Additive Product Intersect All and related cases.
+-/

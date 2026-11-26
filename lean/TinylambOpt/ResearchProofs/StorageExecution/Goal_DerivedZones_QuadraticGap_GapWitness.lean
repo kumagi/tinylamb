@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Refuted by counterexample
+
+- `QuadraticGap.GapWitness` — `∀ t a b, a.hi<b.lo → (kernel.bounds t a b).lo =
+  kernel.score t (a.hi,b.lo)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

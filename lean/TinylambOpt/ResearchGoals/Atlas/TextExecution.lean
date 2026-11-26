@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.TextExecution
 abbrev Word := List Nat
 def positions (s p : Word) :=

@@ -52,8 +52,9 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (IndividualQueryGaps.lean: TwoPassGroupAvgThreshold_sound)
-// self-join elimination for group-average threshold queries (TPC-DS Q65):
+// Lean-backed (SemijoinFiltersAndGroupThresholds.lean:
+// TwoPassGroupAvgThreshold_sound) self-join elimination for group-average
+// threshold queries (TPC-DS Q65):
 //   SELECT ... FROM ...,
 //     (SELECT k, AVG(v) AS ave FROM (<sa>) GROUP BY k) AS sb,
 //     (<sc>) AS sc
@@ -497,8 +498,9 @@ StatusOr<std::optional<Relation>> TryExecuteTwoPassGroupAvgThreshold(
   return std::optional<Relation>(std::move(out));
 }
 
-// Lean-backed (DuckDBGaps/Orders.lean: DirectionBuckets_sound) fast path for
-// 6-table bidirectional nation-pair shipping volume queries (TPC-H Q7):
+// Lean-backed (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean:
+// DirectionBuckets_sound) fast path for 6-table bidirectional nation-pair
+// shipping volume queries (TPC-H Q7):
 //   SELECT n1.n_name, n2.n_name, EXTRACT(year FROM l_shipdate),
 //          SUM(l_extendedprice * (1 - l_discount))
 //   FROM supplier, lineitem, orders, customer, nation n1, nation n2

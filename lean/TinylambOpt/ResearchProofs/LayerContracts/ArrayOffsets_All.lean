@@ -100,3 +100,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Goal_ZipShortest_L
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Goal_ZipShortest_Ordinal
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Goal_ZipShortest_PayloadDedup
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Goal_ZipShortest_ValueBlind
+
+/-!
+This module collects proofs for Common Array Offsets, Goal Append Fields Address
+Validity, Goal Append Fields Boundary, Goal Append Fields Cardinality and related cases.
+
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+-/

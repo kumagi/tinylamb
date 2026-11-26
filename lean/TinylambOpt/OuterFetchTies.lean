@@ -1,4 +1,4 @@
-import TinylambOpt.HighRiskRulesAudit
+import TinylambOpt.SetJoinAndScalarRewrites
 
 /-!
 # Left-side pre-filtering for FETCH WITH TIES (`executor/topn.cpp`)
@@ -391,3 +391,8 @@ theorem mixed_boundary_regression :
       [((0,some 1),some 0), ((0,some 1),some 0), ((1,some 1),none)] := by decide
 
 end TinylambOpt.OuterFetchTies
+
+-- C++ references to this model or its proof.
+-- executor/topn.cpp
+-- plan/cascades.cpp
+-- plan/implementation_rules.cpp

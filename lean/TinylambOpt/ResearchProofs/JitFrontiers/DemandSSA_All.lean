@@ -99,3 +99,15 @@ import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Goal_NestedChoice_Truth
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Goal_NestedChoice_ReadSetGuard
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Goal_NestedChoice_PayloadDemand
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Goal_NestedChoice_ColdPath
+
+/-!
+This module collects proofs for Goal And Commute Projection, Goal And Commute Where
+Mask, Goal And Commute Drop Guard In Filter, Goal And Commute No New Read and related
+cases.
+
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+-/
+
+-- C++ references to this model or its proof.
+-- expression/jit.cpp

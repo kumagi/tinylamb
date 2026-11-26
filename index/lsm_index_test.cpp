@@ -276,5 +276,21 @@ TEST_F(LsmIndexTest, AuditForeignUpdateCannotReplaceCommittedRangeValue) {
   ASSERT_SUCCESS(reader.PreCommit());
 }
 
+TEST_F(LsmIndexTest, ReadVisibleEmptyKeyDoesNotReturnFirstEntry) {
+  auto txn = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(LsmIndex, index, LsmIndex::Open(txn));
+  ASSERT_SUCCESS(index.Insert(txn, "alpha", "v1"));
+  ASSERT_SUCCESS(index.Insert(txn, "beta", "v2"));
+  // Empty key was never inserted; ReadVisible must not fall through to the
+  // unbounded LsmScanRange prefix and return "v1".
+  EXPECT_EQ(index.ReadVisible(txn, "").GetStatus(), Status::kNotExists);
+  ASSERT_SUCCESS(index.Insert(txn, "", "empty_val"));
+  ASSIGN_OR_ASSERT_FAIL(std::string, got, index.ReadVisible(txn, ""));
+  EXPECT_EQ(got, "empty_val");
+  ASSERT_SUCCESS(index.Delete(txn, ""));
+  EXPECT_EQ(index.ReadVisible(txn, "").GetStatus(), Status::kNotExists);
+  ASSERT_SUCCESS(txn.PreCommit());
+}
+
 }  // namespace
 }  // namespace tinylamb

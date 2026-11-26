@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.Boundaries
 
+/-!
+A scan can use a boundary or restart state only when a range read preserves the
+reference decode and cursor semantics.
+
+The empty instance costs zero.
+
+A single nonempty segment costs its edge.
+
+Named results include `boundaryCost_zero`, `boundaryCost_one`, `boundaryCost_two`.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.Boundaries
 
 open TinylambOpt.ResearchGoals.StorageExecution

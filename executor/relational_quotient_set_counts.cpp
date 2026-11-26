@@ -58,7 +58,7 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 // (quotient_gid_setop_cardinality_sound)
 StatusOr<std::optional<Relation>> TryExecuteQuotientGidDistinctSetOpCount(
     TransactionContext& context, const SelectStatement& statement,
@@ -710,7 +710,7 @@ StatusOr<std::optional<Relation>> TryExecuteQuotientGidDistinctSetOpCount(
                                               inherited_ctes, true));
 
   // Lean proofs:
-  //   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Retail.lean
+  //   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/RollupsAndChannelSetCounts.lean
   //     (ShrinkingIntersect_sound, ExclusionErase_sound)
   auto eval_branch = [&](size_t bi,
                          const QuotientSet* intersect_filter = nullptr,

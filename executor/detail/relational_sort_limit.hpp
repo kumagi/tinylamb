@@ -205,7 +205,7 @@ Status MergeKeyedSpillRuns(const std::vector<SortKeyOrder>& order_specs,
 
 class ExternalKeyedSorter {
  public:
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (single_pass_argmax_eq_filterMaxRows)
   ExternalKeyedSorter(std::vector<SortKeyOrder> order_specs,
                       bool bounded_requested, size_t topn_capacity,

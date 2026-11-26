@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `ScaledFloor.OrderedProbe` — Concatenate right slices without a duplicate-removal or
+  sorting pass.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

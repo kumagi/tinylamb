@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `NestedVersion.PageVerdict` — `∀ b p g, valid g → (∀ r ∈ g.rows, bounded b r.1) →
+  pageScan shape b p g = scan shape p g.rows`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

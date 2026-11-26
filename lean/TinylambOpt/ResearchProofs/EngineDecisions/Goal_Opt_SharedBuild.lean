@@ -1,4 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Optimizer
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `SharedBuild` — A context-independent pruning test: charge A for its A-only builds
+  and give B all of its reusable builds for free. Is this worst case also necessary?
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -158,3 +168,6 @@ theorem sound : Goal := by
     omega
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Opt_SharedBuild
+
+-- C++ references to this model or its proof.
+-- plan/optimizer_decisions.hpp

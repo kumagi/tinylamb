@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Named results include `sound`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false
@@ -198,3 +205,6 @@ theorem sound : Goal := by
   exact main log hpos hp initial 0 fence (Nat.zero_le fence)
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_ExistsDurability
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

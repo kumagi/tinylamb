@@ -2165,13 +2165,20 @@ TEST(ExpressionRewriteTest, PredicatePushdownCase) {
   ASSERT_EQ(case_in.when_clauses_.size(), 1);
   EXPECT_EQ(case_in.when_clauses_[0].second->Type(), TypeTag::kInExp);
 
-  // CAST pushdown
-  Expression cast = CastExpressionExp(case_exp, "INT64");
-  Expression rewritten_cast = rewriter.Rewrite(cast);
+  // CAST pushdown: DOUBLE/FLOAT64 is invariant under CASE's INT64 -> DOUBLE
+  // CoerceCaseBranch promotion, whereas CAST(... AS INT64) without a schema
+  // must stay outside CASE so mixed INT64/DOUBLE branches preserve overflow
+  // semantics (see CastPushdownCaseDoesNotBypassInt64ToDoubleCoercion).
+  Expression cast_double = CastExpressionExp(case_exp, "DOUBLE");
+  Expression rewritten_cast = rewriter.Rewrite(cast_double);
   ASSERT_EQ(rewritten_cast->Type(), TypeTag::kCaseExp);
   const auto& case_cast = rewritten_cast->AsCaseExpression();
   ASSERT_EQ(case_cast.when_clauses_.size(), 1);
   EXPECT_EQ(case_cast.when_clauses_[0].second->Type(), TypeTag::kCastExp);
+
+  Expression cast_int = CastExpressionExp(case_exp, "INT64");
+  Expression rewritten_cast_int = rewriter.Rewrite(cast_int);
+  EXPECT_EQ(rewritten_cast_int->Type(), TypeTag::kCastExp);
 
   // Logical AND / OR must NOT be pushed into CASE to preserve short-circuiting
   // semantics.
@@ -2466,6 +2473,62 @@ TEST(ExpressionRewriteTest, CastPushdownComparison) {
       ConstantValueExp(Value(int64_t{42})), BinaryOperation::kEquals,
       CastExpressionExp(col, "INT64")));
   EXPECT_NE(swapped->ToString().find("CAST("), std::string::npos) << *swapped;
+}
+
+TEST(ExpressionRewriteTest, CastPushdownCaseDoesNotBypassInt64ToDoubleCoercion) {
+  // CAST(CASE WHEN NULL THEN (col_i + col_d) WHEN col_i THEN col_i END AS INT64)
+  // promotes col_i = INT64_MAX to DOUBLE 9223372036854775808.0 via
+  // CoerceCaseBranch, which overflows CAST(... AS INT64). Pushing CAST AS INT64
+  // inside CASE would bypass that promotion and silently return INT64_MAX.
+  const Schema schema("t", {Column("col_i", ValueType::kInt64),
+                            Column("col_d", ValueType::kDouble)});
+  const Row row({Value(std::numeric_limits<int64_t>::max()), Value(0.0)});
+  Expression case_expr = CaseExpressionExp(
+      {{ConstantValueExp(Value()),
+        BinaryExpressionExp(ColumnValueExp("col_i"), BinaryOperation::kAdd,
+                            ColumnValueExp("col_d"))},
+       {ColumnValueExp("col_i"), ColumnValueExp("col_i")}},
+      Expression{});
+  Expression cast_expr = CastExpressionExp(case_expr, "INT64");
+
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
+  Expression rewritten = rewriter.Rewrite(cast_expr);
+
+  auto orig_res = cast_expr->TryEvaluate(row, schema);
+  auto rew_res = rewritten->TryEvaluate(row, schema);
+  EXPECT_FALSE(orig_res.HasValue());
+  EXPECT_FALSE(rew_res.HasValue());
+}
+
+TEST(ExpressionRewriteTest, SimplifyCaseRefusesIntroducingDoublePromotion) {
+  // CASE WHEN NULL THEN 0 WHEN '' THEN col_d ELSE col_s END is NOT DOUBLE
+  // (it mixes INT64, DOUBLE, and VARCHAR), so collapsing it to bare `col_d`
+  // would promote an enclosing CASE's INT64 result to DOUBLE.
+  const Schema schema("t", {Column("col_i", ValueType::kInt64),
+                            Column("col_d", ValueType::kDouble),
+                            Column("col_s", ValueType::kVarChar)});
+  const Row row({Value(int64_t{0}), Value(), Value("")});
+  Expression inner = CaseExpressionExp(
+      {{ConstantValueExp(Value()), ConstantValueExp(Value(int64_t{0}))},
+       {ConstantValueExp(Value("")), ColumnValueExp("col_d")}},
+      ColumnValueExp("col_s"));
+  Expression outer = CaseExpressionExp(
+      {{ConstantValueExp(Value(int64_t{1})), ConstantValueExp(Value(int64_t{1}))},
+       {ConstantValueExp(Value(int64_t{0})), inner}},
+      Expression{});
+
+  ExpressionRewriter rewriter(ExpressionRuleSet::Default());
+  rewriter.set_schema(&schema);
+  Expression rewritten = rewriter.Rewrite(outer);
+
+  auto orig_res = outer->TryEvaluate(row, schema);
+  auto rew_res = rewritten->TryEvaluate(row, schema);
+  ASSERT_TRUE(orig_res.HasValue());
+  ASSERT_TRUE(rew_res.HasValue());
+  EXPECT_EQ(orig_res.Value().type, ValueType::kInt64);
+  EXPECT_EQ(rew_res.Value().type, ValueType::kInt64);
+  EXPECT_EQ(rew_res.Value(), orig_res.Value());
 }
 
 TEST(ExpressionRewriteTest, DeterministicFunctionCse) {

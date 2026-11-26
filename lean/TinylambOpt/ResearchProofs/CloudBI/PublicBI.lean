@@ -1,6 +1,22 @@
 import TinylambOpt.ResearchGoals.CloudBI.PublicBI
 import TinylambOpt.ResearchProofs.CloudBI.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+
+Proved (11 claims, including the following)
+
+- `AttributeWitness` — `∀ (xs : List (Option Int)), display (extrema xs) = match
+  (xs.filterMap id).eraseDups with | [] => .absent | [x] => .single x | _ =>
+  .multiple`
+- `AxisRetraction` — GROUP BY axis membership can be answered by a histogram after
+  removing a slice of the input. Emit a disappearing dimension value only after the
+  last row was removed. Different league/position combinations can share a label.
+- `ClassificationCache` — `∀ c, let (_,out,n) := classify c out.reverse = (labels
+  c).map outfield ∧ n = c.codes.eraseDups.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1423,3 +1439,9 @@ theorem sound_ClassificationCache : ClassificationCache.Goal := by
   exact ⟨h1, h2⟩
 
 end TinylambOpt.ResearchProofs.CloudBI.PublicBI
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- query/select_grouped_rewrites.cpp
+-- query/select_rewrites.hpp
+-- query/select_rewrites_test.cpp

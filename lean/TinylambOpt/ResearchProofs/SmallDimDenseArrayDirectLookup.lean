@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.SmallDimDenseArrayDirectLookup
 
+/-!
+Proved
+
+- `Goal` — Small-dimension dense direct-index lookup for star joins
+  (DictionaryJoinsAndLateLabels B3 / LDBC L5 / JOB J4 / STATS-CEB C2, C5): when both
+  dimension tables have unique non-NULL keys bounded within `[min, min + span)`,
+  direct O(1) array indexing matches two hash joins for all facts (including
+  out-of-range, negative, and NULL FKs), whereas duplicate dimension keys break
+  direct-slot collapse.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SmallDimDenseArrayDirectLookup`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SmallDimDenseArrayDirectLookup
 
 open TinylambOpt.ResearchGoals.SmallDimDenseArrayDirectLookup
@@ -350,3 +364,6 @@ theorem sound : TinylambOpt.ResearchGoals.SmallDimDenseArrayDirectLookup.Goal :=
   · decide
 
 end TinylambOpt.ResearchProofs.SmallDimDenseArrayDirectLookup
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

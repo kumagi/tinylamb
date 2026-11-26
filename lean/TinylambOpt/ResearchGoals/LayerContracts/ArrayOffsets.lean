@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.ArrayOffsets
 
 /-! Correlated array expansion. Each result identifies input offsets; no offset

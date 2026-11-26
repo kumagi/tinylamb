@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
-import TinylambOpt.ResearchProofs.Atlas_JoinPlans_HubWithChords_Remaining
+import TinylambOpt.ResearchProofs.Atlas.JoinPlans.HubWithChordsFractionalCap
+
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `HubWithChords.FractionalCap` — `∀ n db b weights den, cover pattern weights den →
+  (reference pattern n (fun r x y => if db r x y == 0 then 0 else 1) b).toNat ^ den ≤
+  ((pattern.atoms.zip weights).map (fun (a,w) => support n db a pattern b ^ w)).prod`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -49,11 +60,11 @@ private def checkCode (code : Nat) : Bool :=
 
 #eval (codeSamples 200 12345).countP (fun c => !checkCode c)
 
-/-! The general theorem is proved in `Atlas_JoinPlans_HubWithChords_Remaining`
+/-! The general theorem is proved in `Atlas.JoinPlans.HubWithChordsFractionalCap`
 by a Shearer-style fractional-cover argument specialised to this pattern;
 re-export it here under the goal's name. -/
 theorem sound_HubWithChords_FractionalCap :
     TinylambOpt.ResearchGoals.Atlas.JoinPlans.HubWithChords.FractionalCap.Goal :=
-  TinylambOpt.ResearchProofs.Atlas.JoinPlans.HubWithChords.Remaining.sound_FractionalCap
+  TinylambOpt.ResearchProofs.Atlas.JoinPlans.HubWithChordsFractionalCap.sound_FractionalCap
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_HubWithChords_FractionalCap

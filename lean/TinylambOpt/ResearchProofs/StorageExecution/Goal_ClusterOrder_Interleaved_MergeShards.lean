@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Interleaved.MergeShards` — A stable merge of independently clustered shards recovers
+  the global physical order.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

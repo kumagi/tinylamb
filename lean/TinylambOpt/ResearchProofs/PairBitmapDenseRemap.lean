@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.PairBitmapDenseRemap
 
+/-!
+Proved
+
+- `Goal` — Exact 2D dense outer-key remap + bit-matrix
+  (`executor/detail/build_input.cpp` `pair_bits` / `pair_outer_dense`): remapping
+  sparse outer keys injectively via `eraseDups`/`findIdx?` and optionally swapping
+  axes yields an exact filter with zero false positives and zero false negatives.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.PairBitmapDenseRemap`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PairBitmapDenseRemap
 
 open TinylambOpt.ResearchGoals.PairBitmapDenseRemap
@@ -375,3 +386,6 @@ theorem sound : TinylambOpt.ResearchGoals.PairBitmapDenseRemap.Goal := by
             simpa [hprobe, hfindq, hrange] using hbit
 
 end TinylambOpt.ResearchProofs.PairBitmapDenseRemap
+
+-- C++ references to this model or its proof.
+-- executor/detail/ordered_join_input.cpp

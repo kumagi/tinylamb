@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `FrontierOrder` — An arbitrary interleaving keeps each acknowledged byte in the
+  written prefix.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

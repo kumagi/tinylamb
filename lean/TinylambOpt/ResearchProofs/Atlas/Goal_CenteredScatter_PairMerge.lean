@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `CenteredScatter.PairMerge` — `∀ x y, measure (x++y)-measure x-measure y = size
+  y*(x.map (·^2)).sum + size x*(y.map (·^2)).sum-2*x.sum*y.sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

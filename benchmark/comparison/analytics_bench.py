@@ -38,6 +38,7 @@ import random
 import socket
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -913,6 +914,9 @@ def _click_value(field, kind):
         return field
 
 
+from pg_binary_client import PgExtendedBinaryClient as _PgExtendedBinaryClient
+
+
 class TinylambEngine:
     name = "tinylamb"
 
@@ -920,6 +924,7 @@ class TinylambEngine:
         self.args = args
         self.work = work
         self.conn = None
+        self.binary_client = None
         self.process = None
         self.log = None
 
@@ -965,6 +970,13 @@ class TinylambEngine:
                 self.endpoint = dsn
             except psycopg2.Error as exc:
                 raise EngineUnavailable(f"tinylamb connection failed: {exc}")
+        dsn_params = self.conn.get_dsn_parameters()
+        self.binary_client = _PgExtendedBinaryClient(
+            host=dsn_params.get("host", "127.0.0.1") or "127.0.0.1",
+            port=int(dsn_params.get("port", 55433)),
+            user=dsn_params.get("user", "bench"),
+            dbname=dsn_params.get("dbname", "bench"),
+        )
 
     def setup(self):
         pass
@@ -998,16 +1010,16 @@ class TinylambEngine:
             flush()
 
     def query(self, sql):
-        with self.conn.cursor() as cur:
-            cur.execute(sql)
-            return cur.fetchall()
+        return self.binary_client.query(sql)
 
     def version(self):
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            return "postgres-protocol/simple-query"
+        self.binary_client.query("SELECT 1")
+        return "postgres-protocol/extended-binary"
 
     def close(self):
+        if self.binary_client is not None:
+            self.binary_client.close()
+            self.binary_client = None
         if self.conn is not None:
             self.conn.close()
             self.conn = None

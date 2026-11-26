@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `QuadraticVariation.LocalEdit` — `∀ x y a b, measure (x++b::y)-measure (x++a::y) =
+  seam x [b] (fun u v => (v-u)^2) - seam x [a] (fun u v => (v-u)^2) + seam [b] y (fun
+  u v => (v-u)^2) - seam [a] y (fun u v => (v-u)^2)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

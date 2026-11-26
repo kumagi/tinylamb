@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StreamingRunPage
 
+/-!
+Proved
+
+- `Goal` — `∀ off k (files : List (List Row)), PrefixSorted files.flatten →
+  files.flatten.Pairwise (fun a b => a.id < b.id) → let s := run off k files s.output
+  = SqlFetchWithTies.pageSQL off k files.flatten ∧ s.peak ≤ maxRunLen (splitRuns
+  files.flatten) ∧ (k = 0 → s.peak = 0)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.StreamingRunPage`.
+-/
+
 namespace TinylambOpt.ResearchProofs.StreamingRunPage
 
 open TinylambOpt.ResearchGoals.StreamingRunPage

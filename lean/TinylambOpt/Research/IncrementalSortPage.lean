@@ -1,5 +1,16 @@
 import Std.Tactic
 
+/-!
+Strict total order: prefix, then tail, then appearance id, then payload (the last field
+only makes the order total on all `Row` values; input ids are distinct, so stability is
+decided by the id field).
+
+The head of a sorted list precedes every later element, so a later element cannot
+precede the head.
+
+Named results include `rowLt_irrefl`, `rowLt_trans`, `rowLt_trichotomy`.
+-/
+
 set_option maxRecDepth 100000
 
 /-!

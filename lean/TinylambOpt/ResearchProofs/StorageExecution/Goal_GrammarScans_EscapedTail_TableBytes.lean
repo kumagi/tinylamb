@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `EscapedTail.TableBytes` — Every successor state fits the packed dictionary of state
+  identifiers.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

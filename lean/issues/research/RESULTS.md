@@ -476,13 +476,13 @@ tie 共有順位計算で `incPage` をページ SQL と一致させた。`k = 0
 
 | 系統 | 証明モジュール | 主定理（50 件） |
 | --- | --- | --- |
-| Slices（7） | `ResearchProofs/DuckDBGaps/Slices.lean` | `sound_MinorityCodes`, `sound_AppendDictionary`, `sound_ComplementGroups`, `sound_PairwiseExtrema`, `sound_DominatedColumn`, `sound_WitnessedExtrema`, `sound_SparsePosting` |
-| FileMasks（7） | `ResearchProofs/DuckDBGaps/FileMasks.lean` | `ReferencedFiles_sound`, `FileKeyAntiJoin_sound`, `SharedDeleteTable_sound`, `PartitionSpecialization_sound`, `IncrementalSurvivors_sound`, `LateEqualityKey_sound`, `ArithmeticFooter_sound` |
-| Refresh（6） | `ResearchProofs/DuckDBGaps/Refresh.lean` | `InsertSideState_sound`, `ChangedSymbols_sound`, `OverlapReplay_sound`, `LaneOrSpill_sound`, `VisibleFlush_sound`, `DirtyFlush_sound` |
-| Retail（8） | `ResearchProofs/DuckDBGaps/Retail.lean` | `OrderedRollup_sound`, `AverageFence_sound`, `SuffixFlush_sound`, `ThresholdFanout_sound`, `PromoReturnCounts_sound`, `ShrinkingIntersect_sound`, `ExclusionErase_sound`, `NetPairSet_sound` |
-| Hits（8） | `ResearchProofs/DuckDBGaps/Hits.lean` | `CancellationDebt_sound`, `CertifiedWinners_sound`, `OwnerDistinct_sound`, `OrderedCodeMin_sound`, `FrontCodedContains_sound`, `OrderedFetch_sound`, `DatePostings_sound`, `StridedPoint_sound` |
-| Orders（7） | `ResearchProofs/DuckDBGaps/Orders.lean` | `MarketShareWeights_sound`, `YearRoutes_sound`, `DirectionBuckets_sound`, `LateSlack_sound`, `RetireWitness_sound`, `RebucketOrders_sound`, `RevenueRuns_sound` |
-| BridgeStates（7） | `ResearchProofs/DuckDBGaps/BridgeStates.lean` | `RightStateClasses_sound`, `ShardedHybrid_sound`, `SourceWeights_sound`, `EndpointDemand_sound`, `CommentQuotient_sound`, `CollisionBucket_sound`, `CountryProfiles_sound` |
+| Slices（7） | `ResearchProofs/AnalyticalOperators/DictionarySlicesAndExtrema.lean` | `sound_MinorityCodes`, `sound_AppendDictionary`, `sound_ComplementGroups`, `sound_PairwiseExtrema`, `sound_DominatedColumn`, `sound_WitnessedExtrema`, `sound_SparsePosting` |
+| FileMasks（7） | `ResearchProofs/AnalyticalOperators/FilePruningAndDeleteMasks.lean` | `ReferencedFiles_sound`, `FileKeyAntiJoin_sound`, `SharedDeleteTable_sound`, `PartitionSpecialization_sound`, `IncrementalSurvivors_sound`, `LateEqualityKey_sound`, `ArithmeticFooter_sound` |
+| Refresh（6） | `ResearchProofs/AnalyticalOperators/IncrementalRefreshAndFlush.lean` | `InsertSideState_sound`, `ChangedSymbols_sound`, `OverlapReplay_sound`, `LaneOrSpill_sound`, `VisibleFlush_sound`, `DirtyFlush_sound` |
+| Retail（8） | `ResearchProofs/AnalyticalOperators/RollupsAndChannelSetCounts.lean` | `OrderedRollup_sound`, `AverageFence_sound`, `SuffixFlush_sound`, `ThresholdFanout_sound`, `PromoReturnCounts_sound`, `ShrinkingIntersect_sound`, `ExclusionErase_sound`, `NetPairSet_sound` |
+| Hits（8） | `ResearchProofs/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean` | `CancellationDebt_sound`, `CertifiedWinners_sound`, `OwnerDistinct_sound`, `OrderedCodeMin_sound`, `FrontCodedContains_sound`, `OrderedFetch_sound`, `DatePostings_sound`, `StridedPoint_sound` |
+| Orders（7） | `ResearchProofs/AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean` | `MarketShareWeights_sound`, `YearRoutes_sound`, `DirectionBuckets_sound`, `LateSlack_sound`, `RetireWitness_sound`, `RebucketOrders_sound`, `RevenueRuns_sound` |
+| BridgeStates（7） | `ResearchProofs/AnalyticalOperators/SharedJoinStatesAndWeights.lean` | `RightStateClasses_sound`, `ShardedHybrid_sound`, `SourceWeights_sound`, `EndpointDemand_sound`, `CommentQuotient_sound`, `CollisionBucket_sound`, `CountryProfiles_sound` |
 
 証明の要点：
 

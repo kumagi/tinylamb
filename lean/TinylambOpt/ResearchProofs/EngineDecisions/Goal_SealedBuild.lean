@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `SealedBuild` — Return a final decision before the global build barrier exactly when
+  all legal future build tails agree. This licenses both positive early emission and
+  partition-local negative/anti emission.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

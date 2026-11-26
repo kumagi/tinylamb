@@ -528,8 +528,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
               return e->TryEvaluate(row, schema);
             });
         if (!ast_verdict.HasValue()) {
-          Fail("ScanFilterWorker",
-               "worker returned decided verdict when AST raised error");
+          // In kFilter context, filter-only rules such as
+          // inner_join_not_null_inference may convert a NULL comparison into
+          // FALSE and short-circuit a sibling error (returning reject = 0).
+          // Accepting a row whose predicate raised an error (verdict = 1) is
+          // never sound.
+          if (worker_verdict == 1) {
+            Fail("ScanFilterWorker",
+                 "worker accepted row when AST raised error");
+          }
+          continue;
         }
         if ((worker_verdict == 1) != ast_verdict.Value()) {
           Fail("ScanFilterWorker",

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+
+Proved
+
+- `RotationThreshold` — The cheaper rotation puts the larger of the two outer inputs at
+  shallower depth.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

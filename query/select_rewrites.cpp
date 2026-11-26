@@ -910,11 +910,11 @@ bool CteBodyTakesRestriction(SelectStatement& body,
   //       each expose the grouping key from an inner-joined base table
   //       (TPC-DS Q75 `all_sales`).
   // Lean proofs:
-  //   lean/TinylambOpt/TpcdsNextDiscovery.lean
+  //   lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
   //     (shared_cte_disjunct_pushdown_sound)
-  //   lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+  //   lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
   //     (CteVarianceCoeffSelfJoinPivot_sound)
-  //   lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  //   lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
   //     (LeftJoinRightSideKeyFilterPushdown_sound)
   if (body.Sources().size() != 1 || body.Having() || body.Distinct() ||
       !body.DistinctOn().empty() || body.HasLimit() || body.Offset() != 0 ||
@@ -1200,12 +1200,12 @@ bool CteBodyTakesRestriction(SelectStatement& body,
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
 // (shared_cte_disjunct_pushdown_sound, cte_materialize_halves_body_evaluations,
 //  cte_volatile_inline_unsound — the body must not be inlined twice when
 //  volatile calls are present)
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
 // (CteVarianceCoeffSelfJoinPivot_sound)
 size_t PushSharedCteRestrictions(SelectStatement* outer,
                                  TransactionContext& ctx) {

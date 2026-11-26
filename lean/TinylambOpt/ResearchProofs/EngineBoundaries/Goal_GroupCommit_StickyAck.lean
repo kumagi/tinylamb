@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `StickyAck` — Once a waiter can reply it stays eligible across retries and concurrent
+  appends.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

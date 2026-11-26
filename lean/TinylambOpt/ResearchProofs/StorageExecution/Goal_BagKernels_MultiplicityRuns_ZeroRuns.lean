@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `MultiplicityRuns.ZeroRuns` — `∀ rs, live bag (rs.filter (fun r => 0<r.2)) |>.Perm
+  (live bag rs)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

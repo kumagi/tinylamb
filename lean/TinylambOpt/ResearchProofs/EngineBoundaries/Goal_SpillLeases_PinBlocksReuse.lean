@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Proved
+
+- `PinBlocksReuse` — An admitted reader prevents reuse even after the logical segment
+  is dropped.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

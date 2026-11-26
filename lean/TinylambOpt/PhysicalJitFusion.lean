@@ -174,3 +174,7 @@ theorem sparse_varchar_projection (source packed row sourceRest packedRest : Lis
   simp only [List.append_assoc, List.drop_left, List.take_left]
 
 end TinylambOpt.PhysicalJitFusion
+
+-- C++ references to this model or its proof.
+-- executor/detail/columnar_tlcs_predicates.cpp
+-- expression/jit.cpp

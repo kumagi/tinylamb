@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown
 
+/-!
+These models describe plan alternatives for analytical SQL, with row multiplicity and
+aggregate state made explicit.
+
+Sufficient state for group presence, COUNT(*), nullable SUM, and the numerator and
+denominator of AVG. Arithmetic here is widened and exact.
+
+The modeled inputs and results come from
+`TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown`.
+-/
+
 namespace TinylambOpt.ResearchGoals.AnalyticsWorkloads
 
 /-- Sufficient state for group presence, COUNT(*), nullable SUM, and the numerator

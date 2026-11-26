@@ -1,839 +1,351 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.EncodedBlocks
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+
+Proved (8 claims, including the following)
+
+- `TinylambOpt.ResearchGoals.EncodedBlocks.DistinctSeams` — Across empty TLCS pages,
+  carry the last nonempty key. Local sorted DISTINCT counts double-count one value
+  precisely at each equal adjacent nonempty page boundary.
+- `TinylambOpt.ResearchGoals.EncodedBlocks.OverlapDot` — `∀ (a b : List Run), ((spans
+  a).map fun (l,r,x) => ((spans b).map fun (u,v,y) => ((min r v - max l u : Nat) :
+  Int)*x*y).sum).sum = (((unpack a).zip (unpack b)).map (fun (x,y) => x*y)).sum`
+- `TinylambOpt.ResearchGoals.EncodedBlocks.PatchedRange` — Patched frame of reference:
+  ordinary lanes compare in the narrow delta domain. Exceptions *replace* their base
+  code, including when that code falsely qualifies.
+-/
+
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.EncodedBlocks
 
 open TinylambOpt.ResearchGoals.EncodedBlocks
 
-/-!
-# Encoded-block execution strategies
-
-Proofs for the eight `EncodedBlocks` research goals: patched delta frames,
-sparse gathers via validity-bitmap ranks, run-pair overlap aggregation,
-arithmetic-progression slices, difference-array range edits, DISTINCT seam
-correction across pages, binary-search selection directories, and
-second-difference block integration.
--/
-
-/-- Patched frame of reference: an exception lane replaces its base code, so
-the two filters agree pointwise. For `patch i = some x` both sides compare
-`x` directly; for `none` the delta-domain bounds `lo-base ≤ d < hi-base` are
-exactly `lo ≤ base+d < hi` over `Int` (linear arithmetic, `omega`). -/
-theorem sound_PatchedRange : PatchedRange.Goal := by
-  intro base lo hi deltas patch live
-  simp only []
-  apply List.filter_congr
-  intro i _
-  rw [Bool.eq_iff_iff]
-  cases hpi : patch i with
-  | none =>
-      simp only [Option.getD_none, Bool.and_eq_true, decide_eq_true_eq, and_assoc]
-      constructor
-      · rintro ⟨hl, h1, h2⟩
-        exact ⟨hl, by omega, by omega⟩
-      · rintro ⟨hl, h1, h2⟩
-        exact ⟨hl, by omega, by omega⟩
-  | some x =>
-      simp only [Option.getD_some, Bool.and_eq_true, decide_eq_true_eq, and_assoc]
-
-/-- Sparse gather: the `filterMap` payload at validity-rank `k` is the `k`-th
-non-`none` element. Proved by induction on `xs`: the head contributes rank 0
-when it is `some`, and a `succ` index shifts both the validity prefix count
-and the dense index by exactly the head's contribution (`0` for `none`,
-`1` for `some`), reducing to the induction hypothesis. -/
-private theorem sparseGather_aux (xs : List (Option Int)) : ∀ i,
-    (if (xs.map Option.isSome)[i]?.getD false
-        then (xs.filterMap id)[((xs.map Option.isSome).take i).count true]?
-        else none) = xs[i]?.join := by
+private theorem filter_congr {α : Type} (p q : α → Bool) (xs : List α)
+    (h : ∀ x, p x = q x) : xs.filter p = xs.filter q := by
   induction xs with
-  | nil =>
-      intro i
-      rfl
-  | cons x xs' ih =>
-      intro i
-      cases i with
-      | zero =>
-          cases x with
-          | none => rfl
-          | some v =>
-              simp only [List.map_cons, List.getElem?_cons_zero, Option.isSome, Option.getD,
-                List.take_zero, List.count_nil, List.filterMap_cons, id_eq, List.getElem?_cons_zero]
-              rfl
-      | succ j =>
-          cases x with
-          | none =>
-              simp only [List.map_cons, List.getElem?_cons_succ, List.take_succ_cons, List.count_cons,
-                Option.isSome, List.filterMap_cons, id_eq]
-              simp
-              rw [← List.getElem?_map]
-              exact ih j
-          | some v =>
-              simp only [List.map_cons, List.getElem?_cons_succ, List.take_succ_cons, List.count_cons,
-                Option.isSome, List.filterMap_cons, id_eq]
-              simp
-              rw [← List.getElem?_map]
-              exact ih j
+  | nil => rfl
+  | cons x xs ih => simp [List.filter_cons, h x, ih]
 
-theorem sound_SparseGather : SparseGather.Goal := by
-  intro xs i
-  exact sparseGather_aux xs i
+theorem PatchedRange_sound : TinylambOpt.ResearchGoals.EncodedBlocks.PatchedRange.Goal := by
+  intro base lo hi deltas patch live
+  dsimp only
+  apply filter_congr
+  intro i
+  cases hpatch : patch i with
+  | none =>
+      let d : Int := ((deltas[i]?.getD 0).toNat : Int)
+      change (live i && (decide (lo - base ≤ d) && decide (d < hi - base))) =
+        (live i && decide (lo ≤ base + d) && decide (base + d < hi))
+      by_cases hl : live i
+      · by_cases h1 : lo - base ≤ d
+        · have h1' : lo ≤ base + d := by omega
+          by_cases h2 : d < hi - base
+          · have h2' : base + d < hi := by omega
+            simp [hl, h1, h2, h1', h2']
+          · have h2' : ¬ base + d < hi := by omega
+            simp [hl, h1, h2, h1', h2']
+        · have h1' : ¬ lo ≤ base + d := by omega
+          simp [hl, h1, h1']
+      · simp [hl]
+  | some x =>
+      by_cases hl : live i <;> simp [hpatch, hl]
 
-/-- `zipIdx 1` vs `zipIdx` (0-based): shifting every index by `1` while
-strengthening the weight constant by `1` leaves the weighted sum unchanged.
-Proved via `List.zipIdx_eq_map_add` and pointwise `Int` linear arithmetic. -/
-private theorem sd_tail (ds' : List Int) :
-    ((ds'.zipIdx 1).map (fun x => (((ds'.length + 1 : Nat) : Int) - (x.snd : Int)) * x.fst)).sum =
-    ((ds'.zipIdx).map (fun x => ((ds'.length : Int) - (x.snd : Int)) * x.fst)).sum := by
-  rw [List.zipIdx_eq_map_add, List.map_map]
-  congr 1
-  apply List.map_congr_left
-  intro p hp
-  obtain ⟨d, j⟩ := p
-  simp only [Function.comp]
-  have h1 : ((ds'.length + 1 : Nat) : Int) = (ds'.length : Int) + 1 := by
-    rw [Int.natCast_add, Int.natCast_one]
-  have h2 : ((1 + j : Nat) : Int) = 1 + (j : Int) := by
-    rw [Int.natCast_add, Int.natCast_one]
-  rw [h1, h2]
-  have : (ds'.length : Int) + 1 - (1 + (j : Int)) = (ds'.length : Int) - (j : Int) := by omega
-  rw [this]
+private theorem int_mul_two (x : Int) : x * 2 = x + x := by
+  rw [Int.mul_comm, Int.two_mul]
 
-/-- Second differences: `integrate` accumulates `(pos, vel)` where each second
-difference `d` bumps `vel` by `d` and `pos` by the *current* `vel + d`. After
-the fold, `vel = v + Σd` and `pos = p + len·v + Σ (len-i)·d_i` — each `d_i`
-contributes to `pos` once per remaining step. Induction on `ds`; the
-`zipIdx 1` tail is re-based by `sd_tail`, and the remaining identity is
-linear arithmetic over the shared monomials (`omega` after distributing the
-`(len+1)·x` products). -/
-theorem sound_SecondDifferences : SecondDifferences.Goal := by
+private theorem drop_range_add (lo m : Nat) :
+    (List.range m).drop lo = (List.range (m - lo)).map (fun i => lo + i) := by
+  by_cases h : lo ≤ m
+  · rw [← Nat.add_sub_of_le h, List.range_add]
+    have hd : List.drop lo (List.range lo ++ (List.range (m - lo)).map (fun i => lo + i)) =
+        (List.range (m - lo)).map (fun i => lo + i) := by
+      simpa using (List.drop_append_length (l₁ := List.range lo)
+        (l₂ := (List.range (m - lo)).map (fun i => lo + i)))
+    rw [hd]
+    simp
+  · have hle : m ≤ lo := by omega
+    rw [List.drop_eq_nil_of_le (by simpa : (List.range m).length ≤ lo)]
+    have : m - lo = 0 := by omega
+    simp [this]
+
+private theorem stride_alg (A d : Int) (k : Nat) :
+    (k:Int)*(2*A+((k:Int)-1)*d) + 2*(A+(k:Int)*d) =
+      ((k+1:Nat):Int)*(2*A+(k:Int)*d) := by
+  simp [Int.natCast_add, Int.mul_add, Int.mul_sub,
+        Int.mul_assoc, Int.mul_comm, Int.mul_left_comm, int_mul_two,
+        Int.add_assoc, Int.add_comm, Int.add_left_comm]
+  omega
+
+private theorem stride_sum (a d : Int) (lo k : Nat) :
+    2 * (((List.range k).map (fun i => a + ((lo + i : Nat) : Int) * d)).sum) =
+      (k:Int)*(2*(a+(lo:Int)*d)+((k:Int)-1)*d) := by
+  induction k with
+  | zero => simp
+  | succ k ih =>
+      rw [List.range_succ, List.map_append, List.sum_append, Int.mul_add, ih]
+      simpa [Int.natCast_add, Int.add_mul, Int.add_assoc, Int.add_comm, Int.add_left_comm]
+        using stride_alg (a+(lo:Int)*d) d k
+
+theorem StrideSlice_sound : TinylambOpt.ResearchGoals.EncodedBlocks.StrideSlice.Goal := by
+  intro a d n lo hi
+  dsimp only
+  let m := min n hi
+  let len := m - lo
+  change 2 * ((((List.range n).take hi).drop lo).map (fun (i : Nat) => a + (i:Int)*d)).sum =
+    (len:Int)*(2*(a+(lo:Int)*d)+((len:Int)-1)*d)
+  have htake : (List.range n).take hi = List.range m := by
+    rw [List.take_range]
+    simp [m, Nat.min_comm]
+  rw [htake]
+  by_cases hlo : lo ≤ m
+  · have hdrop : (List.range m).drop lo = (List.range len).map (fun i => lo + i) := by
+      simpa [len] using drop_range_add lo m
+    rw [hdrop]
+    rw [show ((List.range len).map (fun i => lo + i)).map (fun (i : Nat) => a + (i:Int)*d) =
+        (List.range len).map (fun i => a + ((lo + i : Nat) : Int) * d) by
+          simp [List.map_map]]
+    exact stride_sum a d lo len
+  · have hlen : len = 0 := by simp [len]; omega
+    have hle : m ≤ lo := by omega
+    have hnil : (List.range m).drop lo = [] := by
+      exact List.drop_eq_nil_of_le (by simpa : (List.range m).length ≤ lo)
+    simp [hlen, hnil]
+
+private theorem moment_shift (ds : List Int) (total start : Nat) :
+    ((ds.zipIdx (start + 1)).map (fun x => ((total : Int) - (x.2 : Int)) * x.1)).sum =
+      ((ds.zipIdx start).map (fun x => (((total : Int) - 1) - (x.2 : Int)) * x.1)).sum := by
+  induction ds generalizing start with
+  | nil => simp
+  | cons x xs ih =>
+      have hcoef : (total : Int) - ((start : Int) + 1) = ((total : Int) - 1) - (start : Int) := by
+        omega
+      simp [List.zipIdx_cons, Int.natCast_add, hcoef, ih (start + 1)]
+
+private theorem moment_cons (d : Int) (ds : List Int) :
+    (((d :: ds).zipIdx.map (fun x => (((ds.length + 1 : Nat) : Int) - (x.2 : Int)) * x.1)).sum) =
+      ((ds.length + 1 : Nat) : Int) * d +
+        ((ds.zipIdx.map (fun x => ((ds.length : Int) - (x.2 : Int)) * x.1)).sum) := by
+  simp only [List.zipIdx_cons, List.map_cons, List.sum_cons]
+  rw [moment_shift ds (ds.length + 1) 0]
+  simp
+
+theorem SecondDifferences_sound : TinylambOpt.ResearchGoals.EncodedBlocks.SecondDifferences.Goal := by
   intro p v ds
   induction ds generalizing p v with
-  | nil =>
-      simp [integrate]
-  | cons d ds' ih =>
-      have step : integrate p v (d :: ds') = integrate (p + v + d) (v + d) ds' := rfl
-      rw [step, ih]
-      simp only [List.length_cons, List.zipIdx_cons, List.map_cons, List.sum_cons,
-        Nat.zero_add, Int.natCast_zero, Int.sub_zero]
-      rw [sd_tail ds']
-      simp only [Prod.mk.injEq]
-      constructor
-      · simp only [Int.natCast_add, Int.natCast_one, Int.mul_add, Int.add_mul,
-          Int.one_mul]
-        omega
+  | nil => simp [integrate]
+  | cons d ds ih =>
+      change integrate (p + v + d) (v + d) ds = _
+      rw [ih]
+      simp only [List.length_cons, List.sum_cons]
+      rw [moment_cons]
+      apply Prod.ext
+      · simp [Int.natCast_add, Int.mul_add, Int.add_mul, Int.mul_comm,
+              Int.add_assoc, Int.add_comm, Int.add_left_comm]
       · omega
 
-/-- `drop lo` of `range m` is `range (m-lo)` shifted by `lo` (Nat subtraction
-makes the `lo > m` case collapse to `[]` on both sides). Induction on `lo`
-via `range_succ_eq_map` + `map_drop`. -/
-private theorem drop_range (m lo : Nat) :
-    (List.range m).drop lo = (List.range (m - lo)).map (· + lo) := by
-  induction lo generalizing m with
-  | zero =>
-      simp only [Nat.sub_zero, List.drop_zero]
-      exact (List.map_id'' (fun x => by omega) _).symm
-  | succ lo ih =>
-      cases m with
-      | zero => simp [List.range_zero]
-      | succ m =>
-          rw [List.range_succ_eq_map, List.drop_succ_cons, ← List.map_drop, ih]
-          rw [List.map_map]
-          have hlen : m + 1 - (lo + 1) = m - lo := by omega
-          rw [hlen]
-          apply List.map_congr_left
-          intro j hj
-          show Nat.succ (j + lo) = j + (lo + 1)
-          rw [Nat.succ_eq_add_one, Nat.add_assoc]
+private def editStep (h : Std.HashMap Nat Int) (e : Edit) : Std.HashMap Nat Int :=
+  let (l, r, d) := e
+  if l < r then
+    let h := h.insert l (h.getD l 0 + d)
+    h.insert r (h.getD r 0 - d)
+  else h
 
-/-- Doubled sum of an arithmetic progression `a + (k+s)·d` over `k < len`:
-`2·Σ = len·(2·first + (len-1)·d)` where `first = a + s·d`. Induction on `len`;
-the step adds the last term `a + (len+s)·d` and the remaining identity is
-verified by distributing all products (`Int.add_mul`/`mul_add`/`mul_sub`/
-`sub_mul`) and closing with `omega` over the shared monomials. -/
-private theorem strideSlice_aux (a d : Int) (s : Nat) : ∀ (len : Nat),
-    2 * (((List.range len).map (fun k => a + ((k + s : Nat) : Int) * d)).sum) =
-    (len : Int) * (2 * (a + (s : Int) * d) + ((len : Int) - 1) * d) := by
-  intro len
-  induction len with
-  | zero => simp [List.range_zero]
-  | succ len ih =>
-      rw [List.range_succ, List.map_append]
-      have hmap : (([len] : List Nat).map (fun k => a + ((k + s : Nat) : Int) * d)) =
-          [a + ((len + s : Nat) : Int) * d] := by simp
-      rw [hmap, List.sum_append]
-      simp only [List.sum_cons, List.sum_nil]
-      rw [Int.mul_add, ih]
-      simp only [Int.natCast_add, Int.natCast_one, Int.add_mul, Int.mul_add,
-        Int.mul_sub, Int.sub_mul, Int.add_sub_cancel, Int.one_mul]
-      omega
+private def impulseAt (e : Edit) (i : Nat) : Int :=
+  let (l, r, d) := e
+  if l < r then (if i == l then d else if i == r then -d else 0) else 0
 
-/-- Stride slice: `take hi` of `range n` is `range (min hi n)`; `drop lo`
-re-bases it at `lo` via `drop_range`; `min_comm` aligns with the goal's
-`min n hi`; `map_map` composes the `+lo` shift into the stride term, and
-`strideSlice_aux` finishes. -/
-theorem sound_StrideSlice : StrideSlice.Goal := by
-  intro a d n lo hi
-  simp only []
-  rw [List.take_range, drop_range]
-  rw [Nat.min_comm]
-  rw [List.map_map]
-  exact strideSlice_aux a d lo _
+private theorem impulses_eq_foldl : impulses = List.foldl editStep {} := by
+  funext es; rfl
 
-/-- One edit's contribution to the impulse map at boundary index `i`: a live
-edit `(l,r,d)` with `l < r` deposits `+d` at `l` and `-d` at `r`; degenerate
-edits (`l ≥ r`) and all other indices contribute `0`. -/
-private def impulseAt (i : Nat) : Edit → Int
-  | (l, r, d) => if l < r then (if l = i then d else 0) - (if r = i then d else 0) else 0
-
-/-- Inserting one edit's two boundary impulses updates any lookup by exactly
-`impulseAt`. The `l < r` guard makes `l ≠ r`, so the two inserts never alias;
-the four `l = i`/`r = i` cases reduce to linear integer arithmetic (`omega`). -/
-private theorem step_getD (h : Std.HashMap Nat Int) (l r : Nat) (d : Int) (i : Nat) :
-    ((if l < r then
-        (h.insert l (h.getD l 0 + d)).insert r
-          ((h.insert l (h.getD l 0 + d)).getD r 0 - d)
-      else h)).getD i 0 =
-    h.getD i 0 + impulseAt i (l, r, d) := by
-  simp only [impulseAt]
+private theorem editStep_getD (h : Std.HashMap Nat Int) (e : Edit) (i : Nat) :
+    (editStep h e).getD i 0 = h.getD i 0 + impulseAt e i := by
+  rcases e with ⟨l, r, d⟩
   by_cases hlr : l < r
-  · rw [ite_eq_left hlr, ite_eq_left hlr]
-    simp only [Std.HashMap.getD_insert, beq_iff_eq]
-    have hne : l ≠ r := Nat.ne_of_lt hlr
-    by_cases hli : l = i <;> by_cases hri : r = i <;>
-      simp_all <;> omega
-  · rw [ite_eq_right hlr, ite_eq_right hlr]
-    omega
+  · have hlr' : l ≠ r := by omega
+    have hrl' : r ≠ l := by omega
+    by_cases hil : i = l
+    · have hir : i ≠ r := by omega
+      have hri : r ≠ i := by omega
+      simp [editStep, impulseAt, hlr, Std.HashMap.getD_insert, Int.sub_eq_add_neg, hil, hrl']
+    · by_cases hir : i = r
+      · have hil' : i ≠ l := by omega
+        have hli : l ≠ i := by omega
+        simp [editStep, impulseAt, hlr, Std.HashMap.getD_insert, Int.sub_eq_add_neg, hir, hli, hlr', hrl']
+      · have hri : r ≠ i := by omega
+        have hli : l ≠ i := by omega
+        simp [editStep, impulseAt, hlr, Std.HashMap.getD_insert, Int.sub_eq_add_neg, hil, hir, hri, hli, hlr', hrl']
+  · simp [editStep, impulseAt, hlr]
 
-/-- The impulse map's value at `i` equals the base map's value plus the sum of
-per-edit contributions. Induction over `es` via the `foldl` step lemma. -/
-private theorem impulses_foldl_getD (h : Std.HashMap Nat Int) :
-    ∀ (es : List Edit), ∀ (i : Nat),
-      (es.foldl (fun h (l,r,d) =>
-        if l < r then
-          let h1 := h.insert l (h.getD l 0 + d)
-          h1.insert r (h1.getD r 0 - d)
-        else h) h).getD i 0 =
-      h.getD i 0 + (es.map fun e => impulseAt i e).sum := by
-  intro es
+private theorem impulses_foldl_getD (es : List Edit) (h : Std.HashMap Nat Int) (i : Nat) :
+    (es.foldl editStep h).getD i 0 = h.getD i 0 + (es.map fun e => impulseAt e i).sum := by
   induction es generalizing h with
-  | nil => intro i; simp
+  | nil => simp
   | cons e es ih =>
-      intro i
-      cases e with
-      | mk l p =>
-        cases p with
-        | mk r d =>
-          simp only [List.foldl_cons, List.map_cons, List.sum_cons, impulseAt]
-          rw [ih]
-          rw [step_getD]
-          simp only [impulseAt]
-          omega
+      rw [show (e :: es).foldl editStep h = es.foldl editStep (editStep h e) by rfl]
+      rw [ih, editStep_getD]
+      simp only [List.map_cons, List.sum_cons]
+      omega
 
 private theorem impulses_getD (es : List Edit) (i : Nat) :
-    (impulses es).getD i 0 = (es.map fun e => impulseAt i e).sum := by
-  unfold impulses
-  rw [impulses_foldl_getD]
-  simp [Std.HashMap.getD_empty]
+    (impulses es).getD i 0 = (es.map fun e => impulseAt e i).sum := by
+  rw [impulses_eq_foldl]
+  simpa using impulses_foldl_getD es ({} : Std.HashMap Nat Int) i
 
-private theorem sum_map_add_int {α : Type} (l : List α) (f g : α → Int) :
-    (l.map fun x => f x + g x).sum = (l.map f).sum + (l.map g).sum := by
-  induction l with
-  | nil => simp
-  | cons x xs ih =>
-      simp only [List.map_cons, List.sum_cons, ih]
+private def sumRange (L : Nat) (f : Nat → Int) : Int := ((List.range L).map f).sum
+
+private theorem sumRange_zero (L : Nat) : sumRange L (fun _ => 0) = 0 := by
+  unfold sumRange
+  induction (List.range L) with
+  | nil => rfl
+  | cons x xs ih => simp [List.map_cons, ih]
+
+private theorem sumRange_succ (L : Nat) (f : Nat → Int) :
+    sumRange (L+1) f = sumRange L f + f L := by
+  simp [sumRange, List.range_succ, List.map_append, List.sum_append]
+
+private theorem sumRange_add (L : Nat) (f g : Nat → Int) :
+    sumRange L (fun j => f j + g j) = sumRange L f + sumRange L g := by
+  induction L with
+  | zero => simp [sumRange]
+  | succ L ih =>
+      rw [sumRange_succ, sumRange_succ, sumRange_succ, ih]
       omega
 
-private theorem sum_map_sub_int {α : Type} (l : List α) (f g : α → Int) :
-    (l.map fun x => f x - g x).sum = (l.map f).sum - (l.map g).sum := by
-  induction l with
-  | nil => simp
-  | cons x xs ih =>
-      simp only [List.map_cons, List.sum_cons, ih]
-      omega
-
-private theorem sum_const_zero {α : Type} (l : List α) :
-    (l.map fun _ => (0 : Int)).sum = 0 := by
-  induction l with
-  | nil => simp
-  | cons x xs ih => simp [List.map_cons, List.sum_cons, ih]
-
-/-- Sum over positions of per-edit sums equals sum over edits of per-position
-sums (Fubini for finite lists). Induction on the position list; each step
-splits the edit-map sum via `sum_map_add_int`. -/
-private theorem sum_sum_swap (l₁ : List Nat) (l₂ : List Edit) (f : Nat → Edit → Int) :
-    ((l₁.map fun j => (l₂.map fun e => f j e).sum).sum) =
-    ((l₂.map fun e => (l₁.map fun j => f j e).sum).sum) := by
-  induction l₁ with
-  | nil => simp [sum_const_zero]
-  | cons j js ih =>
+private theorem sumRange_map_sum (es : List Edit) (L : Nat) :
+    sumRange L (fun j => (es.map fun e => impulseAt e j).sum) =
+      (es.map fun e => sumRange L (fun j => impulseAt e j)).sum := by
+  induction es with
+  | nil => simpa [sumRange] using sumRange_zero L
+  | cons e es ih =>
       simp only [List.map_cons, List.sum_cons]
-      rw [ih]
-      rw [sum_map_add_int]
+      rw [sumRange_add, ih]
 
-/-- A single boundary `c` contributes `d` to the prefix sum over `j ≤ i`
-exactly when `c ≤ i`. Induction on `i`; the `i+1` term is the new boundary
-hit. -/
-private theorem sum_range_succ_ite_eq (i c : Nat) (d : Int) :
-    ((List.range (i+1)).map fun j => if c = j then d else 0).sum =
-    if c ≤ i then d else 0 := by
-  induction i with
-  | zero =>
-      simp [List.range_succ]
-  | succ i ih =>
-      rw [List.range_succ, List.map_append, List.sum_append, ih]
-      simp only [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil]
-      by_cases h1 : c ≤ i <;> by_cases h2 : c = i + 1 <;>
-        simp_all <;> omega
+private theorem impulses_sumRange (es : List Edit) (L : Nat) :
+    sumRange L (fun j => (impulses es).getD j 0) =
+      (es.map fun e => sumRange L (fun j => impulseAt e j)).sum := by
+  unfold sumRange
+  simp only [impulses_getD]
+  exact sumRange_map_sum es L
 
-/-- Prefix-sum characterization of one edit: the impulses of `(l,r,d)`
-accumulate to `d` over positions `j ≤ i` iff `l ≤ i < r` (live range), else
-`0`. Splits the `impulseAt` difference into two boundary sums via
-`sum_map_sub_int`, then applies `sum_range_succ_ite_eq` to each. -/
-private theorem sum_impulseAt_prefix (i l r : Nat) (d : Int) :
-    ((List.range (i+1)).map fun j => impulseAt j (l,r,d)).sum =
-    if l ≤ i && i < r then d else 0 := by
-  by_cases hlr : l < r
-  · have hfun : (fun j => impulseAt j (l,r,d)) =
-        (fun j => (if l = j then d else 0) - (if r = j then d else 0)) := by
-      funext j
-      simp only [impulseAt, ite_eq_left hlr]
-    rw [hfun]
-    rw [show ((List.range (i+1)).map fun j => (if l = j then d else 0) - (if r = j then d else 0)).sum =
-        ((List.range (i+1)).map fun j => (if l = j then d else 0)).sum -
-        ((List.range (i+1)).map fun j => (if r = j then d else 0)).sum from
-      sum_map_sub_int _ _ _]
-    rw [sum_range_succ_ite_eq, sum_range_succ_ite_eq]
-    by_cases h1 : l ≤ i <;> by_cases h2 : r ≤ i <;>
-      simp_all <;> omega
-  · have hzero : ∀ j, impulseAt j (l,r,d) = 0 := by
-      intro j; simp only [impulseAt, ite_eq_right hlr]
-    rw [List.map_congr_left (fun j _ => hzero j)]
-    rw [sum_const_zero]
-    have hcond : ¬ (l ≤ i && i < r) := by
-      simp only [Bool.and_eq_true, decide_eq_true_eq]
-      intro ⟨h1, h2⟩; omega
-    rw [ite_eq_right hcond]
+private theorem impulseAt_sumRange (l r : Nat) (d : Int) (L : Nat) (hlr : l < r) :
+    sumRange L (fun j => impulseAt (l, r, d) j) =
+      if l < L ∧ L ≤ r then d else 0 := by
+  induction L with
+  | zero => simp [sumRange]
+  | succ L ih =>
+      rw [sumRange_succ]
+      by_cases hLl : L < l
+      · have h1 : impulseAt (l, r, d) L = 0 := by
+          simp [impulseAt, hlr, hLl, show L ≠ r by omega, show L ≠ l by omega]
+        have hc0 : ¬ (l < L ∧ L ≤ r) := by omega
+        have hc1 : ¬ (l < L + 1 ∧ L + 1 ≤ r) := by omega
+        rw [ih, h1]
+        simp [hc0, hc1]
+      · have hLge : l ≤ L := by omega
+        by_cases hLr : L < r
+        · by_cases hLeq : L = l
+          · subst L
+            have h1 : impulseAt (l, r, d) l = d := by simp [impulseAt, hlr]
+            have hc0 : ¬ (l < l ∧ l ≤ r) := by omega
+            have hc1 : (l < l + 1 ∧ l + 1 ≤ r) := by omega
+            rw [ih, h1]
+            simp [hc0, hc1]
+          · have hLgt : l < L := by omega
+            have h1 : impulseAt (l, r, d) L = 0 := by
+              simp [impulseAt, hlr, show L ≠ l by omega, show L ≠ r by omega]
+            have hc0 : (l < L ∧ L ≤ r) := by omega
+            have hc1 : (l < L + 1 ∧ L + 1 ≤ r) := by omega
+            rw [ih, h1]
+            simp [hc0, hc1]
+        · have hLrge : r ≤ L := by omega
+          by_cases hLeq : L = r
+          · subst L
+            have h1 : impulseAt (l, r, d) r = -d := by
+              simp [impulseAt, hlr, show r ≠ l by omega]
+            have hc0 : (l < r ∧ r ≤ r) := by omega
+            have hc1 : ¬ (l < r + 1 ∧ r + 1 ≤ r) := by omega
+            rw [ih, h1]
+            simp [hc0, hc1]
+            omega
+          · have h1 : impulseAt (l, r, d) L = 0 := by
+              simp [impulseAt, hlr, show L ≠ l by omega, show L ≠ r by omega]
+            have hc0 : ¬ (l < L ∧ L ≤ r) := by omega
+            have hc1 : ¬ (l < L + 1 ∧ L + 1 ≤ r) := by omega
+            rw [ih, h1]
+            simp [hc0, hc1]
 
-/-- `foldl` of `s ↦ s + f x` equals `b + Σ f` over the list. Induction on the
-list; the step is `b' + f x + Σ = (b' + Σ) + f x` by commutativity/associativity
-(`omega` over `Int`). -/
-private theorem foldl_add_int (l : List Nat) (f : Nat → Int) :
-    ∀ (b : Int), (l.foldl (fun s x => s + f x) b) = b + (l.map f).sum := by
-  induction l with
-  | nil => intro b; simp
-  | cons x xs ih =>
-      intro b
-      simp only [List.foldl_cons, List.map_cons, List.sum_cons]
-      rw [ih]
-      omega
+private theorem foldl_add_eq (f : Nat → Int) (l : List Nat) (a : Int) :
+    l.foldl (fun s j => s + f j) a = a + (l.map f).sum := by
+  induction l generalizing a with
+  | nil => simp
+  | cons x xs ih => simp [ih, Int.add_assoc]
 
-/-- Range edits: the difference-array scan (`scanl` of impulse lookups,
-`drop 1`) produces per-position adjustments equal to the direct per-edit
-membership sum. Pointwise via `List.ext_getElem?`: for `i < xs.length` the
-scan prefix `Σ_{j≤i} impulses[j]` equals `Σ_e Σ_{j≤i} impulseAt j e` (by
-`impulses_getD` + `sum_sum_swap`), which per edit is `d` iff `l ≤ i < r` —
-exactly the direct sum's condition. Out-of-range indices give `none` on both
-sides. -/
-theorem sound_RangeEdits : RangeEdits.Goal := by
+theorem RangeEdits_sound : TinylambOpt.ResearchGoals.EncodedBlocks.RangeEdits.Goal := by
   intro xs es
-  simp only []
+  dsimp only
+  let h := impulses es
+  let adjustments := ((List.range xs.length).scanl (fun s i => s + h.getD i 0) 0).drop 1
+  have hadj (i : Nat) (hi : i < xs.length) :
+      adjustments[i]? = some (sumRange (i+1) (fun j => h.getD j 0)) := by
+    dsimp [adjustments]
+    rw [List.getElem?_drop]
+    rw [List.getElem?_scanl]
+    rw [if_pos (by simp; omega)]
+    have htake : (List.range xs.length).take (1 + i) = List.range (i + 1) := by
+      rw [List.take_range]
+      have : min (1 + i) xs.length = i + 1 := by omega
+      rw [this]
+    rw [htake, foldl_add_eq]
+    simp [sumRange]
   apply List.ext_getElem?
   intro i
   by_cases hi : i < xs.length
-  · have hx : xs[i]? = some xs[i] := List.getElem?_eq_getElem hi
-    have hadj : (List.drop 1 (List.scanl (fun s j => s + (impulses es).getD j 0) 0
-        (List.range xs.length)))[i]? =
-        some (((List.range (i+1)).map fun j => (impulses es).getD j 0).sum) := by
-      rw [List.getElem?_drop, List.getElem?_scanl]
-      rw [ite_eq_left (by rw [List.length_range]; omega : 1 + i ≤ (List.range xs.length).length)]
-      rw [List.take_range, Nat.min_eq_left (by omega : 1 + i ≤ xs.length)]
-      rw [show 1 + i = i + 1 from by omega]
-      rw [foldl_add_int]
+  · rcases hxi : xs[i]? with _ | x
+    · have : xs.length ≤ i := List.getElem?_eq_none_iff.mp hxi
+      omega
+    · rw [List.getElem?_zipWith, hxi, hadj i hi]
       simp
-    have hL : (List.zipWith (fun x1 x2 => x1 + x2) xs
-        (List.drop 1 (List.scanl (fun s j => s + (impulses es).getD j 0) 0
-          (List.range xs.length))))[i]? =
-        some (xs[i] + ((List.range (i+1)).map fun j => (impulses es).getD j 0).sum) := by
-      rw [List.getElem?_zipWith, hx, hadj]
-    have hR : (List.map (fun x => x.fst + (List.map (fun x_1 =>
-        if (decide (x_1.fst ≤ x.snd) && decide (x.snd < x_1.snd.fst)) = true then x_1.snd.snd else 0)
-          es).sum) xs.zipIdx)[i]? =
-        some (xs[i] + (es.map fun x_1 =>
-          if (decide (x_1.fst ≤ i) && decide (i < x_1.snd.fst)) = true then x_1.snd.snd else 0).sum) := by
-      rw [List.getElem?_map, List.getElem?_zipIdx, hx]
-      simp only [Option.map_some]
-      rw [Nat.zero_add]
-    have hadjval : ((List.range (i+1)).map fun j => (impulses es).getD j 0).sum =
-        (es.map fun x_1 =>
-          if (decide (x_1.fst ≤ i) && decide (i < x_1.snd.fst)) = true then x_1.snd.snd else 0).sum := by
-      simp only [impulses_getD]
-      rw [sum_sum_swap]
-      apply congrArg List.sum
-      apply List.map_congr_left
-      intro e he
-      cases e with
-      | mk l p =>
-        cases p with
-        | mk r d =>
-          exact sum_impulseAt_prefix i l r d
-    rw [hL, hR, hadjval]
-  · have hx : xs[i]? = none := by
-      rw [List.getElem?_eq_none_iff]; omega
-    rw [List.getElem?_zipWith, hx, List.getElem?_map, List.getElem?_zipIdx, hx]
+      rw [hxi]
+      simp
+      rw [impulses_sumRange]
+      have hsingle : ∀ e : Edit,
+          sumRange (i+1) (fun j => impulseAt e j) =
+            (let (l,r,d) := e; if l ≤ i ∧ i < r then d else 0) := by
+        intro e
+        rcases e with ⟨l, r, d⟩
+        by_cases hlr : l < r
+        · rw [impulseAt_sumRange l r d (i+1) hlr]
+          by_cases hcond : l ≤ i ∧ i < r
+          · have hc : l < i+1 ∧ i+1 ≤ r := by omega
+            simp [hcond, hc]
+          · have hc : ¬ (l < i+1 ∧ i+1 ≤ r) := by omega
+            simp [hcond, hc]
+        · have hn : ¬ (l ≤ i ∧ i < r) := by omega
+          simpa [impulseAt, hlr, hn] using sumRange_zero (i+1)
+      simp [hsingle]
+  · have hge : xs.length ≤ i := by omega
+    have hxs : xs[i]? = none := List.getElem?_eq_none hge
+    rw [List.getElem?_zipWith, hxs]
+    simp
+    rw [hxs]
     simp
 
-
-
-private def idxs (mask : List Bool) : List Nat :=
-  (mask.zipIdx.filter Prod.fst).map Prod.snd
-
-private theorem zipIdx_add {α : Type} (l : List α) (i c : Nat) :
-    l.zipIdx (i + c) = (l.zipIdx i).map (fun p => (p.1, p.2 + c)) := by
-  induction l generalizing i with
-  | nil => simp [List.zipIdx_nil]
+theorem SparseGather_sound : TinylambOpt.ResearchGoals.EncodedBlocks.SparseGather.Goal := by
+  intro xs
+  induction xs with
+  | nil => intro i; simp [dense]
   | cons a as ih =>
-      rw [List.zipIdx_cons, List.zipIdx_cons, List.map_cons]
-      rw [show i + c + 1 = (i + 1) + c from by omega]
-      rw [ih]
-
-private theorem zipIdx_one (l : List Bool) :
-    l.zipIdx 1 = (l.zipIdx 0).map (fun p => (p.1, p.2 + 1)) := by
-  have h := zipIdx_add l 0 1
-  simpa using h
-
-private theorem shift_filter_snd (bs : List Bool) :
-    ((bs.zipIdx 1).filter Prod.fst).map Prod.snd =
-      (((bs.zipIdx 0).filter Prod.fst).map Prod.snd).map (· + 1) := by
-  have h1 : bs.zipIdx 1 = (bs.zipIdx 0).map (fun p => (p.1, p.2 + 1)) := zipIdx_one bs
-  rw [h1, List.filter_map]
-  have hcomp : (Prod.fst ∘ (fun p : Bool × Nat => (p.1, p.2 + 1))) = Prod.fst := rfl
-  rw [hcomp, List.map_map, List.map_map]
-  rfl
-
-private theorem idxs_cons (b : Bool) (bs : List Bool) :
-    idxs (b :: bs) = (if b then [0] else []) ++ (idxs bs).map (· + 1) := by
-  unfold idxs
-  rw [List.zipIdx_cons]
-  simp only [Nat.zero_add]
-  rw [List.filter_cons]
-  have hfst : Prod.fst (b, 0) = b := rfl
-  rw [hfst]
-  by_cases hb : b = true
-  · subst hb
-    rw [ite_eq_left rfl, List.map_cons]
-    have h0 : Prod.snd (true, 0) = 0 := rfl
-    rw [h0]
-    show (0 : Nat) :: ((bs.zipIdx 1).filter Prod.fst).map Prod.snd =
-      [0] ++ List.map (· + 1) (((bs.zipIdx 0).filter Prod.fst).map Prod.snd)
-    rw [shift_filter_snd]
-    rfl
-  · have hb' : b = false := by cases b <;> simp_all
-    subst hb'
-    rw [ite_eq_right (by simp : ¬ (false = true))]
-    show ((bs.zipIdx 1).filter Prod.fst).map Prod.snd =
-      ([] : List Nat) ++ List.map (· + 1) (((bs.zipIdx 0).filter Prod.fst).map Prod.snd)
-    rw [shift_filter_snd]
-    rfl
-
--- ===== NEW: zipIdx index bound =====
-private theorem zipIdx_snd_lt {α : Type} (l : List α) (i : Nat) :
-    ∀ p ∈ l.zipIdx i, p.2 < l.length + i := by
-  induction l generalizing i with
-  | nil => intro p hp; simp [List.zipIdx_nil] at hp
-  | cons a as ih =>
-      intro p hp
-      rw [List.zipIdx_cons, List.mem_cons] at hp
-      cases hp with
-      | inl h =>
-          subst h
-          simp only [Prod.snd, List.length_cons]
-          omega
-      | inr h =>
-          have h2 := ih (i + 1) p h
-          simp only [List.length_cons] at h2 ⊢
-          omega
-
-private theorem idxs_mem_lt {mask : List Bool} {x : Nat} (h : x ∈ idxs mask) :
-    x < mask.length := by
-  unfold idxs at h
-  rw [List.mem_map] at h
-  obtain ⟨p, hp, rfl⟩ := h
-  rw [List.mem_filter] at hp
-  have h2 := zipIdx_snd_lt mask 0 p hp.1
-  simp only [Nat.add_zero] at h2
-  exact h2
-
--- ===== NEW: sortedness =====
-private theorem pairwise_map_succ {l : List Nat} (h : l.Pairwise (· < ·)) :
-    (l.map (· + 1)).Pairwise (· < ·) := by
-  rw [List.pairwise_map]
-  exact List.Pairwise.imp (fun {a b} hab => Nat.add_lt_add_iff_right.mpr hab) h
-
-private theorem idxs_pairwise (mask : List Bool) : (idxs mask).Pairwise (· < ·) := by
-  induction mask with
-  | nil => simp [idxs]
-  | cons b bs ih =>
-      rw [idxs_cons]
-      by_cases hb : b = true
-      · subst hb
-        rw [show (if (true = true) then ([0] : List Nat) else []) = [0] from rfl]
-        rw [List.pairwise_append]
-        refine ⟨List.pairwise_singleton _ _, pairwise_map_succ ih, ?_⟩
-        intro a ha c hc
-        rw [List.mem_singleton] at ha
-        subst ha
-        rw [List.mem_map] at hc
-        obtain ⟨d, hd, rfl⟩ := hc
-        omega
-      · have hb' : b = false := by cases b <;> simp_all
-        subst hb'
-        rw [show (if (false = true) then ([0] : List Nat) else []) = [] from rfl]
-        rw [List.nil_append]
-        exact pairwise_map_succ ih
-
-
--- countP predicate shift (composed form as produced by countP_map)
-private theorem countP_succ_lt (l : List Nat) (j : Nat) :
-    l.countP ((fun y => y < j + 1) ∘ fun x => x + 1) = l.countP (· < j) := by
-  apply List.countP_congr
-  intro x hx
-  show (decide (x + 1 < j + 1) = true ↔ decide (x < j) = true)
-  rw [decide_eq_true_eq, decide_eq_true_eq]
-  exact Nat.add_lt_add_iff_right
-
-private theorem countP_lt_succ_zero (j : Nat) :
-    ([0] : List Nat).countP (· < j + 1) = 1 := by
-  simp [List.countP_cons]
-
-private theorem rank_idx (mask : List Bool) :
-    ∀ i, i ≤ mask.length →
-      (mask.take i).count true = (idxs mask).countP (· < i) := by
-  induction mask with
-  | nil =>
-      intro i hi
-      have hi0 : i = 0 := by simp at hi; omega
-      subst hi0
-      simp [idxs]
-  | cons b bs ih =>
-      intro i hi
+      intro i
       cases i with
       | zero =>
-          simp [idxs]
+          cases a <;> simp [dense]
       | succ j =>
-          have hj : j ≤ bs.length := by
-            simp only [List.length_cons] at hi
-            omega
-          rw [List.take_succ_cons, List.count_cons, ih j hj]
-          rw [idxs_cons, List.countP_append, List.countP_map]
-          by_cases hb : b = true
-          · subst hb
-            rw [show (if (true = true) then ([0] : List Nat) else []) = [0] from rfl]
-            rw [countP_lt_succ_zero]
-            have h1 : (if ((true == true) = true) then (1 : Nat) else 0) = 1 := by decide
-            rw [h1, countP_succ_lt]
-            omega
-          · have hb' : b = false := by cases b <;> simp_all
-            subst hb'
-            rw [show (if (false = true) then ([0] : List Nat) else []) = [] from rfl]
-            rw [List.countP_nil]
-            have h0 : (if ((false == true) = true) then (1 : Nat) else 0) = 0 := by decide
-            rw [h0, countP_succ_lt]
-            omega
-
-
--- ===== NEW countP lemmas =====
-private theorem sorted_le_getElem {l : List Nat} (h : l.Pairwise (· < ·))
-    {i j : Nat} (hi : i < l.length) (hij : i ≤ j) (hj : j < l.length) : l[i] ≤ l[j] := by
-  rw [List.pairwise_iff_getElem] at h
-  by_cases hlt : i < j
-  · exact Nat.le_of_lt (h i j hi hj hlt)
-  · have heq : i = j := by omega
-    subst heq
-    exact Nat.le_refl _
-
-private theorem pairwise_countP_lt (l : List Nat) :
-    l.Pairwise (· < ·) → ∀ {k : Nat} (hk : k < l.length), l.countP (· < l[k]) = k := by
-  induction l with
-  | nil => intro h k hk; simp at hk
-  | cons x xs ih =>
-      intro h k hk
-      rw [List.pairwise_cons] at h
-      obtain ⟨hhead, htail⟩ := h
-      rcases Nat.eq_zero_or_pos k with rfl | hkpos
-      · have h0 : (x :: xs)[0] = x := List.getElem_cons_zero x xs (by simp)
-        rw [h0]
-        apply List.countP_eq_zero.mpr
-        intro a ha
-        rw [List.mem_cons] at ha
-        rcases ha with hax | hax
-        · intro hlt
-          rw [hax] at hlt
-          rw [decide_eq_true_eq] at hlt
-          exact Nat.lt_irrefl x hlt
-        · intro hlt
-          rw [decide_eq_true_eq] at hlt
-          exact Nat.lt_asymm (hhead a hax) hlt
-      · obtain ⟨j, rfl⟩ : ∃ j, k = j + 1 := ⟨k - 1, by omega⟩
-        have hj : j < xs.length := by
-          simp only [List.length_cons] at hk; omega
-        have hget : (x :: xs)[j + 1] = xs[j] :=
-          List.getElem_cons_succ x xs j (by simp only [List.length_cons]; omega)
-        rw [hget]
-        rw [List.countP_cons, ih htail hj]
-        have hxj : x < xs[j] := hhead _ (List.getElem_mem hj)
-        have hcond : decide (x < xs[j]) = true := by
-          rw [decide_eq_true_eq]; exact hxj
-        rw [ite_eq_left hcond]
-
-private theorem countP_lt_ge {l : List Nat} (h : l.Pairwise (· < ·))
-    {k j : Nat} (hk : k < l.length) (hkj : l[k] < j) :
-    k + 1 ≤ l.countP (· < j) := by
-  have hsub : (l.take (k + 1)).Sublist l := List.take_sublist (k + 1) l
-  have hle : (l.take (k + 1)).countP (· < j) ≤ l.countP (· < j) :=
-    List.Sublist.countP_le hsub
-  have hall : ∀ a ∈ l.take (k + 1), decide (a < j) = true := by
-    intro a ha
-    obtain ⟨m, hm, hma⟩ := List.getElem_of_mem ha
-    have hmkl : m < k + 1 := by
-      have h1 := hm
-      rw [List.length_take] at h1
-      have hmin := Nat.min_le_left (k + 1) l.length
-      omega
-    have hmkl2 : m < l.length := by
-      have h1 := hm
-      rw [List.length_take] at h1
-      have hmin := Nat.min_le_right (k + 1) l.length
-      omega
-    have hml : (l.take (k + 1))[m] = l[m] := List.getElem_take (h := hm)
-    have ham : a = l[m] := hma.symm.trans hml
-    subst ham
-    rw [decide_eq_true_eq]
-    have hmk : m ≤ k := by omega
-    have hle2 : l[m] ≤ l[k] := sorted_le_getElem h hmkl2 hmk hk
-    omega
-  have heq : (l.take (k + 1)).countP (· < j) = k + 1 := by
-    have h1 : (l.take (k + 1)).countP (· < j) = (l.take (k + 1)).length :=
-      List.countP_eq_length.mpr hall
-    rw [h1, List.length_take]
-    have hkl : k + 1 ≤ l.length := by omega
-    simp [Nat.min_eq_left hkl]
-  omega
-
-private theorem countP_all_lt {l : List Nat} {n : Nat} (h : ∀ a ∈ l, a < n) :
-    l.countP (· < n) = l.length := by
-  apply List.countP_eq_length.mpr
-  intro a ha
-  rw [decide_eq_true_eq]
-  exact h a ha
-
-
-private def rsOf (mask : List Bool) : List Nat :=
-  mask.scanl (fun n bit => n + bit.toNat) 0
-
-private theorem tonat_eq_count_ite (b : Bool) :
-    b.toNat = (if (b == true) = true then 1 else 0) := by
-  cases b <;> rfl
-
-private theorem foldl_tonat (c : Nat) (xs : List Bool) :
-    List.foldl (fun n bit => n + bit.toNat) c xs = c + xs.count true := by
-  induction xs generalizing c with
-  | nil => simp
-  | cons b bs ih =>
-      simp only [List.foldl_cons, List.count_cons]
-      rw [ih]
-      have h : b.toNat = (if (b == true) = true then 1 else 0) := tonat_eq_count_ite b
-      rw [h]
-      omega
-
-private theorem rs_get (mask : List Bool) (i : Nat) (hi : i ≤ mask.length) :
-    (rsOf mask)[i]? = some (List.foldl (fun n bit => n + bit.toNat) 0 (mask.take i)) := by
-  rw [rsOf, List.getElem?_scanl]
-  rw [ite_eq_left hi]
-
-private theorem rs_eq_count (mask : List Bool) (i : Nat) (hi : i ≤ mask.length) :
-    (rsOf mask)[i]? = some ((mask.take i).count true) := by
-  rw [rs_get mask i hi, foldl_tonat, Nat.zero_add]
-
-private theorem rs_mono (mask : List Bool) {i j : Nat} (hij : i ≤ j) (hj : j ≤ mask.length) :
-    (mask.take i).count true ≤ (mask.take j).count true := by
-  obtain ⟨d, rfl⟩ : ∃ d, j = i + d := ⟨j - i, by omega⟩
-  rw [List.take_add, List.count_append]
-  omega
-
-private theorem rankAt (mask : List Bool) (j : Nat) (hj : j ≤ mask.length) :
-    ((rsOf mask).toArray[j]?.getD 0) = (mask.take j).count true := by
-  rw [List.getElem?_toArray, rs_eq_count mask j hj]
-  rfl
-
-private theorem locate_succ' (r : Array Nat) (w fuel lo hi : Nat) :
-    locate r w (fuel+1) lo hi =
-      if lo ≥ hi then lo
-      else if r[(lo+hi)/2+1]?.getD 0 ≤ w then locate r w fuel ((lo+hi)/2+1) hi
-           else locate r w fuel lo ((lo+hi)/2) := by
-  rw [locate.eq_2]
-
-private theorem locate_correct (mask : List Bool) (wanted answer : Nat)
-    (hans_le : answer ≤ mask.length)
-    (hans_max : ∀ i, i ≤ mask.length → (mask.take i).count true ≤ wanted → i ≤ answer)
-    (hans_good : (mask.take answer).count true ≤ wanted) :
-    ∀ (fuel lo hi : Nat), hi ≤ mask.length → lo ≤ answer → answer ≤ hi →
-      2 ^ fuel > hi - lo →
-      locate (rsOf mask).toArray wanted fuel lo hi = answer := by
-  intro fuel
-  induction fuel with
-  | zero =>
-      intro lo hi hbound hlo hhi hfuel
-      rw [locate.eq_1]
-      have h1 : (1 : Nat) > hi - lo := hfuel
-      have hdz : hi ≤ lo := by omega
-      have : answer = lo := by omega
-      exact this.symm
-  | succ fuel ih =>
-      intro lo hi hbound hlo hhi hfuel
-      rw [locate_succ']
-      by_cases hlohi : lo ≥ hi
-      · rw [ite_eq_left hlohi]
-        have : answer = lo := by omega
-        exact this.symm
-      · rw [ite_eq_right (by omega : ¬ lo ≥ hi)]
-        have hlt : lo < hi := by omega
-        have hmid_lt : (lo+hi)/2 < hi := by omega
-        have hmid1_le : (lo+hi)/2 + 1 ≤ mask.length := by omega
-        rw [rankAt mask ((lo+hi)/2 + 1) hmid1_le]
-        by_cases hcond : (mask.take ((lo+hi)/2 + 1)).count true ≤ wanted
-        · rw [ite_eq_left hcond]
-          have hlo' : (lo+hi)/2 + 1 ≤ answer := hans_max _ hmid1_le hcond
-          have hsize : hi - ((lo+hi)/2 + 1) ≤ (hi - lo) / 2 := by omega
-          have hfuel' : 2 ^ fuel > hi - ((lo+hi)/2 + 1) := by
-            have h2f : 2 ^ (fuel + 1) = 2 * 2 ^ fuel := by rw [Nat.pow_succ']
-            omega
-          exact ih ((lo+hi)/2 + 1) hi hbound hlo' hhi hfuel'
-        · rw [ite_eq_right hcond]
-          have hgt : wanted < (mask.take ((lo+hi)/2 + 1)).count true := by omega
-          have hsize : (lo+hi)/2 - lo ≤ (hi - lo) / 2 := by omega
-          have hfuel' : 2 ^ fuel > (lo+hi)/2 - lo := by
-            have h2f : 2 ^ (fuel + 1) = 2 * 2 ^ fuel := by rw [Nat.pow_succ']
-            omega
-          have hhi' : answer ≤ (lo+hi)/2 := by
-            by_cases hle : answer ≤ (lo+hi)/2
-            · exact hle
-            · exfalso
-              have hmid_ans : (lo+hi)/2 < answer := Nat.lt_of_not_ge hle
-              have h1 : (lo+hi)/2 + 1 ≤ answer := by omega
-              have hmono : (mask.take ((lo+hi)/2 + 1)).count true ≤
-                  (mask.take answer).count true :=
-                rs_mono mask (by omega) hans_le
-              omega
-          exact ih lo ((lo+hi)/2) (by omega) hlo hhi' hfuel'
-
-
-private theorem pow_log2 (n : Nat) : n < 2 ^ (n.log2 + 2) := by
-  induction n using Nat.strongRecOn with
-  | ind n ih =>
-    by_cases h2 : 2 ≤ n
-    · have hlog : n.log2 = (n / 2).log2 + 1 := by
-        rw [Nat.log2_def]; simp [h2]
-      rw [hlog]
-      have hn2 : n / 2 < n := by omega
-      have ih' := ih (n / 2) hn2
-      have hexp : (n / 2).log2 + 1 + 2 = ((n / 2).log2 + 2) + 1 := by omega
-      rw [hexp, Nat.pow_succ]
-      omega
-    · have hlog : n.log2 = 0 := by
-        rw [Nat.log2_def]; simp [h2]
-      rw [hlog]
-      have hn2 : n < 2 := by omega
-      have h4 : (2 : Nat) ^ (0 + 2) = 4 := by decide
-      rw [h4]
-      omega
-
-theorem sound_SelectDirectory : SelectDirectory.Goal := by
-  intro mask k
-  dsimp only
-  show (if locate (rsOf mask).toArray k (mask.length.log2 + 2) 0 mask.length < mask.length
-        then some (locate (rsOf mask).toArray k (mask.length.log2 + 2) 0 mask.length)
-        else none) = (idxs mask)[k]?
-  have key : locate (rsOf mask).toArray k (mask.length.log2 + 2) 0 mask.length =
-      (idxs mask)[k]?.getD mask.length := by
-    cases hidx : (idxs mask)[k]? with
-    | some v =>
-        rw [Option.getD_some]
-        have hklen : k < (idxs mask).length := by
-          by_cases hk : k < (idxs mask).length
-          · exact hk
-          · have hle : (idxs mask).length ≤ k := by omega
-            have hnone := (List.getElem?_eq_none_iff).mpr hle
-            rw [hidx] at hnone
-            simp at hnone
-        have hvk : v = (idxs mask)[k] := by
-          have hget := List.getElem?_eq_getElem hklen
-          rw [hidx] at hget
-          exact Option.some.inj hget
-        have hvmem : v ∈ idxs mask := by
-          rw [hvk]
-          exact List.getElem_mem hklen
-        have hvlt : v < mask.length := idxs_mem_lt hvmem
-        refine locate_correct mask k _ ?_ ?_ ?_ _ _ _ ?_ ?_ ?_ ?_
-        · omega
-        · intro i hi hcnt
-          by_cases hiv : i ≤ v
-          · exact hiv
-          · exfalso
-            have hvi : v < i := by omega
-            have hkj : (idxs mask)[k] < i := by rw [← hvk]; exact hvi
-            have hge : k + 1 ≤ (idxs mask).countP (· < i) :=
-              countP_lt_ge (idxs_pairwise mask) hklen hkj
-            have heq := rank_idx mask i hi
-            rw [heq] at hcnt
-            omega
-        · have hvle : v ≤ mask.length := by omega
-          have hcnt : (mask.take v).count true = k := by
-            rw [rank_idx mask v hvle, hvk]
-            exact pairwise_countP_lt (idxs mask) (idxs_pairwise mask) hklen
-          omega
-        · exact Nat.le_refl _
-        · exact Nat.zero_le _
-        · omega
-        · have hp := pow_log2 mask.length
-          exact hp
-    | none =>
-        rw [Option.getD_none]
-        have hlen : (idxs mask).length ≤ k := (List.getElem?_eq_none_iff).mp hidx
-        refine locate_correct mask k _ ?_ ?_ ?_ _ _ _ ?_ ?_ ?_ ?_
-        · exact Nat.le_refl _
-        · intro i hi hcnt; exact hi
-        · have hall : ∀ a ∈ idxs mask, a < mask.length := fun a ha => idxs_mem_lt ha
-          have hcnt : (mask.take mask.length).count true = (idxs mask).length := by
-            rw [rank_idx mask mask.length (Nat.le_refl _)]
-            exact countP_all_lt hall
-          rw [hcnt]; exact hlen
-        · exact Nat.le_refl _
-        · exact Nat.zero_le _
-        · exact Nat.le_refl _
-        · have hp := pow_log2 mask.length
-          exact hp
-  rw [key]
-  cases hidx : (idxs mask)[k]? with
-  | some v =>
-      rw [Option.getD_some]
-      have hklen : k < (idxs mask).length := by
-        by_cases hk : k < (idxs mask).length
-        · exact hk
-        · have hle : (idxs mask).length ≤ k := by omega
-          have hnone := (List.getElem?_eq_none_iff).mpr hle
-          rw [hidx] at hnone
-          simp at hnone
-      have hvk : v = (idxs mask)[k] := by
-        have hget := List.getElem?_eq_getElem hklen
-        rw [hidx] at hget
-        exact Option.some.inj hget
-      have hvmem : v ∈ idxs mask := by
-        rw [hvk]
-        exact List.getElem_mem hklen
-      have hvlt : v < mask.length := idxs_mem_lt hvmem
-      exact ite_eq_left hvlt
-  | none =>
-      rw [Option.getD_none]
-      exact ite_eq_right (Nat.lt_irrefl mask.length)
+          cases a with
+          | none =>
+              simpa [dense] using ih j
+          | some x =>
+              simpa [dense, List.getElem?_map] using ih j
 
 private def spansFrom (off : Nat) : List Run → List (Nat × Nat × Int)
   | [] => []
@@ -1089,7 +601,7 @@ private theorem spansFrom_le {a : List Run} {l r : Nat} {x : Int}
         simp at heq
         omega
 
-theorem sound_OverlapDot : TinylambOpt.ResearchGoals.EncodedBlocks.OverlapDot.Goal := by
+theorem OverlapDot_sound : TinylambOpt.ResearchGoals.EncodedBlocks.OverlapDot.Goal := by
   intro a b
   dsimp only
   rw [spans_eq_spansFrom a, spans_eq_spansFrom b]
@@ -1120,6 +632,435 @@ theorem sound_OverlapDot : TinylambOpt.ResearchGoals.EncodedBlocks.OverlapDot.Go
     exact hinner l r x (spansFrom_le ht)
   rw [hL]
   exact (dot_unpack_spans a (unpack b)).symm
+
+private def sel (mask : List Bool) : List Nat := (mask.zipIdx.filter Prod.fst).map Prod.snd
+
+private theorem zipIdx_snd_ge (mask : List Bool) (start : Nat) {p : Bool × Nat}
+    (hp : p ∈ mask.zipIdx start) : start ≤ p.2 := by
+  induction mask generalizing start with
+  | nil => simp at hp
+  | cons b bs ih =>
+      simp [List.zipIdx_cons] at hp
+      rcases hp with rfl | hp
+      · omega
+      · have h := ih (start+1) hp
+        omega
+
+private theorem sel_sorted_aux (mask : List Bool) (start : Nat) :
+    (((mask.zipIdx start).filter Prod.fst).map Prod.snd).Pairwise (· < ·) := by
+  induction mask generalizing start with
+  | nil => simp
+  | cons b bs ih =>
+      cases b
+      · simpa [List.zipIdx_cons] using ih (start+1)
+      · rw [List.zipIdx_cons]
+        simp only [List.filter_cons, decide_true, Bool.true_eq, ↓reduceIte]
+        rw [List.map_cons, List.pairwise_cons]
+        constructor
+        · intro q hq
+          rcases List.mem_map.mp hq with ⟨p, hp, rfl⟩
+          have hp' := (List.mem_filter.mp hp).1
+          have hge := zipIdx_snd_ge bs (start+1) hp'
+          omega
+        · exact ih (start+1)
+
+private theorem sel_sorted (mask : List Bool) : (sel mask).Pairwise (· < ·) := by
+  simpa [sel] using sel_sorted_aux mask 0
+
+private def cnt (mask : List Bool) (j : Nat) : Nat := (mask.take j).count true
+
+private theorem cnt_succ (mask : List Bool) (j : Nat) :
+    cnt mask (j+1) = cnt mask j + (if mask[j]?.getD false then 1 else 0) := by
+  unfold cnt
+  rw [List.take_succ, List.count_append]
+  cases h : mask[j]? with
+  | none => simp [h]
+  | some b => cases b <;> simp [h]
+
+private theorem cnt_mono (mask : List Bool) : ∀ a b : Nat, a ≤ b → cnt mask a ≤ cnt mask b := by
+  intro a b h
+  obtain ⟨c, rfl⟩ := Nat.exists_eq_add_of_le h
+  unfold cnt
+  rw [List.take_add, List.count_append]
+  omega
+
+private theorem bit_mem_sel (mask : List Bool) (j : Nat) :
+    mask[j]?.getD false = true ↔ j ∈ sel mask := by
+  unfold sel
+  rw [List.mem_map]
+  constructor
+  · intro h
+    refine ⟨(true, j), ?_, rfl⟩
+    rw [List.mem_filter]
+    constructor
+    · rw [List.mem_zipIdx_iff_getElem?]
+      cases hget : mask[j]? with
+      | none => simp [hget] at h
+      | some b => cases b <;> simp [hget] at h ⊢
+    · simp
+  · rintro ⟨p, hp, hpj⟩
+    have hpf := (List.mem_filter.mp hp).1
+    rw [List.mem_zipIdx_iff_getElem?] at hpf
+    have hpt := (List.mem_filter.mp hp).2
+    rw [hpj] at hpf
+    rw [hpf]
+    simp [hpt]
+
+private theorem filter_eq_nil_of_not {α : Type} (p : α → Bool) (l : List α)
+    (h : ∀ x ∈ l, ¬ p x = true) : l.filter p = [] := by
+  induction l with
+  | nil => rfl
+  | cons x xs ih =>
+      have hx : p x = false := by
+        by_cases hpt : p x = true
+        · exact False.elim ((h x (by simp)) hpt)
+        · cases hpx : p x <;> simp_all
+      have ht : ∀ y ∈ xs, ¬ p y = true := by intro y hy; exact h y (by simp [hy])
+      rw [List.filter_cons]
+      simp [hx, ih ht]
+
+private theorem count_lt_succ_sorted {l : List Nat} (hs : l.Pairwise (· < ·)) (j : Nat) :
+    (l.filter fun s => s < j+1).length =
+      (l.filter fun s => s < j).length + (if j ∈ l then 1 else 0) := by
+  induction l with
+  | nil => simp
+  | cons a as ih =>
+      obtain ⟨hagt, hstail⟩ := List.pairwise_cons.mp hs
+      by_cases hlt : a < j
+      · have hne : j ≠ a := by omega
+        have hf1 : ((a :: as).filter fun s => s < j+1).length =
+            1 + (as.filter fun s => s < j+1).length := by
+          simp [show a < j+1 by omega]
+          omega
+        have hf2 : ((a :: as).filter fun s => s < j).length =
+            1 + (as.filter fun s => s < j).length := by
+          simp [hlt]
+          omega
+        rw [hf1, hf2, ih hstail]
+        by_cases hm : j ∈ as
+        · have hm' : j ∈ a :: as := by simp [hm]
+          simp [hm, hm']
+          omega
+        · have hm' : ¬ j ∈ a :: as := by simp [hm, hne]
+          simp [hm, hm']
+      · have hge : j ≤ a := by omega
+        by_cases heq : a = j
+        · subst a
+          have hfn1 : (as.filter fun s => s < j+1) = [] := by
+            apply filter_eq_nil_of_not
+            intro x hx
+            have hxgt := hagt x hx
+            simp [show ¬ x < j+1 by omega]
+          have hfn2 : (as.filter fun s => s < j) = [] := by
+            apply filter_eq_nil_of_not
+            intro x hx
+            have hxgt := hagt x hx
+            simp [show ¬ x < j by omega]
+          have hnotmem : ¬ j ∈ as := by
+            intro hj
+            have := hagt j hj
+            omega
+          simp [hfn1, hfn2, hnotmem]
+        · have hjlt : j < a := by omega
+          have hnot1 : ¬ a < j+1 := by omega
+          have hnot2 : ¬ a < j := by omega
+          by_cases hm : j ∈ as
+          · have hm' : j ∈ a :: as := by simp [hm]
+            simp [hnot1, hnot2, hm, hm', ih hstail]
+          · have hm' : ¬ j ∈ a :: as := by simp [hm, show j ≠ a by omega]
+            simp [hnot1, hnot2, hm, hm', ih hstail]
+
+private theorem cnt_eq_filter_sel (mask : List Bool) (j : Nat) :
+    cnt mask j = ((sel mask).filter fun s => s < j).length := by
+  induction j with
+  | zero =>
+      simp [cnt]
+      rw [show (sel mask).filter (fun _ => false) = [] by
+        apply filter_eq_nil_of_not
+        intro x hx
+        simp]
+      rfl
+  | succ j ih =>
+      rw [cnt_succ, ih, count_lt_succ_sorted (sel_sorted mask) j]
+      have hiff := bit_mem_sel mask j
+      by_cases hb : mask[j]?.getD false <;> by_cases hm : j ∈ sel mask <;> simp [hb, hm] at hiff ⊢
+
+private theorem sel_lt_length (mask : List Bool) {s : Nat} (hs : s ∈ sel mask) : s < mask.length := by
+  unfold sel at hs
+  rcases List.mem_map.mp hs with ⟨p, hp, rfl⟩
+  have hpf := (List.mem_filter.mp hp).1
+  have hh := List.mem_zipIdx hpf
+  simpa using hh.2.1
+
+private theorem cnt_length_eq_sel (mask : List Bool) :
+    cnt mask mask.length = (sel mask).length := by
+  rw [cnt_eq_filter_sel]
+  have hf : (sel mask).filter (fun s => s < mask.length) = sel mask := by
+    apply List.filter_eq_self.mpr
+    intro s hs
+    exact decide_eq_true (by exact sel_lt_length mask hs)
+  rw [hf]
+
+private theorem count_lt_get {l : List Nat} (hs : l.Pairwise (· < ·)) :
+    ∀ k (hk : k < l.length), (l.filter fun s => s < l[k]).length = k := by
+  induction l with
+  | nil => intro k hk; simp at hk
+  | cons a as ih =>
+      intro k hk
+      cases k with
+      | zero =>
+          rw [List.getElem_cons_zero a as (by simp)]
+          have hfn : (a :: as).filter (fun s => s < a) = [] := by
+            rw [List.filter_cons]
+            have hnot : ∀ x ∈ as, ¬ x < a := by
+              intro x hx
+              have h := (List.pairwise_cons.mp hs).1 x hx
+              omega
+            simp [show ¬ a < a by omega]
+            intro x hx
+            have hxnot := hnot x hx
+            omega
+          rw [hfn]
+          rfl
+      | succ k =>
+          rw [List.getElem_cons_succ a as k (by simpa using hk)]
+          obtain ⟨hagt, hstail⟩ := List.pairwise_cons.mp hs
+          have hk' : k < as.length := by simpa using hk
+          have hak : a < as[k] := by
+            exact hagt (as[k]) (List.getElem_mem hk')
+          have hf : (a :: as).filter (fun s => s < as[k]) =
+              a :: (as.filter fun s => s < as[k]) := by
+            rw [List.filter_cons]
+            simp [hak]
+          rw [hf, List.length_cons, ih hstail k hk']
+
+private theorem count_le_get {l : List Nat} (hs : l.Pairwise (· < ·)) :
+    ∀ k (hk : k < l.length), (l.filter fun s => s ≤ l[k]).length = k + 1 := by
+  induction l with
+  | nil => intro k hk; simp at hk
+  | cons a as ih =>
+      intro k hk
+      cases k with
+      | zero =>
+          rw [List.getElem_cons_zero a as (by simp)]
+          have hf : (a :: as).filter (fun s => s ≤ a) = [a] := by
+            rw [List.filter_cons]
+            have htail : (as.filter fun s => s ≤ a) = [] := by
+              apply filter_eq_nil_of_not
+              intro x hx
+              have h := (List.pairwise_cons.mp hs).1 x hx
+              intro hxt
+              have hxa : x ≤ a := of_decide_eq_true hxt
+              omega
+            simp [htail]
+          rw [hf]
+          rfl
+      | succ k =>
+          rw [List.getElem_cons_succ a as k (by simpa using hk)]
+          obtain ⟨hagt, hstail⟩ := List.pairwise_cons.mp hs
+          have hk' : k < as.length := by simpa using hk
+          have hak : a ≤ as[k] := by
+            have := hagt (as[k]) (List.getElem_mem hk')
+            omega
+          have hf : (a :: as).filter (fun s => s ≤ as[k]) =
+              a :: (as.filter fun s => s ≤ as[k]) := by
+            rw [List.filter_cons]
+            simp [hak]
+          rw [hf, List.length_cons, ih hstail k hk']
+
+private theorem count_lt_mono (l : List Nat) (t t' : Nat) (h : t ≤ t') :
+    (l.filter fun s => s < t).length ≤ (l.filter fun s => s < t').length := by
+  induction l with
+  | nil => simp
+  | cons x xs ih =>
+      by_cases hx : x < t
+      · have hx' : x < t' := by omega
+        simp [hx, hx', ih]
+      · by_cases hx' : x < t'
+        · simp [hx, hx', ih]
+          omega
+        · simp [hx, hx', ih]
+
+private theorem filter_lt_succ_eq_le (l : List Nat) (i : Nat) :
+    (l.filter fun s => s < i+1) = (l.filter fun s => s ≤ i) := by
+  apply filter_congr
+  intro s
+  by_cases h : s ≤ i <;> simp [h] <;> omega
+
+private def IsAns (mask : List Bool) (k i : Nat) : Prop :=
+  (∀ u, u < i → cnt mask (u+1) ≤ k) ∧
+    (i = mask.length ∨ (i < mask.length ∧ k < cnt mask (i+1)))
+
+private theorem sel_get_spec (mask : List Bool) (k : Nat) (hk : k < (sel mask).length) :
+    IsAns mask k (sel mask)[k] := by
+  have hs := sel_sorted mask
+  have hi_lt : (sel mask)[k] < mask.length :=
+    sel_lt_length mask (List.getElem_mem hk)
+  constructor
+  · intro u hu
+    rw [cnt_eq_filter_sel]
+    have hut : u + 1 ≤ (sel mask)[k] := by omega
+    have hle := count_lt_mono (sel mask) (u+1) ((sel mask)[k]) hut
+    rw [count_lt_get hs k hk] at hle
+    exact hle
+  · right
+    constructor
+    · exact hi_lt
+    · rw [cnt_eq_filter_sel, filter_lt_succ_eq_le, count_le_get hs k hk]
+      omega
+
+private theorem foldl_count (l : List Bool) (a : Nat) :
+    l.foldl (fun n bit => n + bit.toNat) a = a + l.count true := by
+  induction l generalizing a with
+  | nil => simp
+  | cons b bs ih =>
+      cases b <;> simp [ih, Nat.add_assoc] <;> omega
+
+private theorem ranks_get (mask : List Bool) (j : Nat) (hj : j ≤ mask.length) :
+    ((((mask.scanl (fun n bit => n + bit.toNat) 0).toArray)[j]?).getD 0) = cnt mask j := by
+  rw [List.getElem?_toArray, List.getElem?_scanl]
+  rw [if_pos hj]
+  simp [foldl_count, cnt]
+
+private theorem pow_succ_two (n : Nat) : 2 ^ (n + 1) = 2 * 2 ^ n := by
+  rw [show n + 1 = Nat.succ n by omega, Nat.pow_succ]
+  omega
+
+private theorem isAns_unique (mask : List Bool) (k t₁ t₂ : Nat)
+    (h₁ : IsAns mask k t₁) (h₂ : IsAns mask k t₂) : t₁ = t₂ := by
+  unfold IsAns at h₁ h₂
+  by_cases hlt : t₁ < t₂
+  · rcases h₁.2 with ht1 | ⟨ht1n, hkc⟩
+    · subst t₁
+      rcases h₂.2 with ht2 | ⟨ht2n, _⟩
+      · subst t₂; rfl
+      · omega
+    · have := h₂.1 t₁ hlt
+      omega
+  · by_cases hgt : t₂ < t₁
+    · rcases h₂.2 with ht2 | ⟨ht2n, hkc⟩
+      · subst t₂
+        rcases h₁.2 with ht1 | ⟨ht1n, _⟩
+        · subst t₁; rfl
+        · omega
+      · have := h₁.1 t₂ hgt
+        omega
+    · omega
+
+private theorem locate_is_answer (mask : List Bool) (k : Nat) :
+    let ranks := (mask.scanl (fun n bit => n + bit.toNat) 0).toArray
+    ∀ fuel lo hi : Nat,
+      lo ≤ hi → hi ≤ mask.length → hi < lo + 2 ^ fuel →
+      (∀ u, u < lo → cnt mask (u+1) ≤ k) →
+      (hi = mask.length ∨ k < cnt mask (hi+1)) →
+      IsAns mask k (locate ranks k fuel lo hi) := by
+  dsimp only
+  intro fuel
+  induction fuel with
+  | zero =>
+      intro lo hi hle hbound hw hbefore hhi
+      have heq : hi = lo := by
+        simp at hw
+        omega
+      subst hi
+      simp only [locate]
+      constructor
+      · exact hbefore
+      · rcases hhi with rfl | hhi
+        · exact Or.inl rfl
+        · by_cases hln : lo = mask.length
+          · exact Or.inl hln
+          · exact Or.inr ⟨by omega, hhi⟩
+  | succ fuel ih =>
+      intro lo hi hle hbound hw hbefore hhi
+      by_cases hge : lo ≥ hi
+      · have heq : hi = lo := by omega
+        subst hi
+        simp only [locate, if_pos hge]
+        constructor
+        · exact hbefore
+        · rcases hhi with rfl | hhi
+          · exact Or.inl rfl
+          · by_cases hln : lo = mask.length
+            · exact Or.inl hln
+            · exact Or.inr ⟨by omega, hhi⟩
+      · have hlt : lo < hi := by omega
+        let mid := (lo + hi) / 2
+        have hmid_lo : lo ≤ mid := by dsimp [mid]; omega
+        have hmid_hi : mid < hi := by dsimp [mid]; omega
+        have hmid1 : mid + 1 ≤ mask.length := by omega
+        have hrk : ((mask.scanl (fun n bit => n + bit.toNat) 0)[mid+1]?).getD 0 =
+            cnt mask (mid+1) := by
+          simpa [List.getElem?_toArray] using ranks_get mask (mid+1) hmid1
+        by_cases hbranch : ((mask.scanl (fun n bit => n + bit.toNat) 0)[mid+1]?).getD 0 ≤ k
+        · have hcnt : cnt mask (mid+1) ≤ k := by simpa [hrk] using hbranch
+          have hbefore' : ∀ u, u < mid+1 → cnt mask (u+1) ≤ k := by
+            intro u hu
+            have hum : u+1 ≤ mid+1 := by omega
+            exact Nat.le_trans (cnt_mono mask (u+1) (mid+1) hum) hcnt
+          rw [pow_succ_two] at hw
+          have hw' : hi < (mid+1) + 2^fuel := by
+            dsimp [mid] at *
+            omega
+          have hres := ih (mid+1) hi (by omega) hbound hw' hbefore' hhi
+          simpa [locate, List.getElem?_toArray, hge, mid, hbranch] using hres
+        · have hcntgt : k < cnt mask (mid+1) := by
+            have : ¬ cnt mask (mid+1) ≤ k := by simpa [hrk] using hbranch
+            omega
+          rw [pow_succ_two] at hw
+          have hw' : mid < lo + 2^fuel := by
+            dsimp [mid] at *
+            omega
+          have hres := ih lo mid (by omega) (by omega) hw' hbefore (Or.inr hcntgt)
+          simpa [locate, List.getElem?_toArray, hge, mid, hbranch] using hres
+
+theorem SelectDirectory_sound : TinylambOpt.ResearchGoals.EncodedBlocks.SelectDirectory.Goal := by
+  intro mask k
+  dsimp only
+  change (if (locate (mask.scanl (fun n bit => n + bit.toNat) 0).toArray k
+        (mask.length.log2+2) 0 mask.length) < mask.length then
+      some (locate (mask.scanl (fun n bit => n + bit.toNat) 0).toArray k
+        (mask.length.log2+2) 0 mask.length) else none) = (sel mask)[k]?
+  have hltpow : mask.length < 2 ^ (mask.length.log2 + 2) := by
+    have hlt : mask.length < 2 ^ (mask.length.log2 + 1) := Nat.lt_log2_self
+    have hle : 2 ^ (mask.length.log2 + 1) ≤ 2 ^ (mask.length.log2 + 2) := by
+      rw [show mask.length.log2 + 2 = (mask.length.log2 + 1) + 1 by omega, pow_succ_two]
+      omega
+    omega
+  have hans : IsAns mask k
+      (locate (mask.scanl (fun n bit => n + bit.toNat) 0).toArray k
+        (mask.length.log2+2) 0 mask.length) := by
+    apply locate_is_answer
+    · omega
+    · omega
+    · simpa using hltpow
+    · intro u hu
+      omega
+    · exact Or.inl rfl
+  rcases hans.2 with hiEq | ⟨hiLt, hkcnt⟩
+  · have hkge : (sel mask).length ≤ k := by
+      rw [← cnt_length_eq_sel]
+      cases hn : mask.length with
+      | zero => simp [cnt, hn]
+      | succ n =>
+          have h := hans.1 n (by omega)
+          simpa [hn, Nat.succ_eq_add_one] using h
+    rw [if_neg (by omega)]
+    exact (List.getElem?_eq_none hkge).symm
+  · have hklt : k < (sel mask).length := by
+      rw [← cnt_length_eq_sel]
+      have hle := cnt_mono mask
+        (locate (mask.scanl (fun n bit => n + bit.toNat) 0).toArray k
+          (mask.length.log2+2) 0 mask.length + 1) mask.length (by omega)
+      omega
+    have hansSel := sel_get_spec mask k hklt
+    have heq : (sel mask)[k] =
+        locate (mask.scanl (fun n bit => n + bit.toNat) 0).toArray k
+          (mask.length.log2+2) 0 mask.length := isAns_unique mask k _ _ hansSel hans
+    rw [if_pos hiLt]
+    have hsomespec : (sel mask)[k]? = some (sel mask)[k] :=
+      List.getElem?_eq_some_iff.mpr ⟨hklt, rfl⟩
+    rw [hsomespec, heq]
 
 private theorem nodup_eraseDups (l : List Int) : l.eraseDups.Nodup := by
   let P : Nat → Prop := fun n => ∀ l : List Int, l.length = n → l.eraseDups.Nodup
@@ -1469,7 +1410,7 @@ private theorem erase_sum_pages (ps : List (List Int))
       simp only [List.map_cons, List.sum_cons]
       omega
 
-theorem sound_DistinctSeams : TinylambOpt.ResearchGoals.EncodedBlocks.DistinctSeams.Goal := by
+theorem DistinctSeams_sound : TinylambOpt.ResearchGoals.EncodedBlocks.DistinctSeams.Goal := by
   intro pages hpair
   dsimp only
   let ps := pages.filter fun p => !p.isEmpty
@@ -1500,3 +1441,7 @@ theorem sound_DistinctSeams : TinylambOpt.ResearchGoals.EncodedBlocks.DistinctSe
   omega
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.EncodedBlocks
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

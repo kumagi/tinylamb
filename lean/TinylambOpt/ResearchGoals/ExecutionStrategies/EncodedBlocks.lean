@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.EncodedBlocks
 
 /-! Immutable columns after fixing the visibility mask for a snapshot. Intermediates

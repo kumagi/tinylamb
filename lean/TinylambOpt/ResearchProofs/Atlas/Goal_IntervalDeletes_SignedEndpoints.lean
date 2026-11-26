@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `IntervalDeletes.SignedEndpoints` — `∀ rs i, blocked rs i = decide (0 < depth rs i)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

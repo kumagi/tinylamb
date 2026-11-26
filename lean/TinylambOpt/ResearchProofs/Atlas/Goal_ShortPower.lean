@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Grammar.ShortPower` — `∀ s p n, s ≠ [] → p ≠ [] → let period := s.length let probe
+  := expand (.repeat (p.length/period+2) (.literal s)) (positions (expand (.repeat n
+  (.literal s))) p).length = ((List.range period).map (fun i => if p.isPrefixOf
+  (probe.drop i) && i+p.length ≤ n*period then (n*period-i-p.length)/period+1 else
+  0)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

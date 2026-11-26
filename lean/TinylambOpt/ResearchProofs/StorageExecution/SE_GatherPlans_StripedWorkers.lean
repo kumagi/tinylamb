@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `StripedWorkers.ActivationCeiling` — `∀ stripe workers a b, a≤b → price stripe
+  workers a b ≤ span a b+workers+1`
+- `StripedWorkers.AllWorkers` — `∀ k w a b, w+1≤pages (k+1) a b → price k w a b=span a
+  b+w+1`
+- `StripedWorkers.GatherOrder` — `∀ (stripe workers : Nat), gatherOrder (price stripe
+  workers)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.StripedWorkers
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

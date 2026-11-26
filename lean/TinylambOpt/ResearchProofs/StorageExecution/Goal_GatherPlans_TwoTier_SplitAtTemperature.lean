@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `TwoTier.SplitAtTemperature` — `∀ pivot cold a b, a<pivot → pivot≤b → price pivot
+  cold a (pivot-1)+price pivot cold pivot b=price pivot cold a b+1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

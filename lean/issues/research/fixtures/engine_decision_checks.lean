@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.EngineDecisions
 
+/-!
+This fixture compares candidate engine decisions with reference evaluations on concrete
+inputs. It exercises the boundary cases used in the SQL execution study.
+-/
+
 open TinylambOpt.ResearchGoals.EngineDecisions
 
 namespace EngineDecisionChecks

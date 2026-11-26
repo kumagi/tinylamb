@@ -1,5 +1,9 @@
 import Std
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
 /-! One Simple-Query response under construction behind an older queued prefix.

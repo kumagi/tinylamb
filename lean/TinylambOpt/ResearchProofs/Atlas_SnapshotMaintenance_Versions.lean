@@ -1,5 +1,22 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `Versions.DominancePrune` — `∀ es k t v, readAt (frontier es t) k t v = readAt es k t
+  v`
+- `Versions.LocalPublish` — `∀ es e k t v, (∀ old ∈ es, earlier old e = true) → readAt
+  (es++[e]) k t v = if eligible k t v e then e.payload else readAt es k t v`
+- `Versions.RunTournament` — `∀ (runs : List (List Event)) k t v, winner runs.flatten k
+  t v = newest (runs.filterMap (fun r => winner r k t v))`
+- `Versions.SlabReuse` — `∀ es k t l h, l ≤ h → (∀ e ∈ es, e.key = k → e.tx ≤ t →
+  (e.since ≤ l ∨ h < e.since) ∧ (e.stop ≤ l ∨ h < e.stop)) → ∀ v, l ≤ v → v ≤ h →
+  winner es k t v = winner es k t l`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.SnapshotMaintenance.Versions
 
 open TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance.Versions

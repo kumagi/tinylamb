@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `RingNeighborhood.RankSeek` — `∀ b p (rs : Rows) (lo hi : Int) (k : Nat), (∀ r ∈ rs,
+  bounded b r.1 ∧ lo ≤ r.2 ∧ r.2 ≤ hi) → let scores := ((rs.filter (fun r =>
+  shape.qualifies p r.1)).map Prod.snd).mergeSort k < scores.length → scores[k]? =
+  some (seek (beforeScore shape b p rs) k ((hi-lo).toNat.log2+2) lo hi)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

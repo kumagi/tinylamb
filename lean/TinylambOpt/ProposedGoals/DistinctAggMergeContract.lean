@@ -1,5 +1,16 @@
 import Std
 
+/-!
+Keep the first occurrence of each distinct value (NULL is one group).
+
+A partial state is the exact set of distinct values seen so far.
+
+Modeled claims
+
+- `Goal` — `∀ (parts : List (List V)), let rows := parts.flatten let merged :=
+  mergePartial parts values merged = values rows ∧ sumValues merged = sumValues rows`
+-/
+
 namespace TinylambOpt.ProposedGoals.DistinctAggMergeContract
 
 abbrev V := Option Int

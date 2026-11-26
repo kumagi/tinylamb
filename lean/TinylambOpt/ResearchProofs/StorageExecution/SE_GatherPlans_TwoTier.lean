@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `TwoTier.GatherOrder` — `∀ (pivot cold : Nat), gatherOrder (price pivot cold)`
+- `TwoTier.HotTail` — `∀ p c a b, p≤a → a≤b → price p c a b=1+span a b`
+- `TwoTier.LatencyCap` — `∀ (pivot cold : Nat), latencyCap (price pivot cold)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.TwoTier
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

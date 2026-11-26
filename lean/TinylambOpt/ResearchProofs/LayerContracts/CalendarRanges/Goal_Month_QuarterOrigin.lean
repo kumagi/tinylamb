@@ -3,6 +3,16 @@ import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarR
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Facts_Month
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved
+
+- `Month.QuarterOrigin` — `∀ d q, fast model d / 3 = q ↔ monthStart (3*q) ≤ d ∧ d <
+  monthStart (3*q+3)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

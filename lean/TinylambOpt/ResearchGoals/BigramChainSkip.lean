@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.BlockCountModel
 
+/-!
+These claims relate adjacent character pairs to the modeled substring matches. A SQL
+string scan can use bigram information to reject locations that cannot match.
+
+Modeled claims
+
+- `Goal` — `∀ frags (pages : List (Block (Option Bytes) W)), (∀ p ∈ pages, p.header =
+  summary p.data) → let test := fun (row : Option Bytes) => row.any (chain · frags)
+  let r := execute (fun m => if candidate frags m then .inspect else .skip) test
+  pages r.count = ((pages.flatMap Block.data).filter test).length ∧ ∀ p ∈
+  pages.zipIdx, p.2 ∉ reads r → ∃ f ∈ frags, ∃ g ∈ grams f, (flag g &&& p.1.header) =
+  0`
+-/
+
 namespace TinylambOpt.ResearchGoals.BigramChainSkip
 
 open BlockCountModel

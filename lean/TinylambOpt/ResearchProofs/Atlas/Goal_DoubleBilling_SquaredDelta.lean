@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `DoubleBilling.SquaredDelta` — `∀ n db delta b, (∀ r x y, r ≠ 0 → delta r x y = 0) →
+  diff 2 (fun u => reference pattern n (slope db delta u) b) 0 = 2*reference pattern
+  n (fun r => if r == 0 then delta 0 else db r) b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

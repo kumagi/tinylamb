@@ -33,12 +33,13 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb::relational_detail::partitioned_detail {
-// Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+// Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
 // Lean proofs:
-//   - lean/TinylambOpt/ClickBenchRound2.lean
+//   - lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
 //     (unordered_group_by_key_fiber_subset_sound,
 //      unordered_group_by_nonkey_filter_corrupts_count_bug)
-//   - lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+//   -
+//   lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
 //     (GroupByLimitAnyOrderEarlyStop_sound)
 // CB-2: Key-fiber subset aggregation for unordered `GROUP BY ... LIMIT K`
 // (ClickBench Q18: `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY
@@ -474,7 +475,7 @@ StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
                                      "key-fiber-limit", &survivor_charges);
 }
 
-// Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+// Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
 //   (quotient_bucket_count_ge_group_count, quotient_bucket_topk_pruning_sound,
 //    quotient_bucket_asc_order_pruning_bug)
 // CB-7: Exact heavy-hitter pruning via quotient hash-bucket upper bounds for
@@ -485,7 +486,7 @@ StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
 // aggregating exact key tuples only for the <= 2,048 heaviest buckets and
 // certifying `tau > max_bucket_outside_S` before returning!
 // Lean proofs:
-//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean
 //     (CancellationDebt_sound, CertifiedWinners_sound)
 StatusOr<std::optional<Relation>> TryRunQuotientBucketHeavyHittersTopK(
     const PartitionedColumnarAggRequest& req, const KeyProjectionMap& km) {

@@ -1,4 +1,14 @@
-import TinylambOpt.HighRiskRulesAudit
+import TinylambOpt.SetJoinAndScalarRewrites
+
+/-!
+These proofs constrain moving filters through windows, selecting top rows, and
+decorrelating SQL plans. They preserve partition membership, ordering, and the output
+columns observed by the caller.
+
+Named results include `cpp_window_pushdown_mixed_partition_bug`,
+`repaired_push_selection_through_window_sound`,
+`cpp_split_window_noncontiguous_swaps_columns_bug`.
+-/
 
 /-
 # Step 8: Window / TopN / Sort / 相関除去 / Unnest / 再帰CTE / SARGable 境界の Lean 4 監査
@@ -1179,3 +1189,9 @@ theorem cpp_parameter_slot_freeze_bug :
   decide
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- plan/cascades.cpp
+-- plan/cascades_predicate_rules.cpp
+-- plan/optimizer.cpp
+-- query/select_rewrites.cpp

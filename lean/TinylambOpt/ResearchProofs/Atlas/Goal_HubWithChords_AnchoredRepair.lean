@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `HubWithChords.AnchoredRepair` — `∀ n old new b, reference pattern n new b -
+  reference pattern n old b = (pattern.atoms.zipIdx.map (fun (a,i) => pivotTerm
+  pattern n old new b i a)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

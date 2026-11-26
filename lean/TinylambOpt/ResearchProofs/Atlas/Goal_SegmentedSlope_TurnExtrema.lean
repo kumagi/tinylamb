@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `SegmentedSlope.TurnExtrema` — `∀ c, ((rows layout c).map Prod.snd).max? =
+  (([0,c.split-1,c.split,c.n-1].filter (· < c.n)).filterMap (layout.read c)).max?`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

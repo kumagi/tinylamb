@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `FlightCoverage` — Attaching waiters to an in-flight sync cannot certify more than
+  its captured end.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

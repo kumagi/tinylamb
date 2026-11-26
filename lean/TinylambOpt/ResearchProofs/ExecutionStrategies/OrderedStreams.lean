@@ -1,1204 +1,1931 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.OrderedStreams
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+
+Proved (8 claims, including the following)
+
+- `TinylambOpt.ResearchGoals.OrderedStreams.MergeDiagonal` — `∀ a b n, sorted a →
+  sorted b → n ≤ a.length+b.length → let (i,j) := mergeCut a b n i+j = n ∧ cutOK a b
+  i j ∧ (∀ i' j', i'+j' = n → cutOK a b i' j' → i' = i ∧ j' = j) ∧ (List.merge
+  (a.drop i) (b.drop j) leKey) = (List.merge a b leKey).drop n`
+- `TinylambOpt.ResearchGoals.OrderedStreams.MonotoneProbes` — `∀ ks rows, ks.Pairwise
+  (· ≤ ·) → sorted rows → seekMany ks rows = ks.map (fun k => rows.find? fun r => r.1
+  == k)`
+- `TinylambOpt.ResearchGoals.OrderedStreams.RangeCoalescing` — `∀ (keys : List Nat) (g
+  : Nat) (rows : List Nat), let spans := islands keys.mergeSort g (spans.flatMap fun
+  (lo,hi) => rows.filter fun x => lo ≤ x && x ≤ hi && keys.contains x).Perm
+  (rows.filter keys.contains) ∧ spans.Pairwise (fun a b => a.2+g+1 < b.1)`
+-/
+
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.OrderedStreams
 
 open TinylambOpt.ResearchGoals.OrderedStreams
 
-/-!
-# Ordered-stream execution strategies
 
-Proofs for the eight research propositions in
-`TinylambOpt.ResearchGoals.OrderedStreams`.
--/
-
-/-- `getLast?` of a cons with nonempty tail equals `getLast?` of the tail. -/
-private theorem getLast?_cons_cons {α : Type} (a b : α) (u : List α) :
-    (a :: b :: u).getLast? = (b :: u).getLast? := by
-  rw [List.getLast?_cons, List.getLast?_cons]
-  rfl
-
-/-- In a sorted row list, the head key is at most the last key. -/
-private theorem sorted_head_key_le_last_key {l : List Row}
-    (hs : l.Pairwise (fun a b => a.1 ≤ b.1))
-    {h v : Row} (hh : l.head? = some h) (hv : l.getLast? = some v) : h.1 ≤ v.1 := by
-  obtain ⟨t, rfl⟩ := List.head?_eq_some_iff.mp hh
-  cases t with
-  | nil =>
-      have hv' : ([h] : List Row).getLast? = some h := by
-        rw [List.getLast?_cons]
-        rfl
-      rw [hv'] at hv
-      injection hv with hv'
-      subst hv'
-      exact Int.le_rfl
-  | cons b u =>
-      have htv : (b :: u).getLast? = some v := by
-        have h2 := hv
-        rw [getLast?_cons_cons h b u] at h2
-        exact h2
-      obtain ⟨ys, hys⟩ := List.getLast?_eq_some_iff.mp htv
-      have hvmem : v ∈ b :: u := by
-        rw [hys]
-        simp
-      exact (List.pairwise_cons.mp hs).1 v hvmem
-
-theorem sound_SpliceBlock : SpliceBlock.Goal := by
-  intro block tail right hs hr hlast
-  revert hs hlast
-  induction block with
-  | nil =>
-      intro hs hlast
-      rfl
-  | cons x xs ih =>
-      intro hs hlast
-      cases right with
-      | nil => simp
-      | cons y ys =>
-          -- every element of `x :: xs` has key ≤ y.1; in particular x.1 ≤ y.1
-          obtain ⟨v, hv⟩ : ∃ v, (x :: xs).getLast? = some v :=
-            ⟨xs.getLast?.getD x, List.getLast?_cons⟩
-          have hxv : x.1 ≤ v.1 :=
-            sorted_head_key_le_last_key hs List.head?_cons hv
-          have hvy : v.1 ≤ y.1 := by
-            apply hlast v _ y _
-            · rw [hv]
-              exact Option.mem_def.mpr rfl
-            · rw [List.head?_cons]
-              exact Option.mem_def.mpr rfl
-          have hxy : x.1 ≤ y.1 := Int.le_trans hxv hvy
-          have hle : leKey x y = true := decide_eq_true hxy
-          rw [List.cons_append, List.cons_merge_cons, ite_eq_left hle]
-          congr 1
-          apply ih
-          · exact (List.pairwise_cons.mp hs).2
-          · intro x' hx' y' hy'
-            rw [List.head?_cons, Option.mem_some_iff] at hy'
-            subst hy'
-            cases xs with
-            | nil => simp at hx'
-            | cons b u =>
-                have hx'' : x' ∈ (x :: b :: u).getLast? := by
-                  rw [getLast?_cons_cons x b u]
-                  exact hx'
-                apply hlast x' hx'' y
-                · rw [List.head?_cons]
-                  exact Option.mem_def.mpr rfl
-
-/-! ### MonotoneProbes helpers -/
-
-/-- Elements kept by `takeWhile` satisfy the predicate. -/
-private theorem mem_takeWhile {α : Type} {p : α → Bool} {l : List α} {x : α}
-    (h : x ∈ l.takeWhile p) : p x = true := by
-  induction l with
-  | nil => simp at h
-  | cons a l ih =>
-      rw [List.takeWhile_cons] at h
-      split at h
-      · rename_i hp
-        rcases List.mem_cons.mp h with rfl | h'
-        · exact hp
-        · exact ih h'
-      · simp at h
-
-/-- Composing two `dropWhile`s collapses when the first predicate implies the second. -/
-private theorem dropWhile_dropWhile {α : Type} {p q : α → Bool} {l : List α}
-    (hpq : ∀ x, p x = true → q x = true) :
-    (l.dropWhile p).dropWhile q = l.dropWhile q := by
-  induction l with
+private theorem find_head_dropWhile (k : Int) (xs : List Row) (hs : sorted xs) :
+    (xs.dropWhile (fun r => r.1 < k)).head?.filter (fun r => r.1 == k) =
+      xs.find? (fun r => r.1 == k) := by
+  induction xs with
   | nil => rfl
   | cons x xs ih =>
-      rw [List.dropWhile_cons]
-      by_cases hp : p x = true
-      · rw [ite_eq_left hp, List.dropWhile_cons, ite_eq_left (hpq x hp)]
-        exact ih
-      · rw [ite_eq_right hp]
+      have hsx : sorted xs := List.Pairwise.of_cons hs
+      by_cases hx : x.1 < k
+      · have hxne : x.1 ≠ k := by omega
+        have hxeq : (x.1 == k) = false := by simp [hxne]
+        simp [List.dropWhile_cons, hx, hxeq, ih hsx, List.find?_cons, hxeq]
+      · by_cases hxk : x.1 = k
+        · have hxkeq : (x.1 == k) = true := by simp [hxk]
+          simp [List.dropWhile_cons, hx, hxkeq, List.find?_cons, hxkeq]
+        · have hxgt : k < x.1 := by omega
+          have hxkeq : (x.1 == k) = false := by simp [hxk]
+          have hnone : xs.find? (fun r => r.1 == k) = none := by
+            rw [List.find?_eq_none]
+            intro y hy
+            have hge : x.1 ≤ y.1 := (List.pairwise_cons.mp hs).1 y hy
+            simp [show y.1 ≠ k by omega]
+          simp [hx, hxk, hxkeq, hnone]
 
-/-- `find?` is unaffected by a `dropWhile` prefix whose elements all fail `q`. -/
-private theorem find?_dropWhile_of {α : Type} {p q : α → Bool} {l : List α}
-    (h : ∀ x ∈ l.takeWhile p, q x = false) :
-    (l.dropWhile p).find? q = l.find? q := by
-  have hnone : (l.takeWhile p).find? q = none := by
-    rw [List.find?_eq_none]
-    intro x hx
-    exact Bool.eq_false_iff.mp (h x hx)
-  have key : l.find? q = (l.takeWhile p ++ l.dropWhile p).find? q := by
-    rw [List.takeWhile_append_dropWhile]
-  rw [key, List.find?_append, hnone, Option.none_or]
-
-/-- The head of a `dropWhile` result fails the predicate. -/
-private theorem head_dropWhile {α : Type} {p : α → Bool} {l : List α} {r : α}
-    (h : (l.dropWhile p).head? = some r) : p r ≠ true := by
-  induction l with
-  | nil => simp at h
-  | cons x xs ih =>
-      rw [List.dropWhile_cons] at h
-      by_cases hp : p x = true
-      · rw [ite_eq_left hp] at h
-        exact ih h
-      · rw [ite_eq_right hp] at h
-        rw [List.head?_cons] at h
-        injection h with h'
-        subst h'
-        exact hp
-
-/-- Every row surviving `dropWhile (< k)` in a sorted run has key `≥ k`. -/
-private theorem dropWhile_key_ge {rows : List Row} (k : Int) :
-    sorted rows → ∀ {r : Row}, r ∈ rows.dropWhile (fun r => r.1 < k) → k ≤ r.1 := by
-  induction rows with
-  | nil => intro _ hr hmem; simp at hmem
-  | cons a t ih =>
-      intro hs hr hmem
-      have hts : sorted t := (List.pairwise_cons.mp hs).2
-      have hat : ∀ b ∈ t, a.1 ≤ b.1 := (List.pairwise_cons.mp hs).1
-      rw [List.dropWhile_cons] at hmem
-      by_cases ha : decide (a.1 < k) = true
-      · rw [ite_eq_left ha] at hmem
-        exact ih hts hmem
-      · rw [ite_eq_right ha] at hmem
-        have hak : k ≤ a.1 := by
-          have h2 : ¬ a.1 < k := by
-            intro hlt
-            exact ha (decide_eq_true hlt)
-          exact Int.not_lt.mp h2
-        rcases List.mem_cons.mp hmem with rfl | hrt
-        · exact hak
-        · exact Int.le_trans hak (hat _ hrt)
-
-/-- In a sorted row list whose keys are all `≥ k`, `find? (· == k)` inspects
-only the head: it returns the head iff the head's key is `k`, else `none`. -/
-private theorem find?_eq_head_filter_of_forall_ge {l : List Row} (hs : sorted l) {k : Int}
-    (hge : ∀ r ∈ l, k ≤ r.1) :
-    l.find? (fun r => r.1 == k) = l.head?.filter (fun r => r.1 == k) := by
-  cases l with
+private theorem dropWhile_chain (k k' : Int) (hkk : k ≤ k') (xs : List Row) :
+    (xs.dropWhile (fun r => r.1 < k)).dropWhile (fun r => r.1 < k') =
+      xs.dropWhile (fun r => r.1 < k') := by
+  induction xs with
   | nil => rfl
-  | cons a t =>
-      have hat : ∀ b ∈ t, a.1 ≤ b.1 := (List.pairwise_cons.mp hs).1
-      rw [List.head?_cons, Option.filter_some, List.find?_cons]
-      by_cases hq : (a.1 == k) = true
-      · simp [hq]
-      · have hqf : (a.1 == k) = false := Bool.eq_false_iff.mpr hq
-        have haq : a.1 ≠ k := fun h => hq (beq_iff_eq.mpr h)
-        have hak : k ≤ a.1 := hge a (List.mem_cons_self)
-        have hak' : k < a.1 := by omega
-        simp [hqf]
-        intro i j hx
-        have hxi : a.1 ≤ i := hat (i, j) hx
-        omega
+  | cons x xs ih =>
+      by_cases hx : x.1 < k
+      · have hx' : x.1 < k' := by omega
+        simp [List.dropWhile_cons, hx, hx', ih]
+      · by_cases hx' : x.1 < k'
+        · simp [List.dropWhile_cons, hx, hx', ih]
+        · simp [List.dropWhile_cons, hx, hx']
 
-/-- For sorted rows, probing the `dropWhile (< k)` staircase for `== k`
-agrees with filtering its head. -/
-private theorem find?_eq_head?_filter {rows : List Row} (hs : sorted rows) (k : Int) :
-    (rows.dropWhile fun r => r.1 < k).find? (fun r => r.1 == k) =
-      (rows.dropWhile fun r => r.1 < k).head?.filter (fun r => r.1 == k) := by
-  apply find?_eq_head_filter_of_forall_ge
-  · exact List.Pairwise.sublist (List.dropWhile_sublist _) hs
-  · intro r hr
-    exact dropWhile_key_ge k hs hr
+private theorem sorted_dropWhile (p : Row → Bool) (xs : List Row) (hs : sorted xs) :
+    sorted (xs.dropWhile p) := by
+  induction xs with
+  | nil => simp [sorted]
+  | cons x xs ih =>
+      by_cases hp : p x = true
+      · simpa [hp] using ih (List.Pairwise.of_cons hs)
+      · simpa [hp] using hs
 
-/-- Staircase probes equal per-key `find?` results. -/
-private theorem seekMany_aux (ks : List Int) :
-    ∀ (rows₀ : List Row) (k₀ : Int), ks.Pairwise (· ≤ ·) → sorted rows₀ →
-      (∀ k ∈ ks, k₀ ≤ k) →
-      seekMany ks (rows₀.dropWhile fun r => r.1 < k₀) =
-        ks.map (fun k => rows₀.find? fun r => r.1 == k) := by
-  induction ks with
-  | nil => intro _ _ _ _ _; rfl
-  | cons k ks ih =>
-      intro rows₀ k₀ hks hrows hk₀
-      have hkk : k₀ ≤ k := hk₀ k (List.mem_cons_self)
-      have hk_tail : ∀ k' ∈ ks, k ≤ k' := (List.pairwise_cons.mp hks).1
-      have hks_tail : ks.Pairwise (· ≤ ·) := (List.pairwise_cons.mp hks).2
-      -- unfold one seekMany step, then collapse the two nested dropWhiles
-      show ((rows₀.dropWhile fun r => r.1 < k₀).dropWhile fun r => r.1 < k).head?.filter
-            (fun r => r.1 == k) ::
-          seekMany ks ((rows₀.dropWhile fun r => r.1 < k₀).dropWhile fun r => r.1 < k) =
-        (k :: ks).map (fun k => rows₀.find? fun r => r.1 == k)
-      rw [dropWhile_dropWhile (p := fun r => r.1 < k₀) (q := fun r => r.1 < k) (l := rows₀)
-        (fun x hx => by
-          have hx' : x.1 < k₀ := of_decide_eq_true hx
-          have : x.1 < k := by omega
-          exact decide_eq_true this)]
-      rw [List.map_cons]
-      congr 1
-      · exact ((find?_eq_head?_filter hrows k).symm.trans
-          (find?_dropWhile_of (l := rows₀) (p := fun r => r.1 < k) (q := fun r => r.1 == k)
-            (fun x hx => by
-              have hpx := mem_takeWhile hx
-              have hxk : x.1 < k := of_decide_eq_true hpx
-              have hxk' : x.1 ≠ k := by omega
-              exact Bool.eq_false_iff.mpr (fun h => hxk' (beq_iff_eq.mp h)))))
-      · exact ih rows₀ k hks_tail hrows hk_tail
+private theorem seekMany_aux : ∀ (ks : List Int) (rows : List Row),
+    ks.Pairwise (· ≤ ·) → sorted rows →
+    seekMany ks rows = ks.map (fun k => rows.find? fun r => r.1 == k)
+  | [], _, _, _ => by simp [seekMany]
+  | k :: ks, rows, hks, hs => by
+      have htail : ∀ k' ∈ ks, k ≤ k' := (List.pairwise_cons.mp hks).1
+      have hks' : ks.Pairwise (· ≤ ·) := List.Pairwise.of_cons hks
+      let rest := rows.dropWhile (fun r => r.1 < k)
+      have hsrest : sorted rest := by simpa [rest] using sorted_dropWhile (fun r : Row => r.1 < k) rows hs
+      have hfirst : rest.head?.filter (fun r => r.1 == k) = rows.find? (fun r => r.1 == k) := by
+        simpa [rest] using find_head_dropWhile k rows hs
+      have hmap : ks.map (fun k' => rest.find? (fun r => r.1 == k')) =
+          ks.map (fun k' => rows.find? (fun r => r.1 == k')) := by
+        apply List.map_congr_left
+        intro k' hk'
+        have hle : k ≤ k' := htail k' hk'
+        have h1 := find_head_dropWhile k' rest hsrest
+        have h2 := find_head_dropWhile k' rows hs
+        rw [← h1, ← h2]
+        have hchain : rest.dropWhile (fun r => r.1 < k') = rows.dropWhile (fun r => r.1 < k') := by
+          simpa [rest] using dropWhile_chain k k' hle rows
+        rw [hchain]
+      simp [seekMany, rest, hfirst, hmap, seekMany_aux ks rest hks' hsrest]
 
-theorem sound_MonotoneProbes : MonotoneProbes.Goal := by
+theorem MonotoneProbes_sound : TinylambOpt.ResearchGoals.OrderedStreams.MonotoneProbes.Goal := by
   intro ks rows hks hrows
-  cases ks with
-  | nil => rfl
-  | cons k ks =>
-      have hks' : ks.Pairwise (· ≤ ·) := (List.pairwise_cons.mp hks).2
-      have hk_tail : ∀ k' ∈ ks, k ≤ k' := (List.pairwise_cons.mp hks).1
-      -- unfold one step and apply the auxiliary staircase lemma
-      show ((rows.dropWhile fun r => r.1 < k).head?.filter (fun r => r.1 == k)) ::
-          seekMany ks (rows.dropWhile fun r => r.1 < k) =
-        (k :: ks).map (fun k => rows.find? fun r => r.1 == k)
-      rw [List.map_cons]
-      congr 1
-      · exact ((find?_eq_head?_filter hrows k).symm.trans
-          (find?_dropWhile_of (l := rows) (p := fun r => r.1 < k) (q := fun r => r.1 == k)
-            (fun x hx => by
-              have hpx := mem_takeWhile hx
-              have hxk : x.1 < k := of_decide_eq_true hpx
-              have hxk' : x.1 ≠ k := by omega
-              exact Bool.eq_false_iff.mpr (fun h => hxk' (beq_iff_eq.mp h)))))
-      · exact seekMany_aux ks rows k hks' hrows hk_tail
+  exact seekMany_aux ks rows hks hrows
 
 
-/-! ### ReversePeerRuns helpers -/
 
-private abbrev peerExpand (rs : List (Int × List Nat)) : List Row :=
-  rs.flatMap fun (k, vs) => vs.map (k, ·)
+private def flatPair (a b : List Nat) : List (Nat × Nat) :=
+  a.flatMap fun x => b.map fun y => (x, y)
 
-private def candW : List (Int × List Nat) → Nat → List (Row × Nat)
-  | [], _ => []
-  | (k, vs) :: rs, off => candW rs (off + vs.length) ++ (vs.map (k, ·)).zipIdx off
+private def flatRuns (rs : Runs) : List (Nat × Nat) :=
+  rs.flatMap fun (a, b) => flatPair a b
 
-private theorem peerExpand_cons (k : Int) (vs : List Nat) (rs : List (Int × List Nat)) :
-    peerExpand ((k, vs) :: rs) = vs.map (k, ·) ++ peerExpand rs := by
-  show ((k, vs) :: rs).flatMap _ = _
-  rw [List.flatMap_cons]
-
-private theorem peerExpand_append (l₁ l₂ : List (Int × List Nat)) :
-    peerExpand (l₁ ++ l₂) = peerExpand l₁ ++ peerExpand l₂ := by
-  show (l₁ ++ l₂).flatMap _ = _
-  rw [List.flatMap_append]
-
-private theorem peerExpand_singleton (k : Int) (vs : List Nat) :
-    peerExpand [(k, vs)] = vs.map (k, ·) := by
-  show [(k, vs)].flatMap _ = _
-  rw [List.flatMap_cons]
-  simp
-
-private theorem peerExpand_reverse_append (rs : List (Int × List Nat)) (k : Int) (vs : List Nat) :
-    peerExpand (rs.reverse ++ [(k, vs)]) = peerExpand rs.reverse ++ vs.map (k, ·) := by
-  rw [peerExpand_append, peerExpand_singleton]
-
-private theorem map_fst_zipIdx (l : List α) (i : Nat) :
-    (l.zipIdx i).map Prod.fst = l := by
-  induction l generalizing i with
-  | nil => rfl
-  | cons x xs ih =>
-      rw [List.zipIdx_cons, List.map_cons, ih]
-
-private theorem candW_fst : ∀ (runs : List (Int × List Nat)) (off : Nat),
-    (candW runs off).map Prod.fst = peerExpand runs.reverse := by
-  intro runs
-  induction runs with
-  | nil => intro off; rfl
-  | cons r rs ih =>
-      obtain ⟨k, vs⟩ := r
-      intro off
-      show (candW rs (off + vs.length) ++ (vs.map (k, ·)).zipIdx off).map Prod.fst = _
-      rw [List.map_append, map_fst_zipIdx, ih]
-      show peerExpand rs.reverse ++ vs.map (k, ·) = peerExpand ((k, vs) :: rs).reverse
-      rw [List.reverse_cons, peerExpand_reverse_append]
-
-private theorem candW_perm : ∀ (runs : List (Int × List Nat)) (off : Nat),
-    (candW runs off).Perm ((peerExpand runs).zipIdx off) := by
-  intro runs
-  induction runs with
-  | nil => intro off; rfl
-  | cons r rs ih =>
-      obtain ⟨k, vs⟩ := r
-      intro off
-      show (candW rs (off + vs.length) ++ (vs.map (k, ·)).zipIdx off).Perm _
-      have hpe : peerExpand ((k, vs) :: rs) = vs.map (k, ·) ++ peerExpand rs :=
-        peerExpand_cons k vs rs
-      rw [hpe, List.zipIdx_append, List.length_map]
-      exact (List.perm_append_comm).trans
-        (List.Perm.append (List.Perm.refl _) (ih (off + vs.length)))
-
-private theorem mem_map_pair_fst {k : Int} {vs : List Nat} {x : Int × Nat}
-    (h : x ∈ vs.map (k, ·)) : x.1 = k := by
-  obtain ⟨v, -, hv⟩ := List.mem_map.mp h
-  have hx : x = (k, v) := hv.symm
-  rw [hx]
-
-private theorem candW_key_mem : ∀ (runs : List (Int × List Nat)) (off : Nat)
-    (p : Row × Nat), p ∈ candW runs off → p.1.1 ∈ runs.map Prod.fst := by
-  intro runs
-  induction runs with
-  | nil => intro off p h; simp [candW] at h
-  | cons r rs ih =>
-      obtain ⟨k, vs⟩ := r
-      intro off p h
-      have h' : p ∈ candW rs (off + vs.length) ++ (vs.map (k, ·)).zipIdx off := h
-      rw [List.mem_append] at h'
-      rw [List.map_cons]
-      rcases h' with h | h
-      · have := ih (off + vs.length) p h
-        exact List.mem_cons_of_mem _ this
-      · have hfst : p.1 ∈ vs.map (k, ·) := by
-          have hm := List.mem_zipIdx h
-          obtain ⟨-, -, heq⟩ := hm
-          rw [heq]
-          apply List.getElem_mem
-        have hkey : p.1.1 = k := mem_map_pair_fst hfst
-        rw [hkey]
-        exact List.mem_cons_self
-
-private theorem block_pairwise (k : Int) : ∀ (vs : List Nat) (off : Nat),
-    ((vs.map (k, ·)).zipIdx off).Pairwise
-      (fun p q => List.zipIdxLE leKey p q = true) := by
-  intro vs
-  induction vs with
-  | nil => intro off; simp
-  | cons v vs ih =>
-      intro off
-      show (((v :: vs).map (k, ·)).zipIdx off).Pairwise _
-      rw [List.map_cons, List.zipIdx_cons, List.pairwise_cons]
-      refine ⟨?_, ih (off + 1)⟩
-      intro q hq
-      have hm := List.mem_zipIdx hq
-      obtain ⟨hge, hlt, heq⟩ := hm
-      have hq1 : q.1 ∈ vs.map (k, ·) := by
-        rw [heq]
-        apply List.getElem_mem
-      have hq1k : q.1.1 = k := mem_map_pair_fst hq1
-      have hq2 : off ≤ q.2 := by omega
-      show List.zipIdxLE leKey ((k, v), off) q = true
-      rw [List.zipIdxLE]
-      have h1 : leKey (k, v) q.1 = true := by
-        show decide ((k, v).1 ≤ q.1.1) = true
-        rw [hq1k]
-        show decide (k ≤ k) = true
-        exact decide_eq_true (Int.le_refl k)
-      have h2 : leKey q.1 (k, v) = true := by
-        show decide (q.1.1 ≤ (k, v).1) = true
-        rw [hq1k]
-        show decide (k ≤ k) = true
-        exact decide_eq_true (Int.le_refl k)
-      rw [h1, h2]
-      show decide (off ≤ q.2) = true
-      exact decide_eq_true hq2
-
-private theorem candW_pairwise : ∀ (runs : List (Int × List Nat)) (off : Nat),
-    (runs.map Prod.fst).Pairwise (· > ·) →
-    (candW runs off).Pairwise (fun p q => List.zipIdxLE leKey p q = true) := by
-  intro runs
-  induction runs with
-  | nil => intro off _; simp [candW]
-  | cons r rs ih =>
-      obtain ⟨k, vs⟩ := r
-      intro off h
-      rw [List.map_cons, List.pairwise_cons] at h
-      obtain ⟨hk, hrs⟩ := h
-      show (candW rs (off + vs.length) ++ (vs.map (k, ·)).zipIdx off).Pairwise _
-      rw [List.pairwise_append]
-      refine ⟨?_, block_pairwise k vs off, ?_⟩
-      · exact ih (off + vs.length) hrs
-      · intro a ha b hb
-        have hb1 : b.1 ∈ vs.map (k, ·) := by
-          have hm := List.mem_zipIdx hb
-          obtain ⟨-, -, heq⟩ := hm
-          rw [heq]
-          apply List.getElem_mem
-        have hbk : b.1.1 = k := mem_map_pair_fst hb1
-        have hak : a.1.1 ∈ rs.map Prod.fst := candW_key_mem rs (off + vs.length) a ha
-        have hak' : a.1.1 < k := hk _ hak
-        have hle1 : leKey a.1 b.1 = true := by
-          show decide (a.1.1 ≤ b.1.1) = true
-          rw [hbk]
-          exact decide_eq_true (by omega : a.1.1 ≤ k)
-        have hle2 : leKey b.1 a.1 = false := by
-          show decide (b.1.1 ≤ a.1.1) = false
-          rw [hbk]
-          exact decide_eq_false (by omega : ¬ k ≤ a.1.1)
-        show List.zipIdxLE leKey a b = true
-        rw [List.zipIdxLE, hle1, hle2]
-        rfl
-
--- leKey transitivity and totality for pairwise_mergeSort
-private theorem leKey_trans (a b c : Row) :
-    leKey a b = true → leKey b c = true → leKey a c = true := by
-  intro h1 h2
-  have h1' : a.1 ≤ b.1 := of_decide_eq_true h1
-  have h2' : b.1 ≤ c.1 := of_decide_eq_true h2
-  show decide (a.1 ≤ c.1) = true
-  exact decide_eq_true (Int.le_trans h1' h2')
-
-private theorem leKey_total (a b : Row) : (leKey a b || leKey b a) = true := by
-  show (decide (a.1 ≤ b.1) || decide (b.1 ≤ a.1)) = true
-  rw [Bool.or_eq_true]
-  rcases Int.le_total a.1 b.1 with h | h
-  · exact Or.inl (decide_eq_true h)
-  · exact Or.inr (decide_eq_true h)
-
-private theorem leKey_eq_true_iff_key {p q : Row × Nat} :
-    leKey p.1 q.1 = true ↔ p.1.1 ≤ q.1.1 := by
-  show decide (p.1.1 ≤ q.1.1) = true ↔ p.1.1 ≤ q.1.1
-  exact decide_eq_true_iff
-
-theorem sound_ReversePeerRuns : ReversePeerRuns.Goal := by
-  intro runs h
-  show peerExpand runs.reverse = (peerExpand runs).mergeSort leKey
-  have hSZ : ((peerExpand runs).zipIdx.mergeSort (List.zipIdxLE leKey)).Perm ((peerExpand runs).zipIdx) :=
-    List.mergeSort_perm _ _
-  have hWZ : (candW runs 0).Perm ((peerExpand runs).zipIdx) := candW_perm runs 0
-  have hSW : ((peerExpand runs).zipIdx.mergeSort (List.zipIdxLE leKey)).Perm (candW runs 0) :=
-    hSZ.trans hWZ.symm
-  have hSP : ((peerExpand runs).zipIdx.mergeSort (List.zipIdxLE leKey)).Pairwise
-      (fun p q => List.zipIdxLE leKey p q = true) :=
-    List.pairwise_mergeSort (fun a b c => List.zipIdxLE_trans leKey_trans a b c) (fun a b => List.zipIdxLE_total leKey_total a b) _
-  have hWP : (candW runs 0).Pairwise (fun p q => List.zipIdxLE leKey p q = true) :=
-    candW_pairwise runs 0 h
-  have hEq : (peerExpand runs).zipIdx.mergeSort (List.zipIdxLE leKey) = candW runs 0 := by
-    apply List.Perm.eq_of_pairwise (le := fun p q : Row × Nat => List.zipIdxLE leKey p q = true)
-    · intro p q hp hq hpq hqp
-      have hpZ : p ∈ (peerExpand runs).zipIdx := List.mem_mergeSort.mp hp
-      have hqZ : q ∈ (peerExpand runs).zipIdx := (List.Perm.mem_iff hWZ).mp hq
-      obtain ⟨hp1, hp2, hpe⟩ := List.mem_zipIdx hpZ
-      obtain ⟨hq1, hq2, hqe⟩ := List.mem_zipIdx hqZ
-      have hle1 : leKey p.1 q.1 = true := by
-        by_cases hh : leKey p.1 q.1 = true
-        · exact hh
-        · have hfalse : leKey p.1 q.1 = false := by cases hb : leKey p.1 q.1 <;> simp_all
-          have hz : List.zipIdxLE leKey p q = false := by
-            show (if leKey p.1 q.1 then (if leKey q.1 p.1 then decide (p.2 ≤ q.2) else true) else false) = false
-            rw [hfalse]
-            rfl
-          rw [hz] at hpq
-          exact Bool.noConfusion hpq
-      have hle2 : leKey q.1 p.1 = true := by
-        by_cases hh : leKey q.1 p.1 = true
-        · exact hh
-        · have hfalse : leKey q.1 p.1 = false := by cases hb : leKey q.1 p.1 <;> simp_all
-          have hz : List.zipIdxLE leKey q p = false := by
-            show (if leKey q.1 p.1 then (if leKey p.1 q.1 then decide (q.2 ≤ p.2) else true) else false) = false
-            rw [hfalse]
-            rfl
-          rw [hz] at hqp
-          exact Bool.noConfusion hqp
-      have hkey : p.1.1 = q.1.1 := by
-        have h1 : p.1.1 ≤ q.1.1 := (leKey_eq_true_iff_key).mp hle1
-        have h2 : q.1.1 ≤ p.1.1 := (leKey_eq_true_iff_key).mp hle2
-        exact Int.le_antisymm h1 h2
-      have hidx1 : p.2 ≤ q.2 := by
-        rw [List.zipIdxLE] at hpq
-        rw [hle1, hle2] at hpq
-        simp only [Bool.cond_true, Bool.cond_false] at hpq
-        exact of_decide_eq_true hpq
-      have hidx2 : q.2 ≤ p.2 := by
-        rw [List.zipIdxLE] at hqp
-        rw [hle2, hle1] at hqp
-        simp only [Bool.cond_true, Bool.cond_false] at hqp
-        exact of_decide_eq_true hqp
-      have hidx : p.2 = q.2 := Nat.le_antisymm hidx1 hidx2
-      have hidx0 : p.snd - 0 = q.snd - 0 := by rw [hidx]
-      have hpBound : p.snd - 0 < (peerExpand runs).length := by omega
-      have hqBound : q.snd - 0 < (peerExpand runs).length := by omega
-      have hpOpt : (peerExpand runs)[p.snd - 0]? = some p.fst :=
-        (List.getElem?_eq_getElem hpBound).trans (congrArg some hpe.symm)
-      have hqOpt : (peerExpand runs)[q.snd - 0]? = some q.fst :=
-        (List.getElem?_eq_getElem hqBound).trans (congrArg some hqe.symm)
-      have hcongr : (peerExpand runs)[p.snd - 0]? = (peerExpand runs)[q.snd - 0]? :=
-        congrArg (fun i => (peerExpand runs)[i]?) hidx0
-      have hsome : some p.fst = some q.fst := hpOpt.symm.trans (hcongr.trans hqOpt)
-      have hrow : p.fst = q.fst := Option.some.inj hsome
-      exact Prod.ext hrow hidx
-    · exact hSP
-    · exact hWP
-    · exact hSW
-  have hmain : (peerExpand runs).mergeSort leKey = peerExpand runs.reverse := by
-    rw [← List.mergeSort_zipIdx]
-    rw [hEq]
-    exact candW_fst runs 0
-  exact hmain.symm
-
-/-! ### WeightedOffset helpers -/
-
-private theorem sub_div (k b : Nat) (hb : 0 < b) (hbk : b ≤ k) :
-    (k - b) / b = k / b - 1 := by
-  have hdm := Nat.div_add_mod k b
-  have hr : k % b < b := Nat.mod_lt k hb
-  have hq : 1 ≤ k / b := (Nat.le_div_iff_mul_le hb).mpr (by simpa using hbk)
-  apply Nat.div_eq_of_lt_le
-  · have h1 : (k / b - 1) * b = k / b * b - b := by
-      rw [Nat.sub_mul, Nat.one_mul]
-    rw [h1]
-    have hqb0 : b * (k / b) ≤ k := by omega
-    have hqb : k / b * b ≤ k := by
-      rw [Nat.mul_comm b (k / b)] at hqb0
-      exact hqb0
-    exact Nat.sub_le_sub_right hqb b
-  · have h2 : k / b - 1 + 1 = k / b := Nat.sub_add_cancel hq
-    rw [h2, Nat.sub_lt_iff_lt_add hbk, Nat.mul_comm (k / b) b]
-    calc k = b * (k / b) + k % b := hdm.symm
-      _ < b * (k / b) + b := by omega
-
-private theorem sub_mod (k b : Nat) (hbk : b ≤ k) :
-    (k - b) % b = k % b := by
-  have := Nat.mod_eq_sub_mod hbk
-  exact this.symm
-
-private theorem flatMap_pair_getElem? (a b : List Nat) {k : Nat}
-    (hk : k < a.length * b.length) :
-    (a.flatMap fun x => b.map fun y => (x, y))[k]? =
-      (do return (← a[k / b.length]?, ← b[k % b.length]?)) := by
-  induction a generalizing k with
-  | nil =>
-      simp at hk
-  | cons x xs ih =>
-      have hbpos : 0 < b.length := by
-        rcases Nat.eq_zero_or_pos b.length with h0 | hpos
-        · rw [h0, Nat.mul_zero] at hk
-          omega
-        · exact hpos
-      rw [List.flatMap_cons, List.getElem?_append, List.length_map]
-      by_cases hk2 : k < b.length
-      · rw [ite_eq_left hk2, List.getElem?_map]
-        have hdiv0 : k / b.length = 0 := Nat.div_eq_of_lt hk2
-        have hmod0 : k % b.length = k := Nat.mod_eq_of_lt hk2
-        rw [hdiv0, hmod0, List.getElem?_cons, ite_eq_left rfl]
-        cases hb : b[k]? <;> rfl
-      · rw [ite_eq_right hk2]
-        have hbk : b.length ≤ k := Nat.le_of_not_lt hk2
-        have hkdiv : 1 ≤ k / b.length :=
-          (Nat.le_div_iff_mul_le hbpos).mpr (by simpa using hbk)
-        have hget : (x :: xs)[k / b.length]? = xs[(k - b.length) / b.length]? := by
-          have hsub_div := sub_div k b.length hbpos hbk
-          have hdiv_eq : k / b.length = (k - b.length) / b.length + 1 := by omega
-          rw [hdiv_eq, List.getElem?_cons_succ]
-        have hsub_mod : k % b.length = (k - b.length) % b.length :=
-          (sub_mod k b.length hbk).symm
-        rw [hget, hsub_mod]
-        have hk' : k < xs.length * b.length + b.length := by
-          have hlen : (x :: xs).length * b.length = xs.length * b.length + b.length := by
-            rw [List.length_cons, Nat.add_mul, Nat.one_mul]
-          rw [hlen] at hk
-          exact hk
-        have hk_sub : k - b.length < xs.length * b.length :=
-          (Nat.sub_lt_iff_lt_add hbk).mpr hk'
-        exact ih (k := k - b.length) hk_sub
-
-
-private theorem flatMap_pair_length (a b : List Nat) :
-    (a.flatMap fun x => b.map fun y => (x, y)).length = a.length * b.length := by
+private theorem flatPair_length (a b : List Nat) : (flatPair a b).length = a.length * b.length := by
   induction a with
-  | nil => simp
+  | nil => simp [flatPair]
   | cons x xs ih =>
-      rw [List.flatMap_cons, List.length_append, ih, List.length_map, List.length_cons,
-        Nat.add_mul, Nat.one_mul, Nat.add_comm]
+      change (b.map (fun y => (x, y)) ++ flatPair xs b).length = (x :: xs).length * b.length
+      rw [List.length_append, ih]
+      simp [Nat.succ_mul]
+      omega
 
-theorem sound_WeightedOffset : WeightedOffset.Goal := by
-  intro rs k
-  induction rs generalizing k with
+private theorem flatPair_nil (a : List Nat) : flatPair a [] = [] := by
+  induction a with
   | nil => rfl
-  | cons ab rs ih =>
-      cases ab with
-      | mk a b =>
-          simp only [seekPair, List.flatMap_cons, List.getElem?_append, flatMap_pair_length]
-          by_cases hk : k < a.length * b.length
-          · rw [ite_eq_left hk, ite_eq_left hk]
-            exact (flatMap_pair_getElem? a b hk).symm
-          · rw [ite_eq_right hk, ite_eq_right hk]
-            exact ih (k - a.length * b.length)
+  | cons x xs ih => simp [flatPair, ih]
+
+private theorem flatProd_get : ∀ (a b : List Nat) (k : Nat), b.length > 0 →
+    (flatPair a b)[k]? =
+      (do let x ← a[k / b.length]?
+          let y ← b[k % b.length]?
+          some (x, y))
+  | [], b, k, hb => by simp [flatPair]
+  | x :: xs, b, k, hb => by
+      simp only [flatPair, List.flatMap_cons]
+      by_cases hk : k < b.length
+      · rw [List.getElem?_append_left (by simpa using hk)]
+        have hdiv : k / b.length = 0 := Nat.div_eq_of_lt hk
+        have hmod : k % b.length = k := Nat.mod_eq_of_lt hk
+        rw [hdiv, hmod]
+        simp
+        cases h : b[k]? <;> simp [h]
+      · rw [List.getElem?_append_right (by simpa using hk)]
+        have hkdecomp : k = (k - b.length) + b.length * 1 := by omega
+        have hdiv : k / b.length = (k - b.length) / b.length + 1 := by
+          calc
+            k / b.length = ((k - b.length) + b.length * 1) / b.length := by rw [← hkdecomp]
+            _ = (k - b.length) / b.length + 1 := by simpa using (Nat.add_mul_div_left (k - b.length) 1 hb)
+        have hmod : k % b.length = (k - b.length) % b.length := by
+          calc
+            k % b.length = ((k - b.length) + b.length * 1) % b.length := by rw [← hkdecomp]
+            _ = (k - b.length) % b.length := Nat.add_mul_mod_self_left (k - b.length) b.length 1
+        have hgetx : (x :: xs)[k / b.length]? = xs[(k - b.length) / b.length]? := by
+          rw [hdiv]
+          simp
+        have hgetb : b[k % b.length]? = b[(k - b.length) % b.length]? := by rw [hmod]
+        rw [hgetx, hgetb]
+        simpa [flatPair] using flatProd_get xs b (k - b.length) hb
+
+private theorem seekPair_eq_flat : ∀ (rs : Runs) (k : Nat),
+    seekPair rs k = (flatRuns rs)[k]?
+  | [], k => by simp [seekPair, flatRuns]
+  | (a, b) :: rs, k => by
+      cases b with
+      | nil =>
+          simp [seekPair, flatRuns, flatPair_nil, seekPair_eq_flat rs k]
+      | cons b bs =>
+          change seekPair ((a, b :: bs) :: rs) k = (flatPair a (b :: bs) ++ flatRuns rs)[k]?
+          have hb : (b :: bs).length > 0 := by simp
+          by_cases hk : k < a.length * (b :: bs).length
+          · rw [seekPair, if_pos hk]
+            rw [List.getElem?_append_left]
+            · simpa using (flatProd_get a (b :: bs) k hb).symm
+            · simpa [flatPair_length] using hk
+          · rw [seekPair, if_neg hk]
+            rw [List.getElem?_append_right]
+            · rw [seekPair_eq_flat rs (k - a.length * (b :: bs).length)]
+              congr 1
+              rw [flatPair_length]
+            · simpa [flatPair_length] using hk
+
+theorem WeightedOffset_sound : TinylambOpt.ResearchGoals.OrderedStreams.WeightedOffset.Goal := by
+  intro rs k
+  simpa [flatRuns, flatPair] using seekPair_eq_flat rs k
 
 
-def istep (g : Nat) (acc : List (Nat × Nat)) (x : Nat) : List (Nat × Nat) :=
+
+private theorem le_of_mem_getLast {l : List Row} (hs : sorted l) :
+    ∀ x ∈ l, ∀ z ∈ l.getLast?, x.1 ≤ z.1 := by
+  induction l with
+  | nil => simp
+  | cons a l ih =>
+      cases l with
+      | nil => simp
+      | cons b l =>
+          have hs' : sorted (b :: l) := List.Pairwise.of_cons hs
+          have hab : a.1 ≤ b.1 := (List.pairwise_cons.mp hs).1 b (by simp)
+          intro x hx z hz
+          simp at hx
+          rcases hx with rfl | hx
+          · have hbz : b.1 ≤ z.1 := by
+              simpa using ih hs' b (by simp) z hz
+            omega
+          · exact ih hs' x (by simp [hx]) z hz
+
+private theorem splice_aux : ∀ (block tail right : List Row),
+    sorted block → sorted right →
+    (∀ x ∈ block.getLast?, ∀ y ∈ right.head?, x.1 ≤ y.1) →
+    List.merge (block ++ tail) right leKey = block ++ List.merge tail right leKey
+  | [], tail, right, _, _, _ => by simp [List.merge]
+  | x :: xs, tail, [], hs, _, _ => by simp [List.merge]
+  | x :: xs, tail, y :: ys, hs, hr, hcond => by
+      have hxs : sorted xs := List.Pairwise.of_cons hs
+      have hyhead : y ∈ (y :: ys).head? := by simp [List.head?]
+      have hxy : x.1 ≤ y.1 := by
+        cases xs with
+        | nil =>
+            exact hcond x (by simp) y hyhead
+        | cons x' xs' =>
+            have hs' : sorted (x' :: xs') := List.Pairwise.of_cons hs
+            have hle_x_last : ∀ z ∈ (x' :: xs').getLast?, x.1 ≤ z.1 := by
+              intro z hz
+              have hab : x.1 ≤ x'.1 := (List.pairwise_cons.mp hs).1 x' (by simp)
+              have hxz : x'.1 ≤ z.1 := le_of_mem_getLast hs' x' (by simp) z hz
+              omega
+            rcases hlast : (x' :: xs').getLast? with _ | z
+            · simp at hlast
+            · have hzmem : z ∈ (x :: x' :: xs').getLast? := by simpa [hlast]
+              have h1 := hle_x_last z (by simpa using hzmem)
+              have h2 := hcond z hzmem y hyhead
+              omega
+      have hcond' : ∀ z ∈ xs.getLast?, ∀ w ∈ (y :: ys).head?, z.1 ≤ w.1 := by
+        intro z hz w hw
+        have hz' : z ∈ (x :: xs).getLast? := by
+          cases xs with
+          | nil => simp at hz
+          | cons x' xs' => simpa using hz
+        exact hcond z hz' w hw
+      simp [List.merge, leKey, hxy, splice_aux xs tail (y :: ys) hxs hr hcond']
+
+theorem SpliceBlock_sound : TinylambOpt.ResearchGoals.OrderedStreams.SpliceBlock.Goal := by
+  intro block tail right hs hr h
+  exact splice_aux block tail right hs hr h
+
+
+
+private theorem expand_cons (key n : Nat) (ps : Rle) :
+    expand ((key, n) :: ps) = List.replicate n key ++ expand ps := rfl
+
+private theorem not_mem_expand_of_lt : ∀ {xs : Rle} {x : Nat},
+    (∀ p ∈ xs, x < p.1) → x ∉ expand xs
+  | [], x, hx, hmem => by simp [expand] at hmem
+  | (key, n) :: ps, x, hx, hmem => by
+      have hxkey : x < key := hx (key, n) (by simp)
+      have htail : ∀ p ∈ ps, x < p.1 := by intro p hp; exact hx p (by simp [hp])
+      rw [expand_cons, List.mem_append] at hmem
+      rcases hmem with hrep | hmem
+      · have hxk : x = key := (List.mem_replicate.mp hrep).2
+        omega
+      · exact not_mem_expand_of_lt htail hmem
+
+private theorem intersect_count_aux : ∀ (fuel : Nat) (a b : Rle),
+    (a.map Prod.fst).Pairwise (· < ·) → (b.map Prod.fst).Pairwise (· < ·) →
+    a.length + b.length ≤ fuel →
+    ∀ k, (expand (intersectRuns fuel a b)).count k =
+      min ((expand a).count k) ((expand b).count k)
+  | 0, a, b, ha, hb, hfuel, k => by
+      have hla : a.length = 0 := by omega
+      have hlb : b.length = 0 := by omega
+      have hae : a = [] := List.length_eq_zero_iff.mp hla
+      have hbe : b = [] := List.length_eq_zero_iff.mp hlb
+      subst a; subst b
+      simp [intersectRuns, expand]
+  | fuel + 1, [], b, ha, hb, hfuel, k => by
+      cases b <;> simp [intersectRuns, expand]
+  | fuel + 1, a, [], ha, hb, hfuel, k => by
+      cases a <;> simp [intersectRuns, expand, Nat.min_eq_left]
+  | fuel + 1, (x, n) :: xs, (y, m) :: ys, ha, hb, hfuel, k => by
+      have ha' : (xs.map Prod.fst).Pairwise (· < ·) := List.Pairwise.of_cons ha
+      have hb' : (ys.map Prod.fst).Pairwise (· < ·) := List.Pairwise.of_cons hb
+      have hax_gt : ∀ p ∈ xs, x < p.1 := by
+        intro p hp
+        exact (List.pairwise_cons.mp ha).1 p.1 (List.mem_map.mpr ⟨p, hp, rfl⟩)
+      have hby_gt : ∀ p ∈ ys, y < p.1 := by
+        intro p hp
+        exact (List.pairwise_cons.mp hb).1 p.1 (List.mem_map.mpr ⟨p, hp, rfl⟩)
+      simp at hfuel
+      by_cases hxy : x < y
+      · have hb_notx : x ∉ expand ((y, m) :: ys) := by
+          apply not_mem_expand_of_lt
+          intro p hp
+          simp at hp
+          rcases hp with rfl | hp
+          · exact hxy
+          · have := hby_gt p hp
+            omega
+        have hb_countx : (expand ((y, m) :: ys)).count x = 0 := List.count_eq_zero_of_not_mem hb_notx
+        have hxs_countx : (expand xs).count x = 0 := List.count_eq_zero_of_not_mem (not_mem_expand_of_lt hax_gt)
+        have hfuel' : xs.length + ((y, m) :: ys).length ≤ fuel := by simp; omega
+        have ih := intersect_count_aux fuel xs ((y, m) :: ys) ha' hb hfuel'
+        by_cases hk : k = x
+        · subst k
+          have houtx : (expand (intersectRuns fuel xs ((y, m) :: ys))).count x = 0 := by
+            rw [ih, hxs_countx, hb_countx]
+            simp
+          have hyx_ne : y ≠ x := by omega
+          rw [expand_cons, List.count_append] at hb_countx
+          simp [intersectRuns, hxy, expand_cons, List.count_append, houtx, hxs_countx, hb_countx]
+        · have ha_count : (expand ((x, n) :: xs)).count k = (expand xs).count k := by
+            rw [expand_cons, List.count_append]
+            have hxk : x ≠ k := by omega
+            have hbeq : (x == k) = false := by simp [hxk]
+            simp [List.count_replicate, hbeq]
+          simp [intersectRuns, hxy]
+          rw [ih, ha_count]
+      · by_cases hyx : y < x
+        · have ha_noty : y ∉ expand ((x, n) :: xs) := by
+            apply not_mem_expand_of_lt
+            intro p hp
+            simp at hp
+            rcases hp with rfl | hp
+            · exact hyx
+            · have := hax_gt p hp
+              omega
+          have ha_county : (expand ((x, n) :: xs)).count y = 0 := List.count_eq_zero_of_not_mem ha_noty
+          have hys_county : (expand ys).count y = 0 := List.count_eq_zero_of_not_mem (not_mem_expand_of_lt hby_gt)
+          have hfuel' : ((x, n) :: xs).length + ys.length ≤ fuel := by simp; omega
+          have ih := intersect_count_aux fuel ((x, n) :: xs) ys ha hb' hfuel'
+          by_cases hk : k = y
+          · subst k
+            have houty : (expand (intersectRuns fuel ((x, n) :: xs) ys)).count y = 0 := by
+              rw [ih, ha_county, hys_county]
+              simp
+            have hxy_ne : x ≠ y := by omega
+            rw [expand_cons, List.count_append] at ha_county
+            simp [intersectRuns, hxy, hyx, expand_cons, List.count_append, houty, ha_county, hys_county]
+          · have hb_count : (expand ((y, m) :: ys)).count k = (expand ys).count k := by
+              rw [expand_cons, List.count_append]
+              have hyk : y ≠ k := by omega
+              have hbeq : (y == k) = false := by simp [hyk]
+              simp [List.count_replicate, hbeq]
+            simp [intersectRuns, hxy, hyx]
+            rw [ih, hb_count]
+        · have hxy_eq : x = y := by omega
+          subst y
+          have hxs_countx : (expand xs).count x = 0 := List.count_eq_zero_of_not_mem (not_mem_expand_of_lt hax_gt)
+          have hys_countx : (expand ys).count x = 0 := List.count_eq_zero_of_not_mem (not_mem_expand_of_lt hby_gt)
+          have hfuel' : xs.length + ys.length ≤ fuel := by omega
+          have ih := intersect_count_aux fuel xs ys ha' hb' hfuel'
+          by_cases hk : k = x
+          · subst k
+            have houtx : (expand (intersectRuns fuel xs ys)).count x = 0 := by
+              rw [ih, hxs_countx, hys_countx]
+              simp
+            have hir : intersectRuns (fuel + 1) ((x, n) :: xs) ((x, m) :: ys) =
+                (x, min n m) :: intersectRuns fuel xs ys := by
+              simp [intersectRuns, hxy, hyx]
+            rw [hir]
+            change (expand ((x, min n m) :: intersectRuns fuel xs ys)).count x =
+              min ((expand ((x, n) :: xs)).count x) ((expand ((x, m) :: ys)).count x)
+            simp [expand_cons, List.count_append, houtx, hxs_countx, hys_countx]
+          · have hxk : x ≠ k := by omega
+            have hbeq : (x == k) = false := by simp [hxk]
+            have ha_count : (expand ((x, n) :: xs)).count k = (expand xs).count k := by
+              rw [expand_cons, List.count_append]
+              simp [List.count_replicate, hbeq]
+            have hb_count : (expand ((x, m) :: ys)).count k = (expand ys).count k := by
+              rw [expand_cons, List.count_append]
+              simp [List.count_replicate, hbeq]
+            have hir : intersectRuns (fuel + 1) ((x, n) :: xs) ((x, m) :: ys) =
+                (x, min n m) :: intersectRuns fuel xs ys := by
+              simp [intersectRuns, hxy, hyx]
+            rw [hir]
+            change (expand ((x, min n m) :: intersectRuns fuel xs ys)).count k =
+              min ((expand ((x, n) :: xs)).count k) ((expand ((x, m) :: ys)).count k)
+            rw [expand_cons, List.count_append, ih, ha_count, hb_count]
+            simp [List.count_replicate, hbeq]
+
+theorem RunIntersection_sound : TinylambOpt.ResearchGoals.OrderedStreams.RunIntersection.Goal := by
+  intro a b ha hb k
+  exact intersect_count_aux (a.length + b.length) a b ha hb (by omega) k
+
+
+
+private def stepIsland (g : Nat) (acc : List (Nat × Nat)) (x : Nat) : List (Nat × Nat) :=
   match acc with
   | [] => [(x, x)]
   | (l, r) :: rest => if x ≤ r + g + 1 then (l, x) :: rest else (x, x) :: acc
 
-private theorem islands_eq_foldl (xs : List Nat) (g : Nat) :
-    islands xs g = (List.foldl (istep g) [] xs).reverse := rfl
+private def AccOK (g bound : Nat) (acc : List (Nat × Nat)) : Prop :=
+  acc.Pairwise (fun a b => b.2 + g + 1 < a.1) ∧
+  ∀ s ∈ acc, s.1 ≤ s.2 ∧ s.2 ≤ bound
 
-/-- Step preserves separation, validity, and `hi ≤ x` for all resulting islands. -/
-private theorem istep_spec (g : Nat) (acc : List (Nat × Nat)) (x : Nat)
-    (hsep : acc.Pairwise (fun a b => b.2 + g + 1 < a.1))
-    (hvalid : ∀ p ∈ acc, p.1 ≤ p.2)
-    (hx : ∀ p ∈ acc, p.2 ≤ x) :
-    (istep g acc x).Pairwise (fun a b => b.2 + g + 1 < a.1) ∧
-    (∀ p ∈ istep g acc x, p.1 ≤ p.2) ∧
-    (∀ p ∈ istep g acc x, p.2 ≤ x) := by
-  cases acc with
-  | nil =>
-      refine ⟨?_, ?_, ?_⟩
-      · simp [istep]
-      · intro p hp; simp [istep] at hp; rcases hp with rfl; omega
-      · intro p hp; simp [istep] at hp; rcases hp with rfl; omega
-  | cons lr rest =>
-      obtain ⟨l, r⟩ := lr
-      simp only [istep]
-      by_cases hmerge : x ≤ r + g + 1
-      · rw [ite_eq_left hmerge]
-        obtain ⟨hhead, htail⟩ := List.pairwise_cons.mp hsep
-        refine ⟨?_, ?_, ?_⟩
-        · rw [List.pairwise_cons]
-          refine ⟨?_, htail⟩
-          intro b hb
-          exact hhead b hb
-        · intro p hp
-          rcases List.mem_cons.mp hp with rfl | hpr
-          · have hlr : l ≤ r := hvalid (l, r) (List.mem_cons_self)
-            have hrx : r ≤ x := hx (l, r) (List.mem_cons_self)
-            exact Nat.le_trans hlr hrx
-          · exact hvalid p (List.mem_cons.mpr (Or.inr hpr))
-        · intro p hp
-          rcases List.mem_cons.mp hp with rfl | hpr
-          · omega
-          · exact hx p (List.mem_cons.mpr (Or.inr hpr))
-      · rw [ite_eq_right hmerge]
-        have hrx : r < x := by
-          have : r + g + 1 < x := by omega
-          omega
-        have hlx : l < x := by
-          have hlr : l ≤ r := hvalid (l, r) (List.mem_cons_self)
-          exact Nat.lt_of_le_of_lt hlr hrx
-        obtain ⟨hhead, htail⟩ := List.pairwise_cons.mp hsep
-        refine ⟨?_, ?_, ?_⟩
-        · rw [List.pairwise_cons]
-          refine ⟨?_, hsep⟩
-          intro b hb
-          rcases List.mem_cons.mp hb with rfl | hbrest
-          · show r + g + 1 < x
-            omega
-          · have hbl : b.2 + g + 1 < l := hhead b hbrest
-            have hlex : l ≤ x := Nat.le_of_lt hlx
-            exact Nat.lt_of_lt_of_le hbl hlex
-        · intro p hp
-          rcases List.mem_cons.mp hp with rfl | hpr
-          · omega
-          · rcases List.mem_cons.mp hpr with rfl | hprest
-            · exact hvalid (l, r) (List.mem_cons_self)
-            · exact hvalid p (List.mem_cons.mpr (Or.inr hprest))
-        · intro p hp
-          rcases List.mem_cons.mp hp with rfl | hpr
-          · omega
-          · exact hx p hpr
+private theorem accOK_nil (g bound : Nat) : AccOK g bound [] := by simp [AccOK]
 
-/-- The full fold preserves separation and validity. -/
-private theorem foldl_sep (g : Nat) :
-    ∀ (acc : List (Nat × Nat)) (xs : List Nat),
-      acc.Pairwise (fun a b => b.2 + g + 1 < a.1) →
-      (∀ p ∈ acc, p.1 ≤ p.2) →
-      xs.Pairwise (· ≤ ·) →
-      (∀ x' ∈ xs, ∀ p ∈ acc, p.2 ≤ x') →
-      let res := List.foldl (istep g) acc xs
-      res.Pairwise (fun a b => b.2 + g + 1 < a.1) ∧
-      (∀ p ∈ res, p.1 ≤ p.2) := by
-  intro acc xs
-  induction xs generalizing acc with
-  | nil =>
-      intro hsep hvalid _ _
-      rw [List.foldl_nil]
-      exact ⟨hsep, hvalid⟩
-  | cons y ys ih =>
-      intro hsep hvalid hsorted hbnd
-      rw [List.foldl_cons]
-      have hspec := istep_spec g acc y hsep hvalid (fun p hp => hbnd y (List.mem_cons_self) p hp)
-      have hysorted : ys.Pairwise (· ≤ ·) := (List.pairwise_cons.mp hsorted).2
-      have hy_le : ∀ z ∈ ys, y ≤ z := (List.pairwise_cons.mp hsorted).1
-      have hbnd' : ∀ x' ∈ ys, ∀ p ∈ istep g acc y, p.2 ≤ x' := by
-        intro x' hx' p hp
-        have hpy : p.2 ≤ y := hspec.2.2 p hp
-        exact Nat.le_trans hpy (hy_le x' hx')
-      exact ih (istep g acc y) hspec.1 hspec.2.1 hysorted hbnd'
+private theorem getD_getLast_eq : ∀ (l : List Nat) (a b : Nat), l ≠ [] →
+    l.getLast?.getD a = l.getLast?.getD b
+  | [], a, b, h => by contradiction
+  | [x], a, b, h => by simp
+  | x :: y :: ys, a, b, h => by
+      simpa using getD_getLast_eq (y :: ys) a b (by simp)
 
-/-- An element covered by some island of `acc` stays covered after folding `ys`,
-provided it is `≤` every element of `ys`. -/
-private theorem cover_persist (g : Nat) :
-    ∀ (acc : List (Nat × Nat)) (ys : List Nat) (y : Nat),
-      (∃ p ∈ acc, p.1 ≤ y ∧ y ≤ p.2) →
-      (∀ z ∈ ys, y ≤ z) →
-      ∃ p ∈ List.foldl (istep g) acc ys, p.1 ≤ y ∧ y ≤ p.2 := by
-  intro acc ys
-  induction ys generalizing acc with
-  | nil =>
-      intro y hcov _
-      rw [List.foldl_nil]
-      exact hcov
-  | cons z zs ih =>
-      intro y hcov hyz
-      rw [List.foldl_cons]
-      have hyz' : ∀ w ∈ zs, y ≤ w := fun w hw => hyz w (List.mem_cons_of_mem z hw)
-      -- one-step persistence: y covered in istep g acc z
-      have hone : ∃ p ∈ istep g acc z, p.1 ≤ y ∧ y ≤ p.2 := by
-        obtain ⟨p, hp, hply, hpy2⟩ := hcov
-        have hzy : y ≤ z := hyz z (List.mem_cons_self)
+private theorem accOK_step (g : Nat) (xs : List Nat) (bound : Nat)
+    (hxs : xs.Pairwise (· ≤ ·)) (hge : ∀ x ∈ xs, bound ≤ x)
+    (acc : List (Nat × Nat)) (hacc : AccOK g bound acc) :
+    AccOK g (xs.getLast?.getD bound) (xs.foldl (stepIsland g) acc) := by
+  induction xs generalizing acc bound with
+  | nil => simpa using hacc
+  | cons x xs ih =>
+      have hxge : bound ≤ x := hge x (by simp)
+      have hxs' : xs.Pairwise (· ≤ ·) := List.Pairwise.of_cons hxs
+      have hge' : ∀ y ∈ xs, x ≤ y := by
+        intro y hy
+        exact (List.pairwise_cons.mp hxs).1 y hy
+      have hstep : AccOK g x (stepIsland g acc x) := by
+        unfold AccOK at hacc ⊢
         cases acc with
-        | nil => simp [istep] at hp
-        | cons lr rest =>
-            obtain ⟨l, r⟩ := lr
-            simp only [istep]
-            by_cases hmerge : z ≤ r + g + 1
-            · rw [ite_eq_left hmerge]
-              rcases List.mem_cons.mp hp with rfl | hprest
-              · -- p = (l,r): y ∈ [l,r]; new head (l,z) covers since l≤y≤z
-                exact ⟨(l, z), List.mem_cons_self, hply, hzy⟩
-              · -- p ∈ rest: unchanged
-                exact ⟨p, List.mem_cons_of_mem _ hprest, hply, hpy2⟩
-            · rw [ite_eq_right hmerge]
-              -- result (z,z)::(l,r)::rest; p still in tail
-              exact ⟨p, List.mem_cons_of_mem _ hp, hply, hpy2⟩
-      exact ih (istep g acc z) y hone hyz'
+        | nil => simp [stepIsland]
+        | cons s rest =>
+            rcases s with ⟨l, r⟩
+            have hlrs : l ≤ r := (hacc.2 (l, r) (by simp)).1
+            have hrsb : r ≤ bound := (hacc.2 (l, r) (by simp)).2
+            have hrlx : r ≤ x := by omega
+            have hrestcross : ∀ t ∈ rest, t.2 + g + 1 < l := (List.pairwise_cons.mp hacc.1).1
+            by_cases hcond : x ≤ r + g + 1
+            · rw [stepIsland, if_pos hcond]
+              constructor
+              · exact List.Pairwise.cons (by intro t ht; exact hrestcross t ht) hacc.1.tail
+              · intro s hs
+                simp only [List.mem_cons] at hs
+                rcases hs with rfl | hs
+                · exact ⟨by omega, by simp⟩
+                · have h := hacc.2 s (by simp [hs])
+                  exact ⟨h.1, by omega⟩
+            · rw [stepIsland, if_neg hcond]
+              constructor
+              · apply List.Pairwise.cons
+                · intro t ht
+                  simp only [List.mem_cons] at ht
+                  rcases ht with rfl | ht
+                  · omega
+                  · have := hrestcross t ht
+                    omega
+                · exact hacc.1
+              · intro s hs
+                simp only [List.mem_cons] at hs
+                rcases hs with rfl | rfl | hs
+                · simp
+                · exact ⟨hlrs, by omega⟩
+                · have h := hacc.2 s (by simp [hs])
+                  exact ⟨h.1, by omega⟩
+      have hres := ih x hxs' hge' (stepIsland g acc x) hstep
+      cases xs with
+      | nil => simpa using hres
+      | cons y ys =>
+          cases ys with
+          | nil => simpa using hres
+          | cons z zs =>
+              have hb : (z :: zs).getLast?.getD bound = (z :: zs).getLast?.getD x :=
+                getD_getLast_eq (z :: zs) bound x (by simp)
+              simpa [hb] using hres
 
-/-- Every element of the folded list `xs` is covered by some island of the result. -/
-private theorem cover_foldl (g : Nat) :
-    ∀ (acc : List (Nat × Nat)) (xs : List Nat) (y : Nat),
-      acc.Pairwise (fun a b => b.2 + g + 1 < a.1) →
-      (∀ p ∈ acc, p.1 ≤ p.2) →
-      xs.Pairwise (· ≤ ·) →
-      (∀ x' ∈ xs, ∀ p ∈ acc, p.2 ≤ x') →
-      y ∈ xs →
-      ∃ p ∈ List.foldl (istep g) acc xs, p.1 ≤ y ∧ y ≤ p.2 := by
-  intro acc xs
-  induction xs generalizing acc with
-  | nil => intro y _ _ _ _ hy; simp at hy
-  | cons hd tl ih =>
-      intro y hsep hvalid hsorted hbnd hymem
-      rw [List.foldl_cons]
-      have htl_sorted : tl.Pairwise (· ≤ ·) := (List.pairwise_cons.mp hsorted).2
-      have hhd_le : ∀ z ∈ tl, hd ≤ z := (List.pairwise_cons.mp hsorted).1
-      have hspec := istep_spec g acc hd hsep hvalid
-        (fun p hp => hbnd hd (List.mem_cons_self) p hp)
-      have hbnd' : ∀ x' ∈ tl, ∀ p ∈ istep g acc hd, p.2 ≤ x' := by
-        intro x' hx' p hp
-        exact Nat.le_trans (hspec.2.2 p hp) (hhd_le x' hx')
-      rcases List.mem_cons.mp hymem with heq | hy_tl
-      · subst y
-        -- y = hd: covered by istep g acc hd, persists through tl
-        have hhd_cov : ∃ p ∈ istep g acc hd, p.1 ≤ hd ∧ hd ≤ p.2 := by
+private theorem islands_pairwise (xs : List Nat) (g : Nat) (hxs : xs.Pairwise (· ≤ ·)) :
+    (islands xs g).Pairwise (fun a b => a.2 + g + 1 < b.1) := by
+  have hacc := accOK_step g xs 0 hxs (by simp) [] (accOK_nil g 0)
+  change ((xs.foldl (stepIsland g) []).reverse).Pairwise (fun a b => a.2 + g + 1 < b.1)
+  rw [List.pairwise_reverse]
+  simpa using hacc.1
+
+private theorem islands_ok (xs : List Nat) (g : Nat) (hxs : xs.Pairwise (· ≤ ·)) :
+    (islands xs g).Pairwise (fun a b => a.2 + g + 1 < b.1) ∧
+    ∀ s ∈ islands xs g, s.1 ≤ s.2 := by
+  have hacc := accOK_step g xs 0 hxs (by simp) [] (accOK_nil g 0)
+  constructor
+  · change ((xs.foldl (stepIsland g) []).reverse).Pairwise (fun a b => a.2 + g + 1 < b.1)
+    rw [List.pairwise_reverse]
+    simpa using hacc.1
+  · intro s hs
+    have hs' : s ∈ xs.foldl (stepIsland g) [] := by
+      change s ∈ (xs.foldl (stepIsland g) []).reverse at hs
+      simpa using hs
+    exact (hacc.2 s hs').1
+
+private theorem mem_step_nil (g x : Nat) : (x, x) ∈ stepIsland g [] x := by simp [stepIsland]
+
+private theorem mem_step_extend (g l r x : Nat) (rest : List (Nat × Nat))
+    (hcond : x ≤ r + g + 1) : (l, x) ∈ stepIsland g ((l, r) :: rest) x := by simp [stepIsland, hcond]
+
+private theorem mem_step_keep (g l r x : Nat) (rest : List (Nat × Nat))
+    (hcond : ¬ x ≤ r + g + 1) : (l, r) ∈ stepIsland g ((l, r) :: rest) x := by simp [stepIsland, hcond]
+
+private theorem mem_step_new (g l r x : Nat) (rest : List (Nat × Nat))
+    (hcond : ¬ x ≤ r + g + 1) : (x, x) ∈ stepIsland g ((l, r) :: rest) x := by simp [stepIsland, hcond]
+
+private theorem mem_step_rest (g l r x : Nat) (rest : List (Nat × Nat)) (s : Nat × Nat)
+    (hs : s ∈ rest) : s ∈ stepIsland g ((l, r) :: rest) x := by
+  by_cases hcond : x ≤ r + g + 1
+  · simp [stepIsland, hcond, hs]
+  · simp [stepIsland, hcond, hs]
+
+private theorem cover_persist (g : Nat) : ∀ (xs : List Nat) (bound : Nat) (acc : List (Nat × Nat)),
+    xs.Pairwise (· ≤ ·) → (∀ x ∈ xs, bound ≤ x) → AccOK g bound acc →
+    ∀ s ∈ acc, ∀ z, s.1 ≤ z ∧ z ≤ s.2 →
+      ∃ t ∈ xs.foldl (stepIsland g) acc, t.1 ≤ z ∧ z ≤ t.2
+  | [], bound, acc, hxs, hge, hacc, s, hs, z, hz => ⟨s, by simpa using hs, hz⟩
+  | y :: ys, bound, acc, hxs, hge, hacc, s, hs, z, hz => by
+      have hyge : bound ≤ y := hge y (by simp)
+      have hge' : ∀ w ∈ ys, y ≤ w := by intro w hw; exact (List.pairwise_cons.mp hxs).1 w hw
+      have hstep : AccOK g y (stepIsland g acc y) := by
+        have hres := accOK_step g [y] bound (by simp)
+          (fun w hw => hge w (by simp [show w = y from by simpa using hw])) acc hacc
+        simpa using hres
+      have hs' : ∃ t ∈ stepIsland g acc y, t.1 ≤ z ∧ z ≤ t.2 := by
+        cases acc with
+        | nil => simp at hs
+        | cons q rest =>
+            rcases q with ⟨l, r⟩
+            have hlrs : l ≤ r := (hacc.2 (l, r) (by simp)).1
+            have hrsb : r ≤ bound := (hacc.2 (l, r) (by simp)).2
+            simp only [List.mem_cons] at hs
+            rcases hs with hsr | hsrest
+            · cases hsr
+              by_cases hcond : y ≤ r + g + 1
+              · exact ⟨(l, y), mem_step_extend g l r y rest hcond, by omega⟩
+              · exact ⟨(l, r), mem_step_keep g l r y rest hcond, hz⟩
+            · exact ⟨s, mem_step_rest g l r y rest s hsrest, hz⟩
+      rcases hs' with ⟨t, ht, htz⟩
+      rcases cover_persist g ys y (stepIsland g acc y) (List.Pairwise.of_cons hxs) hge' hstep t ht z htz with ⟨u, hu, huz⟩
+      exact ⟨u, by simpa using hu, huz⟩
+
+private theorem cover_foldl (g : Nat) : ∀ (xs : List Nat) (bound : Nat) (acc : List (Nat × Nat)),
+    xs.Pairwise (· ≤ ·) → (∀ x ∈ xs, bound ≤ x) → AccOK g bound acc →
+    ∀ x ∈ xs, ∃ s ∈ xs.foldl (stepIsland g) acc, s.1 ≤ x ∧ x ≤ s.2
+  | [], bound, acc, hxs, hge, hacc, x, hx => by simp at hx
+  | y :: ys, bound, acc, hxs, hge, hacc, x, hx => by
+      have hyge : bound ≤ y := hge y (by simp)
+      have hge' : ∀ z ∈ ys, y ≤ z := by intro z hz; exact (List.pairwise_cons.mp hxs).1 z hz
+      have hstep : AccOK g y (stepIsland g acc y) := by
+        have hres := accOK_step g [y] bound (by simp)
+          (fun z hz => hge z (by simp [show z = y from by simpa using hz])) acc hacc
+        simpa using hres
+      have ihres := cover_foldl g ys y (stepIsland g acc y) (List.Pairwise.of_cons hxs) hge' hstep
+      simp only [List.mem_cons] at hx
+      rcases hx with hxy | hx
+      · subst x
+        have first : ∃ t ∈ stepIsland g acc y, t.1 ≤ y ∧ y ≤ t.2 := by
           cases acc with
-          | nil =>
-              exact ⟨(hd, hd), by simp [istep], Nat.le_refl _, Nat.le_refl _⟩
-          | cons lr rest =>
-              obtain ⟨l, r⟩ := lr
-              simp only [istep]
-              by_cases hmerge : hd ≤ r + g + 1
-              · rw [ite_eq_left hmerge]
-                have hlr : l ≤ r := hvalid (l, r) (List.mem_cons_self)
-                have hry : r ≤ hd := hbnd hd (List.mem_cons_self) (l, r) (List.mem_cons_self)
-                exact ⟨(l, hd), List.mem_cons_self, Nat.le_trans hlr hry, Nat.le_refl _⟩
-              · rw [ite_eq_right hmerge]
-                exact ⟨(hd, hd), by simp, Nat.le_refl _, Nat.le_refl _⟩
-        exact cover_persist g (istep g acc hd) tl hd hhd_cov hhd_le
-      · exact ih (istep g acc hd) y hspec.1 hspec.2.1 htl_sorted hbnd' hy_tl
+          | nil => exact ⟨(y, y), mem_step_nil g y, by simp⟩
+          | cons q rest =>
+              rcases q with ⟨l, r⟩
+              have hlrs : l ≤ r := (hacc.2 (l, r) (by simp)).1
+              have hrsb : r ≤ bound := (hacc.2 (l, r) (by simp)).2
+              by_cases hcond : y ≤ r + g + 1
+              · exact ⟨(l, y), mem_step_extend g l r y rest hcond, by omega⟩
+              · exact ⟨(y, y), mem_step_new g l r y rest hcond, by simp⟩
+        rcases first with ⟨t, ht, htz⟩
+        rcases cover_persist g ys y (stepIsland g acc y) (List.Pairwise.of_cons hxs) hge' hstep t ht y htz with ⟨u, hu, huz⟩
+        exact ⟨u, by simpa using hu, huz⟩
+      · rcases ihres x hx with ⟨s, hs, hsle⟩
+        exact ⟨s, by simpa using hs, hsle⟩
 
-/-- The `mergeSort` of `keys` is sorted. -/
-private theorem mergeSort_sorted (keys : List Nat) :
-    keys.mergeSort.Pairwise (· ≤ ·) := by
-  have htrans : ∀ (a b c : Nat), decide (a ≤ b) = true → decide (b ≤ c) = true →
-      decide (a ≤ c) = true := by
-    intro a b c hab hbc
-    have ha : a ≤ b := of_decide_eq_true hab
-    have hb : b ≤ c := of_decide_eq_true hbc
-    exact decide_eq_true_eq.mpr (Nat.le_trans ha hb)
-  have htotal : ∀ (a b : Nat), (decide (a ≤ b) || decide (b ≤ a)) = true := by
-    intro a b
-    have := Nat.le_total a b
-    cases this with
-    | inl h => simp [h]
-    | inr h => simp [h]
-  have h := List.pairwise_mergeSort htrans htotal keys
-  exact List.Pairwise.imp (fun {a b} hh => of_decide_eq_true hh) h
+private theorem cover_islands (xs : List Nat) (g : Nat) (hxs : xs.Pairwise (· ≤ ·)) :
+    ∀ x ∈ xs, ∃ s ∈ islands xs g, s.1 ≤ x ∧ x ≤ s.2 := by
+  intro x hx
+  rcases cover_foldl g xs 0 [] hxs (by simp) (accOK_nil g 0) x hx with ⟨s, hs, hsle⟩
+  exact ⟨s, by change s ∈ (xs.foldl (stepIsland g) []).reverse; simpa using hs, hsle⟩
 
-/-- Spans (= `islands keys.mergeSort g`) are pairwise separated. -/
-private theorem spans_pairwise (keys : List Nat) (g : Nat) :
-    (islands keys.mergeSort g).Pairwise (fun a b => a.2 + g + 1 < b.1) := by
-  rw [islands_eq_foldl]
-  have hspec := foldl_sep g [] keys.mergeSort
-    (by simp) (by simp) (mergeSort_sorted keys) (by simp)
-  exact (List.pairwise_reverse).mpr hspec.1
+private theorem disjoint_pairwise (g : Nat) (spans : List (Nat × Nat))
+    (hp : spans.Pairwise (fun a b => a.2 + g + 1 < b.1)) :
+    ∀ s ∈ spans, ∀ t ∈ spans, s ≠ t → s.2 < t.1 ∨ t.2 < s.1 := by
+  induction spans with
+  | nil => simp
+  | cons u us ih =>
+      intro s hs t ht hne
+      have hp_tail : us.Pairwise (fun a b => a.2 + g + 1 < b.1) := hp.tail
+      have hcross : ∀ v ∈ us, u.2 + g + 1 < v.1 := (List.pairwise_cons.mp hp).1
+      simp only [List.mem_cons] at hs ht
+      rcases hs with rfl | hs
+      · rcases ht with rfl | ht
+        · contradiction
+        · left
+          have := hcross t ht
+          omega
+      · rcases ht with rfl | ht
+        · right
+          have := hcross s hs
+          omega
+        · exact ih hp_tail s hs t ht hne
 
-/-- Bool "value `x` lies in span `s`'s `[lo,hi]` range". -/
-private def covB (x : Nat) (s : Nat × Nat) : Bool :=
-  decide (s.1 ≤ x) && decide (x ≤ s.2)
+private theorem count_filter_eq (v : Nat) (p : Nat → Bool) (rows : List Nat) :
+    (rows.filter p).count v = if p v = true then rows.count v else 0 := by
+  by_cases hp : p v = true
+  · simp [hp, List.count_filter hp]
+  · have hnot : v ∉ rows.filter p := by simp [List.mem_filter, hp]
+    simp [hp, List.count_eq_zero_of_not_mem hnot]
 
-private theorem covB_eq_true {x : Nat} {s : Nat × Nat} (h : s.1 ≤ x ∧ x ≤ s.2) :
-    covB x s = true := by
-  unfold covB
-  rw [Bool.and_eq_true]
-  exact ⟨by rw [decide_eq_true_eq]; exact h.1, by rw [decide_eq_true_eq]; exact h.2⟩
+private theorem sum_zero_map {α : Type} (xs : List α) : (xs.map fun _ => (0 : Nat)).sum = 0 := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simpa using ih
 
-/-- Exactly one span covers a key value `x`. -/
-private theorem covering_filter_length (keys : List Nat) (g : Nat) (x : Nat)
-    (hx : keys.contains x = true) :
-    ((islands keys.mergeSort g).filter (covB x)).length = 1 := by
-  have hxmem : x ∈ keys := (List.contains_iff).mp hx
-  have hxms : x ∈ keys.mergeSort := (List.mem_mergeSort).mpr hxmem
-  -- lower bound: coverage gives a covering span
-  have hcov := cover_foldl g [] keys.mergeSort x
-    (by simp) (by simp) (mergeSort_sorted keys) (by simp) hxms
-  obtain ⟨p, hp, hp1, hp2⟩ := hcov
-  have hp_spans : p ∈ islands keys.mergeSort g := by
-    rw [islands_eq_foldl]
-    exact (List.mem_reverse).mpr hp
-  have hpcov : covB x p = true := covB_eq_true ⟨hp1, hp2⟩
-  have hpF : p ∈ (islands keys.mergeSort g).filter (covB x) :=
-    (List.mem_filter).mpr ⟨hp_spans, hpcov⟩
-  have hge : 1 ≤ ((islands keys.mergeSort g).filter (covB x)).length := by
-    have : ((islands keys.mergeSort g).filter (covB x)) ≠ [] :=
-      fun h => by rw [h] at hpF; simp at hpF
-    have h0 : 0 < ((islands keys.mergeSort g).filter (covB x)).length :=
-      List.length_pos_iff.mpr this
-    omega
-  -- upper bound: separation forbids two covering spans
-  have hle : ((islands keys.mergeSort g).filter (covB x)).length ≤ 1 := by
-    by_cases h : ((islands keys.mergeSort g).filter (covB x)).length ≤ 1
-    · exact h
-    · have hgt : 2 ≤ ((islands keys.mergeSort g).filter (covB x)).length := by omega
-      have h01 : (0 : Nat) < ((islands keys.mergeSort g).filter (covB x)).length := by omega
-      have h11 : (1 : Nat) < ((islands keys.mergeSort g).filter (covB x)).length := by omega
-      have h0mem : ((islands keys.mergeSort g).filter (covB x))[0]'h01 ∈
-          (islands keys.mergeSort g).filter (covB x) := List.getElem_mem h01
-      have h1mem : ((islands keys.mergeSort g).filter (covB x))[1]'h11 ∈
-          (islands keys.mergeSort g).filter (covB x) := List.getElem_mem h11
-      have hR := (List.pairwise_iff_getElem.mp
-        (List.Pairwise.filter _ (spans_pairwise keys g))) 0 1 h01 h11 (by omega)
-      have hc0 : covB x (((islands keys.mergeSort g).filter (covB x))[0]'h01) = true :=
-        ((List.mem_filter).mp h0mem).2
-      have hc1 : covB x (((islands keys.mergeSort g).filter (covB x))[1]'h11) = true :=
-        ((List.mem_filter).mp h1mem).2
-      have hb0 : (((islands keys.mergeSort g).filter (covB x))[0]'h01).1 ≤ x ∧
-          x ≤ (((islands keys.mergeSort g).filter (covB x))[0]'h01).2 := by
-        unfold covB at hc0; rw [Bool.and_eq_true] at hc0
-        exact ⟨of_decide_eq_true hc0.1, of_decide_eq_true hc0.2⟩
-      have hb1 : (((islands keys.mergeSort g).filter (covB x))[1]'h11).1 ≤ x ∧
-          x ≤ (((islands keys.mergeSort g).filter (covB x))[1]'h11).2 := by
-        unfold covB at hc1; rw [Bool.and_eq_true] at hc1
-        exact ⟨of_decide_eq_true hc1.1, of_decide_eq_true hc1.2⟩
+private theorem sum_unique_span (spans : List (Nat × Nat)) (v c : Nat)
+    (hnd : spans.Nodup)
+    (huniq : ∃ s ∈ spans, s.1 ≤ v ∧ v ≤ s.2 ∧
+      ∀ t ∈ spans, t.1 ≤ v ∧ v ≤ t.2 → t = s) :
+    (spans.map fun s => if (s.1 ≤ v && v ≤ s.2) = true then c else 0).sum = c := by
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  induction spans with
+  | nil => rcases huniq with ⟨s, hs, _⟩; simp at hs
+  | cons s rest ih =>
+      have hnd_rest : rest.Nodup := (List.nodup_cons.mp hnd).2
+      have hs_not_rest : s ∉ rest := (List.nodup_cons.mp hnd).1
+      by_cases hs : s.1 ≤ v ∧ v ≤ s.2
+      · rcases huniq with ⟨u, hu, hule, huv, hu_unique⟩
+        have hus : u = s := (hu_unique s (by simp) hs).symm
+        have hzero : ∀ t ∈ rest, (if t.1 ≤ v ∧ v ≤ t.2 then c else 0) = 0 := by
+          intro t ht
+          have htcond : ¬ (t.1 ≤ v ∧ v ≤ t.2) := by
+            intro htc
+            have htu : t = u := hu_unique t (by simp [ht]) htc
+            have hts : t ≠ s := by
+              intro h
+              have hsrest : s ∈ rest := by simpa [h] using ht
+              exact hs_not_rest hsrest
+            exact hts (htu.trans hus)
+          simp [htcond]
+        have hmap : (rest.map fun t => if t.1 ≤ v ∧ v ≤ t.2 then c else 0) =
+            rest.map fun _ => (0 : Nat) := by
+          apply List.map_congr_left
+          intro t ht
+          exact hzero t ht
+        rw [List.map_cons, List.sum_cons, hmap, sum_zero_map]
+        simp [hs]
+      · rcases huniq with ⟨u, hu, hule, huv, hu_unique⟩
+        have hune : u ≠ s := by
+          intro h
+          subst u
+          exact hs ⟨hule, huv⟩
+        have hurest : u ∈ rest := by
+          cases hu with
+          | head => exact (hune rfl).elim
+          | tail _ ht => exact ht
+        have hu' : ∃ u ∈ rest, u.1 ≤ v ∧ v ≤ u.2 ∧
+            ∀ t ∈ rest, t.1 ≤ v ∧ v ≤ t.2 → t = u := by
+          refine ⟨u, hurest, hule, huv, ?_⟩
+          intro t ht htc
+          exact hu_unique t (by simp [ht]) htc
+        have hrec := ih hnd_rest hu'
+        rw [List.map_cons, List.sum_cons]
+        simp [hs, hrec]
+
+private theorem perm_contains_of_perm {l₁ l₂ : List Nat} (h : l₁.Perm l₂) (x : Nat) :
+    l₁.contains x = l₂.contains x := h.contains_eq
+
+private theorem sorted_mergeSort_nat (xs : List Nat) : xs.mergeSort.Pairwise (· ≤ ·) := by
+  have h := List.pairwise_mergeSort (le := fun a b : Nat => a ≤ b)
+    (by
+      intro a b c hab hbc
+      apply decide_eq_true
+      have hab' : a ≤ b := of_decide_eq_true hab
+      have hbc' : b ≤ c := of_decide_eq_true hbc
+      omega)
+    (by
+      intro a b
+      by_cases h : a ≤ b
+      · simp [h]
+      · have h' : b ≤ a := by omega
+        simp [h, h'])
+    xs
+  exact h.imp (by intro a b hab; exact of_decide_eq_true hab)
+
+theorem RangeCoalescing_sound : TinylambOpt.ResearchGoals.OrderedStreams.RangeCoalescing.Goal := by
+  intro keys g rows
+  let ks := keys.mergeSort
+  let spans := islands ks g
+  have hks : ks.Pairwise (· ≤ ·) := sorted_mergeSort_nat keys
+  have hok := islands_ok ks g hks
+  have hpairs : spans.Pairwise (fun a b => a.2 + g + 1 < b.1) := by
+    simpa [spans] using hok.1
+  have hintervals : ∀ s ∈ spans, s.1 ≤ s.2 := by
+    intro s hs
+    exact hok.2 s (by simpa [spans] using hs)
+  have hcover := cover_islands ks g hks
+  have hdisj := disjoint_pairwise g spans hpairs
+  have hnd_aux : ∀ (sp : List (Nat × Nat)),
+      sp.Pairwise (fun a b => a.2 + g + 1 < b.1) →
+      (∀ s ∈ sp, s.1 ≤ s.2) → sp.Nodup := by
+    intro sp hpair hint
+    induction sp with
+    | nil => simp
+    | cons u us ih =>
+        have hu := hint u (by simp)
+        have hcross : ∀ t ∈ us, u.2 + g + 1 < t.1 := (List.pairwise_cons.mp hpair).1
+        have hint_tail : ∀ s ∈ us, s.1 ≤ s.2 := by intro s hs; exact hint s (by simp [hs])
+        have hus : us.Nodup := ih (List.Pairwise.of_cons hpair) hint_tail
+        rw [List.nodup_cons]
+        constructor
+        · intro huin
+          have := hcross u huin
+          omega
+        · exact hus
+  have hnd : spans.Nodup := hnd_aux spans hpairs hintervals
+  constructor
+  · rw [List.perm_iff_count]
+    intro v
+    by_cases hv : keys.contains v = true
+    · have hvMem : v ∈ keys := by simpa using hv
+      have hvks : ks.contains v = true := by
+        have hp : ks.Perm keys := by simpa [ks] using List.mergeSort_perm keys (fun a b : Nat => a ≤ b)
+        rw [perm_contains_of_perm hp v]
+        exact hv
+      have hvksmem : v ∈ ks := by simpa using hvks
+      rcases hcover v hvksmem with ⟨s, hs, hsle, hsle2⟩
+      have huniq : ∃ s ∈ spans, s.1 ≤ v ∧ v ≤ s.2 ∧
+          ∀ t ∈ spans, t.1 ≤ v ∧ v ≤ t.2 → t = s := by
+        refine ⟨s, hs, hsle, hsle2, ?_⟩
+        intro t ht htle
+        by_cases hts : t = s
+        · exact hts
+        · rcases hdisj s hs t ht (fun h => hts h.symm) with hlt | hgt
+          · have hv1 : v ≤ s.2 := hsle2
+            have hv2 : t.1 ≤ v := htle.1
+            omega
+          · have hv1 : v ≤ t.2 := htle.2
+            have hv2 : s.1 ≤ v := hsle
+            omega
+      have hsum := sum_unique_span spans v (rows.count v) hnd huniq
+      have hflat : (spans.flatMap fun (lo, hi) => rows.filter fun x => lo ≤ x && x ≤ hi && keys.contains x).count v
+          = (spans.map fun t => (rows.filter fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x).count v).sum := by
+        exact List.count_flatMap
+      rw [hflat]
+      have hmap : (spans.map fun t => (rows.filter fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x).count v) =
+          spans.map fun t => if (t.1 ≤ v && v ≤ t.2 && keys.contains v) = true then rows.count v else 0 := by
+        apply List.map_congr_left
+        intro t ht
+        exact count_filter_eq v (fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x) rows
+      rw [hmap]
+      have hright : (rows.filter keys.contains).count v = rows.count v := by
+        simpa [hvMem] using count_filter_eq v keys.contains rows
+      rw [hright]
+      simpa [hvMem] using hsum
+    · have hv' : keys.contains v = false := by cases h : keys.contains v <;> simp_all
+      have hvNotMem : v ∉ keys := by simpa using hv'
+      have hflat : (spans.flatMap fun (lo, hi) => rows.filter fun x => lo ≤ x && x ≤ hi && keys.contains x).count v
+          = (spans.map fun t => (rows.filter fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x).count v).sum := by
+        exact List.count_flatMap
+      rw [hflat]
+      have hmap : (spans.map fun t => (rows.filter fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x).count v) =
+          spans.map fun _ => (0 : Nat) := by
+        apply List.map_congr_left
+        intro t ht
+        have hc := count_filter_eq v (fun x => t.1 ≤ x && x ≤ t.2 && keys.contains x) rows
+        simpa [hvNotMem] using hc
+      rw [hmap, sum_zero_map]
+      have hright : (rows.filter keys.contains).count v = 0 := by
+        simpa [hvNotMem] using count_filter_eq v keys.contains rows
+      rw [hright]
+  · simpa [spans] using hpairs
+
+
+
+private theorem filter_eq_nil_of_all_false {α : Type} (p : α → Bool) {xs : List α}
+    (h : ∀ x ∈ xs, p x = false) : xs.filter p = [] := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih =>
+      have hx := h x (by simp)
+      have ht : ∀ z ∈ xs, p z = false := by intro z hz; exact h z (by simp [hz])
+      simp [List.filter_cons, hx, ih ht]
+
+private theorem takeWhile_len_eq_filter_len (xs : List Nat) (x : Nat)
+    (hs : xs.Pairwise (· ≤ ·)) :
+    (xs.takeWhile (fun y : Nat => y < x)).length = (xs.filter (fun y : Nat => y < x)).length := by
+  induction xs with
+  | nil => rfl
+  | cons a xs ih =>
+      by_cases ha : a < x
+      · simpa [ha] using ih (List.Pairwise.of_cons hs)
+      · have hnot : ∀ b ∈ xs, ¬ b < x := by
+          intro b hb
+          have hab : a ≤ b := (List.pairwise_cons.mp hs).1 b hb
+          omega
+        have hfilter : xs.filter (fun y : Nat => y < x) = [] := by
+          apply filter_eq_nil_of_all_false
+          intro b hb
+          exact decide_eq_false (hnot b hb)
+        simp [ha, hfilter]
+
+private theorem sum_filter_lt (runs : List (List Nat)) (x : Nat) :
+    (runs.map fun s => (s.filter fun y : Nat => y < x).length).sum =
+      (runs.flatten.filter fun y : Nat => y < x).length := by
+  induction runs with
+  | nil => rfl
+  | cons r rs ih =>
+      simp [List.filter_append, ih]
+
+private theorem rank_eq (runs : List (List Nat)) (x : Nat)
+    (hr : ∀ r ∈ runs, r.Pairwise (· ≤ ·)) :
+    (runs.map fun s => (s.takeWhile fun y : Nat => y < x).length).sum =
+      (runs.flatten.filter fun y : Nat => y < x).length := by
+  have hall : ∀ r ∈ runs, (r.takeWhile (fun y : Nat => y < x)).length =
+      (r.filter (fun y : Nat => y < x)).length := by
+    intro r hrp
+    exact takeWhile_len_eq_filter_len r x (hr r hrp)
+  have hmap : (runs.map fun s => (s.takeWhile fun y : Nat => y < x).length) =
+      runs.map fun s => (s.filter fun y : Nat => y < x).length := by
+    apply List.map_congr_left
+    intro r hrp
+    exact hall r hrp
+  rw [hmap]
+  exact sum_filter_lt runs x
+
+private theorem sorted_filter_range (S : List Nat) (hS : S.Pairwise (· ≤ ·)) (hnd : S.Nodup) :
+    ∀ lo size,
+    S.filter (fun x => decide (let r := (S.filter fun y : Nat => y < x).length;
+      lo ≤ r ∧ r < lo + size)) = (S.drop lo).take size := by
+  induction S with
+  | nil => intro lo size; simp
+  | cons a s ih =>
+      have hS' : s.Pairwise (· ≤ ·) := List.Pairwise.of_cons hS
+      have hnd' : s.Nodup := List.Pairwise.of_cons hnd
+      have ha_lt : ∀ b ∈ s, a < b := by
+        intro b hb
+        have hale : a ≤ b := (List.pairwise_cons.mp hS).1 b hb
+        have hane : a ≠ b := by
+          intro h
+          subst b
+          exact (List.nodup_cons.mp hnd).1 hb
+        omega
+      have hcount_a : (s.filter fun y : Nat => y < a) = [] := by
+        apply filter_eq_nil_of_all_false
+        intro b hb
+        have hge : a ≤ b := (List.pairwise_cons.mp hS).1 b hb
+        exact decide_eq_false (by omega)
+      have hcount_head : ((a :: s).filter fun y : Nat => y < a).length = 0 := by simp [hcount_a]
+      intro lo size
+      cases lo with
+      | zero =>
+          cases size with
+          | zero => simp
+          | succ k =>
+              have hPa : decide (let r := ((a :: s).filter fun y : Nat => y < a).length;
+                  0 ≤ r ∧ r < 0 + (k + 1)) = true := by simp [hcount_head, hcount_a]
+              have htailpred : ∀ b ∈ s,
+                  decide (let r := ((a :: s).filter fun y : Nat => y < b).length;
+                    0 ≤ r ∧ r < 0 + (k + 1)) =
+                  decide (let r := (s.filter fun y : Nat => y < b).length;
+                    0 ≤ r ∧ r < 0 + k) := by
+                intro b hb
+                have hbcount : ((a :: s).filter fun y : Nat => y < b).length =
+                    (s.filter fun y : Nat => y < b).length + 1 := by
+                  simp [List.filter_cons, decide_eq_true (ha_lt b hb)]
+                rw [hbcount]
+                apply Bool.eq_iff_iff.mpr
+                constructor
+                · intro h
+                  have hp := of_decide_eq_true h
+                  simp at hp
+                  apply decide_eq_true
+                  simp
+                  omega
+                · intro h
+                  have hp := of_decide_eq_true h
+                  simp at hp
+                  apply decide_eq_true
+                  simp
+                  omega
+              have hfilter_tail : s.filter (fun x =>
+                    decide (let r := ((a :: s).filter fun y : Nat => y < x).length;
+                      0 ≤ r ∧ r < 0 + (k + 1))) =
+                  s.filter (fun x =>
+                    decide (let r := (s.filter fun y : Nat => y < x).length;
+                      0 ≤ r ∧ r < 0 + k)) := by
+                apply List.filter_congr
+                intro x hx
+                exact htailpred x hx
+              rw [List.filter_cons, hPa, hfilter_tail]
+              have hrec := ih hS' hnd' 0 k
+              change a :: s.filter (fun x =>
+                decide (let r := (s.filter fun y : Nat => y < x).length; 0 ≤ r ∧ r < 0 + k)) = a :: s.take k
+              exact congrArg (fun l => a :: l) hrec
+      | succ lo =>
+          have hPa : decide (let r := ((a :: s).filter fun y : Nat => y < a).length;
+              (lo + 1) ≤ r ∧ r < (lo + 1) + size) = false := by simp [hcount_head, hcount_a]
+          have htailpred : ∀ b ∈ s,
+              decide (let r := ((a :: s).filter fun y : Nat => y < b).length;
+                (lo + 1) ≤ r ∧ r < (lo + 1) + size) =
+              decide (let r := (s.filter fun y : Nat => y < b).length;
+                lo ≤ r ∧ r < lo + size) := by
+            intro b hb
+            have hbcount : ((a :: s).filter fun y : Nat => y < b).length =
+                (s.filter fun y : Nat => y < b).length + 1 := by
+              simp [List.filter_cons, decide_eq_true (ha_lt b hb)]
+            rw [hbcount]
+            apply Bool.eq_iff_iff.mpr
+            constructor
+            · intro h
+              have hp := of_decide_eq_true h
+              simp at hp
+              apply decide_eq_true
+              simp
+              omega
+            · intro h
+              have hp := of_decide_eq_true h
+              simp at hp
+              apply decide_eq_true
+              simp
+              omega
+          have hfilter_tail : s.filter (fun x =>
+                decide (let r := ((a :: s).filter fun y : Nat => y < x).length;
+                  (lo + 1) ≤ r ∧ r < (lo + 1) + size)) =
+              s.filter (fun x =>
+                decide (let r := (s.filter fun y : Nat => y < x).length;
+                  lo ≤ r ∧ r < lo + size)) := by
+            apply List.filter_congr
+            intro x hx
+            exact htailpred x hx
+          rw [List.filter_cons, hPa, hfilter_tail]
+          have hrec := ih hS' hnd' lo size
+          simpa [List.drop_succ_cons] using hrec
+
+private theorem flatMap_filter_eq_flatten_filter (runs : List (List Nat)) (P : Nat → Bool) :
+    runs.flatMap (fun r => r.filter P) = runs.flatten.filter P := by
+  induction runs with
+  | nil => rfl
+  | cons r rs ih => simp [List.filter_append, ih]
+
+private theorem count_lt_of_perm {l₁ l₂ : List Nat} (h : l₁.Perm l₂) (x : Nat) :
+    (l₁.filter fun y : Nat => y < x).length = (l₂.filter fun y : Nat => y < x).length := by
+  have hc := List.Perm.countP_eq (fun y : Nat => y < x) h
+  rw [List.countP_eq_length_filter, List.countP_eq_length_filter] at hc
+  exact hc
+
+theorem RankSlice_sound : TinylambOpt.ResearchGoals.OrderedStreams.RankSlice.Goal := by
+  intro runs lo size hnd hr
+  let flat := runs.flatten
+  let S := flat.mergeSort
+  have hSsortedP : S.Pairwise (fun a b : Nat => decide (a ≤ b) = true) := by
+    have h := List.pairwise_mergeSort (le := fun a b : Nat => a ≤ b)
+      (by
+        intro a b c hab hbc
+        apply decide_eq_true
+        have h1 : a ≤ b := of_decide_eq_true hab
+        have h2 : b ≤ c := of_decide_eq_true hbc
+        omega)
+      (by
+        intro a b
+        by_cases h : a ≤ b
+        · simp [h]
+        · have h' : b ≤ a := by omega
+          simp [h, h'])
+      flat
+    simpa [S] using h
+  have hSsorted : S.Pairwise (· ≤ ·) := hSsortedP.imp (by intro a b h; exact of_decide_eq_true h)
+  have hSnd : S.Nodup := by
+    have hp := List.mergeSort_perm flat (fun a b : Nat => a ≤ b)
+    have hnd' := List.Nodup.perm hnd (by simpa [S] using hp.symm)
+    simpa [S, flat] using hnd'
+  have hrange := sorted_filter_range S hSsorted hSnd lo size
+  have hpermS : S.Perm flat := by simpa [S, flat] using List.mergeSort_perm flat (fun a b : Nat => a ≤ b)
+  let selected := runs.flatMap fun r => r.filter fun x =>
+    let rank := (runs.map fun s => (s.takeWhile (· < x)).length).sum
+    lo ≤ rank && rank < lo + size
+  let P : Nat → Bool := fun x => decide (lo ≤ (flat.filter fun y : Nat => y < x).length ∧
+    (flat.filter fun y : Nat => y < x).length < lo + size)
+  let Q : Nat → Bool := fun x => decide (let r := (S.filter fun y : Nat => y < x).length;
+    lo ≤ r ∧ r < lo + size)
+  have hsel_eq : selected = flat.filter P := by
+    unfold selected P flat
+    rw [flatMap_filter_eq_flatten_filter]
+    apply List.filter_congr
+    intro x hx
+    rw [rank_eq runs x hr]
+    apply Bool.eq_iff_iff.mpr
+    simp [Bool.and_eq_true]
+  have hQP : ∀ x, Q x = P x := by
+    intro x
+    unfold Q P
+    have hc := count_lt_of_perm hpermS x
+    rw [hc]
+  have hpermSel : selected.Perm (S.filter Q) := by
+    rw [hsel_eq]
+    have h1 : (flat.filter P).Perm (S.filter P) := hpermS.symm.filter P
+    have h2 : S.filter Q = S.filter P := by
+      apply List.filter_congr
+      intro x hx
+      exact hQP x
+    rw [h2]
+    exact h1
+  have hpermFinal : selected.mergeSort.Perm (S.filter Q) := by
+    exact (List.mergeSort_perm selected (fun a b : Nat => a ≤ b)).trans hpermSel
+  have hselSorted : selected.mergeSort.Pairwise (· ≤ ·) := by
+    have h := List.pairwise_mergeSort (le := fun a b : Nat => a ≤ b)
+      (by
+        intro a b c hab hbc
+        apply decide_eq_true
+        have h1 : a ≤ b := of_decide_eq_true hab
+        have h2 : b ≤ c := of_decide_eq_true hbc
+        omega)
+      (by
+        intro a b
+        by_cases h : a ≤ b
+        · simp [h]
+        · have h' : b ≤ a := by omega
+          simp [h, h'])
+      selected
+    exact h.imp (by intro a b hab; exact of_decide_eq_true hab)
+  have hTSorted : (S.filter Q).Pairwise (· ≤ ·) := hSsorted.filter Q
+  have heq : selected.mergeSort = S.filter Q := by
+    apply List.Perm.eq_of_pairwise (le := fun a b : Nat => a ≤ b)
+    · intro a b ha hb hab hba
       omega
+    · exact hselSorted
+    · exact hTSorted
+    · exact hpermFinal
+  change selected.mergeSort = (S.drop lo).take size
+  rw [heq]
+  simpa [Q] using hrange
+
+private def firstP (P : Nat → Bool) : Nat → Nat → Nat → Nat
+  | 0, lo, _ => lo
+  | fuel + 1, lo, hi =>
+      if lo ≥ hi then lo else
+        let mid := (lo + hi) / 2
+        if P mid then firstP P fuel lo mid else firstP P fuel (mid + 1) hi
+
+private theorem pow_succ_two (n : Nat) : 2 ^ (n + 1) = 2 * 2 ^ n := by
+  rw [show n + 1 = Nat.succ n by omega]
+  rw [Nat.pow_succ]
   omega
 
-/-- Per-span count of value `x` in the residual row filter, when `x` is a key. -/
-private theorem count_span_key (keys : List Nat) (rows : List Nat) (x : Nat)
-    (s : Nat × Nat) (hx : keys.contains x = true) :
-    List.count x (rows.filter fun v => s.1 ≤ v && v ≤ s.2 && keys.contains v)
-      = if covB x s = true then List.count x rows else 0 := by
-  have hpx : (fun v => s.1 ≤ v && v ≤ s.2 && keys.contains v) x = covB x s := by
-    simp only [hx, Bool.and_true, covB]
-  by_cases hc : covB x s = true
-  · rw [if_pos hc]
-    have hpxtrue : (fun v => s.1 ≤ v && v ≤ s.2 && keys.contains v) x = true :=
-      hpx.trans hc
-    exact List.count_filter hpxtrue
-  · rw [if_neg hc]
-    rw [List.count_eq_zero]
-    intro hmemF
-    have hmem := (List.mem_filter).mp hmemF
-    have hcov : covB x s = true := hpx.symm.trans hmem.2
-    exact hc hcov
-
-/-- Sum of `if p a then c else 0` over a list equals `c` times the filtered length. -/
-private theorem sum_map_ite {α : Type} (l : List α) (p : α → Bool) (c : Nat) :
-    (l.map fun a => if p a = true then c else 0).sum = c * (l.filter p).length := by
-  induction l with
-  | nil => simp
-  | cons a l ih =>
-    rw [List.map_cons, List.sum_cons, ih]
-    by_cases hp : p a = true
-    · rw [List.filter_cons]
-      simp only [hp, if_true, List.length_cons]
-      rw [Nat.mul_succ]
-      omega
-    · rw [List.filter_cons]
-      simp only [hp, if_false, List.length_cons]
-      simp
-
-/-- Sum of a constant-zero mapped list is zero. -/
-private theorem sum_map_zero {α : Type} (l : List α) :
-    (l.map fun _ => (0 : Nat)).sum = 0 := by
-  induction l with
-  | nil => rfl
-  | cons a l ih => rw [List.map_cons, List.sum_cons, ih]
-
-/-- Count of `x` in `rows.filter keys.contains` when `x` is a key. -/
-private theorem count_rows_key (keys rows : List Nat) (x : Nat)
-    (hx : keys.contains x = true) :
-    List.count x (rows.filter keys.contains) = List.count x rows := by
-  exact List.count_filter hx
-
-/-- Count of `x` in `rows.filter keys.contains` when `x` is not a key. -/
-private theorem count_rows_nonkey (keys rows : List Nat) (x : Nat)
-    (hx : keys.contains x = false) :
-    List.count x (rows.filter keys.contains) = 0 := by
-  rw [List.count_eq_zero]
-  intro hmemF
-  have hmem := (List.mem_filter).mp hmemF
-  have hcx : keys.contains x = true := hmem.2
-  rw [hx] at hcx
-  exact Bool.noConfusion hcx
-
-/-- Count of `x` in a single span's row filter when `x` is not a key: always zero. -/
-private theorem count_span_zero (keys : List Nat) (rows : List Nat) (x : Nat)
-    (s : Nat × Nat) (hx : keys.contains x = false) :
-    List.count x (rows.filter fun v => s.1 ≤ v && v ≤ s.2 && keys.contains v) = 0 := by
-  rw [List.count_eq_zero]
-  intro hmemF
-  have hmem := (List.mem_filter).mp hmemF
-  have hpxf : (fun v => s.1 ≤ v && v ≤ s.2 && keys.contains v) x = false := by
-    simp only [hx, Bool.and_false]
-  have hbad : false = true := hpxf.symm.trans hmem.2
-  exact Bool.noConfusion hbad
-
-/-- Count of `x` in the span-expanded output when `x` is a key. -/
-private theorem count_lhs_key (keys rows : List Nat) (g : Nat) (x : Nat)
-    (hx : keys.contains x = true) :
-    List.count x ((islands keys.mergeSort g).flatMap
-      fun (lo,hi) => rows.filter fun v => lo ≤ v && v ≤ hi && keys.contains v)
-      = List.count x rows := by
-  rw [List.count_flatMap]
-  have hcongr : (islands keys.mergeSort g).map (List.count x ∘
-      fun (lo,hi) => rows.filter fun v => lo ≤ v && v ≤ hi && keys.contains v)
-      = (islands keys.mergeSort g).map
-        fun s => if covB x s = true then List.count x rows else 0 := by
-    apply List.map_congr_left
-    intro s _
-    exact count_span_key keys rows x s hx
-  rw [hcongr, sum_map_ite, covering_filter_length keys g x hx]
-  simp
-
-/-- Count of `x` in the span-expanded output when `x` is not a key: always zero. -/
-private theorem count_lhs_nonkey (keys rows : List Nat) (g : Nat) (x : Nat)
-    (hx : keys.contains x = false) :
-    List.count x ((islands keys.mergeSort g).flatMap
-      fun (lo,hi) => rows.filter fun v => lo ≤ v && v ≤ hi && keys.contains v)
-      = 0 := by
-  rw [List.count_flatMap]
-  have hcongr : (islands keys.mergeSort g).map (List.count x ∘
-      fun (lo,hi) => rows.filter fun v => lo ≤ v && v ≤ hi && keys.contains v)
-      = (islands keys.mergeSort g).map fun _ => (0 : Nat) := by
-    apply List.map_congr_left
-    intro s _
-    exact count_span_zero keys rows x s hx
-  rw [hcongr, sum_map_zero]
-
-/-- The span-expanded output is a permutation of the key-filtered rows. -/
-private theorem range_perm (keys rows : List Nat) (g : Nat) :
-    ((islands keys.mergeSort g).flatMap
-      fun (lo,hi) => rows.filter fun v => lo ≤ v && v ≤ hi && keys.contains v).Perm
-      (rows.filter keys.contains) := by
-  rw [List.perm_iff_count]
-  intro a
-  by_cases h : keys.contains a = true
-  · rw [count_lhs_key keys rows g a h, count_rows_key keys rows a h]
-  · have hf : keys.contains a = false := Bool.eq_false_of_ne_true h
-    rw [count_lhs_nonkey keys rows g a hf, count_rows_nonkey keys rows a hf]
-
-/-- Range coalescing: span-expansion is a permutation of the key-filtered rows,
-and the resulting spans are pairwise `g`-separated. -/
-theorem sound_RangeCoalescing : RangeCoalescing.Goal := by
-  intro keys g rows
-  dsimp only
-  exact ⟨range_perm keys rows g, spans_pairwise keys g⟩
-
-private theorem expand_cons (k : Nat) (n : Nat) (xs : Rle) :
-    expand ((k,n)::xs) = List.replicate n k ++ expand xs := by
-  simp only [expand, List.flatMap_cons]
-
-private theorem count_expand_cons (k x : Nat) (n : Nat) (xs : Rle) :
-    (expand ((x,n)::xs)).count k = (if x == k then n else 0) + (expand xs).count k := by
-  rw [expand_cons, List.count_append, List.count_replicate]
-
-private theorem count_expand_eq_zero {l : Rle} {k : Nat}
-    (h : ∀ e ∈ l, e.1 ≠ k) : (expand l).count k = 0 := by
-  rw [List.count_eq_zero]
-  intro hmem
-  have hmem' : k ∈ l.flatMap fun (a,b) => List.replicate b a := hmem
-  rw [List.mem_flatMap] at hmem'
-  obtain ⟨e, he, hke⟩ := hmem'
-  rw [List.mem_replicate] at hke
-  obtain ⟨_, hkeq⟩ := hke
-  have h1 : e.1 = k := hkeq.symm
-  exact h e he h1
-
-private theorem key_ne_of_lt {x y : Nat} (h : x < y) : y ≠ x := fun heq => by omega
-
-private theorem pairwise_cons_head {x n : Nat} {xs : Rle}
-    (hp : (((x,n)::xs).map Prod.fst).Pairwise (· < ·)) :
-    (∀ e ∈ xs, x < e.1) ∧ (xs.map Prod.fst).Pairwise (· < ·) := by
-  have hmap : ((x,n)::xs).map Prod.fst = x :: xs.map Prod.fst := by
-    rw [List.map_cons]
-  rw [hmap] at hp
-  obtain ⟨h1, h2⟩ := List.pairwise_cons.mp hp
-  refine ⟨?_, h2⟩
-  intro e he
-  have hmem : e.1 ∈ xs.map Prod.fst := List.mem_map.mpr ⟨e, he, rfl⟩
-  exact h1 _ hmem
-
-private theorem sorted_all_gt {h n : Nat} {t : Rle} {x : Nat}
-    (hp : (((h,n)::t).map Prod.fst).Pairwise (· < ·)) (xh : x < h) :
-    ∀ e ∈ (h,n)::t, x < e.1 := by
-  have hmap : ((h,n)::t).map Prod.fst = h :: t.map Prod.fst := by
-    rw [List.map_cons]
-  rw [hmap] at hp
-  obtain ⟨h1, -⟩ := List.pairwise_cons.mp hp
-  intro e he
-  rw [List.mem_cons] at he
-  cases he with
-  | inl heq =>
-      subst heq
-      exact xh
-  | inr het =>
-      have hmem : e.1 ∈ t.map Prod.fst := List.mem_map.mpr ⟨e, het, rfl⟩
-      exact Nat.lt_trans xh (h1 _ hmem)
-
--- count of head key in the tail expansion is zero (tail keys all exceed it)
-
-/-- Dropping the left head (smaller key `x < y`) preserves the min-count. -/
-private theorem min_count_cons_left {x n y m : Nat} {xs ys : Rle} {k : Nat}
-    (ha : (((x,n)::xs).map Prod.fst).Pairwise (· < ·))
-    (hb : (((y,m)::ys).map Prod.fst).Pairwise (· < ·))
-    (hxy : x < y) :
-    min ((expand ((x,n)::xs)).count k) ((expand ((y,m)::ys)).count k)
-      = min ((expand xs).count k) ((expand ((y,m)::ys)).count k) := by
-  rw [count_expand_cons]
-  by_cases hk : (x == k) = true
-  · have hkx : x = k := (beq_iff_eq).mp hk
-    have hxs0 : (expand xs).count k = 0 := by
-      have hne : ∀ e ∈ xs, e.1 ≠ k := by
-        intro e he
-        have hlt : x < e.1 := (pairwise_cons_head ha).1 e he
-        rw [← hkx]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    have hb0 : (expand ((y,m)::ys)).count k = 0 := by
-      have hne : ∀ e ∈ (y,m)::ys, e.1 ≠ k := by
-        intro e he
-        have hlt : x < e.1 := sorted_all_gt hb hxy e he
-        rw [← hkx]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    simp [hk, hxs0, hb0]
-  · simp [hk]
-
-/-- Dropping the right head (smaller key `y < x`) preserves the min-count. -/
-private theorem min_count_cons_right {x n y m : Nat} {xs ys : Rle} {k : Nat}
-    (ha : (((x,n)::xs).map Prod.fst).Pairwise (· < ·))
-    (hb : (((y,m)::ys).map Prod.fst).Pairwise (· < ·))
-    (hyx : y < x) :
-    min ((expand ((x,n)::xs)).count k) ((expand ((y,m)::ys)).count k)
-      = min ((expand ((x,n)::xs)).count k) ((expand ys).count k) := by
-  rw [count_expand_cons k y m ys]
-  by_cases hk : (y == k) = true
-  · have hky : y = k := (beq_iff_eq).mp hk
-    have hys0 : (expand ys).count k = 0 := by
-      have hne : ∀ e ∈ ys, e.1 ≠ k := by
-        intro e he
-        have hlt : y < e.1 := (pairwise_cons_head hb).1 e he
-        rw [← hky]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    have ha0 : (expand ((x,n)::xs)).count k = 0 := by
-      have hne : ∀ e ∈ (x,n)::xs, e.1 ≠ k := by
-        intro e he
-        have hlt : y < e.1 := sorted_all_gt ha hyx e he
-        rw [← hky]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    simp [hk, hys0, ha0]
-  · simp [hk]
-
-/-- Merging equal heads `(x,min n m)` preserves the min-count. -/
-private theorem min_count_cons_eq {x n m : Nat} {xs ys : Rle} {k : Nat}
-    (ha : (((x,n)::xs).map Prod.fst).Pairwise (· < ·))
-    (hb : (((x,m)::ys).map Prod.fst).Pairwise (· < ·)) :
-    (if x == k then min n m else 0) + min ((expand xs).count k) ((expand ys).count k)
-      = min ((expand ((x,n)::xs)).count k) ((expand ((x,m)::ys)).count k) := by
-  rw [count_expand_cons k x n xs, count_expand_cons k x m ys]
-  by_cases hk : (x == k) = true
-  · have hkx : x = k := (beq_iff_eq).mp hk
-    have hxs0 : (expand xs).count k = 0 := by
-      have hne : ∀ e ∈ xs, e.1 ≠ k := by
-        intro e he
-        have hlt : x < e.1 := (pairwise_cons_head ha).1 e he
-        rw [← hkx]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    have hys0 : (expand ys).count k = 0 := by
-      have hne : ∀ e ∈ ys, e.1 ≠ k := by
-        intro e he
-        have hlt : x < e.1 := (pairwise_cons_head hb).1 e he
-        rw [← hkx]
-        exact key_ne_of_lt hlt
-      exact count_expand_eq_zero hne
-    simp [hk, hxs0, hys0]
-  · simp [hk]
-
-private theorem intersect_count_aux : ∀ (fuel : Nat) (a b : Rle),
-    a.length + b.length ≤ fuel →
-    (a.map Prod.fst).Pairwise (· < ·) → (b.map Prod.fst).Pairwise (· < ·) →
-    ∀ k, (expand (intersectRuns fuel a b)).count k =
-      min ((expand a).count k) ((expand b).count k) := by
+private theorem firstP_result (P : Nat → Bool) :
+    ∀ fuel lo hi, lo ≤ hi → hi < lo + 2 ^ fuel → P hi = true →
+    (∀ i, lo ≤ i → i < hi → P i = true → P (i + 1) = true) →
+    P (firstP P fuel lo hi) = true ∧
+      (∀ i, lo ≤ i → i < firstP P fuel lo hi → P i = false) := by
   intro fuel
   induction fuel with
   | zero =>
-    intro a b hsum ha hb k
-    have ha0 : a.length = 0 := by omega
-    have hb0 : b.length = 0 := by omega
-    rw [List.eq_nil_of_length_eq_zero ha0, List.eq_nil_of_length_eq_zero hb0]
-    simp [intersectRuns, expand]
+      intro lo hi hle hwidth hhi hmono
+      have hEq : hi = lo := by
+        have : hi < lo + 1 := by simpa using hwidth
+        omega
+      subst hi
+      constructor
+      · simpa [firstP] using hhi
+      · intro i hi hlt
+        simp [firstP] at hlt
+        omega
   | succ fuel ih =>
-    intro a b hsum ha hb k
-    cases a with
-    | nil =>
-      have hres : intersectRuns (fuel+1) [] b = [] := by simp [intersectRuns]
-      rw [hres]
-      simp [expand]
-    | cons hnx xs =>
-      obtain ⟨x, n⟩ := hnx
-      cases b with
+      intro lo hi hle hwidth hhi hmono
+      by_cases hlohi : lo = hi
+      · subst hi
+        constructor
+        · simpa [firstP] using hhi
+        · intro i hi hlt
+          simp [firstP] at hlt
+          omega
+      · have hlt : lo < hi := by omega
+        let mid := (lo + hi) / 2
+        have hmid_lo : lo ≤ mid := by dsimp [mid]; omega
+        have hmid_hi : mid < hi := by dsimp [mid]; omega
+        have hpown : 0 < 2 ^ fuel := Nat.pow_pos (by decide : 0 < 2)
+        have hmidmul : 2 * mid ≤ lo + hi := by
+          simpa [mid, Nat.mul_comm] using Nat.mul_div_le (lo + hi) 2
+        have hA : lo + hi < (mid + 1) * 2 := by
+          have hdivlt : (lo + hi) / 2 < mid + 1 := by simpa [mid] using Nat.lt_succ_self mid
+          exact (Nat.div_lt_iff_lt_mul (by decide : 0 < 2)).mp hdivlt
+        rw [pow_succ_two] at hwidth
+        have htwo : 2 * 2 ^ fuel = 2 ^ fuel + 2 ^ fuel := by omega
+        rw [htwo] at hwidth
+        have hnle : ¬ hi ≤ lo := by omega
+        by_cases hPmid : P mid = true
+        · have hw : mid < lo + 2 ^ fuel := by
+            omega
+          have hres := ih lo mid hmid_lo hw hPmid (by
+            intro i hil him hip
+            exact hmono i hil (by omega) hip)
+          have hfirst : firstP P (fuel + 1) lo hi = firstP P fuel lo mid := by
+            simp [firstP, mid, hPmid, hnle]
+          rw [hfirst]
+          exact hres
+        · have hmono_le : ∀ {i j : Nat}, lo ≤ i → i ≤ j → j ≤ hi → P i = true → P j = true := by
+            intro i j hli hij hjh hPi
+            induction j with
+            | zero =>
+                have : i = 0 := by omega
+                subst i
+                exact hPi
+            | succ j ihj =>
+                by_cases h : i ≤ j
+                · exact hmono j (by omega) (by omega) (ihj h (by omega))
+                · have hji : i = j + 1 := by omega
+                  subst i
+                  exact hPi
+          have hw : hi < (mid + 1) + 2 ^ fuel := by
+            omega
+          have hres := ih (mid + 1) hi (by omega) hw hhi (by
+            intro i hi1 hih1 hip
+            exact hmono i (by omega) hih1 hip)
+          have hfirst : firstP P (fuel + 1) lo hi = firstP P fuel (mid + 1) hi := by
+            simp [firstP, mid, hPmid, hnle]
+          rw [hfirst]
+          constructor
+          · exact hres.1
+          · intro i hi hlt
+            by_cases him : i ≤ mid
+            · have hnot : ¬ P i = true := by
+                intro hPi
+                exact hPmid (hmono_le (by omega) him (by omega) hPi)
+              cases hpi : P i with
+              | true => exact (hnot hpi).elim
+              | false => rfl
+            · exact hres.2 i (by omega) hlt
+private theorem getLast_take (l : List Row) (k : Nat) (hk : 0 < k) (hkl : k ≤ l.length) :
+    (l.take k).getLast? = l[k - 1]? := by
+  rw [List.getLast?_eq_getElem?]
+  rw [List.length_take_of_le hkl]
+  exact List.getElem?_take_of_lt (by omega)
+
+private theorem sorted_get_le (l : List Row) (hs : sorted l) {i j : Nat}
+    (hi : i < l.length) (hj : j < l.length) (hij : i ≤ j) : l[i].1 ≤ l[j].1 := by
+  by_cases h : i = j
+  · subst j
+    omega
+  · exact (List.pairwise_iff_getElem.mp hs) i j hi hj (by omega)
+
+private theorem lt_length_of_getElem?_some {α : Type} {l : List α} {i : Nat} {x : α}
+    (h : l[i]? = some x) : i < l.length := by
+  by_cases hlt : i < l.length
+  · exact hlt
+  · have hle : l.length ≤ i := Nat.le_of_not_gt hlt
+    have hnone : l[i]? = none := List.getElem?_eq_none_iff.mpr hle
+    rw [hnone] at h
+    cases h
+
+private theorem cutOK_cons_left (x : Row) (xs b : List Row) (i j : Nat)
+    (hi : i + 1 ≤ (x :: xs).length) (hj : j ≤ b.length)
+    (hcut : cutOK (x :: xs) b (i + 1) j) : cutOK xs b i j := by
+  rcases hcut with ⟨_, _, hleft, hright⟩
+  have hi' : i ≤ xs.length := by simpa using hi
+  refine ⟨hi', hj, ?_, ?_⟩
+  · cases i with
+    | zero => simp
+    | succ i' =>
+        intro p hp q hq
+        have hpeq1 : (xs.take (i' + 1)).getLast? = xs[i']? :=
+          getLast_take xs (i' + 1) (by omega) (by omega)
+        have hpeq2 : ((x :: xs).take (i' + 2)).getLast? = (x :: xs)[i' + 1]? :=
+          getLast_take (x :: xs) (i' + 2) (by omega) (by omega)
+        have hp1 : p ∈ xs[i']? := by simpa [hpeq1] using hp
+        have hp' : p ∈ ((x :: xs).take (i' + 2)).getLast? := by
+          rw [hpeq2]
+          simpa using hp1
+        exact hleft p hp' q hq
+  · intro q hq p hp
+    have hp' : p ∈ (x :: xs)[i + 1]? := by simpa using hp
+    exact hright q hq p hp'
+
+private theorem cutOK_cons_right (a : List Row) (y : Row) (ys : List Row) (i j : Nat)
+    (hi : i ≤ a.length) (hj : j + 1 ≤ (y :: ys).length)
+    (hcut : cutOK a (y :: ys) i (j + 1)) : cutOK a ys i j := by
+  rcases hcut with ⟨_, _, hleft, hright⟩
+  have hj' : j ≤ ys.length := by simpa using hj
+  refine ⟨hi, hj', ?_, ?_⟩
+  · intro p hp q hq
+    have hq' : q ∈ (y :: ys)[j + 1]? := by simpa using hq
+    exact hleft p hp q hq'
+  · cases j with
+    | zero => simp
+    | succ j' =>
+        intro q hq p hp
+        have hqeq1 : (ys.take (j' + 1)).getLast? = ys[j']? :=
+          getLast_take ys (j' + 1) (by omega) (by omega)
+        have hqeq2 : ((y :: ys).take (j' + 2)).getLast? = (y :: ys)[j' + 1]? :=
+          getLast_take (y :: ys) (j' + 2) (by omega) (by omega)
+        have hq1 : q ∈ ys[j']? := by simpa [hqeq1] using hq
+        have hq' : q ∈ ((y :: ys).take (j' + 2)).getLast? := by
+          rw [hqeq2]
+          simpa using hq1
+        exact hright q hq' p hp
+
+private theorem merge_append_left : ∀ (a l₁ l₂ : List Row),
+    sorted a → sorted (l₁ ++ l₂) →
+    (∀ x ∈ a, ∀ y ∈ l₁, y.1 < x.1) →
+    List.merge a (l₁ ++ l₂) leKey = l₁ ++ List.merge a l₂ leKey
+  | a, [], l₂, ha, hl, hcond => by simp
+  | [], l₁, l₂, ha, hl, hcond => by simp
+  | x :: xs, y :: ys, l₂, ha, hl, hcond => by
+      have hxy : y.1 < x.1 := hcond x (by simp) y (by simp)
+      have hxyle : leKey x y = false := by
+        unfold leKey
+        apply decide_eq_false
+        omega
+      have hcond' : ∀ x' ∈ x :: xs, ∀ y' ∈ ys, y'.1 < x'.1 := by
+        intro x' hx' y' hy'
+        exact hcond x' hx' y' (by simp [hy'])
+      have hl' : sorted (ys ++ l₂) := List.Pairwise.of_cons hl
+      simp [List.merge, hxyle, merge_append_left (x :: xs) ys l₂ ha hl' hcond']
+
+private theorem merge_append_right : ∀ (l₁ l₂ b : List Row),
+    sorted (l₁ ++ l₂) → sorted b →
+    (∀ x ∈ l₁, ∀ y ∈ b, x.1 ≤ y.1) →
+    List.merge (l₁ ++ l₂) b leKey = l₁ ++ List.merge l₂ b leKey
+  | [], l₂, b, hl, hb, hcond => by simp
+  | x :: xs, l₂, [], hl, hb, hcond => by simp
+  | x :: xs, l₂, y :: ys, hl, hb, hcond => by
+      have hxy : x.1 ≤ y.1 := hcond x (by simp) y (by simp)
+      have hxyle : leKey x y = true := by
+        unfold leKey
+        exact decide_eq_true hxy
+      have hl' : sorted (xs ++ l₂) := List.Pairwise.of_cons hl
+      have hcond' : ∀ x' ∈ xs, ∀ y' ∈ y :: ys, x'.1 ≤ y'.1 := by
+        intro x' hx' y' hy'
+        exact hcond x' (by simp [hx']) y' hy'
+      simp [List.merge, hxyle, merge_append_right xs l₂ (y :: ys) hl' hb hcond']
+
+private theorem merge_split_aux : ∀ (a b : List Row) (i j : Nat),
+    sorted a → sorted b → i ≤ a.length → j ≤ b.length → cutOK a b i j →
+    List.merge a b leKey =
+      List.merge (a.take i) (b.take j) leKey ++ List.merge (a.drop i) (b.drop j) leKey := by
+  intro a
+  induction a with
+  | nil =>
+      intro b i j ha hb hi hj hcut
+      have hi0 : i = 0 := by simp at hi; omega
+      subst i
+      simp
+  | cons x xs iha =>
+      intro b
+      induction b with
       | nil =>
-        have hres : intersectRuns (fuel+1) ((x,n)::xs) [] = [] := by simp [intersectRuns]
-        rw [hres]
-        simp [expand]
-      | cons hmy ys =>
-        obtain ⟨y, m⟩ := hmy
-        have htri : x < y ∨ x = y ∨ y < x := by omega
-        obtain hxy | hxeq | hyx := htri
-        · have hres : intersectRuns (fuel+1) ((x,n)::xs) ((y,m)::ys)
-              = intersectRuns fuel xs ((y,m)::ys) := by
-            simp only [intersectRuns]
-            rw [if_pos hxy]
-          rw [hres]
-          have hsum' : xs.length + ((y,m)::ys).length ≤ fuel := by
-            simp only [List.length_cons] at hsum ⊢
-            omega
-          have hpa := (pairwise_cons_head ha).2
-          have ih' := ih xs ((y,m)::ys) hsum' hpa hb k
-          rw [ih']
-          exact (min_count_cons_left ha hb hxy).symm
-        · subst y
-          have hres : intersectRuns (fuel+1) ((x,n)::xs) ((x,m)::ys)
-              = (x, min n m) :: intersectRuns fuel xs ys := by
-            simp only [intersectRuns]
-            have hxx : ¬ x < x := by omega
-            rw [if_neg hxx, if_neg hxx]
-          rw [hres, expand_cons, List.count_append, List.count_replicate]
-          have hsum' : xs.length + ys.length ≤ fuel := by
-            simp only [List.length_cons] at hsum ⊢
-            omega
-          have hpa := (pairwise_cons_head ha).2
-          have hpb := (pairwise_cons_head hb).2
-          have ih' := ih xs ys hsum' hpa hpb k
-          rw [ih']
-          exact min_count_cons_eq ha hb
-        · have hxy' : ¬ x < y := by omega
-          have hres : intersectRuns (fuel+1) ((x,n)::xs) ((y,m)::ys)
-              = intersectRuns fuel ((x,n)::xs) ys := by
-            simp only [intersectRuns]
-            rw [if_neg hxy', if_pos hyx]
-          rw [hres]
-          have hsum' : ((x,n)::xs).length + ys.length ≤ fuel := by
-            simp only [List.length_cons] at hsum ⊢
-            omega
-          have hpb := (pairwise_cons_head hb).2
-          have ih' := ih ((x,n)::xs) ys hsum' ha hpb k
-          rw [ih']
-          exact (min_count_cons_right ha hb hyx).symm
+          intro i j ha hb hi hj hcut
+          have hj0 : j = 0 := by simp at hj; omega
+          subst j
+          simp
+      | cons y ys ihb =>
+          intro i j ha hb hi hj hcut
+          cases i with
+          | zero =>
+              have hcond : ∀ z ∈ x :: xs, ∀ w ∈ (y :: ys).take j, w.1 < z.1 := by
+                intro z hz w hw
+                have hzge : x.1 ≤ z.1 := by
+                  rcases List.mem_cons.mp hz with rfl | hz
+                  · omega
+                  · exact (List.pairwise_cons.mp ha).1 z hz
+                rcases hget : (y :: ys).take j |>.getLast? with _ | last
+                · have hnil : (y :: ys).take j = [] := List.getLast?_eq_none_iff.mp hget
+                  simp [hnil] at hw
+                · have hsortedtake : sorted ((y :: ys).take j) := hb.take
+                  have hlastmem : last ∈ ((y :: ys).take j).getLast? := by
+                    rw [hget]
+                    simp
+                  have hwle : w.1 ≤ last.1 :=
+                    le_of_mem_getLast hsortedtake w hw last hlastmem
+                  have hxe : x ∈ (x :: xs)[0]? := by simp
+                  have hlt : last.1 < x.1 := hcut.2.2.2 last hlastmem x hxe
+                  omega
+              have hm := merge_append_left (x :: xs) ((y :: ys).take j) ((y :: ys).drop j)
+                ha (by simpa using hb) hcond
+              simpa using hm
+          | succ i' =>
+              cases j with
+              | zero =>
+                  have hcond : ∀ z ∈ (x :: xs).take (i' + 1), ∀ w ∈ y :: ys, z.1 ≤ w.1 := by
+                    intro z hz w hw
+                    have hwge : y.1 ≤ w.1 := by
+                      rcases List.mem_cons.mp hw with rfl | hw
+                      · omega
+                      · exact (List.pairwise_cons.mp hb).1 w hw
+                    rcases hget : (x :: xs).take (i' + 1) |>.getLast? with _ | last
+                    · have hnil : (x :: xs).take (i' + 1) = [] := List.getLast?_eq_none_iff.mp hget
+                      simp [hnil] at hz
+                    · have hsortedtake : sorted ((x :: xs).take (i' + 1)) := ha.take
+                      have hlastmem : last ∈ ((x :: xs).take (i' + 1)).getLast? := by
+                        rw [hget]
+                        simp
+                      have hzle : z.1 ≤ last.1 :=
+                        le_of_mem_getLast hsortedtake z hz last hlastmem
+                      have hye : y ∈ (y :: ys)[0]? := by simp
+                      have hle : last.1 ≤ y.1 := hcut.2.2.1 last hlastmem y hye
+                      omega
+                  have hm := merge_append_right ((x :: xs).take (i' + 1))
+                    ((x :: xs).drop (i' + 1)) (y :: ys) (by simpa using ha) hb hcond
+                  simpa using hm
+              | succ j' =>
+                  by_cases hxy : leKey x y = true
+                  · have hcut' : cutOK xs (y :: ys) i' (j' + 1) :=
+                      cutOK_cons_left x xs (y :: ys) i' (j' + 1) (by simpa using hi) (by simpa using hj) hcut
+                    have hih := iha (y :: ys) i' (j' + 1)
+                      (List.Pairwise.of_cons ha) hb (by simpa using hi) (by simpa using hj) hcut'
+                    have hm : List.merge (x :: xs) (y :: ys) leKey =
+                        x :: List.merge xs (y :: ys) leKey := by
+                      simp [hxy]
+                    rw [hm, hih]
+                    simp [List.take, List.drop, hxy]
+                  · have hyxlt : y.1 < x.1 := by
+                      have hnot : ¬ x.1 ≤ y.1 := by
+                        unfold leKey at hxy
+                        intro hle
+                        have ht : decide (x.1 ≤ y.1) = true := decide_eq_true hle
+                        rw [ht] at hxy
+                        have hf : (true : Bool) = false := by simpa using hxy
+                        cases hf
+                      omega
+                    have hyxle : leKey y x = true := by
+                      unfold leKey
+                      apply decide_eq_true
+                      omega
+                    have hcut' : cutOK (x :: xs) ys (i' + 1) j' :=
+                      cutOK_cons_right (x :: xs) y ys (i' + 1) j' (by simpa using hi) (by simpa using hj) hcut
+                    have hih := ihb (i' + 1) j'
+                      ha (List.Pairwise.of_cons hb) (by simpa using hi) (by simpa using hj) hcut'
+                    have hm : List.merge (x :: xs) (y :: ys) leKey =
+                        y :: List.merge (x :: xs) ys leKey := by
+                      simp [hxy]
+                    rw [hm, hih]
+                    simp [List.take, List.drop, hxy, hyxle]
 
-theorem sound_RunIntersection : RunIntersection.Goal := by
-  intro a b ha hb k
-  rw [intersect_count_aux (a.length + b.length) a b (Nat.le_refl _)
-    ha hb k]
+private theorem cutOK_unique (a b : List Row) (ha : sorted a) (hb : sorted b) (n i j i' j' : Nat)
+    (hsum : i + j = n) (hsum' : i' + j' = n)
+    (hcut : cutOK a b i j) (hcut' : cutOK a b i' j') : i = i' ∧ j = j' := by
+  rcases hcut with ⟨hi_le, hj_le, hleft, hright⟩
+  rcases hcut' with ⟨hi'_le, hj'_le, hleft', hright'⟩
+  by_cases hii : i = i'
+  · subst i'
+    constructor
+    · rfl
+    · omega
+  · have hor : i < i' ∨ i' < i := by omega
+    rcases hor with hlt | hlt
+    · have hjj : j' < j := by omega
+      rcases hbg : b[j - 1]? with _ | y
+      · have hbnone : b.length ≤ j - 1 := List.getElem?_eq_none_iff.mp hbg
+        omega
+      · rcases hag : a[i]? with _ | x
+        · have hanone : a.length ≤ i := List.getElem?_eq_none_iff.mp hag
+          omega
+        · have hgetB : (b.take j).getLast? = b[j - 1]? := getLast_take b j (by omega) hj_le
+          have hymem : y ∈ (b.take j).getLast? := by rw [hgetB, hbg]; simp
+          have hxmem : x ∈ a[i]? := by rw [hag]; simp
+          have hyx : y.1 < x.1 := hright y hymem x hxmem
+          have hidxa : i < a.length := lt_length_of_getElem?_some hag
+          have hidxa' : i' - 1 < a.length := by omega
+          rcases hag' : (a.take i').getLast? with _ | x'
+          · have hnil : a.take i' = [] := List.getLast?_eq_none_iff.mp hag'
+            have hlen : (a.take i').length = 0 := by rw [hnil]; simp
+            have hmin0 : min i' a.length = 0 := by simpa using hlen
+            have hmin : min i' a.length = i' := Nat.min_eq_left hi'_le
+            rw [hmin] at hmin0
+            omega
+          · have hlast : (a.take i').getLast? = a[i' - 1]? := getLast_take a i' (by omega) hi'_le
+            have hag'' : a[i' - 1] = x' := by
+              have ht := hag'
+              rw [hlast] at ht
+              rw [List.getElem?_eq_getElem (by omega)] at ht
+              exact Option.some.inj ht
+            rcases hbg' : b[j']? with _ | y'
+            · have hbnone : b.length ≤ j' := List.getElem?_eq_none_iff.mp hbg'
+              omega
+            · have hx'mem : x' ∈ (a.take i').getLast? := by rw [hag']; simp
+              have hy'mem : y' ∈ b[j']? := by rw [hbg']; simp
+              have hxx : x'.1 ≤ y'.1 := hleft' x' hx'mem y' hy'mem
+              have hidxj' : j' < b.length := lt_length_of_getElem?_some hbg'
+              have hidxj : j - 1 < b.length := lt_length_of_getElem?_some hbg
+              have hxa : a[i].1 ≤ x'.1 := by
+                rw [← hag'']
+                exact sorted_get_le a ha hidxa hidxa' (by omega)
+              have hyb : y'.1 ≤ b[j - 1].1 := by
+                have hy'eq : b[j'] = y' := by
+                  have ht := hbg'
+                  rw [List.getElem?_eq_getElem (by omega)] at ht
+                  exact Option.some.inj ht
+                rw [← hy'eq]
+                exact sorted_get_le b hb hidxj' hidxj (by omega)
+              have hxeq : a[i] = x := by
+                have ht := hag
+                rw [List.getElem?_eq_getElem (by omega)] at ht
+                exact Option.some.inj ht
+              have hyeq : b[j - 1] = y := by
+                have ht := hbg
+                rw [List.getElem?_eq_getElem (by omega)] at ht
+                exact Option.some.inj ht
+              rw [← hxeq] at hyx
+              rw [← hyeq] at hyx
+              omega
+    · have hjj : j < j' := by omega
+      rcases hbg : b[j' - 1]? with _ | y
+      · have hbnone : b.length ≤ j' - 1 := List.getElem?_eq_none_iff.mp hbg
+        omega
+      · rcases hag : a[i']? with _ | x
+        · have hanone : a.length ≤ i' := List.getElem?_eq_none_iff.mp hag
+          omega
+        · have hgetB : (b.take j').getLast? = b[j' - 1]? := getLast_take b j' (by omega) hj'_le
+          have hymem : y ∈ (b.take j').getLast? := by rw [hgetB, hbg]; simp
+          have hxmem : x ∈ a[i']? := by rw [hag]; simp
+          have hyx : y.1 < x.1 := hright' y hymem x hxmem
+          have hidxa : i' < a.length := lt_length_of_getElem?_some hag
+          have hidxa0 : i - 1 < a.length := by omega
+          rcases hag0 : (a.take i).getLast? with _ | x'
+          · have hnil : a.take i = [] := List.getLast?_eq_none_iff.mp hag0
+            have hlen : (a.take i).length = 0 := by rw [hnil]; simp
+            have hmin0 : min i a.length = 0 := by simpa using hlen
+            have hmin : min i a.length = i := Nat.min_eq_left hi_le
+            rw [hmin] at hmin0
+            omega
+          · have hlast : (a.take i).getLast? = a[i - 1]? := getLast_take a i (by omega) hi_le
+            have hag'' : a[i - 1] = x' := by
+              have ht := hag0
+              rw [hlast] at ht
+              rw [List.getElem?_eq_getElem (by omega)] at ht
+              exact Option.some.inj ht
+            rcases hbg0 : b[j]? with _ | y'
+            · have hbnone : b.length ≤ j := List.getElem?_eq_none_iff.mp hbg0
+              omega
+            · have hx'mem : x' ∈ (a.take i).getLast? := by rw [hag0]; simp
+              have hy'mem : y' ∈ b[j]? := by rw [hbg0]; simp
+              have hxx : x'.1 ≤ y'.1 := hleft x' hx'mem y' hy'mem
+              have hidxj : j < b.length := lt_length_of_getElem?_some hbg0
+              have hidxj' : j' - 1 < b.length := lt_length_of_getElem?_some hbg
+              have hxa : a[i'].1 ≤ x'.1 := by
+                rw [← hag'']
+                exact sorted_get_le a ha hidxa hidxa0 (by omega)
+              have hyb : y'.1 ≤ b[j' - 1].1 := by
+                have hy'eq : b[j] = y' := by
+                  have ht := hbg0
+                  rw [List.getElem?_eq_getElem (by omega)] at ht
+                  exact Option.some.inj ht
+                rw [← hy'eq]
+                exact sorted_get_le b hb hidxj hidxj' (by omega)
+              have hxeq : a[i'] = x := by
+                have ht := hag
+                rw [List.getElem?_eq_getElem (by omega)] at ht
+                exact Option.some.inj ht
+              have hyeq : b[j' - 1] = y := by
+                have ht := hbg
+                rw [List.getElem?_eq_getElem (by omega)] at ht
+                exact Option.some.inj ht
+              rw [← hxeq] at hyx
+              rw [← hyeq] at hyx
+              omega
 
-end TinylambOpt.ResearchProofs.ExecutionStrategies.OrderedStreams
+private def moreLeft (a b : List Row) (n i : Nat) : Bool :=
+  let j := n - i
+  match b[j - 1]?, a[i]? with
+  | some y, some x => j != 0 && decide (x.1 ≤ y.1)
+  | _, _ => false
+
+private def mlProp (a b : List Row) (n i : Nat) : Prop :=
+  n - i ≠ 0 ∧ ∃ x, a[i]? = some x ∧ ∃ y, b[n - i - 1]? = some y ∧ x.1 ≤ y.1
+
+private theorem moreLeft_iff_ml (a b : List Row) (n i : Nat) :
+    moreLeft a b n i = true ↔ mlProp a b n i := by
+  by_cases hj : n - i = 0
+  · rcases hb0 : b[0]? with _ | y
+    · rcases ha0 : a[i]? with _ | x
+      · simp [moreLeft, mlProp, hj, hb0, ha0]
+      · simp [moreLeft, mlProp, hj, hb0, ha0]
+    · rcases ha0 : a[i]? with _ | x
+      · simp [moreLeft, mlProp, hj, hb0, ha0]
+      · simp [moreLeft, mlProp, hj, hb0, ha0]
+  · have hjb : (n - i != 0) = true := by simp [hj]
+    rcases hbget : b[n - i - 1]? with _ | y
+    · simp [moreLeft, mlProp, hj, hjb, hbget]
+    · rcases haget : a[i]? with _ | x
+      · simp [moreLeft, mlProp, hj, hjb, hbget, haget]
+      · simp [moreLeft, mlProp, hj, hjb, hbget, haget]
+
+private theorem ml_mono (a b : List Row) (ha : sorted a) (hb : sorted b)
+    (n lo i : Nat) (hlo : lo = n - b.length) (hli : lo ≤ i) :
+    mlProp a b n (i + 1) → mlProp a b n i := by
+  intro h
+  rcases h with ⟨hjne_succ, x', hx', y', hy', hxy⟩
+  have hidxa_succ : i + 1 < a.length := lt_length_of_getElem?_some hx'
+  have hidxb_succ : n - (i + 1) - 1 < b.length := lt_length_of_getElem?_some hy'
+  have hidxa : i < a.length := by omega
+  have hidxb : n - i - 1 < b.length := by
+    rw [hlo] at hli
+    omega
+  have hji_ne : n - i ≠ 0 := by omega
+  have haget : a[i]? = some a[i] := List.getElem?_eq_getElem (by omega)
+  have hbget : b[n - i - 1]? = some b[n - i - 1] :=
+    List.getElem?_eq_getElem (by omega)
+  have hxeq : a[i + 1] = x' := by
+    have ht := hx'
+    rw [List.getElem?_eq_getElem (by omega)] at ht
+    exact Option.some.inj ht
+  have hyeq : b[n - (i + 1) - 1] = y' := by
+    have ht := hy'
+    rw [List.getElem?_eq_getElem (by omega)] at ht
+    exact Option.some.inj ht
+  have hxle : a[i].1 ≤ x'.1 := by
+    rw [← hxeq]
+    exact sorted_get_le a ha hidxa hidxa_succ (by omega)
+  have hyle : y'.1 ≤ b[n - i - 1].1 := by
+    rw [← hyeq]
+    exact sorted_get_le b hb hidxb_succ hidxb (by omega)
+  exact ⟨hji_ne, a[i], haget, b[n - i - 1], hbget, by omega⟩
+
+private theorem not_ml_hi (a b : List Row) (n : Nat) :
+    ¬ mlProp a b n (min n a.length) := by
+  intro h
+  rcases h with ⟨hjne, x, hx, y, hy, hxy⟩
+  have hidxa : min n a.length < a.length := lt_length_of_getElem?_some hx
+  by_cases hle : a.length ≤ n
+  · have hmin : min n a.length = a.length := Nat.min_eq_right hle
+    omega
+  · have hnle : n ≤ a.length := by omega
+    have hmin : min n a.length = n := Nat.min_eq_left hnle
+    omega
+
+private theorem firstP_bounds (P : Nat → Bool) : ∀ (fuel lo hi : Nat), lo ≤ hi →
+    lo ≤ firstP P fuel lo hi ∧ firstP P fuel lo hi ≤ hi
+  | 0, lo, hi, hle => by simp [firstP, hle]
+  | fuel + 1, lo, hi, hle => by
+      by_cases hh : lo ≥ hi
+      · have heq : lo = hi := by omega
+        subst hi
+        simp [firstP]
+      · let mid := (lo + hi) / 2
+        have hmidlo : lo ≤ mid := by dsimp [mid]; omega
+        have hmidhi : mid < hi := by dsimp [mid]; omega
+        by_cases hP : P mid = true
+        · have hres := firstP_bounds P fuel lo mid hmidlo
+          have hfirst : firstP P (fuel + 1) lo hi = firstP P fuel lo mid := by
+            simp [firstP, mid, hP, hh]
+          rw [hfirst]
+          exact ⟨hres.1, by omega⟩
+        · have hres := firstP_bounds P fuel (mid + 1) hi (by omega)
+          have hfirst : firstP P (fuel + 1) lo hi = firstP P fuel (mid + 1) hi := by
+            simp [firstP, mid, hP, hh]
+          rw [hfirst]
+          exact ⟨by omega, hres.2⟩
+
+private theorem diagonal_eq_firstP (a b : List Row) (n fuel lo hi : Nat) :
+    diagonal a.toArray b.toArray n fuel lo hi =
+      firstP (fun i => !(moreLeft a b n i)) fuel lo hi := by
+  induction fuel generalizing lo hi with
+  | zero => simp [diagonal, firstP]
+  | succ fuel ih =>
+      by_cases hh : lo ≥ hi
+      · simp [diagonal, firstP, hh]
+      · by_cases hm : moreLeft a b n ((lo + hi) / 2) = true
+        · have hc : (match b[n - (lo + hi) / 2 - 1]?, a[(lo + hi) / 2]? with
+              | some y, some x => n - (lo + hi) / 2 != 0 && decide (x.1 ≤ y.1)
+              | _, _ => false) = true := by simpa [moreLeft] using hm
+          simp [diagonal, firstP, List.getElem?_toArray, hh, hm, ih]
+          intro hfalse
+          have hcontra : (true : Bool) = false := by
+            rw [← hc]
+            exact hfalse
+          cases hcontra
+        · have hmf : moreLeft a b n ((lo + hi) / 2) = false := by
+            cases h' : moreLeft a b n ((lo + hi) / 2) <;> simp_all
+          have hc : (match b[n - (lo + hi) / 2 - 1]?, a[(lo + hi) / 2]? with
+              | some y, some x => n - (lo + hi) / 2 != 0 && decide (x.1 ≤ y.1)
+              | _, _ => false) = false := by simpa [moreLeft] using hmf
+          simp [diagonal, firstP, List.getElem?_toArray, hh, hmf, ih]
+          intro htrue
+          have hcontra : (false : Bool) = true := by
+            rw [← hc]
+            exact htrue
+          cases hcontra
+
+private theorem log2_fuel (d : Nat) : d < 2 ^ (d.log2 + 2) := by
+  induction d using Nat.strongRecOn with
+  | ind d ih =>
+      by_cases hd : d < 2
+      · have h01 : d = 0 ∨ d = 1 := by omega
+        rcases h01 with rfl | rfl <;> native_decide
+      · have hd2 : 2 ≤ d := by omega
+        rw [Nat.log2_def]
+        simp [hd2]
+        have hhalf : d / 2 < d := Nat.log2_terminates d hd2
+        have ihh := ih (d / 2) hhalf
+        have hp : 0 < 2 ^ ((d / 2).log2 + 2) := Nat.pow_pos (by decide)
+        have hdp : d / 2 + 1 ≤ 2 ^ ((d / 2).log2 + 2) := by omega
+        have hdm := Nat.div_add_mod d 2
+        have hmod : d % 2 < 2 := Nat.mod_lt d (by decide)
+        have hdle : d ≤ 2 * (d / 2) + 1 := by omega
+        rw [show (d / 2).log2 + 1 + 2 = ((d / 2).log2 + 2) + 1 by omega, pow_succ_two]
+        omega
+
+theorem MergeDiagonal_sound : TinylambOpt.ResearchGoals.OrderedStreams.MergeDiagonal.Goal := by
+  intro a b n ha hb hn
+  let lo := n - b.length
+  let hi := min n a.length
+  let fuel := (hi - lo).log2 + 2
+  let P : Nat → Bool := fun i => !(moreLeft a b n i)
+  have hlohi : lo ≤ hi := by
+    dsimp [lo, hi]
+    omega
+  have hwidth : hi < lo + 2 ^ fuel := by
+    dsimp [fuel]
+    have hd := log2_fuel (hi - lo)
+    omega
+  have hPhi : P hi = true := by
+    dsimp [P]
+    cases hm : moreLeft a b n hi
+    · rfl
+    · have hmlp := (moreLeft_iff_ml a b n hi).mp hm
+      have hmlp' : mlProp a b n (min n a.length) := by simpa [hi] using hmlp
+      exact False.elim ((not_ml_hi a b n) hmlp')
+  have hmono : ∀ i, lo ≤ i → i < hi → P i = true → P (i + 1) = true := by
+    intro i hli hih hPi
+    dsimp [P] at hPi ⊢
+    have hml_i_false : moreLeft a b n i = false := by
+      cases hm : moreLeft a b n i
+      · rfl
+      · have hf : (!(moreLeft a b n i)) = false := by simp [hm]
+        rw [hf] at hPi
+        cases hPi
+    cases hml_succ : moreLeft a b n (i + 1)
+    · rfl
+    · have hp_succ := (moreLeft_iff_ml a b n (i + 1)).mp hml_succ
+      have hp_i := ml_mono a b ha hb n lo i (by rfl) hli hp_succ
+      have hml_i_true := (moreLeft_iff_ml a b n i).mpr hp_i
+      rw [hml_i_false] at hml_i_true
+      cases hml_i_true
+  have hres := firstP_result P fuel lo hi hlohi hwidth hPhi hmono
+  let i := firstP P fuel lo hi
+  have hdiag : diagonal a.toArray b.toArray n fuel lo hi = i := by
+    dsimp [i, P]
+    exact diagonal_eq_firstP a b n fuel lo hi
+  have hPi : moreLeft a b n i = false := by
+    have hp := hres.1
+    dsimp [P] at hp
+    cases hm : moreLeft a b n i
+    · rfl
+    · have hf : (!(moreLeft a b n i)) = false := by simp [hm]
+      rw [hf] at hp
+      cases hp
+  have hprev : ∀ k, lo ≤ k → k < i → moreLeft a b n k = true := by
+    intro k hlk hki
+    have hp := hres.2 k hlk hki
+    dsimp [P] at hp
+    cases hm : moreLeft a b n k
+    · have hf : (!(moreLeft a b n k)) = true := by simp [hm]
+      rw [hf] at hp
+      cases hp
+    · rfl
+  have hibounds := firstP_bounds P fuel lo hi hlohi
+  have hi_le_a : i ≤ a.length := by
+    have hbnd := hibounds.2
+    dsimp [i, hi] at hbnd ⊢
+    omega
+  have hi_le_n : i ≤ n := by
+    have hbnd := hibounds.2
+    dsimp [i, hi] at hbnd ⊢
+    omega
+  let j := n - i
+  have hj_le_b : j ≤ b.length := by
+    have hbnd := hibounds.1
+    dsimp [i, j, lo] at hbnd ⊢
+    omega
+  have hj_eq : i + j = n := by dsimp [j]; omega
+  have hcut : cutOK a b i j := by
+    refine ⟨hi_le_a, hj_le_b, ?_, ?_⟩
+    · intro x hx y hy
+      by_cases hi0 : i = 0
+      · have hax : (a.take i).getLast? = none := by rw [hi0]; simp
+        simp [hax] at hx
+      · by_cases hil : i = lo
+        · have hjl : n - lo = b.length ∨ lo = 0 := by dsimp [lo]; omega
+          rcases hjl with hjl | hlo0
+          · have hbj : b[j]? = none := by dsimp [j]; rw [hil, hjl]; simp
+            simp [hbj] at hy
+          · have hax : (a.take i).getLast? = none := by rw [hil, hlo0]; simp
+            simp [hax] at hx
+        · have hilt : lo ≤ i - 1 := by omega
+          have hilt' : i - 1 < i := by omega
+          have hmprev := hprev (i - 1) hilt hilt'
+          have hmlp : mlProp a b n (i - 1) := (moreLeft_iff_ml a b n (i - 1)).mp hmprev
+          rcases hmlp with ⟨_, x', hx', y', hy', hlexy⟩
+          have hxeq' : a[i - 1] = x' := by
+            have ht := hx'
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact Option.some.inj ht
+          have hyeq' : b[n - (i - 1) - 1] = y' := by
+            have ht := hy'
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact Option.some.inj ht
+          have hgeta : (a.take i).getLast? = a[i - 1]? := getLast_take a i (by omega) hi_le_a
+          have hxeq : x = a[i - 1] := by
+            have ht := hx
+            rw [hgeta] at ht
+            simp at ht
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact (Option.some.inj ht).symm
+          have hidxeq : n - (i - 1) - 1 = j := by dsimp [j]; omega
+          have hyeq : y = b[n - (i - 1) - 1] := by
+            have ht := hy
+            rw [← hidxeq] at ht
+            simp at ht
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact (Option.some.inj ht).symm
+          rw [hxeq, hyeq, hxeq', hyeq']
+          exact hlexy
+    · by_cases hj0 : j = 0
+      · simp [hj0]
+      · by_cases hia : i = a.length
+        · simp [hia]
+        · have hidxa : i < a.length := by omega
+          have hidxb : j - 1 < b.length := by omega
+          dsimp [j] at hidxb
+          have hbgi : b[n - i - 1]? = some b[n - i - 1] := List.getElem?_eq_getElem (by omega)
+          have hagi : a[i]? = some a[i] := List.getElem?_eq_getElem (by omega)
+          have hmlf : moreLeft a b n i = false := hPi
+          dsimp [moreLeft] at hmlf
+          rw [hbgi, hagi] at hmlf
+          simp at hmlf
+          have hlt : b[n - i - 1].1 < a[i].1 := by omega
+          have hgetb : (b.take j).getLast? = b[j - 1]? := getLast_take b j (by omega) hj_le_b
+          intro y hy x hx
+          have hyeq : y = b[n - i - 1] := by
+            have ht := hy
+            rw [hgetb] at ht
+            have hidxeq2 : j - 1 = n - i - 1 := rfl
+            rw [hidxeq2] at ht
+            simp at ht
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact (Option.some.inj ht).symm
+          have hxeq : x = a[i] := by
+            have ht := hx
+            simp at ht
+            rw [List.getElem?_eq_getElem (by omega)] at ht
+            exact (Option.some.inj ht).symm
+          rw [hyeq, hxeq]
+          exact hlt
+  have hcut_eq : mergeCut a b n = (i, j) := by
+    dsimp [mergeCut, lo, hi, fuel, i, j]
+    rw [hdiag]
+  simp [hcut_eq]
+  refine ⟨hj_eq, hcut, ?_, ?_⟩
+  · intro i' j' hsum hcut'
+    have hu := cutOK_unique a b ha hb n i j i' j' hj_eq hsum hcut hcut'
+    exact ⟨hu.1.symm, hu.2.symm⟩
+  · have hm := merge_split_aux a b i j ha hb hi_le_a hj_le_b hcut
+    rw [hm]
+    have hlen : (List.merge (a.take i) (b.take j) leKey).length = n := by
+      simp [Nat.min_eq_left hi_le_a, Nat.min_eq_left hj_le_b, hj_eq]
+    rw [← hlen]
+    simp
+
+private abbrev Tagged := Row × Nat
+
+private abbrev tagLE (a b : Tagged) : Prop := List.zipIdxLE leKey a b = true
+
+private def expRuns (rs : List (Int × List Nat)) : List Row :=
+  rs.flatMap fun (k, vs) => vs.map fun v => (k, v)
+
+private def tagBlocks : List (Int × List Nat) → Nat → List (List Tagged)
+  | [], _ => []
+  | (k, vs) :: rs, off =>
+      (vs.map fun v => (k, v)).zipIdx off :: tagBlocks rs (off + vs.length)
+
+private theorem expRuns_append (rs₁ rs₂ : List (Int × List Nat)) :
+    expRuns (rs₁ ++ rs₂) = expRuns rs₁ ++ expRuns rs₂ := by
+  induction rs₁ <;> simp [expRuns, *]
+
+private theorem tagBlocks_flatten : ∀ (rs : List (Int × List Nat)) (off : Nat),
+    (tagBlocks rs off).flatten = (expRuns rs).zipIdx off
+  | [], off => by simp [tagBlocks, expRuns]
+  | (k, vs) :: rs, off => by
+      simp [tagBlocks, expRuns, List.zipIdx_append, tagBlocks_flatten rs (off + vs.length)]
+
+private theorem zipIdx_map_fst {α : Type} : ∀ (l : List α) (off : Nat),
+    (l.zipIdx off).map (fun z => z.1) = l
+  | [], _ => by simp
+  | x :: xs, off => by simp [zipIdx_map_fst xs (off + 1)]
+
+private theorem tagBlocks_fst (rs : List (Int × List Nat)) (off : Nat) :
+    ((tagBlocks rs off).flatten.map fun z => z.1) = expRuns rs := by
+  rw [tagBlocks_flatten]
+  exact zipIdx_map_fst (expRuns rs) off
+
+private theorem tagBlocks_rev_fst : ∀ (rs : List (Int × List Nat)) (off : Nat),
+    ((tagBlocks rs off).reverse.flatten.map fun z => z.1) = expRuns rs.reverse
+  | [], off => by simp [tagBlocks, expRuns]
+  | (k, vs) :: rs, off => by
+      have htail := tagBlocks_rev_fst rs (off + vs.length)
+      simp [tagBlocks, expRuns, List.reverse_cons, List.flatten_append,
+        List.map_append, htail]
+
+private theorem tagBlocks_rev_perm : ∀ (rs : List (Int × List Nat)) (off : Nat),
+    ((tagBlocks rs off).reverse.flatten).Perm (tagBlocks rs off).flatten
+  | [], off => by simp [tagBlocks]
+  | (k, vs) :: rs, off => by
+      have htail := tagBlocks_rev_perm rs (off + vs.length)
+      have h1 := htail.append (List.Perm.refl ((vs.map fun v => (k, v)).zipIdx off))
+      simpa [tagBlocks] using h1.trans (List.perm_append_comm
+        (l₁ := (tagBlocks rs (off + vs.length)).flatten)
+        (l₂ := (vs.map fun v => (k, v)).zipIdx off))
+
+private theorem mem_block_fst_key {k : Int} {vs : List Nat} {off : Nat} {z : Tagged} :
+    z ∈ (vs.map fun v => (k, v)).zipIdx off → z.1.1 = k := by
+  intro hz
+  have hfz : z.1 ∈ vs.map (fun v => (k, v)) := List.fst_mem_of_mem_zipIdx hz
+  rcases List.mem_map.mp hfz with ⟨v, hv, hvEq⟩
+  rw [← hvEq]
+
+private theorem block_pairwise (k : Int) (vs : List Nat) (off : Nat) :
+    ((vs.map fun v => (k, v)).zipIdx off).Pairwise tagLE := by
+  induction vs generalizing off with
+  | nil => simp
+  | cons v vs ih =>
+      simp only [List.map_cons, List.zipIdx_cons]
+      rw [List.pairwise_cons]
+      constructor
+      · intro z hz
+        have hkey : z.1.1 = k := mem_block_fst_key hz
+        have hidx0 : off + 1 ≤ z.2 := List.le_snd_of_mem_zipIdx hz
+        have hidx : off ≤ z.2 := by omega
+        have hle1 : leKey (k, v) z.1 = true := by
+          unfold leKey
+          apply decide_eq_true
+          rw [hkey]
+          omega
+        have hle2 : leKey z.1 (k, v) = true := by
+          unfold leKey
+          apply decide_eq_true
+          rw [hkey]
+          omega
+        simp [tagLE, List.zipIdxLE, hle1, hle2, hidx]
+      · simpa using ih (off + 1)
+
+private theorem mem_tagBlocks_key_lt : ∀ (rs : List (Int × List Nat)) (off : Nat)
+    (bound : Int) (z : Tagged),
+    (∀ r ∈ rs, r.1 < bound) → z ∈ (tagBlocks rs off).flatten → z.1.1 < bound
+  | [], off, bound, z, h, hz => by simp [tagBlocks] at hz
+  | (k, vs) :: rs, off, bound, z, h, hz => by
+      have hk : k < bound := h (k, vs) (by simp)
+      have htail : ∀ r ∈ rs, r.1 < bound := by intro r hr; exact h r (by simp [hr])
+      change z ∈ (vs.map fun v => (k, v)).zipIdx off ++
+        (tagBlocks rs (off + vs.length)).flatten at hz
+      rw [List.mem_append] at hz
+      rcases hz with hz | hz
+      · rw [mem_block_fst_key hz]
+        exact hk
+      · exact mem_tagBlocks_key_lt rs (off + vs.length) bound z htail hz
+
+private theorem tagBlocks_rev_pairwise : ∀ (rs : List (Int × List Nat)) (off : Nat),
+    (rs.map Prod.fst).Pairwise (· > ·) →
+    ((tagBlocks rs off).reverse.flatten).Pairwise tagLE
+  | [], off, h => by simp [tagBlocks]
+  | (k, vs) :: rs, off, h => by
+      have hkrs : ∀ r ∈ rs, r.1 < k := by
+        intro r hr
+        exact (List.pairwise_cons.mp h).1 r.1 (List.mem_map.mpr ⟨r, hr, rfl⟩)
+      have hpair_tail := tagBlocks_rev_pairwise rs (off + vs.length) (List.Pairwise.of_cons h)
+      have hpair_block := block_pairwise k vs off
+      have hcross : ∀ x ∈ (tagBlocks rs (off + vs.length)).reverse.flatten,
+          ∀ y ∈ (vs.map fun v => (k, v)).zipIdx off, tagLE x y := by
+        intro x hx y hy
+        have hxkey : x.1.1 < k :=
+          mem_tagBlocks_key_lt rs (off + vs.length) k x hkrs (by simpa using hx)
+        have hykey : y.1.1 = k := mem_block_fst_key hy
+        have hle1 : leKey x.1 y.1 = true := by
+          unfold leKey
+          apply decide_eq_true
+          rw [hykey]
+          omega
+        have hle2 : leKey y.1 x.1 = false := by
+          unfold leKey
+          apply decide_eq_false
+          rw [hykey]
+          omega
+        simp [tagLE, List.zipIdxLE, hle1, hle2]
+      have happ := List.pairwise_append.mpr ⟨hpair_tail, hpair_block, hcross⟩
+      simpa [tagBlocks, List.reverse_cons, List.flatten_append] using happ
+
+theorem ReversePeerRuns_sound : TinylambOpt.ResearchGoals.OrderedStreams.ReversePeerRuns.Goal := by
+  intro runs hruns
+  let L := expRuns runs
+  let T := (tagBlocks runs 0).reverse.flatten
+  have hpairT : T.Pairwise tagLE := by
+    simpa [T, L] using tagBlocks_rev_pairwise runs 0 hruns
+  have hpermT : T.Perm L.zipIdx := by
+    have hp := tagBlocks_rev_perm runs 0
+    rw [tagBlocks_flatten] at hp
+    simpa [T, L] using hp
+  have hle_trans : ∀ (a b c : Row), leKey a b → leKey b c → leKey a c := by
+    intro a b c hab hbc
+    unfold leKey at hab hbc ⊢
+    apply decide_eq_true
+    have h1 : a.1 ≤ b.1 := of_decide_eq_true hab
+    have h2 : b.1 ≤ c.1 := of_decide_eq_true hbc
+    omega
+  have hle_total : ∀ (a b : Row), leKey a b || leKey b a := by
+    intro a b
+    unfold leKey
+    by_cases h : a.1 ≤ b.1
+    · simp [h]
+    · have h' : b.1 ≤ a.1 := by omega
+      simp [h, h']
+  have hpairM : ((L.zipIdx).mergeSort (List.zipIdxLE leKey)).Pairwise tagLE := by
+    exact List.pairwise_mergeSort (le := List.zipIdxLE leKey)
+      (List.zipIdxLE_trans hle_trans) (List.zipIdxLE_total hle_total) L.zipIdx
+  have hpermM : ((L.zipIdx).mergeSort (List.zipIdxLE leKey)).Perm T := by
+    exact (List.mergeSort_perm L.zipIdx (List.zipIdxLE leKey)).trans hpermT.symm
+  have hEq : (L.zipIdx).mergeSort (List.zipIdxLE leKey) = T := by
+    apply List.Perm.eq_of_pairwise (le := tagLE)
+    · intro a b ha hb hab hba
+      have hle_ab : leKey a.1 b.1 = true := by
+        by_cases h : leKey a.1 b.1 = true
+        · exact h
+        · have hf : leKey a.1 b.1 = false := by cases hle : leKey a.1 b.1 <;> simp_all
+          simp [tagLE, List.zipIdxLE, hf] at hab
+      have hle_ba : leKey b.1 a.1 = true := by
+        by_cases h : leKey b.1 a.1 = true
+        · exact h
+        · have hf : leKey b.1 a.1 = false := by cases hle : leKey b.1 a.1 <;> simp_all
+          simp [tagLE, List.zipIdxLE, hf] at hba
+      have hind1 : a.2 ≤ b.2 := by simpa [tagLE, List.zipIdxLE, hle_ab, hle_ba] using hab
+      have hind2 : b.2 ≤ a.2 := by simpa [tagLE, List.zipIdxLE, hle_ab, hle_ba] using hba
+      have hind : a.2 = b.2 := by omega
+      have hbmem : b ∈ L.zipIdx := hpermT.mem_iff.mp hb
+      have hamem : a ∈ L.zipIdx := (List.mergeSort_perm L.zipIdx (List.zipIdxLE leKey)).mem_iff.mp ha
+      have had : L[a.2]? = some a.1 := List.mk_mem_zipIdx_iff_getElem?.mp hamem
+      have hbd : L[b.2]? = some b.1 := List.mk_mem_zipIdx_iff_getElem?.mp hbmem
+      rw [hind] at had
+      have hrow : a.1 = b.1 := by
+        have hd : some a.1 = some b.1 := by rw [← had, hbd]
+        exact Option.some.inj hd
+      exact Prod.ext hrow hind
+    · exact hpairM
+    · exact hpairT
+    · exact hpermM
+  have hst := List.mergeSort_zipIdx (l := L) (le := leKey)
+  have hfst : T.map (fun z => z.1) = expRuns runs.reverse := by
+    simpa [T] using tagBlocks_rev_fst runs 0
+  change expRuns runs.reverse = (expRuns runs).mergeSort leKey
+  rw [← hfst, ← hEq, hst]
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

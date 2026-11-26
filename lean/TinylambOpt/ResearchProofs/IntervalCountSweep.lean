@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.IntervalCountSweep
 
+/-!
+Proved
+
+- `Goal` — `∀ spans points, sweep spans points = reference spans points`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.IntervalCountSweep`.
+-/
+
 namespace TinylambOpt.ResearchProofs.IntervalCountSweep
 
 open TinylambOpt.ResearchGoals.IntervalCountSweep
@@ -1167,3 +1175,8 @@ theorem sound : TinylambOpt.ResearchGoals.IntervalCountSweep.Goal := by
     simp [out, reference, List.getElem?_map, hi]
 
 end TinylambOpt.ResearchProofs.IntervalCountSweep
+
+-- C++ references to this model or its proof.
+-- executor/detail/subquery_runtime.cpp
+-- executor/detail/subquery_runtime.hpp
+-- executor/relational_regression_test_part11.cpp

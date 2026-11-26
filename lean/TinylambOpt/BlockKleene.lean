@@ -1,3 +1,12 @@
+/-!
+The four observable outcomes of predicate evaluation.
+
+Kleene NOT; ERROR is absorbing.
+
+Named results include `aeval_contains_ceval`, `block_kleene_sound`,
+`block_all_pass_sound`.
+-/
+
 /-
   TinylambOpt/BlockKleene.lean
 
@@ -223,3 +232,8 @@ theorem dictionary_block_skip (rows : List (Nat → Nat)) (decode : Nat → Nat 
   simpa using List.mem_map_of_mem (f := fun row => decode col (row col)) hr
 
 end TinylambOpt.BlockKleene
+
+-- C++ references to this model or its proof.
+-- executor/parallel_scan.cpp
+-- executor/zone_map.cpp
+-- executor/zone_map.hpp

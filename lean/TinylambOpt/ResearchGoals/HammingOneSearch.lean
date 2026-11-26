@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims characterize candidates within one substitution of a search key. A SQL text
+search can narrow candidates while preserving all matches in that distance model.
+
+Modeled claims
+
+- `Goal` — `∀ pat text, pat.length ≤ 64 → search pat text = reference pat text`
+-/
+
 namespace TinylambOpt.ResearchGoals.HammingOneSearch
 
 abbrev W := BitVec 64

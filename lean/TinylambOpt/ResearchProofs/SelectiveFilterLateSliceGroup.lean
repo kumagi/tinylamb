@@ -1,6 +1,19 @@
 import Std
 import TinylambOpt.ResearchGoals.SelectiveFilterLateSliceGroup
 
+/-!
+Proved
+
+- `Goal` — Selective integer pre-filter + lazy VarChar slice group-by + guarded `CASE`
+  string decode (ClickBench Q37/Q38/Q40): delaying string slicing past integer
+  selection and length checks while guarding secondary string decodes under `CASE
+  WHEN cond THEN ref ELSE ""` produces exact group counts with zero decodes on
+  filtered-out or constant-branch rows.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SelectiveFilterLateSliceGroup`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SelectiveFilterLateSliceGroup
 
 open TinylambOpt.ResearchGoals.SelectiveFilterLateSliceGroup

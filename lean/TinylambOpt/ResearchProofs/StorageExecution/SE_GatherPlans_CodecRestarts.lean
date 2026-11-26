@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `CodecRestarts.GatherOrder` — `∀ (restart seekFee : Nat), gatherOrder (price restart
+  seekFee)`
+- `CodecRestarts.LatencyCap` — `∀ (restart seekFee : Nat), latencyCap (price restart
+  seekFee)`
+- `CodecRestarts.LeastCost` — `∀ (restart seekFee : Nat), leastCost (price restart
+  seekFee)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.CodecRestarts
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

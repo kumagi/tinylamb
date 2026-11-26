@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `IntersectingCycles.TwoSeparators` — `∀ n db b, reference pattern n db b = total n
+  (fun y => total n (fun z => db 0 y z * total n (fun u => bridge n db 0 0 z u * db 0
+  u y) * total n (fun v => bridge n db 1 2 y v * db 2 v z)))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

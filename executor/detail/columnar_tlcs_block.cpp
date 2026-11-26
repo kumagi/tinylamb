@@ -19,7 +19,7 @@
 
 namespace tinylamb::relational_detail {
 namespace {
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (filterColumnAtATime_eq_row_at_a_time, filter_skip_always_true,
 //    range_fusion_filter_eq)
 // Column-at-a-time conjunctive filter for non-null int64/date and double
@@ -244,8 +244,9 @@ bool TryFilterBlockNumericColumnAtATime(
     return false;
   }
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (InRangeSynopsis_sound)
-  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
+  // (InRangeSynopsis_sound)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
   //   (MultiKeyInRangeZoneBlockSkip_sound,
   //   BlockConjunctionZoneBitmapPrune_sound)
   for (const TypedInListCompare& in : preds.inlists) {
@@ -277,8 +278,9 @@ bool TryFilterBlockNumericColumnAtATime(
   std::array<FastNumericPred, 16> fps{};
   size_t nf = 0;
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (InRangeSynopsis_sound)
-  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
+  // (InRangeSynopsis_sound)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
   //   (MultiKeyInRangeZoneBlockSkip_sound,
   //   BlockConjunctionZoneBitmapPrune_sound)
   for (const TypedInListCompare& in : preds.inlists) {
@@ -597,29 +599,98 @@ StatusOr<bool> DecodeAndFilterBlock(
       }
     }
 
-    RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
-        bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
-        &scratch->io1a, {}));
-    for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
-      (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
-    }
-    if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count,
-                            refine_literal, cand_rows)) {
-      for (const auto& pc : preds.contains_prechecks) {
-        const auto* ch = (*col_ptrs)[pc.full_col];
-        if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
-          cand_rows->clear();
-          return false;
+    // Compressed-VARCHAR contains pushdown: evaluate `LIKE '%needle%'` directly
+    // on the front-coded dictionary or decompressed stream before expanding
+    // all 4096 rows into `blk1a`. Skips 85-95% of non-matching blocks
+    // completely and restricts `blk1a` materialization to the matching rows
+    // only.
+    bool stage1a_contains_handled = false;
+    if (sched.stage1a_cols.size() == 1 && !preds.contains_prechecks.empty()) {
+      const slot_t s1a_col = sched.stage1a_cols[0];
+      const auto pc_it = std::ranges::find_if(
+          preds.contains_prechecks, [s1a_col](const ContainsPrecheck& pc) {
+            return pc.full_col == s1a_col && !pc.needle.empty();
+          });
+      if (pc_it != preds.contains_prechecks.end()) {
+        std::vector<uint32_t> hit_rows;
+        uint32_t blk_rows = 0;
+        ASSIGN_OR_RETURN(
+            bool, matched_compressed,
+            tlcs.TryMatchCompressedVarCharContains(bidx, s1a_col, pc_it->needle,
+                                                   &blk_rows, &hit_rows));
+        if (matched_compressed) {
+          stage1a_contains_handled = true;
+          if (hit_rows.empty()) {
+            cand_rows->clear();
+            return false;
+          }
+          if (refine_literal) {
+            // Intersect ascending `cand_rows` and `hit_rows`.
+            std::vector<uint32_t> inter;
+            inter.reserve(std::min(cand_rows->size(), hit_rows.size()));
+            size_t ai = 0;
+            size_t bi = 0;
+            while (ai < cand_rows->size() && bi < hit_rows.size()) {
+              if ((*cand_rows)[ai] < hit_rows[bi]) {
+                ++ai;
+              } else if (hit_rows[bi] < (*cand_rows)[ai]) {
+                ++bi;
+              } else {
+                inter.push_back((*cand_rows)[ai]);
+                ++ai;
+                ++bi;
+              }
+            }
+            cand_rows->swap(inter);
+          } else {
+            // Filter `hit_rows` against already-decoded `stage1b` columns.
+            cand_rows->clear();
+            for (const uint32_t r : hit_rows) {
+              if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+                cand_rows->push_back(r);
+              }
+            }
+          }
+          if (cand_rows->empty()) {
+            return false;
+          }
+          // Materialize ONLY the surviving candidate rows for `stage1a_cols`.
+          RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
+              bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
+              &scratch->io1a, {}, false, *cand_rows));
+          (*col_ptrs)[s1a_col] = scratch->blk1a.columns.data();
+          std::erase_if(*cand_rows, [&](uint32_t r) {
+            return !RowMatchesColPtrs(preds, *col_ptrs, r);
+          });
         }
       }
-      if (refine_literal) {
-        std::erase_if(*cand_rows, [&](uint32_t r) {
-          return !RowMatchesColPtrs(preds, *col_ptrs, r);
-        });
-      } else {
-        for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
-          if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
-            cand_rows->push_back(r);
+    }
+
+    if (!stage1a_contains_handled) {
+      RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
+          bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
+          &scratch->io1a, {}));
+      for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
+        (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
+      }
+      if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count,
+                              refine_literal, cand_rows)) {
+        for (const auto& pc : preds.contains_prechecks) {
+          const auto* ch = (*col_ptrs)[pc.full_col];
+          if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
+            cand_rows->clear();
+            return false;
+          }
+        }
+        if (refine_literal) {
+          std::erase_if(*cand_rows, [&](uint32_t r) {
+            return !RowMatchesColPtrs(preds, *col_ptrs, r);
+          });
+        } else {
+          for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
+            if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+              cand_rows->push_back(r);
+            }
           }
         }
       }
@@ -661,24 +732,68 @@ StatusOr<bool> DecodeAndFilterBlock(
   }
 
   if (!sched.stage1a_cols.empty()) {
-    RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
-        bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
-        &scratch->io1a, {}));
-    *local_scanned += scratch->blk1a.row_count;
-    for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
-      (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
-    }
-    if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count, false,
-                            cand_rows)) {
-      for (const auto& pc : preds.contains_prechecks) {
-        const auto* ch = (*col_ptrs)[pc.full_col];
-        if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
-          return false;
+    bool stage1a_contains_handled = false;
+    if (sched.stage1a_cols.size() == 1 && !preds.contains_prechecks.empty()) {
+      const slot_t s1a_col = sched.stage1a_cols[0];
+      const auto pc_it = std::ranges::find_if(
+          preds.contains_prechecks, [s1a_col](const ContainsPrecheck& pc) {
+            return pc.full_col == s1a_col && !pc.needle.empty();
+          });
+      if (pc_it != preds.contains_prechecks.end()) {
+        uint32_t blk_rows = 0;
+        ASSIGN_OR_RETURN(
+            bool, matched_compressed,
+            tlcs.TryMatchCompressedVarCharContains(bidx, s1a_col, pc_it->needle,
+                                                   &blk_rows, cand_rows));
+        if (matched_compressed) {
+          stage1a_contains_handled = true;
+          *local_scanned += blk_rows;
+          if (cand_rows->empty()) {
+            return false;
+          }
+          // Pure single-contains filter with no downstream column references
+          // (e.g. `SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'`):
+          // `cand_rows` is already exact and `blk1a` never needs expansion.
+          const bool pure_single_contains =
+              preds.compares.size() == 1 && preds.inlists.empty() &&
+              preds.nulls.empty() && preds.derived_compares.empty() &&
+              sched.stage1b_cols.empty() && sched.stage1c_cols.empty() &&
+              sched.stage2_cols.empty() && sched.cond_cols.empty();
+          if (pure_single_contains) {
+            return true;
+          }
+          // Otherwise materialize ONLY the surviving candidate rows for
+          // `stage1a_cols` so downstream predicates/aggregates can read them.
+          RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
+              bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
+              &scratch->io1a, {}, false, *cand_rows));
+          (*col_ptrs)[s1a_col] = scratch->blk1a.columns.data();
+          std::erase_if(*cand_rows, [&](uint32_t r) {
+            return !RowMatchesColPtrs(preds, *col_ptrs, r);
+          });
         }
       }
-      for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
-        if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
-          cand_rows->push_back(r);
+    }
+    if (!stage1a_contains_handled) {
+      RETURN_IF_FAIL(tlcs.DecodeBlockColumnsWithOptions(
+          bidx, sched.stage1a_cols, table_schema, &scratch->blk1a, true,
+          &scratch->io1a, {}));
+      *local_scanned += scratch->blk1a.row_count;
+      for (size_t i = 0; i < sched.stage1a_cols.size(); ++i) {
+        (*col_ptrs)[sched.stage1a_cols[i]] = &scratch->blk1a.columns[i];
+      }
+      if (!TryJitContainsRows(preds, *col_ptrs, scratch->blk1a.row_count, false,
+                              cand_rows)) {
+        for (const auto& pc : preds.contains_prechecks) {
+          const auto* ch = (*col_ptrs)[pc.full_col];
+          if (ch != nullptr && !BlockPassesContainsPrecheck(*ch, pc.needle)) {
+            return false;
+          }
+        }
+        for (uint32_t r = 0; r < scratch->blk1a.row_count; ++r) {
+          if (RowMatchesColPtrs(preds, *col_ptrs, r)) {
+            cand_rows->push_back(r);
+          }
         }
       }
     }
@@ -746,7 +861,8 @@ StatusOr<bool> DecodeAndFilterBlock(
     for (size_t i = 0; i < sched.stage1b_cols.size(); ++i) {
       (*col_ptrs)[sched.stage1b_cols[i]] = &scratch->blk1b.columns[i];
     }
-    if (preds.Empty() || BlockSatisfiesAllColumnarPredicates(preds, *col_ptrs)) {
+    if (preds.Empty() ||
+        BlockSatisfiesAllColumnarPredicates(preds, *col_ptrs)) {
       cand_rows->resize(rc);
       for (uint32_t r = 0; r < rc; ++r) {
         (*cand_rows)[r] = r;

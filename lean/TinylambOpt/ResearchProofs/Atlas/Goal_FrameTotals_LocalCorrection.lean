@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 import TinylambOpt.ResearchProofs.Atlas.Goal_FrameTotals_RowIncidence
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `FrameTotals.LocalCorrection` — `∀ x y a b, measure (x++b::y)-measure (x++a::y) =
+  (b-a)*(size x+1)*(size y+1)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

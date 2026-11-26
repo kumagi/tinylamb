@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.JobJ3
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Refuted by counterexample
+
+- `ProbeSchedule` — Aggressive scheduling hypothesis: exact current-block miss counts
+  suffice to choose an optimal local order despite cache reuse in later morsels.
+  Refutation would justify pricing future reuse even with perfect selectivities.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -17,3 +28,6 @@ theorem refute : ¬ Goal := by
       cheapest counterP counterM ⟨[], []⟩ counterBlocks := by
     native_decide
   exact hne hEq
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.cpp

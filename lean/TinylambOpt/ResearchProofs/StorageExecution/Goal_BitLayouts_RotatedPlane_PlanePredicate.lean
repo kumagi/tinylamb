@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `RotatedPlane.PlanePredicate` — BIT_TEST can produce matching row IDs from a single
+  physical bit per row.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

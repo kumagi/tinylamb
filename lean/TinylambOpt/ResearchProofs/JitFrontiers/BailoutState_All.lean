@@ -1,5 +1,28 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.BailoutState
 
+/-!
+An expression JIT must carry sufficient cursor and accumulator state when it resumes
+execution in a slower path.
+
+Proved (90 claims, including the following)
+
+- `BucketCount.BailReason` — A short return witnesses the first row that cannot be
+  committed in the reported state.
+- `BucketCount.BoundaryGrow` — `∀ k, (run policy 1 []
+  [(64*k+63,none),(64*(k+1),none)]).cursor=1`
+- `BucketCount.ChunkHandoff` — A successful first morsel can hand its state to a second
+  compiled morsel.
+
+Refuted by counterexample (10 claims, including the following)
+
+- `BucketCount.EarlyAdvance` — Strong hypothesis: moving the cursor past the
+  uncommitted bailout row is harmless.
+- `ChangedOnly.EarlyAdvance` — Strong hypothesis: moving the cursor past the
+  uncommitted bailout row is harmless.
+- `CountRows.EarlyAdvance` — Strong hypothesis: moving the cursor past the uncommitted
+  bailout row is harmless.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

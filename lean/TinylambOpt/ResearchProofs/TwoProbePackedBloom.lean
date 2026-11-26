@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.TwoProbePackedBloom
 
+/-!
+Proved
+
+- `Goal` — Two-probe biased-2x32 packed Bloom filter (`executor/detail/build_input.cpp`
+  `packed_bloom`): biasing non-negative offsets within `[0, 2^32)` avoids signed
+  sign-extension bit corruption and yields exact SQL equi-join parity for any 64-bit
+  hash function and bit width `1 ≤ m ≤ 20`.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.TwoProbePackedBloom`.
+-/
+
 open TinylambOpt.ResearchGoals.TwoProbePackedBloom
 
 namespace TinylambOpt.ResearchProofs.TwoProbePackedBloom
@@ -271,3 +282,6 @@ theorem sound : TinylambOpt.ResearchGoals.TwoProbePackedBloom.Goal := by
       rw [probe_eq_of_valid hbuild p]
 
 end TinylambOpt.ResearchProofs.TwoProbePackedBloom
+
+-- C++ references to this model or its proof.
+-- executor/detail/ordered_join_input.cpp

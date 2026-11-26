@@ -1,5 +1,16 @@
 import Std
 
+/-!
+(group key, ORDER BY key, payload); input order breaks ties.
+
+Streaming plan: keep only the best row per key while scanning once.
+
+Modeled claims
+
+- `Goal` — The one-pass top-1 state equals sorting and dropping duplicates, for every
+  key including NULL and for tied ORDER BY values.
+-/
+
 namespace TinylambOpt.ProposedGoals.DistinctOnTop1
 
 /-- (group key, ORDER BY key, payload); input order breaks ties. -/

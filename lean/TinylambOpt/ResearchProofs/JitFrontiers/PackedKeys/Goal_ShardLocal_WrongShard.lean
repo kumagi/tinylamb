@@ -4,6 +4,16 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.BackFields_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Specific_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Refutations_PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Proved
+
+- `ShardLocal.WrongShard` — `∀ x y, x/65536≠y/65536 → encode codec (pair (x:Nat)
+  (y:Nat))=none`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

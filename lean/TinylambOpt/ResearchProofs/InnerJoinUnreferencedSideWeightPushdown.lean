@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.InnerJoinUnreferencedSideWeightPushdown
 
+/-!
+Proved
+
+- `Goal` — Unreferenced right-side multiplicity pushdown for inner equi-joins
+  (DictionaryJoinsAndLateLabels B2 / JOB J4, J5 / STATS-CEB C5 / LDBC L5): replacing
+  the right-hand input of an inner join whose columns are unreferenced by a per-key
+  count weight table matches flat post-join `(COUNT(*), COUNT(v), SUM(v), MIN(v),
+  MAX(v))` for all groups, provided zero-weight rows are skipped rather than passed
+  to `MIN`/`MAX`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.InnerJoinUnreferencedSideWeightPushdown`.
+-/
+
 namespace TinylambOpt.ResearchProofs.InnerJoinUnreferencedSideWeightPushdown
 
 open TinylambOpt.ResearchGoals.InnerJoinUnreferencedSideWeightPushdown
@@ -150,3 +164,6 @@ theorem sound : TinylambOpt.ResearchGoals.InnerJoinUnreferencedSideWeightPushdow
   exact ref_eq_weighted (ls.filter (fun l => l.g == g)) (rs.filter RRow.pred)
 
 end TinylambOpt.ResearchProofs.InnerJoinUnreferencedSideWeightPushdown
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `DemandCache` — Cache a correlated result once per demanded key, preserving the
+  output prefix and first demanded fault. Price only distinct keys reached before
+  stop.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

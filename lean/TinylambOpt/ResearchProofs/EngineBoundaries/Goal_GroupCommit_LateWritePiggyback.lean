@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Refuted by counterexample
+
+- `LateWritePiggyback` — Aggressive: one completion also covers a write issued after
+  sync submission.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

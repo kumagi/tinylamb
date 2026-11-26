@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `OutsideBand.ComplementSum` — `∀ p rs, scan shape p rs = (rs.map Prod.snd).sum -
+  ((rs.filter (fun r => (r.1.x-p.x).natAbs ≤ 2 && (r.1.y-p.y).natAbs ≤ 4)).map
+  Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

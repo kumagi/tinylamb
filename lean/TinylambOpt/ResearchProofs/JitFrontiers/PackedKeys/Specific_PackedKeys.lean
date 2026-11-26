@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.BackFields_PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Proved (19 claims, including the following)
+
+- `CorrelatedDelta.FarApart` — `∀ x, encode codec (pair x (x+2^15))=none`
+- `CorrelatedDelta.WideSecond` — `(encode codec (pair (2^48-1) (2^48))).isSome=true`
+- `DeltaMagnitude.AdjacentNegative` — `∀ x, 0≤x → x<2^52 → encode codec (pair x
+  (x-1))=some (BitVec.ofNat 64 (x.toNat*4096+1))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

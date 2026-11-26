@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.DictionaryGrowth` — `∀ d old more k, (∀ x ∈ old, x < 2^d) → (∀ y ∈ more, 2^d
+  ≤ y ∧ y < 2^(d+1)) → k < old.length+more.length → kth (d+1) (old++more) k = if k <
+  old.length then kth d old k else 2^d+kth d more (k-old.length)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

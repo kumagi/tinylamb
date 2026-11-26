@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.CteSinglePassSplitFilter
 
+/-!
+Proved
+
+- `Goal` — Single-pass split-filter CTE scan (`query/tpch_select_rewrites.cpp`
+  `__merged_scalar_agg`, TPC-DS Q90/Q9/Q28/Q88): pre-filtering by Kleene 3VL `base
+  AND (p_1 OR ... OR p_k)` and conditionally accumulating all branches in one pass
+  equals `k` separate scans (even when `ps` overlap or contain NULL predicates).
+
+The reference model is defined in `TinylambOpt.ResearchGoals.CteSinglePassSplitFilter`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CteSinglePassSplitFilter
 
 open TinylambOpt.ResearchGoals.CteSinglePassSplitFilter

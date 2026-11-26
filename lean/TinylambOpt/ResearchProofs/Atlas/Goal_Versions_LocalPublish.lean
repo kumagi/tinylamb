@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `Versions.LocalPublish` — `∀ es e k t v, (∀ old ∈ es, earlier old e = true) → readAt
+  (es++[e]) k t v = if eligible k t v e then e.payload else readAt es k t v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

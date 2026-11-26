@@ -1,5 +1,23 @@
 import Std
 
+/-!
+Optimized offset-heavy slice via ascending bottom-`(N - off)` + reverse. Early-exits
+with `[]` whenever `xs.length ≤ off` without sorting.
+
+Dense bucket count for monotonic time quotient `Int.ediv t 60 ∈ [lo..hi]` emitting
+groups directly in sorted order without a sort operator.
+
+Modeled claims
+
+- `Goal` — Offset-heavy reverse Top-N duality (`ORDER BY DESC LIMIT L OFFSET O` with `O
+  ≫ L`, ClickBench Q40/Q41/Q42) and monotone `TIMESTAMP_TRUNC` floor quotient
+  grouping (ClickBench Q43): (1) when `xs.length ≤ off`, output is `[]` without
+  sorting; otherwise reversing the `xs.length - off` ascending elements equals
+  dropping `off` descending elements (assuming unique `(score, tieId)` or uniform
+  ties); (2) `Int.ediv · 60` is monotone and dense bucket iteration over
+  `[lo/60..hi/60]` matches hash-group + `ORDER BY`.
+-/
+
 namespace TinylambOpt.ResearchGoals.OffsetHeavyReverseTopNAndQuotientBucket
 
 abbrev Item := Int × Nat  -- (score, tie_id)

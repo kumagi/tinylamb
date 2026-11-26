@@ -2260,7 +2260,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // A selective COUNT HAVING needs only a counter and borrowed key owners
   // while probing. Delay the much larger general aggregate state until the
   // worker counts have merged and the HAVING predicate has accepted a group.
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (packed_2x32_join_key_bijection_sound)
   const bool compact_raw_left_key = [&]() {
     if (!layout.split_key_unpack_only || !layout.split_left_slot ||
@@ -3311,7 +3311,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // null-extend the outer row when every bucket pair for it was rejected.
   // Direct raw aggregates read the probe and build rows themselves. Copying
   // every joined cell into the scratch row is then pure overhead.
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   // (precomputed_build_disjunct_residual_sound)
   // When a single inner-join residual is a disjunction `L(left) OR R(right)`
   // of non-throwing single-side terms, precompute `R(right)` once per build
@@ -3449,7 +3449,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
     if (anti_unmatched_only) {
-      // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+      // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
       //   (fused_antijoin_groupby_sound)
       // A matched pair under LEFT JOIN ... WHERE right.key IS NULL marks the
       // outer row as matched, so its NULL-extended (anti) row is suppressed.
@@ -3698,7 +3698,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           : kProbeChunkRows;
   const size_t chunk_count =
       (total_left + probe_chunk_rows - 1) / probe_chunk_rows;
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   // (packed_2x32_join_key_bijection_sound)
   // Partition ColumnarTable probe chunks into morsels so large or high-fanout
   // ColumnarTables fan out across all worker threads instead of serializing
@@ -4363,7 +4363,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // aggregation over a dense unique build key. Handles both (left, right) and
   // (left, left) key placements (using zero-copy kGathered source dictionaries
   // when available) and both left-side and right-side CASE condition columns.
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (dense_2key_varchar_case_sum_sound)
   if (join_type == JoinType::kInner && integer_key && use_dense_int_rows &&
       !dense_int_idxs.empty() && left_columns.size() == 1 &&
@@ -4565,7 +4565,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         return Status::kSuccess;
       }));
     } else {
-      // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
       //   (parallel_hash_partition_preassign_iff)
       // Parallel zero-copy hash-partitioned group pre-assignment when all
       // group keys are direct uniform INT64/DATE/binary-VARCHAR columns on the
@@ -5275,7 +5275,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     const Column& column = left.schema.GetColumn(static_cast<size_t>(col));
     return !column.IsUnsigned() && column.Type() == ValueType::kInt64;
   };
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (conditional_case_double_arith_cell_eval_sound)
   const auto compile_def_double_arith_program =
       [&](const BytecodeProgram& prog, CompiledDefDoubleArith* plan) -> bool {
@@ -5519,7 +5519,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         if (right_case_conditions[i].empty() || !right_case_complete[i]) {
           // Deferred PK-column CASE: WHEN pk_int_col = const THEN double_arith
           // ELSE 0/NULL END (e.g. TPC-DS Q66 12-month pivot on date_dim.d_moy).
-          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+          // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
           //   (pk_eq_case_double_arith_sound)
           if (deferred_left_probe != nullptr &&
               sh.case_cond == ProgramShape::CaseCondKind::kColEqInt &&
@@ -5733,7 +5733,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   }
   bool left_numeric_probe = left_cell_agg_ready && !uses_double_arith_cell_op;
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
   //   (DisjointRangeBucketHistogram_sound)
   // Detect a 5-bucket disjoint shipping-delay histogram over the same (col0 -
   // col1) pair (TPC-DS Q62 / Q99: <=30, (30,60], (60,90], (90,120], >120) so
@@ -6367,7 +6367,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   bool use_radix_agg = false;
   size_t radix_primary = 0;
   bool radix_tuple_is_int = false;
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   // (packed_2x32_join_key_bijection_sound)
   const bool small_build_packed_2x32 =
       (layout.packed_2x32_group_key || (layout.use_split_key_gid && layout.split_key_unpack_only)) &&
@@ -6449,7 +6449,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
       if (ops_ok) {
         if (bounded_packed_radix) {
-          // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+          // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
           //   (radix_bucket_preserves_exact_key_order)
           // The unique build emits at most one tuple per fact row. Reserve for
           // all tuples and vector growth before switching away from local maps.
@@ -6596,7 +6596,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                       : fusion->output_order[0].expression->ToString())
               << "\n";
   }
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (parallel_disjoint_topk_member_sound, finite_sum_implies_no_inf)
   // Streaming parallel Top-K for disjoint-group indexed probes with
   // ORDER BY SUM(...) DESC LIMIT K (e.g. TPC-H Q3): skips allocating/zeroing
@@ -6957,7 +6957,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   }
   const auto phase_states_done = std::chrono::steady_clock::now();
 
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (parallel_direct_array_merge_eq, finite_sum_implies_no_inf)
   // Monotonic-left-key streaming fast path for deferred resident LSTableStore
   // probes against a unique dense right-side integer key set (e.g. TPC-H Q11):
@@ -7119,7 +7119,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       return std::move(distinct_probe_outcome.result);
     }
   }
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (packed_u64_pair_injective, finite_sum_implies_no_inf)
   // Zero-materialization columnar fast path for 2-key packed-2x32 unique joins
   // with (right_direct_key, EXTRACT(year FROM left_date_col)) grouping and
@@ -7744,7 +7744,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           std::vector<Ref> candidates;
           const auto* refs = &bucket_p;
           if (prefilter_limit != 0 && bucket_p.size() >= 8192) {
-            // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+            // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
             //   (capped_bucket_count_keeps_candidate)
             // Counter collisions can only increase a frequency. Saturating at
             // the acceptance bound therefore rejects only groups that cannot
@@ -8109,7 +8109,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       if (total_pairs == 0) {
         return;
       }
-      // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
       //   (parallel_independent_group_dedup_eq)
       // Bucket-scatter `(gid, val)` pairs by `gid` into contiguous per-group
       // `int64_t` slices, then sort+dedup each tiny slice in L1 cache instead

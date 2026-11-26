@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Vector predicates use lane masks to carry the SQL truth or selection state into later
+operators.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.PredicateBallots
 
 /-! 64-lane predicate words. The scalar reference decides whether the RHS is

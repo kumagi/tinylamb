@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `ThresholdViews.MarginCertificate` — `∀ old patch k, (weight old k).natAbs >
+  ((patch.filter (fun r => r.1 == k)).map (fun r => r.2.natAbs)).sum → active old k =
+  active (old++patch) k`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

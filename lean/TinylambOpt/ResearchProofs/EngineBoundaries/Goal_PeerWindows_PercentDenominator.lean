@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `PercentDenominator` — Appending later peers preserves PERCENT_RANK's numerator but
+  rescales its denominator.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

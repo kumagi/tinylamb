@@ -1,6 +1,17 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 import TinylambOpt.ResearchGoals.ExecutionStrategies.VersionedIndexes
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `OverlayCache` — A batch of workers can reuse a transaction-private lookup cache over
+  a fixed snapshot by patching each hot key once with the *last* staged edit.
+  Negative cache hits are patched as well as positive ones.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -61,3 +72,6 @@ theorem sound : Goal := by
   cases hp : δ.reverse.lookup a <;> simp [hp, List.lookup_append]
 
 end TinylambOpt.ResearchProofs.EngineDecisions.OverlayCache
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

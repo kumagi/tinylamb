@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Common_PredicateBallots
 
+/-!
+Vector predicates use lane masks to carry the SQL truth or selection state into later
+operators.
+
+Named results include `conjunction_yes`, `conjunction_nul`, `conjunction_err`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

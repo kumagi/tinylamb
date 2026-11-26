@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+import TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_NarrowDecimalPrefixCertificate
+
+/-! SOUND: verified DecimalChunks.NarrowDecimalPrefixCertificate. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_DecimalChunks_NarrowDecimalPrefixCertificate
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.NarrowDecimalPrefixCertificate
+theorem sound : Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_NarrowDecimalPrefixCertificate.sound
+end Nov26.Proof_DecimalChunks_NarrowDecimalPrefixCertificate

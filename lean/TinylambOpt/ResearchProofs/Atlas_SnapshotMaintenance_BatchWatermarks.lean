@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `BatchWatermarks.CoarseTime` — `∀ xs t step, 0 < step → score t xs = score (t/step)
+  (rounded step xs) - ((xs.filter (fun r => r.1/step == t/step && t < r.1)).map
+  Prod.snd).sum`
+- `BatchWatermarks.EquivalentHistory` — `∀ a b, (∀ t, score t a = score t b) ↔ ∀ t,
+  ((a.filter (fun r => r.1 == t)).map Prod.snd).sum = ((b.filter (fun r => r.1 ==
+  t)).map Prod.snd).sum`
+- `BatchWatermarks.HistoricalBand` — `∀ xs late lo hi, lo ≤ hi → (score hi
+  (xs++late)-score lo (xs++late)) - (score hi xs-score lo xs) = ((late.filter (fun r
+  => lo < r.1 && r.1 ≤ hi)).map Prod.snd).sum`
+- `BatchWatermarks.PartialOpen` — `∀ runs t, score t runs.flatten = score t (summaries
+  runs) + ((runs.filter (fun r => t < stamp r)).map (score t)).sum`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.SnapshotMaintenance.BatchWatermarks
 
 open TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance.BatchWatermarks

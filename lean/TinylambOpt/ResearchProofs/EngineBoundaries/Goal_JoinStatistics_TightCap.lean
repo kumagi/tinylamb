@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Proved
+
+- `TightCap` — A scalar min/max cap is sharp when every residual left row hits a right
+  key of maximal frequency.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

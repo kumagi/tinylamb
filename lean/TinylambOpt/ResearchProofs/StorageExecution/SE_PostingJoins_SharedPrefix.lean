@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved (10 claims, including the following)
+
+- `SharedPrefix.ExactAtLeaf` — `∀ u x, x<u → search.spans u 0 x=[(x,x+1)]`
+- `SharedPrefix.IntegralSum` — Subtraction on a stored prefix-sum column yields the
+  right payload sum.
+- `SharedPrefix.KthMatch` — Top offset within the matching postings preserves tie
+  multiplicity and right ordering.
+-/
+
 set_option maxHeartbeats 0
 
 namespace Helpers_SharedPrefix

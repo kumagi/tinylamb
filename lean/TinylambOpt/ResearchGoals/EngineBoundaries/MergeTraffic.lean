@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
 /-! Binary external merge plans. Leaves already exist on disk. Each materialized

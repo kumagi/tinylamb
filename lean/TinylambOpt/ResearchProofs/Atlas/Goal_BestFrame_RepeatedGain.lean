@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
-import TinylambOpt.ResearchProofs.Atlas_OrderedMeasures_BestFrame_Remaining
+import TinylambOpt.ResearchProofs.Atlas.OrderedMeasures.BestFrame
+
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `BestFrame.RepeatedGain` — `∀ x n, 2 ≤ n → measure ((List.replicate n x).flatten) =
+  max (measure x) (max0 (suffs x)+max0 (prefs x)+((n-2:Nat):Int)*max 0 x.sum)`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -30,6 +40,6 @@ open TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
     copies, and a prefix of another (贡献 ≤ `max0 (suffs x) + max0 (prefs x) +
     (n-2)*max 0 x.sum`).  Both bounds are attainable, so the goal holds. -/
 theorem sound_BestFrame_RepeatedGain : BestFrame.RepeatedGain.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.OrderedMeasures.BestFrame.Remaining.sound_RepeatedGain
+  exact TinylambOpt.ResearchProofs.Atlas.OrderedMeasures.BestFrame.sound_RepeatedGain
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_BestFrame_RepeatedGain

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.RelationalGuards
 
+/-!
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+
+Proved
+
+- `WeightedMix.GuardNecessity` — Failure of the extrema guard has an actual row witness
+  in the modeled domain.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

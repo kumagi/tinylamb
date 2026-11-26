@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Proved
+
+- `PromoteKey` — Tracking an additional exact hot key should never loosen this
+  two-sided bound.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

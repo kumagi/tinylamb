@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Refuted by counterexample
+
+- `PageMoments.MomentHistogram` — `∀ (a b : Page), a.length = b.length → a.sum = b.sum
+  → energy a 0 = energy b 0 → ∀ (cut : Int), a.countP (· ≥ cut) = b.countP (· ≥ cut)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

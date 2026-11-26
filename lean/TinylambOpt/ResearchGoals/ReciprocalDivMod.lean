@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims compare reciprocal-based arithmetic with division and remainder. A SQL
+expression fast path can replace division only on the proven operand range.
+
+Modeled claims
+
+- `Goal` — `∀ x d, run (prepare d) x = reference x d`
+-/
+
 namespace TinylambOpt.ResearchGoals.ReciprocalDivMod
 
 inductive Result where

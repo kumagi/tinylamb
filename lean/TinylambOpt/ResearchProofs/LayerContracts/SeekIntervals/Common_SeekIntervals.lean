@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
 
+/-!
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+
+Membership in a clamped span is the raw span membership intersected with `[0,cap)`.
+
+`any` over the (clamped, filtered) ranges equals `any` over the raw plan spans.
+
+Named results include `inside_clamped_eq`, `any_ranges_eq`, `separated_clamped`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

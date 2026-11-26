@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Reference: 3 separate full scans for the 3 heterogeneous consumers.
+
+Optimized single-pass union-filtered dispatch: reads each row at most once and updates
+only matching consumer states.
+
+Modeled claims
+
+- `Goal` — Multi-consumer single-pass fact scan sharing (TPC-DS Q14 `cross_items` +
+  `avg_sales` + branches, Q44 dual-RANK `store_sales`, Q65 `sb`+`sc` `store_sales`):
+  dispatching one scan with union predicate `p1 || p2 || p3` across heterogeneous
+  consumers produces identical outputs while bounding row reads to `rows.length` vs
+  `3 * rows.length`.
+-/
+
 namespace TinylambOpt.ResearchGoals.SinglePassMultiConsumerFactScan
 
 structure Row where

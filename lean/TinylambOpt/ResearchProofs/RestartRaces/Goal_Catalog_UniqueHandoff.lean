@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `UniqueHandoff` — Initial and final UNIQUE states can both be valid although a key
+  swap has no legal sequence of separately visible commits. Is acyclicity of the
+  old-owner → new-owner handoff graph exactly the serial-publication boundary?
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

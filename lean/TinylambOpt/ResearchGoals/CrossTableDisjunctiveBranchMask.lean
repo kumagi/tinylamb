@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Optimized build-time bitmask pruning + single bitwise `&` probe test.
+
+Modeled claims
+
+- `Goal` — Cross-table disjunctive branch bitmask reduction (TPC-DS Q48/Q15/Q79): under
+  Kleene 3VL `(pD_0 ∧ pF_0) ∨ ... ∨ (pD_{k-1} ∧ pF_{k-1})`, precomputing bit `j` on
+  dimension `D` (`pD_j = some true`), dropping zero-mask dimension rows before
+  joining, and probing fact rows via `(maskD &&& maskF) ≠ 0` reproduces exact join
+  output even when branch predicates evaluate to `NULL` (`none`).
+-/
+
 namespace TinylambOpt.ResearchGoals.CrossTableDisjunctiveBranchMask
 
 def sqlAnd (a b : Option Bool) : Option Bool :=

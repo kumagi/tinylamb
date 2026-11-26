@@ -567,4 +567,85 @@ TEST(PostgresProtocolTest, AppendDataRowFromChunkHotIntBoundaries) {
   }
 }
 
+TEST(PostgresProtocolTest, ExtendedQueryParsersAndBinaryDataRows) {
+  // Parse message with 1 int8 parameter OID (20).
+  std::string parse_payload;
+  parse_payload.append("s1", 3);
+  parse_payload.append("SELECT $1 + 1", 14);
+  AppendUint16(&parse_payload, 1);
+  AppendUint32(&parse_payload, 20);
+  auto parsed = ParseParseMessage(parse_payload);
+  ASSERT_TRUE(parsed.HasValue());
+  EXPECT_EQ(parsed.Value().statement_name, "s1");
+  EXPECT_EQ(parsed.Value().query, "SELECT $1 + 1");
+  ASSERT_EQ(parsed.Value().param_types.size(), 1U);
+  EXPECT_EQ(parsed.Value().param_types[0], 20U);
+
+  // Bind message with 1 text param ("41") and broadcast binary result format.
+  std::string bind_payload;
+  bind_payload.append("p1", 3);
+  bind_payload.append("s1", 3);
+  AppendUint16(&bind_payload, 1);
+  AppendUint16(&bind_payload, 0);  // param format = text
+  AppendUint16(&bind_payload, 1);
+  AppendUint32(&bind_payload, 2);
+  bind_payload.append("41", 2);
+  AppendUint16(&bind_payload, 1);
+  AppendUint16(&bind_payload, 1);  // result format = binary
+  auto bound = ParseBindMessage(bind_payload);
+  ASSERT_TRUE(bound.HasValue());
+  EXPECT_EQ(bound.Value().portal_name, "p1");
+  EXPECT_EQ(bound.Value().statement_name, "s1");
+  ASSERT_EQ(bound.Value().result_formats.size(), 1U);
+  EXPECT_EQ(bound.Value().result_formats[0], 1U);
+
+  auto sql = BindSqlParameters(parsed.Value().query, parsed.Value().param_types,
+                               bound.Value().param_formats,
+                               bound.Value().params);
+  ASSERT_TRUE(sql.HasValue());
+  EXPECT_EQ(sql.Value(), "SELECT 41 + 1");
+
+  // Fixed-width binary fast path: (INT64, FLOAT64, DATE) with no NULLs.
+  DataChunk fixed_chunk;
+  fixed_chunk.Initialize(
+      {ValueType::kInt64, ValueType::kDouble, ValueType::kDate});
+  fixed_chunk.Append(Row({Value(int64_t{42}), Value(3.25),
+                          Value::DateFromDays(10957 + 10)}));
+  fixed_chunk.Append(Row({Value(int64_t{-7}), Value(-0.5),
+                          Value::DateFromDays(10957 - 5)}));
+  const std::vector<uint16_t> all_bin = {1};
+  std::string batch_wire;
+  size_t written = 0;
+  ASSERT_EQ(AppendDataRowsFromChunk(&batch_wire, fixed_chunk, 0,
+                                    fixed_chunk.Size(), 0, all_bin, &written),
+            Status::kSuccess);
+  EXPECT_EQ(written, 2U);
+  std::string expected_wire;
+  for (size_t r = 0; r < fixed_chunk.Size(); ++r) {
+    expected_wire += DataRow(fixed_chunk.RowAt(r), all_bin);
+  }
+  EXPECT_EQ(batch_wire, expected_wire);
+
+  // Mixed binary + NULL + VARCHAR + text double fast path parity.
+  DataChunk mixed_chunk;
+  mixed_chunk.Initialize(
+      {ValueType::kInt64, ValueType::kDouble, ValueType::kVarChar});
+  mixed_chunk.Append(Row({Value(int64_t{100}), Value(12.5), Value("ok")}));
+  mixed_chunk.Append(Row({Value(), Value(0.0), Value()}));
+  for (const auto& fmts : std::vector<std::vector<uint16_t>>{
+           {}, {1}, {1, 0, 1}}) {
+    std::string got;
+    size_t n = 0;
+    ASSERT_EQ(AppendDataRowsFromChunk(&got, mixed_chunk, 0, mixed_chunk.Size(),
+                                      0, fmts, &n),
+              Status::kSuccess);
+    EXPECT_EQ(n, mixed_chunk.Size());
+    std::string ref;
+    for (size_t r = 0; r < mixed_chunk.Size(); ++r) {
+      ref += DataRow(mixed_chunk.RowAt(r), fmts);
+    }
+    EXPECT_EQ(got, ref);
+  }
+}
+
 }  // namespace tinylamb::pgwire

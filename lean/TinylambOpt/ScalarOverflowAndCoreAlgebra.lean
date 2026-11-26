@@ -1,5 +1,14 @@
 import TinylambOpt.WindowTopNDecorrelate
 
+/-!
+Repeated evaluations of x agree (including errors), and the discarded boolean operand y
+always returns a value. Both orders used by the optimizer preserve errors and SQL
+UNKNOWN under short-circuit evaluation.
+
+Named results include `core_join_identity_and_empty_sound`,
+`inner_join_comm_and_assoc_sound`, `push_and_split_selection_over_join_sound`.
+-/
+
 /-
 # Step 9: コア関係代数・`INT64` オーバーフロー境界・スカラ式 3 値エラー保存の網羅的 Lean 4 証明
 
@@ -785,3 +794,9 @@ theorem greatest_concat_array_cast_cse_sound {α : Type}
           List.append_nil xs, List.nil_append xs, h_idem v⟩
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- expression/rewrite.cpp
+-- plan/cascades.cpp
+-- plan/cascades_predicate_rules.cpp
+-- plan/optimizer.cpp

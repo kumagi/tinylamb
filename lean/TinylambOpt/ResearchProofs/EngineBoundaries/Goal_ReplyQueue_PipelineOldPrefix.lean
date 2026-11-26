@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `PipelineOldPrefix` — Before the first new byte is exposed, sending the old prefix
+  may overlap response assembly.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

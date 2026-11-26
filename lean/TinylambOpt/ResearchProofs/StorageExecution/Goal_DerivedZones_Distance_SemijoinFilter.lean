@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 import TinylambOpt.ResearchProofs.StorageExecution.SE_DerivedZones_Distance
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `Distance.SemijoinFilter` — Apply the footer to the build-key set before probing;
+  retain left bag order and duplicates.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

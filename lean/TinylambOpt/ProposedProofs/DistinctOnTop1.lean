@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.DistinctOnTop1
 
+/-!
+Proved
+
+- `Goal` — The one-pass top-1 state equals sorting and dropping duplicates, for every
+  key including NULL and for tied ORDER BY values.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.DistinctOnTop1`.
+-/
+
 namespace TinylambOpt.ProposedProofs.DistinctOnTop1
 
 open TinylambOpt.ProposedGoals.DistinctOnTop1
@@ -347,3 +356,6 @@ theorem sound : TinylambOpt.ProposedGoals.DistinctOnTop1.Goal := by
     simp [sorted, hfind, hmSome]
 
 end TinylambOpt.ProposedProofs.DistinctOnTop1
+
+-- C++ references to this model or its proof.
+-- executor/detail/relational_sort_limit.cpp

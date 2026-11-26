@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `SingleIsland.Cofactor` — Compute a parallel shard count by conditioning on its
+  prefix state.
+- `SingleIsland.Decoder` — Recreate every accepted bitmap from its compact code.
+- `SingleIsland.EmptyFirst` — `∀ n, unrank model n 0 0 = some (List.replicate n false)`
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/SingleIsland` goals.
 open TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 set_option maxHeartbeats 0

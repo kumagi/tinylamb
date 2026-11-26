@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Common_ArrayOffsets
 
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+
+Proved
+
+- `ReverseOffsets.ValueBlind` — Cache both group sizes and the offset map across inputs
+  of the same shape.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

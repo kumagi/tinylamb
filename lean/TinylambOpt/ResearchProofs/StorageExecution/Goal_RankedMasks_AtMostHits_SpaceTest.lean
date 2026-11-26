@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved
+
+- `AtMostHits.SpaceTest` — A shared language and row count can be amortized across
+  equally sized bitmaps.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+A predicate that is downward closed for `≤`: on a sorted list its satisfying elements
+form a prefix, so `seek` counts exactly `countP`.
+
+On a sorted list with a downward-closed test, the satisfying elements are exactly the
+leading `countP`-prefix.
+
+Named results include `sound`.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false
@@ -245,3 +258,6 @@ theorem sound : Goal := by
   omega
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Exec_RangeFingers
+
+-- C++ references to this model or its proof.
+-- executor/relational_scalar_counts.cpp

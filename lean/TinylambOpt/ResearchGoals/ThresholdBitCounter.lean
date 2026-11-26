@@ -1,5 +1,18 @@
 import TinylambOpt.ThreeValued
 
+/-!
+These claims track whether a count has reached a threshold using compact bit state. A
+SQL filter or aggregate can use the threshold decision without retaining a larger exact
+count when only that decision is needed.
+
+Modeled claims
+
+- `Goal` — `∀ active a b c, ∀ i < 64, let (yes,unknown) := masks active a b c let r :=
+  reference (atom a i) (atom b i) (atom c i) yes.getLsbD i = (active.getLsbD i &&
+  decide (r = .tTrue)) ∧ unknown.getLsbD i = (active.getLsbD i && decide (r =
+  .tNull))`
+-/
+
 namespace TinylambOpt.ResearchGoals.ThresholdBitCounter
 
 abbrev W := BitVec 64

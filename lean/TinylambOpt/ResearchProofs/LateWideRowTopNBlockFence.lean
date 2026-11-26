@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.LateWideRowTopNBlockFence
 
+/-!
+Proved
+
+- `Goal` — Block bitwise AND/OR point-lookup pruning (ClickBench Q20) and sorted block
+  fencing + late wide-row payload decoding (ClickBench Q24): (1) for any non-empty
+  block of `UInt64` keys, if `(target &&& ~~~orMask) ≠ 0` or `(~~~target &&& andMask)
+  ≠ 0`, `target` cannot appear in the block; (2) under `ValidSortBlock`, skipping
+  fenced blocks under `NULLS LAST` and decoding wide payloads only after final Top-N
+  yields exact outputs with `payloadDecodes ≤ k`.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.LateWideRowTopNBlockFence`.
+-/
+
 namespace TinylambOpt.ResearchProofs.LateWideRowTopNBlockFence
 
 open List

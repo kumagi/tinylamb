@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.QuotedDelimiterMask
 
+/-!
+Proved
+
+- `Goal` — `∀ prior len q c, len ≤ 64 → q &&& c = 0 → chunk prior len q c = scalar
+  prior len q c`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.QuotedDelimiterMask`.
+-/
+
 namespace TinylambOpt.ResearchProofs.QuotedDelimiterMask
 
 open TinylambOpt.ResearchGoals.QuotedDelimiterMask

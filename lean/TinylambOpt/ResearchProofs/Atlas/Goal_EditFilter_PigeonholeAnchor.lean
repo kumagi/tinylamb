@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `EditFilter.PigeonholeAnchor` — `∀ (ps : List Word) t k, k < ps.length → (∀ p ∈ ps, p
+  ≠ []) → Edits k ps.flatten t → ∃ p ∈ ps, occurs t p = true`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

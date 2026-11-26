@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.DemandSSA
 
 /-! Predicate SSA over nullable booleans and numbered expression faults.

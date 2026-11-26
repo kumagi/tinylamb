@@ -1,6 +1,20 @@
 import Std
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved (10 claims, including the following)
+
+- `ByteAlignedRow.DictionaryProbe` — Read only lanes requested by a probe and translate
+  them through a possibly short dictionary.
+- `ByteAlignedRow.DisjointRowWrites` — `∀ n w i j, i≠j → ∀ b ∈ footprint layout n w i,
+  b ∉ footprint layout n w j`
+- `ByteAlignedRow.Lossless` — Read one lane from serialized bytes, including zero
+  width.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.BitLayouts.ByteAlignedRow
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.Compression.Wire

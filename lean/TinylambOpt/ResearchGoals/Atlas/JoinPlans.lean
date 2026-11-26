@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Frontiers.Contractions
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
 /-! Finite bag joins. Each atom names a physical binary relation; repeated names

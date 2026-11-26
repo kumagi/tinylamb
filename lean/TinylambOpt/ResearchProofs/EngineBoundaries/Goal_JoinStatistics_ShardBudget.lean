@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Proved
+
+- `ShardBudget` — Per-shard heavy-key estimates can be summed if the build-side
+  histogram is shared.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

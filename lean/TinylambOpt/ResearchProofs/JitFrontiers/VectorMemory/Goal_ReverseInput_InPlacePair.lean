@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Common_VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Proved
+
+- `ReverseInput.InPlacePair` — `∀ j, j.src=j.dst → j.window=2 → ¬ rawFree kernel j
+  [0,1]`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

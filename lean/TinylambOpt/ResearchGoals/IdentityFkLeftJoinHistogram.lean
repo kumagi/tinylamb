@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Right-side row `(fk, val_for_count, pred_pass)`.
+
+Optimized right-only single pass: never touches left table `1..N`, accumulates non-null
+counts only for valid in-range keys `[1..N]`, then synthesizes `hist(0) = N -
+nonzeroKeys`.
+
+Modeled claims
+
+- `Goal` — Identity `1..N` left-outer-join histogram shortcut (TPC-H Q13
+  `customer(is_identity_1_to_n)` ⟕ `orders`): scanning only `R` with filter +
+  non-null value check and computing `hist(0) = N - nonzeroKeys` matches
+  materializing the full `LEFT OUTER JOIN` and double `GROUP BY`.
+-/
+
 namespace TinylambOpt.ResearchGoals.IdentityFkLeftJoinHistogram
 
 /-- Right-side row `(fk, val_for_count, pred_pass)`. -/

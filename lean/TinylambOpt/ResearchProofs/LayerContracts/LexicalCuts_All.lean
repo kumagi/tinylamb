@@ -101,3 +101,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_StringStmt_Neu
 import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_StringStmt_NextCut
 import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_StringStmt_SkipPlain
 import TinylambOpt.ResearchProofs.LayerContracts.LexicalCuts.Goal_StringStmt_StateKey
+
+/-!
+This module collects proofs for Common, Goal Array Comma Carry, Goal Array Comma Cold
+Chunk, Goal Array Comma Depth One and related cases.
+
+The SQL frontend can scan input in chunks when its carried lexical state preserves
+delimiter recognition across chunk boundaries.
+-/

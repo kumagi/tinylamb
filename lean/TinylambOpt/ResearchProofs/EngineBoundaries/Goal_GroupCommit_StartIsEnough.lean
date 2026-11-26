@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Refuted by counterexample
+
+- `StartIsEnough` — Testing a record's starting LSN instead of its exclusive end admits
+  partial records.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

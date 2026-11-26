@@ -1,5 +1,16 @@
 import Std
 
+/-!
+Keeping only `limit` rows per worker drops valid survivors when `offset > 0`.
+
+Modeled claims
+
+- `Goal` — Two-stage worker-local Top-(offset + limit) merge (`executor/topn.cpp`,
+  `executor/detail/relational_sort_limit.cpp`): pruning each worker to `offset +
+  limit` rows and taking `(sorted.drop offset).take limit` on the merged union equals
+  full global sorting across arbitrary chunk splits.
+-/
+
 namespace TinylambOpt.ResearchGoals.BoundedHeapTopNMerge
 
 abbrev Row := Int × Nat

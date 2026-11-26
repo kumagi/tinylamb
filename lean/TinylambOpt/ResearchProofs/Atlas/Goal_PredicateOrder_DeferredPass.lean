@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `PredicateOrder.DeferredPass` — `∀ c tests rows, actual (tests ++ [(c,fun _ =>
+  true)]) rows ≤ actual ((c,fun _ => true)::tests) rows`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

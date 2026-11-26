@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Exchanges.FlushDebt` — `∀ cap a b, 0 < cap → traffic cap a + traffic cap b - traffic
+  cap (a++b) ≤ (a.map Prod.fst).eraseDups.countP (fun d => (b.map Prod.fst).contains
+  d)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

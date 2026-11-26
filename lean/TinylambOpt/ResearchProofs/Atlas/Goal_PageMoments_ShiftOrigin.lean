@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `PageMoments.ShiftOrigin` — `∀ s a b, energy s b = energy s a +
+  2*(a-b)*(s.sum-s.length*a) + s.length*(a-b)^2`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.FloatFubiniHavingBand
 
+/-!
+Proved
+
+- `Goal` — Fubini sum identity + interval error-band pruning for scaled-threshold
+  HAVING queries (TPC-H Q11 `HAVING SUM(v) > alpha * (SELECT SUM(v))`): sum of all
+  group sums equals the global total sum, and any group outside the `[-(den*epsG +
+  num*epsT), +(den*epsG + num*epsT)]` drift band has its `HAVING` comparison provably
+  settled without exact summation.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.FloatFubiniHavingBand`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FloatFubiniHavingBand
 
 open TinylambOpt.ResearchGoals.FloatFubiniHavingBand

@@ -102,3 +102,15 @@ import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Sum_PairS
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Sum_PhysicalCount
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Sum_RemoveZero
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Goal_Sum_TwoEvictions
+
+/-!
+This module collects proofs for Common Frame Retractions, Common Distinct Count, Common
+Lower Median, Goal Bit Parity Always Invertible and related cases.
+
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+-/
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/detail/window_eval.cpp

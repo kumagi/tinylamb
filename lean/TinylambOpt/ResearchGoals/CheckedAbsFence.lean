@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims describe the signed bounds needed by checked absolute value. An expression
+fast path can omit checks only on the range certified by the model.
+
+Modeled claims
+
+- `Goal` — `∀ ps limit, (∀ p ∈ ps, valid p) → let ref := run false limit ps let opt :=
+  run true limit ps opt.hits = ref.hits ∧ opt.failure = ref.failure ∧ opt.opened =
+  ref.opened.filter (fun i => ps[i]?.any (fun p => !canSkip p limit))`
+-/
+
 namespace TinylambOpt.ResearchGoals.CheckedAbsFence
 
 abbrev Cells := List (Option Int64)

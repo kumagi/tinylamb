@@ -101,3 +101,11 @@ import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Goal_StrideStore_Sna
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Goal_StrideStore_TailExact
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Goal_StrideStore_TailOverread
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Goal_StrideStore_UnorderedScatter
+
+/-!
+This module collects proofs for Common Vector Memory, Goal Backward Delta Chunk Local,
+Goal Backward Delta Dead Store, Goal Backward Delta Dependence Guard and related cases.
+
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+-/

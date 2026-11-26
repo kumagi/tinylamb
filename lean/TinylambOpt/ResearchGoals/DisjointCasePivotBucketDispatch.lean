@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Single-pass disjoint bucket dispatch: evaluates `bucket r` once per row and updates at
+most one slot `j < k` instead of running `K` CASE branches.
+
+Modeled claims
+
+- `Goal` — Disjoint CASE-pivot multi-bucket dispatch (TPC-DS Q02/Q21/Q59/Q62/Q66/Q90/
+  Q99): classifying each row into at most one mutually exclusive bucket `0..K-1` and
+  updating only that slot matches `K` independent conditional `SUM` passes under both
+  `ELSE 0` and `ELSE NULL` (including empty inputs and rows where a bucket matches
+  `val = NULL`), while updating `≤ 1` slot per row.
+-/
+
 namespace TinylambOpt.ResearchGoals.DisjointCasePivotBucketDispatch
 
 inductive ElseMode where

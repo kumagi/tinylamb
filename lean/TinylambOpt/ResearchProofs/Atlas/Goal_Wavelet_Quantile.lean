@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.Quantile` — `∀ d xs k, (∀ x ∈ xs, x < 2^d) → k < xs.length →
+  xs.mergeSort[k]? = some (kth d xs k)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

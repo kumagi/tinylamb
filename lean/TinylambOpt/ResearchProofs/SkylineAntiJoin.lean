@@ -735,3 +735,7 @@ theorem sound : Goal := by
   exact hres.trans hperm2
 
 end TinylambOpt.ResearchProofs.SkylineAntiJoin
+
+-- C++ references to this model or its proof.
+-- executor/relational_projection.cpp
+-- executor/relational_regression_test_part11.cpp

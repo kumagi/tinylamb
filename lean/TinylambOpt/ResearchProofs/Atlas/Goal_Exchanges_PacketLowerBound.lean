@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Exchanges.PacketLowerBound` — `∀ cap xs wire, 0 < cap → (∀ d, volume wire d = volume
+  xs d) → (∀ p ∈ wire, p.2 ≤ cap) → traffic cap xs ≤ wire.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

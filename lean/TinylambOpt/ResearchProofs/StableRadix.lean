@@ -1,5 +1,13 @@
 import Std
 import TinylambOpt.ResearchGoals.StableRadix
+
+/-!
+Proved
+
+- `Goal` — `∀ rows, radix rows = rows.mergeSort before`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.StableRadix`.
+-/
 open TinylambOpt.ResearchGoals.StableRadix
 
 namespace TinylambOpt.ResearchProofs.StableRadix
@@ -578,3 +586,12 @@ theorem sound : TinylambOpt.ResearchGoals.StableRadix.Goal := by
       simpa [leIdx] using (List.mergeSort_zipIdx (l := rows) (le := before))
 
 end TinylambOpt.ResearchProofs.StableRadix
+
+-- C++ references to this model or its proof.
+-- executor/detail/columnar_tlcs_fast_path.cpp
+-- executor/detail/ooc/external_sorter.cpp
+-- executor/detail/relational_sort_limit.cpp
+-- executor/detail/typed_stream_aggregate_dict.cpp
+-- executor/detail/typed_stream_aggregate_partitioned.cpp
+-- executor/relational_regression_test_part11.cpp
+-- executor/sort.cpp

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `ExceptionOverlay.OrderStatistic` — Find an order statistic with ties by cumulative
+  multiplicity.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

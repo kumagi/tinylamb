@@ -15,7 +15,7 @@
 
 namespace tinylamb::rematch_storage {
 
-// Zigzag + ULEB128 wire primitives shared by BenchmarkRematch.Storage proofs.
+// Zigzag + ULEB128 wire primitives shared by QueryRewrites.ColumnCodecs proofs.
 [[nodiscard]] inline uint64_t ZigZagEncode(int64_t v) noexcept {
   return (static_cast<uint64_t>(v) << 1U) ^ static_cast<uint64_t>(v >> 63U);
 }
@@ -52,9 +52,11 @@ inline void AppendUleb128(uint64_t v, std::vector<uint8_t>* out) {
 }
 
 // ============================================================================
-// 1. BenchmarkRematch.Storage.TpchDuckDB
-// Lean proof: Storage_Goal_TpchDuckDB.lean (sound)
-// Anchor commitdate and receiptdate as zigzag-ULEB128 deltas from shipdate.
+// 1. QueryRewrites.ColumnCodecs.SignedDateDeltaRoundtrip.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/SignedDateDeltaRoundtrip.lean
+// (sound) Anchor commitdate and receiptdate as zigzag-ULEB128 deltas from
+// shipdate.
 // ============================================================================
 inline void EncodeShipAnchoredDates(int64_t ship, int64_t commit,
                                     int64_t receipt,
@@ -77,9 +79,10 @@ inline void EncodeShipAnchoredDates(int64_t ship, int64_t commit,
 }
 
 // ============================================================================
-// 2. BenchmarkRematch.Storage.TpchClickHouse
-// Lean proof: Storage_Goal_TpchClickHouse.lean (sound)
-// Run-end indexed RLE lookup for sorted orderkey runs.
+// 2. QueryRewrites.ColumnCodecs.RunEndOrderKeyLookup.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/RunEndOrderKeyLookup.lean
+// (sound) Run-end indexed RLE lookup for sorted orderkey runs.
 // ============================================================================
 struct RunEndIndex {
   std::vector<size_t> ends;
@@ -108,9 +111,11 @@ struct RunEndIndex {
 };
 
 // ============================================================================
-// 3. BenchmarkRematch.Storage.TpcdsDuckDB
-// Lean proof: Storage_Goal_TpcdsDuckDB.lean (sound)
-// Implicit `(item, warehouse)` grid `((start+i)/W, (start+i)%W)` + exceptions.
+// 3. QueryRewrites.ColumnCodecs.GridKeysWithSparseExceptions.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/GridKeysWithSparseExceptions.lean
+// (sound) Implicit `(item, warehouse)` grid `((start+i)/W, (start+i)%W)` +
+// exceptions.
 // ============================================================================
 struct GridWithExceptions {
   uint64_t start{0};
@@ -129,10 +134,11 @@ struct GridWithExceptions {
 };
 
 // ============================================================================
-// 4. BenchmarkRematch.Storage.TpcdsClickHouse
-// Lean proof: Storage_Goal_TpcdsClickHouse.lean (sound)
-// Separate nullable key column into validity mask + base-anchored dense stream
-// indexed by prefix popcount rank.
+// 4. QueryRewrites.ColumnCodecs.NullableRankIndexedResiduals.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/NullableRankIndexedResiduals.lean
+// (sound) Separate nullable key column into validity mask + base-anchored dense
+// stream indexed by prefix popcount rank.
 // ============================================================================
 struct RankIndexedNullableColumn {
   uint64_t base{0};
@@ -164,9 +170,11 @@ struct RankIndexedNullableColumn {
 };
 
 // ============================================================================
-// 5. BenchmarkRematch.Storage.ClickDuckDB
-// Lean proof: Storage_Goal_ClickDuckDB.lean (sound)
-// Strided anchor offsets + per-row lengths for random string point access.
+// 5. QueryRewrites.ColumnCodecs.SparseOffsetsWithLocalLengthLookup.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/SparseOffsetsWithLocalLengthLookup.lean
+// (sound) Strided anchor offsets + per-row lengths for random string point
+// access.
 // ============================================================================
 struct StridedStringColumn {
   size_t stride{64};
@@ -200,9 +208,10 @@ struct StridedStringColumn {
 };
 
 // ============================================================================
-// 6. BenchmarkRematch.Storage.ClickClickHouse
-// Lean proof: Storage_Goal_ClickClickHouse.lean (sound)
-// 3-clock per-row median anchor + signed residuals.
+// 6. QueryRewrites.ColumnCodecs.MedianClockResidualRoundtrip.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/MedianClockResidualRoundtrip.lean
+// (sound) 3-clock per-row median anchor + signed residuals.
 // ============================================================================
 [[nodiscard]] inline int64_t MedianOfThree(int64_t a, int64_t b,
                                            int64_t c) noexcept {
@@ -212,9 +221,11 @@ struct StridedStringColumn {
 }
 
 // ============================================================================
-// 7. BenchmarkRematch.Storage.AnalyticsDuckDB
-// Lean proof: Storage_Goal_AnalyticsDuckDB.lean (sound)
-// Byte-lane transposition by `pos % width` for better entropy compression.
+// 7. QueryRewrites.ColumnCodecs.ByteLaneTransposeRoundtrip.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/ByteLaneTransposeRoundtrip.lean
+// (sound) Byte-lane transposition by `pos % width` for better entropy
+// compression.
 // ============================================================================
 [[nodiscard]] inline std::vector<uint8_t> TransposeByteLanes(
     std::span<const uint8_t> page, size_t width) {
@@ -243,9 +254,10 @@ struct StridedStringColumn {
 }
 
 // ============================================================================
-// 8. BenchmarkRematch.Storage.AnalyticsClickHouse
-// Lean proof: Storage_Goal_AnalyticsClickHouse.lean (sound)
-// Independent frame span reader over logical byte offsets.
+// 8. QueryRewrites.ColumnCodecs.IndexedFrameRangeRead.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/IndexedFrameRangeRead.lean
+// (sound) Independent frame span reader over logical byte offsets.
 // ============================================================================
 struct CompressedFrameEntry {
   size_t logical_start{0};
@@ -275,9 +287,11 @@ template <typename DecodeFn>
 }
 
 // ============================================================================
-// 9. BenchmarkRematch.Storage.OfflineClickClickHouse
-// Lean proof: Storage_Goal_OfflineClickClickHouse.lean (sound)
-// Encode `original` against `url` using common prefix length + suffix frame.
+// 9. QueryRewrites.ColumnCodecs.SharedUrlPrefixRoundtrip.Goal
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/ColumnCodecs/SharedUrlPrefixRoundtrip.lean
+// (sound) Encode `original` against `url` using common prefix length + suffix
+// frame.
 // ============================================================================
 inline void EncodeCommonPrefixResidual(std::string_view url,
                                        std::string_view original,

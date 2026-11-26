@@ -1,5 +1,13 @@
 import TinylambOpt.ThompsonFragment
 
+/-!
+Packing a boolean function into a BitVec, with bit-level readback.
+
+Reference NFA: finite states 0..states-1, epsilon and labeled edges.
+
+Named results include `packNat_testBit`, `pack_getLsbD`, `pack_high_zero`.
+-/
+
 /-
   TinylambOpt/RegexBitsetNfa.lean
 
@@ -844,3 +852,7 @@ theorem start_injection_once_is_wrong :
   set_option maxRecDepth 100000 in
     decide
 end TinylambOpt.RegexBitsetNfa
+
+-- C++ references to this model or its proof.
+-- common/regex_guard.cpp
+-- common/regex_guard.hpp

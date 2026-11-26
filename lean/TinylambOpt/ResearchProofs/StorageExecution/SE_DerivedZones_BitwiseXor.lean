@@ -1,4 +1,18 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
+
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (10 claims, including the following)
+
+- `BitwiseXor.AlignedSiblings` — `∀ k a b, (kernel.bounds 0 ⟨a*2^k,(a+1)*2^k-1⟩
+  ⟨b*2^k,(b+1)*2^k-1⟩).lo = (a ^^^ b)*2^k`
+- `BitwiseXor.CrossPageJoin` — Disjoint derived score intervals imply an empty equijoin
+  between pages.
+- `BitwiseXor.DominatedTop` — A bounded page cannot change the descending top k once k
+  strictly better witnesses are known.
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZones.BitwiseXor

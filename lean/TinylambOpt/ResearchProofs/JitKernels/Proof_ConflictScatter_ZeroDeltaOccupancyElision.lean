@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+import TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_ZeroDeltaOccupancyElision
+
+/-! REFUTE: verified ConflictScatter.ZeroDeltaOccupancyElision. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_ConflictScatter_ZeroDeltaOccupancyElision
+open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.ZeroDeltaOccupancyElision
+theorem refute : ¬ Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_ZeroDeltaOccupancyElision.refute
+end Nov26.Proof_ConflictScatter_ZeroDeltaOccupancyElision

@@ -1,5 +1,29 @@
 import TinylambOpt.ResearchGoals.Compression.Text
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (21 claims, including the following)
+
+- `AdjacentExchange` — `∀ prev a b tail, ((entries prev (a::b::tail)).length:Int) -
+  (entries prev (b::a::tail)).length = ((entry prev a).length:Int)+(entry a
+  b).length-(entry prev b).length-(entry b a).length + (tail.head?.map (fun w =>
+  ((entry b w).length:Int)-(entry a w).length)).getD 0`
+- `BoundaryToken` — `∀ (a b : Bytes) (x y : Nat), x < 256 → y < 256 → x ≠ y → (symbols
+  [x,y] (a++b).length (a++b)).count 256 = (symbols [x,y] a.length a).count 256 +
+  (symbols [x,y] b.length b).count 256 + (if a.getLast? == some x && b.head? == some
+  y then 1 else 0)`
+- `CommonStemBudget` — `∀ stem tails, let ws := tails.map (stem ++ ·)
+  tails.length*(stem.length) + (lengths tails).length ≤ (lengths ws).length`
+
+Refuted by counterexample
+
+- `OverlappingSavings` — `∀ pat s, 1 < pat.length → let allHits := (List.range
+  s.length).countP (fun i => pat.isPrefixOf (s.drop i)) (symbols pat s.length
+  s).length + allHits*(pat.length-1) = s.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1143,3 +1167,7 @@ theorem BoundaryToken_sound : BoundaryToken.Goal := by
   omega
 
 end TinylambOpt.ResearchProofs.Compression.Text
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.hpp

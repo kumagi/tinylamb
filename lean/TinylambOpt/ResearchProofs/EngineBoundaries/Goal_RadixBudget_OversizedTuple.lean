@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `OversizedTuple` — A single tuple larger than the grant must survive in a fallback
+  leaf.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

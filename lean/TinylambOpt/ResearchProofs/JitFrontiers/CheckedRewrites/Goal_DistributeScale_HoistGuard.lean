@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `DistributeScale.FoldValue` — Algebraic replacement remains exact in the widened IR
+  domain.
+- `DistributeScale.HoistGuard` — A once-per-block guard allows an entirely folded loop
+  without changing its first failing lane.
+- `DistributeScale.Sufficient` — The proposed strength-reduced guard excludes every
+  fault of the removed instruction.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

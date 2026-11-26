@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `TiePairs.FanoutBound` — `∀ x (c : Nat), (∀ a ∈ x, x.count a ≤ c) → 2*measure x ≤
+  size x*(c-1:Nat)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

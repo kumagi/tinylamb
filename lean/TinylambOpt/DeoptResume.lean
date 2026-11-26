@@ -1,5 +1,12 @@
 import Std.Tactic
 
+/-!
+A JIT-specific guard may reject a row even when checked scalar addition succeeds. Undo
+speculative writes before re-evaluating the unconsumed row.
+
+Named results include `restore_save`, `step_eq`, `stepRolled_eq_of_ok`.
+-/
+
 /-
 # Deopt 後のスカラ再開 (deopt resume)
 

@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims compare data opened from footer metadata with the reference open. A SQL
+access path can initialize from the compact footer when it carries the required state.
+
+Modeled claims
+
+- `Goal` — Footer-only TLCS v3 open (`table/tlcs_file.cpp`): opening reads only the
+  footer directory regardless of total column payload size or trailing bytes, and
+  subsequent on-demand column reads recover exact column byte slices.
+-/
+
 namespace TinylambOpt.ResearchGoals.FooterOnlyOpenEquiv
 
 structure ChunkEntry where

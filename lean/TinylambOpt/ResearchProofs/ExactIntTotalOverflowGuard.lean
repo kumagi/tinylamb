@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.ExactIntTotalOverflowGuard
 
+/-!
+Proved
+
+- `Goal` — Parallel `exact_integer_total` + O(1) `constBlock` fold
+  (`executor/detail/fused_grouped_join.cpp`): when the sum of per-block absolute
+  magnitude bounds fits strictly within `int64Max` (`2^63 - 1`), associative
+  block-parallel summation and constant multiplication cannot overflow in any
+  evaluation order and match sequential checked SQL `SUM`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.ExactIntTotalOverflowGuard`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ExactIntTotalOverflowGuard
 
 open TinylambOpt.ResearchGoals.ExactIntTotalOverflowGuard
@@ -376,3 +389,7 @@ theorem sound : TinylambOpt.ResearchGoals.ExactIntTotalOverflowGuard.Goal := by
   rw [hpar, href]
 
 end TinylambOpt.ResearchProofs.ExactIntTotalOverflowGuard
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_raw_aggregates.cpp
+-- executor/detail/typed_stream_aggregate_partitioned.cpp

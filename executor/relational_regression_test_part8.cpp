@@ -813,7 +813,8 @@ TEST_F(RelationalRegressionTest,
 
 TEST_F(RelationalRegressionTest, PromoReturnThresholdCountsMatchesCanonical) {
   // Verifies PromoReturnCounts_sound + ThresholdFanout_sound
-  // (DuckDBGaps/Retail.lean) against the canonical plan across:
+  // (AnalyticalOperators/RollupsAndChannelSetCounts.lean) against the canonical
+  // plan across:
   //   - NULL cs_promo_sk (no_promo)
   //   - duplicate p_promo_sk rows (multiplies promo and total_cnt)
   //   - duplicate (cr_item_sk, cr_order_number) rows (ret_mult = max(1, cnt))
@@ -937,7 +938,8 @@ TEST_F(RelationalRegressionTest, PromoReturnThresholdCountsMatchesCanonical) {
 
 TEST_F(RelationalRegressionTest, MarketShareYearRoutesMatchesCanonical) {
   // Verifies MarketShareWeights_sound + YearRoutes_sound
-  // (DuckDBGaps/Orders.lean) against the canonical 8-way join across:
+  // (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean) against the
+  // canonical 8-way join across:
   //   - duplicate part, supplier, customer, and orders keys (including an
   //     o_orderkey appearing in two distinct years)
   //   - NULL volume (CASE ELSE 0 still contributes non-NULL 0 to numerator)
@@ -1029,7 +1031,8 @@ TEST_F(RelationalRegressionTest, MarketShareYearRoutesMatchesCanonical) {
 }
 
 TEST_F(RelationalRegressionTest, OrderedFetchTopNMatchesCanonical) {
-  // Verifies OrderedFetch_sound (DuckDBGaps/Hits.lean) against canonical
+  // Verifies OrderedFetch_sound
+  // (AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean) against canonical
   // execution across:
   //   - SELECT * wide-row late materialization (kInt64, kDate, kDouble,
   //     kVarChar)
@@ -1079,7 +1082,8 @@ TEST_F(RelationalRegressionTest, OrderedFetchTopNMatchesCanonical) {
 
 TEST_F(RelationalRegressionTest,
        SurrogateIntersectAndExceptCountMatchesCanonical) {
-  // Verifies SurrogateIntersectSetCount_sound (Wave9TpcdsRollupAndSetOps.lean)
+  // Verifies SurrogateIntersectSetCount_sound
+  // (lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean)
   // for both INTERSECT DISTINCT (TPC-DS Q38) and EXCEPT DISTINCT (TPC-DS Q87),
   // including:
   //   - two distinct customer_sk rows sharing the exact same (last, first) name
@@ -1175,9 +1179,10 @@ TEST_F(RelationalRegressionTest,
 }
 
 TEST_F(RelationalRegressionTest, TwoPassGroupAvgThresholdMatchesCanonical) {
-  // Verifies TwoPassGroupAvgThreshold_sound (IndividualQueryGaps.lean) on the
-  // TPC-DS Q65 self-join shape, including NULL sales prices, NULL store keys,
-  // and exact boundary revenue == 0.1 * avg(revenue).
+  // Verifies TwoPassGroupAvgThreshold_sound
+  // (SemijoinFiltersAndGroupThresholds.lean) on the TPC-DS Q65 self-join shape,
+  // including NULL sales prices, NULL store keys, and exact boundary revenue ==
+  // 0.1 * avg(revenue).
   RelationalRun(*rs_,
                 "CREATE TABLE tp_store (s_store_sk INT64, "
                 "s_store_name STRING)");
@@ -1237,8 +1242,9 @@ TEST_F(RelationalRegressionTest, TwoPassGroupAvgThresholdMatchesCanonical) {
 
 TEST_F(RelationalRegressionTest,
        FrequencyUpperBoundHavingPruneMatchesCanonical) {
-  // Verifies FrequencyUpperBoundHavingPrune_sound (IndividualQueryGaps.lean)
-  // on GROUP BY key HAVING COUNT(*) > T / >= T with secondary AVG/MIN/MAX.
+  // Verifies FrequencyUpperBoundHavingPrune_sound
+  // (SemijoinFiltersAndGroupThresholds.lean) on GROUP BY key HAVING COUNT(*) >
+  // T / >= T with secondary AVG/MIN/MAX.
   RelationalRun(*rs_, "CREATE TABLE hfp_t (k INT64, v FLOAT64, tag INT64)");
   std::string ins = "INSERT INTO hfp_t VALUES ";
   bool first = true;
@@ -1276,8 +1282,8 @@ TEST_F(RelationalRegressionTest,
 TEST_F(RelationalRegressionTest,
        CompositeKeySemiJoinChainReductionMatchesCanonical) {
   // Verifies CompositeKeySemiJoinChainReduction_sound
-  // (IndividualQueryGaps.lean) on a 3-table composite-key join chain
-  // A ⋈_{(a1,a2)} B ⋈_{(b1,b2)} C with duplicates and NULLs.
+  // (SemijoinFiltersAndGroupThresholds.lean) on a 3-table composite-key join
+  // chain A ⋈_{(a1,a2)} B ⋈_{(b1,b2)} C with duplicates and NULLs.
   RelationalRun(*rs_, "CREATE TABLE ck_a (a1 INT64, a2 INT64, va INT64)");
   RelationalRun(*rs_,
                 "CREATE TABLE ck_b (b1 INT64, b2 INT64, j1 INT64, j2 INT64)");
@@ -1318,7 +1324,8 @@ TEST_F(RelationalRegressionTest,
 }
 
 TEST_F(RelationalRegressionTest, DirectionBucketsMatchesCanonical) {
-  // Verifies DirectionBuckets_sound (DuckDBGaps/Orders.lean) on TPC-H Q7
+  // Verifies DirectionBuckets_sound
+  // (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean) on TPC-H Q7
   // including duplicate keys, NULL volume, and opposite nation routes.
   RelationalRun(*rs_, "CREATE TABLE q7_nat (n_nationkey INT64, n_name STRING)");
   RelationalRun(*rs_,
@@ -1382,8 +1389,9 @@ TEST_F(RelationalRegressionTest, DirectionBucketsMatchesCanonical) {
 }
 
 TEST_F(RelationalRegressionTest, RetireWitnessExistsMatchesCanonical) {
-  // Verifies LateSlack_sound + RetireWitness_sound (DuckDBGaps/Orders.lean)
-  // on TPC-H Q4 including duplicate outer orders and paired-date checks.
+  // Verifies LateSlack_sound + RetireWitness_sound
+  // (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean) on TPC-H Q4
+  // including duplicate outer orders and paired-date checks.
   RelationalRun(*rs_,
                 "CREATE TABLE q4_ord (o_orderkey INT64, o_orderdate DATE, "
                 "o_orderpriority STRING)");
@@ -1431,7 +1439,8 @@ TEST_F(RelationalRegressionTest, RetireWitnessExistsMatchesCanonical) {
 }
 
 TEST_F(RelationalRegressionTest, RebucketLeftJoinHistMatchesCanonical) {
-  // Verifies RebucketOrders_sound (DuckDBGaps/Orders.lean) on TPC-H Q13,
+  // Verifies RebucketOrders_sound
+  // (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean) on TPC-H Q13,
   // including 0-order customers, excluded comments, and NULL comments.
   RelationalRun(*rs_, "CREATE TABLE q13_cust (c_custkey INT64)");
   RelationalRun(*rs_,
@@ -1470,7 +1479,8 @@ TEST_F(RelationalRegressionTest, RebucketLeftJoinHistMatchesCanonical) {
 }
 
 TEST_F(RelationalRegressionTest, ContiguousRevenueRunsMatchesCanonical) {
-  // Verifies RevenueRuns_sound (DuckDBGaps/Orders.lean) on TPC-H Q3,
+  // Verifies RevenueRuns_sound
+  // (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean) on TPC-H Q3,
   // including contiguous runs, NULL prices, and Top-K tie-breaking by date.
   RelationalRun(*rs_,
                 "CREATE TABLE q3_cust (c_custkey INT64, c_mktsegment STRING)");
@@ -1529,7 +1539,7 @@ TEST_F(RelationalRegressionTest,
        HitsDatePostingsAndStridedPointMatchCanonical) {
   // Verifies DatePostings_sound (whole-block interior predicate skip) and
   // StridedPoint_sound (FOR code-domain point equality) from
-  // DuckDBGaps/Hits.lean.
+  // AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean.
   RelationalRun(*rs_,
                 "CREATE TABLE hits_dp (counter_id INT64, event_date DATE, "
                 "user_id INT64, url STRING)");

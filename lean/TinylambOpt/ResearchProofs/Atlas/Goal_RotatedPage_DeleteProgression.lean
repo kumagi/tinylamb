@@ -1,4 +1,15 @@
-import TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_P8
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.RotatedPageAlignment
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `RotatedPage.DeleteProgression` — `∀ c mask, (((rows layout c).filter (fun r =>
+  !contains mask r.1)).map Prod.snd).sum = ((layout.lanes c).map (fun a => partialSum
+  a a.n - deletedSum a mask)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -35,6 +46,6 @@ physical ordinals therefore subtracts `deletedSum` from each lane's
 `partialSum`, which is exactly the generic stride-one lane deletion lemma
 proved for RotatedPage in `Auto_EncodedPages_P8`. -/
 theorem sound_RotatedPage_DeleteProgression : RotatedPage.DeleteProgression.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_P8.sound_DeleteProgression
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.RotatedPageAlignment.sound_DeleteProgression
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_RotatedPage_DeleteProgression

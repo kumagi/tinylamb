@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+
+Proved
+
+- `FourRunCrossover` — For four leaves ask when the balanced pairing beats a left-deep
+  merge.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

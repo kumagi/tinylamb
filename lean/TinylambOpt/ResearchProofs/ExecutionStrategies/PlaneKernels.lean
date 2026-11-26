@@ -1,33 +1,19 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.PlaneKernels
 
 /-!
-# Soundness of bit-sliced plane kernels
+  Soundness proofs for the bit-slice kernels of `PlaneKernels`.
 
-Each `Goal` states that a bit-plane kernel over 64 lanes of unsigned byte
-codes agrees with the corresponding scalar (per-lane) computation.
-
-Proof strategy shared by all goals:
-
-* `pack_getLsbD`: bit `i` of `pack f` is `f i` for `i < 64` (fold induction).
-* `planes_getLsbD`: bit `i` of `planes x` at plane `k` is bit `k` of `x i`.
-* `mod_two_pow_succ`: `x % 2^(n+1) = x % 2^n + 2^n * (x.testBit n)` — the
-  bridge between `BitVec` lanes and their bit-plane decomposition.
-* Per-bit Boolean recurrences (`ltStep`, the ripple-carry step, the
-  `changed` fold, ...) are verified by finite case analysis and lifted over
-  `List.range 8` / `List.range 64` by fold inductions of the shape
-  `*_foldl_getLsbD`.
-
-`ParallelLess` is proved first: the low-to-high `lessMask` fold is shown,
-bit by bit, to compute the unsigned `<` of each lane pair, hence
-`lessMask (planes x) (planes y) = pack (fun i => decide (x i < y i))` and the
-masked equality follows.
+  Every word operation here is lane-wise, so it suffices to prove a one-lane
+  statement.  The eight-bit lane kernels are verified by `native_decide` and
+  lifted to 64-lane words using `pack`'s bit-extraction lemma.
 -/
 
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.PlaneKernels
 
+open TinylambOpt.ResearchGoals.BitPlaneSum (W B pack count)
 open TinylambOpt.ResearchGoals.PlaneKernels
-open TinylambOpt.ResearchGoals.BitPlaneSum
 
+/-! ### Extracting bit `i` of `pack f` -/
 
 private def pstep (f : Nat → Bool) (w : W) (i : Nat) : W :=
   w ||| ((BitVec.ofNat 64 (f i).toNat) <<< i)
@@ -103,1358 +89,1567 @@ private theorem pack_getLsbD (f : Nat → Bool) (i : Nat) (hi : i < 64) :
   rw [foldl_pstep f 64 0 i hi]
   simp [hi]
 
-private def ltStep (ak bk lt : Bool) : Bool :=
-  (!(ak) && bk) || (!(ak ^^ bk) && lt)
+/-! ### ParallelLess -/
 
-private theorem ltStep_ft (d : Bool) : ltStep false true d = true := by simp [ltStep]
-private theorem ltStep_tf (d : Bool) : ltStep true false d = false := by simp [ltStep]
-private theorem ltStep_ff (d : Bool) : ltStep false false d = d := by simp [ltStep]
-private theorem ltStep_tt (d : Bool) : ltStep true true d = d := by simp [ltStep]
+private def ltStep (xb yb : B) (lt : Bool) (k : Nat) : Bool :=
+  (!xb.getLsbD k && yb.getLsbD k) || ((xb.getLsbD k == yb.getLsbD k) && lt)
 
-private theorem mod_two_pow_succ (x n : Nat) :
-    x % 2^(n+1) = x % 2^n + 2^n * (x.testBit n).toNat := by
-  have hpow : 2^(n+1) = 2^n * 2 := by rw [Nat.pow_add, Nat.pow_one]
-  have hlt : x % 2^n < 2^n := Nat.mod_lt _ (Nat.two_pow_pos _)
-  have hq : x / 2^n = 2 * (x / 2^(n+1)) + (x / 2^n) % 2 := by
-    have h1 : (x / 2^n) % 2 + 2 * ((x / 2^n) / 2) = x / 2^n := Nat.mod_add_div _ _
-    have h2 : (x / 2^n) / 2 = x / 2^(n+1) := by
-      rw [Nat.div_div_eq_div_mul, ← hpow]
-    omega
-  have htb : (x.testBit n).toNat = (x / 2^n) % 2 := by
-    have h3 : x.testBit n = (x / 2^n).testBit 0 := by
-      have h := Nat.testBit_add x 0 n
-      rwa [Nat.zero_add] at h
-    rw [h3, Nat.testBit_zero]
-    have h4 : (x / 2^n) % 2 < 2 := Nat.mod_lt _ (by decide : (0:Nat) < 2)
-    by_cases h5 : (x / 2^n) % 2 = 1
-    · rw [decide_eq_true h5]
-      simp [h5]
-    · rw [decide_eq_false h5]
-      have h6 : (x / 2^n) % 2 = 0 := by omega
-      simp [h6]
-  have hx : x = x % 2^n + 2^n * (x / 2^n) := by
-    have := Nat.mod_add_div x (2^n)
-    omega
-  have hx2 : x % 2^(n+1) = (x % 2^n + 2^n * (x / 2^n)) % 2^(n+1) :=
-    congrArg (fun t => t % 2^(n+1)) hx
-  rw [hx2]
-  have hq' : 2 ^ n * (x / 2 ^ n)
-      = 2 ^ (n + 1) * (x / 2 ^ (n + 1)) + 2 ^ n * ((x / 2 ^ n) % 2) := by
-    have e := congrArg (fun t => 2 ^ n * t) hq
-    rw [Nat.mul_add] at e
-    have e2 : 2 ^ n * (2 * (x / 2 ^ (n + 1))) = 2 ^ (n + 1) * (x / 2 ^ (n + 1)) := by
-      rw [← Nat.mul_assoc, ← hpow]
-    rw [e2] at e
-    exact e
-  have hdecomp : x % 2^n + 2^n * (x / 2^n)
-      = (x % 2^n + 2^n * ((x / 2^n) % 2)) + 2^(n+1) * (x / 2^(n+1)) := by
-    rw [hq']
-    omega
-  rw [hdecomp, Nat.add_mul_mod_self_left, htb]
-  apply Nat.mod_eq_of_lt
-  have h2m : (x / 2^n) % 2 < 2 := Nat.mod_lt _ (by decide : (0:Nat) < 2)
-  have h2 : (x / 2^n) % 2 ≤ 1 := by omega
-  have h3 : 2^n * ((x / 2^n) % 2) ≤ 2^n := by
-    calc 2^n * ((x / 2^n) % 2) ≤ 2^n * 1 := Nat.mul_le_mul_left _ h2
-      _ = 2^n := by simp
-  have hpow2 : 2^(n+1) = 2^n + 2^n := Nat.two_pow_succ n
-  omega
+private theorem ltStep_fold_eq (xb yb : B) :
+    (List.range 8).foldl (ltStep xb yb) false = decide (xb < yb) := by
+  revert xb yb
+  native_decide
 
-private theorem ltStep_foldl_spec (xn yn : Nat) (n : Nat) :
-    (List.range n).foldl (fun lt k => ltStep (xn.testBit k) (yn.testBit k) lt) false
-      = decide (xn % 2^n < yn % 2^n) := by
-  induction n with
-  | zero =>
-      simp [Nat.mod_one]
-  | succ n ih =>
-      rw [List.range_succ, List.foldl_append]
-      simp only [List.foldl_cons, List.foldl_nil]
-      rw [ih, mod_two_pow_succ xn n, mod_two_pow_succ yn n]
-      have hlt1 : xn % 2^n < 2^n := Nat.mod_lt _ (Nat.two_pow_pos _)
-      have hlt2 : yn % 2^n < 2^n := Nat.mod_lt _ (Nat.two_pow_pos _)
-      have hpos : 0 < 2^n := Nat.two_pow_pos _
-      cases hxb : xn.testBit n <;> cases hyb : yn.testBit n <;>
-        simp only [hxb, hyb, ltStep_ft, ltStep_tf, ltStep_ff, ltStep_tt,
-          Bool.toNat_true, Bool.toNat_false, Nat.mul_zero, Nat.mul_one,
-          Nat.add_zero] <;>
-        first
-        | rfl
-        | (apply (decide_eq_true _).symm; omega)
-        | (apply (decide_eq_false _).symm; omega)
-        | (rw [decide_eq_decide]; exact (Nat.add_lt_add_iff_right).symm)
-
-/-- bit `i` of `planes x` at plane `k` is bit `k` of `x i`. -/
-private theorem planes_getLsbD (x : Nat → B) (k i : Nat) (hi : i < 64) :
-    (planes x k).getLsbD i = (x i).getLsbD k := by
-  show (pack fun i => (x i).getLsbD k).getLsbD i = _
-  exact pack_getLsbD _ _ hi
-
-/-- `getLsbD` commutes with the `lessMask` fold (for lanes `i < 64`). -/
-private theorem lessMask_foldl_getLsbD (a b : Planes) (i : Nat) (hi : i < 64) (n : Nat) :
-    ((List.range n).foldl (fun lt k => (~~~(a k) &&& b k) ||| (~~~(a k ^^^ b k) &&& lt)) 0).getLsbD i
-      = (List.range n).foldl (fun lt k => ltStep ((a k).getLsbD i) ((b k).getLsbD i) lt) false := by
-  induction n with
-  | zero => simp
-  | succ n ih =>
-      simp only [List.range_succ, List.foldl_append, List.foldl_cons, List.foldl_nil]
-      have hstep : ∀ lt : W,
-          ((~~~(a n) &&& b n) ||| (~~~(a n ^^^ b n) &&& lt)).getLsbD i
-            = ltStep ((a n).getLsbD i) ((b n).getLsbD i) (lt.getLsbD i) := by
-        intro lt
-        rw [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_and,
-            BitVec.getLsbD_not, BitVec.getLsbD_not, BitVec.getLsbD_xor]
-        simp [hi, ltStep]
-      rw [hstep, ih]
-
-private theorem foldl_ltStep_congr {f g : Bool → Nat → Bool} (l : List Nat) (init : Bool)
-    (h : ∀ acc k, f acc k = g acc k) :
-    l.foldl f init = l.foldl g init := by
-  induction l generalizing init with
-  | nil => rfl
-  | cons k t ih =>
-      rw [List.foldl_cons, List.foldl_cons, h init k]
-      exact ih (g init k)
-
-private theorem lessMask_getLsbD (x y : Nat → B) (i : Nat) (hi : i < 64) :
+private theorem lessMask_bit (x y : Nat → B) (i : Nat) (hi : i < 64) :
     (lessMask (planes x) (planes y)).getLsbD i = decide (x i < y i) := by
-  have h1 := lessMask_foldl_getLsbD (planes x) (planes y) i hi 8
-  -- rewrite plane bits to testBit of lane values
-  have h2 : (List.range 8).foldl (fun lt k => ltStep ((planes x k).getLsbD i) ((planes y k).getLsbD i) lt) false
-      = (List.range 8).foldl (fun lt k => ltStep ((x i).toNat.testBit k) ((y i).toNat.testBit k) lt) false := by
-    apply foldl_ltStep_congr
+  unfold lessMask
+  let stepW : W → Nat → W := fun lt k =>
+    (~~~(planes x k) &&& planes y k) ||| (~~~(planes x k ^^^ planes y k) &&& lt)
+  have hstep : ∀ (acc : W) (k : Nat),
+      (stepW acc k).getLsbD i = ltStep (x i) (y i) (acc.getLsbD i) k := by
     intro acc k
-    rw [planes_getLsbD x k i hi, planes_getLsbD y k i hi]
-    rfl
-  rw [h2] at h1
-  rw [ltStep_foldl_spec ((x i).toNat) ((y i).toNat) 8] at h1
-  -- h1 : lessMask...getLsbD i = decide (xn % 256 < yn % 256)
-  have hlt : (x i).toNat < 256 := (x i).isLt
-  have hlt2 : (y i).toNat < 256 := (y i).isLt
-  rw [Nat.mod_eq_of_lt hlt, Nat.mod_eq_of_lt hlt2] at h1
-  -- h1 : ... = decide ((x i).toNat < (y i).toNat)
-  exact h1
+    dsimp [stepW, ltStep]
+    rw [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_and,
+      BitVec.getLsbD_not, BitVec.getLsbD_not, BitVec.getLsbD_xor]
+    dsimp [planes]
+    rw [pack_getLsbD (fun j => (x j).getLsbD k) i hi,
+      pack_getLsbD (fun j => (y j).getLsbD k) i hi]
+    have hbeq : Bool.not (((x i).getLsbD k) ^^ ((y i).getLsbD k)) =
+        (((x i).getLsbD k) == ((y i).getLsbD k)) := by
+      cases (x i).getLsbD k <;> cases (y i).getLsbD k <;> rfl
+    have hnotxor : (decide (i < 64) && Bool.not (((x i).getLsbD k) ^^ ((y i).getLsbD k))) =
+        (((x i).getLsbD k) == ((y i).getLsbD k)) := by
+      rw [decide_eq_true hi, Bool.true_and, hbeq]
+    rw [hnotxor, decide_eq_true hi]
+    cases (x i).getLsbD k <;> cases (y i).getLsbD k <;> cases acc.getLsbD i <;> rfl
+  have hfold : ∀ (n : Nat) (acc : W),
+      ((List.range n).foldl stepW acc).getLsbD i =
+        (List.range n).foldl (ltStep (x i) (y i)) (acc.getLsbD i) := by
+    intro n
+    induction n with
+    | zero => intro acc; simp
+    | succ n ih =>
+        intro acc
+        rw [List.range_succ]
+        simp only [List.foldl_append, List.foldl_cons, List.foldl_nil]
+        rw [hstep, ih acc]
+  change (((List.range 8).foldl stepW 0).getLsbD i) = decide (x i < y i)
+  rw [hfold 8 0]
+  simpa using ltStep_fold_eq (x i) (y i)
 
-theorem sound_ParallelLess : ParallelLess.Goal := by
+theorem ParallelLess_sound : TinylambOpt.ResearchGoals.PlaneKernels.ParallelLess.Goal := by
   intro x y m
-  have hmask : lessMask (planes x) (planes y) = pack (fun i => decide (x i < y i)) := by
-    apply BitVec.eq_of_getLsbD_eq
-    intro i hi
-    rw [lessMask_getLsbD x y i hi, pack_getLsbD _ _ hi]
-  rw [hmask]
-
-private theorem foldl_or_decide (g : Nat → Bool) (n : Nat) :
-    (List.range n).foldl (fun acc k => acc || g k) false
-      = decide (∃ k ∈ List.range n, g k) := by
-  induction n with
-  | zero => simp
-  | succ n ih =>
-      rw [List.range_succ, List.foldl_append]
-      simp only [List.foldl_cons, List.foldl_nil, ih]
-      have hmem : (∃ k ∈ List.range n ++ [n], g k) ↔
-          (∃ k ∈ List.range n, g k) ∨ g n := by
-        constructor
-        · rintro ⟨k, hk, hg⟩
-          rw [List.mem_append] at hk
-          rcases hk with hk | hk
-          · exact Or.inl ⟨k, hk, hg⟩
-          · rw [List.mem_singleton] at hk; subst hk; exact Or.inr hg
-        · rintro (⟨k, hk, hg⟩ | hg)
-          · exact ⟨k, List.mem_append.mpr (Or.inl hk), hg⟩
-          · exact ⟨n, List.mem_append.mpr (Or.inr (List.mem_singleton_self n)), hg⟩
-      rw [decide_eq_decide.mpr hmem, Bool.eq_iff_iff, Bool.or_eq_true_iff,
-        decide_eq_true_iff, decide_eq_true_iff]
-
-private theorem exists_bit_diff_iff_ne (x v : B) :
-    (∃ k ∈ List.range 8, (x.getLsbD k) ≠ (v.getLsbD k)) ↔ x ≠ v := by
-  have hext : x = v ↔ ∀ k, k < 8 → x.getLsbD k = v.getLsbD k :=
-    BitVec.eq_of_getLsbD_eq_iff (w := 8)
-  constructor
-  · rintro ⟨k, hk, hne⟩ rfl
-    have hk8 : k < 8 := List.mem_range.mp hk
-    exact hne (hext.mp rfl k hk8)
-  · intro hne
-    by_cases hcon : ∃ k ∈ List.range 8, x.getLsbD k ≠ v.getLsbD k
-    · exact hcon
-    · exfalso
-      apply hne
-      apply hext.mpr
-      intro k hk
-      by_cases hdiff : x.getLsbD k = v.getLsbD k
-      · exact hdiff
-      · exact absurd ⟨k, List.mem_range.mpr hk, hdiff⟩ hcon
-
-
-
--- getLsbD of an ite
-private theorem getLsbD_ite {c : Prop} [Decidable c] (x y : W) (i : Nat) :
-    BitVec.getLsbD (if c then x else y) i = if c then BitVec.getLsbD x i else BitVec.getLsbD y i := by
-  by_cases hc : c <;> simp [hc]
-
--- contribution of one plane of `changed` at lane i, as a Bool
-private theorem changed_contrib (a : Planes) (v : B) (i n : Nat) (hi : i < 64) :
-    BitVec.getLsbD (if v.getLsbD n = true then ~~~(a n) else a n) i
-      = (if v.getLsbD n = true then !(a n).getLsbD i else (a n).getLsbD i) := by
-  rw [getLsbD_ite, BitVec.getLsbD_not, decide_eq_true hi, Bool.true_and]
-
--- the ite contribution is true iff the two bits differ
-private theorem contrib_iff_diff (xb vb : Bool) :
-    ((if vb = true then !xb else xb) = true) ↔ (xb ≠ vb) := by
-  cases xb <;> cases vb <;> simp
-
--- the `changed` fold commutes with getLsbD
-private theorem changed_foldl_getLsbD (a : Planes) (v : B) (i : Nat) (hi : i < 64) (n : Nat) :
-    BitVec.getLsbD
-        ((List.range n).foldl
-          (fun w k => w ||| (if v.getLsbD k = true then ~~~(a k) else a k)) 0) i
-      = (List.range n).foldl
-          (fun acc k => acc || (if v.getLsbD k = true then !(a k).getLsbD i else (a k).getLsbD i))
-          false := by
-  induction n with
-  | zero => simp
-  | succ n ih =>
-      simp only [List.range_succ, List.foldl_append, List.foldl_cons, List.foldl_nil]
-      rw [BitVec.getLsbD_or, changed_contrib a v i n hi, ih]
-
-private theorem exists_mem_congr {P Q : Nat → Prop} (l : List Nat) (h : ∀ k ∈ l, P k ↔ Q k) :
-    (∃ k ∈ l, P k) ↔ (∃ k ∈ l, Q k) := by
-  constructor
-  · rintro ⟨k, hk, hp⟩; exact ⟨k, hk, (h k hk).mp hp⟩
-  · rintro ⟨k, hk, hq⟩; exact ⟨k, hk, (h k hk).mpr hq⟩
-
-private theorem changed_planes_getLsbD (x : Nat → B) (v : B) (i : Nat) (hi : i < 64) :
-    BitVec.getLsbD (changed (planes x) v) i = decide (x i != v) := by
-  show BitVec.getLsbD
-      ((List.range 8).foldl
-        (fun w k => w ||| (if v.getLsbD k = true then ~~~(planes x k) else planes x k)) 0) i
-      = decide (x i != v)
-  rw [changed_foldl_getLsbD (planes x) v i hi 8]
-  have hcongr : (List.range 8).foldl
-        (fun acc k => acc || (if v.getLsbD k = true then !((planes x k).getLsbD i) else (planes x k).getLsbD i)) false
-      = (List.range 8).foldl
-        (fun acc k => acc || (if v.getLsbD k = true then !((x i).getLsbD k) else (x i).getLsbD k)) false := by
-    apply foldl_ltStep_congr
-    intro acc k
-    rw [planes_getLsbD x k i hi]
-  rw [hcongr, foldl_or_decide _ 8]
-  apply decide_eq_decide.mpr
-  have h1 : ∀ k ∈ List.range 8,
-      ((if v.getLsbD k = true then !((x i).getLsbD k) else (x i).getLsbD k) = true) ↔
-        ((x i).getLsbD k ≠ v.getLsbD k) := by
-    intro k _
-    exact contrib_iff_diff _ _
-  rw [exists_mem_congr _ h1]
-  exact Iff.trans (exists_bit_diff_iff_ne (x i) v) (bne_iff_ne).symm
-
--- mask bit = lane selected AND differs
-private theorem mask_changed_getLsbD (x : Nat → B) (v : B) (m : W) (i : Nat) (hi : i < 64) :
-    BitVec.getLsbD (m &&& changed (planes x) v) i = (m.getLsbD i && decide (x i != v)) := by
-  rw [BitVec.getLsbD_and, changed_planes_getLsbD x v i hi]
-
-
-
-private theorem pairwise_range (n : Nat) : List.Pairwise (· < ·) (List.range n) := by
-  induction n with
-  | zero => exact List.Pairwise.nil
-  | succ n ih =>
-      rw [List.range_succ, List.pairwise_append]
-      refine ⟨ih, List.pairwise_singleton _ _, ?_⟩
-      intro a ha b hb
-      rw [List.mem_singleton] at hb
-      subst hb
-      exact List.mem_range.mp ha
-
-private theorem pairwise_lanes (m : W) : List.Pairwise (· < ·) (lanes m) := by
-  show List.Pairwise (· < ·) ((List.range 64).filter m.getLsbD)
-  exact List.Pairwise.filter _ (pairwise_range 64)
-
-private theorem find?_eq_iff_of_pairwise {p : Nat → Bool} {l : List Nat}
-    (hs : List.Pairwise (· < ·) l) {i : Nat} :
-    l.find? p = some i ↔ i ∈ l ∧ p i = true ∧ ∀ j ∈ l, j < i → ¬ (p j = true) := by
-  induction l with
-  | nil => simp [List.find?]
-  | cons a t ih =>
-      have hst : List.Pairwise (· < ·) t := List.Pairwise.of_cons hs
-      have hat : ∀ b ∈ t, a < b := (List.pairwise_cons.mp hs).1
-      have hat_not : a ∉ t := by
-        intro ha
-        exact Nat.lt_irrefl a (hat a ha)
-      rw [List.find?_cons]
-      cases hpa : p a with
-      | true =>
-          dsimp only
-          rw [Option.some.injEq]
-          constructor
-          · intro hai
-            subst i
-            refine ⟨List.mem_cons_self, hpa, ?_⟩
-            intro j hj hjlt
-            rcases List.mem_cons.mp hj with heq | hjt
-            · subst j
-              exact absurd hjlt (Nat.lt_irrefl a)
-            · exact absurd (Nat.lt_trans hjlt (hat j hjt)) (Nat.lt_irrefl j)
-          · rintro ⟨hmem, -, hforall⟩
-            rcases List.mem_cons.mp hmem with heq | hit
-            · subst i
-              rfl
-            · have hai : a < i := hat i hit
-              have hna := hforall a List.mem_cons_self hai
-              rw [hpa] at hna
-              exact absurd rfl hna
-      | false =>
-          dsimp only
-          rw [ih hst]
-          have hpaF : p a = false := hpa
-          constructor
-          · rintro ⟨hit, hp, htf⟩
-            have hmem : i ∈ a :: t := List.mem_cons.mpr (Or.inr hit)
-            refine ⟨hmem, hp, ?_⟩
-            intro j hj hjlt
-            rcases List.mem_cons.mp hj with heq | hjt
-            · subst j
-              rw [hpaF]
-              exact fun h => Bool.noConfusion h
-            · exact htf j hjt hjlt
-          · rintro ⟨hmem, hp, hcall⟩
-            have hnot_a : i ≠ a := by
-              intro hia
-              subst i
-              rw [hpaF] at hp
-              exact Bool.noConfusion hp
-            have hit : i ∈ t := by
-              rcases List.mem_cons.mp hmem with h | h
-              · exact absurd h hnot_a
-              · exact h
-            refine ⟨hit, hp, ?_⟩
-            intro j hjt hjlt
-            exact hcall j (List.mem_cons.mpr (Or.inr hjt)) hjlt
-
-
-private theorem natCast64_toNat : ((↑64 : W)).toNat = 64 := by
-  show (BitVec.ofNat 64 64).toNat = 64
-  rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (Nat.lt_pow_self (a := 2) (n := 64) (by decide))]
-
-private theorem ctz_zero_toNat : ((0 : W).ctz).toNat = 64 := by
-  have hrev : ((0 : W).reverse) = 0 := (BitVec.reverse_eq_zero_iff (x := (0 : W))).mpr rfl
-  have h : (0 : W).ctz = (↑64 : W) := by
-    rw [BitVec.ctz_eq_reverse_clz, hrev]
-    exact (BitVec.clz_eq_iff_eq_zero (x := (0 : W))).mpr rfl
-  rw [h, natCast64_toNat]
-
-private theorem ne_zero_of_getLsbD {w : W} {i : Nat} (hi : i < 64)
-    (h : w.getLsbD i = true) : w ≠ 0 := by
-  intro hw
-  rw [hw] at h
-  simp at h
-
-private theorem eq_zero_of_getLsbD {w : W} (h : ∀ i, i < 64 → w.getLsbD i = false) : w = 0 := by
   apply BitVec.eq_of_getLsbD_eq
   intro i hi
-  simp [h i hi]
+  rw [BitVec.getLsbD_and, BitVec.getLsbD_and, lessMask_bit x y i hi,
+    pack_getLsbD (fun i => decide (x i < y i)) i hi]
 
-/-- If `i₀` is a set bit and all lower bits are clear, `ctz` lands on `i₀`. -/
-private theorem ctz_toNat_eq_of_bits {w : W} (hw : w ≠ 0) {i₀ : Nat} (hi₀ : i₀ < 64)
-    (hbit : w.getLsbD i₀ = true) (hbelow : ∀ j, j < i₀ → w.getLsbD j = false) :
-    w.ctz.toNat = i₀ := by
-  have hc : w.ctz.toNat < 64 := by
-    have hlt := (BitVec.ctz_lt_iff_ne_zero (x := w)).mpr hw
-    have h2 : (w.ctz).toNat < ((↑64 : W)).toNat := hlt
-    rw [natCast64_toNat] at h2
-    exact h2
-  have hct : w.getLsbD w.ctz.toNat = true := BitVec.getLsbD_true_ctz_of_ne_zero hw
-  have hcl : ∀ j, j < w.ctz.toNat → w.getLsbD j = false :=
-    fun j hj => BitVec.getLsbD_false_of_lt_ctz hj
-  rcases Nat.lt_trichotomy w.ctz.toNat i₀ with hlt | heq | hgt
-  · have hb := hbelow _ hlt
-    rw [hct] at hb
-    simp at hb
-  · exact heq
-  · have hb := hcl _ hgt
-    rw [hbit] at hb
-    simp at hb
+/-! ### PlaneAdd -/
 
-/-- bit `i` of `m &&& changed` is `m_i && (x_i ≠ v)` for `i < 64`. -/
-private theorem maskbit_iff_diff (x : Nat → B) (v : B) (m : W) (i : Nat) (hi : i < 64) :
-    ((m &&& changed (planes x) v).getLsbD i = true) ↔
-      (m.getLsbD i = true ∧ (x i != v) = true) := by
-  rw [mask_changed_getLsbD x v m i hi]
-  have hd : decide (x i != v) = (x i != v) := Bool.decide_eq_true
-  rw [hd, Bool.and_eq_true]
+private def addStepBool (xb yb : B) (st : List Bool × Bool) (k : Nat) : List Bool × Bool :=
+  let p := (xb.getLsbD k ^^ yb.getLsbD k)
+  (((p ^^ st.2) :: st.1), (xb.getLsbD k && yb.getLsbD k) || (p && st.2))
 
-theorem sound_RunBoundary : RunBoundary.Goal := by
-  intro x v m
-  cases hfind : (lanes m).find? (fun i => x i != v) with
-  | none =>
-      have hnone := (List.find?_eq_none).mp hfind
-      have hw0 : m &&& changed (planes x) v = 0 := by
-        apply eq_zero_of_getLsbD
-        intro i hi
-        rw [mask_changed_getLsbD x v m i hi]
-        have hd : decide (x i != v) = (x i != v) := Bool.decide_eq_true
-        rw [hd]
-        by_cases hmi : m.getLsbD i = true
-        · have himem : i ∈ lanes m := by
-            show i ∈ (List.range 64).filter m.getLsbD
-            exact List.mem_filter.mpr ⟨List.mem_range.mpr hi, hmi⟩
-          have hnp := hnone i himem
-          have hdf : (x i != v) = false := by
-            cases h : (x i != v) with
-            | true => exact absurd h hnp
-            | false => rfl
-          rw [hmi, hdf]
-          rfl
-        · have hmif : m.getLsbD i = false := by
-            cases hc : m.getLsbD i <;> simp_all
-          rw [hmif]
+private theorem addStepBool_fold_eq (xb yb : B) :
+    let (rev, c) := (List.range 8).foldl (addStepBool xb yb) ([], false)
+    rev.reverse = ((List.range 8).map fun k => (xb + yb).getLsbD k) ∧
+    c = decide (256 ≤ xb.toNat + yb.toNat) := by
+  revert xb yb
+  native_decide
+
+private def addStepW (a b : Planes) (st : List W × W) (k : Nat) : List W × W :=
+  let p := a k ^^^ b k
+  (((p ^^^ st.2) :: st.1), (a k &&& b k) ||| (p &&& st.2))
+
+private theorem addFold_bit (x y : Nat → B) (i : Nat) (hi : i < 64) :
+    ∀ (n : Nat) (out : List W) (c : W),
+      let (rev, carry) := (List.range n).foldl (addStepW (planes x) (planes y)) (out, c)
+      (rev.map fun w => w.getLsbD i, carry.getLsbD i) =
+        (List.range n).foldl (addStepBool (x i) (y i))
+          (out.map fun w => w.getLsbD i, c.getLsbD i) := by
+  intro n
+  induction n with
+  | zero => intro out c; rfl
+  | succ n ih =>
+      intro out c
+      rw [List.range_succ]
+      simp only [List.foldl_append, List.foldl_cons, List.foldl_nil]
+      have ih' : (((List.range n).foldl (addStepW (planes x) (planes y)) (out, c)).1.map
+              (fun w => w.getLsbD i),
+            ((List.range n).foldl (addStepW (planes x) (planes y)) (out, c)).2.getLsbD i) =
+          (List.range n).foldl (addStepBool (x i) (y i))
+            (out.map fun w => w.getLsbD i, c.getLsbD i) := by
+        simpa using ih out c
+      dsimp [addStepW, addStepBool]
+      simp only [List.map_cons]
+      apply Prod.ext
+      · simp only
+        have hfst' : ((List.range n).foldl (addStepW (planes x) (planes y)) (out, c)).1.map
+              (fun w => w.getLsbD i) =
+            ((List.range n).foldl (addStepBool (x i) (y i))
+              (out.map fun w => w.getLsbD i, c.getLsbD i)).1 := by
+          simpa using congrArg Prod.fst ih'
+        have hsnd' : ((List.range n).foldl (addStepW (planes x) (planes y)) (out, c)).2.getLsbD i =
+            ((List.range n).foldl (addStepBool (x i) (y i))
+              (out.map fun w => w.getLsbD i, c.getLsbD i)).2 := by
+          simpa using congrArg Prod.snd ih'
+        rw [hfst']
+        congr 1
+        rw [BitVec.getLsbD_xor, BitVec.getLsbD_xor, hsnd']
+        dsimp [planes]
+        rw [pack_getLsbD (fun j => (x j).getLsbD n) i hi,
+          pack_getLsbD (fun j => (y j).getLsbD n) i hi]
+      · simp only
+        have hsnd' : ((List.range n).foldl (addStepW (planes x) (planes y)) (out, c)).2.getLsbD i =
+            ((List.range n).foldl (addStepBool (x i) (y i))
+              (out.map fun w => w.getLsbD i, c.getLsbD i)).2 := by
+          simpa using congrArg Prod.snd ih'
+        rw [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_and, hsnd']
+        dsimp [planes]
+        rw [BitVec.getLsbD_xor,
+          pack_getLsbD (fun j => (x j).getLsbD n) i hi,
+          pack_getLsbD (fun j => (y j).getLsbD n) i hi]
+
+private theorem add_fold_length (a b : Planes) : ∀ (n : Nat) (out : List W) (c : W),
+    ((List.range n).foldl (addStepW a b) (out, c)).1.length = out.length + n := by
+  intro n
+  induction n with
+  | zero => intro out c; simp
+  | succ n ih =>
+      intro out c
+      rw [List.range_succ]
+      simp only [List.foldl_append, List.foldl_cons, List.foldl_nil]
+      dsimp [addStepW]
+      rw [ih]
+      omega
+
+theorem PlaneAdd_sound : TinylambOpt.ResearchGoals.PlaneKernels.PlaneAdd.Goal := by
+  intro x y
+  let st := (List.range 8).foldl (addStepW (planes x) (planes y)) ([], 0)
+  let bits := st.1.reverse
+  let carry := st.2
+  have hlenst : st.1.length = 8 := by
+    simpa [st] using (add_fold_length (planes x) (planes y) 8 [] 0)
+  have hbitslen : bits.length = 8 := by simpa [bits, hlenst]
+  have hbitlane : ∀ (i : Nat), i < 64 →
+      bits.map (fun w => w.getLsbD i) =
+        (List.range 8).map fun k => ((x i) + (y i)).getLsbD k := by
+    intro i hi
+    have h0 := addFold_bit x y i hi 8 [] 0
+    have h : (st.1.map (fun w => w.getLsbD i), carry.getLsbD i) =
+        (List.range 8).foldl (addStepBool (x i) (y i)) ([], false) := by
+      simpa [st, carry] using h0
+    have hfst : st.1.map (fun w => w.getLsbD i) =
+        ((List.range 8).foldl (addStepBool (x i) (y i)) ([], false)).1 := by
+      exact congrArg Prod.fst h
+    have hb : ((List.range 8).foldl (addStepBool (x i) (y i)) ([], false)).1.reverse =
+        ((List.range 8).map fun k => ((x i) + (y i)).getLsbD k) ∧
+        ((List.range 8).foldl (addStepBool (x i) (y i)) ([], false)).2 =
+          decide (256 ≤ (x i).toNat + (y i).toNat) := by
+      simpa using (addStepBool_fold_eq (x i) (y i))
+    simpa only [bits, List.map_reverse, hfst] using hb.1
+  have hcarrylane : ∀ (i : Nat), i < 64 →
+      carry.getLsbD i = decide (256 ≤ (x i).toNat + (y i).toNat) := by
+    intro i hi
+    have h0 := addFold_bit x y i hi 8 [] 0
+    have h : (st.1.map (fun w => w.getLsbD i), carry.getLsbD i) =
+        (List.range 8).foldl (addStepBool (x i) (y i)) ([], false) := by
+      simpa [st, carry] using h0
+    have hb : ((List.range 8).foldl (addStepBool (x i) (y i)) ([], false)).1.reverse =
+        ((List.range 8).map fun k => ((x i) + (y i)).getLsbD k) ∧
+        ((List.range 8).foldl (addStepBool (x i) (y i)) ([], false)).2 =
+          decide (256 ≤ (x i).toNat + (y i).toNat) := by
+      simpa using (addStepBool_fold_eq (x i) (y i))
+    exact (congrArg Prod.snd h).trans hb.2
+  constructor
+  · change bits = (List.range 8).map fun k => planes (fun i => x i + y i) k
+    apply List.ext_getElem?
+    intro n
+    by_cases hn : n < 8
+    · have hnlen : n < bits.length := by simpa [hbitslen] using hn
+      have hnlen' : n < ((List.range 8).map fun k => planes (fun i => x i + y i) k).length := by
+        simp [hn]
+      rw [List.getElem?_eq_getElem hnlen, List.getElem?_eq_getElem hnlen']
+      simp only [Option.some.injEq]
+      apply BitVec.eq_of_getLsbD_eq
+      intro i hi
+      have hget := congrArg (fun l : List Bool => l[n]?) (hbitlane i hi)
+      have hm1 : n < (bits.map (fun w => w.getLsbD i)).length := by simpa [hbitslen]
+      have hm2 : n < ((List.range 8).map fun k => ((x i + y i).getLsbD k)).length := by
+        simp [hn]
+      rw [List.getElem?_eq_getElem hm1, List.getElem?_eq_getElem hm2] at hget
+      simp only [Option.some.injEq] at hget
+      have hbit : (bits[n]).getLsbD i = ((x i + y i).getLsbD n) := by
+        rw [List.getElem_map, List.getElem_map] at hget
+        rw [show (List.range 8)[n] = n from List.getElem_range (by simpa using hn)] at hget
+        exact hget
+      rw [List.getElem_map]
+      simp [hn]
+      dsimp [planes]
+      rw [pack_getLsbD (fun j => (x j + y j).getLsbD n) i hi]
+      exact hbit
+    · have hnlen : bits.length ≤ n := by simpa [hbitslen] using hn
+      have hnlen' : ((List.range 8).map fun k => planes (fun i => x i + y i) k).length ≤ n := by
+        simpa using hn
+      rw [List.getElem?_eq_none hnlen, List.getElem?_eq_none hnlen']
+  · change carry = pack (fun i => decide (256 ≤ (x i).toNat + (y i).toNat))
+    apply BitVec.eq_of_getLsbD_eq
+    intro i hi
+    rw [hcarrylane i hi, pack_getLsbD _ i hi]
+
+/-! ### PlaneDot -/
+
+private theorem sum_map_zero (l : List Nat) : (l.map fun _ => 0).sum = 0 := by
+  induction l with
+  | nil => rfl
+  | cons x xs ih => simpa using ih
+
+private theorem sum_map_add_nat (l : List Nat) (a b : Nat → Nat) :
+    (l.map fun k => a k + b k).sum = (l.map a).sum + (l.map b).sum := by
+  induction l with
+  | nil => simp
+  | cons k t ih => simp only [List.map_cons, List.sum_cons, ih]; omega
+
+private theorem len_range_succ_filter (p : Nat → Bool) (n : Nat) :
+    ((List.range (n+1)).filter p).length =
+      ((List.range n).filter p).length + (if p n then 1 else 0) := by
+  rw [List.range_succ, List.filter_append, List.length_append]
+  cases h : p n with
+  | true =>
+      rw [List.filter_cons_of_pos h]
+      simp [List.length_cons, List.length_nil, List.filter_nil]
+  | false =>
+      rw [List.filter_cons_of_neg (by simp [h])]
+      simp [List.length_nil, List.filter_nil]
+
+private theorem prod_expand (xb yb : B) :
+    xb.toNat * yb.toNat =
+      ((List.range 8).map fun j =>
+        ((List.range 8).map fun k =>
+          if xb.getLsbD j && yb.getLsbD k then 2^(j+k) else 0).sum).sum := by
+  revert xb yb
+  native_decide
+
+private theorem dotFold (sel : Nat → Bool) (valX valY : Nat → B) : ∀ n : Nat,
+    (((List.range n).filter sel).map fun i => (valX i).toNat * (valY i).toNat).sum =
+      ((List.range 8).map fun j =>
+        ((List.range 8).map fun k =>
+          2^(j+k) * ((List.range n).filter fun i =>
+            sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum).sum := by
+  intro n
+  induction n with
+  | zero =>
+      simp only [List.range_zero, List.filter_nil, List.map_nil, List.sum_nil,
+        List.length_nil, Nat.mul_zero]
+      rw [sum_map_zero (List.range 8), sum_map_zero (List.range 8)]
+  | succ n ih =>
+      by_cases hsel : sel n
+      · have hT : (((List.range (n+1)).filter sel).map fun i =>
+            (valX i).toNat * (valY i).toNat).sum =
+            (((List.range n).filter sel).map fun i =>
+              (valX i).toNat * (valY i).toNat).sum +
+              (valX n).toNat * (valY n).toNat := by
+          rw [List.range_succ, List.filter_append, List.filter_cons_of_pos hsel]
+          simp [List.map_append, List.sum_append]
+        have helem (j k : Nat) :
+            2^(j+k) * ((List.range (n+1)).filter fun i =>
+                sel i && (valX i).getLsbD j && (valY i).getLsbD k).length =
+              2^(j+k) * ((List.range n).filter fun i =>
+                sel i && (valX i).getLsbD j && (valY i).getLsbD k).length +
+              (if (valX n).getLsbD j && (valY n).getLsbD k then 2^(j+k) else 0) := by
+          rw [len_range_succ_filter (fun i =>
+            sel i && (valX i).getLsbD j && (valY i).getLsbD k) n]
+          by_cases hcond : (valX n).getLsbD j && (valY n).getLsbD k <;>
+            simp [hsel, hcond, Nat.mul_add]
+        have hU :
+            ((List.range 8).map fun j =>
+              ((List.range 8).map fun k =>
+                2^(j+k) * ((List.range (n+1)).filter fun i =>
+                  sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum).sum =
+            ((List.range 8).map fun j =>
+              ((List.range 8).map fun k =>
+                2^(j+k) * ((List.range n).filter fun i =>
+                  sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum).sum +
+            ((List.range 8).map fun j =>
+              ((List.range 8).map fun k =>
+                if (valX n).getLsbD j && (valY n).getLsbD k then 2^(j+k) else 0).sum).sum := by
+          rw [show (List.range 8).map (fun j =>
+                ((List.range 8).map fun k =>
+                  2^(j+k) * ((List.range (n+1)).filter fun i =>
+                    sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum) =
+              (List.range 8).map (fun j =>
+                ((List.range 8).map fun k =>
+                  2^(j+k) * ((List.range n).filter fun i =>
+                    sel i && (valX i).getLsbD j && (valY i).getLsbD k).length +
+                  (if (valX n).getLsbD j && (valY n).getLsbD k then 2^(j+k) else 0)).sum) from
+                List.map_congr_left (fun j _ =>
+                  congrArg List.sum (List.map_congr_left (fun k _ => helem j k)))]
+          rw [show (List.range 8).map (fun j =>
+                ((List.range 8).map fun k =>
+                  2^(j+k) * ((List.range n).filter fun i =>
+                    sel i && (valX i).getLsbD j && (valY i).getLsbD k).length +
+                  (if (valX n).getLsbD j && (valY n).getLsbD k then 2^(j+k) else 0)).sum) =
+              (List.range 8).map (fun j =>
+                ((List.range 8).map fun k =>
+                  2^(j+k) * ((List.range n).filter fun i =>
+                    sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum +
+                ((List.range 8).map fun k =>
+                  if (valX n).getLsbD j && (valY n).getLsbD k then 2^(j+k) else 0).sum) from
+                List.map_congr_left (fun j _ => sum_map_add_nat (List.range 8) _ _)]
+          exact sum_map_add_nat (List.range 8) _ _
+        rw [hT, hU, ih, prod_expand (valX n) (valY n)]
+      · have hsf : sel n = false := by
+          cases h : sel n <;> simp_all
+        have hT : (((List.range (n+1)).filter sel).map fun i =>
+            (valX i).toNat * (valY i).toNat).sum =
+            (((List.range n).filter sel).map fun i =>
+              (valX i).toNat * (valY i).toNat).sum := by
+          rw [List.range_succ, List.filter_append, List.filter_cons_of_neg (by simp [hsf])]
           simp
-      rw [hw0, ctz_zero_toNat]
-      rfl
-  | some i₀ =>
-      have hprop := (find?_eq_iff_of_pairwise (pairwise_lanes m)
-        (p := fun i => x i != v)).mp hfind
-      obtain ⟨hi₀mem, hp₀, hleast⟩ := hprop
-      have hi₀64 : i₀ < 64 := List.mem_range.mp ((List.mem_filter.mp hi₀mem).1)
-      have hm₀ : m.getLsbD i₀ = true := (List.mem_filter.mp hi₀mem).2
-      have hbit₀ : (m &&& changed (planes x) v).getLsbD i₀ = true := by
-        rw [maskbit_iff_diff x v m i₀ hi₀64]
-        exact ⟨hm₀, hp₀⟩
-      have hw : m &&& changed (planes x) v ≠ 0 := ne_zero_of_getLsbD hi₀64 hbit₀
-      have hctz : (m &&& changed (planes x) v).ctz.toNat = i₀ := by
-        apply ctz_toNat_eq_of_bits hw hi₀64 hbit₀
-        intro j hj
-        rw [mask_changed_getLsbD x v m j (by omega : j < 64)]
-        have hj64 : j < 64 := by omega
-        by_cases hmj : m.getLsbD j = true
-        · have hjmem : j ∈ lanes m := by
-            show j ∈ (List.range 64).filter m.getLsbD
-            exact List.mem_filter.mpr ⟨List.mem_range.mpr hj64, hmj⟩
-          have hnotp := hleast j hjmem hj
-          have hdf : (x j != v) = false := by
-            cases h : (x j != v) with
-            | true => exact absurd h hnotp
-            | false => rfl
-          rw [hmj]
-          have hd : decide (x j != v) = (x j != v) := Bool.decide_eq_true
-          rw [hd, hdf]
-          rfl
-        · have hmjf : m.getLsbD j = false := by
-            cases hc : m.getLsbD j <;> simp_all
-          rw [hmjf]
-          simp
-      rw [hctz]
-      rfl
+        have helem (j k : Nat) :
+            2^(j+k) * ((List.range (n+1)).filter fun i =>
+                sel i && (valX i).getLsbD j && (valY i).getLsbD k).length =
+              2^(j+k) * ((List.range n).filter fun i =>
+                sel i && (valX i).getLsbD j && (valY i).getLsbD k).length := by
+          rw [len_range_succ_filter (fun i =>
+            sel i && (valX i).getLsbD j && (valY i).getLsbD k) n]
+          simp [hsf]
+        rw [hT]
+        rw [show (List.range 8).map (fun j =>
+              ((List.range 8).map fun k =>
+                2^(j+k) * ((List.range (n+1)).filter fun i =>
+                  sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum) =
+            (List.range 8).map (fun j =>
+              ((List.range 8).map fun k =>
+                2^(j+k) * ((List.range n).filter fun i =>
+                  sel i && (valX i).getLsbD j && (valY i).getLsbD k).length).sum) from
+              List.map_congr_left (fun j _ =>
+                congrArg List.sum (List.map_congr_left (fun k _ => helem j k)))]
+        exact ih
 
-/-! ### MedianOfThree: per-lane median mux over pairwise `lessMask` bits -/
+private theorem count_inter (m : W) (x y : Nat → B) (j k : Nat) :
+    count (m &&& planes x j &&& planes y k) =
+      ((List.range 64).filter fun i =>
+        m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k).length := by
+  show ((List.range 64).filter (fun i =>
+    (m &&& planes x j &&& planes y k).getLsbD i)).length = _
+  apply congrArg List.length
+  apply List.filter_congr
+  intro i hi
+  have hi64 : i < 64 := List.mem_range.mp hi
+  rw [BitVec.getLsbD_and, BitVec.getLsbD_and]
+  dsimp [planes]
+  rw [pack_getLsbD (fun t => (x t).getLsbD j) i hi64,
+    pack_getLsbD (fun t => (y t).getLsbD k) i hi64]
 
-private theorem bv_le_of_lt {a b : BitVec 8} (h : a < b) : a ≤ b := by
-  have h' : a.toNat < b.toNat := h
-  have : a.toNat ≤ b.toNat := by omega
-  exact this
+theorem PlaneDot_sound : TinylambOpt.ResearchGoals.PlaneKernels.PlaneDot.Goal := by
+  intro x y m
+  have h := dotFold m.getLsbD x y 64
+  rw [show ((List.range 8).map fun j =>
+        ((List.range 8).map fun k =>
+          2^(j+k) * ((List.range 64).filter fun i =>
+            m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k).length).sum).sum =
+      ((List.range 8).map fun j =>
+        ((List.range 8).map fun k =>
+          2^(j+k) * count (m &&& planes x j &&& planes y k)).sum).sum from
+      congrArg List.sum (List.map_congr_left (fun j _ =>
+        congrArg List.sum (List.map_congr_left (fun k _ =>
+          congrArg (fun t : Nat => 2^(j+k) * t) (count_inter m x y j k).symm))))] at h
+  simpa [lanes] using h.symm
 
-private theorem bv_ge_of_not_lt {a b : BitVec 8} (h : ¬ a < b) : b ≤ a := by
-  have h' : ¬ (a.toNat < b.toNat) := h
-  have : b.toNat ≤ a.toNat := by omega
-  exact this
+/-! ### MedianOfThree -/
 
-private theorem bv_eq_of_le_ge {a b : BitVec 8} (h1 : a ≤ b) (h2 : b ≤ a) : a = b := by
-  have e1 : a.toNat ≤ b.toNat := h1
-  have e2 : b.toNat ≤ a.toNat := h2
-  have : a.toNat = b.toNat := by omega
-  exact BitVec.eq_of_toNat_eq this
+private theorem getLsbD_ge_width {w : Nat} (v : BitVec w) {i : Nat} (h : w ≤ i) :
+    v.getLsbD i = false := by
+  change v.toNat.testBit i = false
+  exact Nat.testBit_lt_two_pow (Nat.lt_of_lt_of_le v.isLt
+    (Nat.pow_le_pow_right (by decide : (2 : Nat) > 0) h))
 
-private theorem bv_min_eq_of_le {a b : BitVec 8} (h : a ≤ b) : min a b = a := ite_eq_left h
-private theorem bv_min_eq_of_not_le {a b : BitVec 8} (h : ¬ a ≤ b) : min a b = b := ite_eq_right h
-private theorem bv_min_eq_of_ge {a b : BitVec 8} (h : b ≤ a) : min a b = b := by
-  by_cases hab : a ≤ b
-  · have he : a = b := bv_eq_of_le_ge hab h
-    rw [bv_min_eq_of_le hab]
-    exact he
-  · exact bv_min_eq_of_not_le hab
-private theorem bv_max_eq_of_le {a b : BitVec 8} (h : a ≤ b) : max a b = b := ite_eq_left h
-private theorem bv_max_eq_of_not_le {a b : BitVec 8} (h : ¬ a ≤ b) : max a b = a := ite_eq_right h
-private theorem bv_max_eq_of_ge {a b : BitVec 8} (h : b ≤ a) : max a b = a := by
-  by_cases hab : a ≤ b
-  · have he : a = b := bv_eq_of_le_ge hab h
-    rw [bv_max_eq_of_le hab]
-    exact he.symm
-  · exact bv_max_eq_of_not_le hab
+private theorem median3_bool (xb yb zb : B) (ki : Fin 8) :
+    let ab := decide (xb < yb)
+    let ac := decide (xb < zb)
+    let bc := decide (yb < zb)
+    let midA := ab ^^ ac
+    let midB := (Bool.not ab) ^^ bc
+    ((midA && xb.getLsbD ki) || ((Bool.not midA) && midB && yb.getLsbD ki) ||
+      ((Bool.not midA) && (Bool.not midB) && zb.getLsbD ki)) =
+      (max (min xb yb) (min (max xb yb) zb)).getLsbD ki := by
+  revert xb yb zb ki
+  native_decide
 
-/-- Per-lane median bit: the mux of the three comparison masks picks the bit of the
-median byte `max (min x y) (min (max x y) z)`. -/
-private theorem median3_lane (xv yv zv : BitVec 8) (k : Nat) :
-    (((decide (xv < yv) ^^ decide (xv < zv)) && (xv.getLsbD k)) ||
-    (!(decide (xv < yv) ^^ decide (xv < zv)) &&
-      ((!decide (xv < yv)) ^^ decide (yv < zv)) && (yv.getLsbD k)) ||
-    (!(decide (xv < yv) ^^ decide (xv < zv)) &&
-      !((!decide (xv < yv)) ^^ decide (yv < zv)) && (zv.getLsbD k)))
-    = (max (min xv yv) (min (max xv yv) zv)).getLsbD k := by
-  by_cases hxy : xv < yv
-  · by_cases hxz : xv < zv
-    · by_cases hyz : yv < zv
-      · -- x < y < z : median is y
-        rw [decide_eq_true hxy, decide_eq_true hxz, decide_eq_true hyz]
-        have hxy' := bv_le_of_lt hxy
-        have hyz' := bv_le_of_lt hyz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = yv := by
-          rw [bv_min_eq_of_le hxy', bv_max_eq_of_le hxy', bv_min_eq_of_le hyz',
-            bv_max_eq_of_le hxy']
-        rw [hmed]
-        simp
-      · -- x < z ≤ y : median is z
-        rw [decide_eq_true hxy, decide_eq_true hxz, decide_eq_false hyz]
-        have hxy' := bv_le_of_lt hxy
-        have hxz' := bv_le_of_lt hxz
-        have hzy := bv_ge_of_not_lt hyz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = zv := by
-          rw [bv_min_eq_of_le hxy', bv_max_eq_of_le hxy', bv_min_eq_of_ge hzy,
-            bv_max_eq_of_le hxz']
-        rw [hmed]
-        simp
-    · by_cases hyz : yv < zv
-      · -- z ≤ x < y and y < z : inconsistent
-        have e1 : xv.toNat < yv.toNat := hxy
-        have e2 : zv.toNat ≤ xv.toNat := bv_ge_of_not_lt hxz
-        have e3 : yv.toNat < zv.toNat := hyz
-        have hF : False := by omega
-        exact hF.elim
-      · -- z ≤ x < y : median is x
-        rw [decide_eq_true hxy, decide_eq_false hxz, decide_eq_false hyz]
-        have hxy' := bv_le_of_lt hxy
-        have hzx := bv_ge_of_not_lt hxz
-        have hzy := bv_ge_of_not_lt hyz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = xv := by
-          rw [bv_min_eq_of_le hxy', bv_max_eq_of_le hxy', bv_min_eq_of_ge hzy,
-            bv_max_eq_of_ge hzx]
-        rw [hmed]
-        simp
-  · by_cases hxz : xv < zv
-    · by_cases hyz : yv < zv
-      · -- y ≤ x < z : median is x
-        rw [decide_eq_false hxy, decide_eq_true hxz, decide_eq_true hyz]
-        have hyx := bv_ge_of_not_lt hxy
-        have hxz' := bv_le_of_lt hxz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = xv := by
-          rw [bv_min_eq_of_ge hyx, bv_max_eq_of_ge hyx, bv_min_eq_of_le hxz',
-            bv_max_eq_of_le hyx]
-        rw [hmed]
-        simp
-      · -- y ≤ x < z and z ≤ y : inconsistent
-        have e1 : yv.toNat ≤ xv.toNat := bv_ge_of_not_lt hxy
-        have e2 : xv.toNat < zv.toNat := hxz
-        have e3 : zv.toNat ≤ yv.toNat := bv_ge_of_not_lt hyz
-        have hF : False := by omega
-        exact hF.elim
-    · by_cases hyz : yv < zv
-      · -- y < z ≤ x : median is z
-        rw [decide_eq_false hxy, decide_eq_false hxz, decide_eq_true hyz]
-        have hyx := bv_ge_of_not_lt hxy
-        have hzx := bv_ge_of_not_lt hxz
-        have hyz' := bv_le_of_lt hyz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = zv := by
-          rw [bv_min_eq_of_ge hyx, bv_max_eq_of_ge hyx, bv_min_eq_of_ge hzx,
-            bv_max_eq_of_le hyz']
-        rw [hmed]
-        simp
-      · -- z ≤ y ≤ x : median is y
-        rw [decide_eq_false hxy, decide_eq_false hxz, decide_eq_false hyz]
-        have hyx := bv_ge_of_not_lt hxy
-        have hzx := bv_ge_of_not_lt hxz
-        have hzy := bv_ge_of_not_lt hyz
-        have hmed : max (min xv yv) (min (max xv yv) zv) = yv := by
-          rw [bv_min_eq_of_ge hyx, bv_max_eq_of_ge hyx, bv_min_eq_of_ge hzx,
-            bv_max_eq_of_ge hzy]
-        rw [hmed]
-        simp
+private theorem median3_bit (x y z : Nat → B) (i k : Nat) (hi : i < 64) :
+    (median3 (planes x) (planes y) (planes z) k).getLsbD i =
+      (max (min (x i) (y i)) (min (max (x i) (y i)) (z i))).getLsbD k := by
+  by_cases hk : k < 8
+  · let ki : Fin 8 := ⟨k, hk⟩
+    dsimp [median3]
+    simp only [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_xor, BitVec.getLsbD_not]
+    rw [lessMask_bit x y i hi, lessMask_bit x z i hi, lessMask_bit y z i hi]
+    dsimp [planes]
+    rw [pack_getLsbD (fun t => (x t).getLsbD k) i hi,
+      pack_getLsbD (fun t => (y t).getLsbD k) i hi,
+      pack_getLsbD (fun t => (z t).getLsbD k) i hi]
+    simp only [decide_eq_true hi, Bool.true_and]
+    simpa [ki] using median3_bool (x i) (y i) (z i) ki
+  · have hk8 : 8 ≤ k := by omega
+    dsimp [median3, planes]
+    simp only [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_xor, BitVec.getLsbD_not]
+    rw [pack_getLsbD (fun t => (x t).getLsbD k) i hi,
+      pack_getLsbD (fun t => (y t).getLsbD k) i hi,
+      pack_getLsbD (fun t => (z t).getLsbD k) i hi]
+    rw [show (x i).getLsbD k = false from getLsbD_ge_width _ hk8,
+      show (y i).getLsbD k = false from getLsbD_ge_width _ hk8,
+      show (z i).getLsbD k = false from getLsbD_ge_width _ hk8]
+    simp only [decide_eq_true hi, Bool.true_and, Bool.false_and, Bool.and_false,
+      Bool.false_or, Bool.or_false]
+    exact (getLsbD_ge_width _ hk8).symm
 
-theorem sound_MedianOfThree : MedianOfThree.Goal := by
+theorem MedianOfThree_sound : TinylambOpt.ResearchGoals.PlaneKernels.MedianOfThree.Goal := by
   intro x y z k
   apply BitVec.eq_of_getLsbD_eq
   intro i hi
-  simp only [median3, BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_xor,
-    BitVec.getLsbD_not, planes_getLsbD x k i hi, planes_getLsbD y k i hi,
-    planes_getLsbD z k i hi,
-    planes_getLsbD (fun i => max (min (x i) (y i)) (min (max (x i) (y i)) (z i))) k i hi,
-    lessMask_getLsbD x y i hi, lessMask_getLsbD x z i hi, lessMask_getLsbD y z i hi,
-    decide_eq_true hi, Bool.true_and]
-  exact median3_lane (x i) (y i) (z i) k
+  rw [median3_bit x y z i k hi]
+  dsimp [planes]
+  rw [pack_getLsbD (fun t =>
+    (max (min (x t) (y t)) (min (max (x t) (y t)) (z t))).getLsbD k) i hi]
 
-/-! ### PlaneDot helpers -/
+/-! ### RunBoundary -/
 
-private theorem sum_map_zero {α : Type} (l : List α) : (l.map fun _ => (0 : Nat)).sum = 0 := by
+private def changedBit (vb xb : B) (k : Nat) : Bool :=
+  if vb.getLsbD k then Bool.not (xb.getLsbD k) else xb.getLsbD k
+
+private theorem changed_bit (x : Nat → B) (v : B) (i : Nat) (hi : i < 64) :
+    (changed (planes x) v).getLsbD i = decide (x i != v) := by
+  unfold changed
+  have hstep : ∀ (n : Nat) (acc : W),
+      ((List.range n).foldl (fun w k =>
+        w ||| (if v.getLsbD k then ~~~(planes x k) else planes x k)) acc).getLsbD i =
+        (List.range n).foldl (fun w k => w || changedBit v (x i) k) (acc.getLsbD i) := by
+    intro n
+    induction n with
+    | zero => intro acc; rfl
+    | succ n ih =>
+        intro acc
+        rw [List.range_succ]
+        simp only [List.foldl_append, List.foldl_cons, List.foldl_nil]
+        rw [BitVec.getLsbD_or, ih]
+        dsimp [changedBit]
+        by_cases hv : v.getLsbD n
+        · rw [ite_eq_left hv]
+          rw [BitVec.getLsbD_not]
+          dsimp [planes]
+          rw [pack_getLsbD (fun t => (x t).getLsbD n) i hi]
+          simp [hi, hv]
+        · rw [ite_eq_right hv]
+          dsimp [planes]
+          rw [pack_getLsbD (fun t => (x t).getLsbD n) i hi]
+          simp [hi, hv]
+  rw [hstep 8 0]
+  have hfinite : ∀ (xb vb : B),
+      (List.range 8).foldl (fun w k => w || changedBit vb xb k) false = decide (xb != vb) := by
+    native_decide
+  simpa using hfinite (x i) v
+
+private theorem ctz_find_getD (w : W) :
+    ((List.range 64).find? w.getLsbD).getD 64 = w.ctz.toNat := by
+  by_cases hz : w = 0
+  · have hfind : (List.range 64).find? w.getLsbD = none := by
+      apply List.find?_range_eq_none.mpr
+      intro i hi
+      rw [hz]
+      simp
+    rw [hfind]
+    subst w
+    native_decide
+  · have hset := BitVec.getLsbD_true_ctz_of_ne_zero hz
+    have hfind : (List.range 64).find? w.getLsbD = some w.ctz.toNat := by
+      apply List.find?_range_eq_some.mpr
+      refine ⟨hset, List.mem_range.mpr (BitVec.lt_of_getLsbD hset), ?_⟩
+      intro j hj
+      rw [Bool.not_eq_eq_eq_not]
+      exact (show w.getLsbD j = false from BitVec.getLsbD_false_of_lt_ctz hj)
+    rw [hfind]
+    rfl
+
+private theorem find?_congr {α : Type} (p q : α → Bool) : ∀ l : List α,
+    (∀ x ∈ l, p x = q x) → l.find? p = l.find? q := by
+  intro l
   induction l with
-  | nil => rfl
-  | cons a t ih => simp [ih]
-
-private theorem sum_map_add {α : Type} (l : List α) (f g : α → Nat) :
-    (l.map fun a => f a + g a).sum = (l.map f).sum + (l.map g).sum := by
-  induction l with
-  | nil => rfl
+  | nil => intro _; rfl
   | cons a t ih =>
-      simp only [List.map_cons, List.sum_cons, ih]
+      intro h
+      have ha := h a (by simp)
+      have hq : q a = p a := ha.symm
+      by_cases hp : p a = true
+      · rw [List.find?_cons, hp]
+        rw [List.find?_cons, hq, hp]
+      · have hp' : p a = false := by
+          cases hpa : p a with
+          | false => rfl
+          | true => simp [hpa] at hp
+        rw [List.find?_cons, hp']
+        rw [List.find?_cons, hq, hp']
+        apply ih
+        intro x hx
+        exact h x (by simp [hx])
+
+theorem RunBoundary_sound : TinylambOpt.ResearchGoals.PlaneKernels.RunBoundary.Goal := by
+  intro x v m
+  rw [← ctz_find_getD (m &&& changed (planes x) v)]
+  have hfind : (List.range 64).find? (m &&& changed (planes x) v).getLsbD =
+      (lanes m).find? (fun i => x i != v) := by
+    rw [lanes, List.find?_filter]
+    apply find?_congr
+    intro i hi
+    have hi64 : i < 64 := List.mem_range.mp hi
+    rw [BitVec.getLsbD_and, changed_bit x v i hi64]
+    rfl
+  rw [hfind]
+
+/-! ### ArgMinMask -/
+
+private def pref (v : B) : Nat → Nat
+  | 0 => 0
+  | d+1 => 2 * pref v d + (if v.getLsbD (7-d) then 1 else 0)
+
+private theorem pref_lt_pow (v : B) : ∀ d, pref v d < 2^d := by
+  intro d
+  induction d with
+  | zero => simp [pref]
+  | succ d ih =>
+      rw [pref, Nat.pow_succ]
+      have hb : (if v.getLsbD (7-d) then 1 else 0) < 2 := by
+        cases v.getLsbD (7-d) <;> simp
       omega
 
-private theorem mul_sum_const {α : Type} (l : List α) (f : α → Nat) (c : Nat) :
-    c * (l.map f).sum = (l.map fun a => c * f a).sum := by
-  induction l with
-  | nil => simp
-  | cons a t ih =>
-      simp only [List.map_cons, List.sum_cons]
-      rw [Nat.mul_add, ih]
+private theorem pref_8 (v : B) : pref v 8 = v.toNat := by
+  revert v
+  native_decide
 
-private theorem countP_congr_bool {α : Type} {p q : α → Bool} {l : List α}
-    (h : ∀ i ∈ l, p i = q i) : l.countP p = l.countP q := by
-  induction l with
-  | nil => rfl
-  | cons a t ih =>
-      have hat : p a = q a := h a List.mem_cons_self
-      have ht : ∀ i ∈ t, p i = q i := fun i hi => h i (List.mem_cons_of_mem a hi)
-      rw [List.countP_cons, List.countP_cons, ih ht, hat]
+private theorem pref_le_of_succ_le (v w : B) (d : Nat) (h : pref v (d+1) ≤ pref w (d+1)) :
+    pref v d ≤ pref w d := by
+  rw [pref, pref] at h
+  have hbV : (if v.getLsbD (7 - d) then 1 else 0) < 2 := by
+    cases v.getLsbD (7-d) <;> simp
+  have hbW : (if w.getLsbD (7 - d) then 1 else 0) < 2 := by
+    cases w.getLsbD (7-d) <;> simp
+  omega
 
-private theorem sum_congr {α : Type} {l : List α} {f g : α → Nat}
-    (h : ∀ a ∈ l, f a = g a) : (l.map f).sum = (l.map g).sum := by
-  induction l with
-  | nil => rfl
-  | cons a t ih =>
-      rw [List.map_cons, List.map_cons, List.sum_cons, List.sum_cons,
-        h a List.mem_cons_self, ih (fun x hx => h x (List.mem_cons_of_mem a hx))]
+private theorem pref_succ_step (v w : B) (d : Nat)
+    (hp : pref v d < pref w d) : pref v (d+1) < pref w (d+1) := by
+  rw [pref, pref]
+  have hb : (if v.getLsbD (7 - d) then 1 else 0) < 2 := by
+    cases v.getLsbD (7-d) <;> simp
+  have hle : pref v d + 1 ≤ pref w d := by omega
+  omega
 
-private theorem sum_sum_comm {α β : Type} (l1 : List α) (l2 : List β) (f : α → β → Nat) :
-    (l1.map fun a => (l2.map fun b => f a b).sum).sum
-      = (l2.map fun b => (l1.map fun a => f a b).sum).sum := by
-  induction l1 with
-  | nil =>
-      simp only [List.map_nil, List.sum_nil]
-      -- RHS: (l2.map fun b => ([].map ...).sum).sum = (l2.map fun _ => 0).sum = 0
-      simp [sum_map_zero]
-  | cons a t ih =>
-      simp only [List.map_cons, List.sum_cons]
-      have hsplit : (l2.map fun b => f a b + (t.map fun a' => f a' b).sum).sum
-          = (l2.map fun b => f a b).sum + (l2.map fun b => (t.map fun a' => f a' b).sum).sum := by
-        exact sum_map_add l2 (fun b => f a b) (fun b => (t.map fun a' => f a' b).sum)
-      rw [hsplit, ih]
+private def refLive (x : Nat → B) (m : W) : Nat → W
+  | 0 => m
+  | d+1 =>
+      let prev := refLive x m d
+      let k := 7 - d
+      let zeros := prev &&& ~~~(planes x k)
+      if zeros == 0 then prev else zeros
 
-private theorem sum_mul_sum {α β : Type} (l1 : List α) (l2 : List β) (f : α → Nat) (g : β → Nat) :
-    (l1.map f).sum * (l2.map g).sum
-      = (l1.map fun a => (l2.map fun b => f a * g b).sum).sum := by
-  induction l1 with
-  | nil => simp
-  | cons a t ih =>
-      simp only [List.map_cons, List.sum_cons]
-      rw [Nat.add_mul, ih, mul_sum_const]
+private theorem minMask_eq_refLive (x : Nat → B) (m : W) :
+    minMask m (planes x) = refLive x m 8 := by
+  unfold minMask
+  have hlist : (List.range 8).reverse = [7,6,5,4,3,2,1,0] := by native_decide
+  rw [hlist]
+  rfl
 
-private theorem sum_testBit : ∀ (w n : Nat), n < 2^w →
-    n = ((List.range w).map fun k => 2^k * (n.testBit k).toNat).sum := by
-  intro w
-  induction w with
+private theorem refLive_char (x : Nat → B) (m : W) : ∀ d, d ≤ 8 → ∀ i, i < 64 →
+    ((refLive x m d).getLsbD i = true ↔
+      m.getLsbD i = true ∧ ∀ j, m.getLsbD j = true → pref (x i) d ≤ pref (x j) d) := by
+  intro d hd
+  induction d with
   | zero =>
-      intro n hn
-      have hn0 : n = 0 := by omega
-      subst hn0
-      simp
-  | succ w ih =>
-      intro n hn
-      have hltw : n % 2^w < 2^w := Nat.mod_lt _ (Nat.two_pow_pos _)
-      have hih := ih (n % 2^w) hltw
-      have htb : ∀ k ∈ List.range w, ((n % 2^w).testBit k) = n.testBit k := by
-        intro k hk
-        have hk' : k < w := List.mem_range.mp hk
-        rw [Nat.testBit_mod_two_pow, decide_eq_true hk', Bool.true_and]
-      have hmap : ((List.range w).map fun k => 2^k * ((n % 2^w).testBit k).toNat).sum
-          = ((List.range w).map fun k => 2^k * (n.testBit k).toNat).sum := by
-        apply sum_congr
-        intro k hk
-        rw [htb k hk]
-      rw [hmap] at hih
-      calc n = n % 2^(w+1) := (Nat.mod_eq_of_lt hn).symm
-        _ = n % 2^w + 2^w * (n.testBit w).toNat := mod_two_pow_succ n w
-        _ = ((List.range w).map fun k => 2^k * (n.testBit k).toNat).sum
-              + 2^w * (n.testBit w).toNat := by rw [hih]
-        _ = ((List.range (w+1)).map fun k => 2^k * (n.testBit k).toNat).sum := by
-            rw [List.range_succ, List.map_append, List.sum_append_nat]
-            simp only [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil,
-              Nat.add_zero]
+      intro i hi
+      simp [refLive, pref]
+  | succ d ih =>
+      intro i hi
+      have hd' : d ≤ 8 := by omega
+      have hchar := ih hd'
+      let prev := refLive x m d
+      let zeros := prev &&& ~~~(planes x (7-d))
+      have hzbit : ∀ t, t < 64 → prev.getLsbD t = true →
+          zeros.getLsbD t = Bool.not ((x t).getLsbD (7-d)) := by
+        intro t ht hpt
+        dsimp [zeros, planes]
+        rw [BitVec.getLsbD_and, BitVec.getLsbD_not]
+        rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) t ht]
+        simp [hpt, ht]
+      have hzexpand : ∀ t, t < 64 → zeros.getLsbD t =
+          (prev.getLsbD t && Bool.not ((x t).getLsbD (7-d))) := by
+        intro t ht
+        dsimp [zeros, planes]
+        rw [BitVec.getLsbD_and, BitVec.getLsbD_not]
+        rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) t ht]
+        simp [ht]
+      change (if zeros == 0 then prev else zeros).getLsbD i = true ↔
+        m.getLsbD i = true ∧ ∀ j, m.getLsbD j = true → pref (x i) (d+1) ≤ pref (x j) (d+1)
+      by_cases hz : zeros == 0
+      · have hz0 : zeros = 0 := by simpa using hz
+        have hzfalse : ∀ t, zeros.getLsbD t = false := by
+          intro t
+          rw [hz0]
+          simp
+        rw [if_pos hz]
+        constructor
+        · intro hl
+          have hci := (hchar i hi).mp hl
+          refine ⟨hci.1, ?_⟩
+          intro j hj
+          have hjlt : j < 64 := BitVec.lt_of_getLsbD hj
+          have hpij := hci.2 j hj
+          by_cases hlt : pref (x i) d < pref (x j) d
+          · exact Nat.le_of_lt (pref_succ_step (x i) (x j) d hlt)
+          · have hpeq : pref (x i) d = pref (x j) d := by omega
+            have hbi : (x i).getLsbD (7-d) = true := by
+              have hzcalc := hzbit i hi hl
+              rw [hzfalse i] at hzcalc
+              cases hb : (x i).getLsbD (7-d) <;> simp [hb] at hzcalc ⊢
+            have hjmin : ∀ t, m.getLsbD t = true → pref (x j) d ≤ pref (x t) d := by
+              intro t ht
+              rw [← hpeq]
+              exact hci.2 t ht
+            have hjl : prev.getLsbD j = true := (hchar j hjlt).mpr ⟨hj, hjmin⟩
+            have hbj : (x j).getLsbD (7-d) = true := by
+              have hzcalc := hzbit j hjlt hjl
+              rw [hzfalse j] at hzcalc
+              cases hb : (x j).getLsbD (7-d) <;> simp [hb] at hzcalc ⊢
+            simp [pref, hpeq, hbi, hbj]
+        · intro hm
+          apply (hchar i hi).mpr
+          refine ⟨hm.1, ?_⟩
+          intro j hj
+          exact pref_le_of_succ_le (x i) (x j) d (hm.2 j hj)
+      · have hnz : zeros ≠ 0 := by
+          intro h0
+          exact hz (by simpa [h0])
+        have hex : ∃ t, t < 64 ∧ zeros.getLsbD t = true := by
+          have hset := BitVec.getLsbD_true_ctz_of_ne_zero hnz
+          exact ⟨zeros.ctz.toNat, BitVec.lt_of_getLsbD hset, hset⟩
+        rw [if_neg hz]
+        constructor
+        · intro hl
+          have hzi0' : (prev.getLsbD i && Bool.not ((x i).getLsbD (7-d))) = true := by
+            rw [← hzexpand i hi]
+            exact hl
+          rcases Bool.and_eq_true_iff.mp hzi0' with ⟨hpl, hnbi⟩
+          have hbi : (x i).getLsbD (7-d) = false := by
+            cases hb : (x i).getLsbD (7-d) <;> simp [hb] at hnbi ⊢
+          have hci := (hchar i hi).mp hpl
+          refine ⟨hci.1, ?_⟩
+          intro j hj
+          have hpij := hci.2 j hj
+          have hbj : 0 ≤ (if (x j).getLsbD (7-d) then 1 else 0) := Nat.zero_le _
+          simp [pref, hbi]
+          omega
+        · intro hm
+          have hmin_d : ∀ j, m.getLsbD j = true → pref (x i) d ≤ pref (x j) d := by
+            intro j hj
+            exact pref_le_of_succ_le (x i) (x j) d (hm.2 j hj)
+          have hpl : prev.getLsbD i = true := (hchar i hi).mpr ⟨hm.1, hmin_d⟩
+          rcases hex with ⟨i0, hi0, hz0⟩
+          have hzi0' : (prev.getLsbD i0 && Bool.not ((x i0).getLsbD (7-d))) = true := by
+            rw [← hzexpand i0 hi0]
+            exact hz0
+          rcases Bool.and_eq_true_iff.mp hzi0' with ⟨hpl0, hnbi0⟩
+          have hbi0 : (x i0).getLsbD (7-d) = false := by
+            cases hb : (x i0).getLsbD (7-d) <;> simp [hb] at hnbi0 ⊢
+          have hci0 := (hchar i0 hi0).mp hpl0
+          have hp0i : pref (x i0) d ≤ pref (x i) d := hci0.2 i hm.1
+          have hpi0 : pref (x i) d ≤ pref (x i0) d := hmin_d i0 hci0.1
+          have hpeq : pref (x i) d = pref (x i0) d := by omega
+          have hbi : (x i).getLsbD (7-d) = false := by
+            cases hb : (x i).getLsbD (7-d)
+            · rfl
+            · have hle := hm.2 i0 hci0.1
+              simp [pref, hpeq, hb, hbi0] at hle
+              omega
+          rw [hzexpand i hi, hpl, hbi]
+          rfl
 
-private theorem sum_testBit_ite (w n : Nat) (hn : n < 2^w) :
-    n = ((List.range w).map fun k => if n.testBit k = true then 2^k else 0).sum := by
-  calc n = ((List.range w).map fun k => 2^k * (n.testBit k).toNat).sum :=
-        sum_testBit w n hn
-    _ = ((List.range w).map fun k => if n.testBit k = true then 2^k else 0).sum := by
-        apply sum_congr
-        intro k _
-        cases n.testBit k <;> simp
-
-private theorem bv_sum_bits (v : B) :
-    v.toNat = ((List.range 8).map fun j => if v.getLsbD j = true then 2^j else 0).sum := by
-  have h := sum_testBit_ite 8 v.toNat v.isLt
-  exact h
-
-private theorem ite_mul_pow (b c : Bool) (j k : Nat) :
-    (if b = true then 2^j else 0) * (if c = true then 2^k else 0)
-      = if (b && c) = true then 2^(j+k) else 0 := by
-  cases b <;> cases c <;> simp [Nat.pow_add]
-
-private theorem ite_ite_and3 (m bx bz : Bool) (W : Nat) :
-    (if m = true then (if (bx && bz) = true then W else 0) else 0)
-      = if ((m && bx) && bz) = true then W else 0 := by
-  cases m <;> cases bx <;> cases bz <;> rfl
-
-private theorem ite_sum {c : Prop} [Decidable c] :
-    ∀ (l : List Nat) (f : Nat → Nat),
-    (if c then (l.map f).sum else 0) = (l.map fun a => if c then f a else 0).sum := by
-  intro l f
-  induction l with
-  | nil => by_cases c <;> simp
-  | cons a t ih =>
-      simp only [List.map_cons, List.sum_cons]
-      by_cases hc : c
-      · simp only [ite_eq_left hc]
-      · simp only [ite_eq_right hc, sum_map_zero]
-
-private theorem sum_ite_const {α : Type} (l : List α) (p : α → Bool) (C : Nat) :
-    (l.map fun a => if p a = true then C else 0).sum = C * l.countP p := by
-  induction l with
-  | nil => simp
-  | cons a t ih =>
-      rw [List.map_cons, List.sum_cons, List.countP_cons]
-      by_cases hpa : p a = true
-      · rw [ite_eq_left hpa]
-        rw [ite_eq_left hpa]
-        rw [ih, Nat.mul_add_one]
-        omega
-      · rw [ite_eq_right hpa]
-        rw [ite_eq_right hpa]
-        rw [ih]
-        simp
-
-private theorem sum_filter_map_ite {α : Type} (l : List α) (p : α → Bool) (f : α → Nat) :
-    ((l.filter p).map f).sum = (l.map fun a => if p a = true then f a else 0).sum := by
-  induction l with
-  | nil => rfl
-  | cons a t ih =>
-      by_cases hpa : p a = true
-      · rw [List.filter_cons_of_pos hpa, List.map_cons, List.map_cons, List.sum_cons,
-          List.sum_cons, ih, ite_eq_left hpa]
-      · rw [List.filter_cons_of_neg hpa, List.map_cons, List.sum_cons, ih,
-          ite_eq_right hpa]
-        simp
-
-private theorem count_planes_dot (x y : Nat → B) (m : W) (j k : Nat) :
-    count (m &&& planes x j &&& planes y k)
-      = (List.range 64).countP (fun i => m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k) := by
-  show ((List.range 64).filter (m &&& planes x j &&& planes y k).getLsbD).length = _
-  rw [← List.countP_eq_length_filter]
-  apply countP_congr_bool
+theorem ArgMinMask_sound : TinylambOpt.ResearchGoals.PlaneKernels.ArgMinMask.Goal := by
+  intro x m
+  apply BitVec.eq_of_getLsbD_eq
   intro i hi
-  have hi64 : i < 64 := List.mem_range.mp hi
-  rw [BitVec.getLsbD_and, BitVec.getLsbD_and,
-    planes_getLsbD x j i hi64, planes_getLsbD y k i hi64]
+  rw [minMask_eq_refLive]
+  rw [pack_getLsbD (fun i => m.getLsbD i && (lanes m).all (fun j => x i ≤ x j)) i hi]
+  apply Bool.eq_iff_iff.mpr
+  constructor
+  · intro hleft
+    have hc := (refLive_char x m 8 (by omega) i hi).mp hleft
+    apply Bool.and_eq_true_iff.mpr
+    refine ⟨hc.1, List.all_eq_true.mpr ?_⟩
+    intro j hj
+    rw [lanes, List.mem_filter] at hj
+    have hle := hc.2 j hj.2
+    simpa [pref_8, BitVec.le_def] using hle
+  · intro hright
+    have hr := Bool.and_eq_true_iff.mp hright
+    apply (refLive_char x m 8 (by omega) i hi).mpr
+    refine ⟨hr.1, ?_⟩
+    intro j hj
+    have hjlt : j < 64 := BitVec.lt_of_getLsbD hj
+    have hjmem : j ∈ lanes m := by
+      rw [lanes, List.mem_filter]
+      exact ⟨List.mem_range.mpr hjlt, hj⟩
+    have h := (List.all_eq_true.mp hr.2) j hjmem
+    simpa [pref_8, BitVec.le_def] using h
 
-private theorem sum_sum_sum_comm (l : List Nat) (f : Nat → Nat → Nat → Nat) :
-    (l.map fun a => ((List.range 8).map fun j =>
-        ((List.range 8).map fun k => f a j k).sum).sum).sum
-      = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-          (l.map fun a => f a j k).sum).sum).sum := by
-  calc (l.map fun a => ((List.range 8).map fun j =>
-          ((List.range 8).map fun k => f a j k).sum).sum).sum
-      = ((List.range 8).map fun j => (l.map fun a =>
-          ((List.range 8).map fun k => f a j k).sum).sum).sum :=
-        sum_sum_comm l (List.range 8)
-          (fun a j => ((List.range 8).map fun k => f a j k).sum)
-    _ = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-          (l.map fun a => f a j k).sum).sum).sum := by
-        apply sum_congr
-        intro j _
-        exact sum_sum_comm l (List.range 8) (fun a k => f a j k)
+/-! ### RadixSelect -/
 
-theorem sound_PlaneDot : PlaneDot.Goal := by
-  intro x y m
-  have hR : ((lanes m).map fun i => (x i).toNat * (y i).toNat).sum
-      = ((List.range 64).map fun i =>
-          if m.getLsbD i = true then (x i).toNat * (y i).toNat else 0).sum := by
-    show (((List.range 64).filter m.getLsbD).map fun i => (x i).toNat * (y i).toNat).sum = _
-    exact sum_filter_map_ite _ _ _
-  rw [hR]
-  have hlane : ∀ i : Nat,
-      (if m.getLsbD i = true then (x i).toNat * (y i).toNat else 0)
-        = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-            if (m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k) = true
-            then 2^(j+k) else 0).sum).sum := by
-    intro i
-    have e1 : (x i).toNat * (y i).toNat
-        = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-            (if (x i).getLsbD j = true then 2^j else 0) *
-            (if (y i).getLsbD k = true then 2^k else 0)).sum).sum := by
-      rw [bv_sum_bits (x i), bv_sum_bits (y i)]
-      exact sum_mul_sum _ _ _ _
-    have e2 : ∀ j k : Nat,
-        (if (x i).getLsbD j = true then 2^j else 0) *
-        (if (y i).getLsbD k = true then 2^k else 0)
-          = if ((x i).getLsbD j && (y i).getLsbD k) = true then 2^(j+k) else 0 :=
-      fun j k => ite_mul_pow _ _ _ _
-    have e3 : ((List.range 8).map fun j => ((List.range 8).map fun k =>
-            (if (x i).getLsbD j = true then 2^j else 0) *
-            (if (y i).getLsbD k = true then 2^k else 0)).sum).sum
-        = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-            if ((x i).getLsbD j && (y i).getLsbD k) = true then 2^(j+k) else 0).sum).sum := by
-      apply sum_congr
-      intro j _
-      apply sum_congr
-      intro k _
-      exact e2 j k
-    have e4 : (if m.getLsbD i = true then
-            ((List.range 8).map fun j => ((List.range 8).map fun k =>
-              if ((x i).getLsbD j && (y i).getLsbD k) = true then 2^(j+k) else 0).sum).sum else 0)
-        = ((List.range 8).map fun j => ((List.range 8).map fun k =>
-            if (m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k) = true
-            then 2^(j+k) else 0).sum).sum := by
-      rw [ite_sum]
-      apply sum_congr
-      intro j _
-      rw [ite_sum]
-      apply sum_congr
-      intro k _
-      exact ite_ite_and3 _ _ _ _
-    rw [e1, e3]
-    exact e4
-  have hmap : ((List.range 64).map fun i =>
-        if m.getLsbD i = true then (x i).toNat * (y i).toNat else 0).sum
-      = ((List.range 64).map fun i => ((List.range 8).map fun j =>
-          ((List.range 8).map fun k =>
-            if (m.getLsbD i && (x i).getLsbD j && (y i).getLsbD k) = true
-            then 2^(j+k) else 0).sum).sum).sum :=
-    sum_congr (fun i _ => hlane i)
-  rw [hmap, sum_sum_sum_comm]
-  apply sum_congr
-  intro j _
-  apply sum_congr
-  intro k _
-  rw [sum_ite_const]
-  rw [← count_planes_dot x y m j k]
+private def radixStep (a : Planes) (k : Nat) (st : W × Nat × Nat) : W × Nat × Nat :=
+  let zeros := st.1 &&& ~~~(a k)
+  let z := count zeros
+  if st.2.1 < z then (zeros, st.2.1, st.2.2)
+  else (st.1 &&& a k, st.2.1 - z, st.2.2 + 2^k)
 
+private def radixFold (a : Planes) (st : W × Nat × Nat) (ks : List Nat) : W × Nat × Nat :=
+  ks.foldl (fun st k => radixStep a k st) st
 
-/-! ### List eraseDups counting infrastructure -/
+private def radixN (a : Planes) : Nat → W × Nat × Nat → W × Nat × Nat
+  | 0, st => st
+  | d+1, st => radixStep a (7-d) (radixN a d st)
 
-private theorem nodup_eraseDups_aux {α : Type} [BEq α] [LawfulBEq α] :
-    ∀ n : Nat, ∀ l : List α, l.length = n → (l.eraseDups).Nodup := by
-  intro n
-  induction n using Nat.strongRecOn with
-  | ind n ih =>
-      intro l hl
-      cases l with
-      | nil => exact List.nodup_nil
-      | cons a t =>
-          rw [List.eraseDups_cons, List.nodup_cons]
-          have hlt : (t.filter fun b => !b == a).length < n := by
-            have hle : (t.filter fun b => !b == a).length ≤ t.length :=
-              List.length_filter_le _ _
-            simp at hl
-            omega
-          have ih' := ih _ hlt _ rfl
-          constructor
-          · intro hmem
-            rw [List.mem_eraseDups, List.mem_filter] at hmem
-            obtain ⟨_, hne⟩ := hmem
-            have haa : (a == a) = true := beq_iff_eq.mpr rfl
-            simp_all
-          · exact ih'
+private theorem radixFold_reverse_eq_radixN (a : Planes) (st : W × Nat × Nat) :
+    radixFold a st (List.range 8).reverse = radixN a 8 st := by
+  have hlist : (List.range 8).reverse = [7,6,5,4,3,2,1,0] := by native_decide
+  rw [hlist]
+  simp [radixFold, radixN]
 
-private theorem nodup_eraseDups {α : Type} [BEq α] [LawfulBEq α] (l : List α) :
-    (l.eraseDups).Nodup := nodup_eraseDups_aux _ _ rfl
+private theorem forIn_radix_body (a : Planes) : ∀ (ks : List Nat) (st : W × Nat × Nat),
+    Id.run (forIn ks st (fun k s =>
+      if s.2.1 < count (s.1 &&& ~~~(a k)) then
+        pure (ForInStep.yield (s.1 &&& ~~~(a k), s.2.1, s.2.2))
+      else pure (ForInStep.yield (s.1 &&& a k, s.2.1 - count (s.1 &&& ~~~(a k)), s.2.2 + 2^k)))) =
+    radixFold a st ks := by
+  intro ks
+  induction ks with
+  | nil => intro st; simp [radixFold]
+  | cons k rest ih =>
+      intro st
+      rw [List.forIn_cons]
+      by_cases hcond : st.2.1 < count (st.1 &&& ~~~(a k)) <;> simp [hcond, radixStep, radixFold, ih]
 
-private theorem eraseDups_length_perm {α : Type} [BEq α] [LawfulBEq α]
-    {l₁ l₂ : List α} (h : List.Perm l₁ l₂) :
-    l₁.eraseDups.length = l₂.eraseDups.length := by
-  have hperm : List.Perm l₁.eraseDups l₂.eraseDups := by
-    rw [List.perm_ext_iff_of_nodup (nodup_eraseDups l₁) (nodup_eraseDups l₂)]
-    intro a
-    rw [List.mem_eraseDups, List.mem_eraseDups, h.mem_iff]
-  exact hperm.length_eq
+private theorem kth_unfold (m : W) (a : Planes) (rank : Nat) (hk : rank < count m) :
+    kth m a rank = some (radixN a 8 (m, rank, 0)).2.2 := by
+  unfold kth
+  simp [Nat.not_le_of_gt hk]
+  rw [forIn_radix_body]
+  rw [radixFold_reverse_eq_radixN]
 
-private theorem filter_map_pred {α β : Type} (g : α → β) (p : β → Bool) :
-    ∀ l : List α, (l.map g).filter p = (l.filter fun a => p (g a)).map g := by
-  intro l
-  induction l with
-  | nil => rfl
-  | cons a t ih =>
-      simp only [List.map_cons, List.filter_cons]
-      by_cases h : p (g a) <;> simp [ih, h]
+private def cnt (p : Nat → Bool) : Nat := ((List.range 64).filter p).length
 
-private theorem filter_map_beq {α β : Type} [BEq α] [LawfulBEq α]
-    [BEq β] [LawfulBEq β] (g : α → β) (hg : Function.Injective g) (a : α) :
-    ∀ l : List α, (l.map g).filter (fun b => !b == g a) =
-      (l.filter fun b => !b == a).map g := by
-  intro l
-  rw [filter_map_pred]
-  congr 1
-  apply List.filter_congr
-  intro c _
-  have hbeq : (g c == g a) = (c == a) := by
-    apply Bool.eq_iff_iff.mpr
-    rw [beq_iff_eq, beq_iff_eq, hg.eq_iff]
-  simp only [hbeq]
-
-private theorem eraseDups_map_inj_aux {α β : Type} [BEq α] [LawfulBEq α]
-    [BEq β] [LawfulBEq β] (g : α → β) (hg : Function.Injective g) :
-    ∀ n : Nat, ∀ l : List α, l.length = n →
-      (l.map g).eraseDups = l.eraseDups.map g := by
-  intro n
-  induction n using Nat.strongRecOn with
-  | ind n ih =>
-      intro l hl
-      cases l with
-      | nil => rfl
-      | cons a t =>
-          have hlt : (t.filter fun b => !b == a).length < n := by
-            have hle : (t.filter fun b => !b == a).length ≤ t.length :=
-              List.length_filter_le _ _
-            simp at hl
-            omega
-          rw [List.map_cons, List.eraseDups_cons, List.eraseDups_cons, List.map_cons]
-          congr 1
-          rw [filter_map_beq g hg a t]
-          exact ih _ hlt _ rfl
-
-private theorem eraseDups_map_inj {α β : Type} [BEq α] [LawfulBEq α]
-    [BEq β] [LawfulBEq β] (g : α → β) (hg : Function.Injective g) (l : List α) :
-    (l.map g).eraseDups = l.eraseDups.map g :=
-  eraseDups_map_inj_aux g hg _ _ rfl
-
-private theorem eraseDups_length_map_inj {α β : Type} [BEq α] [LawfulBEq α]
-    [BEq β] [LawfulBEq β] (g : α → β) (hg : Function.Injective g) (l : List α) :
-    (l.map g).eraseDups.length = l.eraseDups.length := by
-  rw [eraseDups_map_inj g hg l, List.length_map]
-
-private theorem removeAll_eq_self {α : Type} [BEq α] [LawfulBEq α]
-    {xs ys : List α} (h : ∀ x ∈ ys, x ∉ xs) : ys.removeAll xs = ys := by
-  show ys.filter (fun x => !xs.elem x) = ys
-  rw [List.filter_eq_self]
-  intro x hx
-  have hxn : x ∉ xs := h x hx
-  rw [List.elem_eq_mem]
-  simp [hxn]
-
-private theorem eraseDups_length_map_const {α : Type} [BEq α] [LawfulBEq α]
-    (c : α) : ∀ l : List α, ((l.map fun _ => c).eraseDups).length =
-      if l = [] then 0 else 1 := by
-  intro l
+private theorem filter_or_length_add {α} (p q : α → Bool) (l : List α) :
+    (l.filter fun a => p a || q a).length + (l.filter fun a => p a && q a).length =
+      (l.filter p).length + (l.filter q).length := by
   induction l with
   | nil => simp
   | cons a t ih =>
-      rw [List.map_cons, List.eraseDups_cons]
-      have hfil : ((t.map fun _ => c).filter fun b => !b == c) = [] := by
-        rw [List.filter_eq_nil_iff]
-        intro x hx
-        rw [List.mem_map] at hx
-        obtain ⟨y, -, rfl⟩ := hx
-        simp
-      rw [hfil]
-      simp
+      cases hp : p a <;> cases hq : q a <;> simp [hp, hq] at ih ⊢ <;> omega
+
+private theorem cnt_congr {p q : Nat → Bool} (h : ∀ i, i < 64 → p i = q i) : cnt p = cnt q := by
+  unfold cnt
+  apply congrArg List.length
+  apply List.filter_congr
+  intro i hi
+  exact h i (List.mem_range.mp hi)
+
+private theorem cnt_or_add (p q : Nat → Bool) (hdisj : ∀ i, i < 64 → ¬ (p i && q i)) :
+    cnt (fun i => p i || q i) = cnt p + cnt q := by
+  have h := filter_or_length_add p q (List.range 64)
+  have hz : ((List.range 64).filter fun i => p i && q i).length = 0 := by
+    apply List.length_eq_zero_iff.mpr
+    apply List.filter_eq_nil_iff.mpr
+    intro i hi
+    exact hdisj i (List.mem_range.mp hi)
+  unfold cnt at h ⊢
+  omega
+
+private theorem count_word_split (w p : W) :
+    count w = count (w &&& p) + count (w &&& ~~~p) := by
+  unfold count
+  have h := filter_or_length_add (fun i : Nat => w.getLsbD i && p.getLsbD i)
+                                  (fun i : Nat => w.getLsbD i && ! p.getLsbD i) (List.range 64)
+  have hdisj : ((List.range 64).filter fun i => (w.getLsbD i && p.getLsbD i) && (w.getLsbD i && !p.getLsbD i)) = [] := by
+    apply List.filter_eq_nil_iff.mpr
+    intro i hi
+    cases p.getLsbD i <;> simp
+  have hleft : (List.range 64).filter (fun i => (w.getLsbD i && p.getLsbD i) || (w.getLsbD i && !p.getLsbD i)) =
+      (List.range 64).filter w.getLsbD := by
+    apply List.filter_congr
+    intro i hi
+    cases hp : p.getLsbD i <;> simp [hp]
+  have hwp : ((List.range 64).filter fun i => w.getLsbD i && p.getLsbD i).length =
+      ((List.range 64).filter fun i => (w &&& p).getLsbD i).length := by
+    apply congrArg List.length
+    apply List.filter_congr
+    intro i hi
+    rw [BitVec.getLsbD_and]
+  have hwnp : ((List.range 64).filter fun i => w.getLsbD i && ! p.getLsbD i).length =
+      ((List.range 64).filter fun i => (w &&& ~~~p).getLsbD i).length := by
+    apply congrArg List.length
+    apply List.filter_congr
+    intro i hi
+    have hi64 := List.mem_range.mp hi
+    rw [BitVec.getLsbD_and, BitVec.getLsbD_not]
+    simp [hi64]
+  rw [hleft, hdisj] at h
+  simp at h
+  rw [hwp, hwnp] at h
+  omega
+
+private theorem zeros_count (x : Nat → B) (live m : W) (d p : Nat)
+    (hchar : ∀ i, i < 64 → (live.getLsbD i = true ↔ m.getLsbD i = true ∧ pref (x i) d = p)) :
+    count (live &&& ~~~(planes x (7-d))) =
+      cnt (fun i => m.getLsbD i && decide (pref (x i) d = p) && ! (x i).getLsbD (7-d)) := by
+  unfold count cnt
+  apply congrArg List.length
+  apply List.filter_congr
+  intro i hi
+  have hi64 := List.mem_range.mp hi
+  rw [BitVec.getLsbD_and, BitVec.getLsbD_not]
+  dsimp [planes]
+  rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) i hi64]
+  simp only [decide_eq_true hi64, Bool.true_and]
+  apply Bool.eq_iff_iff.mpr
+  constructor
+  · intro ht
+    have ht' := Bool.and_eq_true_iff.mp ht
+    have hl : live.getLsbD i = true := ht'.1
+    have hnb : Bool.not ((x i).getLsbD (7-d)) = true := ht'.2
+    have hc := (hchar i hi64).mp hl
+    apply Bool.and_eq_true_iff.mpr
+    refine ⟨?_, hnb⟩
+    apply Bool.and_eq_true_iff.mpr
+    exact ⟨hc.1, decide_eq_true hc.2⟩
+  · intro ht
+    have ht' := Bool.and_eq_true_iff.mp ht
+    have ht'' := Bool.and_eq_true_iff.mp ht'.1
+    have hm : m.getLsbD i = true := ht''.1
+    have hp : decide (pref (x i) d = p) = true := ht''.2
+    have hnb : Bool.not ((x i).getLsbD (7-d)) = true := ht'.2
+    apply Bool.and_eq_true_iff.mpr
+    exact ⟨(hchar i hi64).mpr ⟨hm, of_decide_eq_true hp⟩, hnb⟩
+
+private theorem pow_split (d : Nat) (hd : d < 8) : 2^(8-d) = 2 * 2^(7-d) := by
+  have h : 8 - d = (7 - d) + 1 := by omega
+  rw [h, Nat.pow_succ]
+  omega
+
+private theorem radixN_inv (x : Nat → B) (m : W) (k : Nat) (hk : k < count m) :
+    ∀ d, d ≤ 8 →
+      ∃ p, let st := radixN (planes x) d (m, k, 0)
+        st.2.2 = p * 2^(8-d) ∧
+        (∀ i, i < 64 → (st.1.getLsbD i = true ↔ m.getLsbD i = true ∧ pref (x i) d = p)) ∧
+        st.2.1 < count st.1 ∧
+        k = st.2.1 + cnt (fun i => m.getLsbD i && decide (pref (x i) d < p)) := by
+  intro d hd
+  induction d with
+  | zero =>
+      refine ⟨0, ?_⟩
+      simp [radixN, cnt, pref]
+      exact hk
+  | succ d ih =>
+      have hd8 : d ≤ 8 := by omega
+      have hdlt : d < 8 := by omega
+      rcases ih hd8 with ⟨p, hv, hchar, hn, hrank⟩
+      let st0 := radixN (planes x) d (m, k, 0)
+      let b := 7 - d
+      let zeros := st0.1 &&& ~~~(planes x b)
+      let z := count zeros
+      have hpow := pow_split d hdlt
+      have hz_eq : z = cnt (fun i => m.getLsbD i && decide (pref (x i) d = p) && ! (x i).getLsbD b) := by
+        dsimp [z, zeros, b, st0]
+        simpa using zeros_count x st0.1 m d p hchar
+      have hsplit : count st0.1 = z + count (st0.1 &&& planes x b) := by
+        rw [count_word_split st0.1 (planes x b)]
+        dsimp [z, zeros]
+        omega
+      change ∃ p, let st := radixStep (planes x) b st0
+        st.2.2 = p * 2^(8-(d+1)) ∧
+        (∀ i, i < 64 → (st.1.getLsbD i = true ↔ m.getLsbD i = true ∧ pref (x i) (d+1) = p)) ∧
+        st.2.1 < count st.1 ∧
+        k = st.2.1 + cnt (fun i => m.getLsbD i && decide (pref (x i) (d+1) < p))
+      by_cases hbr : st0.2.1 < z
+      · simp [radixStep, st0, b, zeros, z, hbr]
+        refine ⟨2*p, ?_, ?_, ?_⟩
+        · have hv' : (radixN (planes x) d (m, k, 0)).2.2 = (2*p) * 2^(7-d) := by
+            rw [hv, hpow]
+            simp [Nat.mul_assoc, Nat.mul_left_comm, Nat.mul_comm]
+          exact hv'
+        · intro i hi
+          constructor
+          · intro ht
+            rcases ht with ⟨hl, _, hnb⟩
+            have hc := (hchar i hi).mp hl
+            refine ⟨hc.1, ?_⟩
+            rw [pref]
+            have hnb' : (x i).getLsbD (7-d) = false := by
+              dsimp [planes] at hnb
+              rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) i hi] at hnb
+              exact hnb
+            have hb0 : (x i).getLsbD b = false := by simpa [b] using hnb'
+            simp [b, hb0, hc.2]
+          · intro ht
+            rcases ht with ⟨hm, hp2⟩
+            have hpf : 2 * pref (x i) d + (if (x i).getLsbD b then 1 else 0) = 2*p := by
+              simpa [pref] using hp2
+            have hb0 : (x i).getLsbD b = false := by
+              cases hb : (x i).getLsbD b <;> simp [hb] at hpf ⊢ <;> omega
+            have hpe : pref (x i) d = p := by
+              cases hb : (x i).getLsbD b <;> simp [hb] at hpf ⊢ <;> omega
+            have hplanes : (planes x (7-d)).getLsbD i = false := by
+              dsimp [planes]
+              rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) i hi]
+              simpa [b] using hb0
+            exact ⟨(hchar i hi).mpr ⟨hm, hpe⟩, hi, hplanes⟩
+        · have hcnt : cnt (fun i => m.getLsbD i && decide (pref (x i) (d+1) < 2*p)) =
+              cnt (fun i => m.getLsbD i && decide (pref (x i) d < p)) := by
+            apply cnt_congr
+            intro i hi
+            rw [pref]
+            have hpred : (2 * pref (x i) d + (if (x i).getLsbD b then 1 else 0) < 2*p) ↔
+                pref (x i) d < p := by
+              have hbnd : (if (x i).getLsbD b then 1 else 0) ≤ 1 := by
+                cases (x i).getLsbD b <;> simp
+              omega
+            rw [show decide (2 * pref (x i) d + (if (x i).getLsbD b then 1 else 0) < 2*p) =
+                decide (pref (x i) d < p) from Bool.eq_iff_iff.mpr (by simpa using hpred)]
+          omega
+      · simp [radixStep, st0, b, zeros, z, hbr]
+        refine ⟨2*p+1, ?_, ?_, ?_, ?_⟩
+        · have hv' : (radixN (planes x) d (m, k, 0)).2.2 + 2^(7-d) = (2*p+1) * 2^(7-d) := by
+            rw [hv, hpow]
+            simp [Nat.add_mul, Nat.mul_assoc, Nat.mul_left_comm, Nat.mul_comm]
+          exact hv'
+        · intro i hi
+          constructor
+          · intro ht
+            have hl : (radixN (planes x) d (m, k, 0)).1.getLsbD i = true := ht.1
+            have hb1 : (planes x (7-d)).getLsbD i = true := ht.2
+            have hc := (hchar i hi).mp hl
+            refine ⟨hc.1, ?_⟩
+            rw [pref]
+            dsimp [planes] at hb1
+            rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) i hi] at hb1
+            simp [hb1, hc.2]
+          · intro ht
+            have hm : m.getLsbD i = true := ht.1
+            have hp2 : pref (x i) (d+1) = 2*p+1 := ht.2
+            have hpf : 2 * pref (x i) d + (if (x i).getLsbD (7-d) then 1 else 0) = 2*p+1 := by
+              simpa [pref] using hp2
+            have hb1 : (x i).getLsbD (7-d) = true := by
+              cases hb : (x i).getLsbD (7-d) <;> simp [hb] at hpf ⊢ <;> omega
+            have hpe : pref (x i) d = p := by
+              cases hb : (x i).getLsbD (7-d) <;> simp [hb] at hpf ⊢ <;> omega
+            have hl : (radixN (planes x) d (m, k, 0)).1.getLsbD i = true :=
+              (hchar i hi).mpr ⟨hm, hpe⟩
+            constructor
+            · exact hl
+            · dsimp [planes]
+              rw [pack_getLsbD (fun t => (x t).getLsbD (7-d)) i hi]
+              exact hb1
+        · have hn' : st0.2.1 < count st0.1 := by simpa [st0] using hn
+          have hzle : z ≤ st0.2.1 := by omega
+          have hzdef : z = count (st0.1 &&& ~~~(planes x (7-d))) := by rfl
+          change st0.2.1 - count (st0.1 &&& ~~~(planes x (7-d))) < count (st0.1 &&& planes x (7-d))
+          dsimp [b] at hsplit
+          omega
+        · have hdisj : ∀ i, i < 64 → ¬ (m.getLsbD i && decide (pref (x i) d < p) && (m.getLsbD i && decide (pref (x i) d = p) && ! (x i).getLsbD b)) := by
+            intro i hi ht
+            have ht' := Bool.and_eq_true_iff.mp ht
+            have ht'' := Bool.and_eq_true_iff.mp ht'.1
+            exact (Nat.lt_irrefl p) (by
+              have hp_lt : pref (x i) d < p := of_decide_eq_true ht''.2
+              have hp_eq : pref (x i) d = p := by
+                have ht'' := (Bool.and_eq_true_iff.mp ht'.2).1
+                exact of_decide_eq_true (Bool.and_eq_true_iff.mp ht'').2
+              omega)
+          have hcntor := cnt_or_add
+            (fun i => m.getLsbD i && decide (pref (x i) d < p))
+            (fun i => m.getLsbD i && decide (pref (x i) d = p) && ! (x i).getLsbD b) hdisj
+          have hcntnew : cnt (fun i => m.getLsbD i && decide (pref (x i) (d+1) < 2*p+1)) =
+              cnt (fun i => (m.getLsbD i && decide (pref (x i) d < p)) ||
+                (m.getLsbD i && decide (pref (x i) d = p) && ! (x i).getLsbD b)) := by
+            apply cnt_congr
+            intro i hi
+            have hmcase : m.getLsbD i = true ∨ m.getLsbD i = false := by cases m.getLsbD i <;> simp
+            rcases hmcase with hm | hm
+            · simp [hm]
+              apply Bool.eq_iff_iff.mpr
+              rw [pref]
+              by_cases hb : (x i).getLsbD b <;> simp [b, hb] <;> omega
+            · simp [hm]
+          have hcntsum : cnt (fun i => m.getLsbD i && decide (pref (x i) (d+1) < 2*p+1)) =
+              cnt (fun i => m.getLsbD i && decide (pref (x i) d < p)) + z := by
+            rw [hcntnew, hcntor, ← hz_eq]
+          have hrank' : k = st0.2.1 + cnt (fun i => m.getLsbD i && decide (pref (x i) d < p)) := by
+            simpa [st0] using hrank
+          have hzdef : z = count (st0.1 &&& ~~~(planes x (7-d))) := by rfl
+          change k = st0.2.1 - z + cnt (fun i => m.getLsbD i && decide (pref (x i) (d+1) < 2*p+1))
+          omega
+
+private theorem count_char (live m : W) (pred : Nat → Bool)
+    (hchar : ∀ i, i < 64 → (live.getLsbD i = true ↔ m.getLsbD i = true ∧ pred i = true)) :
+    count live = cnt (fun i => m.getLsbD i && pred i) := by
+  unfold count cnt
+  apply congrArg List.length
+  apply List.filter_congr
+  intro i hi
+  have hi64 := List.mem_range.mp hi
+  apply Bool.eq_iff_iff.mpr
+  rw [hchar i hi64]
+  simp [Bool.and_eq_true_iff]
+
+private theorem cnt_of_lanes (x : Nat → B) (m : W) (pred : Nat → Bool) :
+    cnt (fun i => m.getLsbD i && pred ((x i).toNat)) =
+      (((lanes m).map fun i => (x i).toNat).filter pred).length := by
+  unfold cnt
+  rw [List.filter_map]
+  simp [lanes, List.filter_filter, Function.comp_def, Bool.and_comm]
+
+private theorem sorted_kth_eq_of_counts : ∀ (ys : List Nat),
+    ys.Pairwise (fun a b : Nat => decide (a ≤ b)) →
+    ∀ (k p : Nat), k < ys.length →
+      (ys.filter fun a => decide (a < p)).length ≤ k →
+      k < (ys.filter fun a => decide (a ≤ p)).length →
+      ys[k]? = some p := by
+  intro ys
+  induction ys with
+  | nil =>
+      intro _ k p hk
+      simp at hk
+  | cons a t ih =>
+      intro hs k p hk hlo hhi
+      have hs' := List.pairwise_cons.mp hs
+      have hge : ∀ b ∈ t, a ≤ b := by
+        intro b hb
+        exact of_decide_eq_true (hs'.1 b hb)
+      cases k with
+      | zero =>
+          simp only [List.getElem?_cons_zero, Option.some.injEq]
+          have hp_le_a : p ≤ a := by
+            by_cases h : p ≤ a
+            · exact h
+            · have hap : a < p := by omega
+              simp [hap] at hlo
+          have ha_le_p : a ≤ p := by
+            by_cases h : a ≤ p
+            · exact h
+            · have hpa : p < a := by omega
+              have hf : ((a :: t).filter fun b => decide (b ≤ p)) = [] := by
+                apply List.filter_eq_nil_iff.mpr
+                intro b hb
+                have hab : a ≤ b := by
+                  cases hb with
+                  | head => exact Nat.le_refl a
+                  | tail _ hbt => exact hge b hbt
+                simp [show ¬ b ≤ p from by omega]
+              rw [hf] at hhi
+              simp at hhi
+          omega
+      | succ k =>
+          simp only [List.getElem?_cons_succ]
+          simp at hk
+          have hkt : k < t.length := by omega
+          by_cases hap : a < p
+          · have hale : a ≤ p := Nat.le_of_lt hap
+            have hlot : ((t.filter fun b => decide (b < p)).length) ≤ k := by
+              simp [hap] at hlo
+              omega
+            have hhit : k < (t.filter fun b => decide (b ≤ p)).length := by
+              simp [hale] at hhi
+              omega
+            exact ih hs'.2 k p hkt hlot hhit
+          · have haleq : p ≤ a := by omega
+            have hlot : ((t.filter fun b => decide (b < p)).length) ≤ k := by
+              have hplow : ∀ b ∈ t, ¬ b < p := by
+                intro b hb
+                have hab := hge b hb
+                omega
+              have hf : (t.filter fun b => decide (b < p)) = [] := by
+                apply List.filter_eq_nil_iff.mpr
+                intro b hb
+                simp [hplow b hb]
+              rw [hf]
+              exact Nat.zero_le k
+            have hhit : k < (t.filter fun b => decide (b ≤ p)).length := by
+              by_cases hpa : p < a
+              · have hf : ((a :: t).filter fun b => decide (b ≤ p)) = [] := by
+                  apply List.filter_eq_nil_iff.mpr
+                  intro b hb
+                  have hab : a ≤ b := by
+                    cases hb with
+                    | head => exact Nat.le_refl a
+                    | tail _ hbt => exact hge b hbt
+                  simp [show ¬ b ≤ p from by omega]
+                rw [hf] at hhi
+                simp at hhi
+              · have haeq : a = p := by omega
+                simp [haeq] at hhi
+                omega
+            exact ih hs'.2 k p hkt hlot hhit
+
+theorem RadixSelect_sound : TinylambOpt.ResearchGoals.PlaneKernels.RadixSelect.Goal := by
+  intro x m k
+  by_cases hk : k < count m
+  · rcases radixN_inv x m k hk 8 (by omega) with ⟨p, hv, hchar, hn, hrank⟩
+    simp at hv
+    rw [kth_unfold m (planes x) k hk, hv]
+    let ys := (lanes m).map fun i => (x i).toNat
+    have hyslen : ys.length = count m := by simp [ys, lanes, count]
+    have hkys : k < ys.length := by omega
+    have hsorted : (ys.mergeSort).Pairwise (fun a b : Nat => decide (a ≤ b)) := by
+      apply List.pairwise_mergeSort
+      · intro a b c hab hbc
+        have hab' : a ≤ b := of_decide_eq_true hab
+        have hbc' : b ≤ c := of_decide_eq_true hbc
+        exact decide_eq_true (by omega)
+      · intro a b
+        by_cases h : a ≤ b
+        · simp [h]
+        · have hba : b ≤ a := by omega
+          simp [h, hba]
+    have hrank' : k = (radixN (planes x) 8 (m, k, 0)).2.1 +
+        cnt (fun i => m.getLsbD i && decide ((x i).toNat < p)) := by
+      simpa [pref_8] using hrank
+    have hn' : (radixN (planes x) 8 (m, k, 0)).2.1 < count (radixN (planes x) 8 (m, k, 0)).1 := hn
+    have hcntlive : count (radixN (planes x) 8 (m, k, 0)).1 =
+        cnt (fun i => m.getLsbD i && decide ((x i).toNat = p)) := by
+      apply count_char
+      intro i hi
+      simpa [pref_8] using hchar i hi
+    have hdisj : ∀ i, i < 64 → ¬ (m.getLsbD i && decide ((x i).toNat < p) &&
+        (m.getLsbD i && decide ((x i).toNat = p))) := by
+      intro i hi ht
+      have ht' := Bool.and_eq_true_iff.mp ht
+      have ht'' := Bool.and_eq_true_iff.mp ht'.1
+      exact (Nat.lt_irrefl p) (by
+        have hlt : (x i).toNat < p := of_decide_eq_true ht''.2
+        have heq : (x i).toNat = p := of_decide_eq_true (Bool.and_eq_true_iff.mp ht'.2).2
+        omega)
+    have horadd := cnt_or_add
+      (fun i => m.getLsbD i && decide ((x i).toNat < p))
+      (fun i => m.getLsbD i && decide ((x i).toNat = p)) hdisj
+    have hlecnt : cnt (fun i => m.getLsbD i && decide ((x i).toNat ≤ p)) =
+        cnt (fun i => m.getLsbD i && decide ((x i).toNat < p)) +
+        cnt (fun i => m.getLsbD i && decide ((x i).toNat = p)) := by
+      have hpoint : cnt (fun i => m.getLsbD i && decide ((x i).toNat ≤ p)) =
+          cnt (fun i => (m.getLsbD i && decide ((x i).toNat < p)) ||
+            (m.getLsbD i && decide ((x i).toNat = p))) := by
+        apply cnt_congr
+        intro i hi
+        by_cases hlt : (x i).toNat < p <;> by_cases heq : (x i).toNat = p <;> simp [hlt, heq] <;> omega
+      rw [hpoint, horadd]
+    have hlo : (ys.filter fun a => decide (a < p)).length ≤ k := by
+      rw [← cnt_of_lanes x m (fun a => decide (a < p))]
+      omega
+    have hhi_cnt : k < cnt (fun i => m.getLsbD i && decide ((x i).toNat < p)) +
+        cnt (fun i => m.getLsbD i && decide ((x i).toNat = p)) := by
+      omega
+    have hhi : k < (ys.filter fun a => decide (a ≤ p)).length := by
+      rw [← cnt_of_lanes x m (fun a => decide (a ≤ p))]
+      rw [hlecnt]
+      exact hhi_cnt
+    have hperm : List.Perm (ys.mergeSort) ys := List.mergeSort_perm ys _
+    have hlo_sort : ((ys.mergeSort).filter fun a => decide (a < p)).length ≤ k := by
+      have hp := (hperm.filter (fun a => decide (a < p))).length_eq
+      omega
+    have hhi_sort : k < ((ys.mergeSort).filter fun a => decide (a ≤ p)).length := by
+      have hp := (hperm.filter (fun a => decide (a ≤ p))).length_eq
+      omega
+    have hkval := sorted_kth_eq_of_counts (ys.mergeSort) hsorted k p
+      (by simpa using hkys) hlo_sort hhi_sort
+    simpa [ys] using hkval.symm
+  · have hkge : count m ≤ k := by omega
+    unfold kth
+    rw [ite_eq_left hkge]
+    have hyslen : ((lanes m).map fun i => (x i).toNat).length = count m := by simp [lanes, count]
+    have hnone : (((lanes m).map fun i => (x i).toNat).mergeSort)[k]? = none := by
+      apply List.getElem?_eq_none
+      rw [List.length_mergeSort, hyslen]
+      exact hkge
+    rw [hnone]
+    rfl
 
 /-! ### OccupiedCodes -/
 
-private theorem mem_lanes_iff (m : W) (i : Nat) :
-    i ∈ lanes m ↔ i < 64 ∧ m.getLsbD i = true := by
-  show i ∈ (List.range 64).filter m.getLsbD ↔ i < 64 ∧ m.getLsbD i = true
-  rw [List.mem_filter, List.mem_range]
+private def prefLow (v : B) : Nat → Nat
+  | 0 => 0
+  | d+1 => prefLow v d + (if v.getLsbD d then 2^d else 0)
 
-private theorem lanes_eq_nil_iff (m : W) : lanes m = [] ↔ m == 0 := by
-  show (List.range 64).filter m.getLsbD = [] ↔ m == 0
-  rw [List.filter_eq_nil_iff]
-  constructor
-  · intro h
-    have h0 : m = 0 := by
-      apply eq_zero_of_getLsbD
-      intro i hi
-      have hh := h i (List.mem_range.mpr hi)
-      cases hb : m.getLsbD i <;> simp_all
-    rw [h0]
-    simp
-  · intro h
-    have hm : m = 0 := beq_iff_eq.mp h
-    subst hm
+private theorem prefLow_lt_pow (v : B) : ∀ d, d ≤ 8 → prefLow v d < 2^d := by
+  intro d hd
+  induction d with
+  | zero => simp [prefLow]
+  | succ d ih =>
+      have hd' : d ≤ 8 := by omega
+      rw [prefLow, Nat.pow_succ]
+      have hbit : (if v.getLsbD d then 2^d else 0) ≤ 2^d := by
+        cases v.getLsbD d <;> simp
+      have ih' := ih hd'
+      omega
+
+private theorem prefLow_8 (v : B) : prefLow v 8 = v.toNat := by
+  revert v
+  native_decide
+
+private theorem nodup_eraseDups [BEq α] [LawfulBEq α] : ∀ l : List α, l.eraseDups.Nodup
+  | [] => by simp
+  | a :: t => by
+      rw [List.eraseDups_cons]
+      apply List.nodup_cons.mpr
+      constructor
+      · simp
+      · exact nodup_eraseDups (t.filter fun b => ! b == a)
+termination_by l => l.length
+decreasing_by
+  simp
+  have hle := List.length_filter_le (fun b => ! b == a) t
+  omega
+
+private theorem nodup_len_eq_of_mem_iff [BEq α] [LawfulBEq α] : ∀ (s t : List α),
+    s.Nodup → t.Nodup → (∀ a, a ∈ s ↔ a ∈ t) → s.length = t.length := by
+  intro s
+  induction s with
+  | nil =>
+      intro t hs ht hmem
+      have ht0 : t.length = 0 := by
+        by_cases h0 : t.length = 0
+        · exact h0
+        · exfalso
+          have hpos : 0 < t.length := Nat.pos_of_ne_zero h0
+          have hmemin : t[0] ∈ ([] : List α) := (hmem t[0]).mpr (List.getElem_mem hpos)
+          simp at hmemin
+      simp [ht0]
+  | cons a s' ih =>
+      intro t hs ht hmem
+      have hsTail := List.nodup_cons.mp hs
+      have hnotmem : a ∉ s' := hsTail.1
+      have hsnodup : s'.Nodup := hsTail.2
+      have hain : a ∈ t := (hmem a).mp (by simp)
+      have htperm : List.Perm t (a :: t.erase a) := List.perm_cons_erase hain
+      have htlen : t.length = (a :: t.erase a).length := htperm.length_eq
+      have htnodup : (t.erase a).Nodup := ht.erase a
+      have hmem' : ∀ b, b ∈ s' ↔ b ∈ t.erase a := by
+        intro b
+        constructor
+        · intro hbS
+          have hbne : b ≠ a := by
+            intro h
+            subst b
+            exact hnotmem hbS
+          have hbT : b ∈ t := (hmem b).mp (by simp [hbS])
+          exact (ht.mem_erase_iff (b := a) (a := b)).mpr ⟨hbne, hbT⟩
+        · intro hbEr
+          have hbneT := (ht.mem_erase_iff (b := a) (a := b)).mp hbEr
+          have hbne : b ≠ a := hbneT.1
+          have hbT : b ∈ t := hbneT.2
+          have hbCons : b ∈ a :: s' := (hmem b).mpr hbT
+          rcases List.mem_cons.mp hbCons with hba | hbs
+          · exact False.elim (hbne hba)
+          · exact hbs
+      have ih' := ih (t.erase a) hsnodup htnodup hmem'
+      rw [htlen]
+      simp [ih']
+
+private theorem eraseDups_length_perm [BEq α] [LawfulBEq α] {l l' : List α}
+    (h : List.Perm l l') : l.eraseDups.length = l'.eraseDups.length := by
+  apply nodup_len_eq_of_mem_iff _ _ (nodup_eraseDups l) (nodup_eraseDups l')
+  intro a
+  simp [List.mem_eraseDups, List.Perm.mem_iff h]
+
+private theorem filter_map_of_inj {α β} [BEq α] [LawfulBEq α] [BEq β] [LawfulBEq β]
+    (f : α → β) (hf : ∀ a b, f a = f b ↔ a = b) (a : α) : ∀ l : List α,
+    (l.map f).filter (fun b => ! b == f a) = (l.filter fun b => ! b == a).map f := by
+  intro l
+  induction l with
+  | nil => simp
+  | cons x xs ih =>
+      by_cases hxa : x = a
+      · subst x
+        simpa using ih
+      · have hfxa : f x != f a := by
+          apply bne_iff_ne.mpr
+          intro h
+          exact hxa ((hf x a).mp h)
+        have hfxane : f x ≠ f a := bne_iff_ne.mp hfxa
+        simp only [List.map_cons, List.filter_cons]
+        simp [hxa, hfxane, ih]
+
+private theorem eraseDups_length_map_of_inj {α β} [BEq α] [LawfulBEq α] [BEq β] [LawfulBEq β]
+    (f : α → β) (hf : ∀ a b, f a = f b ↔ a = b) : ∀ l : List α,
+    (l.map f).eraseDups.length = l.eraseDups.length
+  | [] => by simp
+  | a :: as => by
+      rw [List.map_cons, List.eraseDups_cons, List.eraseDups_cons]
+      simp only [List.length_cons]
+      congr 1
+      rw [filter_map_of_inj f hf a as]
+      exact eraseDups_length_map_of_inj f hf (as.filter fun b => ! b == a)
+termination_by l => l.length
+decreasing_by
+  simp
+  have hle := List.length_filter_le (fun b => ! b == a) as
+  omega
+
+private theorem removeAll_eq_self_of_not_mem [BEq α] [LawfulBEq α] {xs ys : List α}
+    (h : ∀ x ∈ xs, x ∉ ys) : xs.removeAll ys = xs := by
+  induction ys with
+  | nil => simp
+  | cons y ys ih =>
+      rw [List.removeAll_cons]
+      have hf : (xs.filter fun x => ! x == y) = xs := by
+        apply List.filter_eq_self.mpr
+        intro x hx
+        have hxny : x ≠ y := by
+          intro hxy
+          subst y
+          exact h x hx (by simp)
+        simp [hxny]
+      rw [hf]
+      apply ih
+      intro x hx hy
+      exact h x hx (by simp [hy])
+
+private theorem eraseDups_append_disjoint (A B : List Nat)
+    (h : ∀ a ∈ A, ∀ b ∈ B, a != b) :
+    (A ++ B).eraseDups.length = A.eraseDups.length + B.eraseDups.length := by
+  rw [List.eraseDups_append]
+  have hrm : B.removeAll A = B := by
+    apply removeAll_eq_self_of_not_mem
+    intro b hb hbA
+    have hbb : b != b := h b hbA b hb
+    exact (bne_iff_ne.mp hbb) rfl
+  rw [hrm]
+  simp
+
+private theorem filter_or_append_perm {α} (p q : α → Bool) : ∀ l : List α,
+    (∀ a ∈ l, ¬ (p a && q a)) →
+    List.Perm (l.filter fun a => p a || q a) (l.filter p ++ l.filter q) := by
+  intro l
+  induction l with
+  | nil => simp
+  | cons a t ih =>
+      intro hdisj
+      have hdt : ∀ b ∈ t, ¬ (p b && q b) := by
+        intro b hb
+        exact hdisj b (by simp [hb])
+      have ih' := ih hdt
+      cases hp : p a <;> cases hq : q a
+      · simpa [hp, hq] using ih'
+      · simpa [hp, hq] using (List.perm_cons_append_cons a ih')
+      · simpa [hp, hq] using ih'.cons a
+      · exfalso
+        exact hdisj a (by simp) (by simp [hp, hq])
+
+private theorem lanes_split (m : W) (a : Planes) (d : Nat) :
+    List.Perm (lanes m) (lanes (m &&& a d) ++ lanes (m &&& ~~~(a d))) := by
+  unfold lanes
+  have hp := filter_or_append_perm
+    (fun i : Nat => m.getLsbD i && (a d).getLsbD i)
+    (fun i : Nat => m.getLsbD i && ! (a d).getLsbD i) (List.range 64) (by
+      intro i hi hai
+      have h1 := Bool.and_eq_true_iff.mp hai
+      have h2 := Bool.and_eq_true_iff.mp h1.1
+      have h3 := Bool.and_eq_true_iff.mp h1.2
+      cases hbit : (a d).getLsbD i <;> simp [hbit] at h2 h3 ⊢)
+  have hleft : (List.range 64).filter (fun i =>
+      (m.getLsbD i && (a d).getLsbD i) || (m.getLsbD i && ! (a d).getLsbD i)) =
+      (List.range 64).filter m.getLsbD := by
+    apply List.filter_congr
     intro i hi
-    simp
+    cases m.getLsbD i <;> cases (a d).getLsbD i <;> simp
+  have hp1 : ((List.range 64).filter fun i => m.getLsbD i && (a d).getLsbD i) =
+      (List.range 64).filter (fun i => (m &&& a d).getLsbD i) := by
+    apply List.filter_congr
+    intro i hi
+    rw [BitVec.getLsbD_and]
+  have hp0 : ((List.range 64).filter fun i => m.getLsbD i && ! (a d).getLsbD i) =
+      (List.range 64).filter (fun i => (m &&& ~~~(a d)).getLsbD i) := by
+    apply List.filter_congr
+    intro i hi
+    have hi64 := List.mem_range.mp hi
+    rw [BitVec.getLsbD_and, BitVec.getLsbD_not]
+    simp [hi64]
+  rw [hleft, hp1, hp0] at hp
+  exact hp
 
-private theorem mem_lanes_and_plane (x : Nat → B) (m : W) (n i : Nat) (hi : i < 64) :
-    i ∈ lanes (m &&& planes x n) ↔ i ∈ lanes m ∧ (x i).getLsbD n = true := by
-  rw [mem_lanes_iff, mem_lanes_iff]
-  constructor
-  · rintro ⟨hi64, hmi⟩
-    rw [BitVec.getLsbD_and, planes_getLsbD x n i hi64, Bool.and_eq_true] at hmi
-    exact ⟨⟨hi64, hmi.1⟩, hmi.2⟩
-  · rintro ⟨⟨hi64, hmi⟩, hbit⟩
-    refine ⟨hi64, ?_⟩
-    rw [BitVec.getLsbD_and, planes_getLsbD x n i hi64, Bool.and_eq_true]
-    exact ⟨hmi, hbit⟩
+private theorem eraseDups_length_const_zero (l : List Nat) (h : ∀ a ∈ l, a = 0) :
+    l.eraseDups.length = if l.length = 0 then 0 else 1 := by
+  induction l with
+  | nil => simp
+  | cons a t ih =>
+      have ha : a = 0 := h a (by simp)
+      subst a
+      by_cases ht : t.length = 0
+      · have ht' : t = [] := List.length_eq_zero_iff.mp ht
+        subst t
+        simp [List.eraseDups_cons]
+      · have hf : (t.filter fun b => ! b == 0) = [] := by
+          apply List.filter_eq_nil_iff.mpr
+          intro b hb
+          have hb0 := h b (by simp [hb])
+          subst b
+          simp
+        rw [List.eraseDups_cons, hf]
+        simp [ht]
 
-private theorem mem_lanes_and_not_plane (x : Nat → B) (m : W) (n i : Nat) (hi : i < 64) :
-    i ∈ lanes (m &&& ~~~(planes x n)) ↔ i ∈ lanes m ∧ (x i).getLsbD n = false := by
-  rw [mem_lanes_iff, mem_lanes_iff]
-  constructor
-  · rintro ⟨hi64, hmi⟩
-    rw [BitVec.getLsbD_and, BitVec.getLsbD_not, planes_getLsbD x n i hi64,
-        decide_eq_true hi64, Bool.true_and, Bool.and_eq_true] at hmi
-    refine ⟨⟨hi64, hmi.1⟩, ?_⟩
-    cases hb : (x i).getLsbD n <;> simp_all
-  · rintro ⟨⟨hi64, hmi⟩, hbit⟩
-    refine ⟨hi64, ?_⟩
-    rw [BitVec.getLsbD_and, BitVec.getLsbD_not, planes_getLsbD x n i hi64,
-        decide_eq_true hi64, Bool.true_and, hmi]
-    cases hb : (x i).getLsbD n <;> simp_all
-
-private theorem lanes_and_plane_eq_filter (x : Nat → B) (m : W) (n : Nat) :
-    lanes (m &&& planes x n) = (lanes m).filter (fun i => (x i).getLsbD n) := by
-  show (List.range 64).filter ((m &&& planes x n).getLsbD)
-      = ((List.range 64).filter m.getLsbD).filter (fun i => (x i).getLsbD n)
-  rw [List.filter_filter]
-  apply List.filter_congr
-  intro i hi
-  have hi64 : i < 64 := List.mem_range.mp hi
-  rw [BitVec.getLsbD_and, planes_getLsbD x n i hi64]
-  exact Bool.and_comm _ _
-
-private theorem lanes_and_not_plane_eq_filter (x : Nat → B) (m : W) (n : Nat) :
-    lanes (m &&& ~~~(planes x n)) = (lanes m).filter (fun i => !(x i).getLsbD n) := by
-  show (List.range 64).filter ((m &&& ~~~(planes x n)).getLsbD)
-      = ((List.range 64).filter m.getLsbD).filter (fun i => !(x i).getLsbD n)
-  rw [List.filter_filter]
-  apply List.filter_congr
-  intro i hi
-  have hi64 : i < 64 := List.mem_range.mp hi
-  rw [BitVec.getLsbD_and, BitVec.getLsbD_not, planes_getLsbD x n i hi64,
-      decide_eq_true hi64, Bool.true_and]
-  exact Bool.and_comm _ _
-
-private theorem pat_succ_bit_val (x : Nat → B) (i n : Nat) :
-    (x i).toNat % 2^(n+1) =
-      (x i).toNat % 2^n + 2^n * (((x i).getLsbD n).toNat) := by
-  have h := mod_two_pow_succ ((x i).toNat) n
-  rwa [BitVec.testBit_toNat] at h
-
-private theorem pat_succ_eq_add (x : Nat → B) (i n : Nat)
-    (hb : (x i).getLsbD n = true) :
-    (x i).toNat % 2^(n+1) = (x i).toNat % 2^n + 2^n := by
-  rw [pat_succ_bit_val, hb]
-  simp
-
-private theorem pat_succ_eq (x : Nat → B) (i n : Nat)
-    (hb : (x i).getLsbD n = false) :
-    (x i).toNat % 2^(n+1) = (x i).toNat % 2^n := by
-  rw [pat_succ_bit_val, hb]
-  simp
-
-private theorem occupied_eq_length (x : Nat → B) :
-    ∀ n : Nat, ∀ m : W,
-      occupied (planes x) m n =
-        (((lanes m).map fun i => (x i).toNat % 2^n).eraseDups).length := by
-  intro n
-  induction n with
+private theorem occupied_prefix_count (x : Nat → B) : ∀ d, d ≤ 8 → ∀ m : W,
+    occupied (planes x) m d = (((lanes m).map fun i => prefLow (x i) d).eraseDups).length := by
+  intro d
+  induction d with
   | zero =>
-      intro m
-      show (if m == 0 then 0 else 1) = _
-      have hmap : ((lanes m).map fun i => (x i).toNat % 2^0)
-          = (lanes m).map fun _ => (0 : Nat) := by
-        apply List.map_congr_left
-        intro i _
-        omega
-      rw [hmap, eraseDups_length_map_const]
-      by_cases h : lanes m = []
-      · have hm : m == 0 := (lanes_eq_nil_iff m).mp h
-        rw [ite_eq_left h, ite_eq_left hm]
-      · rw [ite_eq_right h]
-        have hm : ¬(m == 0) := fun h' => h ((lanes_eq_nil_iff m).mpr h')
-        rw [ite_eq_right hm]
-  | succ n ih =>
-      intro m
-      show (if m == 0 then 0 else
-          occupied (planes x) (m &&& planes x n) n +
-          occupied (planes x) (m &&& ~~~(planes x n)) n) = _
-      by_cases hm : m == 0
-      · rw [ite_eq_left hm]
-        have he : lanes m = [] := (lanes_eq_nil_iff m).mpr hm
-        rw [he]
+      intro hd m
+      by_cases hm : (m == 0) = true
+      · have hm0 : m = 0 := by simpa using hm
+        subst m
+        have hl : lanes (0 : W) = [] := by
+          unfold lanes
+          apply List.filter_eq_nil_iff.mpr
+          intro i hi
+          simp
+        rw [occupied, ite_eq_left hm, hl]
+        simp
+      · rw [occupied, ite_eq_right hm]
+        rw [show (lanes m).map (fun i => prefLow (x i) 0) = (lanes m).map (fun _ => 0) from by
+          apply List.map_congr_left
+          intro i hi
+          simp [prefLow]]
+        have hlen := eraseDups_length_const_zero ((lanes m).map fun _ => 0) (by
+          intro a ha
+          rcases List.mem_map.mp ha with ⟨i, hi, rfl⟩
+          rfl)
+        have hmzero : (lanes m).length ≠ 0 := by
+          intro hzero
+          have hl : lanes m = [] := List.length_eq_zero_iff.mp hzero
+          have hbits : ∀ i, i < 64 → m.getLsbD i = false := by
+            intro i hi
+            by_cases hb : m.getLsbD i = true
+            · have hin : i ∈ lanes m := by simp [lanes, hi, hb]
+              rw [hl] at hin
+              simpa using hin
+            · cases hbit : m.getLsbD i <;> simp [hbit] at hb ⊢
+          have hm0 : m = 0 := by
+            apply BitVec.eq_of_getLsbD_eq
+            intro i hi
+            by_cases hi64 : i < 64
+            · simpa using hbits i hi64
+            · simpa using getLsbD_ge_width m (Nat.le_of_not_gt hi64)
+          exact hm (by simp [hm0])
+        have hlenmap : ((lanes m).map fun _ => 0).length = (lanes m).length := by simp
+        rw [hlen, hlenmap]
+        simp [hmzero]
+  | succ d ih =>
+      intro hd m
+      have hd' : d ≤ 8 := by omega
+      rw [occupied]
+      by_cases hm : (m == 0) = true
+      · have hm0 : m = 0 := by simpa using hm
+        subst m
+        have hl : lanes (0 : W) = [] := by
+          unfold lanes
+          apply List.filter_eq_nil_iff.mpr
+          intro i hi
+          simp
+        rw [ite_eq_left hm, hl]
         simp
       · rw [ite_eq_right hm]
-        have hperm : List.Perm (lanes m)
-            (List.filter (fun i => (x i).getLsbD n) (lanes m) ++
-             List.filter (fun i => !(x i).getLsbD n) (lanes m)) := by
-          have h := List.filter_append_perm (fun i => (x i).getLsbD n) (lanes m)
-          exact h.symm
-        have hmap_perm : List.Perm
-            (List.map (fun i => (x i).toNat % 2^(n+1)) (lanes m))
-            (List.map (fun i => (x i).toNat % 2^(n+1))
-                (List.filter (fun i => (x i).getLsbD n) (lanes m)) ++
-             List.map (fun i => (x i).toNat % 2^(n+1))
-                (List.filter (fun i => !(x i).getLsbD n) (lanes m))) := by
-          have h := hperm.map (fun i => (x i).toNat % 2^(n+1))
-          rwa [List.map_append] at h
-        have hA : (((lanes m).filter fun i => (x i).getLsbD n).map
-            fun i => (x i).toNat % 2^(n+1)).eraseDups.length
-            = occupied (planes x) (m &&& planes x n) n := by
-          rw [← lanes_and_plane_eq_filter x m n]
-          have hmap : ((lanes (m &&& planes x n)).map fun i => (x i).toNat % 2^(n+1))
-              = ((lanes (m &&& planes x n)).map fun i => (x i).toNat % 2^n).map (· + 2^n) := by
-            rw [List.map_map]
+        let m1 := m &&& planes x d
+        let m0 := m &&& ~~~(planes x d)
+        rw [ih hd' m1, ih hd' m0]
+        have hmapeq : ((lanes m1).map fun i => prefLow (x i) d + 2^d) =
+            ((lanes m1).map fun i => prefLow (x i) d).map (fun p => p + 2^d) := by
+          rw [List.map_map]
+          rfl
+        have hmap1 : (((lanes m1).map fun i => prefLow (x i) d).eraseDups).length =
+            (((lanes m1).map fun i => prefLow (x i) d + 2^d).eraseDups).length := by
+          symm
+          rw [hmapeq]
+          exact eraseDups_length_map_of_inj (fun p : Nat => p + 2^d) (by
+            intro a b
+            constructor <;> intro h <;> omega) ((lanes m1).map fun i => prefLow (x i) d)
+        rw [hmap1]
+        have hpref1 : ∀ i, m1.getLsbD i = true → prefLow (x i) (d+1) = prefLow (x i) d + 2^d := by
+          intro i hi
+          have hi64 : i < 64 := BitVec.lt_of_getLsbD hi
+          have hbit : (x i).getLsbD d = true := by
+            have hb := hi
+            dsimp [m1] at hb
+            rw [BitVec.getLsbD_and] at hb
+            have hb2 := (Bool.and_eq_true_iff.mp hb).2
+            dsimp [planes] at hb2
+            rw [pack_getLsbD (fun t => (x t).getLsbD d) i hi64] at hb2
+            exact hb2
+          rw [prefLow]
+          simp [hbit]
+        have hpref0 : ∀ i, m0.getLsbD i = true → prefLow (x i) (d+1) = prefLow (x i) d := by
+          intro i hi
+          have hi64 : i < 64 := BitVec.lt_of_getLsbD hi
+          have hbit : (x i).getLsbD d = false := by
+            have hb := hi
+            dsimp [m0] at hb
+            rw [BitVec.getLsbD_and, BitVec.getLsbD_not] at hb
+            have hb2 := (Bool.and_eq_true_iff.mp hb).2
+            simp only [decide_eq_true hi64, Bool.true_and] at hb2
+            dsimp [planes] at hb2
+            rw [pack_getLsbD (fun t => (x t).getLsbD d) i hi64] at hb2
+            cases hbx : (x i).getLsbD d <;> simp [hbx] at hb2 ⊢
+          rw [prefLow]
+          simp [hbit]
+        have hperm := lanes_split m (planes x) d
+        have hpermMap : List.Perm ((lanes m).map fun i => prefLow (x i) (d+1))
+            (((lanes m1).map fun i => prefLow (x i) d + 2^d) ++
+             ((lanes m0).map fun i => prefLow (x i) d)) := by
+          have hpm := hperm.map (fun i => prefLow (x i) (d+1))
+          rw [List.map_append] at hpm
+          refine hpm.trans ?_
+          apply List.Perm.append
+          · apply List.Perm.of_eq
             apply List.map_congr_left
             intro i hi
-            have hi64 : i < 64 := (mem_lanes_iff _ i).mp hi |>.1
-            have hb : (x i).getLsbD n = true :=
-              ((mem_lanes_and_plane x m n i hi64).mp hi).2
-            exact pat_succ_eq_add x i n hb
-          rw [hmap]
-          have hinj : Function.Injective (· + 2^n) :=
-            fun a b h => Nat.add_right_cancel h
-          rw [eraseDups_length_map_inj _ hinj]
-          exact (ih _).symm
-        have hB : (((lanes m).filter fun i => !(x i).getLsbD n).map
-            fun i => (x i).toNat % 2^(n+1)).eraseDups.length
-            = occupied (planes x) (m &&& ~~~(planes x n)) n := by
-          rw [← lanes_and_not_plane_eq_filter x m n]
-          have hmap : ((lanes (m &&& ~~~(planes x n))).map fun i => (x i).toNat % 2^(n+1))
-              = (lanes (m &&& ~~~(planes x n))).map fun i => (x i).toNat % 2^n := by
+            have hiL : m1.getLsbD i = true := by
+              rw [lanes, List.mem_filter] at hi
+              simpa [m1] using hi.2
+            exact hpref1 i hiL
+          · apply List.Perm.of_eq
             apply List.map_congr_left
             intro i hi
-            have hi64 : i < 64 := (mem_lanes_iff _ i).mp hi |>.1
-            have hb : (x i).getLsbD n = false :=
-              ((mem_lanes_and_not_plane x m n i hi64).mp hi).2
-            exact pat_succ_eq x i n hb
-          rw [hmap]
-          exact (ih _).symm
-        have hdisj : ∀ v ∈ ((lanes m).filter fun i => !(x i).getLsbD n).map
-            (fun i => (x i).toNat % 2^(n+1)),
-            v ∉ ((lanes m).filter fun i => (x i).getLsbD n).map
-              (fun i => (x i).toNat % 2^(n+1)) := by
-          intro v hv hvmem
-          rw [List.mem_map] at hv hvmem
-          obtain ⟨i, hi, rfl⟩ := hv
-          obtain ⟨j, hj, hij⟩ := hvmem
-          rw [List.mem_filter] at hi hj
-          obtain ⟨-, hni⟩ := hi
-          obtain ⟨-, hbj⟩ := hj
-          have hbi : (x i).getLsbD n = false := by
-            cases hb : (x i).getLsbD n <;> simp_all
-          rw [pat_succ_eq x i n hbi] at hij
-          rw [pat_succ_eq_add x j n hbj] at hij
-          have hlt : (x i).toNat % 2^n < 2^n := Nat.mod_lt _ (Nat.two_pow_pos _)
-          omega
-        rw [eraseDups_length_perm hmap_perm, List.eraseDups_append,
-            removeAll_eq_self hdisj, List.length_append, hA, hB]
-
-
-theorem sound_OccupiedCodes : OccupiedCodes.Goal := by
-  intro x m
-  have h := occupied_eq_length x 8 m
-  -- h : occupied (planes x) m 8 = (((lanes m).map fun i => (x i).toNat % 2^8).eraseDups).length
-  rw [h]
-  -- need: ((lanes m).map fun i => (x i).toNat % 256).eraseDups.length
-  --     = ((lanes m).map x).eraseDups.length
-  have hmod : ((lanes m).map fun i => (x i).toNat % 2^8)
-      = ((lanes m).map x).map BitVec.toNat := by
-    rw [List.map_map]
-    apply List.map_congr_left
-    intro i _
-    have hlt : (x i).toNat < 2^8 := (x i).isLt
-    exact Nat.mod_eq_of_lt hlt
-  rw [hmod, eraseDups_map_inj _ (fun a b h => BitVec.toNat_inj.mp h)]
-  rw [List.length_map]
-
-/-! ### PlaneAdd: ripple-carry adder spec -/
-
-/-- Carry into bit `k` of the ripple adder over planes `a b`. -/
-private def carrySeq (a b : Planes) : Nat → W
-  | 0 => 0
-  | k+1 => (a k &&& b k) ||| ((a k ^^^ b k) &&& carrySeq a b k)
-
-/-- Plane `j` of the sum: `a j ^^^ b j` plus carry-in. -/
-private def sumBit (a b : Planes) (j : Nat) : W := a j ^^^ b j ^^^ carrySeq a b j
-
-private theorem add_foldl_spec (a b : Planes) (k : Nat) :
-    (List.range k).foldl
-        (fun (out, c) j =>
-          let p := a j ^^^ b j
-          ((p ^^^ c)::out, (a j &&& b j) ||| (p &&& c)))
-        ([], 0)
-      = ((List.range k).reverse.map (sumBit a b), carrySeq a b k) := by
-  induction k with
-  | zero => rfl
-  | succ k ih =>
-      rw [List.range_succ, List.foldl_append, ih]
-      simp only [List.foldl_cons, List.foldl_nil]
-      show ((a k ^^^ b k ^^^ carrySeq a b k) :: ((List.range k).reverse.map (sumBit a b)),
-            (a k &&& b k) ||| ((a k ^^^ b k) &&& carrySeq a b k))
-        = (List.map (sumBit a b) (List.range k ++ [k]).reverse, carrySeq a b (k+1))
-      refine Prod.ext_iff.mpr ⟨?_, rfl⟩
-      rw [List.reverse_append, List.map_append]
-      simp [List.map_cons, List.map_nil, sumBit]
-
-
-/-- Bit `i` of the carry into plane `k` is `1` iff the low `k` bits of the
-two lane values already overflow `2^k`. -/
-private theorem carrySeq_planes_getLsbD (x y : Nat → B) (k i : Nat) (hi : i < 64) :
-    (carrySeq (planes x) (planes y) k).getLsbD i
-      = decide (2^k ≤ (x i).toNat % 2^k + (y i).toNat % 2^k) := by
-  induction k with
-  | zero =>
-      show ((0 : W).getLsbD i) = decide (2^0 ≤ (x i).toNat % 2^0 + (y i).toNat % 2^0)
-      simp [Nat.mod_one]
-  | succ k ih =>
-      show (((planes x k &&& planes y k) |||
-          ((planes x k ^^^ planes y k) &&& carrySeq (planes x) (planes y) k))).getLsbD i
-        = decide (2^(k+1) ≤ (x i).toNat % 2^(k+1) + (y i).toNat % 2^(k+1))
-      rw [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_and, BitVec.getLsbD_xor,
-          planes_getLsbD x k i hi, planes_getLsbD y k i hi, ih]
-      rw [show (x i).getLsbD k = (x i).toNat.testBit k from rfl,
-          show (y i).getLsbD k = (y i).toNat.testBit k from rfl]
-      rw [mod_two_pow_succ (x i).toNat k, mod_two_pow_succ (y i).toNat k]
-      have hpow : 2^(k+1) = 2^k + 2^k := Nat.two_pow_succ k
-      have hbx : (x i).toNat % 2^k < 2^k := Nat.mod_lt _ (Nat.two_pow_pos _)
-      have hby : (y i).toNat % 2^k < 2^k := Nat.mod_lt _ (Nat.two_pow_pos _)
-      cases hA : (x i).toNat.testBit k <;> cases hB : (y i).toNat.testBit k <;>
-        simp [hA, hB, Bool.toNat_true, Bool.toNat_false] <;>
-        first
-        | rfl
-        | omega
-        | (constructor <;> intro h <;> omega)
-        | exact ((decide_eq_true _).mpr (by omega)).symm
-        | exact ((decide_eq_false _).mpr (by omega)).symm
-        | (rw [decide_eq_decide]; constructor <;> intro h <;> omega)
-
-
-/-- Bit `j` of `xn + yn` equals `xn_j ^^ yn_j ^^ carry_j`, where `carry_j` is
-the carry into bit `j` generated by the low `j` bits. -/
-private theorem add_testBit (xn yn j : Nat) :
-    (xn + yn).testBit j =
-      (((xn.testBit j) ^^ (yn.testBit j)) ^^ decide (2^j ≤ xn % 2^j + yn % 2^j)) := by
-  have hpow : 2^(j+1) = 2^j + 2^j := Nat.two_pow_succ j
-  generalize hsdef : xn % 2^j + yn % 2^j = s
-  have hslt : s < 2^(j+1) := by
-    rw [← hsdef]
-    have h1 : xn % 2^j < 2^j := Nat.mod_lt _ (Nat.two_pow_pos _)
-    have h2 : yn % 2^j < 2^j := Nat.mod_lt _ (Nat.two_pow_pos _)
-    omega
-  have hrlt : s % 2^j < 2^j := Nat.mod_lt s (Nat.two_pow_pos _)
-  -- the carry predicate equals `s / 2^j` as a natural number
-  have hcb_eq : (decide (2^j ≤ s)).toNat = s / 2^j := by
-    by_cases hP : 2^j ≤ s
-    · have hc1 : s / 2^j = 1 := by
-        apply (Nat.div_eq_iff (Nat.two_pow_pos _)).mpr
-        refine ⟨?_, ?_⟩ <;> omega
-      rw [decide_eq_true hP, hc1]
-      rfl
-    · have hc0 : s / 2^j = 0 := by
-        apply Nat.div_eq_of_lt
-        have := Nat.not_le.mp hP
+            have hiL : m0.getLsbD i = true := by
+              rw [lanes, List.mem_filter] at hi
+              simpa [m0] using hi.2
+            exact hpref0 i hiL
+        rw [eraseDups_length_perm hpermMap]
+        symm
+        apply eraseDups_append_disjoint
+        intro a ha b hb
+        rcases List.mem_map.mp ha with ⟨i, hi, rfl⟩
+        rcases List.mem_map.mp hb with ⟨j, hj, rfl⟩
+        apply bne_iff_ne.mpr
+        intro heq
+        have hiLT := prefLow_lt_pow (x i) d hd'
+        have hjLT := prefLow_lt_pow (x j) d hd'
         omega
-      rw [decide_eq_false hP, hc0]
-      rfl
-  -- mod-2^{j+1} decompositions
-  have hmodx : xn % 2^(j+1) = xn % 2^j + 2^j * (xn.testBit j).toNat := mod_two_pow_succ xn j
-  have hmody : yn % 2^(j+1) = yn % 2^j + 2^j * (yn.testBit j).toNat := mod_two_pow_succ yn j
-  have hxn : xn = xn % 2^(j+1) + 2^(j+1) * (xn / 2^(j+1)) := (Nat.mod_add_div xn _).symm
-  have hyn : yn = yn % 2^(j+1) + 2^(j+1) * (yn / 2^(j+1)) := (Nat.mod_add_div yn _).symm
-  have hlow : xn % 2^(j+1) + yn % 2^(j+1)
-      = s + 2^j * ((xn.testBit j).toNat + (yn.testBit j).toNat) := by
-    rw [hmodx, hmody, ← hsdef, Nat.mul_add]
-    ac_rfl
-  have hs_eq : s = s % 2^j + 2^j * (s / 2^j) := (Nat.mod_add_div s (2^j)).symm
-  have hsum1 : xn + yn = (xn % 2^(j+1) + yn % 2^(j+1))
-      + 2^(j+1) * (xn / 2^(j+1) + yn / 2^(j+1)) := by
-    conv => lhs; rw [hxn, hyn]
-    rw [Nat.mul_add]
-    ac_rfl
-  have hdecomp : xn + yn = s % 2^j
-      + 2^j * ((xn.testBit j).toNat + (yn.testBit j).toNat + s / 2^j)
-      + 2^(j+1) * (xn / 2^(j+1) + yn / 2^(j+1)) := by
-    have h1 := hsum1
-    rw [hlow] at h1
-    rw [hs_eq] at h1
-    refine h1.trans ?_
-    rw [Nat.mul_add (2^j) ((xn.testBit j).toNat + (yn.testBit j).toNat) (s / 2^j)]
-    ac_rfl
-  -- division by 2^j
-  have hQ : (2^(j+1) * (xn / 2^(j+1) + yn / 2^(j+1)))
-      = 2^j * ((xn / 2^(j+1) + yn / 2^(j+1)) + (xn / 2^(j+1) + yn / 2^(j+1))) := by
-    rw [hpow, Nat.add_mul, ← Nat.mul_add]
-  have hnum : s % 2^j
-      + 2^j * ((xn.testBit j).toNat + (yn.testBit j).toNat + s / 2^j)
-      + 2^j * ((xn / 2^(j+1) + yn / 2^(j+1)) + (xn / 2^(j+1) + yn / 2^(j+1)))
-      = 2^j * (((xn.testBit j).toNat + (yn.testBit j).toNat + s / 2^j)
-          + ((xn / 2^(j+1) + yn / 2^(j+1)) + (xn / 2^(j+1) + yn / 2^(j+1))))
-        + s % 2^j := by
-    rw [Nat.add_assoc, ← Nat.mul_add]
-    exact Nat.add_comm _ _
-  have hdiv : (xn + yn) / 2^j
-      = (xn.testBit j).toNat + (yn.testBit j).toNat + s / 2^j
-        + (xn / 2^(j+1) + yn / 2^(j+1)) + (xn / 2^(j+1) + yn / 2^(j+1)) := by
-    rw [hdecomp, hQ, hnum]
-    rw [Nat.mul_add_div (Nat.two_pow_pos _) _ _]
-    have hr0 : s % 2^j / 2^j = 0 := Nat.div_eq_of_lt hrlt
-    rw [hr0, Nat.add_zero]
-    omega
-  have hmod2 : (xn + yn) / 2^j % 2
-      = ((xn.testBit j).toNat + (yn.testBit j).toNat + s / 2^j) % 2 := by
-    rw [hdiv]
-    omega
-  rw [Nat.testBit_eq_decide_div_mod_eq, hmod2]
-  -- replace `s / 2^j` by the Bool carry's toNat
-  rw [← hcb_eq]
-  -- finite case analysis on the three bits
-  cases hA : xn.testBit j <;> cases hB : yn.testBit j <;>
-    cases hcb : decide (2^j ≤ s) <;>
-    simp [hA, hB, hcb, Bool.toNat_true, Bool.toNat_false]
 
-/-- Bit `i` of plane `j` of the bit-sliced sum equals bit `j` of `x i + y i`. -/
-private theorem sumBit_planes_getLsbD (x y : Nat → B) (j i : Nat)
-    (hi : i < 64) (hj : j < 8) :
-    (sumBit (planes x) (planes y) j).getLsbD i
-      = (planes (fun i => x i + y i) j).getLsbD i := by
-  show (((planes x j ^^^ planes y j) ^^^ carrySeq (planes x) (planes y) j).getLsbD i
-      = (planes (fun i => x i + y i) j).getLsbD i)
-  rw [BitVec.getLsbD_xor, BitVec.getLsbD_xor,
-      planes_getLsbD x j i hi, planes_getLsbD y j i hi,
-      carrySeq_planes_getLsbD x y j i hi]
-  have hRHS : (planes (fun i => x i + y i) j).getLsbD i
-      = ((x i + y i).toNat).testBit j := by
-    show (pack fun i => (x i + y i).getLsbD j).getLsbD i = _
-    exact pack_getLsbD _ _ hi
-  rw [hRHS]
-  show (((x i).toNat.testBit j) ^^ ((y i).toNat.testBit j) ^^
-      (decide (2^j ≤ (x i).toNat % 2^j + (y i).toNat % 2^j)))
-    = (((x i + y i).toNat).testBit j)
-  rw [BitVec.toNat_add, Nat.testBit_mod_two_pow, decide_eq_true hj]
-  simp only [Bool.true_and]
-  exact (add_testBit ((x i).toNat) ((y i).toNat) j).symm
-
-private theorem sumBit_planes (x y : Nat → B) (j : Nat) (hj : j < 8) :
-    sumBit (planes x) (planes y) j = planes (fun i => x i + y i) j := by
-  apply (BitVec.eq_of_getLsbD_eq_iff).mpr
-  intro i hi
-  exact sumBit_planes_getLsbD x y j i hi hj
-
-/-- `add` produces sum planes `sumBit` and final carry `carrySeq`. -/
-private theorem add_eq_sumBit_carry (a b : Planes) :
-    add a b = ((List.range 8).map (sumBit a b), carrySeq a b 8) := by
-  unfold add
-  rw [add_foldl_spec a b 8]
-  show (((List.range 8).reverse.map (sumBit a b)).reverse, carrySeq a b 8)
-      = ((List.range 8).map (sumBit a b), carrySeq a b 8)
-  have hrev : ((List.range 8).reverse.map (sumBit a b)).reverse
-      = (List.range 8).map (sumBit a b) := by
-    rw [List.map_reverse, List.reverse_reverse]
-  rw [hrev]
-
-theorem sound_PlaneAdd : PlaneAdd.Goal := by
-  intro x y
-  rw [add_eq_sumBit_carry (planes x) (planes y)]
-  constructor
-  · refine List.map_congr_left ?_
-    intro j hj
-    exact sumBit_planes x y j (List.mem_range.mp hj)
-  · apply (BitVec.eq_of_getLsbD_eq_iff).mpr
+theorem OccupiedCodes_sound : TinylambOpt.ResearchGoals.PlaneKernels.OccupiedCodes.Goal := by
+  intro x m
+  rw [occupied_prefix_count x 8 (by omega) m]
+  have hinj : ∀ a b : B, a.toNat = b.toNat ↔ a = b := by
+    intro a b
+    exact BitVec.toNat_inj
+  rw [show (lanes m).map (fun i => prefLow (x i) 8) = (lanes m).map (fun i => (x i).toNat) from by
+    apply List.map_congr_left
     intro i hi
-    rw [carrySeq_planes_getLsbD x y 8 i hi, pack_getLsbD _ _ hi]
-    have hx : (x i).toNat < 256 := (x i).isLt
-    have hy : (y i).toNat < 256 := (y i).isLt
-    rw [Nat.mod_eq_of_lt hx, Nat.mod_eq_of_lt hy]
-
+    exact prefLow_8 (x i)]
+  rw [show (lanes m).map (fun i => (x i).toNat) = ((lanes m).map x).map BitVec.toNat from by
+    simp [List.map_map]]
+  exact eraseDups_length_map_of_inj BitVec.toNat hinj ((lanes m).map x)
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.PlaneKernels
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

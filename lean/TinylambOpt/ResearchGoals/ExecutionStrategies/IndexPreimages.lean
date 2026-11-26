@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.IndexPreimages
 
 /-! Exact preimages for seeking sorted indexes. All arithmetic in generated bounds is

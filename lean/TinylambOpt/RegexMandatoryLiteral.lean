@@ -1,5 +1,17 @@
 import Std.Tactic
 
+/-!
+Reference acceptance derivation. `Matches r s` means the regex r matches the whole byte
+string s; the existence-search prefilter is expressed by the candidate filter theorem
+below, which looks for substrings in rows.
+
+A literal is mandatory for a regex only if it is present in every derivation;
+alternation intersects, repetitions with minimum 0 keep nothing.
+
+Named results include `substring_append_left`, `substring_append_right`,
+`mandatory_sound`.
+-/
+
 namespace TinylambOpt.RegexMandatoryLiteral
 
 /-- Formal model of the regex mandatory-literal prefilter.
@@ -254,3 +266,7 @@ theorem mandatory_search_sound (r : Regex) (rows : List (List UInt8))
   · simp [h]
 
 end TinylambOpt.RegexMandatoryLiteral
+
+-- C++ references to this model or its proof.
+-- common/regex_guard.cpp
+-- common/regex_guard.hpp

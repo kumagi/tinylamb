@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Refuted by counterexample
+
+- `PeerConstantTile` — Tile boundaries can cut a peer group even though rank-based
+  windows agree on the peer.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import Std.Tactic
 
+/-!
+First failing op of one row, in op order.
+
+`find?` + first value: the ballot's nonzero-guard step.
+
+Named results include `findSome_eq_firstOf`, `findSome_eq_firstOf_guard`,
+`findSome_congr`.
+-/
+
 namespace TinylambOpt.FirstErrorBallot
 
 /-

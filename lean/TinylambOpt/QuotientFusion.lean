@@ -1,4 +1,4 @@
-import TinylambOpt.ClickBenchRound2
+import TinylambOpt.CountBoundsAndBlockAggregates
 import Std.Tactic
 
 /-! A single ordered sweep maintains both the original bucket histogram and
@@ -157,3 +157,7 @@ theorem bucket_increment_fits (count rows : Nat)
   simp [BitVec.toNat_add, Nat.mod_eq_of_lt before, Nat.mod_eq_of_lt after]
 
 end TinylambOpt.QuotientFusion
+
+-- C++ references to this model or its proof.
+-- executor/detail/partitioned_aggregate_topk.cpp
+-- table/tlcs_file.cpp

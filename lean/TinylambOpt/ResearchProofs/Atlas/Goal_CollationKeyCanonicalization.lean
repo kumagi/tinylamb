@@ -1,6 +1,16 @@
 import Std
 import TinylambOpt.ProposedGoals.CollationKeyCanonicalization
 
+/-!
+Proved
+
+- `Goal` — Key-based grouping and ordering may replace raw grouping and ordering as
+  long as the key does not merge distinct raw values and preserves order.
+
+The reference model is defined in
+`TinylambOpt.ProposedGoals.CollationKeyCanonicalization`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

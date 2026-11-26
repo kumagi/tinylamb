@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `DictionaryFault.ColdBucketGap` — `∀ g f a b c, a≤b → b<c → b/(g+1)=c/(g+1) → price g
+  f a c - price g f a b = c-b`
+- `DictionaryFault.GatherOrder` — `∀ (group fault : Nat), gatherOrder (price group
+  fault)`
+- `DictionaryFault.LatencyCap` — `∀ (group fault : Nat), latencyCap (price group
+  fault)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.DictionaryFault
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

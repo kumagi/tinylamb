@@ -1,4 +1,13 @@
-import TinylambOpt.AggJoinDiscovery
+import TinylambOpt.JoinPreaggregation
+
+/-!
+The proofs cover partial AVG, MIN, and MAX states and the boundaries of HAVING and
+DISTINCT rewrites. SQL can merge states when the non-NULL count, empty result, and join
+multiplicities are carried correctly.
+
+Named results include `avg_of_avg_bug`, `avg_div_by_count_star_null_bug`,
+`finalize_aggFold_eq_avg_min_max`.
+-/
 
 /-
 # Step 5: `AVG / MIN / MAX` × `LEFT JOIN` × `HAVING` × `DISTINCT` 集約の網羅的検証と新ルール探索
@@ -1345,3 +1354,10 @@ theorem having_null_rejecting_demotes_left_join_sound {D S GD : Type} [Decidable
     rw [← hEvalEq]
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- executor/detail/aggregate_accumulator.cpp
+-- plan/cascades_aggregate_rules.cpp
+-- plan/optimizer.cpp
+-- query/join_reduction.cpp
+-- query/select_rewrites.cpp

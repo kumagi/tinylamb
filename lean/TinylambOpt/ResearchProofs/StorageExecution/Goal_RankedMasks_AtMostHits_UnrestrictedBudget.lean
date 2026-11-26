@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved
+
+- `AtMostHits.UnrestrictedBudget` — `∀ n q, n≤q → count model n q = 2^n`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

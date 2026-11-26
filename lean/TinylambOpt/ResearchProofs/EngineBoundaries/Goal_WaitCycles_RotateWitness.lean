@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `RotateWitness` — In a functional wait graph, rotating the witness preserves its
+  validity.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

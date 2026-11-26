@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Splits a byte stream at UTF-8 code-point start bytes (`(b & 0xC0) != 0x80`), matching
+`expression/bytecode.cpp` (`TryEvalSubstrView`).
+
+Modeled claims
+
+- `Goal` — Signed-start 1-based ASCII `SUBSTR` O(1) byte-slice equivalence
+  (`expression/bytecode.cpp` `TryEvalSubstrView`,
+  `executor/detail/columnar_tlcs_fast_path.cpp`): on any all-ASCII input, signed
+  `start` (positive, `0`, negative, clamped) and optional `len` (negative -> error)
+  match full UTF-8 code-point slicing byte-for-byte.
+-/
+
 namespace TinylambOpt.ResearchGoals.SubstrAsciiByteSliceEquiv
 
 def isAsciiStr (bs : List UInt8) : Bool :=

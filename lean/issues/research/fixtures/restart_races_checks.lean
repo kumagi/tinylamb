@@ -1,4 +1,9 @@
 import TinylambOpt.ResearchGoals.RestartRaces
+
+/-!
+This fixture checks concrete commit, replay, and concurrency schedules. These examples
+expose the ordering requirements for SQL transactions across restart.
+-/
 open TinylambOpt.ResearchGoals.RestartRaces
 
 namespace RestartRaceChecks

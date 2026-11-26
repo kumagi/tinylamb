@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `Ordinal.AbsoluteSeek` — `∀ base slope side i n, encode (predict base slope) side i
+  [] ((List.range n).map (fun (j : Nat) => base+slope*(i+j:Nat))) = List.replicate n
+  0`
+- `Ordinal.ByteBudget` — `∀ base slope side i h xs w extra oldBytes, certificate
+  (predict base slope) side i h xs w → extra + quote xs.length w < oldBytes → extra +
+  (frame (encode (predict base slope) side i h xs)).length < oldBytes`
+- `Ordinal.ResidualRoundTrip` — `∀ base slope side i h xs, restore (predict base slope)
+  side i h (encode (predict base slope) side i h xs) = xs`
+- `Ordinal.RestartSeed` — `∀ base slope side i h xs, encode (predict base slope) side i
+  (h.take (0)) xs = encode (predict base slope) side i h xs`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.Ordinal
 
 open TinylambOpt.ResearchGoals.Compression.Wire

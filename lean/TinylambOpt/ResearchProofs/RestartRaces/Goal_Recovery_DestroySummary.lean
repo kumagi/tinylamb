@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `DestroySummary` — Compose independent pass-1 segment summaries to seed the allocator
+  and install the exact committed destroy fence. Each worker retains maxima per
+  (owner,page) even when it has not seen that owner's commit. Zero is no fence.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -206,3 +217,6 @@ theorem sound : Goal := by
   exact Prod.ext hfirst hsecond
 
 end TinylambOpt.ResearchProofs.RestartRaces.Recovery_DestroySummary
+
+-- C++ references to this model or its proof.
+-- recovery/recovery_manager.cpp

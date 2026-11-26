@@ -1,5 +1,17 @@
 import TinylambOpt.CheckedEagerSum
 
+/-!
+Input for one group in execution order. Its original ordinals can be sparse.
+
+Build summaries once before evaluation. The evaluator can inspect the root summary
+without traversing the underlying rows.
+
+Modeled claims
+
+- `Goal` — Prove against the same independently specified scalar scan for every
+  bracketing and valid incoming state. Safe inputs must take the summary path.
+-/
+
 namespace TinylambOpt.ResearchGoals.CheckedAggregateTree
 
 open TinylambOpt.CheckedEagerSum (InRange)

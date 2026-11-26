@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `AdditiveProduct.IntersectAll` — Intersect two bags by the minimum multiplicity at
+  each key.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

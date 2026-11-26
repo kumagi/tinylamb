@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `GiniDistance.DictionaryPairs` — `∀ x, 2*measure x = ((cart x.eraseDups
+  x.eraseDups).map (fun (a,b) => distance a b * x.count a * x.count b)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

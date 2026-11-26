@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+-/
+
 namespace TinylambOpt.ResearchGoals.RestartRaces.Catalog
 
 namespace OnlineUnique

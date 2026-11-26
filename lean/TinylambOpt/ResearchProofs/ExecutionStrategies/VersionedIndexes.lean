@@ -1,1347 +1,1207 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.VersionedIndexes
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+
+Proved (8 claims, including the following)
+
+- `TinylambOpt.ResearchGoals.VersionedIndexes.BatchedLookup` — `∀ xs ks t, probeBatch
+  xs ks t = ks.map (fun k => valueAt xs k t)`
+- `TinylambOpt.ResearchGoals.VersionedIndexes.BottomTombstone` — At bottommost
+  compaction an old deletion anchor may be dropped with all older versions for that
+  key. The observer projects the SQL row value.
+- `TinylambOpt.ResearchGoals.VersionedIndexes.CoveredPredicate` — A value predicate can
+  be pushed to an index with a newer-version shadow check. Filtering out tombstones
+  and nonmatching versions before deduplication alone is unsafe.
+-/
+
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.VersionedIndexes
 
 open TinylambOpt.ResearchGoals.VersionedIndexes
-open List
 
-/-!
-# Versioned-index execution strategies
+/-! ---------- Generic list helpers ---------- -/
 
-Proofs for the eight research propositions in
-`TinylambOpt.ResearchGoals.VersionedIndexes`: snapshot anchors, sparse pins,
-range tombstones, covered predicates, batched lookup, dominated runs,
-bottom tombstones and overlay aggregates over immutable, committed
-versioned entries.
--/
+private theorem find?_filter_eq {α : Type} (p q : α → Bool) {l : List α} {b : α}
+    (h : l.find? q = some b) (hp : p b = true) : (l.filter p).find? q = some b := by
+  rw [List.find?_filter]
+  apply List.find?_eq_some_iff_getElem.mpr
+  rcases List.find?_eq_some_iff_getElem.mp h with ⟨hbq, i, hi, hli, hbefore⟩
+  refine ⟨?_, i, hi, hli, ?_⟩
+  · exact decide_eq_true ⟨hp, hbq⟩
+  · intro j hj
+    have hb := hbefore j hj
+    simp at hb ⊢
+    exact Or.inr hb
 
-/-! ### Batched lookup -/
+private theorem find?_filter_none {α : Type} (p q : α → Bool) {l : List α}
+    (h : l.find? q = none) : (l.filter p).find? q = none := by
+  rw [List.find?_filter]
+  apply List.find?_eq_none.mpr
+  intro x hx
+  have hx' := (List.find?_eq_none.mp h) x hx
+  intro hboth
+  exact hx' (of_decide_eq_true hboth).2
 
-/-- Folding `insert k (valueAt xs k t)` over `L` leaves `e`'s slot untouched
-when `e ∉ L`. -/
-private theorem probe_foldl_getD_of_not_mem (xs : List Entry) (t : Nat)
-    (m : Std.HashMap Nat (Option Int)) (e : Nat) :
-    ∀ (L : List Nat), e ∉ L →
-      (L.foldl (fun m k => m.insert k (valueAt xs k t)) m).getD e none
-        = m.getD e none := by
-  intro L
-  induction L generalizing m with
-  | nil => intro _; rfl
-  | cons g L ih =>
-      intro hne
-      rw [List.foldl_cons]
-      rw [ih _ (fun hg => hne (List.mem_cons_of_mem g hg))]
-      rw [Std.HashMap.getD_insert]
-      have hge : (g == e) = false := by
-        rw [beq_eq_false_iff_ne]
-        exact fun h => hne (h ▸ List.mem_cons_self)
-      rw [hge]
-      simp
+/-! ---------- BatchedLookup ---------- -/
 
-/-- After folding the per-key probe inserts over `L`, a key `k ∈ L` reads back
-`valueAt xs k t`. -/
-private theorem probe_foldl_getD_of_mem (xs : List Entry) (t : Nat)
-    (m : Std.HashMap Nat (Option Int)) :
-    ∀ (L : List Nat) (k : Nat), k ∈ L →
-      (L.foldl (fun m k => m.insert k (valueAt xs k t)) m).getD k none
-        = valueAt xs k t := by
-  intro L
-  induction L generalizing m with
-  | nil => intro k hk; simp at hk
-  | cons e L ih =>
-      intro k hk
-      rw [List.mem_cons] at hk
-      rw [List.foldl_cons]
-      rcases hk with hke | hkL
-      · rw [hke]
-        by_cases hel : e ∈ L
-        · rw [ih _ _ hel]
-        · rw [probe_foldl_getD_of_not_mem xs t (m.insert e (valueAt xs e t)) e L hel,
-            Std.HashMap.getD_insert_self]
-      · rw [ih _ _ hkL]
+private theorem hm_fold_getD (l : List Nat) (f : Nat → Option Int)
+    (m : Std.HashMap Nat (Option Int)) (k : Nat) :
+    (l.foldl (fun m k => m.insert k (f k)) m).getD k none =
+      if k ∈ l then f k else m.getD k none := by
+  induction l generalizing m with
+  | nil => simp
+  | cons x xs ih =>
+      rw [List.foldl_cons, ih]
+      by_cases hxk : x == k
+      · have hxk' : x = k := by simpa using hxk
+        subst x
+        simp [Std.HashMap.getD_insert]
+      · have hxk' : x ≠ k := by
+          intro heq
+          apply hxk
+          simp [heq]
+        rw [Std.HashMap.getD_insert]
+        have hkx : ¬ k = x := by intro h; exact hxk' h.symm
+        by_cases hmem : k ∈ xs <;> simp [hxk, hkx, hmem]
 
-theorem sound_BatchedLookup : BatchedLookup.Goal := by
+theorem BatchedLookup_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.BatchedLookup.Goal := by
   intro xs ks t
   unfold probeBatch
+  let f := fun k => valueAt xs k t
   apply List.map_congr_left
   intro k hk
-  exact probe_foldl_getD_of_mem xs t {} ks.eraseDups k
-    ((List.mem_eraseDups).mpr hk)
+  rw [hm_fold_getD]
+  simp [List.mem_eraseDups, hk]
 
-/-! ### Overlay aggregate -/
+/-! ---------- OverlayAggregate ---------- -/
 
-/-- `(l.filterMap f).sum` equals summing `(f x).getD 0` over `l`. -/
-private theorem sum_filterMap_getD {α : Type} (l : List α) (f : α → Option Int) :
-    (l.filterMap f).sum = (l.map fun x => (f x).getD 0).sum := by
-  induction l with
-  | nil => rfl
-  | cons x xs ih =>
-      cases hx : f x with
-      | none => simp [hx, ih, List.sum_cons]
-      | some v => simp [hx, ih, List.sum_cons]
-
-/-- The visible entry of `a ++ b` is `a`'s visible entry when present,
-otherwise `b`'s. -/
-private theorem visible_append (a b : List Entry) (k t : Nat) :
-    visible (a ++ b) k t = (visible a k t).or (visible b k t) := by
-  unfold visible
-  rw [List.find?_append]
-
-/-- `valueAt` on the merged run resolves to `a`'s version when visible,
-else `b`'s. -/
-private theorem valueAt_append (a b : List Entry) (k t : Nat) :
-    valueAt (a ++ b) k t
-      = if (visible a k t).isSome then valueAt a k t else valueAt b k t := by
-  unfold valueAt
-  rw [visible_append]
-  cases h : visible a k t with
-  | none => simp
-  | some e => simp
-
-private theorem sum_map_add {α : Type} (l : List α) (f g : α → Int) :
-    (l.map fun x => f x + g x).sum = (l.map f).sum + (l.map g).sum := by
-  induction l with
-  | nil => simp
-  | cons x xs ih =>
-      simp only [List.map_cons, List.sum_cons, ih]
-      omega
-
-private theorem sum_map_ite_filter {α : Type} (l : List α) (p : α → Bool) (f : α → Int) :
-    (l.map fun x => if p x then f x else 0).sum = ((l.filter p).map f).sum := by
-  induction l with
-  | nil => simp
-  | cons x xs ih =>
-      cases hp : p x with
-      | true => simp [hp, ih, List.sum_cons]
-      | false => simp [hp, ih, List.sum_cons]
-
-theorem sound_OverlayAggregate : OverlayAggregate.Goal := by
-  intro a b ks t
+private theorem total_cons (xs : List Entry) (ks : List Nat) (t k : Nat) :
+    total xs (k :: ks) t = (valueAt xs k t).getD 0 + total xs ks t := by
   unfold total
-  simp only [sum_filterMap_getD]
-  -- pointwise relation between the three `valueAt` contributions
-  have hpt : ∀ k : Nat,
-      (valueAt (a ++ b) k t).getD 0
-        = (valueAt a k t).getD 0
-          + (if (visible a k t).isNone then (valueAt b k t).getD 0 else 0) := by
-    intro k
-    cases h : visible a k t with
-    | none =>
-        have hv : visible a k t = none := h
-        have h3 : valueAt a k t = none := by
-          unfold valueAt; rw [hv]; rfl
-        rw [valueAt_append, h3]
-        simp [hv]
-    | some e =>
-        have hv : visible a k t = some e := h
-        rw [valueAt_append]
-        simp [hv]
-  have hmap : ks.map (fun k => (valueAt (a ++ b) k t).getD 0)
-      = ks.map (fun k => (valueAt a k t).getD 0
-          + (if (visible a k t).isNone then (valueAt b k t).getD 0 else 0)) :=
-    List.map_congr_left (fun k _ => hpt k)
-  rw [hmap, sum_map_add, sum_map_ite_filter]
+  rw [List.filterMap_cons]
+  cases h : valueAt xs k t <;> simp [h]
 
-/-! ### Snapshot anchor -/
+private theorem valueAt_append_key (a b : List Entry) (k t : Nat) :
+    (valueAt (a ++ b) k t).getD 0 =
+      (valueAt a k t).getD 0 +
+        (if (visible a k t).isNone then (valueAt b k t).getD 0 else 0) := by
+  unfold valueAt visible
+  rw [List.find?_append]
+  generalize ha : a.find? (fun e => e.key == k && e.seq ≤ t) = A
+  generalize hb : b.find? (fun e => e.key == k && e.seq ≤ t) = B
+  cases A <;> cases B <;> simp [ha, hb]
 
-/-- The fold step used by `compact`, factored to take the state pair. -/
-private def cfold (f : Nat) (s : List Nat × List Entry) (e : Entry) :
-    List Nat × List Entry :=
-  if f < e.seq then (s.1, e :: s.2)
-  else if s.1.contains e.key then s
-  else (e.key :: s.1, e :: s.2)
+/-! ---------- compact / SnapshotAnchor / BottomTombstone ---------- -/
 
-private theorem cfold_new (f : Nat) (sn : List Nat) (out : List Entry) (e : Entry)
-    (h : f < e.seq) : cfold f (sn, out) e = (sn, e :: out) := by
-  unfold cfold; rw [if_pos h]
+private def buildStep (floor : Nat) (p : List Nat × List Entry) (e : Entry) : List Nat × List Entry :=
+  if floor < e.seq then (p.1, e :: p.2)
+  else if p.1.contains e.key then (p.1, p.2)
+  else (e.key :: p.1, e :: p.2)
 
-private theorem cfold_drop (f : Nat) (sn : List Nat) (out : List Entry) (e : Entry)
-    (h1 : ¬ f < e.seq) (h2 : sn.contains e.key) : cfold f (sn, out) e = (sn, out) := by
-  unfold cfold; rw [if_neg h1, if_pos h2]
+private def build (xs : List Entry) (seen : List Nat) (out : List Entry) (floor : Nat) : List Entry :=
+  (xs.foldl (buildStep floor) (seen, out)).2
 
-private theorem cfold_keep (f : Nat) (sn : List Nat) (out : List Entry) (e : Entry)
-    (h1 : ¬ f < e.seq) (h2 : ¬ sn.contains e.key) :
-    cfold f (sn, out) e = (e.key :: sn, e :: out) := by
-  unfold cfold; rw [if_neg h1, if_neg h2]
+private def compactSeen (xs : List Entry) (seen : List Nat) (floor : Nat) : List Entry :=
+  (build xs seen [] floor).reverse
 
-private def seenInv (f : Nat) (seen : List Nat) (out : List Entry) : Prop :=
-  ∀ key ∈ seen, ∃ e ∈ out, e.key = key ∧ e.seq ≤ f
-
-private theorem fold_find?_inv (xs : List Entry) (seen₀ : List Nat) (out₀ : List Entry)
-    (k t f : Nat) (hf : f ≤ t) (hinv : seenInv f seen₀ out₀) :
-    (((xs.foldl (fun s e => cfold f s e) (seen₀, out₀)).2).reverse).find?
-        (fun e => e.key == k && e.seq ≤ t)
-      = (out₀.reverse ++ xs).find? (fun e => e.key == k && e.seq ≤ t) := by
-  revert hinv hf
-  induction xs generalizing seen₀ out₀ with
-  | nil =>
-      intro hf hinv
-      simp
-  | cons e xs ih =>
-      intro hf hinv
-      rw [List.foldl_cons]
-      by_cases h1 : f < e.seq
-      · rw [cfold_new f seen₀ out₀ e h1]
-        have hinv' : seenInv f seen₀ (e :: out₀) := by
-          intro key hk
-          obtain ⟨w, hw, hkw, hws⟩ := hinv key hk
-          exact ⟨w, List.mem_cons_of_mem e hw, hkw, hws⟩
-        rw [ih seen₀ (e :: out₀) hf hinv']
-        have hlist : (e :: out₀).reverse ++ xs = out₀.reverse ++ e :: xs := by
-          simp [List.reverse_cons, List.append_assoc]
-        rw [hlist]
-      · have hle : e.seq ≤ f := Nat.le_of_not_lt h1
-        by_cases h2 : seen₀.contains e.key
-        · rw [cfold_drop f seen₀ out₀ e h1 h2]
-          rw [ih seen₀ out₀ hf hinv]
-          have hmem : e.key ∈ seen₀ := by
-            have h2' : seen₀.contains e.key = true := h2
-            rwa [List.contains_iff_mem] at h2'
-          obtain ⟨w, hw, hkw, hws⟩ := hinv e.key hmem
-          have hw' : w ∈ out₀.reverse := List.mem_reverse.mpr hw
-          have hwt : w.seq ≤ t := Nat.le_trans hws hf
-          by_cases hP : (e.key == k && decide (e.seq ≤ t)) = true
-          · have hek : e.key = k := by
-              have h1' : (e.key == k) = true := (Bool.and_eq_true_iff.mp hP).1
-              exact beq_iff_eq.mp h1'
-            have hwk : w.key = k := hkw.trans hek
-            have hwP : (w.key == k && decide (w.seq ≤ t)) = true := by
-              have h3 : (w.key == k) = true := beq_iff_eq.mpr hwk
-              have h4 : decide (w.seq ≤ t) = true := decide_eq_true hwt
-              exact Bool.and_eq_true_iff.mpr ⟨h3, h4⟩
-            have hsome : (out₀.reverse.find? (fun e => e.key == k && e.seq ≤ t)).isSome = true := by
-              rw [List.find?_isSome]
-              exact ⟨w, hw', hwP⟩
-            rw [List.find?_append, List.find?_append,
-              Option.or_eq_left_of_isSome hsome, Option.or_eq_left_of_isSome hsome]
-          · have hP' : (e.key == k && decide (e.seq ≤ t)) = false := by
-              cases hb : (e.key == k && decide (e.seq ≤ t)) with
-              | true => rw [hb] at hP; simp at hP
-              | false => rfl
-            have hcons : (e :: xs).find? (fun e => e.key == k && e.seq ≤ t)
-                = xs.find? (fun e => e.key == k && e.seq ≤ t) := by
-              apply List.find?_cons_of_neg
-              intro h
-              rw [hP'] at h
-              exact Bool.noConfusion h
-            rw [List.find?_append, List.find?_append, hcons]
-        · rw [cfold_keep f seen₀ out₀ e h1 h2]
-          have hinv' : seenInv f (e.key :: seen₀) (e :: out₀) := by
-            intro key hk
-            rw [List.mem_cons] at hk
-            rcases hk with rfl | hk
-            · exact ⟨e, List.mem_cons_self, rfl, hle⟩
-            · obtain ⟨w, hw, hkw, hws⟩ := hinv key hk
-              exact ⟨w, List.mem_cons_of_mem e hw, hkw, hws⟩
-          rw [ih (e.key :: seen₀) (e :: out₀) hf hinv']
-          have hlist : (e :: out₀).reverse ++ xs = out₀.reverse ++ e :: xs := by
-            simp [List.reverse_cons, List.append_assoc]
-          rw [hlist]
-
-theorem sound_SnapshotAnchor : SnapshotAnchor.Goal := by
-  intro xs oldest k t _hord hord
-  exact fold_find?_inv xs [] [] k t oldest hord (by simp [seenInv])
-
-/-! ### Sparse pins -/
-
-private theorem entry_beq_self (e : Entry) : (e == e) = true := by
-  obtain ⟨k, s, v⟩ := e
-  change instBEqEntry.beq _ _ = true
-  unfold instBEqEntry.beq
-  simp
-
-/-- If the first `p`-match `e` of `xs` satisfies `q`, filtering by `q`
-preserves the first `p`-match. -/
-private theorem find?_filter_of_first_mem {α : Type} (xs : List α) (p q : α → Bool) {e : α}
-    (h : xs.find? p = some e) (he : q e = true) :
-    (xs.filter q).find? p = xs.find? p := by
-  rw [List.find?_eq_some_iff_append] at h
-  obtain ⟨hp, as, bs, hxs, has⟩ := h
-  subst hxs
-  have hR : (as ++ e :: bs).find? p = some e :=
-    List.find?_eq_some_iff_append.mpr ⟨hp, as, bs, rfl, has⟩
-  have hL : ((as ++ e :: bs).filter q).find? p = some e := by
-    have hq : (as ++ e :: bs).filter q = as.filter q ++ e :: bs.filter q := by
-      rw [List.filter_append, List.filter_cons_of_pos he]
-    rw [hq]
-    apply List.find?_eq_some_iff_append.mpr
-    refine ⟨hp, as.filter q, bs.filter q, rfl, ?_⟩
-    intro x hx
-    rw [List.mem_filter] at hx
-    have h2 := has x hx.1
-    simpa using h2
-  rw [hL, hR]
-
-/-- `keepPinned`'s filter predicate, named for readability. -/
-private def keepPred (xs : List Entry) (pins : List Nat) (latest : Nat) (e : Entry) : Bool :=
-  latest < e.seq || (latest :: pins).any fun t => visible xs e.key t == some e
-
-theorem sound_SparsePins : SparsePins.Goal := by
-  intro xs pins latest k t hord hmem
-  show ((xs.filter fun e => keepPred xs pins latest e).find?
-        (fun e => e.key == k && e.seq ≤ t))
-      = xs.find? (fun e => e.key == k && e.seq ≤ t)
-  by_cases hfind : xs.find? (fun e => e.key == k && e.seq ≤ t) = none
-  · have hnone : (xs.filter fun e => keepPred xs pins latest e).find?
-        (fun e => e.key == k && e.seq ≤ t) = none := by
-      unfold keepPred
-      exact List.Sublist.find?_eq_none List.filter_sublist hfind
-    rw [hnone, hfind]
-  · obtain ⟨e, he⟩ := Option.ne_none_iff_exists'.mp hfind
-    have heP : (e.key == k && decide (e.seq ≤ t)) = true := by
-      have h := List.find?_some he
-      simpa using h
-    have hek : e.key = k := beq_iff_eq.mp (Bool.and_eq_true_iff.mp heP).1
-    have hest : e.seq ≤ t := of_decide_eq_true (Bool.and_eq_true_iff.mp heP).2
-    -- the winner is kept by keepPinned's filter
-    have hkeep : keepPred xs pins latest e = true := by
-      unfold keepPred
-      rcases hmem with htp | hlt
-      · -- t ∈ pins: pin t witnesses e
-        have hany : ((latest :: pins).any fun s => visible xs e.key s == some e) = true := by
-          rw [List.any_eq_true]
-          refine ⟨t, List.mem_cons.mpr (Or.inr htp), ?_⟩
-          rw [hek]
-          have hvis : visible xs k t = some e := he
-          rw [hvis]
-          exact entry_beq_self e
-        exact Bool.or_eq_true_iff.mpr (Or.inr hany)
-      · by_cases hseq : latest < e.seq
-        · -- newer than latest: first disjunct
-          exact Bool.or_eq_true_iff.mpr (Or.inl (decide_eq_true hseq))
-        · have helse : e.seq ≤ latest := Nat.le_of_not_lt hseq
-          have hvis : visible xs k latest = some e := by
-            unfold visible
-            apply List.find?_eq_some_iff_append.mpr
-            obtain ⟨_, as, bs, hxs, has⟩ := List.find?_eq_some_iff_append.mp he
-            have hPle : (e.key == k && decide (e.seq ≤ latest)) = true := by
-              have h1 : (e.key == k) = true := (Bool.and_eq_true_iff.mp heP).1
-              have h2 : decide (e.seq ≤ latest) = true := decide_eq_true helse
-              exact Bool.and_eq_true_iff.mpr ⟨h1, h2⟩
-            refine ⟨hPle, as, bs, hxs, ?_⟩
-            intro a ha
-            by_cases hpl : (a.key == k && decide (a.seq ≤ latest)) = true
-            · have hak : (a.key == k) = true := (Bool.and_eq_true_iff.mp hpl).1
-              have has_ : a.seq ≤ latest := of_decide_eq_true (Bool.and_eq_true_iff.mp hpl).2
-              have has_t : a.seq ≤ t := Nat.le_trans has_ hlt
-              have hpt : (a.key == k && decide (a.seq ≤ t)) = true :=
-                Bool.and_eq_true_iff.mpr ⟨hak, decide_eq_true has_t⟩
-              have h4 := has a ha
-              rw [hpt] at h4
-              simp at h4
-            · have hfa : (a.key == k && decide (a.seq ≤ latest)) = false :=
-                Bool.eq_false_iff.mpr hpl
-              rw [hfa]
-              rfl
-          have hany : ((latest :: pins).any fun s => visible xs e.key s == some e) = true := by
-            rw [List.any_eq_true]
-            refine ⟨latest, List.mem_cons_self, ?_⟩
-            rw [hek, hvis]
-            exact entry_beq_self e
-          exact Bool.or_eq_true_iff.mpr (Or.inr hany)
-    have hfil := find?_filter_of_first_mem xs
-      (fun e => e.key == k && e.seq ≤ t) (fun e => keepPred xs pins latest e)
-      he hkeep
-    rw [hfil, he]
-
-/-! ### Bottom tombstone -/
-
-/-- The compaction fold emits a sublist of the processed prefix (reversed). -/
-private theorem foldl_sublist (f : Nat) (xs : List Entry) :
-    ∀ (sn : List Nat) (out : List Entry),
-      (((xs.foldl (fun s e => cfold f s e) (sn, out)).2).reverse) <+ out.reverse ++ xs := by
-  induction xs with
-  | nil => intro sn out; simp
-  | cons e xs ih =>
-      intro sn out
-      rw [List.foldl_cons]
-      by_cases h1 : f < e.seq
-      · rw [cfold_new f sn out e h1]
-        have hrev : (e :: out).reverse ++ xs = out.reverse ++ e :: xs := by
-          simp [List.reverse_cons, List.append_assoc]
-        have h := ih sn (e :: out)
-        rwa [hrev] at h
-      · have hle : e.seq ≤ f := Nat.le_of_not_lt h1
-        by_cases h2 : sn.contains e.key
-        · rw [cfold_drop f sn out e h1 h2]
-          have h := ih sn out
-          refine h.trans ?_
-          exact (List.sublist_cons_self e xs).append_left (out.reverse)
-        · rw [cfold_keep f sn out e h1 h2]
-          have hrev : (e :: out).reverse ++ xs = out.reverse ++ e :: xs := by
-            simp [List.reverse_cons, List.append_assoc]
-          have h := ih (e.key :: sn) (e :: out)
-          rwa [hrev] at h
-
-/-- `compact xs f` is a sublist of `xs`. -/
-private theorem compact_sublist (xs : List Entry) (f : Nat) :
-    compact xs f <+ xs := by
-  have h := foldl_sublist f xs [] []
-  have h2 : [].reverse ++ xs = xs := by simp
-  rw [h2] at h
-  show (((xs.foldl (fun (seen, out) e =>
-      if f < e.seq then (seen, e :: out)
-      else if seen.contains e.key then (seen, out)
-      else (e.key :: seen, e :: out)) ([], [])).2).reverse) <+ xs
-  exact h
-
-/-- Invariant: keys of kept old entries are recorded in `seen`, and old kept
-entries have pairwise-distinct keys. -/
-private theorem foldl_pw_inv (f : Nat) (xs : List Entry) :
-    ∀ (sn : List Nat) (out : List Entry),
-      (∀ e ∈ out, e.seq ≤ f → e.key ∈ sn) →
-      (out.filter fun e => e.seq ≤ f).Pairwise (fun a b => a.key ≠ b.key) →
-      (∀ e ∈ (xs.foldl (fun s e => cfold f s e) (sn, out)).2,
-          e.seq ≤ f → e.key ∈ (xs.foldl (fun s e => cfold f s e) (sn, out)).1) ∧
-      (((xs.foldl (fun s e => cfold f s e) (sn, out)).2).filter fun e => e.seq ≤ f).Pairwise
-        (fun a b => a.key ≠ b.key) := by
-  induction xs with
-  | nil => intro sn out h1 h2; exact ⟨h1, h2⟩
-  | cons e xs ih =>
-      intro sn out h1 h2
-      rw [List.foldl_cons]
-      by_cases hnew : f < e.seq
-      · rw [cfold_new f sn out e hnew]
-        refine ih sn (e :: out) ?_ ?_
-        · intro e' he' hle'
-          rw [List.mem_cons] at he'
-          rcases he' with rfl | he''
-          · exact absurd hle' (Nat.not_le_of_gt hnew)
-          · exact h1 e' he'' hle'
-        · have hneg : ¬ decide (e.seq ≤ f) = true := by
-            intro hdec
-            exact absurd (of_decide_eq_true hdec) (Nat.not_le_of_gt hnew)
-          have hfilter : ((e :: out).filter fun e => e.seq ≤ f)
-              = out.filter fun e => e.seq ≤ f := by
-            apply List.filter_cons_of_neg
-            exact hneg
-          rw [hfilter]; exact h2
-      · have hle : e.seq ≤ f := Nat.le_of_not_lt hnew
-        by_cases h2' : sn.contains e.key
-        · rw [cfold_drop f sn out e hnew h2']
-          exact ih sn out h1 h2
-        · rw [cfold_keep f sn out e hnew h2']
-          refine ih (e.key :: sn) (e :: out) ?_ ?_
-          · intro e' he' hle'
-            rw [List.mem_cons] at he'
-            rcases he' with rfl | he''
-            · exact List.mem_cons_self
-            · have hk := h1 e' he'' hle'
-              exact List.mem_cons_of_mem e.key hk
-          · have hpos : decide (e.seq ≤ f) = true := decide_eq_true hle
-            have hfilter : ((e :: out).filter fun e => e.seq ≤ f)
-                = e :: out.filter fun e => e.seq ≤ f :=
-              List.filter_cons_of_pos hpos
-            rw [hfilter, List.pairwise_cons]
-            refine ⟨?_, h2⟩
-            intro b hb
-            rw [List.mem_filter] at hb
-            have hbkey : b.key ∈ sn := h1 b hb.1 (of_decide_eq_true hb.2)
-            have hnek : e.key ∉ sn := by
-              intro hmem
-              apply h2'
-              rw [List.contains_iff_mem]
-              exact hmem
-            intro hbe
-            apply hnek
-            simpa [hbe] using hbkey
-
-/-- Old (≤ f) kept entries of `compact xs f` have pairwise-distinct keys. -/
-private theorem compact_old_pw (xs : List Entry) (f : Nat) :
-    ((compact xs f).filter fun e => e.seq ≤ f).Pairwise (fun a b => a.key ≠ b.key) := by
-  have h := foldl_pw_inv f xs [] [] (by simp) (by simp)
-  have h2 := h.2
-  show (((xs.foldl (fun (seen, out) e =>
-      if f < e.seq then (seen, e :: out)
-      else if seen.contains e.key then (seen, out)
-      else (e.key :: seen, e :: out)) ([], [])).2).reverse.filter
-        fun e => e.seq ≤ f).Pairwise (fun a b => a.key ≠ b.key)
-  rw [List.filter_reverse]
-  apply List.pairwise_reverse.mpr
-  exact (List.Pairwise.iff (fun a b => ne_comm)).mpr h2
-
-theorem sound_BottomTombstone : BottomTombstone.Goal := by
-  intro xs oldest k t hord hge
-  have hSA : visible (compact xs oldest) k t = visible xs k t :=
-    sound_SnapshotAnchor xs oldest k t hord hge
-  have hVC : valueAt (compact xs oldest) k t = valueAt xs k t := by
-    unfold valueAt
-    rw [hSA]
-  rw [← hVC]
-  unfold valueAt
-  by_cases hfind : visible (compact xs oldest) k t = none
-  · have hnone : visible ((compact xs oldest).filter
-        fun e => oldest < e.seq || e.value.isSome) k t = none := by
-      show ((compact xs oldest).filter fun e => oldest < e.seq || e.value.isSome).find?
-        (fun e => e.key == k && e.seq ≤ t) = none
-      exact List.Sublist.find?_eq_none List.filter_sublist hfind
-    rw [hnone, hfind]
-  · obtain ⟨w, hvis⟩ := Option.ne_none_iff_exists'.mp hfind
-    by_cases hFw : oldest < w.seq || w.value.isSome
-    · -- w survives the filter: the first match is preserved
-      have hfil := find?_filter_of_first_mem (compact xs oldest)
-        (fun e => e.key == k && e.seq ≤ t)
-        (fun e => oldest < e.seq || e.value.isSome) hvis hFw
-      have hEq : visible ((compact xs oldest).filter
-            fun e => oldest < e.seq || e.value.isSome) k t
-          = visible (compact xs oldest) k t := by
-        show ((compact xs oldest).filter fun e => oldest < e.seq || e.value.isSome).find?
-            (fun e => e.key == k && e.seq ≤ t)
-          = (compact xs oldest).find? (fun e => e.key == k && e.seq ≤ t)
-        exact hfil
-      rw [hEq]
-    · -- w is an old tombstone anchor that gets dropped
-      have hFw' : (oldest < w.seq || w.value.isSome) = false :=
-        Bool.eq_false_iff.mpr hFw
-      have hparts := Bool.or_eq_false_iff.mp hFw'
-      have hseqle : ¬ oldest < w.seq := of_decide_eq_false hparts.1
-      have hwseq : w.seq ≤ oldest := Nat.le_of_not_lt hseqle
-      have hwval : w.value = none := by
-        cases hv : w.value with
-        | none => rfl
-        | some v =>
-          rw [hv] at hparts
-          simp at hparts
-      have hPw : (w.key == k && decide (w.seq ≤ t)) = true := by
-        have h := List.find?_some hvis
-        simpa using h
-      have hwk : w.key = k := beq_iff_eq.mp (Bool.and_eq_true_iff.mp hPw).1
-      have hwt : w.seq ≤ t := of_decide_eq_true (Bool.and_eq_true_iff.mp hPw).2
-      have hdec := List.find?_eq_some_iff_append.mp hvis
-      obtain ⟨_, as, bs, hcs, has⟩ := hdec
-      have hnone' : visible ((compact xs oldest).filter
-            fun e => oldest < e.seq || e.value.isSome) k t = none := by
-        show ((compact xs oldest).filter fun e => oldest < e.seq || e.value.isSome).find?
-          (fun e => e.key == k && e.seq ≤ t) = none
-        have hBsNone : ∀ x ∈ bs.filter (fun e => oldest < e.seq || e.value.isSome),
-            ¬ (x.key == k && decide (x.seq ≤ t)) := by
-          intro x hx hPx
-          rw [List.mem_filter] at hx
-          obtain ⟨hxb, _⟩ := hx
-          have hxk : x.key = k := beq_iff_eq.mp (Bool.and_eq_true_iff.mp hPx).1
-          have hxt : x.seq ≤ t := of_decide_eq_true (Bool.and_eq_true_iff.mp hPx).2
-          have hordc : (compact xs oldest).Pairwise (fun a b => b.seq ≤ a.seq) := by
-            exact List.Pairwise.sublist (compact_sublist xs oldest) hord
-          have hcs' : compact xs oldest = (as ++ [w]) ++ bs := by
-            rw [hcs, List.append_assoc, List.singleton_append]
-          rw [hcs'] at hordc
-          have hxseq : x.seq ≤ w.seq := by
-            have h := List.Pairwise.rel_of_mem_append hordc
-              (List.mem_append_right as (List.mem_singleton_self w)) hxb
-            exact h
-          have hxold : x.seq ≤ oldest := Nat.le_trans hxseq hwseq
-          have hcF : (compact xs oldest).filter (fun e => e.seq ≤ oldest)
-              = (as.filter (fun e => e.seq ≤ oldest) ++ [w])
-                ++ bs.filter (fun e => e.seq ≤ oldest) := by
-            rw [hcs']
-            have hwf : [w].filter (fun e => e.seq ≤ oldest) = [w] :=
-              List.filter_cons_of_pos (decide_eq_true hwseq)
-            rw [List.filter_append, List.filter_append, hwf]
-          have hpw := compact_old_pw xs oldest
-          rw [hcF] at hpw
-          have hxF' : x ∈ bs.filter (fun e => e.seq ≤ oldest) :=
-            List.mem_filter.mpr ⟨hxb, decide_eq_true hxold⟩
-          have hne := List.Pairwise.rel_of_mem_append hpw
-            (List.mem_append_right _ (List.mem_singleton_self w)) hxF'
-          have hwe : w.key = x.key := hwk.trans hxk.symm
-          exact hne hwe
-        have hAsNone : (as.filter fun e => oldest < e.seq || e.value.isSome).find?
-            (fun e => e.key == k && e.seq ≤ t) = none := by
-          apply List.Sublist.find?_eq_none List.filter_sublist
-          apply List.find?_eq_none.mpr
-          intro a ha
-          have h4 := has a ha
-          intro hPa
-          rw [hPa] at h4
-          simp at h4
-        have hfilter : (compact xs oldest).filter
-              (fun e => oldest < e.seq || e.value.isSome)
-            = as.filter (fun e => oldest < e.seq || e.value.isSome)
-              ++ bs.filter (fun e => oldest < e.seq || e.value.isSome) := by
-          rw [hcs, List.filter_append]
-          have hwf : (w :: bs).filter (fun e => oldest < e.seq || e.value.isSome)
-              = bs.filter (fun e => oldest < e.seq || e.value.isSome) :=
-            List.filter_cons_of_neg hFw
-          rw [hwf]
-        rw [hfilter, List.find?_append, hAsNone]
-        show (bs.filter fun e => oldest < e.seq || e.value.isSome).find?
-          (fun e => e.key == k && e.seq ≤ t) = none
-        apply List.find?_eq_none.mpr
-        intro x hx
-        exact hBsNone x hx
-      rw [hnone', hvis]
-      show (none : Option Int) = w.value
-      exact hwval.symm
-
-/-! ### Covered predicate -/
-
-/-- Under `ordered`, the `find?` winner for key `k` at `t` has maximal `seq`
-among all key-`k` entries visible at `t`. -/
-private theorem visible_max_seq {xs : List Entry} {k t : Nat} {e : Entry}
-    (hord : ordered xs) (hvis : visible xs k t = some e) :
-    ∀ f ∈ xs, f.key = k → f.seq ≤ t → f.seq ≤ e.seq := by
-  unfold visible at hvis
-  obtain ⟨hPe, as, bs, hxs, has⟩ := List.find?_eq_some_iff_append.mp hvis
-  intro f hf hfk hft
-  rw [hxs] at hf
-  rw [List.mem_append] at hf
-  rcases hf with hfa | hfb
-  · exfalso
-    have hPf : (f.key == k && decide (f.seq ≤ t)) = true := by
-      have h1 : (f.key == k) = true := beq_iff_eq.mpr hfk
-      have h2 : decide (f.seq ≤ t) = true := decide_eq_true hft
-      exact Bool.and_eq_true_iff.mpr ⟨h1, h2⟩
-    have h4 := has f hfa
-    exact (Bool.not_eq.mp h4) hPf
-  · rw [List.mem_cons] at hfb
-    rcases hfb with rfl | hfs
-    · exact Nat.le_refl _
-    · have hsub : e :: bs <+ xs := by
-        rw [hxs]
-        exact List.sublist_append_right as (e :: bs)
-      have hpw : (e :: bs).Pairwise (fun a b => b.seq ≤ a.seq) :=
-        List.Pairwise.sublist hsub hord
-      have hpw' : ([e] ++ bs).Pairwise (fun a b => b.seq ≤ a.seq) := hpw
-      have h := List.Pairwise.rel_of_mem_append hpw' (List.mem_singleton_self e) hfs
-      exact h
-
-/-- The `find?` winner has no strictly newer key-`k` version still `≤ t`. -/
-private theorem visible_no_newer {xs : List Entry} {k t : Nat} {e : Entry}
-    (hord : ordered xs) (hvis : visible xs k t = some e) :
-    (xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t) = false := by
-  apply Bool.eq_false_iff.mpr
-  intro hany
-  rw [List.any_eq_true] at hany
-  obtain ⟨f, hfm, hfP⟩ := hany
-  simp only [Bool.and_eq_true_iff] at hfP
-  obtain ⟨⟨hf1, hf2⟩, hf3⟩ := hfP
-  have hfk : f.key = k := beq_iff_eq.mp hf1
-  have hgt : e.seq < f.seq := of_decide_eq_true hf2
-  have hft : f.seq ≤ t := of_decide_eq_true hf3
-  have hle := visible_max_seq hord hvis f hfm hfk hft
-  omega
-
-/-- `uniqueSeq` makes `(key, seq)` pairs unique, hence entries with equal
-key and sequence are equal. -/
-private theorem uniqueSeq_inj {xs : List Entry} (huniq : uniqueSeq xs)
-    {e e' : Entry} (he : e ∈ xs) (he' : e' ∈ xs)
-    (hkey : e.key = e'.key) (hseq : e.seq = e'.seq) : e = e' := by
-  obtain ⟨i, hi, hie⟩ := List.getElem_of_mem he
-  obtain ⟨j, hj, hje⟩ := List.getElem_of_mem he'
-  have hiM : i < (xs.map fun e => (e.key, e.seq)).length := by
-    rw [List.length_map]; exact hi
-  have hjM : j < (xs.map fun e => (e.key, e.seq)).length := by
-    rw [List.length_map]; exact hj
-  have hi? : xs[i]? = some e := by
-    rw [List.getElem?_eq_getElem hi, hie]
-  have hj? : xs[j]? = some e' := by
-    rw [List.getElem?_eq_getElem hj, hje]
-  have hmi? : (xs.map fun e => (e.key, e.seq))[i]?
-      = some (e.key, e.seq) := by
-    rw [List.getElem?_map, hi?]
-    rfl
-  have hmj? : (xs.map fun e => (e.key, e.seq))[j]?
-      = some (e'.key, e'.seq) := by
-    rw [List.getElem?_map, hj?]
-    rfl
-  have hpair : (e'.key, e'.seq) = (e.key, e.seq) := by
-    apply Prod.ext_iff.mpr
-    exact ⟨hkey.symm, hseq.symm⟩
-  rw [hpair] at hmj?
-  have hij : i = j := (List.Nodup.getElem?_inj hiM huniq).mp (hmi?.trans hmj?.symm)
-  subst j
-  have hsome : some e = some e' := hi?.symm.trans hj?
-  exact Option.some.inj hsome
-
-/-- An entry satisfying the right-hand side of `CoveredPredicate` must be the
-`find?` winner: its sequence is maximal and `uniqueSeq` pins it down. -/
-private theorem rhs_unique {xs : List Entry} {k t : Nat} {e e' : Entry}
-    (hord : ordered xs) (huniq : uniqueSeq xs)
-    (hvis : visible xs k t = some e)
-    (he'mem : e' ∈ xs) (he'key : e'.key = k) (he'seq : e'.seq ≤ t)
-    (hnewer : (xs.any fun f => f.key == k && e'.seq < f.seq && f.seq ≤ t) = false) :
-    e' = e := by
-  have hek : e.key = k := by
-    have hPe := List.find?_some hvis
-    exact beq_iff_eq.mp (Bool.and_eq_true_iff.mp hPe).1
-  have het : e.seq ≤ t := by
-    have hPe := List.find?_some hvis
-    exact of_decide_eq_true (Bool.and_eq_true_iff.mp hPe).2
-  have he_mem : e ∈ xs := by
-    obtain ⟨_, as, bs, hxs, _⟩ := List.find?_eq_some_iff_append.mp hvis
-    rw [hxs]
-    exact List.mem_append_right as List.mem_cons_self
-  have hle1 : e'.seq ≤ e.seq :=
-    visible_max_seq hord hvis e' he'mem he'key he'seq
-  have hle2 : e.seq ≤ e'.seq := by
-    apply Nat.le_of_not_lt
-    intro hlt'
-    have hPe' : (e.key == k && decide (e'.seq < e.seq) && decide (e.seq ≤ t)) = true := by
-      have h1 : (e.key == k) = true := beq_iff_eq.mpr hek
-      have h2 : decide (e'.seq < e.seq) = true := decide_eq_true hlt'
-      have h3 : decide (e.seq ≤ t) = true := decide_eq_true het
-      exact Bool.and_eq_true_iff.mpr ⟨Bool.and_eq_true_iff.mpr ⟨h1, h2⟩, h3⟩
-    have htrue : (xs.any fun f => f.key == k && e'.seq < f.seq && f.seq ≤ t) = true := by
-      rw [List.any_eq_true]
-      exact ⟨e, he_mem, hPe'⟩
-    rw [htrue] at hnewer
-    simp at hnewer
-  have hseq : e'.seq = e.seq := Nat.le_antisymm hle1 hle2
-  exact uniqueSeq_inj huniq he'mem he_mem (he'key.trans hek.symm) hseq
-
-theorem sound_CoveredPredicate : CoveredPredicate.Goal := by
-  intro xs p k t hord huniq
-  rw [Bool.eq_iff_iff]
-  constructor
-  · -- LHS → RHS: a satisfying visible value yields the newest matching entry
-    intro hL
-    unfold valueAt at hL
-    cases hvis : visible xs k t with
-    | none =>
-        rw [hvis] at hL
-        simp at hL
-    | some e =>
-        have hbind : (visible xs k t).bind Entry.value = e.value := by
-          rw [hvis]; rfl
-        rw [hbind] at hL
-        cases hv : e.value with
-        | none =>
-            rw [hv] at hL
-            simp at hL
-        | some v =>
-            have hpv : p v = true := by
-              rw [hv] at hL
-              exact hL
-            have hPe := List.find?_some hvis
-            have hek : e.key = k := beq_iff_eq.mp (Bool.and_eq_true_iff.mp hPe).1
-            have het : e.seq ≤ t := of_decide_eq_true (Bool.and_eq_true_iff.mp hPe).2
-            have he_mem : e ∈ xs := by
-              obtain ⟨_, as, bs, hxs, _⟩ := List.find?_eq_some_iff_append.mp hvis
-              rw [hxs]
-              exact List.mem_append_right as List.mem_cons_self
-            have hpred : (e.key == k && decide (e.seq ≤ t) && Option.any p e.value
-                && !(xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t)) = true := by
-              have h1 : (e.key == k) = true := beq_iff_eq.mpr hek
-              have h2 : decide (e.seq ≤ t) = true := decide_eq_true het
-              have h3 : Option.any p e.value = true := by
-                rw [hv]
-                exact hpv
-              have h4 : !(xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t) = true :=
-                Bool.not_eq.mpr (Bool.ne_true_of_eq_false (visible_no_newer hord hvis))
-              exact Bool.and_eq_true_iff.mpr ⟨Bool.and_eq_true_iff.mpr
-                ⟨Bool.and_eq_true_iff.mpr ⟨h1, h2⟩, h3⟩, h4⟩
-            rw [List.any_eq_true]
-            exact ⟨e, he_mem, hpred⟩
-  · -- RHS → LHS: the unique newest matching entry is the visible winner
-    intro hR
-    rw [List.any_eq_true] at hR
-    obtain ⟨e', he'mem, he'P⟩ := hR
-    simp only [Bool.and_eq_true_iff] at he'P
-    obtain ⟨⟨⟨hk, ht⟩, hv⟩, hn⟩ := he'P
-    have he'key : e'.key = k := beq_iff_eq.mp hk
-    have he'seq : e'.seq ≤ t := of_decide_eq_true ht
-    have hany' : (xs.any fun f => f.key == k && e'.seq < f.seq && f.seq ≤ t) = false := by
-      apply Bool.eq_false_iff.mpr
-      intro h
-      rw [h] at hn
-      simp at hn
-    -- `visible` cannot be `none`: `e'` itself matches the `find?` predicate
-    have hvis : ∃ e, visible xs k t = some e := by
-      cases hvc : visible xs k t with
-      | none =>
-          unfold visible at hvc
-          rw [List.find?_eq_none] at hvc
-          have hPe' : (e'.key == k && decide (e'.seq ≤ t)) = true := by
-            exact Bool.and_eq_true_iff.mpr ⟨hk, ht⟩
-          exact absurd hPe' (hvc e' he'mem)
-      | some e => exact ⟨e, rfl⟩
-    obtain ⟨e, hvis⟩ := hvis
-    have he'e : e' = e := rhs_unique hord huniq hvis he'mem he'key he'seq hany'
-    rw [he'e] at hv
-    unfold valueAt
-    rw [hvis]
-    show Option.any p e.value = true
-    exact hv
-
-/-! ### Dominated run -/
-
-/-- Transitivity of the sequence comparator underlying `zipIdxLE`. -/
-private theorem domLe_trans (a b c : Entry) :
-    decide (b.seq ≤ a.seq) = true → decide (c.seq ≤ b.seq) = true →
-    decide (c.seq ≤ a.seq) = true := by
-  intro hab hbc
-  exact decide_eq_true (Nat.le_trans (of_decide_eq_true hbc) (of_decide_eq_true hab))
-
-private theorem domLe_total (a b : Entry) :
-    (decide (b.seq ≤ a.seq) || decide (a.seq ≤ b.seq)) = true := by
-  rcases Nat.le_total a.seq b.seq with h | h
-  · rw [decide_eq_true h]; simp
-  · rw [decide_eq_true h]; simp
-
-private theorem zipIdxLE_refl (x : Entry × Nat) :
-    zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x x = true := by
-  obtain ⟨xf, xi⟩ := x
-  simp [zipIdxLE]
-
-/-- A strictly smaller sequence always loses to a larger one. -/
-private theorem zipIdxLE_of_seq_lt {x y : Entry × Nat} (h : y.fst.seq < x.fst.seq) :
-    zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true := by
-  obtain ⟨xf, xi⟩ := x; obtain ⟨yf, yi⟩ := y
-  have h' : yf.seq < xf.seq := h
-  have h1 : yf.seq ≤ xf.seq := Nat.le_of_lt h'
-  have h2 : ¬ xf.seq ≤ yf.seq := by omega
-  simp [zipIdxLE, h1, h2]
-
-private theorem zipIdxLE_iff {x y : Entry × Nat} :
-    zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true ↔
-      y.fst.seq < x.fst.seq ∨ (x.fst.seq = y.fst.seq ∧ x.snd ≤ y.snd) := by
-  obtain ⟨xf, xi⟩ := x; obtain ⟨yf, yi⟩ := y
-  by_cases h1 : yf.seq ≤ xf.seq <;> by_cases h2 : xf.seq ≤ yf.seq <;>
-    simp [zipIdxLE, h1, h2] <;> omega
-
-/-- `zipIdxLE` is antisymmetric on elements drawn from one `zipIdx`,
-thanks to the index tie-break. -/
-private theorem zipIdxLE_antisymm {xs : List Entry} {x y : Entry × Nat}
-    (hx : x ∈ xs.zipIdx) (hy : y ∈ xs.zipIdx)
-    (hxy : zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true)
-    (hyx : zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) y x = true) : x = y := by
-  obtain ⟨xf, xi⟩ := x; obtain ⟨yf, yi⟩ := y
-  rw [zipIdxLE_iff] at hxy hyx
-  dsimp only at hxy hyx
-  rcases hxy with hlt | ⟨hseq, hle⟩ <;> rcases hyx with hlt' | ⟨hseq', hle'⟩
-  · omega
-  · omega
-  · omega
-  · have hsnd : xi = yi := Nat.le_antisymm hle hle'
-    have hxs := (List.mem_zipIdx' hx).2
-    have hys := (List.mem_zipIdx' hy).2
-    cases hsnd
-    exact Prod.ext (hxs.trans hys.symm) rfl
-
-private theorem nodup_zipIdx_gen (l : List Entry) (i : Nat) : (l.zipIdx i).Nodup := by
-  induction l generalizing i with
+private theorem foldl_build_snd (xs : List Entry) (seen : List Nat) (out : List Entry) (floor : Nat) :
+    (xs.foldl (buildStep floor) (seen, out)).2 =
+      (xs.foldl (buildStep floor) (seen, [])).2 ++ out := by
+  induction xs generalizing seen out with
   | nil => simp
-  | cons x xs ih =>
-    rw [List.zipIdx_cons, List.nodup_cons]
-    constructor
-    · intro hmem
-      obtain ⟨h1, -, -⟩ := List.mem_zipIdx hmem
-      omega
-    · exact ih (i + 1)
+  | cons e xs ih =>
+      simp only [List.foldl_cons]
+      by_cases hf : floor < e.seq
+      · simp only [buildStep, if_pos hf]
+        rw [ih seen (e :: out), ih seen [e]]
+        simp [List.append_assoc]
+      · by_cases hs : seen.contains e.key
+        · simp only [buildStep, if_neg hf, if_pos hs]
+          exact ih seen out
+        · simp only [buildStep, if_neg hf, if_neg hs]
+          rw [ih (e.key :: seen) (e :: out), ih (e.key :: seen) [e]]
+          simp [List.append_assoc]
 
-theorem sound_DominatedRun : DominatedRun.Goal := by
-  intro a b k t e hvis hb
-  unfold visible at hvis
-  unfold newest at hvis
-  rw [← List.mergeSort_zipIdx] at hvis
-  rw [List.find?_map] at hvis
-  obtain ⟨⟨vf, i0⟩, hzfind, hzsnd⟩ := Option.map_eq_some_iff.mp hvis
-  have hvf : vf = e := hzsnd
-  subst vf
-  -- hzfind : Z_a.find? q = some (e, i0)
-  obtain ⟨hq_ei0, asA, bsA, hZA, hasA⟩ := List.find?_eq_some_iff_append.mp hzfind
-  have hq' : (e.key == k && decide (e.seq ≤ t)) = true := hq_ei0
-  rw [Bool.and_eq_true_iff] at hq'
-  obtain ⟨hkeyb, hseqb⟩ := hq'
-  have hek : e.key = k := beq_iff_eq.mp hkeyb
-  have hest : e.seq ≤ t := of_decide_eq_true hseqb
-  have hei0_Za : (e, i0) ∈ (a.zipIdx).mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)) := by
-    rw [hZA]
+private theorem build_append (xs : List Entry) (seen : List Nat) (out : List Entry) (floor : Nat) :
+    build xs seen out floor = build xs seen [] floor ++ out := by
+  exact foldl_build_snd xs seen out floor
+
+private theorem compactSeen_cons (e : Entry) (xs : List Entry) (seen : List Nat) (floor : Nat) :
+    compactSeen (e :: xs) seen floor =
+      if floor < e.seq then e :: compactSeen xs seen floor
+      else if seen.contains e.key then compactSeen xs seen floor
+      else e :: compactSeen xs (e.key :: seen) floor := by
+  unfold compactSeen build
+  simp only [List.foldl_cons]
+  by_cases hf : floor < e.seq
+  · simp only [buildStep, if_pos hf]
+    rw [foldl_build_snd]
     simp
-  have hei0_Wa : (e, i0) ∈ a.zipIdx := List.mem_mergeSort.mp hei0_Za
-  obtain ⟨hi0len, hie0⟩ := List.mem_zipIdx' hei0_Wa
-  have hea : e ∈ a := List.mem_iff_getElem.mpr ⟨i0, hi0len, hie0.symm⟩
-  have htransLE : ∀ (x y z : Entry × Nat),
-      zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true →
-      zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) y z = true →
-      zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x z = true :=
-    fun x y z h1 h2 => List.zipIdxLE_trans (fun a b c h1 h2 => domLe_trans a b c h1 h2) x y z h1 h2
-  have htotalLE : ∀ (x y : Entry × Nat),
-      (zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y ||
-        zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) y x) = true :=
-    fun x y => List.zipIdxLE_total (fun a b => domLe_total a b) x y
-  have hPairA : ((a.zipIdx).mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq))).Pairwise
-      (fun x y => zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true) :=
-    List.pairwise_mergeSort htransLE htotalLE _
-  -- Every qualifying element of the `a`-sorted list sits at-or-after `(e, i0)`.
-  have hminA : ∀ u ∈ (a.zipIdx).mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)),
-      ((fun e => e.key == k && decide (e.seq ≤ t)) ∘ fun x => x.fst) u = true →
-      zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) (e, i0) u = true := by
-    intro u huZ huq
-    rw [hZA] at huZ
-    rw [List.mem_append] at huZ
-    rcases huZ with hua | hub
-    · have hnu := hasA u hua
-      rw [Bool.not_eq] at hnu
-      exact absurd huq hnu
-    · rw [List.mem_cons] at hub
-      rcases hub with rfl | hubs
-      · exact zipIdxLE_refl _
-      · have hZeq : (a.zipIdx).mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)) =
-            (asA ++ [(e, i0)]) ++ bsA := by
-          rw [hZA]; simp [List.append_assoc]
-        have hpair : ((asA ++ [(e, i0)]) ++ bsA).Pairwise
-            (fun x y => zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true) := by
-          rw [← hZeq]; exact hPairA
-        rw [List.pairwise_append] at hpair
-        exact hpair.2.2 (e, i0)
-          (List.mem_append_right asA (List.mem_singleton_self (e, i0))) u hubs
-  -- W-side
-  have hWlen : i0 < (a ++ b).length := by
-    rw [List.length_append]; omega
-  have he_ab : e = (a ++ b)[i0]'hWlen := by
-    rw [List.getElem_append_left hi0len (h' := hWlen)]
-    exact hie0
-  have heW : (e, i0) ∈ (a ++ b).zipIdx := by
-    rw [List.mem_zipIdx_iff_getElem?]
-    show (a ++ b)[i0]? = some e
-    exact List.getElem?_eq_some_iff.mpr ⟨hWlen, he_ab.symm⟩
-  have hminW : ∀ z ∈ (a ++ b).zipIdx,
-      ((fun e => e.key == k && decide (e.seq ≤ t)) ∘ fun x => x.fst) z = true →
-      zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) (e, i0) z = true := by
-    intro z hzW hzq
-    obtain ⟨zf, zi⟩ := z
-    by_cases hlt : zf.seq < e.seq
-    · exact zipIdxLE_of_seq_lt hlt
-    · have hge : e.seq ≤ zf.seq := Nat.le_of_not_lt hlt
-      obtain ⟨hzWlen, hzWval⟩ := List.mem_zipIdx' hzW
-      rw [List.length_append] at hzWlen
-      by_cases hzi : zi < a.length
-      · have hzAval : zf = a[zi]'hzi := hzWval.trans (List.getElem_append_left hzi)
-        have hzA : (zf, zi) ∈ a.zipIdx := by
-          rw [List.mem_zipIdx_iff_getElem?]
-          show a[zi]? = some zf
-          exact List.getElem?_eq_some_iff.mpr ⟨hzi, hzAval.symm⟩
-        have hzZa : (zf, zi) ∈ (a.zipIdx).mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)) :=
-          List.mem_mergeSort.mpr hzA
-        exact hminA (zf, zi) hzZa hzq
-      · have hzBval : zf = b[zi - a.length]'(by omega : zi - a.length < b.length) := by
-          exact hzWval.trans (List.getElem_append_right (by omega : a.length ≤ zi))
-        have hzb : zf ∈ b := by
-          rw [hzBval]; exact List.getElem_mem _
-        have hlt2 := hb zf hzb
-        exfalso; omega
-  have hPairW : ((a ++ b).zipIdx.mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq))).Pairwise
-      (fun x y => zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true) :=
-    List.pairwise_mergeSort htransLE htotalLE _
-  have heZ : (e, i0) ∈ (a ++ b).zipIdx.mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)) :=
-    List.mem_mergeSort.mpr heW
-  obtain ⟨asZ, bsZ, hZdec⟩ := List.append_of_mem heZ
-  -- No element before `(e, i0)` in the merged sort satisfies the predicate.
-  have hprefix : ∀ z ∈ asZ,
-      (!((fun e => e.key == k && decide (e.seq ≤ t)) ∘ fun x => x.fst) z) = true := by
-    intro z hz
-    have hrel : zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) z (e, i0) = true := by
-      have hpair : (asZ ++ ((e, i0) :: bsZ)).Pairwise
-          (fun x y => zipIdxLE (fun a b => decide (b.seq ≤ a.seq)) x y = true) := by
-        rw [← hZdec]; exact hPairW
-      rw [List.pairwise_append] at hpair
-      exact hpair.2.2 z hz (e, i0) (List.mem_cons_self)
-    rw [Bool.not_eq]
-    by_cases hqz : ((fun e => e.key == k && decide (e.seq ≤ t)) ∘ fun x => x.fst) z = true
-    · exfalso
-      have hzW : z ∈ (a ++ b).zipIdx := by
-        have hzZ : z ∈ (a ++ b).zipIdx.mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq)) := by
-          rw [hZdec]
-          exact List.mem_append_left _ hz
-        exact List.mem_mergeSort.mp hzZ
-      have hmin := hminW z hzW hqz
-      have hzeq : z = (e, i0) := zipIdxLE_antisymm hzW heW hrel hmin
-      rw [hzeq] at hz
-      have hZN : ((a ++ b).zipIdx.mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq))).Nodup :=
-        (List.Perm.nodup_iff (List.mergeSort_perm _ _)).mpr (nodup_zipIdx_gen _ 0)
-      rw [hZdec, List.nodup_append] at hZN
-      have hne := hZN.2.2 (e, i0) hz (e, i0) (List.mem_cons_self)
-      exact hne rfl
-    · exact hqz
-  unfold visible
-  unfold newest
-  rw [← List.mergeSort_zipIdx, List.find?_map]
-  have hZfind : ((a ++ b).zipIdx.mergeSort (zipIdxLE fun a b => decide (b.seq ≤ a.seq))).find?
-      ((fun e => e.key == k && decide (e.seq ≤ t)) ∘ fun x => x.fst) = some (e, i0) :=
-    List.find?_eq_some_iff_append.mpr ⟨hq_ei0, asZ, bsZ, hZdec, hprefix⟩
-  rw [hZfind]
+  · by_cases hs : seen.contains e.key
+    · simp only [buildStep, if_neg hf, if_pos hs]
+    · simp only [buildStep, if_neg hf, if_neg hs]
+      rw [foldl_build_snd]
+      simp
+
+private theorem compact_eq (xs : List Entry) (floor : Nat) :
+    compact xs floor = compactSeen xs [] floor := by
   rfl
 
+/-- When every entry is at or below the floor, the first entry per key survives. -/
+private theorem compactSeen_sound_le : ∀ (xs : List Entry) (seen : List Nat) (floor k t : Nat),
+    ordered xs → (∀ f ∈ xs, f.seq ≤ floor) → floor ≤ t → k ∉ seen →
+    visible (compactSeen xs seen floor) k t = visible xs k t := by
+  intro xs
+  induction xs with
+  | nil => intros; simp [compactSeen, build]
+  | cons e xs ih =>
+      intro seen floor k t hord hall hfk hk
+      have hxsord : ordered xs := hord.of_cons
+      have heseq : e.seq ≤ floor := hall e (by simp)
+      have hf : ¬ floor < e.seq := by omega
+      rw [compactSeen_cons]
+      by_cases heq : (e.key == k) = true
+      · have heqeq : e.key = k := by simpa using heq
+        have hseenP : e.key ∉ seen := by simpa [heqeq] using hk
+        have hseen : seen.contains e.key = false := by simpa using hseenP
+        have het : e.seq ≤ t := by omega
+        simp [visible, hf, hseenP, heq, het]
+      · by_cases hseenP : e.key ∈ seen
+        · simp [visible, hf, hseenP, heq]
+          exact ih seen floor k t hxsord (by
+            intro f hfmem
+            exact hall f (by simp [hfmem])) hfk hk
+        · have hk' : k ∉ e.key :: seen := by
+            intro hmem
+            simp only [List.mem_cons] at hmem
+            rcases hmem with hke | hks
+            · exact heq (by simpa [hke])
+            · exact hk hks
+          simp [visible, hf, hseenP, heq]
+          exact ih (e.key :: seen) floor k t hxsord (by
+            intro f hfmem
+            exact hall f (by simp [hfmem])) hfk hk'
 
-/-! ### Range tombstone -/
+private theorem compact_sound : ∀ (xs : List Entry) (floor k t : Nat),
+    ordered xs → floor ≤ t →
+    visible (compact xs floor) k t = visible xs k t := by
+  intro xs
+  induction xs with
+  | nil => intros; simp [compact]
+  | cons e xs ih =>
+      intro floor k t hord hft
+      have hxsord : ordered xs := hord.of_cons
+      rw [compact_eq, compactSeen_cons]
+      by_cases heq : (e.key == k) = true
+      · by_cases hf : floor < e.seq
+        · by_cases het : e.seq ≤ t
+          · simp [visible, hf, heq, het]
+          · simp [visible, hf, heq, het]
+            rw [← compact_eq xs floor]
+            exact ih floor k t hxsord hft
+        · have het : e.seq ≤ t := by omega
+          simp [visible, hf, heq, het]
+      · by_cases hf : floor < e.seq
+        · simp [visible, hf, heq]
+          rw [← compact_eq xs floor]
+          exact ih floor k t hxsord hft
+        · simp [visible, hf, heq]
+          have hall : ∀ f ∈ xs, f.seq ≤ floor := by
+            intro f hfmem
+            have hrel := (List.pairwise_cons.mp hord).1 f hfmem
+            omega
+          have hk' : k ∉ [e.key] := by
+            intro hmem
+            simp only [List.mem_singleton] at hmem
+            exact heq (by simpa [hmem])
+          exact compactSeen_sound_le xs [e.key] floor k t hxsord hall hft hk'
 
-private def rcmp (a b : Entry) : Bool :=
-  decide (a.seq > b.seq) || (a.seq == b.seq && (a.value.isNone || b.value.isSome))
+theorem SnapshotAnchor_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.SnapshotAnchor.Goal := by
+  intro xs oldest k t hord hft
+  exact compact_sound xs oldest k t hord hft
 
-private theorem rcmp_iff (a b : Entry) :
-    rcmp a b = true ↔ a.seq > b.seq ∨
-      (a.seq = b.seq ∧ (a.value = none ∨ b.value ≠ none)) := by
-  unfold rcmp
-  rw [Bool.or_eq_true_iff, Bool.and_eq_true_iff]
-  constructor
-  · rintro (h | ⟨h1, h2⟩)
-    · exact Or.inl (of_decide_eq_true h)
-    · rw [beq_iff_eq] at h1
-      rw [Bool.or_eq_true_iff] at h2
-      rcases h2 with h2 | h2
-      · exact Or.inr ⟨h1, Or.inl (Option.isNone_iff_eq_none.mp h2)⟩
-      · exact Or.inr ⟨h1, Or.inr (Option.isSome_iff_ne_none.mp h2)⟩
-  · rintro (h | ⟨h1, h2⟩)
-    · exact Or.inl (decide_eq_true h)
-    · apply Or.inr
-      constructor
-      · exact beq_iff_eq.mpr h1
-      · rcases h2 with h2 | h2
-        · exact Bool.or_eq_true_iff.mpr (Or.inl
-            (Option.isNone_iff_eq_none.mpr h2))
-        · exact Bool.or_eq_true_iff.mpr (Or.inr
-            (Option.isSome_iff_ne_none.mpr h2))
+/-! ---------- BottomTombstone ---------- -/
 
-private theorem rcmp_refl (a : Entry) : rcmp a a = true := by
-  apply (rcmp_iff a a).mpr
-  right
-  refine ⟨rfl, ?_⟩
-  by_cases hav : a.value = none
-  · exact Or.inl hav
-  · exact Or.inr hav
+private theorem visible_cons_match {xs : List Entry} {k t : Nat} {e : Entry}
+    (h : (e.key == k && e.seq ≤ t) = true) : visible (e :: xs) k t = some e := by
+  simp [visible, h]
 
-private theorem rcmp_trans (a b c : Entry)
-    (hab : rcmp a b = true) (hbc : rcmp b c = true) : rcmp a c = true := by
-  rw [rcmp_iff] at hab hbc ⊢
-  rcases hab with h1 | ⟨h2, h3⟩ <;> rcases hbc with h4 | ⟨h5, h6⟩
-  · left; omega
-  · left; omega
-  · left; omega
-  · right
-    refine ⟨?_, ?_⟩
-    · omega
-    · rcases h3 with h3 | h3 <;> rcases h6 with h6 | h6
-      · exact Or.inl h3
-      · exact Or.inl h3
-      · exact (h3 h6).elim
-      · exact Or.inr h6
+private theorem visible_cons_nomatch {xs : List Entry} {k t : Nat} {e : Entry}
+    (h : (e.key == k && e.seq ≤ t) = false) : visible (e :: xs) k t = visible xs k t := by
+  simp [visible, h]
 
-private theorem rcmp_total (a b : Entry) : (rcmp a b || rcmp b a) = true := by
-  rw [Bool.or_eq_true_iff]
-  by_cases hseq : a.seq = b.seq
-  · by_cases hav : a.value = none
-    · left
-      apply (rcmp_iff a b).mpr
-      right
-      exact ⟨hseq, Or.inl hav⟩
-    · right
-      apply (rcmp_iff b a).mpr
-      right
-      exact ⟨hseq.symm, Or.inr hav⟩
-  · rcases Nat.lt_trichotomy a.seq b.seq with hlt | heq | hgt
-    · right
-      apply (rcmp_iff b a).mpr
-      left
-      omega
-    · exact absurd heq hseq
-    · left
-      apply (rcmp_iff a b).mpr
-      left
-      omega
+private theorem valueAt_cons_match {xs : List Entry} {k t : Nat} {e : Entry}
+    (h : (e.key == k && e.seq ≤ t) = true) : valueAt (e :: xs) k t = e.value := by
+  simp [valueAt, visible_cons_match h]
 
+private theorem valueAt_cons_nomatch {xs : List Entry} {k t : Nat} {e : Entry}
+    (h : (e.key == k && e.seq ≤ t) = false) : valueAt (e :: xs) k t = valueAt xs k t := by
+  simp [valueAt, visible_cons_nomatch h]
 
-/-- On a `rcmp`-sorted list, the `find?` winner is `rcmp`-minimal among
-all elements satisfying the predicate. -/
-private theorem visible_sorted_min {xs : List Entry} {k t : Nat} {w : Entry}
-    (hsorted : xs.Pairwise (fun a b => rcmp a b = true))
-    (hfind : visible xs k t = some w) :
-    ∀ y ∈ xs, (y.key == k && decide (y.seq ≤ t)) = true → rcmp w y = true := by
-  unfold visible at hfind
-  obtain ⟨hPw, pre, post, hl, hasPre⟩ := List.find?_eq_some_iff_append.mp hfind
-  intro y hy hp
-  rw [hl] at hy hsorted
-  rw [List.mem_append] at hy
-  rcases hy with hyp | hyp
-  · have hnp := hasPre y hyp
-    rw [hp] at hnp
-    simp at hnp
-  · rw [List.mem_cons] at hyp
-    rcases hyp with rfl | hpost
-    · exact rcmp_refl _
-    · have hsub : w :: post <+ pre ++ w :: post :=
-        List.sublist_append_right pre (w :: post)
-      have hpw := List.Pairwise.sublist hsub hsorted
-      exact (List.pairwise_cons.mp hpw).1 y hpost
+private theorem valueAt_of_visible_none {xs : List Entry} {k t : Nat}
+    (h : visible xs k t = none) : valueAt xs k t = none := by
+  simp [valueAt, h]
 
-/-- A tombstone entry produced by `applyMarkers` comes from a marker that
-covers `k` spatially (`covers m k m.seq` ignores the time bound). -/
-private theorem tomb_mem {ms : List Marker} {k : Nat} {e : Entry}
-    (he : e ∈ (ms.filter fun m => covers m k m.seq).map
-      fun m => Entry.mk k m.seq none) :
-    ∃ m ∈ ms, covers m k m.seq = true ∧ e = Entry.mk k m.seq none := by
-  rw [List.mem_map] at he
-  obtain ⟨m, hm, hfm⟩ := he
-  rw [List.mem_filter] at hm
-  exact ⟨m, hm.1, hm.2, hfm.symm⟩
+private theorem compactSeen_cons_of_lt {e : Entry} {xs : List Entry} {seen : List Nat} {floor : Nat}
+    (h : floor < e.seq) : compactSeen (e :: xs) seen floor = e :: compactSeen xs seen floor := by
+  rw [compactSeen_cons, if_pos h]
 
-private theorem tomb_mem' {ms : List Marker} {k : Nat} {m : Marker}
-    (hm : m ∈ ms.filter fun m => covers m k m.seq) :
-    Entry.mk k m.seq none ∈
-      (ms.filter fun m => covers m k m.seq).map
-        fun m => Entry.mk k m.seq none := by
-  rw [List.mem_map]
-  exact ⟨m, hm, rfl⟩
+private theorem compactSeen_cons_of_drop {e : Entry} {xs : List Entry} {seen : List Nat} {floor : Nat}
+    (h1 : ¬ floor < e.seq) (h2 : e.key ∈ seen) :
+    compactSeen (e :: xs) seen floor = compactSeen xs seen floor := by
+  rw [compactSeen_cons, if_neg h1, if_pos (by simpa using h2)]
 
-/-- `covers m k t` implies the spatial part needed for `covers m k m.seq`. -/
-private theorem covers_mseq_of_covers {m : Marker} {k t : Nat}
-    (h : covers m k t = true) : covers m k m.seq = true := by
-  unfold covers at h ⊢
-  simp only [Bool.and_eq_true_iff] at h ⊢
-  obtain ⟨⟨h1, h2⟩, h3⟩ := h
-  exact ⟨⟨h1, h2⟩, decide_eq_true (Nat.le_refl _)⟩
+private theorem compactSeen_cons_of_keep {e : Entry} {xs : List Entry} {seen : List Nat} {floor : Nat}
+    (h1 : ¬ floor < e.seq) (h2 : e.key ∉ seen) :
+    compactSeen (e :: xs) seen floor = e :: compactSeen xs (e.key :: seen) floor := by
+  rw [compactSeen_cons, if_neg h1, if_neg (by simpa using h2)]
 
-/-- Spatial coverage gives the concrete bounds on `lo`, `hi`. -/
-private theorem covers_bounds {m : Marker} {k : Nat}
-    (h : covers m k m.seq = true) : m.lo ≤ k ∧ k < m.hi := by
-  unfold covers at h
-  simp only [Bool.and_eq_true_iff] at h
-  obtain ⟨⟨h1, h2⟩, _⟩ := h
-  exact ⟨of_decide_eq_true h1, of_decide_eq_true h2⟩
+private theorem valueAt_filter_of_visible_none {xs : List Entry} {k t : Nat}
+    (p : Entry → Bool) (h : visible xs k t = none) :
+    valueAt (xs.filter p) k t = none := by
+  have hv0 : xs.find? (fun e => e.key == k && e.seq ≤ t) = none := by
+    simpa [visible] using h
+  have hv1 : (xs.filter p).find? (fun e => e.key == k && e.seq ≤ t) = none :=
+    find?_filter_none p (fun e => e.key == k && e.seq ≤ t) hv0
+  simp [valueAt, visible, hv1]
 
-/-- A `some`-valued entry never precedes a `none`-valued entry of sequence
-at least its own: the tombstone wins ties and higher sequences. -/
-private theorem rcmp_false {a b : Entry} (hle : a.seq ≤ b.seq)
-    (ha : a.value.isSome = true) (hb : b.value.isNone = true) :
-    rcmp a b = false := by
-  rw [Bool.eq_false_iff]
-  intro hrcmp
-  rw [rcmp_iff] at hrcmp
-  rcases hrcmp with hgt | ⟨heq, hval⟩
-  · omega
-  · rcases hval with hnone | hsome
-    · rw [hnone] at ha
-      simp at ha
-    · have hbv : b.value = none := Option.isNone_iff_eq_none.mp hb
-      exact hsome hbv
+private theorem compactSeen_none_of_mem : ∀ (xs : List Entry) (seen : List Nat) (floor k t : Nat),
+    ordered xs → (∀ f ∈ xs, f.seq ≤ floor) → k ∈ seen →
+    visible (compactSeen xs seen floor) k t = none := by
+  intro xs
+  induction xs with
+  | nil => intros; rfl
+  | cons e xs ih =>
+      intro seen floor k t hord hall hkmem
+      have hf : ¬ floor < e.seq := by
+        have := hall e (by simp)
+        omega
+      have hall' : ∀ f ∈ xs, f.seq ≤ floor := by
+        intro f hfmem
+        exact hall f (by simp [hfmem])
+      by_cases hes : e.key ∈ seen
+      · rw [compactSeen_cons_of_drop hf hes]
+        exact ih seen floor k t hord.of_cons hall' hkmem
+      · rw [compactSeen_cons_of_keep hf hes]
+        have heqEq : e.key ≠ k := by
+          intro heqk
+          exact hes (by simpa [heqk] using hkmem)
+        have hnomatch : (e.key == k && e.seq ≤ t) = false := by simp [heqEq]
+        rw [visible_cons_nomatch hnomatch]
+        exact ih (e.key :: seen) floor k t hord.of_cons hall' (by simp [hkmem])
 
-/-- A strictly older sequence never precedes a newer one. -/
-private theorem rcmp_false_of_seq_lt {a b : Entry} (hlt : a.seq < b.seq) :
-    rcmp a b = false := by
-  rw [Bool.eq_false_iff]
-  intro h
-  rw [rcmp_iff] at h
-  rcases h with hgt | ⟨heq, _⟩ <;> omega
-
-theorem sound_RangeTombstone : RangeTombstone.Goal := by
-  intro xs ms k t hord huniq
-  -- sortedness of the merged list produced by `applyMarkers`
-  have hSsorted : (((xs ++ ((ms.filter fun m => covers m k m.seq).map
-        fun m => Entry.mk k m.seq none)).mergeSort
-        (fun a b => a.seq > b.seq ||
-          (a.seq == b.seq && (a.value.isNone || b.value.isSome))))).Pairwise
-      (fun a b => rcmp a b = true) := by
-    have h := List.pairwise_mergeSort (le := rcmp) rcmp_trans rcmp_total
-      (xs ++ ((ms.filter fun m => covers m k m.seq).map
-        fun m => Entry.mk k m.seq none))
-    exact h
-  unfold valueAt
-  cases hvis : visible xs k t with
-  | none =>
-      cases hSv : visible (applyMarkers xs ms k) k t with
-      | none => rfl
-      | some w =>
-          -- LHS = w.value; RHS = none → need w.value = none
-          unfold applyMarkers at hSv
-          unfold visible at hSv
-          obtain ⟨hPw, pre, post, hl, hasPre⟩ :=
-            List.find?_eq_some_iff_append.mp hSv
-          have hwS : w ∈ (xs ++ ((ms.filter fun m => covers m k m.seq).map
-              fun m => Entry.mk k m.seq none)).mergeSort
-              (fun a b => a.seq > b.seq ||
-                (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-            rw [hl]
-            exact List.mem_append_right pre List.mem_cons_self
-          rw [List.mem_mergeSort] at hwS
-          rw [List.mem_append] at hwS
-          rcases hwS with hwxs | hwt
-          · -- w ∈ xs → contradicts visible xs k t = none
-            have hPw := List.find?_some hSv
-            -- hPw : (w.key == k && decide (w.seq ≤ t)) = true
-            unfold visible at hvis
-            rw [List.find?_eq_none] at hvis
-            exact absurd hPw (hvis w hwxs)
-          · obtain ⟨m, hmms, hmcov, rfl⟩ := tomb_mem hwt
-            rfl
-  | some e₀ =>
-      simp only [Option.bind_some]
-      by_cases hany : ((ms.filter fun m => covers m k t).any
-          fun m => decide (e₀.seq ≤ m.seq)) = true
-      · rw [ite_eq_left hany]
-        cases hSv : visible (applyMarkers xs ms k) k t with
-        | none => rfl
-        | some w =>
-            simp only [Option.bind_some]
-            -- goal: w.value = none; derive via tombstone τ₀
-            obtain ⟨m₀, hm₀filt, hm₀ge⟩ := List.any_eq_true.mp hany
-            rw [List.mem_filter] at hm₀filt
-            obtain ⟨hm₀ms, hm₀cov⟩ := hm₀filt
-            have hm₀seq : e₀.seq ≤ m₀.seq := of_decide_eq_true hm₀ge
-            have hm₀covseq : covers m₀ k m₀.seq = true :=
-              covers_mseq_of_covers hm₀cov
-            have hm₀tseq : m₀.seq ≤ t := by
-              unfold covers at hm₀cov
-              simp only [Bool.and_eq_true_iff] at hm₀cov
-              obtain ⟨⟨_, _⟩, h3⟩ := hm₀cov
-              exact of_decide_eq_true h3
-            have hm₀filt' : m₀ ∈ ms.filter (fun m => covers m k m.seq) := by
-              rw [List.mem_filter]
-              exact ⟨hm₀ms, hm₀covseq⟩
-            have hτ₀T' : Entry.mk k m₀.seq none ∈
-                (ms.filter fun m => covers m k m.seq).map
-                  fun m => Entry.mk k m.seq none := tomb_mem' hm₀filt'
-            have hτ₀S : Entry.mk k m₀.seq none ∈
-                (xs ++ ((ms.filter fun m => covers m k m.seq).map
-                  fun m => Entry.mk k m.seq none)).mergeSort
-                  (fun a b => a.seq > b.seq ||
-                    (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-              rw [List.mem_mergeSort]
-              exact List.mem_append_right xs hτ₀T'
-            have hτ₀q : ((Entry.mk k m₀.seq none).key == k &&
-                decide ((Entry.mk k m₀.seq none).seq ≤ t)) = true := by
-              have hk : (Entry.mk k m₀.seq none).key = k := rfl
-              have hs : (Entry.mk k m₀.seq none).seq = m₀.seq := rfl
-              rw [hk, hs]
-              exact Bool.and_eq_true_iff.mpr
-                ⟨beq_iff_eq.mpr rfl, decide_eq_true hm₀tseq⟩
-            unfold applyMarkers at hSv
-            unfold visible at hSv
-            have hτ₀S' : Entry.mk k m₀.seq none ∈
-                applyMarkers xs ms k := hτ₀S
-            have hmin := visible_sorted_min hSsorted hSv
-              (Entry.mk k m₀.seq none) hτ₀S' hτ₀q
-            -- hmin : rcmp w (Entry.mk k m₀.seq none) = true
-            obtain ⟨hPw, pre, post, hl, hasPre⟩ :=
-              List.find?_eq_some_iff_append.mp hSv
-            have hwS : w ∈ (xs ++ ((ms.filter fun m => covers m k m.seq).map
-                fun m => Entry.mk k m.seq none)).mergeSort
-                (fun a b => a.seq > b.seq ||
-                  (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-              rw [hl]
-              exact List.mem_append_right pre List.mem_cons_self
-            rw [List.mem_mergeSort, List.mem_append] at hwS
-            rcases hwS with hwxs | hwt
-            · -- w ∈ xs: w.seq ≤ e₀.seq; τ₀.seq ≥ e₀.seq → τ₀.seq ≥ w.seq
-              have hPw' := hPw
-              have hkey : w.key = k := beq_iff_eq.mp
-                (Bool.and_eq_true_iff.mp hPw').1
-              have hseq : w.seq ≤ t := of_decide_eq_true
-                (Bool.and_eq_true_iff.mp hPw').2
-              have hwle := visible_max_seq hord hvis w hwxs hkey hseq
-              -- hwle : w.seq ≤ e₀.seq
-              cases hwv : w.value with
-              | none => rfl
-              | some hv =>
-                  exfalso
-                  have hle : w.seq ≤ (Entry.mk k m₀.seq none).seq := by
-                    have : (Entry.mk k m₀.seq none).seq = m₀.seq := rfl
-                    rw [this]
-                    omega
-                  have his : w.value.isSome = true := by
-                    rw [hwv]; rfl
-                  have hnis : (Entry.mk k m₀.seq none).value.isNone = true := rfl
-                  have hfalse := rcmp_false hle his hnis
-                  rw [hfalse] at hmin
-                  exact Bool.noConfusion hmin
-            · obtain ⟨m, hmms, hmcov, rfl⟩ := tomb_mem hwt
-              rfl
-      · rw [ite_eq_right hany]
-        cases hSv : visible (applyMarkers xs ms k) k t with
+private theorem dropTomb_compactSeen_sound : ∀ (xs : List Entry) (seen : List Nat) (floor k t : Nat),
+    ordered xs → (∀ f ∈ xs, f.seq ≤ floor) → floor ≤ t → k ∉ seen →
+    valueAt ((compactSeen xs seen floor).filter (fun e => floor < e.seq || e.value.isSome)) k t =
+      valueAt xs k t := by
+  intro xs
+  induction xs with
+  | nil => intros; rfl
+  | cons e xs ih =>
+      intro seen floor k t hord hall hft hk
+      have hf : ¬ floor < e.seq := by
+        have := hall e (by simp)
+        omega
+      have hall' : ∀ f ∈ xs, f.seq ≤ floor := by
+        intro f hfmem
+        exact hall f (by simp [hfmem])
+      by_cases heq : (e.key == k) = true
+      · have hEq : e.key = k := by simpa using heq
+        have hes : e.key ∉ seen := by simpa [hEq] using hk
+        rw [compactSeen_cons_of_keep hf hes]
+        have het : e.seq ≤ t := by
+          have := hall e (by simp)
+          omega
+        have hmatch : (e.key == k && e.seq ≤ t) = true := by simp [heq, het]
+        cases hval : e.value with
         | none =>
-            exfalso
-            unfold visible at hvis
-            obtain ⟨hPe₀, as, bs, hxs, _⟩ :=
-              List.find?_eq_some_iff_append.mp hvis
-            have he₀xs : e₀ ∈ xs := by
-              rw [hxs]
-              exact List.mem_append_right as List.mem_cons_self
-            have he₀S : e₀ ∈ (xs ++ ((ms.filter fun m => covers m k m.seq).map
-                fun m => Entry.mk k m.seq none)).mergeSort
-                (fun a b => a.seq > b.seq ||
-                  (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-              rw [List.mem_mergeSort]
-              exact List.mem_append_left _ he₀xs
-            unfold applyMarkers at hSv
-            unfold visible at hSv
-            rw [List.find?_eq_none] at hSv
-            exact (hSv e₀ he₀S) hPe₀
-        | some w =>
-            simp only [Option.bind_some]
-            unfold applyMarkers at hSv
-            unfold visible at hSv
-            obtain ⟨hPw, pre, post, hl, hasPre⟩ :=
-              List.find?_eq_some_iff_append.mp hSv
-            have hwS : w ∈ (xs ++ ((ms.filter fun m => covers m k m.seq).map
-                fun m => Entry.mk k m.seq none)).mergeSort
-                (fun a b => a.seq > b.seq ||
-                  (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-              rw [hl]
-              exact List.mem_append_right pre List.mem_cons_self
-            rw [List.mem_mergeSort, List.mem_append] at hwS
-            have hPw' := hPw
-            have hkeyW : w.key = k := beq_iff_eq.mp
-              (Bool.and_eq_true_iff.mp hPw').1
-            have hseqW : w.seq ≤ t := of_decide_eq_true
-              (Bool.and_eq_true_iff.mp hPw').2
-            -- e₀ facts
-            unfold visible at hvis
-            obtain ⟨hPe₀, _, _, _, _⟩ := List.find?_eq_some_iff_append.mp hvis
-            have he₀xs : e₀ ∈ xs := by
-              obtain ⟨_, as, bs, hxs, _⟩ :=
-                List.find?_eq_some_iff_append.mp hvis
-              rw [hxs]
-              exact List.mem_append_right as List.mem_cons_self
-            have he₀key : e₀.key = k := beq_iff_eq.mp
-              (Bool.and_eq_true_iff.mp hPe₀).1
-            have he₀S : e₀ ∈ (xs ++ ((ms.filter fun m => covers m k m.seq).map
-                fun m => Entry.mk k m.seq none)).mergeSort
-                (fun a b => a.seq > b.seq ||
-                  (a.seq == b.seq && (a.value.isNone || b.value.isSome))) := by
-              rw [List.mem_mergeSort]
-              exact List.mem_append_left _ he₀xs
-            have hmin := visible_sorted_min hSsorted hSv
-            have hrw_e₀ : rcmp w e₀ = true := hmin e₀ he₀S hPe₀
-            rcases hwS with hwxs | hwt
-            · -- w ∈ xs: show w.seq = e₀.seq then uniqueSeq gives w = e₀
-              have hwle := visible_max_seq hord hvis w hwxs hkeyW hseqW
-              rw [rcmp_iff] at hrw_e₀
-              rcases hrw_e₀ with hgt | ⟨heq, _⟩
-              · omega
-              · have hseq : w.seq = e₀.seq := heq
-                have hwe : w = e₀ :=
-                  uniqueSeq_inj huniq hwxs he₀xs
-                    (hkeyW.trans he₀key.symm) hseq
-                rw [hwe]
-            · -- w ∈ T': a tombstone; derive w.seq < e₀.seq, contradicting min
+            have hnone := compactSeen_none_of_mem xs (e.key :: seen) floor k t hord.of_cons hall'
+              (by
+                have hEq : e.key = k := by simpa using heq
+                simp [hEq])
+            have hvnone : valueAt ((compactSeen xs (e.key :: seen) floor).filter
+                (fun e => floor < e.seq || e.value.isSome)) k t = none :=
+              valueAt_filter_of_visible_none _ hnone
+            have hkeep : (floor < e.seq || e.value.isSome) = false := by simp [hf, hval]
+            rw [List.filter_cons]
+            simp [hkeep, hf, valueAt_cons_match hmatch, hval, hvnone]
+        | some v =>
+            have hkeep : (floor < e.seq || e.value.isSome) = true := by simp [hval]
+            rw [List.filter_cons]
+            simp [hkeep, hf, valueAt_cons_match hmatch, hval]
+      · by_cases hes : e.key ∈ seen
+        · rw [compactSeen_cons_of_drop hf hes]
+          have hnomatch : (e.key == k && e.seq ≤ t) = false := by
+            have heqEq : e.key ≠ k := by
+              intro heqk
+              exact heq (by simpa [heqk])
+            simp [heqEq]
+          rw [valueAt_cons_nomatch hnomatch]
+          exact ih seen floor k t hord.of_cons hall' hft hk
+        · rw [compactSeen_cons_of_keep hf hes]
+          have hk' : k ∉ e.key :: seen := by
+            intro hmem
+            simp only [List.mem_cons] at hmem
+            rcases hmem with hke | hks
+            · exact heq (by simpa [hke])
+            · exact hk hks
+          have hnomatch : (e.key == k && e.seq ≤ t) = false := by
+            have heqEq : e.key ≠ k := by
+              intro heqk
+              exact heq (by simpa [heqk])
+            simp [heqEq]
+          by_cases hkeep : (floor < e.seq || e.value.isSome) = true
+          · rw [List.filter_cons]
+            simp [hkeep]
+            rw [valueAt_cons_nomatch hnomatch]
+            rw [valueAt_cons_nomatch hnomatch]
+            exact ih (e.key :: seen) floor k t hord.of_cons hall' hft hk'
+          · rw [List.filter_cons]
+            simp [hkeep]
+            rw [valueAt_cons_nomatch hnomatch]
+            exact ih (e.key :: seen) floor k t hord.of_cons hall' hft hk'
+
+private theorem bottomTombstone_aux : ∀ (xs : List Entry) (floor k t : Nat),
+    ordered xs → floor ≤ t →
+    valueAt ((compact xs floor).filter (fun e => floor < e.seq || e.value.isSome)) k t =
+      valueAt xs k t := by
+  intro xs
+  induction xs with
+  | nil => intros; simp [compact]
+  | cons e xs ih =>
+      intro floor k t hord hft
+      have hxsord : ordered xs := hord.of_cons
+      rw [compact_eq]
+      by_cases heq : (e.key == k) = true
+      · by_cases hf : floor < e.seq
+        · rw [compactSeen_cons_of_lt hf]
+          by_cases het : e.seq ≤ t
+          · have hmatch : (e.key == k && e.seq ≤ t) = true := by simp [heq, het]
+            have hkeep : (floor < e.seq || e.value.isSome) = true := by simp [hf]
+            rw [List.filter_cons]
+            simp [hkeep, hf, valueAt_cons_match hmatch]
+          · have hnomatch : (e.key == k && e.seq ≤ t) = false := by simp [heq, het]
+            have hkeep : (floor < e.seq || e.value.isSome) = true := by simp [hf]
+            rw [List.filter_cons]
+            simp [hkeep, hf, valueAt_cons_nomatch hnomatch]
+            rw [← compact_eq xs floor]
+            exact ih floor k t hxsord hft
+        · rw [compactSeen_cons_of_keep hf (by simp)]
+          have hall' : ∀ f ∈ xs, f.seq ≤ floor := by
+            intro f hfmem
+            have := (List.pairwise_cons.mp hord).1 f hfmem
+            omega
+          have het : e.seq ≤ t := by omega
+          have hmatch : (e.key == k && e.seq ≤ t) = true := by simp [heq, het]
+          cases hval : e.value with
+          | none =>
+              have hnone := compactSeen_none_of_mem xs [e.key] floor k t hxsord hall'
+                (by
+                  have hEq : e.key = k := by simpa using heq
+                  simp [hEq])
+              have hvnone : valueAt ((compactSeen xs [e.key] floor).filter
+                  (fun e => floor < e.seq || e.value.isSome)) k t = none :=
+                valueAt_filter_of_visible_none _ hnone
+              have hkeep : (floor < e.seq || e.value.isSome) = false := by simp [hf, hval]
+              rw [List.filter_cons]
+              simp [hkeep, hf, valueAt_cons_match hmatch, hval, hvnone]
+          | some v =>
+              have hkeep : (floor < e.seq || e.value.isSome) = true := by simp [hval]
+              rw [List.filter_cons]
+              simp [hkeep, hf, valueAt_cons_match hmatch, hval]
+      · by_cases hf : floor < e.seq
+        · rw [compactSeen_cons_of_lt hf]
+          have hnomatch : (e.key == k && e.seq ≤ t) = false := by
+            have heqEq : e.key ≠ k := by intro heqk; exact heq (by simpa [heqk])
+            simp [heqEq]
+          have hkeep : (floor < e.seq || e.value.isSome) = true := by simp [hf]
+          rw [List.filter_cons]
+          simp [hkeep, valueAt_cons_nomatch hnomatch]
+          rw [← compact_eq xs floor]
+          exact ih floor k t hxsord hft
+        · rw [compactSeen_cons_of_keep hf (by simp)]
+          have hall' : ∀ f ∈ xs, f.seq ≤ floor := by
+            intro f hfmem
+            have := (List.pairwise_cons.mp hord).1 f hfmem
+            omega
+          have hnomatch : (e.key == k && e.seq ≤ t) = false := by
+            have heqEq : e.key ≠ k := by intro heqk; exact heq (by simpa [heqk])
+            simp [heqEq]
+          by_cases hkeep : (floor < e.seq || e.value.isSome) = true
+          · rw [List.filter_cons]
+            simp [hkeep, valueAt_cons_nomatch hnomatch]
+            exact dropTomb_compactSeen_sound xs [e.key] floor k t hxsord hall' hft (by
+              intro hmem
+              simp only [List.mem_singleton] at hmem
+              exact heq (by simpa [hmem]))
+          · rw [List.filter_cons]
+            simp [hkeep]
+            rw [valueAt_cons_nomatch hnomatch]
+            exact dropTomb_compactSeen_sound xs [e.key] floor k t hxsord hall' hft (by
+              intro hmem
+              simp only [List.mem_singleton] at hmem
+              exact heq (by simpa [hmem]))
+
+theorem BottomTombstone_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.BottomTombstone.Goal := by
+  intro xs oldest k t hord hft
+  exact bottomTombstone_aux xs oldest k t hord hft
+
+/-! ---------- SparsePins ---------- -/
+
+private theorem entry_beq_self (e : Entry) : (e == e) = true := by
+  change TinylambOpt.ResearchGoals.VersionedIndexes.instBEqEntry.beq e e = true
+  rw [TinylambOpt.ResearchGoals.VersionedIndexes.instBEqEntry.beq]
+  cases e <;> simp
+
+private theorem find?_of_newer {xs : List Entry} {k t t' : Nat} {e : Entry}
+    (h : xs.find? (fun f => f.key == k && f.seq ≤ t) = some e)
+    (heq : e.seq ≤ t') (htt' : t' ≤ t) :
+    xs.find? (fun f => f.key == e.key && f.seq ≤ t') = some e := by
+  rcases List.find?_eq_some_iff_getElem.mp h with ⟨hp, i, hi, hli, hbefore⟩
+  have hp' : (e.key == k) = true := by
+    have := hp
+    rw [Bool.and_eq_true] at this
+    exact this.1
+  apply List.find?_eq_some_iff_getElem.mpr
+  constructor
+  · rw [Bool.and_eq_true]
+    exact ⟨by simp, decide_eq_true heq⟩
+  · refine ⟨i, hi, hli, ?_⟩
+    intro j hj
+    have hb : ¬ xs[j].key = k ∨ t < xs[j].seq := by
+      simpa using hbefore j hj
+    by_cases hm : (xs[j].key == e.key && xs[j].seq ≤ t') = true
+    · exfalso
+      have hm' := hm
+      rw [Bool.and_eq_true] at hm'
+      have h1 : xs[j].key = e.key := by simpa using hm'.1
+      have h2 : e.key = k := by simpa using hp'
+      have hjkey : xs[j].key = k := h1.trans h2
+      have hjseq' : xs[j].seq ≤ t' := of_decide_eq_true hm'.2
+      have hjseq : xs[j].seq ≤ t := by omega
+      exact hb.elim (fun hk => hk hjkey) (fun ht => by omega)
+    · simpa [hm]
+
+theorem SparsePins_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.SparsePins.Goal := by
+  intro xs pins latest k t hord hcond
+  unfold visible
+  unfold keepPinned
+  let pred := fun e : Entry => e.key == k && e.seq ≤ t
+  let keep := fun e : Entry =>
+    latest < e.seq || (latest :: pins).any fun u =>
+      (xs.find? fun f => f.key == e.key && f.seq ≤ u) == some e
+  change (xs.filter keep).find? pred = xs.find? pred
+  cases hv : xs.find? pred with
+  | none =>
+      exact find?_filter_none keep pred hv
+  | some e =>
+      have hp : (e.key == k && e.seq ≤ t) = true := by
+        simpa [pred] using List.find?_some hv
+      have hkey : (e.key == k) = true := by
+        have hp' := hp
+        rw [Bool.and_eq_true] at hp'
+        exact hp'.1
+      have heseq : e.seq ≤ t := by
+        have hp' := hp
+        rw [Bool.and_eq_true] at hp'
+        exact of_decide_eq_true hp'.2
+      have hkeep : keep e = true := by
+        by_cases hlt : latest < e.seq
+        · simp [keep, hlt]
+        · have heseq_latest : e.seq ≤ latest := by omega
+          rcases hcond with htpin | hlatest
+          · have hvis : (xs.find? fun f => f.key == e.key && f.seq ≤ t) = some e := by
+              have hkeq : e.key = k := by simpa using hkey
+              simpa [pred, hkeq] using hv
+            simp [keep, hlt]
+            right
+            exact ⟨t, htpin, by simp [hvis, entry_beq_self]⟩
+          · have hvlatest : xs.find? (fun f => f.key == e.key && f.seq ≤ latest) = some e :=
+              find?_of_newer hv heseq_latest hlatest
+            simp [keep, hlt, hvlatest, entry_beq_self]
+      exact find?_filter_eq keep pred hv hkeep
+
+/-! ---------- CoveredPredicate ---------- -/
+
+theorem CoveredPredicate_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.CoveredPredicate.Goal := by
+  intro xs p k t hord huniq
+  unfold valueAt
+  cases hv : visible xs k t with
+  | none =>
+      by_cases hR : xs.any (fun e => e.key == k && e.seq ≤ t && e.value.any p &&
+          !(xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t)) = true
+      · rcases List.any_eq_true.mp hR with ⟨w, hwmem, hw⟩
+        simp only [Bool.and_eq_true] at hw
+        have hwP : (w.key == k && w.seq ≤ t) = true := by
+          rw [Bool.and_eq_true]
+          exact ⟨hw.1.1.1, decide_eq_true (of_decide_eq_true hw.1.1.2)⟩
+        have hsome : (visible xs k t).isSome = true := by
+          rw [visible]
+          exact List.find?_isSome.mpr ⟨w, hwmem, hwP⟩
+        simp [hv] at hsome
+      · simp [hR]
+  | some e =>
+      have hvf : xs.find? (fun f => f.key == k && f.seq ≤ t) = some e := by
+        simpa [visible] using hv
+      rcases List.find?_eq_some_iff_getElem.mp hvf with ⟨hp, i, hi, hli, hbefore⟩
+      have hkey : (e.key == k) = true := by
+        have hp' := hp
+        rw [Bool.and_eq_true] at hp'
+        exact hp'.1
+      have heseq : e.seq ≤ t := by
+        have hp' := hp
+        rw [Bool.and_eq_true] at hp'
+        exact of_decide_eq_true hp'.2
+      have hemem : e ∈ xs := List.mem_of_find?_eq_some hvf
+      by_cases hpE : e.value.any p = true
+      · have hno : (xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t) = false := by
+          apply List.any_eq_false.mpr
+          intro f hfmem hfw
+          simp only [Bool.and_eq_true] at hfw
+          have hfkey : (f.key == k) = true := hfw.1.1
+          have hfnew : e.seq < f.seq := of_decide_eq_true hfw.1.2
+          have hfseq : f.seq ≤ t := of_decide_eq_true hfw.2
+          rcases List.mem_iff_getElem.mp hfmem with ⟨j, hjlen, hfj⟩
+          by_cases hji : j = i
+          · subst j
+            have hfe : f = e := hfj.symm.trans hli
+            have : e.seq < e.seq := by simpa [hfe] using hfnew
+            omega
+          · by_cases hlt : j < i
+            · have hb := hbefore j hlt
+              simp at hb
               exfalso
-              obtain ⟨m, hmms, hmcov, rfl⟩ := tomb_mem hwt
-              have hms_le : m.seq ≤ t := by
-                have hPwτ := hPw
-                -- pvis (Entry.mk k m.seq none) = true → seq ≤ t
-                rw [show (Entry.mk k m.seq none).key = k from rfl,
-                    show (Entry.mk k m.seq none).seq = m.seq from rfl] at hPwτ
-                exact of_decide_eq_true (Bool.and_eq_true_iff.mp hPwτ).2
-              have hbounds := covers_bounds hmcov
-              have hcovt : covers m k t = true := by
-                unfold covers
-                simp only [Bool.and_eq_true_iff]
-                refine ⟨⟨?_, ?_⟩, ?_⟩
-                · exact decide_eq_true hbounds.1
-                · exact decide_eq_true hbounds.2
-                · exact decide_eq_true hms_le
-              have hm_filt : m ∈ ms.filter (fun m => covers m k t) := by
-                rw [List.mem_filter]
-                exact ⟨hmms, hcovt⟩
-              have hnotle : ¬(e₀.seq ≤ m.seq) := by
-                intro hle
-                have htrue : ((ms.filter fun m => covers m k t).any
-                    fun m => decide (e₀.seq ≤ m.seq)) = true := by
-                  rw [List.any_eq_true]
-                  exact ⟨m, hm_filt, decide_eq_true hle⟩
-                exact hany htrue
-              have hlt : m.seq < e₀.seq := Nat.lt_of_not_ge hnotle
-              have hfalse := rcmp_false_of_seq_lt (a := Entry.mk k m.seq none) (b := e₀) hlt
-              rw [hfalse] at hrw_e₀
-              simp at hrw_e₀
+              exact hb.elim
+                (fun hk => hk (by simpa [hfj] using hfkey))
+                (fun ht => by
+                  have hxj : xs[j].seq = f.seq := by rw [hfj]
+                  omega)
+            · have hij : i < j := by omega
+              have hseqle := hord.rel_getElem_of_lt hi hjlen hij
+              have hxj : xs[j].seq = f.seq := by rw [hfj]
+              have hxi : xs[i].seq = e.seq := by rw [hli]
+              omega
+        have hR : xs.any (fun e => e.key == k && e.seq ≤ t && e.value.any p &&
+            !(xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t)) = true := by
+          apply List.any_eq_true.mpr
+          refine ⟨e, hemem, ?_⟩
+          rw [Bool.and_eq_true]
+          refine ⟨?_, by simp [hno]⟩
+          rw [Bool.and_eq_true]
+          refine ⟨?_, hpE⟩
+          rw [Bool.and_eq_true]
+          exact ⟨hkey, decide_eq_true heseq⟩
+        simp [hpE, hR]
+      · by_cases hR : xs.any (fun e => e.key == k && e.seq ≤ t && e.value.any p &&
+            !(xs.any fun f => f.key == k && e.seq < f.seq && f.seq ≤ t)) = true
+        · rcases List.any_eq_true.mp hR with ⟨w, hwmem, hw⟩
+          simp only [Bool.and_eq_true] at hw
+          have hwkey : (w.key == k) = true := hw.1.1.1
+          have hwseq : w.seq ≤ t := of_decide_eq_true hw.1.1.2
+          have hwval : w.value.any p = true := hw.1.2
+          have hwno : (xs.any fun f => f.key == k && w.seq < f.seq && f.seq ≤ t) = false := by
+            simpa using hw.2
+          rcases List.mem_iff_getElem.mp hwmem with ⟨j, hjlen, hwj⟩
+          have hnotlt : ¬ j < i := by
+            intro hlt
+            have hb := hbefore j hlt
+            simp at hb
+            exact hb.elim
+              (fun hk => hk (by simpa [hwj] using hwkey))
+              (fun ht => by
+                have hxj : xs[j].seq = w.seq := by rw [hwj]
+                omega)
+          by_cases hji : j = i
+          · subst j
+            have hwe : w = e := hwj.symm.trans hli
+            have hvale : e.value.any p = true := by simpa [hwe] using hwval
+            exact (hpE hvale).elim
+          · have hij : i < j := by omega
+            have hseqle := hord.rel_getElem_of_lt hi hjlen hij
+            have hxj : xs[j].seq = w.seq := by rw [hwj]
+            have hxi : xs[i].seq = e.seq := by rw [hli]
+            have hnotnew : ¬ w.seq < e.seq := by
+              intro hwlt
+              have hany : (xs.any fun f => f.key == k && w.seq < f.seq && f.seq ≤ t) = true := by
+                apply List.any_eq_true.mpr
+                refine ⟨e, hemem, ?_⟩
+                rw [Bool.and_eq_true]
+                refine ⟨?_, decide_eq_true heseq⟩
+                rw [Bool.and_eq_true]
+                exact ⟨hkey, decide_eq_true hwlt⟩
+              rw [hany] at hwno
+              simp at hwno
+            have hweq : w.seq = e.seq := by omega
+            have hwkey' : w.key = k := by simpa using hwkey
+            have hekey' : e.key = k := by simpa using hkey
+            have hi_map : i < (xs.map fun z : Entry => (z.key, z.seq)).length := by simpa using hi
+            have hj_map : j < (xs.map fun z : Entry => (z.key, z.seq)).length := by simpa using hjlen
+            have hpair : (xs.map fun z : Entry => (z.key, z.seq))[i] =
+                (xs.map fun z : Entry => (z.key, z.seq))[j] := by
+              rw [List.getElem_map (f := fun z : Entry => (z.key, z.seq)) (h := hi_map),
+                  List.getElem_map (f := fun z : Entry => (z.key, z.seq)) (h := hj_map)]
+              simp [hli, hwj, hwkey', hekey', hweq]
+            have hij' : i = j := (huniq.getElem_inj (hi := hi_map) (hj := hj_map)).mp hpair
+            exfalso
+            exact hji hij'.symm
+        · simp [hpE, hR]
+
+/-! ---------- RangeTombstone ---------- -/
+
+private def cmpR (a b : Entry) : Bool :=
+  a.seq > b.seq || (a.seq == b.seq && (a.value.isNone || b.value.isSome))
+
+private theorem cmpR_seq {a b : Entry} (h : cmpR a b = true) : b.seq ≤ a.seq := by
+  unfold cmpR at h
+  simp at h
+  rcases h with hgt | hrest
+  · omega
+  · have hs : a.seq = b.seq := by simpa using hrest.1
+    omega
+
+private theorem cmpR_trans : ∀ a b c : Entry, cmpR a b = true → cmpR b c = true → cmpR a c = true := by
+  intro a b c hab hbc
+  unfold cmpR at *
+  simp at hab hbc ⊢
+  rcases hab with hgt | hrest
+  · rcases hbc with hgt' | hrest'
+    · omega
+    · omega
+  · rcases hbc with hgt' | hrest'
+    · omega
+    · rcases hrest with ⟨habseq, habval⟩
+      rcases hrest' with ⟨hbcseq, hbcval⟩
+      by_cases hc : c.value.isSome = true
+      · right; constructor
+        · omega
+        · right; exact hc
+      · have hbnone : b.value = none := by
+          cases hbv : b.value with
+          | none => rfl
+          | some v =>
+              exfalso
+              have hcsome : c.value.isSome = true := by
+                rcases hbcval with hbnone' | hc'
+                · simp [hbv] at hbnone'
+                · exact hc'
+              exact hc hcsome
+        have hanone : a.value = none := by
+          cases hav : a.value with
+          | none => rfl
+          | some v =>
+              exfalso
+              have hbsome : b.value.isSome = true := by
+                rcases habval with hanone' | hbs'
+                · simp [hav] at hanone'
+                · exact hbs'
+              simp [hbnone] at hbsome
+        right; constructor
+        · omega
+        · left; simp [hanone]
+
+private theorem cmpR_total : ∀ a b : Entry, (cmpR a b || cmpR b a) = true := by
+  intro a b
+  unfold cmpR
+  by_cases hlt : a.seq < b.seq
+  · have hgt : b.seq > a.seq := by omega
+    have hn : ¬ a.seq > b.seq := by omega
+    simp [hgt, hn]
+  · by_cases hgt : a.seq > b.seq
+    · have hn : ¬ b.seq > a.seq := by omega
+      simp [hgt, hn]
+    · have heq : a.seq = b.seq := by omega
+      rw [heq]
+      cases ha : a.value <;> cases hb : b.value <;> simp
+
+private theorem visible_match {xs : List Entry} {k t : Nat} {e : Entry}
+    (h : visible xs k t = some e) : (e.key == k && e.seq ≤ t) = true := by
+  have hf : xs.find? (fun f => f.key == k && f.seq ≤ t) = some e := by
+    simpa [visible] using h
+  exact (List.find?_eq_some_iff_getElem.mp hf).1
+
+theorem RangeTombstone_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.RangeTombstone.Goal := by
+  intro xs ms k t hord huniq
+  let markers := (ms.filter fun m => covers m k m.seq).map fun m => Entry.mk k m.seq none
+  let L := xs ++ markers
+  let SC := L.mergeSort cmpR
+  have hsorted : SC.Pairwise (fun a b => cmpR a b = true) := by
+    unfold SC L
+    exact List.pairwise_mergeSort cmpR_trans cmpR_total _
+  have hSC_of_xs : ∀ e, e ∈ xs → e ∈ SC := by
+    intro e he
+    unfold SC L
+    exact List.mem_mergeSort.mpr (List.mem_append_left markers he)
+  have hSC_of_marker : ∀ e, e ∈ markers → e ∈ SC := by
+    intro e he
+    unfold SC L
+    exact List.mem_mergeSort.mpr (List.mem_append_right xs he)
+  unfold applyMarkers
+  change valueAt SC k t =
+    ((visible xs k t).bind fun e =>
+      if (ms.filter (fun m => covers m k t)).any (fun m => e.seq ≤ m.seq) then none else e.value)
+
+  cases hv : visible SC k t with
+  | none =>
+      cases hvx : visible xs k t with
+      | none => simp [valueAt, hv, hvx]
+      | some e =>
+          have hpred : (e.key == k && e.seq ≤ t) = true := visible_match hvx
+          have hsome : (visible SC k t).isSome = true := by
+            rw [visible]
+            exact List.find?_isSome.mpr ⟨e,
+              hSC_of_xs e (List.mem_of_find?_eq_some (by simpa [visible] using hvx)), hpred⟩
+          simp [hv] at hsome
+  | some z =>
+      have hvf : SC.find? (fun e => e.key == k && e.seq ≤ t) = some z := by
+        simpa [visible] using hv
+      rcases List.find?_eq_some_iff_getElem.mp hvf with ⟨hpz, i, hi, hiz, hbefore⟩
+      have hzkey : (z.key == k) = true := by
+        have hp := hpz; rw [Bool.and_eq_true] at hp; exact hp.1
+      have hzseq : z.seq ≤ t := by
+        have hp := hpz; rw [Bool.and_eq_true] at hp; exact of_decide_eq_true hp.2
+      have hzmem : z ∈ L := by
+        have : z ∈ SC := List.mem_of_find?_eq_some hvf
+        simpa [SC] using (List.mem_mergeSort.mp this)
+      cases hvx : visible xs k t with
+      | none =>
+          have hzmarkers : z ∈ markers := by
+            rcases List.mem_append.mp hzmem with hzxs | hzm
+            · exfalso
+              have hpred : (z.key == k && z.seq ≤ t) = true := by
+                rw [Bool.and_eq_true]; exact ⟨hzkey, decide_eq_true hzseq⟩
+              have hs : (visible xs k t).isSome = true := by
+                rw [visible]; exact List.find?_isSome.mpr ⟨z, hzxs, hpred⟩
+              simp [hvx] at hs
+            · exact hzm
+          have hzval : z.value = none := by
+            rcases List.mem_map.mp hzmarkers with ⟨m, hmfilter, hmz⟩
+            have htmp := congrArg Entry.value hmz
+            simpa using htmp.symm
+          simp [valueAt, hv, hvx, hzval]
+      | some e =>
+          have hpred_e : (e.key == k && e.seq ≤ t) = true := visible_match hvx
+          have hekey : (e.key == k) = true := by
+            have hp := hpred_e; rw [Bool.and_eq_true] at hp; exact hp.1
+          have heseq : e.seq ≤ t := by
+            have hp := hpred_e; rw [Bool.and_eq_true] at hp; exact of_decide_eq_true hp.2
+          have hemem : e ∈ xs := List.mem_of_find?_eq_some (by simpa [visible] using hvx)
+          have hSCe : e ∈ SC := hSC_of_xs e hemem
+          rcases List.mem_iff_getElem.mp hSCe with ⟨j, hjlen, hje⟩
+          have hjge : i ≤ j := by
+            by_cases hjlt : j < i
+            · have hb := hbefore j hjlt
+              simp at hb
+              have hbtrue : (SC[j].key == k && SC[j].seq ≤ t) = true := by
+                rw [hje]; exact hpred_e
+              rw [Bool.and_eq_true] at hbtrue
+              exfalso
+              exact hb.elim (fun hk => hk (by simpa using hbtrue.1))
+                (fun ht => by have := of_decide_eq_true hbtrue.2; omega)
+            · omega
+          have hseqle : e.seq ≤ z.seq := by
+            by_cases hji : j = i
+            · subst j
+              rw [hiz] at hje
+              have hez : e = z := hje.symm
+              subst e
+              omega
+            · have hij : i < j := by omega
+              have hrel := hsorted.rel_getElem_of_lt hi hjlen hij
+              rw [hiz, hje] at hrel
+              exact cmpR_seq hrel
+          rcases List.mem_append.mp hzmem with hzxs | hzmarkers
+          · have hzseqle : z.seq ≤ e.seq := by
+              by_cases hlt : e.seq < z.seq
+              · rcases List.find?_eq_some_iff_getElem.mp (by simpa [visible] using hvx) with
+                  ⟨_, ie2, hie2len, hie2, hbeforexs⟩
+                rcases List.mem_iff_getElem.mp hzxs with ⟨iz, hizlenxs, hizz⟩
+                have hizlt : iz < ie2 := by
+                  by_cases hb : iz < ie2
+                  · exact hb
+                  · have hle : ie2 ≤ iz := by omega
+                    have hne : ie2 ≠ iz := by
+                      intro heq
+                      subst ie2
+                      have hez' : e = z := hie2.symm.trans hizz
+                      have hseqeq : e.seq = z.seq := by rw [hez']
+                      omega
+                    have hlt2 : ie2 < iz := by omega
+                    have hrel := hord.rel_getElem_of_lt hie2len hizlenxs hlt2
+                    have hzle : z.seq ≤ e.seq := by simpa [hie2, hizz] using hrel
+                    omega
+                have hbxs0 := hbeforexs iz hizlt
+                simp at hbxs0
+                rw [hizz] at hbxs0
+                have hzpred : (z.key == k && z.seq ≤ t) = true := by
+                  rw [Bool.and_eq_true]; exact ⟨hzkey, decide_eq_true hzseq⟩
+                exfalso
+                exact hbxs0.elim
+                  (fun hk => hk (by simpa using hzkey))
+                  (fun ht => by omega)
+              · exact Nat.le_of_not_gt hlt
+            have hzeqseq : z.seq = e.seq := by omega
+            have hzkey' : z.key = k := by simpa using hzkey
+            have hekey' : e.key = k := by simpa using hekey
+            have hze : z = e := by
+              rcases List.mem_iff_getElem.mp hzxs with ⟨iz, hizlen, hizz⟩
+              rcases List.mem_iff_getElem.mp hemem with ⟨ie, hielen, hie⟩
+              have hi_map : iz < (xs.map fun q : Entry => (q.key, q.seq)).length := by simpa using hizlen
+              have hj_map : ie < (xs.map fun q : Entry => (q.key, q.seq)).length := by simpa using hielen
+              have hpair : (xs.map fun q : Entry => (q.key, q.seq))[iz] =
+                  (xs.map fun q : Entry => (q.key, q.seq))[ie] := by
+                rw [List.getElem_map (f := fun q : Entry => (q.key, q.seq)) (h := hi_map),
+                    List.getElem_map (f := fun q : Entry => (q.key, q.seq)) (h := hj_map)]
+                simp [hizz, hie, hzkey', hekey', hzeqseq]
+              have hidx : iz = ie := (huniq.getElem_inj (hi := hi_map) (hj := hj_map)).mp hpair
+              cases hidx
+              exact hizz.symm.trans hie
+            by_cases hval : e.value = none
+            · simp [valueAt, hv, hvx, hze, hval]
+            · have hno : (ms.filter (fun m => covers m k t)).any (fun m => e.seq ≤ m.seq) = false := by
+                by_cases hany : (ms.filter (fun m => covers m k t)).any (fun m => e.seq ≤ m.seq) = true
+                · rcases List.any_eq_true.mp hany with ⟨m, hmfilter, hmleB⟩
+                  have hmle : e.seq ≤ m.seq := of_decide_eq_true hmleB
+                  have hcovt : covers m k t := (List.mem_filter.mp hmfilter).2
+                  have hcovseq : covers m k m.seq := by
+                    rw [covers] at hcovt ⊢
+                    simp at hcovt ⊢
+                    omega
+                  have hymark : Entry.mk k m.seq none ∈ markers := by
+                    unfold markers
+                    exact List.mem_map.mpr ⟨m,
+                      List.mem_filter.mpr ⟨(List.mem_filter.mp hmfilter).1, hcovseq⟩, rfl⟩
+                  have hySC : Entry.mk k m.seq none ∈ SC := hSC_of_marker _ hymark
+                  rcases List.mem_iff_getElem.mp hySC with ⟨jy, hjylen, hjey⟩
+                  have hymatch : ((Entry.mk k m.seq none).key == k &&
+                      (Entry.mk k m.seq none).seq ≤ t) = true := by
+                    rw [Bool.and_eq_true]
+                    refine ⟨by simp, decide_eq_true ?_⟩
+                    have hmseingt : m.seq ≤ t := by
+                      have hcovt' := hcovt
+                      rw [covers] at hcovt'
+                      simp at hcovt'
+                      omega
+                    exact hmseingt
+                  by_cases hylt : jy < i
+                  · have hb := hbefore jy hylt
+                    simp at hb
+                    have hytrue : (SC[jy].key == k && SC[jy].seq ≤ t) = true := by
+                      rw [hjey]; exact hymatch
+                    rw [Bool.and_eq_true] at hytrue
+                    exfalso
+                    exact hb.elim (fun hk => hk (by simpa using hytrue.1))
+                      (fun ht => by have := of_decide_eq_true hytrue.2; omega)
+                  · have hijy : i < jy ∨ i = jy := by omega
+                    rcases hijy with hijy | hieq
+                    · have hrel := hsorted.rel_getElem_of_lt hi hjylen hijy
+                      rw [hiz, hjey] at hrel
+                      have hmle' : m.seq ≤ z.seq := cmpR_seq hrel
+                      have hmle'' : m.seq ≤ e.seq := by simpa [hze] using hmle'
+                      have hmseqeq : m.seq = e.seq := by omega
+                      have hrelE : cmpR e (Entry.mk k m.seq none) = true := by
+                        simpa [hze] using hrel
+                      have hties : ¬ cmpR e (Entry.mk k m.seq none) = true := by
+                        unfold cmpR
+                        simp [hmseqeq, hval]
+                      exfalso
+                      exact hties hrelE
+                    · subst jy
+                      rw [hjey] at hiz
+                      have hzy : z = Entry.mk k m.seq none := hiz.symm
+                      have : e = Entry.mk k m.seq none := hze.symm.trans hzy
+                      simp [this] at hval
+                · simp [hany]
+              rw [show valueAt SC k t = z.value by simp [valueAt, hv], hze]
+              simp only [Option.bind_some]
+              simp [hno]
+          · rcases List.mem_map.mp hzmarkers with ⟨m, hmfilter, hmz⟩
+            have hcovseq : covers m k m.seq := (List.mem_filter.mp hmfilter).2
+            have hzval : z.value = none := by
+              have htmp := congrArg Entry.value hmz
+              simpa using htmp.symm
+            have hmseingt : m.seq ≤ t := by
+              have htmp := congrArg Entry.seq hmz
+              have hmzseq : m.seq = z.seq := by simpa using htmp
+              omega
+            have hmseqle : e.seq ≤ m.seq := by
+              by_cases hle : e.seq ≤ m.seq
+              · exact hle
+              · have hlt : m.seq < e.seq := by omega
+                by_cases hjlt : j < i
+                · have hb := hbefore j hjlt
+                  simp at hb
+                  have hbtrue : (SC[j].key == k && SC[j].seq ≤ t) = true := by
+                    rw [hje]; exact hpred_e
+                  rw [Bool.and_eq_true] at hbtrue
+                  exfalso
+                  exact hb.elim (fun hk => hk (by simpa using hbtrue.1))
+                    (fun ht => by have := of_decide_eq_true hbtrue.2; omega)
+                · have hij : i < j ∨ i = j := by omega
+                  rcases hij with hij | hieq
+                  · have hrel := hsorted.rel_getElem_of_lt hi hjlen hij
+                    rw [hiz, hje] at hrel
+                    rw [← hmz] at hrel
+                    have hle' : e.seq ≤ m.seq := by simpa using cmpR_seq hrel
+                    omega
+                  · subst j
+                    rw [hje] at hiz
+                    have hze : z = e := hiz.symm
+                    rw [hze] at hmz
+                    have : m.seq = e.seq := by
+                      have := congrArg Entry.seq hmz
+                      simpa using this
+                    omega
+            have hcovt : covers m k t := by
+              rw [covers] at hcovseq ⊢
+              simp at hcovseq ⊢
+              omega
+            have hany : (ms.filter (fun mm => covers mm k t)).any (fun mm => e.seq ≤ mm.seq) = true := by
+              apply List.any_eq_true.mpr
+              refine ⟨m, List.mem_filter.mpr ⟨(List.mem_filter.mp hmfilter).1, hcovt⟩, decide_eq_true hmseqle⟩
+            rw [show valueAt SC k t = z.value by simp [valueAt, hv], hzval]
+            simp only [Option.bind_some]
+            simp [hany]
+
+/-! ---------- DominatedRun ----------
+`newest` is a stable sort by descending sequence. Std exposes that stability via
+`mergeSort_zipIdx`: sorting the index-tagged list with `zipIdxLE` is the same as
+sorting the plain list, and `zipIdxLE` breaks sequence ties by input position.
+So the tagged sort is a strict total order on a list with distinct indices,
+which lets us identify the visible winner and argue that a strictly older run
+can never overtake it. -/
+
+private def leD (a b : Entry) : Bool := b.seq ≤ a.seq
+
+private theorem newest_eq (xs : List Entry) : newest xs = xs.mergeSort leD := by
+  rfl
+
+private theorem leD_trans : ∀ a b c : Entry, leD a b = true → leD b c = true → leD a c = true := by
+  intro a b c hab hbc
+  simp [leD] at hab hbc ⊢
+  omega
+
+private theorem leD_total : ∀ a b : Entry, (leD a b || leD b a) = true := by
+  intro a b
+  unfold leD
+  by_cases h : b.seq ≤ a.seq
+  · simp [h]
+  · have h2 : a.seq ≤ b.seq := by omega
+    simp [h, h2]
+
+private theorem relD_old (e f : Entry) (i j : Nat) (hlt : f.seq < e.seq) :
+    List.zipIdxLE leD (e, i) (f, j) = true := by
+  unfold List.zipIdxLE leD
+  have h1 : f.seq ≤ e.seq := by omega
+  have h2 : ¬ e.seq ≤ f.seq := by omega
+  simp [h1, h2]
+
+private theorem relD_both_same_idx {u v : Entry × Nat}
+    (huv : List.zipIdxLE leD u v = true) (hvu : List.zipIdxLE leD v u = true) :
+    u.2 = v.2 := by
+  unfold List.zipIdxLE leD at huv hvu
+  simp at huv hvu
+  omega
+
+private theorem relD_antisymm_of_mem {S : List (Entry × Nat)}
+    (hnd : (S.map (fun z : Entry × Nat => z.2)).Nodup)
+    {u v : Entry × Nat} (hu : u ∈ S) (hv : v ∈ S)
+    (huv : List.zipIdxLE leD u v = true) (hvu : List.zipIdxLE leD v u = true) : u = v := by
+  have hidx : u.2 = v.2 := relD_both_same_idx huv hvu
+  rcases List.mem_iff_getElem.mp hu with ⟨i1, hi1, hui⟩
+  rcases List.mem_iff_getElem.mp hv with ⟨i2, hi2, hvi⟩
+  have hi1m : i1 < (S.map (fun z : Entry × Nat => z.2)).length := by simpa using hi1
+  have hi2m : i2 < (S.map (fun z : Entry × Nat => z.2)).length := by simpa using hi2
+  have hsnds : (S.map (fun z : Entry × Nat => z.2))[i1] =
+      (S.map (fun z : Entry × Nat => z.2))[i2] := by
+    rw [List.getElem_map (f := fun z : Entry × Nat => z.2) (h := hi1m),
+        List.getElem_map (f := fun z : Entry × Nat => z.2) (h := hi2m), hui, hvi, hidx]
+  have hi_eq : i1 = i2 := hnd.eq_of_getElem_eq (by simpa using hi1) (by simpa using hi2) hsnds
+  subst i2
+  exact hui.symm.trans hvi
+
+private theorem nodup_snd_mergeSort (l : List Entry) :
+    ((l.zipIdx.mergeSort (List.zipIdxLE leD)).map (fun z : Entry × Nat => z.2)).Nodup := by
+  have hp := List.mergeSort_perm l.zipIdx (List.zipIdxLE leD)
+  have hpm := hp.map (fun z : Entry × Nat => z.2)
+  have hnd : (l.zipIdx.map (fun z : Entry × Nat => z.2)).Nodup := by
+    rw [List.zipIdx_map_snd]
+    exact List.nodup_range'
+  exact hnd.perm hpm.symm
+
+private theorem find?_map_fst_lift {L : List (Entry × Nat)} {p : Entry → Bool} {e : Entry}
+    (h : (L.map Prod.fst).find? p = some e) :
+    ∃ z ∈ L, z.1 = e ∧ L.find? (fun z : Entry × Nat => p z.1) = some z := by
+  rcases List.find?_eq_some_iff_getElem.mp h with ⟨hpE, i, hi, hLi, hbefore⟩
+  have hiL : i < L.length := by simpa using hi
+  have hLi1 : L[i].1 = e := by
+    have hLi' := hLi
+    rw [List.getElem_map (f := Prod.fst) (h := hi)] at hLi'
+    exact hLi'
+  refine ⟨L[i], List.getElem_mem hiL, hLi1, ?_⟩
+  apply List.find?_eq_some_iff_getElem.mpr
+  constructor
+  · simpa [hLi1] using hpE
+  · refine ⟨i, hiL, rfl, ?_⟩
+    intro j hj
+    have hb := hbefore j hj
+    have hjm : j < (L.map Prod.fst).length := by omega
+    simpa [List.getElem_map (f := Prod.fst) (h := hjm)] using hb
+
+private theorem find?_of_find?_map : ∀ (L : List (Entry × Nat)) {p : Entry → Bool}
+    {z : Entry × Nat}, L.find? (fun w : Entry × Nat => p w.1) = some z →
+    (L.map Prod.fst).find? p = some z.1
+  | [], _, _, h => by simp at h
+  | u :: us, p, z, h => by
+      simp only [List.map_cons, List.find?_cons]
+      by_cases hpu : p u.1 = true
+      · have huz : u = z := by simpa [hpu] using h
+        subst z
+        simp [hpu]
+      · have htail : us.find? (fun w : Entry × Nat => p w.1) = some z := by
+          simpa [hpu] using h
+        have ht := find?_of_find?_map us htail
+        simp [hpu, ht]
+
+private theorem find?_min_of_sorted {L : List (Entry × Nat)}
+    (hs : L.Pairwise (fun u v : Entry × Nat => List.zipIdxLE leD u v = true))
+    {q : Entry × Nat → Bool} {z : Entry × Nat}
+    (hz : L.find? q = some z) :
+    ∀ y ∈ L, q y = true → y = z ∨ List.zipIdxLE leD z y = true := by
+  rcases List.find?_eq_some_iff_getElem.mp hz with ⟨hqz, i, hi, hLi, hbefore⟩
+  intro y hy hqy
+  rcases List.mem_iff_getElem.mp hy with ⟨j, hjlen, hjy⟩
+  by_cases hji : j = i
+  · subst j
+    left
+    exact hjy.symm.trans hLi
+  · by_cases hlt : j < i
+    · have hb := hbefore j hlt
+      simp at hb
+      have hqj : q L[j] = true := by simpa [hjy] using hqy
+      rw [hqj] at hb
+      simp at hb
+    · have hij : i < j := by omega
+      right
+      have hrel := hs.rel_getElem_of_lt hi hjlen hij
+      rw [hLi, hjy] at hrel
+      exact hrel
+
+theorem DominatedRun_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.DominatedRun.Goal := by
+  intro a b k t e hvis hb
+  let le := List.zipIdxLE leD
+  let SA := a.zipIdx.mergeSort le
+  let SB := (a ++ b).zipIdx.mergeSort le
+  let p : Entry → Bool := fun x => x.key == k && x.seq ≤ t
+  let q : Entry × Nat → Bool := fun z => p z.1
+  have hsa : SA.Pairwise (fun u v : Entry × Nat => le u v = true) := by
+    dsimp [SA, le]
+    exact List.pairwise_mergeSort (List.zipIdxLE_trans leD_trans) (List.zipIdxLE_total leD_total) _
+  have hsb : SB.Pairwise (fun u v : Entry × Nat => le u v = true) := by
+    dsimp [SB, le]
+    exact List.pairwise_mergeSort (List.zipIdxLE_trans leD_trans) (List.zipIdxLE_total leD_total) _
+  have hSAeq : SA.map Prod.fst = newest a := by
+    dsimp [SA, le]
+    simpa [newest_eq] using (List.mergeSort_zipIdx (le := leD) (l := a))
+  have hSBeq : SB.map Prod.fst = newest (a ++ b) := by
+    dsimp [SB, le]
+    simpa [newest_eq] using (List.mergeSort_zipIdx (le := leD) (l := a ++ b))
+  have hvismap : (SA.map Prod.fst).find? p = some e := by
+    simpa [visible, p, hSAeq] using hvis
+  rcases find?_map_fst_lift hvismap with ⟨⟨e', i⟩, hzeSA, hze1, hfindSA⟩
+  simp at hze1
+  subst e'
+  have hqze : q (e, i) = true := List.find?_some hfindSA
+  have hminA : ∀ y ∈ SA, q y = true → y = (e, i) ∨ le (e, i) y = true :=
+    find?_min_of_sorted hsa hfindSA
+  have hndSB : (SB.map (fun z : Entry × Nat => z.2)).Nodup := by
+    dsimp [SB, le]
+    exact nodup_snd_mergeSort (a ++ b)
+  have hzeA_sort : (e, i) ∈ a.zipIdx.mergeSort le := by simpa [SA] using hzeSA
+  have hzeInAzip : (e, i) ∈ a.zipIdx :=
+    (List.mem_mergeSort (a := (e, i)) (l := a.zipIdx) (le := le)).mp hzeA_sort
+  have hzeInABzip : (e, i) ∈ (a ++ b).zipIdx := by
+    rw [List.zipIdx_append]
+    exact List.mem_append_left _ hzeInAzip
+  have hzeAB_sort : (e, i) ∈ (a ++ b).zipIdx.mergeSort le := by
+    exact (List.mem_mergeSort (a := (e, i)) (l := (a ++ b).zipIdx) (le := le)).mpr hzeInABzip
+  have hzeSB : (e, i) ∈ SB := by simpa [SB] using hzeAB_sort
+  have hminB : ∀ z ∈ SB, q z = true → z = (e, i) ∨ le (e, i) z = true := by
+    intro z hzSB hqz
+    have hzsort : z ∈ (a ++ b).zipIdx.mergeSort le := by simpa [SB] using hzSB
+    have hzzip : z ∈ (a ++ b).zipIdx :=
+      (List.mem_mergeSort (a := z) (l := (a ++ b).zipIdx) (le := le)).mp hzsort
+    rw [List.zipIdx_append] at hzzip
+    rcases List.mem_append.mp hzzip with hza | hzb
+    · have hza_sort : z ∈ a.zipIdx.mergeSort le :=
+        (List.mem_mergeSort (a := z) (l := a.zipIdx) (le := le)).mpr hza
+      have hzSA : z ∈ SA := by simpa [SA] using hza_sort
+      exact hminA z hzSA hqz
+    · have hfbin : z.1 ∈ b := List.fst_mem_of_mem_zipIdx hzb
+      have hseq : z.1.seq < e.seq := hb z.1 hfbin
+      right
+      dsimp [le]
+      exact relD_old e z.1 i z.2 hseq
+  rcases List.mem_iff_getElem.mp hzeSB with ⟨idx, hidxlen, hidxval⟩
+  have hfindSB : SB.find? q = some (e, i) := by
+    apply List.find?_eq_some_iff_getElem.mpr
+    constructor
+    · exact hqze
+    · refine ⟨idx, hidxlen, hidxval, ?_⟩
+      intro j hjlt
+      by_cases hqj : q SB[j] = true
+      · exfalso
+        have hjlen : j < SB.length := by omega
+        have hneq : SB[j] ≠ (e, i) := by
+          intro heq
+          have hjlenM : j < (SB.map (fun z : Entry × Nat => z.2)).length := by simpa using hjlen
+          have hidxlenM : idx < (SB.map (fun z : Entry × Nat => z.2)).length := by simpa using hidxlen
+          have hsnds : (SB.map (fun z : Entry × Nat => z.2))[j] =
+              (SB.map (fun z : Entry × Nat => z.2))[idx] := by
+            rw [List.getElem_map (f := fun z : Entry × Nat => z.2) (h := hjlenM),
+                List.getElem_map (f := fun z : Entry × Nat => z.2) (h := hidxlenM), hidxval, heq]
+          have hjidx : j = idx := hndSB.eq_of_getElem_eq hjlenM hidxlenM hsnds
+          omega
+        have hrelfwd : le SB[j] (e, i) = true := by
+          have hrel := hsb.rel_getElem_of_lt hjlen hidxlen hjlt
+          rw [hidxval] at hrel
+          exact hrel
+        rcases hminB SB[j] (List.getElem_mem hjlen) hqj with hjEq | hjRel
+        · exact hneq hjEq
+        · have heq : SB[j] = (e, i) := by
+            apply relD_antisymm_of_mem hndSB (List.getElem_mem hjlen) hzeSB
+            · exact hrelfwd
+            · exact hjRel
+          exact hneq heq
+      · simp [hqj]
+  have hmapfinal : (SB.map Prod.fst).find? p = some e := by
+    simpa using find?_of_find?_map SB hfindSB
+  simpa [visible, p, hSBeq] using hmapfinal
+
+theorem OverlayAggregate_sound :
+    TinylambOpt.ResearchGoals.VersionedIndexes.OverlayAggregate.Goal := by
+  intro a b ks t
+  induction ks with
+  | nil => simp [total]
+  | cons k ks ih =>
+      rw [List.filter_cons]
+      by_cases h : (visible a k t).isNone
+      · simp [h]
+        rw [total_cons (a ++ b), total_cons a, total_cons b, ih, valueAt_append_key]
+        simp [h, Int.add_assoc, Int.add_left_comm, Int.add_comm]
+      · simp [h]
+        rw [total_cons (a ++ b), total_cons a, ih, valueAt_append_key]
+        simp [h, Int.add_assoc]
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.VersionedIndexes
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

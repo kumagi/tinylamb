@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Reference execution: two separate scans of `T` (total `2 * T.length` base-row touches),
+followed by joining edges `(e.src = r1.id ∧ e.dst = r2.id)`.
+
+Single-pass shared scan + dual role-bitmask split: scans `T` once (`T.length` row
+touches), tags each row with `(cond1, cond2)` role bits, and resolves edge joins without
+a second table scan.
+
+Modeled claims
+
+- `Goal` — Self-join shared base scan with dual role bitmasks (LDBC L1 `person p / p2`
+  / STATS-CEB C2 `users u / u2`): building a single tagged node table with 2 role
+  filter bits `(cond1, cond2)` in one pass over `T` yields the exact same join pairs
+  as two independent base scans for every table and edge set, while halving base-row
+  scan touches whenever `T ≠ []`.
+-/
+
 namespace TinylambOpt.ResearchGoals.SelfJoinSharedScanDualFilterSplit
 
 structure BaseRow where

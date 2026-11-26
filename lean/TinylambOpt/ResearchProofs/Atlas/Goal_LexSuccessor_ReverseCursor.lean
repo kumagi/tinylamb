@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `LexSuccessor.ReverseCursor` — `∀ p rs, rs.Pairwise (fun a b => a.1.x < b.1.x ∨
+  (a.1.x = b.1.x ∧ a.1.y ≤ b.1.y)) → scan shape p rs = ((rs.dropWhile (fun r =>
+  !shape.qualifies p r.1)).map Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
 /-! One reusable physical block of a spill store. A logical drop prevents new

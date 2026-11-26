@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `LaneCompaction.ChunkOffsets` — `∀ a b, slots (a++b) = slots a ++ (slots b).map
+  (a.length+·)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

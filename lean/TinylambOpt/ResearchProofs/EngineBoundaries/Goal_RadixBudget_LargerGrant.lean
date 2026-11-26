@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `LargerGrant` — Hot-key fallback pressure can only decrease when the same plan gets a
+  larger grant.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

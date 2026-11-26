@@ -1,5 +1,16 @@
 import Std
 
+/-!
+(partition key, measure, payload)
+
+QUALIFY is applied after the window value is computed.
+
+Modeled claims
+
+- `Goal` — `∀ (w : Row → Bool) (q : Int → Bool) (rows : List Row), PartitionOnly w →
+  whereFilter w (qualify q rows) = qualify q (whereFilter w rows)`
+-/
+
 namespace TinylambOpt.ProposedGoals.QualifyPushdown
 
 /-- (partition key, measure, payload) -/

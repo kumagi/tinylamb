@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_RowMajor_Nonoverlap
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `RowMajor.PlanePredicate` — BIT_TEST can produce matching row IDs from a single
+  physical bit per row.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

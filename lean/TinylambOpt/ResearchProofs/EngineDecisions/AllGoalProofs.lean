@@ -22,3 +22,11 @@ import TinylambOpt.ResearchProofs.EngineDecisions.Goal_OverlayCache
 import TinylambOpt.ResearchProofs.EngineDecisions.Goal_RangeFingers
 import TinylambOpt.ResearchProofs.EngineDecisions.Goal_RunOffset
 import TinylambOpt.ResearchProofs.EngineDecisions.Goal_SealedBuild
+
+/-!
+This module collects proofs for Goal Demand Cache, Goal Distinct Exclude Ties, Goal
+Exists Durability, Goal Flush Choice and related cases.
+
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+-/

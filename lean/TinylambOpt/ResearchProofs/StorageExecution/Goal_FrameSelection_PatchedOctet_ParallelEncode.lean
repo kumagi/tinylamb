@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `PatchedOctet.ParallelEncode` — Independent workers may force a boundary; global
+  optimum is bounded by the sum of their plans.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

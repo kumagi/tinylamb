@@ -1,5 +1,39 @@
 import TinylambOpt.ResearchGoals.Frontiers.RankedJoins
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `BoxCertificate` — `∀ (boxes : List (Int × List Int)) (seed : List Int) k cutoff, k ≤
+  seed.countP (· ≤ cutoff) → (∀ b ∈ boxes, ∀ v ∈ b.2, b.1 ≤ v) → best k (seed ++
+  boxes.flatMap Prod.snd) = best k (seed ++ (boxes.filter (·.1 ≤ cutoff)).flatMap
+  Prod.snd)`
+- `DistinctOverfetch` — `∀ (xs : List Int) k cap, (∀ x ∈ xs, xs.count x ≤ cap) → ((best
+  (k*cap) xs).eraseDups.take k) = best k xs.eraseDups`
+- `IntervalWinners` — `∀ (winners rest : List Nat) (lo hi score : Nat → Int), (∀ x ∈
+  winners ++ rest, lo x ≤ score x ∧ score x ≤ hi x) → (∀ x ∈ winners, ∀ y ∈ rest, hi
+  x < lo y) → ((winners ++ rest).mergeSort (fun x y => score x ≤ score y)).take
+  winners.length = winners.mergeSort (fun x y => score x ≤ score y)`
+- `RankByCut` — `∀ a b k (bound : Int), k < a.length*b.length → ((sums a
+  b).mergeSort[k]?.any (· ≤ bound) = true ↔ k < (a.map (fun x =>
+  (b.mergeSort.takeWhile (· ≤ bound-x)).length)).sum)`
+- `TieMass` — `∀ (rows : List (Int × Nat)) k cutoff, pick (rows.mergeSort (fun a b =>
+  a.1 ≤ b.1)) k = some cutoff → let xs := rows.flatMap (fun (v,w) => List.replicate w
+  v) let lt := ((rows.filter (·.1 < cutoff)).map Prod.snd).sum let eq :=
+  ((rows.filter (·.1 == cutoff)).map Prod.snd).sum lt ≤ k ∧ k < lt+eq ∧
+  (xs.mergeSort.takeWhile (· ≤ cutoff)).length = lt+eq`
+- `WeightedSeek` — `∀ (rows : List (Int × Nat)) k, pick (rows.mergeSort (fun a b => a.1
+  ≤ b.1)) k = (rows.flatMap (fun (v,w) => List.replicate w v)).mergeSort[k]?`
+
+Refuted by counterexample
+
+- `MeanHoleBudget` — `∀ a b ok k h, (a.map (fun x => b.countP (fun y => !ok x y))).sum
+  ≤ h * min a.length b.length → best k (qualified a b ok) = best k (qualified (best
+  (k+h) a) (best (k+h) b) ok)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.RankedJoins
 
 open TinylambOpt.ResearchGoals.Frontiers.RankedJoins
@@ -1214,3 +1248,6 @@ theorem refutation_MeanHoleBudget :
 
 
 end TinylambOpt.ResearchProofs.Frontiers.RankedJoins
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

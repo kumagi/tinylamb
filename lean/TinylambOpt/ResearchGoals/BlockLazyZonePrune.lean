@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims relate block summaries to the qualifying rows of a reference scan. SQL can
+omit a block only when the summary excludes every match.
+
+Modeled claims
+
+- `Goal` — Two-stage lazy block pruning (`table/tlcs_file.cpp`,
+  `executor/relational_regression_test_part4.cpp`): ZoneMap headers gate key
+  decoding, and payload columns are decoded only on blocks with ≥ 1 match.
+-/
+
 namespace TinylambOpt.ResearchGoals.BlockLazyZonePrune
 
 structure Block where

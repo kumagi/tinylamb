@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Frontiers.RankedJoins
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `NearPairs` — `∀ (xs : List Int) (d : Nat), let a := xs.mergeSort let directed :=
+  (a.map (fun x => (a.takeWhile (· ≤ x+(d:Int))).length - (a.takeWhile (· <
+  x-(d:Int))).length)).sum (directed-a.length)/2 = (xs.zipIdx.map (fun (x,i) =>
+  (xs.drop (i+1)).countP (fun y => (x-y).natAbs ≤ d))).sum`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.RankedJoinsNear
 
 private theorem sortedInt (xs : List Int) : xs.mergeSort.Pairwise (fun a b : Int => a ≤ b) := by
@@ -229,3 +241,6 @@ theorem NearPairs_sound : TinylambOpt.ResearchGoals.Frontiers.RankedJoins.NearPa
   exact hlater
 
 end TinylambOpt.ResearchProofs.Frontiers.RankedJoinsNear
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

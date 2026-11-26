@@ -1619,7 +1619,7 @@ StatusOr<std::optional<Relation>> TryDictionaryAggregate(
                            AggregationType::kSum;
       if (is_count || is_int_sum) {
         // Lean proof:
-        // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+        // lean/TinylambOpt/ResearchProofs/StableRadix.lean
         // (sound)
         const size_t nslot = numeric_slots[item.index];
         RadixSortIndicesByUint64Key(
@@ -2415,7 +2415,7 @@ StatusOr<std::optional<Relation>> TryCompositeDictionaryAggregate(
                 AggregationType::kSum;
         if (is_count || is_int_sum) {
           // Lean proof:
-          // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+          // lean/TinylambOpt/ResearchProofs/StableRadix.lean
           // (sound)
           const size_t nslot = numeric_slots[item.index];
           RadixSortIndicesByUint64Key(

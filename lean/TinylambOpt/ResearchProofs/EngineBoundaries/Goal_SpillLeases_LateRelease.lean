@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Proved
+
+- `LateRelease` — A stale release from an old generation cannot decrement the new
+  block's pin count.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

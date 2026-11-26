@@ -152,6 +152,434 @@ void AppendUint32(std::string* output, uint32_t value) {
   output->push_back(static_cast<char>(value & 0xffU));
 }
 
+namespace {
+
+constexpr int64_t kPgDateEpochOffsetDays = 10957;  // 2000-01-01 - 1970-01-01.
+
+inline void WriteBe16(char* dst, uint16_t value) noexcept {
+  dst[0] = static_cast<char>((value >> 8U) & 0xffU);
+  dst[1] = static_cast<char>(value & 0xffU);
+}
+
+inline void WriteBe32(char* dst, uint32_t value) noexcept {
+  dst[0] = static_cast<char>((value >> 24U) & 0xffU);
+  dst[1] = static_cast<char>((value >> 16U) & 0xffU);
+  dst[2] = static_cast<char>((value >> 8U) & 0xffU);
+  dst[3] = static_cast<char>(value & 0xffU);
+}
+
+inline void WriteBe64(char* dst, uint64_t value) noexcept {
+  dst[0] = static_cast<char>((value >> 56U) & 0xffU);
+  dst[1] = static_cast<char>((value >> 48U) & 0xffU);
+  dst[2] = static_cast<char>((value >> 40U) & 0xffU);
+  dst[3] = static_cast<char>((value >> 32U) & 0xffU);
+  dst[4] = static_cast<char>((value >> 24U) & 0xffU);
+  dst[5] = static_cast<char>((value >> 16U) & 0xffU);
+  dst[6] = static_cast<char>((value >> 8U) & 0xffU);
+  dst[7] = static_cast<char>(value & 0xffU);
+}
+
+inline void AppendUint64(std::string* output, uint64_t value) {
+  std::array<char, 8> buf{};
+  WriteBe64(buf.data(), value);
+  output->append(buf.data(), buf.size());
+}
+
+inline uint16_t ResolveColumnFormat(const std::vector<uint16_t>& result_formats,
+                                    size_t col_idx) noexcept {
+  if (result_formats.empty()) {
+    return 0;
+  }
+  if (result_formats.size() == 1) {
+    return result_formats[0];
+  }
+  return col_idx < result_formats.size() ? result_formats[col_idx] : 0;
+}
+
+StatusOr<std::string> ReadCString(std::string_view payload, size_t* cursor) {
+  const size_t nul = payload.find('\0', *cursor);
+  if (nul == std::string_view::npos) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unterminated C-string in PostgreSQL message");
+  }
+  std::string out(payload.substr(*cursor, nul - *cursor));
+  *cursor = nul + 1;
+  return out;
+}
+
+StatusOr<std::string> RenderParamAsSqlLiteral(
+    uint32_t param_oid, uint16_t format_code,
+    const std::optional<std::string>& raw) {
+  if (!raw.has_value()) {
+    return std::string("NULL");
+  }
+  const std::string& bytes = *raw;
+  if (format_code == 1) {
+    // Binary parameter decoding for standard PostgreSQL OIDs.
+    if (param_oid == 20 && bytes.size() == 8) {  // int8
+      const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+      const uint64_t u = (static_cast<uint64_t>(p[0]) << 56U) |
+                         (static_cast<uint64_t>(p[1]) << 48U) |
+                         (static_cast<uint64_t>(p[2]) << 40U) |
+                         (static_cast<uint64_t>(p[3]) << 32U) |
+                         (static_cast<uint64_t>(p[4]) << 24U) |
+                         (static_cast<uint64_t>(p[5]) << 16U) |
+                         (static_cast<uint64_t>(p[6]) << 8U) |
+                         static_cast<uint64_t>(p[7]);
+      return std::to_string(std::bit_cast<int64_t>(u));
+    }
+    if (param_oid == 23 && bytes.size() == 4) {  // int4
+      ASSIGN_OR_RETURN(uint32_t, u, ReadUint32(bytes, 0));
+      return std::to_string(std::bit_cast<int32_t>(u));
+    }
+    if (param_oid == 21 && bytes.size() == 2) {  // int2
+      ASSIGN_OR_RETURN(uint16_t, u, ReadUint16(bytes, 0));
+      return std::to_string(std::bit_cast<int16_t>(u));
+    }
+    if (param_oid == 701 && bytes.size() == 8) {  // float8
+      const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+      const uint64_t u = (static_cast<uint64_t>(p[0]) << 56U) |
+                         (static_cast<uint64_t>(p[1]) << 48U) |
+                         (static_cast<uint64_t>(p[2]) << 40U) |
+                         (static_cast<uint64_t>(p[3]) << 32U) |
+                         (static_cast<uint64_t>(p[4]) << 24U) |
+                         (static_cast<uint64_t>(p[5]) << 16U) |
+                         (static_cast<uint64_t>(p[6]) << 8U) |
+                         static_cast<uint64_t>(p[7]);
+      const double d = std::bit_cast<double>(u);
+      if (std::isnan(d)) {
+        return std::string("CAST('NaN' AS FLOAT64)");
+      }
+      if (d == std::numeric_limits<double>::infinity()) {
+        return std::string("CAST('Infinity' AS FLOAT64)");
+      }
+      if (d == -std::numeric_limits<double>::infinity()) {
+        return std::string("CAST('-Infinity' AS FLOAT64)");
+      }
+      return FormatDoubleShortest(d);
+    }
+    if (param_oid == 1082 && bytes.size() == 4) {  // date
+      ASSIGN_OR_RETURN(uint32_t, u, ReadUint32(bytes, 0));
+      const int64_t unix_days =
+          static_cast<int64_t>(std::bit_cast<int32_t>(u)) +
+          kPgDateEpochOffsetDays;
+      return "DATE '" + Value::DateFromDays(unix_days).AsString() + "'";
+    }
+    if (param_oid == 16 && bytes.size() == 1) {  // bool
+      return bytes[0] != 0 ? std::string("TRUE") : std::string("FALSE");
+    }
+  }
+  // Numeric text OIDs render unquoted when syntactically valid.
+  if (format_code == 0 &&
+      (param_oid == 20 || param_oid == 21 || param_oid == 23)) {
+    int64_t parsed = 0;
+    const auto res =
+        std::from_chars(bytes.data(), bytes.data() + bytes.size(), parsed);
+    if (res.ec == std::errc{} && res.ptr == bytes.data() + bytes.size()) {
+      return bytes;
+    }
+  }
+  if (format_code == 0 && (param_oid == 700 || param_oid == 701)) {
+    double parsed = 0.0;
+    const auto res =
+        std::from_chars(bytes.data(), bytes.data() + bytes.size(), parsed);
+    if (res.ec == std::errc{} && res.ptr == bytes.data() + bytes.size() &&
+        std::isfinite(parsed)) {
+      return bytes;
+    }
+  }
+  // Default: single-quoted SQL string literal (escaping quotes and backslashes
+  // because GoogleSQL interprets backslash escapes).
+  std::string out;
+  out.reserve(bytes.size() + 2);
+  out.push_back('\'');
+  for (const char ch : bytes) {
+    if (ch == '\'' || ch == '\\') {
+      out.push_back('\\');
+    }
+    out.push_back(ch);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+void AppendBinaryValue(std::string* wire_out, const Value& value) {
+  if (value.IsNull()) {
+    AppendUint32(wire_out, std::numeric_limits<uint32_t>::max());
+    return;
+  }
+  switch (value.type) {
+    case ValueType::kInt64:
+      AppendUint32(wire_out, 8);
+      AppendUint64(wire_out, std::bit_cast<uint64_t>(value.value.int_value));
+      return;
+    case ValueType::kDouble:
+      AppendUint32(wire_out, 8);
+      AppendUint64(wire_out,
+                   std::bit_cast<uint64_t>(value.value.double_value));
+      return;
+    case ValueType::kDate: {
+      const int32_t pg_days =
+          static_cast<int32_t>(value.DateDays() - kPgDateEpochOffsetDays);
+      AppendUint32(wire_out, 4);
+      AppendUint32(wire_out, std::bit_cast<uint32_t>(pg_days));
+      return;
+    }
+    case ValueType::kVarChar: {
+      const std::string_view sv = value.value.varchar_value;
+      AppendUint32(wire_out, static_cast<uint32_t>(sv.size()));
+      wire_out->append(sv);
+      return;
+    }
+    case ValueType::kNull:
+    case ValueType::kArray: {
+      const std::string text = value.AsString();
+      AppendUint32(wire_out, static_cast<uint32_t>(text.size()));
+      wire_out->append(text);
+      return;
+    }
+  }
+}
+
+}  // namespace
+
+StatusOr<ParseMessage> ParseParseMessage(std::string_view payload) {
+  size_t cursor = 0;
+  ASSIGN_OR_RETURN(std::string, stmt_name, ReadCString(payload, &cursor));
+  ASSIGN_OR_RETURN(std::string, query, ReadCString(payload, &cursor));
+  ASSIGN_OR_RETURN(uint16_t, param_count, ReadUint16(payload, cursor));
+  cursor += 2;
+  if (payload.size() - cursor != static_cast<size_t>(param_count) * 4) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "malformed PostgreSQL Parse message length");
+  }
+  ParseMessage msg;
+  msg.statement_name = std::move(stmt_name);
+  msg.query = std::move(query);
+  msg.param_types.reserve(param_count);
+  for (uint16_t i = 0; i < param_count; ++i) {
+    ASSIGN_OR_RETURN(uint32_t, oid, ReadUint32(payload, cursor));
+    cursor += 4;
+    msg.param_types.push_back(oid);
+  }
+  return msg;
+}
+
+StatusOr<BindMessage> ParseBindMessage(std::string_view payload) {
+  size_t cursor = 0;
+  ASSIGN_OR_RETURN(std::string, portal_name, ReadCString(payload, &cursor));
+  ASSIGN_OR_RETURN(std::string, stmt_name, ReadCString(payload, &cursor));
+  ASSIGN_OR_RETURN(uint16_t, param_fmt_count, ReadUint16(payload, cursor));
+  cursor += 2;
+  if (payload.size() - cursor < static_cast<size_t>(param_fmt_count) * 2) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "truncated parameter formats in PostgreSQL Bind");
+  }
+  BindMessage msg;
+  msg.portal_name = std::move(portal_name);
+  msg.statement_name = std::move(stmt_name);
+  msg.param_formats.reserve(param_fmt_count);
+  for (uint16_t i = 0; i < param_fmt_count; ++i) {
+    ASSIGN_OR_RETURN(uint16_t, fmt, ReadUint16(payload, cursor));
+    cursor += 2;
+    if (fmt != 0 && fmt != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported parameter format code in Bind");
+    }
+    msg.param_formats.push_back(fmt);
+  }
+  ASSIGN_OR_RETURN(uint16_t, param_count, ReadUint16(payload, cursor));
+  cursor += 2;
+  if (param_fmt_count > 1 && param_fmt_count != param_count) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Bind parameter format count mismatch");
+  }
+  msg.params.reserve(param_count);
+  for (uint16_t i = 0; i < param_count; ++i) {
+    ASSIGN_OR_RETURN(uint32_t, raw_len, ReadUint32(payload, cursor));
+    cursor += 4;
+    const int32_t len = std::bit_cast<int32_t>(raw_len);
+    if (len == -1) {
+      msg.params.push_back(std::nullopt);
+      continue;
+    }
+    if (len < 0 || payload.size() - cursor < static_cast<size_t>(len)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "truncated parameter value in PostgreSQL Bind");
+    }
+    msg.params.emplace_back(
+        std::string(payload.substr(cursor, static_cast<size_t>(len))));
+    cursor += static_cast<size_t>(len);
+  }
+  ASSIGN_OR_RETURN(uint16_t, result_fmt_count, ReadUint16(payload, cursor));
+  cursor += 2;
+  if (payload.size() - cursor != static_cast<size_t>(result_fmt_count) * 2) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "malformed result format codes in PostgreSQL Bind");
+  }
+  msg.result_formats.reserve(result_fmt_count);
+  for (uint16_t i = 0; i < result_fmt_count; ++i) {
+    ASSIGN_OR_RETURN(uint16_t, fmt, ReadUint16(payload, cursor));
+    cursor += 2;
+    if (fmt != 0 && fmt != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported result format code in Bind");
+    }
+    msg.result_formats.push_back(fmt);
+  }
+  return msg;
+}
+
+StatusOr<DescribeMessage> ParseDescribeMessage(std::string_view payload) {
+  if (payload.size() < 2) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "truncated PostgreSQL Describe message");
+  }
+  const char target = payload[0];
+  if (target != 'S' && target != 'P') {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid PostgreSQL Describe target");
+  }
+  size_t cursor = 1;
+  ASSIGN_OR_RETURN(std::string, name, ReadCString(payload, &cursor));
+  if (cursor != payload.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "trailing bytes in PostgreSQL Describe message");
+  }
+  return DescribeMessage{.target = target, .name = std::move(name)};
+}
+
+StatusOr<ExecuteMessage> ParseExecuteMessage(std::string_view payload) {
+  size_t cursor = 0;
+  ASSIGN_OR_RETURN(std::string, portal_name, ReadCString(payload, &cursor));
+  if (payload.size() - cursor != 4) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "malformed PostgreSQL Execute message");
+  }
+  ASSIGN_OR_RETURN(uint32_t, max_rows, ReadUint32(payload, cursor));
+  return ExecuteMessage{.portal_name = std::move(portal_name),
+                        .max_rows = max_rows};
+}
+
+StatusOr<CloseMessage> ParseCloseMessage(std::string_view payload) {
+  if (payload.size() < 2) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "truncated PostgreSQL Close message");
+  }
+  const char target = payload[0];
+  if (target != 'S' && target != 'P') {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid PostgreSQL Close target");
+  }
+  size_t cursor = 1;
+  ASSIGN_OR_RETURN(std::string, name, ReadCString(payload, &cursor));
+  if (cursor != payload.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "trailing bytes in PostgreSQL Close message");
+  }
+  return CloseMessage{.target = target, .name = std::move(name)};
+}
+
+StatusOr<std::string> BindSqlParameters(
+    std::string_view sql, const std::vector<uint32_t>& param_types,
+    const std::vector<uint16_t>& param_formats,
+    const std::vector<std::optional<std::string>>& params) {
+  if (params.empty()) {
+    return std::string(sql);
+  }
+  std::vector<std::string> rendered;
+  rendered.reserve(params.size());
+  for (size_t i = 0; i < params.size(); ++i) {
+    const uint32_t oid = i < param_types.size() ? param_types[i] : 0;
+    const uint16_t fmt = ResolveColumnFormat(param_formats, i);
+    ASSIGN_OR_RETURN(std::string, lit,
+                     RenderParamAsSqlLiteral(oid, fmt, params[i]));
+    rendered.push_back(std::move(lit));
+  }
+  std::string out;
+  out.reserve(sql.size() + params.size() * 8);
+  bool single_quote = false;
+  bool double_quote = false;
+  bool line_comment = false;
+  bool block_comment = false;
+  for (size_t i = 0; i < sql.size(); ++i) {
+    const char ch = sql[i];
+    if (line_comment) {
+      out.push_back(ch);
+      if (ch == '\n') {
+        line_comment = false;
+      }
+      continue;
+    }
+    if (block_comment) {
+      out.push_back(ch);
+      if (ch == '*' && i + 1 < sql.size() && sql[i + 1] == '/') {
+        out.push_back('/');
+        ++i;
+        block_comment = false;
+      }
+      continue;
+    }
+    if (single_quote) {
+      out.push_back(ch);
+      if (ch == '\\' && i + 1 < sql.size()) {
+        out.push_back(sql[++i]);
+      } else if (ch == '\'') {
+        single_quote = false;
+      }
+      continue;
+    }
+    if (double_quote) {
+      out.push_back(ch);
+      if (ch == '"') {
+        double_quote = false;
+      }
+      continue;
+    }
+    if (ch == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+      out.append("--");
+      ++i;
+      line_comment = true;
+      continue;
+    }
+    if (ch == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+      out.append("/*");
+      ++i;
+      block_comment = true;
+      continue;
+    }
+    if (ch == '\'') {
+      out.push_back(ch);
+      single_quote = true;
+      continue;
+    }
+    if (ch == '"') {
+      out.push_back(ch);
+      double_quote = true;
+      continue;
+    }
+    if (ch == '$' && i + 1 < sql.size() &&
+        std::isdigit(static_cast<unsigned char>(sql[i + 1])) != 0) {
+      size_t j = i + 1;
+      size_t idx = 0;
+      while (j < sql.size() &&
+             std::isdigit(static_cast<unsigned char>(sql[j])) != 0) {
+        idx = idx * 10 + static_cast<size_t>(sql[j] - '0');
+        ++j;
+      }
+      if (idx == 0 || idx > rendered.size()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "bind parameter index out of range");
+      }
+      out.append(rendered[idx - 1]);
+      i = j - 1;
+      continue;
+    }
+    out.push_back(ch);
+  }
+  return out;
+}
+
 std::optional<StartupPacket> ParseStartupPacket(std::string_view packet,
                                                 std::string* error) {
   const StatusOr<uint32_t> declared = ReadUint32(packet, 0);
@@ -349,8 +777,24 @@ std::string NoticeResponse(std::string_view message, std::string_view sqlstate,
 }
 
 std::string EmptyQueryResponse() { return Message('I', {}); }
+std::string ParseComplete() { return Message('1', {}); }
+std::string BindComplete() { return Message('2', {}); }
+std::string CloseComplete() { return Message('3', {}); }
+std::string NoData() { return Message('n', {}); }
+std::string PortalSuspended() { return Message('s', {}); }
 
-std::string RowDescription(const std::vector<ColumnDescription>& columns) {
+std::string ParameterDescription(const std::vector<uint32_t>& param_oids) {
+  std::string payload;
+  payload.reserve(2 + param_oids.size() * 4);
+  AppendUint16(&payload, static_cast<uint16_t>(param_oids.size()));
+  for (const uint32_t oid : param_oids) {
+    AppendUint32(&payload, oid);
+  }
+  return Message('t', payload);
+}
+
+std::string RowDescription(const std::vector<ColumnDescription>& columns,
+                           const std::vector<uint16_t>& result_formats) {
   if (columns.size() > std::numeric_limits<uint16_t>::max()) {
     // The wire format declares the column count as uint16; truncating would
     // desynchronize the protocol stream.
@@ -358,7 +802,8 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
   }
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(columns.size()));
-  for (const ColumnDescription& column : columns) {
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const ColumnDescription& column = columns[i];
     const std::string safe_name =
         column.name.find('\0') == std::string::npos && !column.name.empty()
             ? column.name
@@ -370,19 +815,25 @@ std::string RowDescription(const std::vector<ColumnDescription>& columns) {
     AppendUint32(&payload, type.oid);
     AppendUint16(&payload, std::bit_cast<uint16_t>(type.length));
     AppendUint32(&payload, std::numeric_limits<uint32_t>::max());
-    AppendUint16(&payload, 0);  // Text format.
+    AppendUint16(&payload, ResolveColumnFormat(result_formats, i));
   }
   return Message('T', payload);
 }
 
-std::string DataRow(const Row& row) {
+std::string DataRow(const Row& row,
+                    const std::vector<uint16_t>& result_formats) {
   CHECK_MSG(row.values_.size() <= std::numeric_limits<uint16_t>::max(),
             "too many values for PostgreSQL protocol");
   std::string payload;
   AppendUint16(&payload, static_cast<uint16_t>(row.values_.size()));
-  for (const Value& value : row.values_) {
+  for (size_t i = 0; i < row.values_.size(); ++i) {
+    const Value& value = row.values_[i];
     if (value.IsNull()) {
       AppendUint32(&payload, std::numeric_limits<uint32_t>::max());
+      continue;
+    }
+    if (ResolveColumnFormat(result_formats, i) == 1) {
+      AppendBinaryValue(&payload, value);
       continue;
     }
     // PostgreSQL text values cannot contain NUL: clients read PQgetvalue as a
@@ -401,7 +852,8 @@ std::string DataRow(const Row& row) {
 // lean/TinylambOpt/ResearchProofs/ColumnarToPgWireChunkedFramingEquiv.lean
 // (sound)
 Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
-                              size_t row_idx) {
+                              size_t row_idx,
+                              const std::vector<uint16_t>& result_formats) {
   if (wire_out == nullptr || row_idx >= chunk.Size()) {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid DataChunk row index for PostgreSQL DataRow");
@@ -410,6 +862,10 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
   if (col_count > std::numeric_limits<uint16_t>::max()) {
     return StatusError(StatusCode::kInvalidArgument,
                        "too many values for PostgreSQL protocol");
+  }
+  if (result_formats.size() > 1 && result_formats.size() != col_count) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "result format count does not match column count");
   }
   for (size_t c = 0; c < col_count; ++c) {
     const ColumnVector& col = chunk.ColumnAt(c);
@@ -426,18 +882,60 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
   wire_out->push_back('D');
   AppendUint32(wire_out, 0);  // Patched below with final frame length.
   AppendUint16(wire_out, static_cast<uint16_t>(col_count));
-  std::array<char, 32> int_buf{};
+  std::array<char, 64> num_buf{};
   for (size_t c = 0; c < col_count; ++c) {
     const ColumnVector& col = chunk.ColumnAt(c);
     if (col.IsNull(row_idx)) {
       AppendUint32(wire_out, std::numeric_limits<uint32_t>::max());
       continue;
     }
+    const uint16_t fmt = ResolveColumnFormat(result_formats, c);
+    if (fmt == 1) {
+      if (!col.IsHeterogeneous()) {
+        switch (col.Type()) {
+          case ValueType::kInt64: {
+            std::array<char, 12> cell{};
+            WriteBe32(cell.data(), 8);
+            WriteBe64(cell.data() + 4,
+                      std::bit_cast<uint64_t>(col.IntegerData()[row_idx]));
+            wire_out->append(cell.data(), cell.size());
+            continue;
+          }
+          case ValueType::kDouble: {
+            std::array<char, 12> cell{};
+            WriteBe32(cell.data(), 8);
+            WriteBe64(cell.data() + 4,
+                      std::bit_cast<uint64_t>(col.DoubleData()[row_idx]));
+            wire_out->append(cell.data(), cell.size());
+            continue;
+          }
+          case ValueType::kDate: {
+            const int32_t pg_days = static_cast<int32_t>(
+                col.IntegerData()[row_idx] - kPgDateEpochOffsetDays);
+            std::array<char, 8> cell{};
+            WriteBe32(cell.data(), 4);
+            WriteBe32(cell.data() + 4, std::bit_cast<uint32_t>(pg_days));
+            wire_out->append(cell.data(), cell.size());
+            continue;
+          }
+          case ValueType::kVarChar: {
+            const std::string& s = col.StringData()[row_idx];
+            AppendUint32(wire_out, static_cast<uint32_t>(s.size()));
+            wire_out->append(s);
+            continue;
+          }
+          default:
+            break;
+        }
+      }
+      AppendBinaryValue(wire_out, col.ValueAt(row_idx));
+      continue;
+    }
     if (!col.IsHeterogeneous()) {
       switch (col.Type()) {
         case ValueType::kInt64: {
           // Lean proof:
-          // lean/TinylambOpt/ResearchProofs/Wave8PhysicalChoices.lean
+          // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/PhysicalChoices.lean
           // (FieldBytes_sound)
           // Pre-encoded length-prefixed wire bytes for hot integers in
           // [-1024, 65535], preserving exact DataRow framing bytes.
@@ -474,10 +972,10 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
               continue;
             }
             const auto res = std::to_chars(
-                int_buf.data(), int_buf.data() + int_buf.size(), raw_v);
-            const auto len = static_cast<uint32_t>(res.ptr - int_buf.data());
+                num_buf.data(), num_buf.data() + num_buf.size(), raw_v);
+            const auto len = static_cast<uint32_t>(res.ptr - num_buf.data());
             AppendUint32(wire_out, len);
-            wire_out->append(int_buf.data(), len);
+            wire_out->append(num_buf.data(), len);
             continue;
           }
           const auto uv = static_cast<uint64_t>(raw_v);
@@ -487,12 +985,39 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
             wire_out->append(e.bytes.data(), e.len);
             continue;
           }
-          const auto res = std::to_chars(int_buf.data(),
-                                         int_buf.data() + int_buf.size(), uv);
-          const auto len = static_cast<uint32_t>(res.ptr - int_buf.data());
+          const auto res = std::to_chars(num_buf.data(),
+                                         num_buf.data() + num_buf.size(), uv);
+          const auto len = static_cast<uint32_t>(res.ptr - num_buf.data());
           AppendUint32(wire_out, len);
-          wire_out->append(int_buf.data(), len);
+          wire_out->append(num_buf.data(), len);
           continue;
+        }
+        case ValueType::kDouble: {
+          const double d = col.DoubleData()[row_idx];
+          if (std::isnan(d)) {
+            AppendUint32(wire_out, 3);
+            wire_out->append("NaN", 3);
+            continue;
+          }
+          if (d == std::numeric_limits<double>::infinity()) {
+            AppendUint32(wire_out, 8);
+            wire_out->append("Infinity", 8);
+            continue;
+          }
+          if (d == -std::numeric_limits<double>::infinity()) {
+            AppendUint32(wire_out, 9);
+            wire_out->append("-Infinity", 9);
+            continue;
+          }
+          const auto res =
+              std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), d);
+          if (res.ec == std::errc{}) {
+            const auto len = static_cast<uint32_t>(res.ptr - num_buf.data());
+            AppendUint32(wire_out, len);
+            wire_out->append(num_buf.data(), len);
+            continue;
+          }
+          break;
         }
         case ValueType::kVarChar: {
           const std::string& s = col.StringData()[row_idx];
@@ -532,6 +1057,128 @@ Status AppendDataRowFromChunk(std::string* wire_out, const DataChunk& chunk,
   (*wire_out)[frame_start + 2] = static_cast<char>((len32 >> 16U) & 0xffU);
   (*wire_out)[frame_start + 3] = static_cast<char>((len32 >> 8U) & 0xffU);
   (*wire_out)[frame_start + 4] = static_cast<char>(len32 & 0xffU);
+  return Status::kSuccess;
+}
+
+Status AppendDataRowsFromChunk(
+    std::string* wire_out, const DataChunk& chunk, size_t row_begin,
+    size_t row_end, size_t max_bytes,
+    const std::vector<uint16_t>& result_formats, size_t* rows_written) {
+  if (wire_out == nullptr || rows_written == nullptr ||
+      row_begin > row_end || row_end > chunk.Size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid DataChunk row range for PostgreSQL DataRow");
+  }
+  *rows_written = 0;
+  if (row_begin == row_end) {
+    return Status::kSuccess;
+  }
+  const size_t col_count = chunk.ColumnCount();
+  if (col_count > std::numeric_limits<uint16_t>::max()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "too many values for PostgreSQL protocol");
+  }
+  if (result_formats.size() > 1 && result_formats.size() != col_count) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "result format count does not match column count");
+  }
+
+  // Specialized zero-allocation fast path: all columns binary + fixed-width
+  // scalar (int8 / float8 / date) + no NULLs in the chunk.
+  bool all_fixed_binary = (col_count > 0);
+  size_t fixed_row_bytes = 7;  // 'D' + uint32 len + uint16 col_count.
+  for (size_t c = 0; c < col_count && all_fixed_binary; ++c) {
+    if (ResolveColumnFormat(result_formats, c) != 1) {
+      all_fixed_binary = false;
+      break;
+    }
+    const ColumnVector& col = chunk.ColumnAt(c);
+    if (col.IsHeterogeneous()) {
+      all_fixed_binary = false;
+      break;
+    }
+    for (const uint64_t word : col.NullBitmap()) {
+      if (word != 0) {
+        all_fixed_binary = false;
+        break;
+      }
+    }
+    if (!all_fixed_binary) {
+      break;
+    }
+    switch (col.Type()) {
+      case ValueType::kInt64:
+      case ValueType::kDouble:
+        fixed_row_bytes += 12;  // uint32(8) + 8 bytes.
+        break;
+      case ValueType::kDate:
+        fixed_row_bytes += 8;  // uint32(4) + 4 bytes.
+        break;
+      default:
+        all_fixed_binary = false;
+        break;
+    }
+  }
+  if (all_fixed_binary) {
+    const size_t avail = row_end - row_begin;
+    size_t count = avail;
+    if (max_bytes > 0) {
+      const size_t rem_bytes =
+          wire_out->size() < max_bytes ? (max_bytes - wire_out->size()) : 0;
+      const size_t budget_rows =
+          std::max<size_t>(1, (rem_bytes + fixed_row_bytes - 1) /
+                                  fixed_row_bytes);
+      count = std::min(avail, budget_rows);
+    }
+    const size_t base = wire_out->size();
+    wire_out->resize(base + count * fixed_row_bytes);
+    char* dst = wire_out->data() + base;
+    const auto frame_len = static_cast<uint32_t>(fixed_row_bytes - 1);
+    const auto ncols = static_cast<uint16_t>(col_count);
+    for (size_t r = row_begin; r < row_begin + count; ++r) {
+      *dst++ = 'D';
+      WriteBe32(dst, frame_len);
+      dst += 4;
+      WriteBe16(dst, ncols);
+      dst += 2;
+      for (size_t c = 0; c < col_count; ++c) {
+        const ColumnVector& col = chunk.ColumnAt(c);
+        switch (col.Type()) {
+          case ValueType::kInt64:
+            WriteBe32(dst, 8);
+            WriteBe64(dst + 4, std::bit_cast<uint64_t>(col.IntegerData()[r]));
+            dst += 12;
+            break;
+          case ValueType::kDouble:
+            WriteBe32(dst, 8);
+            WriteBe64(dst + 4, std::bit_cast<uint64_t>(col.DoubleData()[r]));
+            dst += 12;
+            break;
+          case ValueType::kDate: {
+            const int32_t pg_days = static_cast<int32_t>(
+                col.IntegerData()[r] - kPgDateEpochOffsetDays);
+            WriteBe32(dst, 4);
+            WriteBe32(dst + 4, std::bit_cast<uint32_t>(pg_days));
+            dst += 8;
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+    *rows_written = count;
+    return Status::kSuccess;
+  }
+
+  for (size_t r = row_begin; r < row_end; ++r) {
+    if (*rows_written > 0 && max_bytes > 0 && wire_out->size() >= max_bytes) {
+      break;
+    }
+    RETURN_IF_FAIL(
+        AppendDataRowFromChunk(wire_out, chunk, r, result_formats));
+    ++(*rows_written);
+  }
   return Status::kSuccess;
 }
 

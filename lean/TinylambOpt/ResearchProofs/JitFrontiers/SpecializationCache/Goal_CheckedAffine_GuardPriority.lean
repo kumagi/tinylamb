@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common_SpecializationCache
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+
+Proved
+
+- `CheckedAffine.GuardPriority` — `∀ c x, c.slot=0 → fits 64 (x*c.scale)=false →
+  shape.reference c [some x]=.fault`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

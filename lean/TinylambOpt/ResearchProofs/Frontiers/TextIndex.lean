@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.Frontiers.TextIndex
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (7 claims, including the following)
+
+- `Contiguous` — `∀ s p, ((sa s).drop (lo s p)).take (hits s p).length = hits s p`
+- `DistinctMarks` — `∀ (ids : List Nat) l w, let slice := (ids.drop l).take w
+  slice.eraseDups.length = (slice.zipIdx.countP (fun (doc,j) => (previous ids doc
+  (l+j)).all (· < l)))`
+- `DocumentSum` — `∀ docs p (weight : Nat → Int), (((owners docs p).eraseDups).map
+  weight).sum = ((docs.zipIdx.filter (fun (s,_) => (List.range (s.length+1)).any (fun
+  i => p.isPrefixOf (s.drop i)))).map (fun e => weight e.2)).sum`
+
+Refuted by counterexample
+
+- `Unseparated` — `∀ (docs : List Word) p, p ≠ [] → (!(hits docs.flatten p).isEmpty) =
+  docs.any (fun s => !(hits s p).isEmpty)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.TextIndex
 
 open TinylambOpt.ResearchGoals.Frontiers.TextIndex

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `CoLikes.DistinctMessages` — `∀ n db b, integrate n pattern.freeVars b (fun x => if x
+  2 == x 3 then 0 else product (factors pattern db) x) = total n (fun u => db 2 u (b
+  1) * ((overlap n db 0 u (b 1))^2 - total n (fun j => (db 0 u j * db 0 (b 1)
+  j)^2)))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

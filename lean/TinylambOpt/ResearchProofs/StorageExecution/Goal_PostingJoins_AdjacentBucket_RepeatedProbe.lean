@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `AdjacentBucket.RepeatedProbe` — Cache one interval query per distinct left key when
+  aggregating without output expansion.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

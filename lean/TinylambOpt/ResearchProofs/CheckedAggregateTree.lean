@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.CheckedAggregateTree
 
+/-!
+Proved
+
+- `Goal` — Prove against the same independently specified scalar scan for every
+  bracketing and valid incoming state. Safe inputs must take the summary path.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.CheckedAggregateTree`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CheckedAggregateTree
 
 open TinylambOpt.ResearchGoals.CheckedAggregateTree

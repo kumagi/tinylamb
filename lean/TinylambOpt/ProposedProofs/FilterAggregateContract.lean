@@ -1,5 +1,14 @@
 import TinylambOpt.ProposedGoals.FilterAggregateContract
 
+/-!
+Proved
+
+- `Goal` — Staged evaluation preserves value, NULL and first error; the FILTER
+  aggregate is chunk-mergeable under the row-order contract.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.FilterAggregateContract`.
+-/
+
 namespace TinylambOpt.ProposedProofs.FilterAggregateContract
 
 open TinylambOpt.ProposedGoals.FilterAggregateContract

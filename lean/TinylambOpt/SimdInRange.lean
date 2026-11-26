@@ -1,5 +1,14 @@
 import Std.Tactic
 
+/-!
+Unsigned view of a two's-complement `W`-bit value: `z mod 2^W`.
+
+If `-M < z < M`, then `z mod M` is either `z` (non-negative) or `z + M`.
+
+Named results include `emod_eq_self_or_add`, `modulus_eq_twice_half`,
+`simd_in_range_sound`.
+-/
+
 namespace TinylambOpt.SimdInRange
 
 /-
@@ -111,3 +120,8 @@ theorem int64_range_lowering (lo hi x : BitVec 64) (ordered : lo.sle hi = true) 
   simpa only [Bool.and_eq_true, BitVec.sle_iff_toInt_le,BitVec.ule_iff_toNat_le,Int.ofNat_le] using spec
 
 end TinylambOpt.SimdInRange
+
+-- C++ references to this model or its proof.
+-- expression/bytecode.cpp
+-- expression/bytecode.hpp
+-- expression/jit.cpp

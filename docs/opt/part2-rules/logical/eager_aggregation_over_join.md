@@ -2,7 +2,7 @@
 
 - 状態: draft   /   執筆基準リビジョン: `9ce7837` + Lean拡張 (2026-11-18)
 - 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録名 `"eager_aggregation_over_join"`）
-- Lean 形式証明: `lean/TinylambOpt/AggJoinDiscovery.lean`（定理 `eager_scalar_agg_over_mn_join_sound`, `eager_group_agg_over_mn_join_sound`, `star_cascade_two_hop_agg_sound`）および `lean/TinylambOpt/AvgMinMaxHavingDistinct.lean`（定理 `eager_min_over_mn_innerJoin`, `eager_max_over_mn_innerJoin`）
+- Lean 形式証明: `lean/TinylambOpt/JoinPreaggregation.lean`（定理 `eager_scalar_agg_over_mn_join_sound`, `eager_group_agg_over_mn_join_sound`, `star_cascade_two_hop_agg_sound`）および `lean/TinylambOpt/AvgMinMaxHavingDistinct.lean`（定理 `eager_min_over_mn_innerJoin`, `eager_max_over_mn_innerJoin`）
 
 ## 概要
 

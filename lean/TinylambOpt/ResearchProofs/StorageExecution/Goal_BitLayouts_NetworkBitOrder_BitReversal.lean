@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `NetworkBitOrder.BitReversal` — `∀ n w i b, let p := i*w+b; (layout.bit n w i b)%8 +
+  p%8 = 7 ∧ layout.bit n w i b/8=p/8`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

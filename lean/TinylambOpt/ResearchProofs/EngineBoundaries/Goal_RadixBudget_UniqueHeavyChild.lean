@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `UniqueHeavyChild` — At most one child can exceed the 80% threshold in a binary pass.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

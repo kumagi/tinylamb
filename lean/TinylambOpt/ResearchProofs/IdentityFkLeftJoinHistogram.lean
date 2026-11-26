@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.IdentityFkLeftJoinHistogram
 
+/-!
+Proved
+
+- `Goal` — Identity `1..N` left-outer-join histogram shortcut (TPC-H Q13
+  `customer(is_identity_1_to_n)` ⟕ `orders`): scanning only `R` with filter +
+  non-null value check and computing `hist(0) = N - nonzeroKeys` matches
+  materializing the full `LEFT OUTER JOIN` and double `GROUP BY`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.IdentityFkLeftJoinHistogram`.
+-/
+
 namespace TinylambOpt.ResearchProofs.IdentityFkLeftJoinHistogram
 
 open TinylambOpt.ResearchGoals.IdentityFkLeftJoinHistogram

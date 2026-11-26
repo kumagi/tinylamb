@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BushyJoinAssociativityWithDeadKeyPrune
 
+/-!
+Proved
+
+- `Goal` — Bushy join associativity with dead-key column pruning on 4-table chain joins
+  (LDBC L1 / STATS-CEB C2 / JOB J4 / DictionaryJoinsAndLateLabels B3): reassociating
+  `((A ⋈ B) ⋈ C) ⋈ D` into `(A ⋈ B) ⋈ (C ⋈ D)` while immediately dropping dead join
+  keys (`k1`, `k3`) from intermediate schemas preserves exact multiset equality
+  across duplicates and NULL join keys.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BushyJoinAssociativityWithDeadKeyPrune`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BushyJoinAssociativityWithDeadKeyPrune
 
 open TinylambOpt.ResearchGoals.BushyJoinAssociativityWithDeadKeyPrune
@@ -162,3 +175,7 @@ theorem sound : TinylambOpt.ResearchGoals.BushyJoinAssociativityWithDeadKeyPrune
   exact inner_eq x cRows dRows
 
 end TinylambOpt.ResearchProofs.BushyJoinAssociativityWithDeadKeyPrune
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.cpp
+-- executor/detail/build_input.cpp

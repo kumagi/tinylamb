@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `RingNeighborhood.PerimeterHistogram` — `∀ p rs, scan shape p rs = ([2,3,4,5].map
+  (fun d => ((rs.filter (fun r => max (r.1.x-p.x).natAbs (r.1.y-p.y).natAbs ==
+  d)).map Prod.snd).sum)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

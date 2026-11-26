@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `MultiplicityRuns.SelfPairs` — Count unordered equal-key pairs without materializing
+  a self-join.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

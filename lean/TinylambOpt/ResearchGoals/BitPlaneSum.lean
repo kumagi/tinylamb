@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims recover integer totals from bit-plane contributions. A SQL aggregate can
+use packed plane counts under the stated value representation.
+
+Modeled claims
+
+- `Goal` — `∀ mask xs, weighted mask (pack fun i => (xs i).isSome) (fun k => pack fun i
+  => ((xs i).getD 0).getLsbD k) = scalar mask xs`
+-/
+
 namespace TinylambOpt.ResearchGoals.BitPlaneSum
 
 abbrev W := BitVec 64

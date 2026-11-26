@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Reference 2-step hash join `F ⋈_{fk1=k1} (σ_{p1} D1) ⋈_{fk2=k2} (σ_{p2} D2)` aggregated
+by `(d1.attr, d2.attr)`.
+
+Single-pass star-schema dense-array direct lookup without hash probes or intermediate
+materialized join rows.
+
+Modeled claims
+
+- `Goal` — Small-dimension dense direct-index lookup for star joins
+  (DictionaryJoinsAndLateLabels B3 / LDBC L5 / JOB J4 / STATS-CEB C2, C5): when both
+  dimension tables have unique non-NULL keys bounded within `[min, min + span)`,
+  direct O(1) array indexing matches two hash joins for all facts (including
+  out-of-range, negative, and NULL FKs), whereas duplicate dimension keys break
+  direct-slot collapse.
+-/
+
 namespace TinylambOpt.ResearchGoals.SmallDimDenseArrayDirectLookup
 
 structure DimRow where
@@ -93,7 +110,7 @@ private def singleDim2 : List DimRow :=
 private def dupFact : List FactRow :=
   [ { fk1 := some 0, fk2 := some 0, val := some 5 } ]
 
-/-- Small-dimension dense direct-index lookup for star joins (BigBench B3 / LDBC
+/-- Small-dimension dense direct-index lookup for star joins (DictionaryJoinsAndLateLabels B3 / LDBC
     L5 / JOB J4 / STATS-CEB C2, C5): when both dimension tables have unique
     non-NULL keys bounded within `[min, min + span)`, direct O(1) array indexing
     matches two hash joins for all facts (including out-of-range, negative, and

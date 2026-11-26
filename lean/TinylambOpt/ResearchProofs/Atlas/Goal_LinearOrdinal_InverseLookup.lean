@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `LinearOrdinal.InverseLookup` — `∀ c v, c.step ≠ 0 → ((rows layout c).filter (fun r
+  => r.2 == v)).map Prod.fst = let i := (v-c.base)/c.step if (v-c.base)%c.step == 0
+  && 0 ≤ i && i < c.n then [i.toNat] else []`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

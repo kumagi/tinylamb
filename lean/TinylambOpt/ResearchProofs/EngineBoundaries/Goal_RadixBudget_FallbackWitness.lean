@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `FallbackWitness` — Fallback has a byte-sized witness; a large row count alone cannot
+  trigger it.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

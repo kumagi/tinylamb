@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `EditFilter.GramLowerBound` — `∀ s t k q, 0 < q → Edits k s t → max (grams q
+  s).length (grams q t).length ≤ shared (grams q s) (grams q t)+k*q`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

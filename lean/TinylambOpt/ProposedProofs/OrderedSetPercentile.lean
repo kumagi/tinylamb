@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.OrderedSetPercentile
 
+/-!
+Proved
+
+- `Goal` — `∀ (rows : List V) (num den : Nat), den > 0 → num <= den → sortedPick rows
+  num den = rankPick rows num den`
+
+The reference model is defined in `TinylambOpt.ProposedGoals.OrderedSetPercentile`.
+-/
+
 namespace TinylambOpt.ProposedProofs.OrderedSetPercentile
 
 open TinylambOpt.ProposedGoals.OrderedSetPercentile

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Diagonal.TriangularPrefix` — `∀ rs t, ((physical key rs).takeWhile (fun (x,y) =>
+  x+y<t)).length=rs.countP (fun (x,y) => x+y<t)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

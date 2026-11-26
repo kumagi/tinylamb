@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.FanoutWeightedBucketWorkSplit
 
+/-!
+Proved
+
+- `Goal` — Fanout-weighted bucket-shard parallel join split for skewed `LEFT` and
+  `INNER` joins (STATS-CEB C4 / DictionaryJoinsAndLateLabels B2 / H2O H5 / JOB J4):
+  splitting skewed build buckets across `bShards` and probe batches by fanout cost
+  preserves the exact multiset of `(LRow, Option RRow)` pairs iff unmatched NULL
+  emission waits on global `anyMatched` across all shards.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.FanoutWeightedBucketWorkSplit`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FanoutWeightedBucketWorkSplit
 
 open TinylambOpt.ResearchGoals.FanoutWeightedBucketWorkSplit
@@ -105,3 +118,6 @@ theorem sound : TinylambOpt.ResearchGoals.FanoutWeightedBucketWorkSplit.Goal := 
   rw [opt_eq_ref pChunks bShards, hp]
 
 end TinylambOpt.ResearchProofs.FanoutWeightedBucketWorkSplit
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_grouped_join.cpp

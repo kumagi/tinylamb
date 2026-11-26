@@ -1,5 +1,11 @@
 import TinylambOpt.BagRel
 
+/-!
+SQL SUM, COUNT, MIN, and MAX use explicit aggregate states that preserve empty-input and
+NULL behavior. The fold and grouping theorems justify computing partial aggregates
+before combining their states.
+-/
+
 /-
 # Step 4-A: SQL 集約演算（GROUP BY / SUM / COUNT / MIN / MAX）の形式モデルと基礎定理
 
@@ -298,7 +304,7 @@ private theorem perm_filter_append_not {α : Type} (p : α → Bool) :
 
 /-- **バケット分割の基本定理**:
     任意のテーブル `r` は、キー `key` ごとのバケット `r.filter (key · == k)` をすべて連結したものと Bag 等価！ -/
-theorem perm_buckets_of_nodup {Row K : Type} [DecidableEq K]
+theorem perm_buckets_of_nodup {Row K : Type} [BEq K] [LawfulBEq K]
     (key : Row → K) :
     ∀ (ks : List K) (r : Rel Row),
       ks.Nodup →
@@ -457,3 +463,6 @@ theorem groupBy_bagEq_of_keys_and_vals {R1 R2 K V : Type} [DecidableEq K]
   exact hPermKeys.map _
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- plan/cascades_predicate_rules.cpp

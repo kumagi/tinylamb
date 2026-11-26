@@ -1,4 +1,11 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Named results include `sound`.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false
@@ -705,3 +712,7 @@ theorem sound : Goal := by
             fun ⟨h1, h2, hp⟩ => ⟨List.mem_range.mp h1, List.mem_range.mp h2, hp⟩⟩
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Exec_HotRunTiles
+
+-- C++ references to this model or its proof.
+-- executor/detail/engine_decisions.hpp
+-- executor/merge_join.cpp

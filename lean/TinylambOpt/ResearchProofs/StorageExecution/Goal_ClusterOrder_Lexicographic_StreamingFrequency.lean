@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Lexicographic.StreamingFrequency` — `∀ rs v, let col := (physical key rs).map
+  Prod.fst; (col.dropWhile (· < v) |>.takeWhile (· == v)).length = (rs.map
+  Prod.fst).count v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

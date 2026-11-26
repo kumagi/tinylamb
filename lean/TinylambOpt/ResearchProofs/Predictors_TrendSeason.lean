@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `TrendSeason.ByteBudget` — `∀ period side i h xs w extra oldBytes, certificate
+  (predict period) side i h xs w → extra + quote xs.length w < oldBytes → extra +
+  (frame (encode (predict period) side i h xs)).length < oldBytes`
+- `TrendSeason.ResidualRoundTrip` — `∀ period side i h xs, restore (predict period)
+  side i h (encode (predict period) side i h xs) = xs`
+- `TrendSeason.RestartSeed` — `∀ period side i h xs, encode (predict period) side i
+  (h.take (period+2)) xs = encode (predict period) side i h xs`
+- `TrendSeason.TranslatedCycle` — `∀ period side i h xs delta, period+2 ≤ h.length →
+  encode (predict period) side i (h.map (·+delta)) (xs.map (·+delta)) = encode
+  (predict period) side i h xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

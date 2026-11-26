@@ -1,5 +1,20 @@
 import TinylambOpt.ResearchGoals.OffsetHeavyReverseTopNAndQuotientBucket
 
+/-!
+Proved
+
+- `Goal` — Offset-heavy reverse Top-N duality (`ORDER BY DESC LIMIT L OFFSET O` with `O
+  ≫ L`, ClickBench Q40/Q41/Q42) and monotone `TIMESTAMP_TRUNC` floor quotient
+  grouping (ClickBench Q43): (1) when `xs.length ≤ off`, output is `[]` without
+  sorting; otherwise reversing the `xs.length - off` ascending elements equals
+  dropping `off` descending elements (assuming unique `(score, tieId)` or uniform
+  ties); (2) `Int.ediv · 60` is monotone and dense bucket iteration over
+  `[lo/60..hi/60]` matches hash-group + `ORDER BY`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.OffsetHeavyReverseTopNAndQuotientBucket`.
+-/
+
 namespace TinylambOpt.ResearchProofs.OffsetHeavyReverseTopNAndQuotientBucket
 
 open TinylambOpt.ResearchGoals.OffsetHeavyReverseTopNAndQuotientBucket
@@ -793,3 +808,7 @@ theorem sound : TinylambOpt.ResearchGoals.OffsetHeavyReverseTopNAndQuotientBucke
   exact ⟨part1, part2, part3⟩
 
 end TinylambOpt.ResearchProofs.OffsetHeavyReverseTopNAndQuotientBucket
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp
+-- executor/detail/analytics_factorized_join_test.cpp

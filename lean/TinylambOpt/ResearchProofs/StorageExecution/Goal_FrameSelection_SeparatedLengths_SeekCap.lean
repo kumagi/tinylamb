@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `SeparatedLengths.SeekCap` — Relaxing maximum rows per frame bounds the best fully
+  framed size.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

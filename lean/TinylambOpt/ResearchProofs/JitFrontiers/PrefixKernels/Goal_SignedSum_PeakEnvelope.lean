@@ -1,6 +1,17 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Common_PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+Proved
+
+- `SignedSum.PeakEnvelope` — `∀ w s rs, let ps := (rs.map (·.getD 0)).scanl (·+·) 0
+  fits w s → (cert update w s rs = true ↔ -limit w ≤ s + ps.min?.getD 0 ∧ s +
+  ps.max?.getD 0 < limit w)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

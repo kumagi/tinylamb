@@ -287,7 +287,7 @@ class FlatIntSet {
     return true;
   }
 
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (dense_compact_membership_eq)
   // After all keys are inserted into hash mode, compact to a dense bitmap when
   // the observed [min_key, max_key] span fits within kMaxDenseSpan and the
@@ -340,7 +340,7 @@ class FlatIntSet {
     return dense_bits_.size();
   }
 
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (parallel_bitset_or_eq_union)
   void MergeDenseWordsAtomic(const uint64_t* local_words,
                              size_t count) noexcept {
@@ -546,7 +546,7 @@ class FlatIntSet {
       }
       return (dense_bits_[word_hi] & high_mask) != 0;
     }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (range_check_conservative_sound)
     // Hash mode: when the query range covers the whole member domain every key
     // is in range (O(1)). For narrow ranges (<= 64 distinct integers), probe

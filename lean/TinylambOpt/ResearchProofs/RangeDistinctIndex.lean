@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.RangeDistinctIndex
 
+/-!
+Proved
+
+- `Goal` — `∀ xs lo hi, query (build xs) lo hi = reference xs lo hi`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.RangeDistinctIndex`.
+-/
+
 namespace TinylambOpt.ResearchProofs.RangeDistinctIndex
 
 open TinylambOpt.ResearchGoals.RangeDistinctIndex
@@ -1481,3 +1489,7 @@ theorem sound : TinylambOpt.ResearchGoals.RangeDistinctIndex.Goal := by
   exact hquery.trans href.symm
 
 end TinylambOpt.ResearchProofs.RangeDistinctIndex
+
+-- C++ references to this model or its proof.
+-- executor/detail/window_eval.cpp
+-- executor/relational_regression_test_part11.cpp

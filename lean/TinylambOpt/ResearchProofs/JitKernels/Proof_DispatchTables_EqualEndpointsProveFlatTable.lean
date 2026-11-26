@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.DispatchTables
+import TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_EqualEndpointsProveFlatTable
+
+/-! REFUTE: verified DispatchTables.EqualEndpointsProveFlatTable. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_DispatchTables_EqualEndpointsProveFlatTable
+open TinylambOpt.ResearchGoals.JitKernels.DispatchTables
+open TinylambOpt.ResearchGoals.JitKernels.DispatchTables.EqualEndpointsProveFlatTable
+theorem refute : ¬ Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.Goal_DispatchTables_EqualEndpointsProveFlatTable.refute
+end Nov26.Proof_DispatchTables_EqualEndpointsProveFlatTable

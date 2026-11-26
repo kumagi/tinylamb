@@ -183,18 +183,26 @@ def probe_frames():
     print(f"Complete footprint including catalog and WAL: independent={plain:,} B, adaptive={adaptive:,} B")
 
 
-def declarations():
+def declarations(origin="matchup"):
     result = {}
-    for f in sorted((LEAN / "TinylambOpt/ResearchGoals/BenchmarkRematch").glob("*.lean")):
+    models = LEAN / "TinylambOpt/ResearchGoals/QueryRewrites"
+    ledger = HERE / ("november26-queries.md" if origin == "query" else "benchmark-rematch-ledger.md")
+    # Presentation text stays in the Japanese ledger. Lean supplies the
+    # benchmark key, declaration name, and current source location.
+    captions = {}
+    caption_pattern = r"\[(\w+\.Goal)\]\([^\n)]+\)　(.+?) \|$"
+    for name, caption in re.findall(caption_pattern, ledger.read_text(), re.M):
+        assert name not in captions, f"duplicate caption for {name}"
+        captions[name] = caption
+    pattern = rf"^-- Benchmark {origin}: (\w+\.\w+)\n/--[\s\S]+?-/\ndef (\w+)\.Goal : Prop"
+    for f in sorted(models.glob("*.lean")):
         src = f.read_text()
-        names = re.findall(r"^def (\w+)\.Goal : Prop", src, re.M)
-        annotated = re.findall(r"^/-- (.+?) -/\ndef (\w+)\.Goal : Prop", src, re.M)
-        assert sorted(names) == sorted(n for _, n in annotated)
-        for doc, name in annotated:
-            key = f"{f.stem}.{name}"
+        for match in re.finditer(pattern, src, re.M):
+            key, declaration = match.groups()
+            name = f"{declaration}.Goal"
             assert key not in result
-            line = src[:src.index(f"def {name}.Goal")].count("\n") + 1
-            result[key] = (doc, f"../../{f.relative_to(LEAN)}#L{line}")
+            line = src.count("\n", 0, match.start(2)) + 1
+            result[key] = (captions[name], f"../../{f.relative_to(LEAN)}#L{line}", name)
     return result
 
 
@@ -214,13 +222,13 @@ def render():
                       + ("勝利に必要な削減 (B)" if size else "同点までの短縮 (ms)")
                       + " | 未証明命題と観測量 |", "|---|---|---:|---:|---:|---|"])
         for r in rows:
-            doc, link = goals[r.goal]
+            doc, link, name = goals[r.goal]
             # Preserve raw medians. Decimal formatting is just for displaying the gap.
             if size:
                 vals = [f"{n:,}" for n in (r.current, r.target, r.current-r.target+1)]
             else:
                 vals = [str(r.current), str(r.target), f"{r.current-r.target:.6f}"]
-            lines.append(f"| {r.case} | {r.rival} | {' | '.join(vals)} | [{r.goal}]({link})　{doc} |")
+            lines.append(f"| {r.case} | {r.rival} | {' | '.join(vals)} | [{name}]({link})　{doc} |")
         lines.append("")
     return "\n".join(lines)
 

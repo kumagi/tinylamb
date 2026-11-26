@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.SearchBounds
 
 /-! Conservative exact bounds for Cascades cardinality properties, grants, runtime

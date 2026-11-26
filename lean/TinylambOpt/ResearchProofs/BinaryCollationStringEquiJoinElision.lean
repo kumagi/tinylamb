@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BinaryCollationStringEquiJoinElision
 
+/-!
+Proved
+
+- `Goal` — Binary collation residual-predicate elision for string equi-joins (STATS-CEB
+  C4 / DictionaryJoinsAndLateLabels B2): under `Collation.binary`, eliding residual
+  string equality into exact byte-equality inside the hash join matches `refJoin` for
+  all hash functions (including total hash collisions) on both INNER and LEFT JOIN,
+  whereas `asciiCaseInsensitive` and `padSpace` collations must keep residual checks.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BinaryCollationStringEquiJoinElision`.
+-/
+
 open TinylambOpt.ResearchGoals.BinaryCollationStringEquiJoinElision
 
 namespace TinylambOpt.ResearchProofs.BinaryCollationStringEquiJoinElision
@@ -62,3 +75,7 @@ theorem sound : TinylambOpt.ResearchGoals.BinaryCollationStringEquiJoinElision.G
   ⟨opt_eq_ref, exists_ci, exists_pad⟩
 
 end TinylambOpt.ResearchProofs.BinaryCollationStringEquiJoinElision
+
+-- C++ references to this model or its proof.
+-- executor/detail/planning_heuristics.cpp
+-- executor/detail/planning_heuristics.hpp

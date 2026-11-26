@@ -1190,7 +1190,7 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       }
       // String IN with uncollated, non-interval string constants lowers to an
       // O(1) flat string hash-set lookup (Lean proof:
-      // lean/TinylambOpt/TpcdsExecCodegen.lean: in_const_set_3vl_sound).
+      // lean/TinylambOpt/PredicateAndRelationalLowering.lean: in_const_set_3vl_sound).
       const Type child_decl_type = in.child_->ResultType(schema);
       // Each constant below is checked for collation/interval explicitly.
       if (ValueTypeFor(child_decl_type) == ValueType::kVarChar) {
@@ -1512,7 +1512,7 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
         return true;
       }
       if (call.FuncName() == "substr" || call.FuncName() == "substring") {
-        // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+        // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
         //   (ascii_substr_1based_slice_sound)
         if (call.Args().size() != 2 && call.Args().size() != 3) {
           return false;
@@ -1719,7 +1719,7 @@ bool IsAllAsciiFast(std::string_view s) noexcept {
   return true;
 }
 
-// Lean proofs: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proofs: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (ascii_substr_1based_slice_sound),
 //   lean/TinylambOpt/ResearchProofs/SubstrAsciiByteSliceEquiv.lean (sound)
 StatusOr<std::string_view> TryEvalSubstrView(
@@ -1826,7 +1826,7 @@ StatusOr<Value> TryEvalSubstrCanonical(const Value& str_v, const Value& start_v,
   return Value(std::string(sliced));
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean (in_const_set_3vl_sound)
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean (in_const_set_3vl_sound)
 StatusOr<Value> TryEvalInStringSetCanonical(const Value& child,
                                             const StringSetSpec& spec) {
   if (!spec.non_empty) {
@@ -3594,7 +3594,7 @@ FastEvalStatus ExecuteFastProgram(
                           "ABS requires numeric argument");
       }
       case BytecodeOp::kInStringSet: {
-        // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+        // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
         //   (in_const_set_3vl_sound)
         if (stack.empty()) {
           return push_error(StatusCode::kCorrupt, "bytecode stack underflow");
@@ -3623,7 +3623,7 @@ FastEvalStatus ExecuteFastProgram(
         continue;
       }
       case BytecodeOp::kSubstr: {
-        // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+        // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
         //   (ascii_substr_1based_slice_sound)
         const bool has_len = instruction.operand == 3;
         if (stack.size() < (has_len ? 3 : 2)) {

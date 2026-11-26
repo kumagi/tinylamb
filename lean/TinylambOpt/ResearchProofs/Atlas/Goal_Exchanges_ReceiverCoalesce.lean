@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Exchanges.ReceiverCoalesce` — `∀ cap xs (route : Nat → Nat), 0 < cap → traffic cap
+  (xs.map (fun (d,w) => (route d,w))) ≤ traffic cap xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

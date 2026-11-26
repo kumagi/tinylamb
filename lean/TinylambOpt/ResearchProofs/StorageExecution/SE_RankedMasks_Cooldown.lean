@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `Cooldown.CheckpointConvergence` — `∀ q, q≤2 → run model q [false,false]=some 0`
+- `Cooldown.Cofactor` — Compute a parallel shard count by conditioning on its prefix
+  state.
+- `Cooldown.Decoder` — Recreate every accepted bitmap from its compact code.
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/Cooldown` goals.
 open TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 set_option maxHeartbeats 0

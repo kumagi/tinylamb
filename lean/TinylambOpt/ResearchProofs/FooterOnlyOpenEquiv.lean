@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.FooterOnlyOpenEquiv
 
+/-!
+Proved
+
+- `Goal` — Footer-only TLCS v3 open (`table/tlcs_file.cpp`): opening reads only the
+  footer directory regardless of total column payload size or trailing bytes, and
+  subsequent on-demand column reads recover exact column byte slices.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.FooterOnlyOpenEquiv`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FooterOnlyOpenEquiv
 open TinylambOpt.ResearchGoals.FooterOnlyOpenEquiv
 

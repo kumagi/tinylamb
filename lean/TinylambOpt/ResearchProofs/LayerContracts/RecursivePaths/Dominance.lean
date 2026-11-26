@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Common
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Named results include `Rt_append`, `It_iff_Rt`, `Rt_walk`.
+-/
+
 set_option maxHeartbeats 0
 set_option linter.unusedVariables false
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Interleaved.SquareTile` — `∀ h x y bx by_, ((key (x,y)).1/4^h = morton bx by_ ↔
+  x/2^h=bx ∧ y/2^h=by_)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

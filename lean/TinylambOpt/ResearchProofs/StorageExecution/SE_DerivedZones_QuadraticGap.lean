@@ -1,4 +1,23 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
+
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (9 claims, including the following)
+
+- `QuadraticGap.CrossPageJoin` — Disjoint derived score intervals imply an empty
+  equijoin between pages.
+- `QuadraticGap.DominatedTop` — A bounded page cannot change the descending top k once
+  k strictly better witnesses are known.
+- `QuadraticGap.SemijoinFilter` — Apply the footer to the build-key set before probing;
+  retain left bag order and duplicates.
+
+Refuted by counterexample
+
+- `QuadraticGap.GapWitness` — `∀ t a b, a.hi<b.lo → (kernel.bounds t a b).lo =
+  kernel.score t (a.hi,b.lo)`
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZones.QuadraticGap

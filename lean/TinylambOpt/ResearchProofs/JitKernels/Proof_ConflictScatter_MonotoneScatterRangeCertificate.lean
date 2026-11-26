@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+import TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_MonotoneScatterRangeCertificate
+
+/-! SOUND: verified ConflictScatter.MonotoneScatterRangeCertificate. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_ConflictScatter_MonotoneScatterRangeCertificate
+open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+open TinylambOpt.ResearchGoals.JitKernels.ConflictScatter.MonotoneScatterRangeCertificate
+theorem sound : Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.Goal_ConflictScatter_MonotoneScatterRangeCertificate.sound
+end Nov26.Proof_ConflictScatter_MonotoneScatterRangeCertificate

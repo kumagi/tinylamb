@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `AdjacentBucket.SymmetricJoin` — `∀ u t a b, valid u a → valid u b → (a.map (fun x =>
+  fan search u t x b)).sum = (b.map (fun x => fan search u t x a)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

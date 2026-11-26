@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Reference 3-way inner join checking BOTH `b.k = c.k` AND redundant `a.k = c.k`.
+
+Optimized 3-way inner join: pushes transitive semijoin filter from `A` into `C` (`kc ∈ {
+a.k | a ∈ A }`) and drops duplicate key `a.k = c.k` on the second hash join (`keys=2 ->
+keys=1`).
+
+Modeled claims
+
+- `Goal` — Transitive equivalence key closure, semijoin pushdown, and duplicate
+  hash-key dropping (JOB J5 / STATS-CEB C1, C5 / LDBC L1, L2 / JOB J4): for inner
+  joins `A ⋈_{a.k = b.k} B ⋈_{b.k = c.k ∧ a.k = c.k} C`, pushing `A`'s key domain
+  into `C` and eliding the redundant `a.k = c.k` comparison (`keys=2 -> keys=1`) is
+  unconditionally sound, whereas dropping the `B`-side check across a `LEFT OUTER
+  JOIN` (`A ⟕ B`) changes results.
+-/
+
 namespace TinylambOpt.ResearchGoals.TransitiveEquivPredicatePushdownAndDupKeyDrop
 
 structure RowA where

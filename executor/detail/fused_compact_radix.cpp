@@ -49,7 +49,7 @@
 
 namespace tinylamb::relational_detail {
 StatusOr<bool> CompactRadixGroups::TryEmit() const {
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (radix_compact_sum_partition_eq)
   // Fast path for packed-2x32 single-SUM/AVG-double radix aggregation with
   // direct columnar output (e.g. TPC-DS Q65 with 2.31M groups): accumulate
@@ -369,7 +369,7 @@ StatusOr<bool> CompactRadixGroups::TryEmit() const {
     }
   }
   if (compact_radix_double) {
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (jit_radix_key_double_agg_sound)
     // Reusable per-worker generation-stamped SoA open-addressed table driven
     // by JitRadixKeyDoubleAgg with zero-copy right/PK columnar emission in

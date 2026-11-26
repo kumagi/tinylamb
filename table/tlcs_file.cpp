@@ -1864,44 +1864,58 @@ bool IsCompressedNumericEncoding(TlcsColumnEncoding enc) noexcept {
          enc == TlcsColumnEncoding::kZstdNumeric;
 }
 
-bool DecodeCompressedVarCharPayload(TlcsColumnEncoding enc,
-                                    std::span<const uint8_t> raw,
-                                    const uint8_t* nulls, uint32_t n,
-                                    std::vector<char>* chars_out,
-                                    std::vector<uint32_t>* ends_out) {
+bool DecodeCompressedVarCharPayload(
+    TlcsColumnEncoding enc, std::span<const uint8_t> raw, const uint8_t* nulls,
+    uint32_t n, std::vector<uint8_t>* bytes_out,
+    std::vector<uint32_t>* ends_out, bool lengths_only = false,
+    std::span<const uint32_t> selected_rows = {},
+    bool* selected_rows_applied = nullptr) {
+  if (selected_rows_applied != nullptr) {
+    *selected_rows_applied = false;
+  }
   switch (enc) {
     case TlcsColumnEncoding::kTemporalText:
-      return tlcs_compression::DecodeTemporalText(raw, nulls, n, chars_out,
-                                                  ends_out);
+      return tlcs_compression::DecodeTemporalTextBytes(raw, nulls, n, bytes_out,
+                                                       ends_out, lengths_only);
     case TlcsColumnEncoding::kVarCharFrontDict:
-      return tlcs_compression::DecodeVarCharFrontDict(raw, nulls, n, chars_out,
-                                                      ends_out);
+      if (!selected_rows.empty() && selected_rows_applied != nullptr) {
+        *selected_rows_applied = true;
+      }
+      return tlcs_compression::DecodeVarCharFrontDictBytes(
+          raw, nulls, n, bytes_out, ends_out, lengths_only, selected_rows);
     case TlcsColumnEncoding::kVarCharPhraseTable:
-      return tlcs_compression::DecodeVarCharPhraseTable(raw, nulls, n,
-                                                        chars_out, ends_out);
+      return tlcs_compression::DecodeVarCharPhraseTableBytes(
+          raw, nulls, n, bytes_out, ends_out, lengths_only);
     case TlcsColumnEncoding::kZstdVarChar: {
       uint8_t tag = 0;
       uint8_t subtag = 0;
-      std::vector<uint8_t> inner;
-      if (!tlcs_compression::DecompressZstdFrame(raw, &tag, &subtag, &inner)) {
+      std::span<const uint8_t> inner;
+      if (!tlcs_compression::DecompressZstdFrameRaw(raw, &tag, &subtag,
+                                                    &inner)) {
         return false;
       }
       if (tag == 0U) {
-        return tlcs_compression::DecodeZstdVarChar(raw, nulls, n, chars_out,
-                                                   ends_out);
+        if (!selected_rows.empty() && selected_rows_applied != nullptr) {
+          *selected_rows_applied = true;
+        }
+        return tlcs_compression::DecodeZstdVarCharUnpackedBytes(
+            inner, nulls, n, bytes_out, ends_out, lengths_only, selected_rows);
       }
       if (tag == static_cast<uint8_t>(TlcsColumnEncoding::kTemporalText)) {
-        return tlcs_compression::DecodeTemporalText(inner, nulls, n, chars_out,
-                                                    ends_out);
+        return tlcs_compression::DecodeTemporalTextBytes(
+            inner, nulls, n, bytes_out, ends_out, lengths_only);
       }
       if (tag == static_cast<uint8_t>(TlcsColumnEncoding::kVarCharFrontDict)) {
-        return tlcs_compression::DecodeVarCharFrontDict(inner, nulls, n,
-                                                        chars_out, ends_out);
+        if (!selected_rows.empty() && selected_rows_applied != nullptr) {
+          *selected_rows_applied = true;
+        }
+        return tlcs_compression::DecodeVarCharFrontDictBytes(
+            inner, nulls, n, bytes_out, ends_out, lengths_only, selected_rows);
       }
       if (tag ==
           static_cast<uint8_t>(TlcsColumnEncoding::kVarCharPhraseTable)) {
-        return tlcs_compression::DecodeVarCharPhraseTable(inner, nulls, n,
-                                                          chars_out, ends_out);
+        return tlcs_compression::DecodeVarCharPhraseTableBytes(
+            inner, nulls, n, bytes_out, ends_out, lengths_only);
       }
       return false;
     }
@@ -1922,9 +1936,9 @@ bool DecodeCompressedNumericPayload(const TlcsFile::ColumnMeta& meta,
   if (meta.encoding == TlcsColumnEncoding::kZstdNumeric) {
     uint8_t inner_tag = 0;
     uint8_t inner_fw = 0;
-    std::vector<uint8_t> inner;
-    if (!tlcs_compression::DecompressZstdFrame(raw, &inner_tag, &inner_fw,
-                                               &inner)) {
+    std::span<const uint8_t> inner;
+    if (!tlcs_compression::DecompressZstdFrameRaw(raw, &inner_tag, &inner_fw,
+                                                  &inner)) {
       return false;
     }
     const auto inner_enc = static_cast<TlcsColumnEncoding>(inner_tag);
@@ -1938,22 +1952,22 @@ bool DecodeCompressedNumericPayload(const TlcsFile::ColumnMeta& meta,
       TlcsFile::ColumnMeta tmp = meta;
       tmp.encoding = TlcsColumnEncoding::kFor;
       tmp.for_width = inner_fw;
-      if (inner_fw > 0 && inner.size() != static_cast<size_t>(n) * inner_fw) {
-        return false;
+      if (inner_fw == 0 || inner.size() == static_cast<size_t>(n) * inner_fw) {
+        if (inner_fw == 8) {
+          Le64BufferToInt64(inner.data(), n, dst);
+        } else {
+          UnpackForToInt64(tmp, inner, n, dst);
+        }
+        return true;
       }
-      if (inner_fw == 8) {
-        Le64BufferToInt64(inner.data(), n, dst);
-      } else {
-        UnpackForToInt64(tmp, inner, n, dst);
-      }
-      return true;
+      return false;
     }
     if (inner_enc == TlcsColumnEncoding::kRawDouble) {
-      if (inner.size() != static_cast<size_t>(n) * sizeof(int64_t)) {
-        return false;
+      if (inner.size() == static_cast<size_t>(n) * sizeof(int64_t)) {
+        Le64BufferToInt64(inner.data(), n, dst);
+        return true;
       }
-      Le64BufferToInt64(inner.data(), n, dst);
-      return true;
+      return false;
     }
     return false;
   }
@@ -2266,16 +2280,9 @@ bool DecodeColumnBlockFromFile(
       const uint8_t* nulls_ptr = !dc.nulls_view.empty() ? dc.nulls_view.data()
                                  : !dc.nulls.empty()    ? dc.nulls.data()
                                                         : nullptr;
-      std::vector<char> chars;
-      if (!DecodeCompressedVarCharPayload(sm.encoding, enc, nulls_ptr,
-                                          src_b.row_count, &chars,
-                                          &dc.varchar_ends)) {
-        return false;
-      }
-      dc.varchar_bytes.assign(
-          reinterpret_cast<const uint8_t*>(chars.data()),
-          reinterpret_cast<const uint8_t*>(chars.data()) + chars.size());
-      return true;
+      return DecodeCompressedVarCharPayload(sm.encoding, enc, nulls_ptr,
+                                            src_b.row_count, &dc.varchar_bytes,
+                                            &dc.varchar_ends);
     }
     if (using_mmap) {
       dc.varchar_bytes_view =
@@ -3543,7 +3550,7 @@ TlcsFile::GetOrComputeVarcharBlockBounds(slot_t col_idx,
     }
   }
 
-  // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+  // Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
   //   (bottom_exclusion_tightens_min_bound_sound,
   //    interior_exclusion_min_bound_unsound_bug)
   auto set_bounds = [](VarcharBlockBound& out, std::string_view min_str,
@@ -3686,6 +3693,134 @@ TlcsFile::GetOrComputeVarcharBlockBounds(slot_t col_idx,
   return published;
 }
 
+StatusOr<bool> TlcsFile::TryMatchCompressedVarCharContains(
+    uint32_t block_idx, slot_t col_id, std::string_view needle,
+    uint32_t* row_count_out, std::vector<uint32_t>* matching_rows_out) const {
+  if (block_idx >= block_count_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "tlcs block index out of range");
+  }
+  ASSIGN_OR_RETURN(std::shared_ptr<const DirGroup>, grp,
+                   GetDirGroup(block_idx / dir_group_size_));
+  const uint32_t lidx = block_idx % dir_group_size_;
+  if (lidx >= grp->blocks.size()) {
+    return StatusError(StatusCode::kCorrupt,
+                       "tlcs directory block index out of range");
+  }
+  const BlockDirEntry& blk = grp->blocks[lidx];
+  if (col_id >= blk.columns.size()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "tlcs column id out of range");
+  }
+  const ColumnMeta& meta = blk.columns[col_id];
+  if (meta.encoding != TlcsColumnEncoding::kVarCharFrontDict &&
+      meta.encoding != TlcsColumnEncoding::kZstdVarChar) {
+    return false;
+  }
+  const uint32_t n = blk.row_count;
+  if (row_count_out != nullptr) {
+    *row_count_out = n;
+  }
+  if (n == 0) {
+    matching_rows_out->clear();
+    return true;
+  }
+  if (n > RowPage::kMaxColumnarRows) {
+    return StatusError(StatusCode::kCorrupt,
+                       "tlcs block row count out of range");
+  }
+  if (meta.data_size > 0 && (meta.data_offset > file_size_ ||
+                             meta.data_size > file_size_ - meta.data_offset)) {
+    return StatusError(StatusCode::kCorrupt, "tlcs stream out of bounds");
+  }
+
+  std::shared_ptr<const platform::MemoryMap> mmap_copy;
+  {
+    std::scoped_lock lk(resident_mu_);
+    mmap_copy = resident_mmap_;
+  }
+  const bool have_mmap = mmap_copy != nullptr && mmap_copy->IsValid();
+  const uint8_t* const mmap_data = have_mmap ? mmap_copy->Data() : nullptr;
+
+  thread_local std::vector<uint8_t> raw_buf;
+  thread_local std::vector<uint8_t> nulls_buf;
+  const uint8_t* nulls_ptr = nullptr;
+  if (meta.has_null) {
+    if (meta.nulls_size == 0 || meta.nulls_size > static_cast<uint64_t>(n) ||
+        meta.nulls_offset > file_size_ ||
+        meta.nulls_size > file_size_ - meta.nulls_offset) {
+      return StatusError(StatusCode::kCorrupt, "tlcs null bitmap out of range");
+    }
+    std::span<const uint8_t> enc_nulls;
+    if (have_mmap) {
+      enc_nulls = std::span<const uint8_t>(
+          mmap_data + meta.nulls_offset, static_cast<size_t>(meta.nulls_size));
+    } else {
+      raw_buf.resize(static_cast<size_t>(meta.nulls_size));
+      RETURN_IF_FAIL(PreadAllFd(fd_, raw_buf.data(),
+                                static_cast<size_t>(meta.nulls_size),
+                                meta.nulls_offset));
+      enc_nulls = raw_buf;
+    }
+    if (enc_nulls.size() == n) {
+      nulls_ptr = enc_nulls.data();
+    } else {
+      if (!tlcs_compression::DecodeCompactNulls(enc_nulls, n, &nulls_buf)) {
+        return StatusError(StatusCode::kCorrupt,
+                           "tlcs compact null bitmap corrupt");
+      }
+      nulls_ptr = nulls_buf.data();
+    }
+  }
+
+  std::span<const uint8_t> enc;
+  if (have_mmap) {
+    enc = std::span<const uint8_t>(mmap_data + meta.data_offset,
+                                   static_cast<size_t>(meta.data_size));
+  } else {
+    raw_buf.resize(static_cast<size_t>(meta.data_size));
+    if (meta.data_size > 0) {
+      RETURN_IF_FAIL(PreadAllFd(fd_, raw_buf.data(),
+                                static_cast<size_t>(meta.data_size),
+                                meta.data_offset));
+    }
+    enc = raw_buf;
+  }
+
+  if (meta.encoding == TlcsColumnEncoding::kVarCharFrontDict) {
+    if (!tlcs_compression::MatchVarCharFrontDictContains(
+            enc, nulls_ptr, n, needle, matching_rows_out)) {
+      return StatusError(StatusCode::kCorrupt,
+                         "tlcs front-dict contains match failed");
+    }
+    return true;
+  }
+
+  uint8_t tag = 0;
+  uint8_t subtag = 0;
+  std::span<const uint8_t> inner;
+  if (!tlcs_compression::DecompressZstdFrameRaw(enc, &tag, &subtag, &inner)) {
+    return StatusError(StatusCode::kCorrupt, "tlcs zstd frame decode failed");
+  }
+  if (tag == 0U) {
+    if (!tlcs_compression::MatchZstdVarCharUnpackedContains(
+            inner, nulls_ptr, n, needle, matching_rows_out)) {
+      return StatusError(StatusCode::kCorrupt,
+                         "tlcs zstd varchar contains match failed");
+    }
+    return true;
+  }
+  if (tag == static_cast<uint8_t>(TlcsColumnEncoding::kVarCharFrontDict)) {
+    if (!tlcs_compression::MatchVarCharFrontDictContains(
+            inner, nulls_ptr, n, needle, matching_rows_out)) {
+      return StatusError(StatusCode::kCorrupt,
+                         "tlcs zstd front-dict contains match failed");
+    }
+    return true;
+  }
+  return false;
+}
+
 Status TlcsFile::DecodeBlockColumns(uint32_t block_idx,
                                     std::span<const slot_t> column_ids,
                                     const Schema& schema, DecodedBlock* out,
@@ -3695,7 +3830,7 @@ Status TlcsFile::DecodeBlockColumns(uint32_t block_idx,
                                        materialize_dict_ints, io_scratch, {});
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (gather_decode_commutes)
 bool TlcsFile::TryGatherMmapFixedColumns(uint32_t block_idx,
                                          std::span<const slot_t> column_ids,
@@ -4256,50 +4391,60 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
       case TlcsColumnEncoding::kZstdVarChar: {
         chunk.dict_codes.clear();
         chunk.int_cells.clear();
-        raw.resize(meta.data_size);
-        if (meta.data_size > 0) {
-          RETURN_IF_FAIL(
-              read_slice(meta.data_offset, meta.data_size, raw.data()));
+        std::span<const uint8_t> enc;
+        if (have_mmap) {
+          if (meta.data_size > 0 &&
+              (meta.data_offset > file_size_ ||
+               meta.data_size > file_size_ - meta.data_offset)) {
+            return StatusError(StatusCode::kCorrupt,
+                               "tlcs stream out of bounds");
+          }
+          enc = std::span<const uint8_t>(mmap_data + meta.data_offset,
+                                         meta.data_size);
+        } else {
+          raw.resize(meta.data_size);
+          if (meta.data_size > 0) {
+            RETURN_IF_FAIL(
+                read_slice(meta.data_offset, meta.data_size, raw.data()));
+          }
+          enc = raw;
         }
         const uint8_t* nulls_ptr =
             chunk.nulls.empty() ? nullptr : chunk.nulls.data();
-        std::vector<char> chars;
-        if (!DecodeCompressedVarCharPayload(meta.encoding, raw, nulls_ptr, n,
-                                            &chars, &chunk.varchar_ends)) {
+        const bool lengths_only =
+            i < varchar_lengths_only.size() && varchar_lengths_only[i] != 0;
+        bool sparse_applied = false;
+        if (!DecodeCompressedVarCharPayload(
+                meta.encoding, enc, nulls_ptr, n, &chunk.varchar_bytes,
+                &chunk.varchar_ends, lengths_only,
+                lengths_only ? std::span<const uint32_t>{} : varchar_rows,
+                &sparse_applied)) {
           return StatusError(StatusCode::kCorrupt,
                              "tlcs compressed varchar decode failed");
         }
-        const bool lengths_only =
-            i < varchar_lengths_only.size() && varchar_lengths_only[i] != 0;
-        if (lengths_only) {
-          chunk.varchar_bytes.clear();
-        } else if (!varchar_rows.empty()) {
+        if (!lengths_only && !varchar_rows.empty() && !sparse_applied) {
+          // `varchar_rows` is strictly ascending, so `packed <= begin` always
+          // holds and we can compact selected strings in-place via memmove.
           const std::vector<uint32_t> source_ends = chunk.varchar_ends;
-          chunk.varchar_bytes.clear();
+          size_t packed = 0;
           uint32_t next_row = 0;
+          uint8_t* const bytes_ptr = chunk.varchar_bytes.data();
           for (const uint32_t row : varchar_rows) {
             const uint32_t begin = row == 0 ? 0 : source_ends[row - 1];
             const uint32_t end = source_ends[row];
             const uint32_t len = end - begin;
-            const size_t packed = chunk.varchar_bytes.size();
             std::fill_n(chunk.varchar_ends.begin() + next_row, row - next_row,
                         static_cast<uint32_t>(packed));
-            if (len != 0) {
-              chunk.varchar_bytes.insert(
-                  chunk.varchar_bytes.end(),
-                  reinterpret_cast<const uint8_t*>(chars.data() + begin),
-                  reinterpret_cast<const uint8_t*>(chars.data() + end));
+            if (len != 0 && packed != begin) {
+              std::memmove(bytes_ptr + packed, bytes_ptr + begin, len);
             }
-            chunk.varchar_ends[row] = static_cast<uint32_t>(packed + len);
+            packed += len;
+            chunk.varchar_ends[row] = static_cast<uint32_t>(packed);
             next_row = row + 1;
           }
           std::fill(chunk.varchar_ends.begin() + next_row,
-                    chunk.varchar_ends.end(),
-                    static_cast<uint32_t>(chunk.varchar_bytes.size()));
-        } else {
-          chunk.varchar_bytes.assign(
-              reinterpret_cast<const uint8_t*>(chars.data()),
-              reinterpret_cast<const uint8_t*>(chars.data()) + chars.size());
+                    chunk.varchar_ends.end(), static_cast<uint32_t>(packed));
+          chunk.varchar_bytes.resize(packed);
         }
         break;
       }
@@ -4310,12 +4455,25 @@ Status TlcsFile::DecodeBlockColumnsWithOptions(
         chunk.varchar_bytes.clear();
         chunk.varchar_ends.clear();
         chunk.int_cells.resize(n);
-        raw.resize(meta.data_size);
-        if (meta.data_size > 0) {
-          RETURN_IF_FAIL(
-              read_slice(meta.data_offset, meta.data_size, raw.data()));
+        std::span<const uint8_t> enc;
+        if (have_mmap) {
+          if (meta.data_size > 0 &&
+              (meta.data_offset > file_size_ ||
+               meta.data_size > file_size_ - meta.data_offset)) {
+            return StatusError(StatusCode::kCorrupt,
+                               "tlcs stream out of bounds");
+          }
+          enc = std::span<const uint8_t>(mmap_data + meta.data_offset,
+                                         meta.data_size);
+        } else {
+          raw.resize(meta.data_size);
+          if (meta.data_size > 0) {
+            RETURN_IF_FAIL(
+                read_slice(meta.data_offset, meta.data_size, raw.data()));
+          }
+          enc = raw;
         }
-        if (!DecodeCompressedNumericPayload(meta, raw, n,
+        if (!DecodeCompressedNumericPayload(meta, enc, n,
                                             chunk.int_cells.data())) {
           return StatusError(StatusCode::kCorrupt,
                              "tlcs compressed numeric decode failed");
@@ -4712,20 +4870,18 @@ Status TlcsFile::DecodeSingleRowByBlockIndex(uint32_t block_idx,
                                "tlcs compact null bitmap corrupt");
           }
         }
-        std::vector<char> chars;
+        std::vector<uint8_t> bytes;
         std::vector<uint32_t> ends;
         if (!DecodeCompressedVarCharPayload(
                 meta.encoding, enc,
                 full_nulls.empty() ? nullptr : full_nulls.data(),
-                src_b.row_count, &chars, &ends)) {
+                src_b.row_count, &bytes, &ends)) {
           return StatusError(StatusCode::kCorrupt,
                              "tlcs compressed varchar decode failed");
         }
         const uint32_t begin = row_idx == 0 ? 0 : ends[row_idx - 1];
         const uint32_t end = ends[row_idx];
-        chunk.varchar_bytes.assign(
-            reinterpret_cast<const uint8_t*>(chars.data() + begin),
-            reinterpret_cast<const uint8_t*>(chars.data() + end));
+        chunk.varchar_bytes.assign(bytes.data() + begin, bytes.data() + end);
         chunk.varchar_ends.push_back(end - begin);
         break;
       }
@@ -5744,14 +5900,11 @@ bool TlcsFile::DecodeSingleColumnBlockForCache(
     }
     const uint8_t* nulls_ptr =
         dc.nulls_view.empty() ? nullptr : dc.nulls_view.data();
-    std::vector<char> chars;
-    if (!DecodeCompressedVarCharPayload(sm.encoding, enc, nulls_ptr, n, &chars,
+    if (!DecodeCompressedVarCharPayload(sm.encoding, enc, nulls_ptr, n,
+                                        &decoded->owned_varchar_bytes,
                                         &decoded->owned_varchar_ends)) {
       return false;
     }
-    decoded->owned_varchar_bytes.assign(
-        reinterpret_cast<const uint8_t*>(chars.data()),
-        reinterpret_cast<const uint8_t*>(chars.data()) + chars.size());
     dc.varchar_bytes_view = decoded->owned_varchar_bytes;
     dc.varchar_ends_view = decoded->owned_varchar_ends;
     bytes += decoded->owned_varchar_bytes.size() +

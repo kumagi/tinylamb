@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.SplitOverlap` — `∀ l r a b c d, finish (l++[(a,b),(c,d)]++r) ≤ finish
+  (l++[(a+c,b+d)]++r)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

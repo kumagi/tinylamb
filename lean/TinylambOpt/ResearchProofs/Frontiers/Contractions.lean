@@ -1,5 +1,29 @@
 import TinylambOpt.ResearchGoals.Frontiers.Contractions
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `ExceptionJoin` — `∀ n m l r u v (edits : List (Nat × Nat × Int)), (∀ e ∈ edits, e.1
+  < n ∧ e.2.1 < m) → run n m (fun i j => l i*r j + ((edits.filter (fun (x,y,_) => x
+  == i && y == j)).map (fun e => e.2.2)).sum) u v = dot n u l * dot m r v +
+  (edits.map (fun (i,j,w) => u i*w*v j)).sum`
+- `InvisibleDelta` — `∀ n m d (l r : Mat) (delta : Vec), (∀ h < d, dot n delta (fun i
+  => l i h) = 0) → ∀ v, run n m (fun i j => total d (fun h => l i h*r h j)) delta v =
+  0`
+- `LatentBridge` — `∀ n h k (l r s t : Mat) i j, total n (fun x => dot h (l i) (fun p
+  => r p x) * dot k (s x) (fun q => t q j)) = total h (fun p => total k (fun q => l i
+  p * dot n (r p) (fun x => s x q) * t q j))`
+
+Refuted by counterexample
+
+- `QuotientCycles` — `∀ n (a b : Mat) (cls : Nat → Nat), (∀ i < n, ∀ c, total n (fun j
+  => if cls j == c then a i j else 0) = total n (fun j => if cls j == c then b i j
+  else 0)) → cycle n a a a = cycle n b b b`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.Contractions
 
 open TinylambOpt.ResearchGoals.Frontiers.Contractions

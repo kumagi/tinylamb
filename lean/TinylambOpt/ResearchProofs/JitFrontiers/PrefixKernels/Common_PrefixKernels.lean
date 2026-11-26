@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+All accumulator values seen by the loop, starting with the incoming one.
+
+Named results include `limit_pos`, `fits_zero`, `fits_true`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

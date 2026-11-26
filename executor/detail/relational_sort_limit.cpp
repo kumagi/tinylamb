@@ -107,7 +107,7 @@ bool IsScalarBytecodeCompilable(const Expression& node) {
     return true;
   }
   if (node->Type() == TypeTag::kFunctionCallExp) {
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     // (ascii_substr_1based_slice_sound)
     const auto& name = node->AsFunctionCallExpression().FuncName();
     if (!IdentifierEquals(name, "coalesce") &&
@@ -1155,7 +1155,7 @@ Status ApplyOrderBy(TransactionContext& context,
           } else if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_RADIX_SORT") == nullptr &&
                      n >= 1024 && exact0) {
             // Lean proof:
-            // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+            // lean/TinylambOpt/ResearchProofs/StableRadix.lean
             // (sound)
             auto key_fn = [](const SortEntry& e) noexcept { return e.k0; };
             if (!fully_exact || has_k1 || order_specs.size() > 1) {

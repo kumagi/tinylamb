@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `MergeRank` — RANK can merge arbitrary shards by summing the two counts of strict
+  predecessors.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

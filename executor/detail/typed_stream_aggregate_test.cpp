@@ -830,7 +830,8 @@ TEST(TypedStreamAggregateTest, TypedColumnEvalOverflowUsesCanonicalStatus) {
   EXPECT_EQ(ok.Value().AsInt64(), kMax - 1);
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
 // (InRangeSynopsis_sound).
 // Verifies scalar IN-list + integer range folds (both 64-bit bitmask and
 // wide-span list, plus empty-match zone-map/bloom skipping and NULL handling)

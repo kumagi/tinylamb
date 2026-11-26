@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
 /-! Binary radix spill using a fixed number of hash bits from high to low.

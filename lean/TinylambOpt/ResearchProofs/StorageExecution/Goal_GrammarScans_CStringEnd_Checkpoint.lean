@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `CStringEnd.Checkpoint` — A saved state at a prefix resumes scanning across further
+  phrase boundaries.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

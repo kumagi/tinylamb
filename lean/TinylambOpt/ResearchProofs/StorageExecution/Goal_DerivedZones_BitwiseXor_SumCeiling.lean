@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_DerivedZones_BitwiseXor_SoundInterval
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `BitwiseXor.SumCeiling` — A footer gives a deterministic interval for the SUM
+  accumulator over non-NULL scores.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

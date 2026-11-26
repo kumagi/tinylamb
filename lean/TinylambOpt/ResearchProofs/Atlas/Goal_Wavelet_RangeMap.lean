@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.RangeMap` — `∀ bit l w xs high, let branch := fun x : Nat => x.testBit bit
+  == high let (start,len) := remap bit l w xs high (((xs.drop l).take w).filter
+  branch) = (((xs.filter branch).drop start).take len)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

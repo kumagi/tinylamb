@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `DeletedSpan.SliceState` — `∀ c lo hi, lo ≤ hi → let selected := (rows layout
+  c).filter (fun r => lo ≤ r.1 && r.1 < hi) let ls := layout.lanes c
+  (selected.length,(selected.map Prod.snd).sum) = ((ls.map (fun a => beforePos a hi -
+  beforePos a lo)).sum, (ls.map (fun a => partialSum a (beforePos a hi)-partialSum a
+  (beforePos a lo))).sum)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

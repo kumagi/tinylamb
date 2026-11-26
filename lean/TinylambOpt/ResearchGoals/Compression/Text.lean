@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+-/
+
 namespace TinylambOpt.ResearchGoals.Compression.Text
 open Wire
 open TinylambOpt.ResearchGoals.Atlas.TextExecution.Lcp (common)

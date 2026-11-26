@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Order-reversing signed 64-bit bijection to `Nat ∈ [0, 2^64 - 1]`: larger signed keys map
+to SMALLER unsigned keys so ascending LSB radix sort produces descending signed order.
+
+Extracts `radix`-base digit at position `pass`.
+
+Modeled claims
+
+- `Goal` — Signed 64-bit order-reversing LSB descending radix sort equivalence (H2O H2
+  / LDBC L2 / DictionaryJoinsAndLateLabels B1 / STATS-CEB C2 / JOB J4): for all
+  inputs with `key ∈ [i64Min, i64Max]` and any `(radix, passes)` with `2^64 ≤ radix ^
+  passes` (including both `(256, 8)` byte passes and `(16, 16)` nibble passes),
+  `radixSortDescWith` preserves the exact multiset (`count`), produces monotonically
+  descending keys (`b.key ≤ a.key`), and is stable.
+-/
+
 namespace TinylambOpt.ResearchGoals.BoundedCountRadixDescSortEquiv
 
 def i64Min : Int := -9223372036854775808
@@ -42,7 +58,7 @@ def AllKeysInI64 (xs : List SortItem) : Prop :=
   ∀ x : SortItem, x ∈ xs → i64Min ≤ x.key ∧ x.key ≤ i64Max
 
 /-- Signed 64-bit order-reversing LSB descending radix sort equivalence
-    (H2O H2 / LDBC L2 / BigBench B1 / STATS-CEB C2 / JOB J4): for all inputs
+    (H2O H2 / LDBC L2 / DictionaryJoinsAndLateLabels B1 / STATS-CEB C2 / JOB J4): for all inputs
     with `key ∈ [i64Min, i64Max]` and any `(radix, passes)` with
     `2^64 ≤ radix ^ passes` (including both `(256, 8)` byte passes and `(16, 16)`
     nibble passes), `radixSortDescWith` preserves the exact multiset (`count`),

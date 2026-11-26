@@ -41,34 +41,38 @@ constexpr size_t SaturatingAddBytes(size_t a, size_t b) noexcept {
 // Any number of non-DISTINCT, non-collection siblings (e.g. MIN/MAX/SUM/COUNT)
 // may accompany the single DISTINCT aggregate: the sorted skew path feeds
 // siblings on every row and deduplicates the single DISTINCT aggregate.
-[[nodiscard]] std::optional<size_t> SingleStrippableDistinctAggregate(
+[[nodiscard]] std::vector<size_t> SharedStrippableDistinctAggregates(
     const std::vector<const AggregateExpression*>& aggregates,
-    bool has_collection_agg) noexcept {
+    bool has_collection_agg) {
   if (has_collection_agg || aggregates.empty()) {
-    return std::nullopt;
+    return {};
   }
-  std::optional<size_t> distinct_idx;
+  std::vector<size_t> indices;
+  std::string shared_child;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const AggregateExpression* agg = aggregates[i];
     if (agg == nullptr) {
-      return std::nullopt;
+      return {};
     }
     if (!agg->Distinct()) {
       continue;
-    }
-    if (distinct_idx.has_value()) {
-      return std::nullopt;
     }
     const AggregationType t = agg->GetType();
     if (agg->HasWhereFilter() || agg->NeedsGroupContext() ||
         agg->HasInnerGroupBy() || agg->Child() == nullptr ||
         (t != AggregationType::kCount && t != AggregationType::kSum &&
          t != AggregationType::kAvg)) {
-      return std::nullopt;
+      return {};
     }
-    distinct_idx = i;
+    const std::string child_str = agg->Child()->ToString();
+    if (indices.empty()) {
+      shared_child = child_str;
+    } else if (child_str != shared_child) {
+      return {};
+    }
+    indices.push_back(i);
   }
-  return distinct_idx;
+  return indices;
 }
 
 // Streams finished aggregate rows lazily from PartitionLeafSet one leaf at a
@@ -88,8 +92,8 @@ class
       std::vector<Expression> aggregate_owners,
       std::vector<const AggregateExpression*> aggregates, bool partial_mode,
       bool has_collection_agg, std::optional<slot_t> single_distinct_child_slot,
-      size_t single_distinct_agg_index,
-      std::shared_ptr<AggregateExpression> skew_strip_aggregate,
+      std::vector<size_t> shared_distinct_agg_indices,
+      std::vector<std::shared_ptr<AggregateExpression>> skew_strip_aggregates,
       size_t budget_bytes, QueryMemoryGrant* grant,
       std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard,
       std::string label, std::shared_ptr<std::atomic<size_t>> output_groups)
@@ -103,8 +107,8 @@ class
         partial_mode_(partial_mode),
         has_collection_agg_(has_collection_agg),
         single_distinct_child_slot_(single_distinct_child_slot),
-        single_distinct_agg_index_(single_distinct_agg_index),
-        skew_strip_aggregate_(std::move(skew_strip_aggregate)),
+        shared_distinct_agg_indices_(std::move(shared_distinct_agg_indices)),
+        skew_strip_aggregates_(std::move(skew_strip_aggregates)),
         budget_bytes_(budget_bytes),
         grant_(grant),
         consumer_guard_(std::move(consumer_guard)),
@@ -120,15 +124,21 @@ class
         }
       }
     }
-    if (skew_strip_aggregate_ != nullptr &&
-        single_distinct_agg_index_ < aggregates_.size()) {
-      // The skew table accumulates the DISTINCT-stripped clone at
-      // single_distinct_agg_index_ instead of the original aggregate: the
-      // sorter already feeds each distinct value once, so the clone's plain
-      // state stays O(1) per group while non-distinct siblings fold normally.
+    if (!skew_strip_aggregates_.empty() &&
+        skew_strip_aggregates_.size() == shared_distinct_agg_indices_.size()) {
+      // The skew table accumulates DISTINCT-stripped clones for every index in
+      // shared_distinct_agg_indices_ instead of the originals: the sorter
+      // already feeds each distinct value once, so the clones' plain states
+      // stay O(1) per group while non-distinct siblings fold normally.
       skew_table_aggregates_ = aggregates_;
-      skew_table_aggregates_[single_distinct_agg_index_] =
-          skew_strip_aggregate_.get();
+      shared_distinct_skip_mask_.assign(aggregates_.size(), 0);
+      for (size_t k = 0; k < shared_distinct_agg_indices_.size(); ++k) {
+        const size_t idx = shared_distinct_agg_indices_[k];
+        if (idx < skew_table_aggregates_.size()) {
+          skew_table_aggregates_[idx] = skew_strip_aggregates_[k].get();
+          shared_distinct_skip_mask_[idx] = 1;
+        }
+      }
     }
     if (grant_ != nullptr) {
       const size_t refill =
@@ -332,10 +342,8 @@ class
   }
 
   [[nodiscard]] bool UseSingleCountDistinctSort() const noexcept {
-    return single_distinct_child_slot_.has_value() ||
-           (!partial_mode_ &&
-            SingleStrippableDistinctAggregate(aggregates_, has_collection_agg_)
-                .has_value());
+    return !shared_distinct_agg_indices_.empty() &&
+           !skew_strip_aggregates_.empty() && !partial_mode_;
   }
 
   void EnsureConsumerGuard() {
@@ -465,7 +473,8 @@ class
                 ASSIGN_OR_RETURN(
                     Value, ev,
                     EvalRowExpression(
-                        aggregates_[single_distinct_agg_index_]->Child(),
+                        aggregates_[shared_distinct_agg_indices_.front()]
+                            ->Child(),
                         input_schema_, raw));
                 dv = std::move(ev);
               }
@@ -531,7 +540,7 @@ class
       if (!have_active_skew_key_) {
         active_skew_key_ = std::move(cur_key);
         skew_table_ = std::make_unique<AggregateGroupTable>(
-            &input_schema_, skew_strip_aggregate_ != nullptr
+            &input_schema_, !skew_strip_aggregates_.empty()
                                 ? &skew_table_aggregates_
                                 : &aggregates_);
         ASSIGN_OR_RETURN(size_t, gid,
@@ -551,9 +560,9 @@ class
         // keeps O(1) state per group instead of materializing a distinct set.
         const Value dval = sorted_row[skew_raw_width_ + gcnt];
         sorted_row.values_.resize(skew_raw_width_);
-        if (aggregates_.size() > 1) {
-          RETURN_IF_FAIL(skew_table_->AccumulateExcluding(
-              0, sorted_row, single_distinct_agg_index_));
+        if (aggregates_.size() > shared_distinct_agg_indices_.size()) {
+          RETURN_IF_FAIL(skew_table_->AccumulateExcludingMask(
+              0, sorted_row, shared_distinct_skip_mask_));
         }
         if (!dval.IsNull()) {
           if (!have_prev_distinct_ || !relational_detail::DistinctValueEqual{}(
@@ -569,10 +578,11 @@ class
                   StatusCode::kTooBigData,
                   "Single aggregate group exceeds operator memory budget");
             }
-            ASSIGN_OR_RETURN(
-                relational_detail::AggregateAccumulator*, state,
-                skew_table_->StateFor(0, single_distinct_agg_index_));
-            RETURN_IF_FAIL(state->Add(dval));
+            for (const size_t idx : shared_distinct_agg_indices_) {
+              ASSIGN_OR_RETURN(relational_detail::AggregateAccumulator*, state,
+                               skew_table_->StateFor(0, idx));
+              RETURN_IF_FAIL(state->Add(dval));
+            }
           }
         }
       } else {
@@ -632,12 +642,13 @@ class
   bool partial_mode_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
-  size_t single_distinct_agg_index_{0};
-  // Owned DISTINCT-stripped clone used by the skew table when the aggregate
-  // list has one plain DISTINCT aggregate and non-distinct siblings (see
-  // SingleStrippableDistinctAggregate). Non-null implies the skew path is
-  // the sorted single-distinct path, so its per-group state stays O(1).
-  std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
+  std::vector<size_t> shared_distinct_agg_indices_;
+  std::vector<uint8_t> shared_distinct_skip_mask_;
+  // Owned DISTINCT-stripped clones used by the skew table when all DISTINCT
+  // aggregates share one plain child expression (see
+  // SharedStrippableDistinctAggregates). Non-empty implies the skew path is
+  // the sorted distinct path, so its per-group state stays O(1).
+  std::vector<std::shared_ptr<AggregateExpression>> skew_strip_aggregates_;
   std::vector<const AggregateExpression*> skew_table_aggregates_;
   bool has_distinct_state_agg_{false};
   size_t budget_bytes_{0};
@@ -759,24 +770,29 @@ Status OocGroupAggSink::Init(PipelineContext* ctx, size_t /*worker_count*/) {
     }
   }
 
-  // Detect a single plain COUNT/SUM/AVG(DISTINCT expr) for the O(1) sorted
-  // skew fallback: the sorter feeds each distinct value once, so the skew
-  // table accumulates a DISTINCT-stripped clone whose state stays O(1).
+  // Detect one or more plain COUNT/SUM/AVG(DISTINCT expr) over the SAME child
+  // expression for the O(1) sorted skew fallback: the sorter feeds each
+  // distinct value once, so the skew table accumulates DISTINCT-stripped
+  // clones whose states stay O(1).
   single_distinct_child_slot_.reset();
-  single_distinct_agg_index_ = 0;
-  skew_strip_aggregate_.reset();
-  const std::optional<size_t> strip_idx =
-      SingleStrippableDistinctAggregate(aggregates_, has_collection_agg_);
-  if (strip_idx.has_value()) {
-    single_distinct_agg_index_ = *strip_idx;
-    const AggregateExpression* strip_agg = aggregates_[*strip_idx];
-    auto stripped = std::make_shared<AggregateExpression>(
-        strip_agg->GetType(), strip_agg->Child(), false);
-    stripped->SetIgnoreNulls(strip_agg->IgnoreNulls());
-    skew_strip_aggregate_ = std::move(stripped);
-    if (strip_agg->Child()->Type() == TypeTag::kColumnValue) {
+  shared_distinct_agg_indices_.clear();
+  skew_strip_aggregates_.clear();
+  shared_distinct_agg_indices_ =
+      SharedStrippableDistinctAggregates(aggregates_, has_collection_agg_);
+  if (!shared_distinct_agg_indices_.empty()) {
+    skew_strip_aggregates_.reserve(shared_distinct_agg_indices_.size());
+    for (const size_t strip_idx : shared_distinct_agg_indices_) {
+      const AggregateExpression* strip_agg = aggregates_[strip_idx];
+      auto stripped = std::make_shared<AggregateExpression>(
+          strip_agg->GetType(), strip_agg->Child(), false);
+      stripped->SetIgnoreNulls(strip_agg->IgnoreNulls());
+      skew_strip_aggregates_.push_back(std::move(stripped));
+    }
+    const AggregateExpression* first_agg =
+        aggregates_[shared_distinct_agg_indices_.front()];
+    if (first_agg->Child()->Type() == TypeTag::kColumnValue) {
       const int off = input_schema_.Offset(
-          strip_agg->Child()->AsColumnValue().GetColumnName());
+          first_agg->Child()->AsColumnValue().GetColumnName());
       // T4853: same uint16 bound as the group-key slots above.
       if (off >= 0 &&
           std::cmp_less_equal(
@@ -1090,7 +1106,7 @@ StatusOr<std::shared_ptr<PipelineSource>> OocGroupAggSink::Finalize(
       &ctx->spill_store, std::move(leaves), input_schema_, group_keys_,
       group_key_slots_, aggregate_owners_, aggregates_, all_combinable_,
       has_collection_agg_, single_distinct_child_slot_,
-      single_distinct_agg_index_, skew_strip_aggregate_, budget_bytes_,
+      shared_distinct_agg_indices_, skew_strip_aggregates_, budget_bytes_,
       &ctx->grant, std::move(leaf_guard), label_ + "Output", output_groups_);
 }
 

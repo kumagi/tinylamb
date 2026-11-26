@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+An exact recursive specification of the plans enumerated by `covers`.
+
+A compact recurrence for the iterative `boundaryCost` implementation.
+
+The modeled inputs and results come from
+`TinylambOpt.ResearchGoals.StorageExecution.GatherPlans`.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlansA
 
 open TinylambOpt.ResearchGoals.StorageExecution
@@ -229,3 +241,6 @@ private theorem coverMin_attained {f : Price} {xs : List Nat} :
     exact ⟨ps, hps, rfl⟩
 
 end TinylambOpt.ResearchProofs.StorageExecution.GatherPlansA
+
+-- C++ references to this model or its proof.
+-- table/tlcs_file.cpp

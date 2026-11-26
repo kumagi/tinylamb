@@ -26,7 +26,8 @@
 namespace tinylamb::execution_strategies {
 namespace {
 
-// 1. FrameIndexes (Wave7FrameIndexes)
+// 1. FrameIndexes
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/FrameIndexes.lean)
 TEST(ExecutionStrategiesTest, FrameIndexesMatchBruteForce) {
   const std::vector<int64_t> xs{5, 2, 8, 1, 9, 3, 7, 4};
   SparseMinimumTable smt;
@@ -61,7 +62,8 @@ TEST(ExecutionStrategiesTest, FrameIndexesMatchBruteForce) {
   EXPECT_EQ(WaveletQuantile({5, 2, 8, 1, 9, 3}, 1, 5, 2), 8);
 }
 
-// 2. CorrelatedProbes (Wave7CorrelatedProbes)
+// 2. CorrelatedProbes
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/CorrelatedProbes.lean)
 TEST(ExecutionStrategiesTest, CorrelatedProbesMatchReference) {
   EXPECT_TRUE(
       RelationalDivision({1, std::nullopt, 2}, {3, 2, std::nullopt, 1}));
@@ -94,7 +96,9 @@ TEST(ExecutionStrategiesTest, CorrelatedProbesMatchReference) {
             (std::vector<std::string>{"bar", "baz", "foo"}));
 }
 
-// 3. IndexPreimages (Wave7IndexPreimages) + live zone_map.cpp integration
+// 3. IndexPreimages
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/IndexPreimages.lean) +
+// live zone_map.cpp integration
 TEST(ExecutionStrategiesTest, IndexPreimagesAndZoneMapIntegration) {
   // TruncBucketPreimage: exact match against C++ integer division (trunc toward
   // 0) for positive, zero, and negative quotients.
@@ -160,7 +164,8 @@ TEST(ExecutionStrategiesTest, IndexPreimagesAndZoneMapIntegration) {
   EXPECT_EQ(EvaluateBlockKleene(div_pred, schema, blk), kKleeneT);
 }
 
-// 4. OrderedStreams (Wave7OrderedStreams)
+// 4. OrderedStreams
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/OrderedStreams.lean)
 TEST(ExecutionStrategiesTest, OrderedStreamsMatchReference) {
   const std::vector<int64_t> a{1, 4, 7, 10};
   const std::vector<int64_t> b{2, 3, 7, 12};
@@ -180,7 +185,8 @@ TEST(ExecutionStrategiesTest, OrderedStreamsMatchReference) {
       (std::vector<std::pair<int64_t, int64_t>>{{3, 5}, {10, 12}, {15, 20}}));
 }
 
-// 5. PairAggregates (Wave7PairAggregates)
+// 5. PairAggregates
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/PairAggregates.lean)
 TEST(ExecutionStrategiesTest, PairAggregatesMatchBruteForce) {
   const std::vector<int64_t> xs{3, -1, 7, 2};
   const std::vector<int64_t> ys{5, 0, -2};
@@ -226,7 +232,8 @@ TEST(ExecutionStrategiesTest, PairAggregatesMatchBruteForce) {
   EXPECT_EQ(LayerCakeMinimumSum(la, lb), lc_ref);
 }
 
-// 6. PlaneKernels (Wave7PlaneKernels)
+// 6. PlaneKernels
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/PlaneKernels.lean)
 TEST(ExecutionStrategiesTest, PlaneKernelsMatchScalar) {
   std::array<uint8_t, 64> ax{};
   std::array<uint8_t, 64> ay{};
@@ -267,7 +274,8 @@ TEST(ExecutionStrategiesTest, PlaneKernelsMatchScalar) {
   EXPECT_EQ(PlaneRunBoundary(px, ax[0], mask) & 1ULL, 1ULL);
 }
 
-// 7. EncodedBlocks (Wave7EncodedBlocks)
+// 7. EncodedBlocks
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/EncodedBlocks.lean)
 TEST(ExecutionStrategiesTest, EncodedBlocksMatchReference) {
   EXPECT_EQ(PatchedRangeFilter(100, 102, 105, {0, 2, 5, 10}, {{3, 103}}),
             (std::vector<size_t>{1, 2, 3}));
@@ -279,7 +287,8 @@ TEST(ExecutionStrategiesTest, EncodedBlocksMatchReference) {
             (std::vector<int64_t>{10, 12, 15, 20, 24}));
 }
 
-// 8. SearchBounds (Wave7SearchBounds)
+// 8. SearchBounds
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/SearchBounds.lean)
 TEST(ExecutionStrategiesTest, SearchBoundsHold) {
   const std::vector<int64_t> a{1, 1, 2, 3};
   const std::vector<int64_t> b{1, 2, 2, 2};
@@ -292,7 +301,8 @@ TEST(ExecutionStrategiesTest, SearchBoundsHold) {
   EXPECT_TRUE(PredicateExchangePreferFirst(100, 1, 10, 10, 50));
 }
 
-// 9. DeltaMaintenance (Wave7DeltaMaintenance)
+// 9. DeltaMaintenance
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/DeltaMaintenance.lean)
 TEST(ExecutionStrategiesTest, DeltaMaintenanceMatchesFullRecompute) {
   const KeyBag a{{1, 2}, {2, 1}};
   const KeyBag b{{1, 3}, {2, 0}};
@@ -311,7 +321,8 @@ TEST(ExecutionStrategiesTest, DeltaMaintenanceMatchesFullRecompute) {
   EXPECT_EQ(DeltaMinimumRepair(5, 1, {5}, {10}), std::nullopt);
 }
 
-// 10. RecursiveJoins (Wave7RecursiveJoins)
+// 10. RecursiveJoins
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/RecursiveJoins.lean)
 TEST(ExecutionStrategiesTest, RecursiveJoinsMatchReference) {
   EXPECT_TRUE(
       MeetFrontiersReachable(5, {{0, 1}, {1, 2}, {2, 3}, {3, 4}}, 0, 4));
@@ -331,7 +342,8 @@ TEST(ExecutionStrategiesTest, RecursiveJoinsMatchReference) {
             4U);
 }
 
-// 11. VersionedIndexes (Wave7VersionedIndexes)
+// 11. VersionedIndexes
+// (lean/TinylambOpt/ResearchProofs/ExecutionStrategies/VersionedIndexes.lean)
 TEST(ExecutionStrategiesTest, VersionedIndexesPreserveSnapshotVisibility) {
   const std::vector<VersionedEntry> entries{{1, 10, false, 100},
                                             {1, 5, true, 0},
@@ -437,7 +449,7 @@ TEST(ExecutionStrategiesTest, SelectionAndBlockSkipProofsMatchReference) {
   EXPECT_FALSE(SnapshotZoneMapValid(10, 12, true));
 }
 
-// 13. Frontiers, Claude1125, Slices, Ceb, Retail Proofs
+// 13. Scheduling, arithmetic, encoded pages, and grouped aggregates
 TEST(ExecutionStrategiesTest, FrontiersClaude1125AndAnalyticsProofs) {
   // SpillScheduling: ExcessFirst + LPT
   const auto victims = ExcessFirstSpillVictims({100, 500, 300, 50}, 700);
@@ -474,7 +486,7 @@ TEST(ExecutionStrategiesTest, FrontiersClaude1125AndAnalyticsProofs) {
   EXPECT_TRUE(ExactAverageAtLeast(10, 3, 3, 1));
   EXPECT_FALSE(ExactAverageAtLeast(8, 3, 3, 1));
 
-  // Claude1125: PagedTombstones + GrayTile + RestartedDeltaRank
+  // Encoded pages: tombstone epochs, Gray order, and restarted-delta rank.
   EXPECT_TRUE(CanSkipTombstoneEpochPage(20, 15));
   EXPECT_FALSE(CanSkipTombstoneEpochPage(15, 15));
   for (uint64_t i = 0; i < 64; ++i) {

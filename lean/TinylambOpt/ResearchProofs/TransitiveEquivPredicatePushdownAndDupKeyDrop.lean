@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.TransitiveEquivPredicatePushdownAndDupKeyDrop
 
+/-!
+Proved
+
+- `Goal` — Transitive equivalence key closure, semijoin pushdown, and duplicate
+  hash-key dropping (JOB J5 / STATS-CEB C1, C5 / LDBC L1, L2 / JOB J4): for inner
+  joins `A ⋈_{a.k = b.k} B ⋈_{b.k = c.k ∧ a.k = c.k} C`, pushing `A`'s key domain
+  into `C` and eliding the redundant `a.k = c.k` comparison (`keys=2 -> keys=1`) is
+  unconditionally sound, whereas dropping the `B`-side check across a `LEFT OUTER
+  JOIN` (`A ⟕ B`) changes results.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.TransitiveEquivPredicatePushdownAndDupKeyDrop`.
+-/
+
 namespace TinylambOpt.ResearchProofs.TransitiveEquivPredicatePushdownAndDupKeyDrop
 
 open TinylambOpt.ResearchGoals.TransitiveEquivPredicatePushdownAndDupKeyDrop
@@ -159,3 +173,7 @@ theorem sound : TinylambOpt.ResearchGoals.TransitiveEquivPredicatePushdownAndDup
     decide
 
 end TinylambOpt.ResearchProofs.TransitiveEquivPredicatePushdownAndDupKeyDrop
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp
+-- executor/detail/build_input.cpp

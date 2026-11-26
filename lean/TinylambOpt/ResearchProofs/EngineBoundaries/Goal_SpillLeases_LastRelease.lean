@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Proved
+
+- `LastRelease` — The last release after a drop is the precise point where the physical
+  space is available.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

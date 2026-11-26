@@ -831,9 +831,9 @@ bool DeferOneUniqueDimJoinPastGroupBy(SelectStatement* stmt,
 }
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (rollup_sum_homomorphic_arbitrary_expr_sound)
-// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
 //   (rollup_two_level_state_combine_sound,
 //   rollup_three_level_state_combine_sound,
 //    rollup_grand_total_requires_coalesce)
@@ -1871,7 +1871,7 @@ bool DistributeDistinctUnionDimJoinsOneSelect(
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (bijective_dim_key_cte_deferral_sound)
 bool DeferUniqueDimJoinPastGroupBy(SelectStatement* outer,
                                    TransactionContext& ctx) {
@@ -1879,7 +1879,7 @@ bool DeferUniqueDimJoinPastGroupBy(SelectStatement* outer,
   return DeferUniqueDimJoinPastGroupByImpl(outer, ctx, &visited);
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (unreferenced_unique_pk_inner_join_to_semi_sound)
 bool EliminateUnreferencedUniquePkInnerJoins(SelectStatement* outer,
                                              TransactionContext& ctx) {
@@ -2357,7 +2357,7 @@ bool EliminateSingletonScalarCrossJoinsImpl(  // NOLINT(misc-no-recursion)
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (singleton_scalar_cross_join_elim_sound,
 //    trap_singleton_cross_join_sum_not_idempotent)
 bool EliminateSingletonScalarCrossJoins(SelectStatement* outer,
@@ -2367,7 +2367,7 @@ bool EliminateSingletonScalarCrossJoins(SelectStatement* outer,
                                                 &visited);
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (distinct_union_all_dim_distribution_sound)
 bool DistributeDistinctUnionDimJoins(SelectStatement* outer,
                                      TransactionContext& ctx) {
@@ -2390,7 +2390,7 @@ bool DistributeDistinctUnionDimJoins(SelectStatement* outer,
   return changed;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (adjacent_rank_self_join_to_lag_lead_sound)
 bool RewriteAdjacentRankSelfJoinToLagLead(SelectStatement* outer) {
   if (outer == nullptr || outer->WithQueries().size() < 2 ||
@@ -3139,14 +3139,14 @@ bool FoldSingletonRankInStatement(  // NOLINT(misc-no-recursion)
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (singleton_partition_rank_const_one_sound)
 bool FoldSingletonPartitionRankToOne(SelectStatement* outer) {
   std::unordered_set<SelectStatement*> visited;
   return FoldSingletonRankInStatement(outer, &visited);
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (multi_join_shared_unique_dim_deferral_sound,
 //    trap_non_unique_uk_dim_collapse_unsound)
 bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
@@ -3612,7 +3612,7 @@ bool CollapseSharedUniqueDimAcrossJoinedSubqueries(SelectStatement* outer,
   return false;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (left_join_disjunctive_null_rejecting_semi_filter_sound,
 //    trap_left_join_non_strict_predicate_semi_unsound,
 //    packed_int32_pair_bijection_sound)
@@ -4945,7 +4945,7 @@ std::string CanonicalGroupedDerivedFingerprint(const SelectStatement& q) {
 }  // namespace select_rewrite_detail
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
 //   (GroupAvgThresholdTwoPassSplit_sound)
 bool HoistDuplicateDerivedTablesToCte(SelectStatement* select) {
   if (select == nullptr || select->Sources().size() < 2) {
@@ -5539,7 +5539,8 @@ bool TryFactorThreeTableInSubquery(SelectStatement* sq) {
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/DuckDBGaps/FileMasks.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/AnalyticalOperators/FilePruningAndDeleteMasks.lean
 //   (FileKeyAntiJoin_sound)
 bool FactorDeleteAntiJoinSubquery(SelectStatement* select) {
   if (select == nullptr || !select->WhereClause()) {
@@ -5571,7 +5572,8 @@ bool FactorDeleteAntiJoinSubquery(SelectStatement* select) {
   return changed;
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
 //   (SurrogateKeyPreAggRollup_sound)
 bool PreAggregateSurrogateKeyBeforeRollup(  // NOLINT(misc-no-recursion)
     SelectStatement* outer, TransactionContext& ctx) {

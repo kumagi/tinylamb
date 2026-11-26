@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `GrayPair.AdjacentGray` — `∀ x y, ∃ b, (key (x,y)).1 ^^^ (key (x+1,y)).1 = 2^b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

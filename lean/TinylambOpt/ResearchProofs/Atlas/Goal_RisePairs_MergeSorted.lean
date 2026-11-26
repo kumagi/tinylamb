@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 import TinylambOpt.ResearchProofs.Atlas.Goal_TiePairs_Multiplicity
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `RisePairs.MergeSorted` — `∀ x, x.Pairwise (· ≤ ·) → measure x = (choose2
+  x.length:Int) - (x.eraseDups.map (fun a => choose2 (x.count a))).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

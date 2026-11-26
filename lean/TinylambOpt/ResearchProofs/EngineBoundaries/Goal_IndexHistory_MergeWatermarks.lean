@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `MergeWatermarks` — Combining two eviction batches requires just their two upper
+  timestamps.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

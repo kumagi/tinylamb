@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Text
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+-/
+
 namespace TinylambOpt.ResearchGoals.Compression.TemporalText
 open Wire
 open Text (Words)

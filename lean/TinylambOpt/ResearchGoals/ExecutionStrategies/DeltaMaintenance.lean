@@ -1,6 +1,11 @@
 import Std
 import TinylambOpt.ResearchGoals.OuterJoinCounts
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.DeltaMaintenance
 
 /-! Before/after bags at two statement snapshots. Signed differences describe insertions

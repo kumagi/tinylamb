@@ -101,3 +101,16 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_IfMissingTe
 import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_IfMissingTest_SplitActive
 import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_IfMissingTest_MaskNonNull
 import TinylambOpt.ResearchProofs.JitFrontiers.PredicateBallots.Goal_IfMissingTest_TwoMissing
+
+/-!
+This module collects proofs for Common Predicate Ballots, Lanes Predicate Ballots, Goal
+Conjunction Masked Truth, Goal Conjunction Null Output and related cases.
+
+Vector predicates use lane masks to carry the SQL truth or selection state into later
+operators.
+-/
+
+-- C++ references to this model or its proof.
+-- expression/jit.cpp
+-- expression/jit.hpp
+-- expression/jit_test.cpp

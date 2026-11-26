@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `SplitHigh.CommonUpper` — `∀ xs h, xs≠[] → (∀ x∈xs, x/256=h) → (write xs).length =
+  xs.length+ubytes h+ubytes xs.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

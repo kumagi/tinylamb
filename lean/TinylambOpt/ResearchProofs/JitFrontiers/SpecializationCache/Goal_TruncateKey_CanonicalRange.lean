@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common_SpecializationCache
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+
+Proved
+
+- `TruncateKey.CanonicalRange` — `∀ c r v, shape.code c r=.val v → 0≤v ∧ v<65536`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

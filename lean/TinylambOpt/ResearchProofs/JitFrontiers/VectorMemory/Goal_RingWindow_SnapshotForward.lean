@@ -1,6 +1,16 @@
 import Std
 import TinylambOpt.ResearchGoals.JitFrontiers.VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Refuted by counterexample
+
+- `RingWindow.SnapshotForward` — Proposed full-vector speculation with no alias guard;
+  overlaps can invalidate values.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

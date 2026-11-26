@@ -1,5 +1,23 @@
 import Std
 
+/-!
+Can block `b` be skipped because the heap already holds `k > 0` non-null entries and
+`b.allNullSort || heapMax < b.minNonNullSort`?
+
+Optimized two-stage Top-N: skip entire blocks fenced below `minNonNullSort` when `k`
+non-null winners already exist, evaluate `filterPass` only on surviving blocks, and
+decode wide `payload` only for final `≤ k` winners.
+
+Modeled claims
+
+- `Goal` — Block bitwise AND/OR point-lookup pruning (ClickBench Q20) and sorted block
+  fencing + late wide-row payload decoding (ClickBench Q24): (1) for any non-empty
+  block of `UInt64` keys, if `(target &&& ~~~orMask) ≠ 0` or `(~~~target &&& andMask)
+  ≠ 0`, `target` cannot appear in the block; (2) under `ValidSortBlock`, skipping
+  fenced blocks under `NULLS LAST` and decoding wide payloads only after final Top-N
+  yields exact outputs with `payloadDecodes ≤ k`.
+-/
+
 namespace TinylambOpt.ResearchGoals.LateWideRowTopNBlockFence
 
 def mayMatchMask (andMask orMask target : UInt64) : Bool :=

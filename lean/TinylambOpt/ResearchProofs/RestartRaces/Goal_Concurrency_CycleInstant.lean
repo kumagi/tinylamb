@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Concurrency
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `CycleInstant` — For a candidate cycle already checked for topology, when do
+  non-atomic edge observations force the existence of a simultaneous cycle? This is
+  an information bound over all live histories compatible with the observations.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -152,3 +163,7 @@ theorem sound : Goal := by
       exact hle' (Nat.le_trans hstart_le hle_end)
 
 end TinylambOpt.ResearchProofs.RestartRaces.Concurrency_CycleInstant
+
+-- C++ references to this model or its proof.
+-- transaction/transaction_manager.hpp
+-- transaction/transaction_test.cpp

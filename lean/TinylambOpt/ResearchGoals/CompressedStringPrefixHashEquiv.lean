@@ -1,5 +1,23 @@
 import Std
 
+/-!
+Packs up to 7 bytes into an unsigned 56-bit big-endian integer padded on the right with
+zero bytes (used to produce both `beWord7` and length-tagged `pack7`).
+
+Inline 64-bit packed prefix+length representation for short strings `|s| ≤ 7`: upper 56
+bits hold big-endian bytes zero-padded on the right, low 8 bits hold `s.length`, making
+equality, hashing, and byte-lexicographic ordering a single integer operation.
+
+Modeled claims
+
+- `Goal` — Short-string inline packed prefix+length equivalence
+  (DictionaryJoinsAndLateLabels B1, B2 / STATS-CEB C4 / JOB J4 / LDBC L1, L5): for
+  every byte sequence with `s.length ≤ 7`, `pack7` is both injective (`pack7 s1 =
+  pack7 s2 ↔ s1 = s2`) and strictly order-preserving for byte-lexicographic order
+  (`pack7 s1 < pack7 s2 ↔ byteLexLt s1 s2`), whereas omitting the length byte
+  (`beWord7`) collides `[]` and `[0]`.
+-/
+
 namespace TinylambOpt.ResearchGoals.CompressedStringPrefixHashEquiv
 
 /-- Packs up to 7 bytes into an unsigned 56-bit big-endian integer padded on the
@@ -31,7 +49,7 @@ def byteLexLt : List UInt8 → List UInt8 → Bool
       else if b < a then false
       else byteLexLt as bs
 
-/-- Short-string inline packed prefix+length equivalence (BigBench B1, B2 /
+/-- Short-string inline packed prefix+length equivalence (DictionaryJoinsAndLateLabels B1, B2 /
     STATS-CEB C4 / JOB J4 / LDBC L1, L5): for every byte sequence with
     `s.length ≤ 7`, `pack7` is both injective (`pack7 s1 = pack7 s2 ↔ s1 = s2`)
     and strictly order-preserving for byte-lexicographic order (`pack7 s1 <

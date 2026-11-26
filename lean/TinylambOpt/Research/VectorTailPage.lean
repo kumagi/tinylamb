@@ -1,5 +1,13 @@
 import Std.Tactic
 
+/-!
+The value returned by a safe read is the logical byte at that position.
+
+Prefix as coordinate-wise equality.
+
+Named results include `getD_append_left`, `getD_drop`, `prefix_iff_get`.
+-/
+
 namespace TinylambOpt.Research.VectorTailPage
 
 /-

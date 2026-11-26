@@ -1,6 +1,17 @@
 import TinylambOpt.PhysicalJitFusion
 import Std.Tactic
 
+/-!
+Greedy optional literal. A failed later match still tries the skipped alternative for
+that prefix before moving to the next prefix.
+
+The validated VM's negated byte class and the generated first-delimiter search consume
+the same run. The tail after the delimiter is irrelevant.
+
+Named results include `prefix_expansion`, `first_delimiter_capture`,
+`delimiter_at_start`.
+-/
+
 namespace TinylambOpt.DelimitedCaptureJit
 
 def firstResult (f : α → Option β) : List α → Option β

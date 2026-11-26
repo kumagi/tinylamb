@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
 
+/-!
+The SQL frontend can scan input in chunks when its carried lexical state preserves
+delimiter recognition across chunk boundaries.
+
+Named results include `scanRevAux_eq_foldl`, `scan_eq_rev`, `scanRevAux_snoc`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

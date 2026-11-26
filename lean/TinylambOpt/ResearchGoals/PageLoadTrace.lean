@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims compare page-load traces for alternative read paths. A SQL scan can see the
+same data under the modeled conditions while changing its page-load work.
+
+Modeled claims
+
+- `Goal` — `∀ pages needle width, 0 < width → let r := scan pages needle width r.hits =
+  reference needle (pages.flatMap Page.bytes) ∧ r.reads = (if needle.isEmpty then []
+  else pages.flatMap fun p => (List.range p.bytes.length).map (p.base + ·))`
+-/
+
 namespace TinylambOpt.ResearchGoals.PageLoadTrace
 
 structure Page where

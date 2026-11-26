@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `TriangleWave.PeakPositions` — `∀ c, c.step ≠ 0 → (((rows layout c).filter (fun r =>
+  r.2 == c.base+c.step*width c)).map Prod.fst) = (List.range c.n).filter (fun i =>
+  i%(2*width c) == width c)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

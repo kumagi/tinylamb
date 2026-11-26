@@ -1,12 +1,9 @@
 """Compare the two pinned runs and audit one new declaration per losing query."""
 import argparse
 from collections import defaultdict
-import re
-
-from benchmark_rematch import BENCH, HERE, LEAN, speed_losses
+from benchmark_rematch import BENCH, HERE, declarations, speed_losses
 
 RUN = BENCH / "three-db-sf10-20261122/after-ed-cb-20261126"
-MODELS = LEAN / "TinylambOpt/ResearchGoals/November26"
 OUTPUT = HERE / "november26-queries.md"
 
 
@@ -19,24 +16,10 @@ def by_query(losses):
     return result
 
 
-def read_goals():
-    goals = {}
-    for path in MODELS.glob("*.lean"):
-        src = path.read_text()
-        matches = list(re.finditer(r"^/-- (.+?) -/\ndef (\w+)\.Goal : Prop :=", src, re.M))
-        assert len(matches) == len(re.findall(r"^def \w+\.Goal\b", src, re.M))
-        for m in matches:
-            key = f"{path.stem}.{m[2]}"
-            assert key not in goals
-            line = src.count("\n", 0, m.start(2)) + 1
-            goals[key] = (m[1], f"../../{path.relative_to(LEAN)}#L{line}")
-    return goals
-
-
 def render():
     old = by_query(speed_losses())
     current = by_query(speed_losses(RUN, RUN / "analytics", RUN / "cloud_bi/measurements.json"))
-    goals = read_goals()
+    goals = declarations("query")
     keys_used = set()
     new = current.keys() - old.keys()
     resolved = old.keys() - current.keys()
@@ -102,10 +85,10 @@ def render():
             assert key not in keys_used
             keys_used.add(key)
             assert all(r.goal == key + e and r.current == row.current for e, r in rivals.items())
-            proposal, link = goals[key]
+            proposal, link, name = goals[key]
             times = [f"{rivals[e].target:.6f}" if e in rivals else "—" for e in ("DuckDB", "ClickHouse")]
             status = "新規" if (s, q) in new else "継続"
-            lines.append(f"| {q} | {status} | {row.current:.6f} | {' | '.join(times)} | [{key}]({link})　{proposal} |")
+            lines.append(f"| {q} | {status} | {row.current:.6f} | {' | '.join(times)} | [{name}]({link})　{proposal} |")
         lines.append("")
     assert keys_used == goals.keys(), f"unassigned goals: {goals.keys()-keys_used}"
     lines += ["## 再確認", "", "保存済みの両測定系列がある作業ツリーで、以下を実行する。"
@@ -124,4 +107,4 @@ if __name__ == "__main__":
         OUTPUT.write_text(content)
     elif OUTPUT.read_text() != content:
         raise SystemExit("Ledger differs from measurements or Lean declarations")
-    print(f"{len(read_goals())} losing queries matched to as many new goals")
+    print(f"{len(declarations('query'))} losing queries matched to as many new goals")

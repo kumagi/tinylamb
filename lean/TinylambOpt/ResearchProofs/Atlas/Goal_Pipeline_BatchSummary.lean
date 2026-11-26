@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.BatchSummary` — `∀ a b, finish (a++b) = max (finish a + (b.map
+  Prod.snd).sum) ((a.map Prod.fst).sum + finish b)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

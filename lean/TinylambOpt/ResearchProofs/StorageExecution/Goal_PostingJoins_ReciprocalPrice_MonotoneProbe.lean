@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `ReciprocalPrice.MonotoneProbe` — `∀ u t x z ys, valid u ys → x≤z → fan search u t z
+  ys ≤ fan search u t x ys`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

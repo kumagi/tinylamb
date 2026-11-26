@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.JobJ3
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `PersonPages` — Derive the least sufficient set of person pages for COUNT(*) over all
+  possible gender assignments, including key holes and repeated cast credits. A
+  synopsis proving the contents of additional pages changes the model.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -102,3 +113,6 @@ theorem sound : Goal := by
       simp [result, a, b] at heq
       rw [sum_zero] at heq
       omega
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.cpp

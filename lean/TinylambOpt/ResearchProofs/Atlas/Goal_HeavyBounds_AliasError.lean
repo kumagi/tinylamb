@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `HeavyBounds.AliasError` — `∀ a b (bucket : Nat → Nat), joinSize (a.map bucket)
+  (b.map bucket) - joinSize a b = (a.map (fun x => b.countP (fun y => y != x &&
+  bucket x == bucket y))).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `StaleCleanup` — A late cleanup cannot cancel a newer wait from the same transaction
+  with a fresh ticket.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

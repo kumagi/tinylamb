@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+-/
+
 namespace TinylambOpt.ResearchGoals.CloudBI.DeleteFiles
 
 /-- File identity and physical ordinal survive scan-time filtering. Partition identity

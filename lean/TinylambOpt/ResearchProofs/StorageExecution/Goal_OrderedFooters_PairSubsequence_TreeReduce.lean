@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `PairSubsequence.TreeReduce` — Merge an arbitrary spill tree without visiting the raw
+  rows again.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

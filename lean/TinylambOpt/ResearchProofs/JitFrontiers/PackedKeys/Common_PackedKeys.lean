@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Named results include `guardRange_any`, `word_lt_two_pow64`, `word_toNat`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `PreserveBytes` — Compaction after a partial write preserves the final byte stream.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

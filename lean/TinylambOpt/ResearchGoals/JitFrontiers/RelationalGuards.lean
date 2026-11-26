@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.RelationalGuards
 
 open TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites (fits limit)

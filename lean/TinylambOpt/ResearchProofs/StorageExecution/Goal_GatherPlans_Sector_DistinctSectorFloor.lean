@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `Sector.DistinctSectorFloor` — `∀ shift startup xs, (((points xs).map
+  (·/2^shift)).eraseDups).length ≤ cost (price shift startup) (choose (price shift
+  startup) xs)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

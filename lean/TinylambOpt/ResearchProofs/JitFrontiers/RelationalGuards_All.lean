@@ -100,3 +100,11 @@ import TinylambOpt.ResearchProofs.JitFrontiers.RelationalGuards.Goal_WeightedMix
 import TinylambOpt.ResearchProofs.JitFrontiers.RelationalGuards.Goal_WeightedMix_PhiHull
 import TinylambOpt.ResearchProofs.JitFrontiers.RelationalGuards.Goal_WeightedMix_RemoveLower
 import TinylambOpt.ResearchProofs.JitFrontiers.RelationalGuards.Goal_WeightedMix_SwapWeight
+
+/-!
+This module collects proofs for Goal Abs Lag Branch Split, Goal Abs Lag Dead Edge, Goal
+Abs Lag Fold Compare, Goal Abs Lag Guard Necessity and related cases.
+
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+-/

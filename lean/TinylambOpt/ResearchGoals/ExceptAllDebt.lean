@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims model EXCEPT ALL by accounting for the number of right-side copies removed
+from each left-side key. An executor can work with multiplicities and still emit the
+correct number of copies.
+
+Modeled claims
+
+- `Goal` — `∀ p, (output p).Perm (reference p)`
+-/
+
 namespace TinylambOpt.ResearchGoals.ExceptAllDebt
 
 abbrev Row := List (Option Int)

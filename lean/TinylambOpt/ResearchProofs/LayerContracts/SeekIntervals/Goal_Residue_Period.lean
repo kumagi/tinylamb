@@ -3,6 +3,15 @@ import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common_SeekInterv
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Cores
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Specifics
 
+/-!
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+
+Proved
+
+- `Residue.Period` — `∀ p x, model.test p (x+p.b+1) = model.test p x`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

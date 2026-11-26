@@ -347,12 +347,22 @@ class TlcsFile : public std::enable_shared_from_this<TlcsFile> {
   // success (populating `out->columns[i]` with `rows.size()` dense entries),
   // or false if mmap is unavailable or any requested column requires full
   // block decode.
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (gather_decode_commutes)
   [[nodiscard]] bool TryGatherMmapFixedColumns(
       uint32_t block_idx, std::span<const slot_t> column_ids,
       std::span<const uint32_t> rows, const Schema& schema,
       DecodedBlock* out) const;
+
+  // Evaluates `col contains needle` directly over a compressed VARCHAR block
+  // (`kVarCharFrontDict` or `kZstdVarChar` wrapping FrontDict/plain) without
+  // expanding row bytes. Returns true if handled (writing exact ascending
+  // matching row ordinals into `matching_rows_out` and block row count into
+  // `row_count_out`), or false if the encoding is not handled by this fast
+  // path (caller falls back to `DecodeBlockColumnsWithOptions`).
+  [[nodiscard]] StatusOr<bool> TryMatchCompressedVarCharContains(
+      uint32_t block_idx, slot_t col_id, std::string_view needle,
+      uint32_t* row_count_out, std::vector<uint32_t>* matching_rows_out) const;
 
   [[nodiscard]] uint32_t DirGroupCount() const noexcept {
     return static_cast<uint32_t>(dir_groups_.size());

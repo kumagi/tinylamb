@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_BagKernels_Common
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved (10 claims, including the following)
+
+- `DictionaryAliases.AntiRevenue` — Compute revenue of all left rows whose key is
+  absent on the right.
+- `DictionaryAliases.DistinctOutput` — Output live grouping keys once even if physical
+  codes alias.
+- `DictionaryAliases.FilteredMoment` — Use a histogram for a filtered sum of squared
+  values.
+-/
+
 set_option maxHeartbeats 0
 
 open TinylambOpt.ResearchProofs.StorageExecution.BagKernels

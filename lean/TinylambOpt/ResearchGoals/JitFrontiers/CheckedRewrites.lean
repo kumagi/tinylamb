@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
 /-! Signed intermediate values are checked left-to-right. The site number

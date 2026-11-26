@@ -259,3 +259,9 @@ example : tokenize [92,37,92,95,92] = [.lit 37,.lit 95,.lit 92] ∧
     utf8Len 128 = 1 ∧ utf8Len 245 = 1 := by decide
 
 end TinylambOpt.LikeUnderscore
+
+-- C++ references to this model or its proof.
+-- common/literal_like_pattern.hpp
+-- executor/detail/expression_eval.cpp
+-- executor/detail/scan_filter.cpp
+-- expression/binary_expression.cpp

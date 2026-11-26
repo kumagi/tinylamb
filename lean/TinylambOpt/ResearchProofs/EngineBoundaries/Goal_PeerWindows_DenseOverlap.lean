@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `DenseOverlap` — Merging DENSE_RANK summaries subtracts the distinct predecessors
+  shared by both shards.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

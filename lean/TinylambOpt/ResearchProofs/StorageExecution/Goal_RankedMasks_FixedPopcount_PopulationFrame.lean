@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved
+
+- `FixedPopcount.PopulationFrame` — One count byte followed by a little-endian rank, as
+  in the fixture probe.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -99,3 +99,9 @@ import TinylambOpt.ResearchProofs.EngineBoundaries.Goal_WaitCycles_StaleCleanup
 import TinylambOpt.ResearchProofs.EngineBoundaries.Goal_WaitCycles_VictimEdgeOnly
 import TinylambOpt.ResearchProofs.EngineBoundaries.Goal_WaitCycles_WaitDie
 import TinylambOpt.ResearchProofs.EngineBoundaries.Goal_WaitCycles_WoundWait
+
+/-!
+This module collects proofs for Goal Group Commit Coalesce Writes, Goal Group Commit
+Duplicate Submit, Goal Group Commit Flight Coverage, Goal Group Commit Frontier Order
+and related cases.
+-/

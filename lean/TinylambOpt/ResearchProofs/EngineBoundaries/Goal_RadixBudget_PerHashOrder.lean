@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `PerHashOrder` — Equal hash keys land in at most one leaf, preserving their original
+  row order.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

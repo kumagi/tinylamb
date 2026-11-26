@@ -1,4 +1,14 @@
 import Std.Tactic
+
+/-!
+One lane of the batch.
+
+What the reference reports for one batch. `carry r` means "no output, no error, r
+passing lanes still needed in the next batch".
+
+Named results include `firstErrorFrom_ge`, `kthPassFrom_ge`,
+`refIdx_eq_simdDecisionFrom`.
+-/
 -- C++ counterpart: expression/jit.cpp (see issues/README.md).
 
 /-! LIMIT error frontier: when a row-ordered reference stops after K passing

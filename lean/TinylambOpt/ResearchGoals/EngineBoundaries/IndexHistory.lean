@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
 /-! A bounded committed mutation journal. A scan asks whether a half-open key

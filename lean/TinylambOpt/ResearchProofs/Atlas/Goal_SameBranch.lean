@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.SameBranch` — `∀ a b bit, pairs a b = pairs (lower bit a) (lower bit b) +
+  pairs (upper bit a) (upper bit b)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Refuted by counterexample
+
+- `UniformUpper` — A proposed NDV-based estimate used as an upper bound for an inner
+  join.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

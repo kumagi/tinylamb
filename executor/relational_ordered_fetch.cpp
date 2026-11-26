@@ -45,8 +45,9 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (DuckDBGaps/Hits.lean: OrderedFetch_sound) late-materializing
-// early-stop Top-N scan for single-table queries:
+// Lean-backed (AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean:
+// OrderedFetch_sound) late-materializing early-stop Top-N scan for single-table
+// queries:
 //   SELECT <* | col1, ...> FROM T [WHERE <simple predicates>]
 //   ORDER BY <ord_col> [ASC|DESC] [NULLS FIRST|LAST] LIMIT K [OFFSET O]
 //

@@ -14,7 +14,9 @@
 namespace tinylamb::execution_strategies {
 
 // ============================================================================
-// 1. FrameIndexes (Wave7FrameIndexes / ExecutionStrategies/FrameIndexes.lean)
+// 1. FrameIndexes
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/FrameIndexes.lean
 // ============================================================================
 
 struct SparseMinimumTable {
@@ -61,7 +63,9 @@ struct PrefixNullableSum {
                                       size_t r, size_t k);
 
 // ============================================================================
-// 2. CorrelatedProbes (Wave7CorrelatedProbes / CorrelatedProbes.lean)
+// 2. CorrelatedProbes
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/CorrelatedProbes.lean
 // ============================================================================
 
 // RelationalDivision: returns true iff every non-null element of `need` appears
@@ -105,7 +109,9 @@ struct NeWitnessSummary {
     std::vector<std::string> prefixes);
 
 // ============================================================================
-// 3. IndexPreimages (Wave7IndexPreimages / IndexPreimages.lean)
+// 3. IndexPreimages
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/IndexPreimages.lean
 // ============================================================================
 
 struct IntInterval {
@@ -157,7 +163,9 @@ struct IntInterval {
                                                   int64_t phase);
 
 // ============================================================================
-// 4. OrderedStreams (Wave7OrderedStreams / OrderedStreams.lean)
+// 4. OrderedStreams
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/OrderedStreams.lean
 // ============================================================================
 
 // MergeDiagonal: O(log(min(|a|, |b|))) exact merge-path partition `(i, j)` such
@@ -186,7 +194,9 @@ struct IntInterval {
     const std::vector<std::pair<int64_t, int64_t>>& b);
 
 // ============================================================================
-// 5. PairAggregates (Wave7PairAggregates / PairAggregates.lean)
+// 5. PairAggregates
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/PairAggregates.lean
 // ============================================================================
 
 // AbsoluteDistanceSum: O(n log n) exact `sum_{i, j} |xs[i] - xs[j]|`.
@@ -223,7 +233,9 @@ struct IntInterval {
                                            std::vector<uint64_t> b);
 
 // ============================================================================
-// 6. PlaneKernels (Wave7PlaneKernels / PlaneKernels.lean)
+// 6. PlaneKernels
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/PlaneKernels.lean
 // ============================================================================
 
 // 8-bit x 64-lane bit-sliced column (8 `uint64_t` bit planes).
@@ -251,7 +263,9 @@ struct BitPlane8x64 {
                                         uint64_t mask) noexcept;
 
 // ============================================================================
-// 7. EncodedBlocks (Wave7EncodedBlocks / EncodedBlocks.lean)
+// 7. EncodedBlocks
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/EncodedBlocks.lean
 // ============================================================================
 
 // PatchedRange: PFOR range filter over base + uint8 deltas + exception patches.
@@ -279,7 +293,9 @@ struct BitPlane8x64 {
     int64_t p0, int64_t p1, const std::vector<int64_t>& d2);
 
 // ============================================================================
-// 8. SearchBounds (Wave7SearchBounds / SearchBounds.lean)
+// 8. SearchBounds
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/SearchBounds.lean
 // ============================================================================
 
 // CollisionBound: Cauchy-Schwarz join size upper bound `sqrt(sum(fa^2) *
@@ -307,7 +323,9 @@ struct BitPlane8x64 {
                                                 uint64_t sb) noexcept;
 
 // ============================================================================
-// 9. DeltaMaintenance (Wave7DeltaMaintenance / DeltaMaintenance.lean)
+// 9. DeltaMaintenance
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/DeltaMaintenance.lean
 // ============================================================================
 
 using KeyBag = std::unordered_map<int64_t, int64_t>;
@@ -328,7 +346,9 @@ using KeyBag = std::unordered_map<int64_t, int64_t>;
     const std::vector<int64_t>& adds);
 
 // ============================================================================
-// 10. RecursiveJoins (Wave7RecursiveJoins / RecursiveJoins.lean)
+// 10. RecursiveJoins
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/RecursiveJoins.lean
 // ============================================================================
 
 // MeetFrontiers: bidirectional BFS shortest-path existence check in directed
@@ -356,7 +376,9 @@ struct BinaryLiftingTable {
     size_t n, const std::vector<std::pair<size_t, size_t>>& edges);
 
 // ============================================================================
-// 11. VersionedIndexes (Wave7VersionedIndexes / VersionedIndexes.lean)
+// 11. VersionedIndexes
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/ExecutionStrategies/VersionedIndexes.lean
 // ============================================================================
 
 struct VersionedEntry {
@@ -433,7 +455,8 @@ struct RangeTombstoneMark {
 // ============================================================================
 // 14. Arithmetic & SetTransforms (Frontiers/Arithmetic.lean,
 // SetTransforms.lean,
-//     AnalyticsWorkloads/Ceb.lean, DuckDBGaps/Retail.lean)
+//     AnalyticsWorkloads/UserRolesAndCommentJoins.lean,
+//     AnalyticalOperators/RollupsAndChannelSetCounts.lean)
 // ============================================================================
 
 // BinnedCheckedSum (sound_BinnedAccumulator, sound_FirstOverflow): sums `xs`
@@ -442,24 +465,26 @@ struct RangeTombstoneMark {
 [[nodiscard]] std::pair<int64_t, std::optional<size_t>> CheckedSumFirstOverflow(
     const std::vector<int64_t>& xs);
 
-// RepeatedScore (AnalyticsWorkloads/Ceb.lean: sound_RepeatedScore): closed-form
-// O(1) checked repeated addition of `v` starting at `acc` up to `reps` times;
-// returns `(final_acc, completed_reps)` where `completed_reps < reps` iff the
-// next addition would overflow int64.
+// RepeatedScore (AnalyticsWorkloads/UserRolesAndCommentJoins.lean:
+// sound_RepeatedScore): closed-form O(1) checked repeated addition of `v`
+// starting at `acc` up to `reps` times; returns `(final_acc, completed_reps)`
+// where `completed_reps < reps` iff the next addition would overflow int64.
 [[nodiscard]] std::pair<int64_t, uint64_t> RepeatedScoreCheckedAdd(
     int64_t acc, int64_t v, uint64_t reps) noexcept;
 
-// AverageFence (DuckDBGaps/Retail.lean: AverageFence_sound;
-// Frontiers/Arithmetic.lean: sound_QuantizedAverage): exact integer
-// cross-multiplied comparison `grp_sum / grp_cnt >= num / den` (for `grp_cnt >
-// 0`, `den > 0`) using `__int128` with zero floating-point rounding error.
+// AverageFence (AnalyticalOperators/RollupsAndChannelSetCounts.lean:
+// AverageFence_sound; Frontiers/Arithmetic.lean: sound_QuantizedAverage): exact
+// integer cross-multiplied comparison `grp_sum / grp_cnt >= num / den` (for
+// `grp_cnt > 0`, `den > 0`) using `__int128` with zero floating-point rounding
+// error.
 [[nodiscard]] bool ExactAverageAtLeast(int64_t grp_sum, uint64_t grp_cnt,
                                        int64_t threshold_num,
                                        uint64_t threshold_den) noexcept;
 
 // ============================================================================
-// 15. EncodedPages & RestartedDeltaRank (Claude1125/EncodedPages.lean,
-//     Claude1125/RestartedDeltaRank.lean)
+// 15. Gray encodings, tombstone epochs, and restarted-delta rank
+// Atlas/EncodedPages/GrayTileOrderAndTombstoneEpochs.lean
+// Atlas/EncodedPages/RestartedDeltaPredicateRank.lean
 // ============================================================================
 
 // PagedTombstones.SkipEpochs (sound_PagedTombstones_SkipEpochs): returns true
@@ -486,7 +511,8 @@ struct RangeTombstoneMark {
     int64_t target);
 
 // ============================================================================
-// 16. Slice Extrema & Complement Groups (DuckDBGaps/Slices.lean:
+// 16. Slice Extrema & Complement Groups
+// (AnalyticalOperators/DictionarySlicesAndExtrema.lean:
 //     sound_ComplementGroups, sound_WitnessedExtrema; CloudBI/PublicBI.lean:
 //     sound_CodeExtrema, sound_PartialExtrema)
 // ============================================================================

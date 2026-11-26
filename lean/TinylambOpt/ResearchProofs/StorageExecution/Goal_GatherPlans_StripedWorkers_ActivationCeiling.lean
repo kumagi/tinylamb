@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `StripedWorkers.ActivationCeiling` — `∀ stripe workers a b, a≤b → price stripe
+  workers a b ≤ span a b+workers+1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

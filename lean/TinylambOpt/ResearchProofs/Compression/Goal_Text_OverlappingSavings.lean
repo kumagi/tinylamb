@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchProofs.Compression.Text
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Refuted by counterexample
+
+- `OverlappingSavings` — `∀ pat s, 1 < pat.length → let allHits := (List.range
+  s.length).countP (fun i => pat.isPrefixOf (s.drop i)) (symbols pat s.length
+  s).length + allHits*(pat.length-1) = s.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

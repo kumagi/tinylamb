@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RedoPatches
 
+/-!
+Database recovery can combine or replay edits only where the resulting state agrees with
+LSN-ordered replay.
+
+Proved (81 claims, including the following)
+
+- `Affine.Difference` — `∀ a x y, x ≤ y → model.patch a y-model.patch a x = a.1*(y-x)`
+- `Affine.ExactExchange` — Is the proposed conflict test complete as well as sound?
+- `Affine.ExchangeGuard` — When marked independent, patches may be scheduled in either
+  order.
+
+Refuted by counterexample (19 claims, including the following)
+
+- `Affine.NewestOnly` — A last-record-per-cell index reconstructs both value and stamp.
+- `Affine.NoStamp` — Blindly repeating a patch after recovery is observationally
+  idempotent.
+- `Affine.RestartInside` — Can a fused record also replay on a snapshot already
+  containing its first half?
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

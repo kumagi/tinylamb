@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.UniqueKeyLeftJoinElisionAndMark
 
+/-!
+Proved
+
+- `Goal` — Unique-key `LEFT JOIN` elision, 1-bit Mark reduction, and non-equi `<`
+  upper-bound semijoin pushdown (TPC-DS Q40/Q72/Q80): (1) when right non-null keys
+  are unique, projecting only left columns elides the `LEFT JOIN`, (2) testing `r.key
+  IS NOT NULL` reduces to a key-membership 1-bit mark without reading right payloads,
+  and (3) `l.val < r.val` allows pre-filtering `L` by `l.val < max(r.val)`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.UniqueKeyLeftJoinElisionAndMark`.
+-/
+
 namespace TinylambOpt.ResearchProofs.UniqueKeyLeftJoinElisionAndMark
 
 open TinylambOpt.ResearchGoals.UniqueKeyLeftJoinElisionAndMark
@@ -196,3 +209,6 @@ theorem sound : TinylambOpt.ResearchGoals.UniqueKeyLeftJoinElisionAndMark.Goal :
   · decide
 
 end TinylambOpt.ResearchProofs.UniqueKeyLeftJoinElisionAndMark
+
+-- C++ references to this model or its proof.
+-- query/tpch_select_rewrites.cpp

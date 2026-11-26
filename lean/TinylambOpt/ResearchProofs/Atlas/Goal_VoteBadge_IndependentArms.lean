@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `VoteBadge.IndependentArms` — `∀ n db b, reference pattern n db b = total n (fun u =>
+  db 0 (b 0) u * total n (db 1 u) * total n (db 2 u)) * total n (fun v => db 3 (b 0)
+  v * total n (db 3 v))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

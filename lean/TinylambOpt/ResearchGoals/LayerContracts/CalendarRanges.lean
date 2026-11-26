@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.CalendarRanges
 
 /-! Calendar bucket boundaries indexed from epoch zero. Day numbers and period ordinals

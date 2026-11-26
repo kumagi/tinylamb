@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Buggy `same_child_program` comparing only `insts`, `consts`, and `resultTypeTag` while
+ignoring `ranges`/`recips`/`stringSets` (the TPC-DS Q90 aliasing bug).
+
+Modeled claims
+
+- `Goal` — Stack-VM bytecode CSE / aggregate slot deduplication
+  (`executor/detail/fused_grouped_join.cpp` `same_child_program`): slot reuse is
+  sound when and only when side tables (`ranges`, `recips`, `stringSets`,
+  `resultTypeTag`) are compared alongside `insts` and `consts`.
+-/
+
 namespace TinylambOpt.ResearchGoals.BytecodeSideTableEquiv
 
 inductive Inst where

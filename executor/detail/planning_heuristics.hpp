@@ -272,7 +272,7 @@ struct GroupedJoinFusionSpec {
   std::vector<std::string> rollup_select_names;
   // Emit a ColumnarTable directly when true (and output_sink is not active).
   bool columnar_output{false};
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (fused_antijoin_groupby_sound)
   // When true on a JoinType::kLeft final join, accumulate ONLY unmatched left
   // rows (dropping matched pairs without materializing or aggregating them).

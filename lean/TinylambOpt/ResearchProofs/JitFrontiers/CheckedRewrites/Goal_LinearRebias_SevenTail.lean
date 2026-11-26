@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `LinearRebias.SevenTail` — `∀ w x, fits w x → (rule.guard w x 0=false ↔ limit w-7≤x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

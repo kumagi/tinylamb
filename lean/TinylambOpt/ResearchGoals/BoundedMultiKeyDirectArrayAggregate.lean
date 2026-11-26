@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Reference hash-based group aggregate for key pair `(k1, k2)`: returns `none` if the
+group never appeared, or `some (cntStar, sumOpt)`.
+
+Maps `Option Int` key onto flat dimension index `[0..span]`, sending `none` (`NULL`) to
+the dedicated sentinel index `span`.
+
+Modeled claims
+
+- `Goal` — Bounded 2-key dense direct-array parallel aggregation with NULL sentinel
+  slots (H2O H2, H4 / LDBC L2 / DictionaryJoinsAndLateLabels B3 / STATS-CEB C5):
+  mapping bounded non-NULL keys onto `[0..span-1]` and `NULL` onto index `span`
+  produces a collision-free 2D table per worker whose elementwise merge matches full
+  hash-based `GROUP BY (k1, k2)` across empty, zero-canceling, and NULL-key groups.
+-/
+
 namespace TinylambOpt.ResearchGoals.BoundedMultiKeyDirectArrayAggregate
 
 structure InputRow where
@@ -93,7 +109,7 @@ def optParallelFlatAgg (min1 : Int) (span1 : Nat) (min2 : Int) (span2 : Nat)
   else some (s.cntStar, if s.nnCnt == 0 then none else some s.sumVal)
 
 /-- Bounded 2-key dense direct-array parallel aggregation with NULL sentinel
-    slots (H2O H2, H4 / LDBC L2 / BigBench B3 / STATS-CEB C5): mapping bounded
+    slots (H2O H2, H4 / LDBC L2 / DictionaryJoinsAndLateLabels B3 / STATS-CEB C5): mapping bounded
     non-NULL keys onto `[0..span-1]` and `NULL` onto index `span` produces a
     collision-free 2D table per worker whose elementwise merge matches full
     hash-based `GROUP BY (k1, k2)` across empty, zero-canceling, and NULL-key

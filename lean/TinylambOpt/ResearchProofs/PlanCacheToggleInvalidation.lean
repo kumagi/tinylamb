@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.PlanCacheToggleInvalidation
 
+/-!
+Proved
+
+- `Goal` — Plan cache invalidation with optimizer-toggle bitmask
+  (`query/plan_cache.hpp` `PreparedPlanCache` / `CurrentCompiledPlans`,
+  `expression/bytecode.cpp` `BytecodeOptToggleBits`): keying cached plans by `(sqlId,
+  schemaGen, optBits)` always produces the uncached plan and execution result without
+  ever recompiling an already-seen `(sqlId, schemaGen, optBits)` triple.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.PlanCacheToggleInvalidation`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PlanCacheToggleInvalidation
 
 open TinylambOpt.ResearchGoals.PlanCacheToggleInvalidation
@@ -387,3 +400,8 @@ theorem sound : TinylambOpt.ResearchGoals.PlanCacheToggleInvalidation.Goal := by
     rfl
 
 end TinylambOpt.ResearchProofs.PlanCacheToggleInvalidation
+
+-- C++ references to this model or its proof.
+-- expression/bytecode.cpp
+-- query/plan_cache.hpp
+-- query/plan_cache_unit_test.cpp

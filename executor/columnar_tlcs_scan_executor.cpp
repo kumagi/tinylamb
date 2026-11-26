@@ -622,7 +622,7 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
         use_varchar_cutoff = false;
       }
     }
-    // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+    // Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
     //   (bottom_exclusion_tightens_min_bound_sound,
     //    interior_exclusion_min_bound_unsound_bug)
     bool key0_excludes_empty_and_null = false;

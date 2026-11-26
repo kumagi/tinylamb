@@ -99,3 +99,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Goal_Modulo_SuffixR
 import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Goal_Modulo_ParallelFold
 import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Goal_Modulo_FitsExtent
 import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Goal_Modulo_Period
+
+/-!
+This module collects proofs for Goal Overwrite Fusion, Goal Overwrite Restart Inside,
+Goal Overwrite Exchange Guard, Goal Overwrite Exact Exchange and related cases.
+
+Database recovery can combine or replay edits only where the resulting state agrees with
+LSN-ordered replay.
+-/

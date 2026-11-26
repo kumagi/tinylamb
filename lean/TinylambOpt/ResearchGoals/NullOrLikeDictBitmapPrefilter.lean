@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Dictionary-precomputed bitmap prefilter: evaluates `matchStr` once per distinct
+dictionary entry, then evaluates rows via `(oc == none || mask[c]) && (extra idx ==
+tTrue)`.
+
+Counterexample: replacing `IS NULL` by `NOT (col = x)` yields `UNKNOWN`, not `TRUE`, on
+NULL values, even inside `OR matchStr(col)`.
+
+Modeled claims
+
+- `Goal` — Dictionary-level bitmap prefilter for `(col IS NULL OR LIKE ...)` predicates
+  (STATS-CEB C4 / JOB J4 / JOB J5): evaluating `matchStr` once per dictionary entry
+  rather than per row and folding `NULL` to `TRUE` matches SQL 3-valued logic
+  whenever all non-NULL codes are valid indices `< dict.length`.
+-/
+
 namespace TinylambOpt.ResearchGoals.NullOrLikeDictBitmapPrefilter
 
 inductive Tri where

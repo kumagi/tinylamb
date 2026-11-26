@@ -1,5 +1,19 @@
 import Std
 
+/-!
+These claims describe how LIMIT and OFFSET compose on an ordered list. A SQL plan can
+combine prefix operations when it retains the required window of rows.
+
+Modeled claims
+
+- `Goal` — Limit/TopN prefix-offset algebra (`plan/limit_plan.hpp` `prior_offset_`,
+  `plan/topn_plan.hpp`, `plan/cascades.cpp` `window_halo_topn` /
+  `topn_push_through_projection`): when an inner operator already skipped `p ≤ O`
+  prefix rows and retained at least `m ≥ (O - p) + L` rows, an outer `limitOp L (O -
+  p)` recovers the exact slice `limitOp L O` (and commutes with any row-wise
+  projection `f`).
+-/
+
 namespace TinylambOpt.ResearchGoals.LimitOffsetPrefixComposition
 
 def limitOp {α : Type} (lim off : Nat) (xs : List α) : List α :=

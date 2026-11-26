@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Optimizer
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Core fact: under the dependency, `compact` preserves and reflects equality of rows
+occurring in `xs`.
+
+Fuel-indexed deduplication with a custom key-equality predicate.
+
+Named results include `sound`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false
@@ -602,3 +614,6 @@ theorem sound : Goal := by
     exact grep_agree xs hdep K hK
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Opt_NullableGroupKey
+
+-- C++ references to this model or its proof.
+-- executor/detail/engine_decisions.hpp

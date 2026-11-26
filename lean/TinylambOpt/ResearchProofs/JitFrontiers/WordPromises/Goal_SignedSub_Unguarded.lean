@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Refuted by counterexample
+
+- `SignedSub.Unguarded` — Aggressive hypothesis: a defined raw bit pattern can always
+  be marked with the extra IR promise.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

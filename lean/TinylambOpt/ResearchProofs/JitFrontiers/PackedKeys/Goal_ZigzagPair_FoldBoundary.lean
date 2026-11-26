@@ -4,6 +4,15 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.BackFields_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Specific_PackedKeys
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Refutations_PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Proved
+
+- `ZigzagPair.FoldBoundary` — `∀ x, zig x < 2^32 ↔ -(2^31:Int)≤x ∧ x<2^31`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+import TinylambOpt.ResearchProofs.JitKernels.Goal_DecimalChunks_DecimalBlockMultiplyAccumulate
+
+/-! SOUND: verified DecimalChunks.DecimalBlockMultiplyAccumulate. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_DecimalChunks_DecimalBlockMultiplyAccumulate
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+open TinylambOpt.ResearchGoals.JitKernels.DecimalChunks.DecimalBlockMultiplyAccumulate
+theorem sound : Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.DecimalChunks.Goal_DecimalBlockMultiplyAccumulate.sound
+end Nov26.Proof_DecimalChunks_DecimalBlockMultiplyAccumulate

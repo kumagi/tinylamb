@@ -1,5 +1,19 @@
 import TinylambOpt.Research.AdaptiveRadixReplay
 
+/-!
+A token addresses one live batch. Splitting retires it and issues fresh tokens even if a
+child has the same radix prefix as its parent.
+
+Modeled claims
+
+- `Goal` — `∀ (rows : List Occ) (cmds : List Cmd), (occIds rows).Nodup → let s :=
+  cmds.foldl step (start rows) ((consumedIds s.events ++ s.live.flatMap (fun b =>
+  occIds b.pending)).Perm (occIds rows)) ∧ (s.live.map Batch.token).Nodup ∧ (∀ b ∈
+  s.live, b.token < s.fresh ∧ ∀ o ∈ b.pending, o.key % 2^b.depth = b.bucket) ∧ (∀ o ∈
+  rows, consumptionCount (finish s) o.id = 1) ∧ (∀ k, optAgg rows (finish s) k =
+  refAgg rows k)`
+-/
+
 namespace TinylambOpt.ResearchGoals.RadixReplayOwnership
 open Research.AdaptiveRadixReplay
 

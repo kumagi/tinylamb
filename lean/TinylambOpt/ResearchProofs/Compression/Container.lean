@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Compression.Container
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (16 claims, including the following)
+
+- `AdjacentRequest` — `∀ k n p a b, 0 < k → ((rangeBlocks k n p a ++ rangeBlocks k n
+  (p+a) b).eraseDups) = rangeBlocks k n p (a+b)`
+- `AnchoredDirectory` — `∀ (bs : List Block) a i, a ≤ i → i ≤ bs.length → offset bs i =
+  offset bs a + payload ((bs.drop a).take (i-a))`
+- `AppendAtBoundary` — `∀ c k a b, 0 < k → a.length%k = 0 → (blocks c k (a++b)).map
+  Block.body = (blocks c k a ++ blocks c k b).map Block.body`
+
+Refuted by counterexample
+
+- `FinerAlwaysWins` — `∀ c s k, 0 < k → onDisk (blocks c k s) ≤ onDisk (blocks c (2*k)
+  s)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1063,3 +1082,9 @@ theorem sound_RandomRead : RandomRead.Goal := by
 
 
 end TinylambOpt.ResearchProofs.Compression.Container
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.cpp
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp
+-- table/tlcs_file.hpp

@@ -9,6 +9,15 @@ the vacuous rank bound.
 import Std
 import TinylambOpt.ResearchGoals.SelectionMaskDeposit
 
+/-!
+Proved
+
+- `Goal` — `∀ parent child, lanes (deposit 64 child parent) = ((lanes
+  parent).zipIdx.filter (fun p => child.getLsbD p.2)).map Prod.fst`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.SelectionMaskDeposit`.
+-/
+
 open TinylambOpt.ResearchGoals.SelectionMaskDeposit
 
 namespace TinylambOpt.ResearchProofs.SelectionMaskDeposit

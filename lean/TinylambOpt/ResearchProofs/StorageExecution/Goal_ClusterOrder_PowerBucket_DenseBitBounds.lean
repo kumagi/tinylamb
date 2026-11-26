@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `PowerBucket.DenseBitBounds` — `∀ rs w, (((physical key rs).filter (fun p => (key
+  p).1==w)).map Prod.fst).all (fun x => x<2^w)=true`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

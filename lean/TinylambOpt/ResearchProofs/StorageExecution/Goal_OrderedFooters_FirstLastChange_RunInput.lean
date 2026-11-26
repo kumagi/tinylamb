@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `FirstLastChange.RunInput` — Consume the lengths on a run-encoded column directly.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

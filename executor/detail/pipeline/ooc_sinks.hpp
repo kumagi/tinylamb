@@ -197,11 +197,12 @@ class OocGroupAggSink final : public PipelineSink {
   bool all_combinable_{false};
   bool has_collection_agg_{false};
   std::optional<slot_t> single_distinct_child_slot_;
-  size_t single_distinct_agg_index_{0};
-  // Owned DISTINCT-stripped clone for the O(1) sorted skew fallback when
-  // the aggregate list has one plain COUNT/SUM/AVG(DISTINCT expr) and only
-  // non-distinct non-collection siblings.
-  std::shared_ptr<AggregateExpression> skew_strip_aggregate_;
+  std::vector<size_t> shared_distinct_agg_indices_;
+  // Owned DISTINCT-stripped clones for the O(1) sorted skew fallback when
+  // all DISTINCT aggregates in the list are plain COUNT/SUM/AVG(DISTINCT expr)
+  // over the SAME child expression alongside non-distinct non-collection
+  // siblings.
+  std::vector<std::shared_ptr<AggregateExpression>> skew_strip_aggregates_;
 
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
   std::optional<QueryMemoryGrant::LocalBatchCache> grant_cache_;

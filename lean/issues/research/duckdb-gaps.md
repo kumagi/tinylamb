@@ -11,7 +11,7 @@
 | TPC-H SF10 | Q3 71.74 / 54.45、Q4 55.29 / 52.27、Q7 59.07 / 54.54、Q8 131.42 / 52.31、Q13 158.97 / 157.61 | 注文経由の多重度伝播、国別分岐、存在判定、注文数ヒストグラム |
 | 派生分析の既存記録 | SF10 の C3 66.3 / 8.2、C2 42.6 / 15.8。SF1 の H5 162.6 / 7.7、C4 103.5 / 5.5、L1 81.9 / 16.0 | 結合前の状態圧縮、並行辺・重複 ID・偏りへの対応 |
 
-3 スイートの数値は各 JSONL の `tinylamb.median_ms` と `duckdb.median_ms`。after-wave8 の集計に収録された DuckDB 値を使用した。各スイートは独立した条件で、派生分析の SF1 数値も当時の Release + ANALYZE + TLCS の記録である。[TPC-DS](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/tpcds/results.jsonl)・[ClickBench](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/clickbench/results.jsonl)・[TPC-H](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/tpch/results.jsonl)・[C2/C3 の記録](../../TinylambOpt/ResearchGoals/Wave9/AnalyticsRemaining.lean)・[H5](analytics-losses/bilateral-eager-agg-join-pushdown.md)・[C4](analytics-losses/left-join-right-multiplicity-collapse.md)・[L1](analytics-losses/factorized-join-tree-count-propagation.md)
+3 スイートの数値は各 JSONL の `tinylamb.median_ms` と `duckdb.median_ms`。after-wave8 の集計に収録された DuckDB 値を使用した。各スイートは独立した条件で、派生分析の SF1 数値も当時の Release + ANALYZE + TLCS の記録である。[TPC-DS](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/tpcds/results.jsonl)・[ClickBench](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/clickbench/results.jsonl)・[TPC-H](../../../build/benchmarks/three-db-sf10-20261122/after-wave8-20261124/tpch/results.jsonl)・[C2/C3 の記録](../../TinylambOpt/ResearchGoals/QueryRewrites/JoinMultiplicityAndZoneFilters.lean)・[H5](analytics-losses/bilateral-eager-agg-join-pushdown.md)・[C4](analytics-losses/left-join-right-multiplicity-collapse.md)・[L1](analytics-losses/factorized-join-tree-count-propagation.md)
 
 ## 同じ結果を返す SQL での追試
 
@@ -40,11 +40,11 @@ MLB の試行は `SELECT DISTINCT pos FROM mlb` のうち末尾が ` Fielder` �
 
 ## Lean 提出型
 
-各名前には `TinylambOpt.ResearchGoals.DuckDBGaps.<モジュール>.` を前置し、`.Goal` を付ける。提案は `def …Goal : Prop`。数値集約が比較するのは行数、非 NULL 数、拡張精度の整数和またはその組。実装での固定幅オーバーフロー、FLOAT64 の再結合、文字列照合、MVCC の可視性には各カーネルの適用時に対応する契約が要る。とくに Q22 の平均値の上界・下界を使う場合、実際の丸めと同順位の扱いまで枝刈り条件に含める。
+各名前には `TinylambOpt.ResearchGoals.AnalyticalOperators.<モジュール>.` を前置し、`.Goal` を付ける。提案は `def …Goal : Prop`。数値集約が比較するのは行数、非 NULL 数、拡張精度の整数和またはその組。実装での固定幅オーバーフロー、FLOAT64 の再結合、文字列照合、MVCC の可視性には各カーネルの適用時に対応する契約が要る。とくに Q22 の平均値の上界・下界を使う場合、実際の丸めと同順位の扱いまで枝刈り条件に含める。
 
 ### Slices — MLB Q108 と接尾辞分類、7 件
 
-既存の `GroupBeforeSuffix`、`ClassificationCache`、`PartialExtrema` を参照し、符号の偏り、辞書の追記、選択行での極値の確定を対象にした。実装での照合先はブロックのメタデータから MIN/MAX を返す経路。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/Slices.lean)・[既存モデル](../../TinylambOpt/ResearchGoals/CloudBI/PublicBI.lean)・[集約カーネル](../../../executor/detail/typed_stream_aggregate.cpp)
+既存の `GroupBeforeSuffix`、`ClassificationCache`、`PartialExtrema` を参照し、符号の偏り、辞書の追記、選択行での極値の確定を対象にした。実装での照合先はブロックのメタデータから MIN/MAX を返す経路。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/DictionarySlicesAndExtrema.lean)・[既存モデル](../../TinylambOpt/ResearchGoals/CloudBI/PublicBI.lean)・[集約カーネル](../../../executor/detail/typed_stream_aggregate.cpp)
 
 | 宣言名 | 省ける処理と成立条件 |
 | --- | --- |
@@ -58,7 +58,7 @@ MLB の試行は `SELECT DISTINCT pos FROM mlb` のうち末尾が ` Fielder` �
 
 ### FileMasks — Iceberg 相当の関係演算、7 件
 
-既存の `EqualityHorizon` はキーごとの最大削除 sequence を扱う。ここではファイルの識別子・共有可能なファイル署名・削除が当たった後の読み取り順を扱う。共通 SQL の速度差はネイティブ Iceberg コネクタの速度とは別に測定した。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/FileMasks.lean)・[既存の削除規則](../../TinylambOpt/ResearchGoals/CloudBI/DeleteFiles.lean)
+既存の `EqualityHorizon` はキーごとの最大削除 sequence を扱う。ここではファイルの識別子・共有可能なファイル署名・削除が当たった後の読み取り順を扱う。共通 SQL の速度差はネイティブ Iceberg コネクタの速度とは別に測定した。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/FilePruningAndDeleteMasks.lean)・[既存の削除規則](../../TinylambOpt/ResearchGoals/CloudBI/DeleteFiles.lean)
 
 | 宣言名 | 省ける処理と成立条件 |
 | --- | --- |
@@ -72,7 +72,7 @@ MLB の試行は `SELECT DISTINCT pos FROM mlb` のうち末尾が ` Fielder` �
 
 ### Refresh — CostBench の集計公開、6 件
 
-refresh の測定には集計結果の受信と再 INSERT が含まれる。書き込み中に集計状態を得る候補について、読み取り時点、既存バッチへの追記と部分的な再送を明示した。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/Refresh.lean)・[既存の公開・再送モデル](../../TinylambOpt/ResearchGoals/CloudBI/Quotes.lean)
+refresh の測定には集計結果の受信と再 INSERT が含まれる。書き込み中に集計状態を得る候補について、読み取り時点、既存バッチへの追記と部分的な再送を明示した。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/IncrementalRefreshAndFlush.lean)・[既存の公開・再送モデル](../../TinylambOpt/ResearchGoals/CloudBI/Quotes.lean)
 
 | 宣言名 | 省ける処理と成立条件 |
 | --- | --- |
@@ -85,7 +85,7 @@ refresh の測定には集計結果の受信と再 INSERT が含まれる。書�
 
 ### Retail — TPC-DS、8 件
 
-既存の Q22 の品目事前集約、Q38 の surrogate 重複排除を起点に、整列済み入力、閾値順位、チャネル間の集合の保持方法に着目した。Q72 ではフィルタ伝播を行う既存の結合入力構築の後にも不等号比較が残る場合を扱う。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/Retail.lean)・[既存の ROLLUP・集合演算](../../TinylambOpt/ResearchGoals/Wave9/TpcdsRollupAndSetOps.lean)・[結合入力構築](../../../executor/detail/build_input.cpp)
+既存の Q22 の品目事前集約、Q38 の surrogate 重複排除を起点に、整列済み入力、閾値順位、チャネル間の集合の保持方法に着目した。Q72 ではフィルタ伝播を行う既存の結合入力構築の後にも不等号比較が残る場合を扱う。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/RollupsAndChannelSetCounts.lean)・[既存の ROLLUP・集合演算](../../TinylambOpt/ResearchGoals/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean)・[結合入力構築](../../../executor/detail/build_input.cpp)
 
 | 宣言名 | 対象と候補 |
 | --- | --- |
@@ -100,7 +100,7 @@ refresh の測定には集計結果の受信と再 INSERT が含まれる。書�
 
 ### Hits — ClickBench、8 件
 
-既存の Misra–Gries による HAVING 候補と二段 Top-N を起点に、実際の相殺回数を利用した上位キーの確定と、確定後のメンバー数・文字列取得に進んだ。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/Hits.lean)・[既存の候補抽出](../../TinylambOpt/ResearchGoals/ExecutionStrategies/SearchBounds.lean)・[二段集約実装](../../../executor/detail/columnar_tlcs_fast_path.cpp)
+既存の Misra–Gries による HAVING 候補と二段 Top-N を起点に、実際の相殺回数を利用した上位キーの確定と、確定後のメンバー数・文字列取得に進んだ。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean)・[既存の候補抽出](../../TinylambOpt/ResearchGoals/ExecutionStrategies/SearchBounds.lean)・[二段集約実装](../../../executor/detail/columnar_tlcs_fast_path.cpp)
 
 | 宣言名 | 対象と候補 |
 | --- | --- |
@@ -115,7 +115,7 @@ refresh の測定には集計結果の受信と再 INSERT が含まれる。書�
 
 ### Orders — TPC-H、7 件
 
-結合後に残す列、右側の重複、CASE の NULL 規則まで保存した候補。Q3 の run 境界合成は整列性が利用できる場合に適用する。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/Orders.lean)・[クエリテンプレート](../../../benchmark/tpch_queries.hpp)
+結合後に残す列、右側の重複、CASE の NULL 規則まで保存した候補。Q3 の run 境界合成は整列性が利用できる場合に適用する。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean)・[クエリテンプレート](../../../benchmark/tpch_queries.hpp)
 
 | 宣言名 | 対象と候補 |
 | --- | --- |
@@ -129,7 +129,7 @@ refresh の測定には集計結果の受信と再 INSERT が含まれる。書�
 
 ### BridgeStates — H2O・STATS-CEB・LDBC-SNB、7 件
 
-既存の左右事前集約と二役の posts/users プロファイルを再利用した。実装側には因子化結合と右側多重度の縮約がある。今回の候補は状態そのものの共有、重複する経路の圧縮、パーティションごとの実行方式を扱う。[提出型](../../TinylambOpt/ResearchGoals/DuckDBGaps/BridgeStates.lean)・[既存の H5 モデル](../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/H2o.lean)・[因子化結合実装](../../../executor/detail/analytics_factorized_join.hpp)
+既存の左右事前集約と二役の posts/users プロファイルを再利用した。実装側には因子化結合と右側多重度の縮約がある。今回の候補は状態そのものの共有、重複する経路の圧縮、パーティションごとの実行方式を扱う。[提出型](../../TinylambOpt/ResearchGoals/AnalyticalOperators/SharedJoinStatesAndWeights.lean)・[既存の H5 モデル](../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean)・[因子化結合実装](../../../executor/detail/analytics_factorized_join.hpp)
 
 | 宣言名 | 対象と候補 |
 | --- | --- |

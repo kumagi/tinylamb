@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims compare recursive evaluation with a delta-based iteration. A recursive SQL
+query can process new frontier rows while preserving the modeled fixpoint.
+
+Modeled claims
+
+- `Goal` — `∀ edges seeds, let s := execute edges seeds (∀ v, v ∈ s.seen ↔ Reach edges
+  seeds v) ∧ s.seen.Nodup ∧ s.frontier = [] ∧ s.expanded.Perm s.seen`
+-/
+
 namespace TinylambOpt.ResearchGoals.RecursiveDelta
 
 abbrev Edge := Nat × Nat

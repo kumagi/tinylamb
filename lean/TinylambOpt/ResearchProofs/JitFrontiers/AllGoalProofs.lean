@@ -8,3 +8,8 @@ import TinylambOpt.ResearchProofs.JitFrontiers.RelationalGuards_All
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache_All
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory_All
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises_All
+
+/-!
+This module collects proofs for Bailout State, Checked Rewrites, Demand SSA, Packed Keys
+and related cases.
+-/

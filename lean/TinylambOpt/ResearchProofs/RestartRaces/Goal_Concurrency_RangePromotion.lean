@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Concurrency
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `RangePromotion` — Price range-lock promotion using local collision counts. If one
+  writer touches at most d intervals per candidate, does minimizing that surrogate
+  guarantee at most d times the minimum number of distinct blocked writers?
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

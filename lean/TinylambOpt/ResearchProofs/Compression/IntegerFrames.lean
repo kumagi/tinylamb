@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.IntegerFrames
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (15 claims, including the following)
+
+- `ExactQuote` — `∀ base w xs, (body base w xs).length = charge base w xs`
+- `ExceptionDrop` — `∀ w xs, (patches w xs).length - (patches (w+1) xs).length =
+  xs.countP (fun v => 2^w ≤ v && v < 2^(w+1))`
+- `FiniteSearch` — `∀ base xs w, let widths := List.range (width (peak xs)+1)
+  (widths.map (fun k => charge base k xs)).min?.getD 0 ≤ charge base w xs`
+
+Refuted by counterexample
+
+- `FewestExceptions` — `∀ base xs w, charge base (width (peak xs)) xs ≤ charge base w
+  xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1100,3 +1118,8 @@ theorem sound_TwoStrideSegments : TwoStrideSegments.Goal := by
   omega
 
 end TinylambOpt.ResearchProofs.Compression.IntegerFrames
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp
+-- table/tlcs_file.hpp

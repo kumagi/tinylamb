@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Common_DemandSSA
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+
+Refuted by counterexample
+
+- `CoalesceDispatch.ReuseBudget` — Cached common subexpressions may reduce repeated
+  evaluations of the same slot.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

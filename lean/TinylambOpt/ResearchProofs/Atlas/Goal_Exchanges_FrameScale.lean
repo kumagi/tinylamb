@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Exchanges.FrameScale` — `∀ cap xs n, 0 < cap → 0 < n → traffic (cap*n) xs ≤ traffic
+  cap xs ∧ traffic cap xs ≤ n*traffic (cap*n) xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

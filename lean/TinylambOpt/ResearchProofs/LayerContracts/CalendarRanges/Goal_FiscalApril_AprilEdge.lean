@@ -3,6 +3,15 @@ import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarR
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Facts_FiscalApril
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved
+
+- `FiscalApril.AprilEdge` — `∀ y, fast model (monthStart (12*y+3)-monthStart 3) = y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

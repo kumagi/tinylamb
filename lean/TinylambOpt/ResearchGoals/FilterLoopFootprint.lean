@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims compare filter loops by their evaluations and selected rows. A SQL executor
+can reduce predicate work subject to the observed evaluation and result contract.
+
+Modeled claims
+
+- `Goal` — `∀ (xs : List Int64) (k : Int64), (schedule xs.length).flatMap accessed =
+  List.range xs.length ∧ writes xs k = xs.zipIdx.map (fun (x,i) => (i, some (if x ==
+  k then 1 else 0)))`
+-/
+
 namespace TinylambOpt.ResearchGoals.FilterLoopFootprint
 
 -- Element offsets for the 32-row main loop (4 vector loads), 8-row

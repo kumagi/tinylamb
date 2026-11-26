@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Page allocation for stored SQL rows must preserve the byte ranges, alignment, and live
+data required by the modeled layout.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.SlotPlacement
 
 /-! One bounded page with byte occupancy. A request carries payload size, old slot,

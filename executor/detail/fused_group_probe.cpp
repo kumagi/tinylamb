@@ -372,7 +372,7 @@ Status FusedGroupProbe::Run(size_t w, FusedWorkerLocal& local,
     return right_gids == nullptr ? r_idx : right_gids[r_idx];
   };
   if (source.deferred_left_probe != nullptr) {
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     //   (interleaved_worker_partition_bijection_sound)
     // Assign 64-block stripes deterministically across workers (`w, w+W,
     // ...`) so parallel floating-point / ROLLUP partial sums are 100%
@@ -1067,7 +1067,7 @@ Status FusedGroupProbe::Run(size_t w, FusedWorkerLocal& local,
           const size_t base = static_cast<size_t>(gid) * direct.agg_count;
           if (deferred.disjoint_bucket5_ready) {
             // Lean proof:
-            // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+            // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
             //   (DisjointRangeBucketHistogram_sound)
             int64_t a = 0;
             int64_t b = 0;
@@ -1419,7 +1419,7 @@ Status FusedGroupProbe::Run(size_t w, FusedWorkerLocal& local,
           FusedGroup& group = local.groups[group_index];
           if (deferred.disjoint_bucket5_ready) {
             // Lean proof:
-            // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+            // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
             //   (DisjointRangeBucketHistogram_sound)
             int64_t a = 0;
             int64_t b = 0;
@@ -2037,7 +2037,7 @@ Status FusedGroupProbe::Run(size_t w, FusedWorkerLocal& local,
             return;
           }
         }
-        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
         //   (finite_sum_implies_no_inf, dense_group_block_accum_monoid_eq)
         // A single range predicate over a non-NULL flat column needs one
         // comparison per candidate, accumulating into a register across the

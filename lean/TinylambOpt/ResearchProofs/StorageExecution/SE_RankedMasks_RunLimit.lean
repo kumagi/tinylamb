@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `RunLimit.Cofactor` — Compute a parallel shard count by conditioning on its prefix
+  state.
+- `RunLimit.Decoder` — Recreate every accepted bitmap from its compact code.
+- `RunLimit.EraseSeparator` — `∀ a b, legal model 0 a → legal model 0 b → legal model 0
+  (a++[false]++b)`
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/RunLimit` goals.
 open TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 set_option maxHeartbeats 0

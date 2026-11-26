@@ -283,7 +283,7 @@ StatusOr<std::string> LsmIndex::ReadVisible(Transaction& txn,
   auto entries =
       txn.GetPageManager()->LsmScanRange(root_, key, key, true, &txn, &status);
   RETURN_IF_FAIL(status);
-  if (entries.empty()) {
+  if (entries.empty() || entries.front().first != key) {
     return Status::kNotExists;
   }
   return std::move(entries.front().second);

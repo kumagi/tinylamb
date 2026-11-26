@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `Seasonal.ByteBudget` — `∀ period side i h xs w extra oldBytes, certificate (predict
+  period) side i h xs w → extra + quote xs.length w < oldBytes → extra + (frame
+  (encode (predict period) side i h xs)).length < oldBytes`
+- `Seasonal.RepeatCycle` — `∀ (block : List Int) n side i, block ≠ [] → encode (predict
+  (block.length-1)) side i block.reverse (List.replicate n block |>.flatten) =
+  List.replicate (n*block.length) 0`
+- `Seasonal.ResidualRoundTrip` — `∀ period side i h xs, restore (predict period) side i
+  h (encode (predict period) side i h xs) = xs`
+- `Seasonal.RestartSeed` — `∀ period side i h xs, encode (predict period) side i
+  (h.take (period+1)) xs = encode (predict period) side i h xs`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.Seasonal
 
 open TinylambOpt.ResearchGoals.Compression.Predictors

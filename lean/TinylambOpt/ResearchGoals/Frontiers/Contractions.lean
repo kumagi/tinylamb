@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.Frontiers.Contractions
 
 /-! H5, C3, L1, Q8. A matrix cell is the multiplicity of a join-key pair, or a

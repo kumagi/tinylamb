@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.CorrelatedProbes
 
 /-! Specialized per-correlation-key kernels. Count multiplicities as bags, identify

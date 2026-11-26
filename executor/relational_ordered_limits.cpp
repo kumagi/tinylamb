@@ -51,7 +51,7 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (partitioned_order_by_limit_band_pruning_sound)
 StatusOr<std::optional<Relation>> TryExecutePartitionBandedOrderByLimit(
     TransactionContext& context, const SelectStatement& statement,
@@ -567,7 +567,8 @@ StatusOr<std::optional<Relation>> TryExecutePartitionBandedOrderByLimit(
   return std::optional<Relation>{};
 }
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
 //   (LexicographicDimPrefixTopK_sound)
 // When a top-level ORDER BY <dim_col>, ... LIMIT K joins a small base
 // dimension table D (e.g. `store`, <= 50k rows) against a derived-table

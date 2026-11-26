@@ -200,3 +200,7 @@ theorem lazy_dictionary_ignores_unused_bad_code (gen : Nat) (dict : Nat → Opti
   exact hs.2.trans hr
 
 end TinylambOpt.LazyDictionary
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp
+-- executor/detail/analytics_factorized_join_test.cpp

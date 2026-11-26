@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `LocalRevalidation` — Recheck just the outgoing edges of the recorded cycle before
+  using it.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

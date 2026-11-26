@@ -1,4 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `RunOffset` — Skip sorting entire runs covered by OFFSET and stop after the boundary
+  run, preserving suffix ties only within their own prefix.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

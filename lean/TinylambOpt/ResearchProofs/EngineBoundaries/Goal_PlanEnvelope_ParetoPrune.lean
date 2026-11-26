@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Proved
+
+- `ParetoPrune` — Remove a dominated candidate from a memo group without affecting the
+  optimum.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

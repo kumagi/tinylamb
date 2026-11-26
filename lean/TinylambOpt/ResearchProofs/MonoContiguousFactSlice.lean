@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.MonoContiguousFactSlice
 
+/-!
+Proved
+
+- `Goal` — Monotone contiguous compressed fact binary-search slice
+  (`executor/detail/fused_grouped_join.cpp` `mono_contiguous_rf`, TPC-DS Q65): over a
+  non-null key-sorted fact column, `bsLower lo .. bsUpper hi` selects a contiguous
+  range covering every row satisfying any predicate whose support lies within `[lo,
+  hi]` (even when `lo > hi`).
+
+The reference model is defined in `TinylambOpt.ResearchGoals.MonoContiguousFactSlice`.
+-/
+
 namespace TinylambOpt.ResearchProofs.MonoContiguousFactSlice
 
 open TinylambOpt.ResearchGoals.MonoContiguousFactSlice
@@ -498,3 +510,6 @@ theorem sound : TinylambOpt.ResearchGoals.MonoContiguousFactSlice.Goal := by
         (fun hp => absurd (hsupp _ hp).2 hnot)
 
 end TinylambOpt.ResearchProofs.MonoContiguousFactSlice
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_group_probe.cpp

@@ -1,1184 +1,1237 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.IndexPreimages
 
 /-!
-# Proofs for `IndexPreimages` research goals
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
 
-Strategy per goal:
+Proved (9 claims, including the following)
 
-* `TruncBucket`: reduce `x.tdiv d = q` to the sign-split quotient/remainder
-  characterizations `Int.tdiv_tmod_unique` / `Int.tdiv_tmod_unique'`, then match
-  the three `truncBounds` branches (`q < 0`, `q = 0`, `q > 0`) against the sign
-  of `x`.
-* `DescendingBand`: rewrite both sides into linear inequalities in the atom
-  `d * x` using `Int.le_ediv_iff_mul_le`, `Int.ediv_lt_iff_lt_mul` and
-  `Int.add_one_le_iff`, then finish with `omega`.
-* `DistanceRing`: the negative and positive seeks are disjoint, so their
-  concatenation is a permutation of the filter by the disjunction of the two
-  range predicates (`filter_or_perm`); that disjunction is pointwise equal to
-  the `|x - o| ∈ [l, h]` predicate (`ring_union`), again by `omega` after
-  splitting on the sign of `x - o` for `Int.natAbs`.
-* `ModularLookup`: both sides are residues in `[0, m)`, hence equivalent to
-  divisibility of `a*x+bias-target` and `x-inv*(target-bias)`; the validated
-  inverse `a*inv ≡ 1` bridges them (`modlookup_dvd`, `emod_eq_iff_dvd_sub`).
-* `CheckedDistanceBand`: the block hypotheses put every row inside the
-  `checkedDistance` guard, so `mapM` reduces pointwise to
-  `decide (center-rad ≤ x ∧ x ≤ center+rad)` via a `natAbs` sign split.
-* `RoundedBucket`: `2n - 2kd = 2(n%d) + 2d(n/d - k)` shows only `k = n/d` and
-  `k = n/d + 1` can be within `d`, matching the `nearestEven` tie-break.
-* `CursorRanges`: `cmpKey cur r == .lt` is pointwise "peer or later"; the
-  pairwise `≠ .gt` hypothesis gives disjointness and separation, and induction
-  on `rows` yields `peers ++ later`.
-* `PeriodicSeek`: the normalized residue enumeration
-  `filter (· % p == r) (map Nat→Int (range k))` is proved by induction on `k`
-  (splitting on `k % p = r`), then bridged to the `[lo, hi)` window via
-  Euclidean division (`ps_enum_nat`, `ps_bridge`, `ps_rhs`).
-* `MortonSquare`: `morton_split'` splits the interleaved-bit sum at depth `b`
-  into low bits `< 4^b` plus `4^b *` high bits; `morton_inj` (induction on bit
-  depth, peeling the lowest interleaved pair) shows the high Morton code
-  determines `(x/2^b, y/2^b)` uniquely, turning the interval membership into
-  the quotient-pair equality.
+- `TinylambOpt.ResearchGoals.IndexPreimages.CheckedDistanceBand` — `∀ (rows : List Int)
+  (m l h center rad : Int), (∀ x ∈ rows, l ≤ x ∧ x ≤ h) → -m < l-center → h-center <
+  m → rows.mapM (fun x => (checkedDistance m x center).map (fun n => decide (n ≤
+  rad))) = some (rows.map fun x => decide (center-rad ≤ x ∧ x ≤ center+rad))`
+- `TinylambOpt.ResearchGoals.IndexPreimages.CursorRanges` — `∀ (rows : List Key) (cur :
+  Key), let later := rows.filter fun r => match cur.1,r.1 with | some x,some y => x <
+  y | some _,none => true | _,_ => false let peers := rows.filter fun r => r.1 ==
+  cur.1 && r.2 < cur.2 rows.Pairwise (fun a b => cmpKey a b ≠ .gt) → peers ++ later =
+  rows.filter (fun r => cmpKey cur r == .lt)`
+- `TinylambOpt.ResearchGoals.IndexPreimages.DescendingBand` — A band filter on a
+  negative-slope affine expression flips both inequalities. Use integer floor
+  endpoints to seek an inclusive range even with negative inputs.
 -/
 
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.IndexPreimages
 
 open TinylambOpt.ResearchGoals.IndexPreimages
 
-/-! ### TruncBucket -/
+private theorem tdiv_of_nonneg {x d : Int} (hx : 0 ≤ x) (hd : 0 < d) : x.tdiv d = x / d := by
+  cases x with
+  | ofNat xm =>
+      cases d with
+      | ofNat dm => rfl
+      | negSucc dm => omega
+  | negSucc xm =>
+      have : ¬ (0 ≤ (Int.negSucc xm : Int)) := by omega
+      exact False.elim (this hx)
 
-private theorem tdiv_eq_iff_nonneg {x d q : Int} (hd : 0 < d) (hx : 0 ≤ x) :
-    x.tdiv d = q ↔ 0 ≤ q ∧ q * d ≤ x ∧ x ≤ q * d + d - 1 := by
-  have hb : d ≠ 0 := Int.ne_of_gt hd
-  have hna : (d.natAbs : Int) = d := Int.natAbs_of_nonneg (Int.le_of_lt hd)
+
+private theorem tdiv_of_neg {x d : Int} (hx : x < 0) (hd : 0 < d) : x.tdiv d = -((-x)/d) := by
+  cases x with
+  | ofNat xm =>
+      have hnon : 0 ≤ (Int.ofNat xm : Int) := Int.natCast_nonneg xm
+      omega
+  | negSucc xm =>
+      cases d with
+      | ofNat dm => rfl
+      | negSucc dm => omega
+
+
+private theorem ediv_eq_iff_range (x d k : Int) (hx : 0 ≤ x) (hd : 0 < d) :
+    x / d = k ↔ k*d ≤ x ∧ x < k*d + d := by
   constructor
   · intro h
-    have h' := (Int.tdiv_tmod_unique hx hb).mp ⟨h, rfl⟩
-    obtain ⟨hrx, hr0, hrd⟩ := h'
-    rw [hna] at hrd
-    rw [Int.mul_comm d q] at hrx
-    refine ⟨?_, ?_, ?_⟩
-    · by_cases hq : 0 ≤ q
-      · exact hq
-      · have hdq : q * d ≤ -d := by
-          have h2 := Int.mul_le_mul_of_nonneg_right (show q ≤ -1 by omega) (show 0 ≤ d by omega)
-          rwa [Int.neg_one_mul] at h2
-        have hq' : q < 0 := Int.not_le.mp hq
+    subst k
+    constructor
+    · have hle : (x/d)*d ≤ x := (Int.le_ediv_iff_mul_le hd).mp (by omega)
+      simpa [Int.mul_comm] using hle
+    · have hlt : x/d < x/d + 1 := by omega
+      have hmul := (Int.ediv_lt_iff_lt_mul hd).mp hlt
+      rw [Int.add_mul] at hmul
+      omega
+  · intro h
+    apply Int.le_antisymm
+    · have hlt : x < (k+1)*d := by
+        rw [Int.add_mul]
         omega
-    · omega
-    · omega
-  · rintro ⟨hq0, h1, h2⟩
-    have hr : x - q * d + d * q = x := by rw [Int.mul_comm d q]; omega
-    have h0 : 0 ≤ x - q * d := by omega
-    have hlt : x - q * d < (d.natAbs : Int) := by rw [hna]; omega
-    exact ((Int.tdiv_tmod_unique hx hb).mpr ⟨hr, h0, hlt⟩).1
-
-private theorem tdiv_eq_iff_nonpos {x d q : Int} (hd : 0 < d) (hx : x ≤ 0) :
-    x.tdiv d = q ↔ q ≤ 0 ∧ q * d - d + 1 ≤ x ∧ x ≤ q * d := by
-  have hb : d ≠ 0 := Int.ne_of_gt hd
-  have hna : (d.natAbs : Int) = d := Int.natAbs_of_nonneg (Int.le_of_lt hd)
-  constructor
-  · intro h
-    have h' := (Int.tdiv_tmod_unique' hx hb).mp ⟨h, rfl⟩
-    obtain ⟨hrx, hr0, hrd⟩ := h'
-    rw [hna] at hr0
-    rw [Int.mul_comm d q] at hrx
-    refine ⟨?_, ?_, ?_⟩
-    · by_cases hq : q ≤ 0
-      · exact hq
-      · have hdq : d ≤ q * d := by
-          have h2 := Int.mul_le_mul_of_nonneg_right (show 1 ≤ q by omega) (show 0 ≤ d by omega)
-          rwa [Int.one_mul] at h2
-        have hq' : 0 < q := Int.not_le.mp hq
-        omega
-    · omega
-    · omega
-  · rintro ⟨hq0, h1, h2⟩
-    have hr : x - q * d + d * q = x := by rw [Int.mul_comm d q]; omega
-    have h0 : -(d.natAbs : Int) < x - q * d := by rw [hna]; omega
-    have h1' : x - q * d ≤ 0 := by omega
-    exact ((Int.tdiv_tmod_unique' hx hb).mpr ⟨hr, h0, h1'⟩).1
-
-/-- `x.tdiv d = q` iff `x` lies in the interval picked by `truncBounds d q`.
-The interval depends on the sign of `q`; the proof splits on the sign of `x`
-(nonnegative dividends use `tdiv_tmod_unique`, nonpositive ones use
-`tdiv_tmod_unique'`). -/
-theorem sound_TruncBucket : TruncBucket.Goal := by
-  intro x d q hd
-  simp only [truncBounds]
-  by_cases hx : 0 ≤ x
-  · have hA := tdiv_eq_iff_nonneg (x := x) (d := d) (q := q) hd hx
-    by_cases hq : q < 0
-    · rw [ite_eq_left hq]
-      dsimp only
-      rw [hA]
-      have hdq : q * d ≤ -d := by
-        have h2 := Int.mul_le_mul_of_nonneg_right (show q ≤ -1 by omega) (show 0 ≤ d by omega)
-        rwa [Int.neg_one_mul] at h2
-      apply iff_of_false
-      · rintro ⟨h1, -, h3⟩; omega
-      · rintro ⟨-, h2⟩; omega
-    · by_cases hq0 : q = 0
-      · have hq0' : (q == 0) = true := beq_iff_eq.mpr hq0
-        rw [ite_eq_right hq, ite_eq_left hq0']
-        dsimp only
-        subst hq0
-        simp only [Int.zero_mul, Int.zero_add] at hA
-        rw [hA]
-        constructor
-        · rintro ⟨-, h1, h2⟩; exact ⟨by omega, h2⟩
-        · rintro ⟨h1, h2⟩; exact ⟨by omega, by omega, h2⟩
-      · have hq0' : ¬ ((q == 0) = true) := fun hh => hq0 (beq_iff_eq.mp hh)
-        rw [ite_eq_right hq, ite_eq_right hq0']
-        dsimp only
-        rw [hA]
-        have hqpos : 0 < q := by omega
-        constructor
-        · rintro ⟨-, h1, h2⟩; exact ⟨h1, h2⟩
-        · rintro ⟨h1, h2⟩; exact ⟨by omega, h1, h2⟩
-  · have hxle : x ≤ 0 := Int.le_of_lt (Int.not_le.mp hx)
-    have hB := tdiv_eq_iff_nonpos (x := x) (d := d) (q := q) hd hxle
-    by_cases hq : q < 0
-    · rw [ite_eq_left hq]
-      dsimp only
-      rw [hB]
-      have hqle : q ≤ 0 := by omega
-      constructor
-      · rintro ⟨-, h1, h2⟩; exact ⟨h1, h2⟩
-      · rintro ⟨h1, h2⟩; exact ⟨by omega, h1, h2⟩
-    · by_cases hq0 : q = 0
-      · have hq0' : (q == 0) = true := beq_iff_eq.mpr hq0
-        rw [ite_eq_right hq, ite_eq_left hq0']
-        dsimp only
-        subst hq0
-        simp only [Int.zero_mul] at hB
-        rw [hB]
-        constructor
-        · rintro ⟨-, h1, h2⟩; exact ⟨by omega, by omega⟩
-        · rintro ⟨h1, h2⟩; exact ⟨by omega, by omega, by omega⟩
-      · have hq0' : ¬ ((q == 0) = true) := fun hh => hq0 (beq_iff_eq.mp hh)
-        rw [ite_eq_right hq, ite_eq_right hq0']
-        dsimp only
-        rw [hB]
-        have hdq : d ≤ q * d := by
-          have h2 := Int.mul_le_mul_of_nonneg_right (show 1 ≤ q by omega) (show 0 ≤ d by omega)
-          rwa [Int.one_mul] at h2
-        apply iff_of_false
-        · rintro ⟨h1, -, -⟩; omega
-        · rintro ⟨h1, -⟩; omega
-
-/-! ### DescendingBand -/
-
-/-- Inverting `lo ≤ bias - d*x < hi` for `0 < d`: both bounds become floor-division
-inequalities in `x`, which `Int.le_ediv_iff_mul_le` and
-`Int.ediv_lt_iff_lt_mul` turn back into linear facts about `d * x`. -/
-theorem sound_DescendingBand : DescendingBand.Goal := by
-  intro x lo hi bias d hd
-  constructor
-  · rintro ⟨h1, h2⟩
-    have hx1 : x ≤ (bias - lo) / d := by
-      rw [Int.le_ediv_iff_mul_le hd, Int.mul_comm x d]
+      have hlt' : x/d < k+1 := (Int.ediv_lt_iff_lt_mul hd).mpr hlt
       omega
-    have hx2 : (bias - hi) / d + 1 ≤ x := by
-      rw [Int.add_one_le_iff, Int.ediv_lt_iff_lt_mul hd, Int.mul_comm x d]
-      omega
-    exact ⟨hx2, hx1⟩
-  · rintro ⟨h1, h2⟩
-    have hB' : bias - hi < d * x := by
-      have t := h1
-      rw [Int.add_one_le_iff, Int.ediv_lt_iff_lt_mul hd, Int.mul_comm x d] at t
-      exact t
-    have hA' : d * x ≤ bias - lo := by
-      have t := h2
-      rw [Int.le_ediv_iff_mul_le hd, Int.mul_comm x d] at t
-      exact t
-    constructor <;> omega
+    · exact (Int.le_ediv_iff_mul_le hd).mpr (by simpa [Int.mul_comm] using h.1)
 
-/-! ### DistanceRing -/
 
-/-- Concatenating the filters of two pointwise-disjoint Boolean predicates is a
-permutation of the filter by their disjunction. Proved by induction on the list;
-the only subtlety is that `||`/`&&` bind looser than `=`, so the `= true`
-hypotheses need parentheses, and `filter_cons_of_pos/neg` need the combined
-predicate passed explicitly to avoid higher-order unification picking
-`Bool.or (p a)` as the predicate. -/
-private theorem filter_or_perm {α : Type} (p q : α → Bool) (l : List α)
-    (hdj : ∀ a ∈ l, ¬ (p a = true ∧ q a = true)) :
-    (l.filter p ++ l.filter q).Perm (l.filter fun a => p a || q a) := by
-  induction l with
-  | nil => exact List.Perm.refl _
-  | cons a l ih =>
-    have hdj' : ∀ b ∈ l, ¬ (p b = true ∧ q b = true) :=
-      fun b hb => hdj b (List.mem_cons_of_mem a hb)
-    by_cases hpa : p a = true
-    · by_cases hqa : q a = true
-      · exact absurd ⟨hpa, hqa⟩ (hdj a List.mem_cons_self)
-      · have hq : ¬ q a = true := hqa
-        have h_or : (p a || q a) = true := by rw [hpa]; rfl
-        rw [List.filter_cons_of_pos hpa, List.filter_cons_of_neg hq,
-            List.filter_cons_of_pos (p := fun a => p a || q a) h_or]
-        rw [List.cons_append]
-        exact List.Perm.cons a (ih hdj')
-    · have hp : ¬ p a = true := hpa
-      by_cases hqa : q a = true
-      · have hpf : p a = false := by
-          have h := Bool.not_eq_true (p a)
-          exact Eq.mp h hpa
-        have h_or : (p a || q a) = true := by rw [hpf, hqa]; rfl
-        rw [List.filter_cons_of_neg hp, List.filter_cons_of_pos hqa,
-            List.filter_cons_of_pos (p := fun a => p a || q a) h_or]
-        exact (List.perm_middle).trans (List.Perm.cons a (ih hdj'))
-      · have hpf : p a = false := by
-          have h := Bool.not_eq_true (p a)
-          exact Eq.mp h hpa
-        have hqf : q a = false := by
-          have h := Bool.not_eq_true (q a)
-          exact Eq.mp h hqa
-        have h_or : ¬ ((p a || q a) = true) := by rw [hpf, hqf]; exact Bool.false_ne_true
-        rw [List.filter_cons_of_neg hp, List.filter_cons_of_neg hqa,
-            List.filter_cons_of_neg (p := fun a => p a || q a) h_or]
-        exact ih hdj'
+private theorem div_nonneg (x d : Int) (hx : 0 ≤ x) (hd : 0 < d) : 0 ≤ x/d := by
+  exact (Int.le_ediv_iff_mul_le hd).mpr (by simpa using hx)
 
-/-- Pointwise, the disjunction of the negative and positive annulus seeks equals
-the absolute-distance predicate. Both sides are Boolean combinations of linear
-inequalities; `Bool.eq_iff_iff` reduces the goal to an iff of `= true`
-propositions, `Int.natAbs_of_nonneg` / `Int.ofNat_natAbs_of_nonpos` evaluate
-`(x - o).natAbs` by the sign of `x - o`, and `omega` (which understands `max`)
-discharges the resulting linear arithmetic. -/
-private theorem ring_union {o l h x : Int} (hl : 0 ≤ l) :
-    ((decide (o - h ≤ x) && decide (x ≤ o - max 1 l)) ||
-     (decide (o + l ≤ x) && decide (x ≤ o + h))) =
-    (decide (l ≤ ((x - o).natAbs : Int)) && decide (((x - o).natAbs : Int) ≤ h)) := by
-  rw [Bool.eq_iff_iff]
-  constructor
-  · intro h
-    rw [Bool.or_eq_true] at h
-    rcases h with hp | hp
-    · simp only [Bool.and_eq_true, decide_eq_true_eq] at hp
-      obtain ⟨h1, h2⟩ := hp
-      by_cases hxo : 0 ≤ x - o
-      · have hna : ((x - o).natAbs : Int) = x - o := Int.natAbs_of_nonneg hxo
-        rw [hna]
-        simp only [Bool.and_eq_true, decide_eq_true_eq]
-        exact ⟨by omega, by omega⟩
-      · have hna : ((x - o).natAbs : Int) = -(x - o) := by
-          have hxo' : x - o ≤ 0 := by omega
-          exact Int.ofNat_natAbs_of_nonpos hxo'
-        rw [hna]
-        simp only [Bool.and_eq_true, decide_eq_true_eq]
-        exact ⟨by omega, by omega⟩
-    · simp only [Bool.and_eq_true, decide_eq_true_eq] at hp
-      obtain ⟨h1, h2⟩ := hp
-      by_cases hxo : 0 ≤ x - o
-      · have hna : ((x - o).natAbs : Int) = x - o := Int.natAbs_of_nonneg hxo
-        rw [hna]
-        simp only [Bool.and_eq_true, decide_eq_true_eq]
-        exact ⟨by omega, by omega⟩
-      · have hna : ((x - o).natAbs : Int) = -(x - o) := by
-          have hxo' : x - o ≤ 0 := by omega
-          exact Int.ofNat_natAbs_of_nonpos hxo'
-        rw [hna]
-        simp only [Bool.and_eq_true, decide_eq_true_eq]
-        exact ⟨by omega, by omega⟩
-  · intro h
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at h
-    obtain ⟨h1, h2⟩ := h
-    rw [Bool.or_eq_true]
-    by_cases hxo : 0 ≤ x - o
-    · have hna : ((x - o).natAbs : Int) = x - o := Int.natAbs_of_nonneg hxo
-      rw [hna] at h1 h2
-      right
-      simp only [Bool.and_eq_true, decide_eq_true_eq]
-      exact ⟨by omega, by omega⟩
-    · have hna : ((x - o).natAbs : Int) = -(x - o) := by
-        have hxo' : x - o ≤ 0 := by omega
-        exact Int.ofNat_natAbs_of_nonpos hxo'
-      rw [hna] at h1 h2
-      left
-      simp only [Bool.and_eq_true, decide_eq_true_eq]
-      exact ⟨by omega, by omega⟩
 
-/-- The two seeks are disjoint: `x ≤ o - max 1 l ≤ o - 1` contradicts
-`o + l ≤ x` since `0 ≤ l`. Hence `filter_or_perm` applies, and `ring_union`
-identifies the combined predicate with the annulus predicate. -/
-theorem sound_DistanceRing : DistanceRing.Goal := by
-  intro rows o l h hl neg pos
-  have hdisj : ∀ a ∈ rows,
-      ¬ ((fun x => decide (o - h ≤ x) && decide (x ≤ o - max 1 l)) a = true ∧
-         (fun x => decide (o + l ≤ x) && decide (x ≤ o + h)) a = true) := by
-    intro a _
-    rintro ⟨h1, h2⟩
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at h1 h2
-    obtain ⟨-, h1b⟩ := h1
-    obtain ⟨h2a, -⟩ := h2
-    omega
-  have hperm := filter_or_perm
-    (p := fun x => decide (o - h ≤ x) && decide (x ≤ o - max 1 l))
-    (q := fun x => decide (o + l ≤ x) && decide (x ≤ o + h))
-    (l := rows) hdisj
-  refine hperm.trans ?_
-  have heq : rows.filter (fun a =>
-        (fun x => decide (o - h ≤ x) && decide (x ≤ o - max 1 l)) a ||
-        (fun x => decide (o + l ≤ x) && decide (x ≤ o + h)) a) =
-      rows.filter (fun x => decide (l ≤ ((x - o).natAbs : Int)) &&
-        decide (((x - o).natAbs : Int) ≤ h)) := by
-    apply List.filter_congr
-    intro x _
-    exact ring_union (x := x) hl
-  rw [heq]
+private theorem natAbs_nonneg_eq {v : Int} (hv : 0 ≤ v) : (v.natAbs : Int) = v :=
+  Int.natAbs_of_nonneg hv
 
-/-! ### ModularLookup -/
 
-/-- Both sides are residues in `[0, m)`, so each equation is equivalent to a
-divisibility statement; clearing `a * inv ≡ 1 (mod m)` turns one divisibility
-into the other by explicit `Int.mul_*` rewrites and `omega`.
--/
-private theorem emod_eq_iff_dvd_sub {u v m : Int} (hm : 0 < m)
-    (hu : 0 ≤ u) (hu' : u < m) :
-    u = v % m ↔ m ∣ (u - v) := by
-  have hvm : 0 ≤ v % m := Int.emod_nonneg v (Int.ne_of_gt hm)
-  have hv'm : v % m < m := Int.emod_lt_of_pos v hm
-  constructor
-  · intro h
-    have h2 : u % m = (v % m) % m := congrArg (· % m) h
-    have h3 : (u - v % m) % m = 0 :=
-      (Int.emod_eq_emod_iff_emod_sub_eq_zero).mp h2
-    have h4 : (u - v) % m = (u - v % m) % m := (Int.sub_emod_emod u v m).symm
-    exact (Int.dvd_iff_emod_eq_zero).mpr (h4.trans h3)
-  · intro h
-    have h0 : (u - v) % m = 0 := (Int.dvd_iff_emod_eq_zero).mp h
-    have h1 : (u - v % m) % m = 0 := (Int.sub_emod_emod u v m).trans h0
-    have h2 : u % m = (v % m) % m :=
-      (Int.emod_eq_emod_iff_emod_sub_eq_zero).mpr h1
-    rw [Int.emod_eq_of_lt hu hu', Int.emod_eq_of_lt hvm hv'm] at h2
-    exact h2
+private theorem natAbs_neg_eq {v : Int} (hv : v < 0) : (v.natAbs : Int) = -v := by
+  have h := Int.natAbs_of_nonneg (a := -v) (by omega)
+  simpa [Int.natAbs_neg] using h
 
-private theorem modlookup_dvd {m a inv bias x target : Int}
-    (hm : 1 < m) (hinv : (a * inv) % m = 1) :
-    m ∣ (a * x + bias - target) ↔ m ∣ (x - inv * (target - bias)) := by
-  have hm0 : 0 < m := by omega
-  have h1m : (1 : Int) % m = 1 := Int.emod_eq_of_lt (by omega) (by omega)
-  have hdiff : (a * inv - 1) % m = 0 := by
-    have hh : (a * inv) % m = (1 : Int) % m := by rw [hinv, h1m]
-    exact (Int.emod_eq_emod_iff_emod_sub_eq_zero).mp hh
-  have hAinv1 : m ∣ (a * inv - 1) := (Int.dvd_iff_emod_eq_zero).mpr hdiff
-  constructor
-  · intro hA
-    have hinvA : m ∣ inv * (a * x + bias - target) := Int.dvd_mul_of_dvd_right hA
-    have hId2 : inv * (a * x + bias - target) - (x - inv * (target - bias)) =
-        (inv * a - 1) * x := by
-      rw [Int.mul_sub, Int.mul_add, ← Int.mul_assoc, Int.mul_sub, Int.sub_mul, Int.one_mul]
-      omega
-    have hInvA1 : m ∣ (inv * a - 1) := by
-      have he : inv * a = a * inv := Int.mul_comm _ _
-      rw [he]; exact hAinv1
-    have hmul : m ∣ (inv * a - 1) * x := Int.dvd_mul_of_dvd_left hInvA1
-    have hdiff2 : m ∣ (inv * (a * x + bias - target) - (x - inv * (target - bias))) := by
-      rw [hId2]; exact hmul
-    have hZeq : x - inv * (target - bias) =
-        inv * (a * x + bias - target) -
-          (inv * (a * x + bias - target) - (x - inv * (target - bias))) := by omega
-    rw [hZeq]
-    exact Int.dvd_sub hinvA hdiff2
-  · intro hZ
-    have haZ : m ∣ a * (x - inv * (target - bias)) := Int.dvd_mul_of_dvd_right hZ
-    have hId1 : a * (x - inv * (target - bias)) - (a * x + bias - target) =
-        (target - bias) - a * inv * (target - bias) := by
-      rw [Int.mul_sub, ← Int.mul_assoc]; omega
-    have hfac : (target - bias) - a * inv * (target - bias) =
-        (1 - a * inv) * (target - bias) := by
-      rw [Int.sub_mul, Int.one_mul]
-    have h1ma : m ∣ (1 - a * inv) := by
-      have he : 1 - a * inv = -(a * inv - 1) := (Int.neg_sub _ _).symm
-      rw [he]; exact Int.dvd_neg.mpr hAinv1
-    have hmul2 : m ∣ (1 - a * inv) * (target - bias) :=
-      Int.dvd_mul_of_dvd_left h1ma
-    have hdiff1 : m ∣ (a * (x - inv * (target - bias)) - (a * x + bias - target)) := by
-      rw [hId1, hfac]; exact hmul2
-    have hAeq : a * x + bias - target =
-        a * (x - inv * (target - bias)) -
-          (a * (x - inv * (target - bias)) - (a * x + bias - target)) := by omega
-    rw [hAeq]
-    exact Int.dvd_sub haZ hdiff1
 
-theorem sound_ModularLookup : ModularLookup.Goal := by
-  intro m a inv bias x target hm hinv hx0 hxm ht0 htm
-  have hm0 : 0 < m := by omega
-  have htarget : target % m = target := Int.emod_eq_of_lt ht0 htm
-  have hL : ((a * x + bias) % m = target) ↔ m ∣ (a * x + bias - target) := by
-    constructor
-    · intro h
-      have hh : (a * x + bias) % m = target % m := by rw [h, htarget]
-      exact (Int.dvd_iff_emod_eq_zero).mpr
-        ((Int.emod_eq_emod_iff_emod_sub_eq_zero).mp hh)
-    · intro h
-      have h0 : (a * x + bias - target) % m = 0 := (Int.dvd_iff_emod_eq_zero).mp h
-      have h1 : (a * x + bias) % m = target % m :=
-        (Int.emod_eq_emod_iff_emod_sub_eq_zero).mpr h0
-      rwa [htarget] at h1
-  have hR : (x = (inv * (target - bias)) % m) ↔ m ∣ (x - inv * (target - bias)) :=
-    emod_eq_iff_dvd_sub hm0 hx0 hxm
-  rw [hL, hR]
-  exact modlookup_dvd hm hinv
-
-/-! ### CheckedDistanceBand -/
-
-/-- Under the block bounds every row satisfies the `checkedDistance` guard, so
-`mapM` never yields `none`; pointwise `|x - center| ≤ rad` is the interval
-`center - rad ≤ x ≤ center + rad` after a `natAbs` sign split.
--/
-private theorem checkedDistance_eq_some {m x center : Int}
-    (h1 : -m ≤ x - center) (h2 : x - center < m) (h3 : x - center ≠ -m) :
-    checkedDistance m x center = some ((x - center).natAbs : Int) := by
-  have hcond : (decide (-m ≤ x - center) && decide (x - center < m) &&
-      (x - center) != -m) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne]
-    exact ⟨⟨h1, h2⟩, h3⟩
-  unfold checkedDistance
-  dsimp only
-  rw [ite_eq_left hcond]
-
-private theorem checkedDistance_decide {x center rad : Int} :
-    decide (((x - center).natAbs : Int) ≤ rad) =
-      decide (center - rad ≤ x ∧ x ≤ center + rad) := by
-  rw [Bool.eq_iff_iff]
-  simp only [decide_eq_true_eq]
-  by_cases hxo : 0 ≤ x - center
-  · have hna : ((x - center).natAbs : Int) = x - center := Int.natAbs_of_nonneg hxo
-    rw [hna]
-    constructor
-    · intro h; exact ⟨by omega, by omega⟩
-    · intro h; omega
-  · have hna : ((x - center).natAbs : Int) = -(x - center) := by
-      have hxo' : x - center ≤ 0 := by omega
-      exact Int.ofNat_natAbs_of_nonpos hxo'
-    rw [hna]
-    constructor
-    · intro h; exact ⟨by omega, by omega⟩
-    · intro h; omega
-
-private theorem mapM_checkedDistance {m center rad : Int} :
-    ∀ (rows : List Int),
-      (∀ x ∈ rows, -m ≤ x - center ∧ x - center < m ∧ x - center ≠ -m) →
-      rows.mapM (fun x => (checkedDistance m x center).map (fun n => decide (n ≤ rad))) =
-        some (rows.map fun x => decide (center - rad ≤ x ∧ x ≤ center + rad)) := by
-  intro rows
-  induction rows with
-  | nil => intro _; rfl
-  | cons x xs ih =>
-    intro h
-    have hx := h x List.mem_cons_self
-    have hxs : ∀ y ∈ xs, -m ≤ y - center ∧ y - center < m ∧ y - center ≠ -m :=
-      fun y hy => h y (List.mem_cons_of_mem x hy)
-    obtain ⟨h1, h2, h3⟩ := hx
-    have hcd : checkedDistance m x center = some ((x - center).natAbs : Int) :=
-      checkedDistance_eq_some h1 h2 h3
-    rw [List.mapM_cons, hcd, Option.map_some, ih hxs]
+private theorem parity_succ_eq (q : Int) : (q+1) % 2 = 0 ↔ q % 2 != 0 := by
+  have hq0 : 0 ≤ q % 2 := Int.emod_nonneg q (by omega)
+  have hq1 : q % 2 < 2 := Int.emod_lt_of_pos q (by omega)
+  have hrel : (q+1) % 2 = (q % 2 + 1) % 2 := by
+    rw [Int.add_emod]
     simp
-    rw [← Bool.decide_and]
-    exact checkedDistance_decide
-
-theorem sound_CheckedDistanceBand : CheckedDistanceBand.Goal := by
-  intro rows m l h center rad hrow hl hh
-  have hguard : ∀ x ∈ rows, -m ≤ x - center ∧ x - center < m ∧ x - center ≠ -m := by
-    intro x hx
-    obtain ⟨hxl, hxh⟩ := hrow x hx
-    exact ⟨by omega, by omega, by omega⟩
-  exact mapM_checkedDistance rows hguard
-
-/-! ### RoundedBucket -/
-
-/-- Write `2n - 2kd = 2(n%d) + 2d(n/d - k)`: the nearest bucket `k = n/d` or
-`k = n/d + 1` gives distance `< d` or `= d`, every other `k` is too far, and
-the exact-half tie is decided by `k % 2 = 0` exactly as `nearestEven` does.
--/
-private theorem rb_dist_eq {n d k : Int} :
-    2 * n - 2 * k * d = 2 * (n % d) + 2 * (d * (n / d) - d * k) := by
-  generalize hA : d * (n / d) = A
-  generalize hB : d * k = B
-  have hdec : n = A + n % d := by
-    have h := Int.mul_ediv_add_emod n d
-    rw [hA] at h
-    exact h.symm
-  have hTB : 2 * k * d = 2 * B := by rw [Int.mul_assoc, Int.mul_comm k d, hB]
-  rw [hTB]
-  omega
-
-private theorem rb_far {n d k : Int} (hd : 0 < d)
-    (hR0 : 0 ≤ n % d) (hRd : n % d < d)
-    (hk : k ≤ n / d - 1 ∨ k ≥ n / d + 2)
-    (hP : (↑(2 * n - 2 * k * d).natAbs < d) ∨
-          (↑(2 * n - 2 * k * d).natAbs = d ∧ k % 2 = 0)) : False := by
-  have hEk := rb_dist_eq (n := n) (d := d) (k := k)
-  rcases hk with hk | hk
-  · have hBk : d * k ≤ d * (n / d) - d := by
-      have h1 : k * d ≤ (n / d - 1) * d :=
-        Int.mul_le_mul_of_nonneg_right hk (by omega)
-      have h2 : (n / d - 1) * d = d * (n / d) - d := by
-        rw [Int.mul_comm (n / d - 1) d, Int.mul_sub, Int.mul_one]
-      have h3 : d * k = k * d := Int.mul_comm _ _
+  rw [hrel]
+  constructor
+  · intro h
+    simp
+    intro hz
+    rw [hz] at h
+    have h1 : (1:Int) % 2 = 1 := by decide
+    simp [h1] at h
+  · intro h
+    have hz : q % 2 = 1 := by
+      have h' : q % 2 ≠ 0 := by simpa using h
       omega
-    have hsign : 0 ≤ 2 * n - 2 * k * d := by omega
-    rw [Int.natAbs_of_nonneg hsign] at hP
-    omega
-  · have hBk : d * (n / d) + 2 * d ≤ d * k := by
-      have h1 : (n / d + 2) * d ≤ k * d :=
-        Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
-      have h2 : (n / d + 2) * d = d * (n / d) + 2 * d := by
-        rw [Int.mul_comm (n / d + 2) d, Int.mul_add, Int.mul_comm d 2]
-      have h3 : d * k = k * d := Int.mul_comm _ _
-      omega
-    have hsign : 2 * n - 2 * k * d ≤ 0 := by omega
-    rw [Int.ofNat_natAbs_of_nonpos hsign] at hP
-    omega
+    rw [hz]
+    have h2 : (2:Int) % 2 = 0 := by decide
+    simp [h2]
 
-theorem sound_RoundedBucket : RoundedBucket.Goal := by
-  intro n d k hd
-  unfold nearestEven
-  dsimp only
-  have hR0 : 0 ≤ n % d := Int.emod_nonneg n (Int.ne_of_gt hd)
-  have hRd : n % d < d := Int.emod_lt_of_pos n hd
-  split
-  · rename_i hC
-    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at hC
+
+private theorem dvd_of_emod_eq_one {m a inv : Int} (hm : 1 < m) (h : (a*inv)%m = 1) : m ∣ a*inv - 1 := by
+  have h1 : (1 : Int) % m = 1 := Int.emod_eq_of_lt (by omega) (by omega)
+  have hz : (a*inv - 1) % m = 0 :=
+    (Int.emod_eq_emod_iff_emod_sub_eq_zero (m:=a*inv) (n:=m) (k:=1)).mp (by simpa [h1] using h)
+  exact (Int.dvd_iff_emod_eq_zero).mpr hz
+
+
+private theorem dvd_emod_sub_self (m n : Int) : m ∣ n % m - n := by
+  apply (Int.dvd_iff_emod_eq_zero).mpr
+  rw [← Int.emod_eq_emod_iff_emod_sub_eq_zero]
+  exact Int.emod_emod n m
+
+
+private theorem emod_eq_of_dvd_sub (m a b : Int) (h : m ∣ a - b) : a % m = b % m := by
+  exact (Int.emod_eq_emod_iff_emod_sub_eq_zero (m:=a) (n:=m) (k:=b)).mpr ((Int.dvd_iff_emod_eq_zero).mp h)
+
+
+private theorem natAbs_le_iff (v rad : Int) : (v.natAbs : Int) ≤ rad ↔ -rad ≤ v ∧ v ≤ rad := by
+  by_cases hv : 0 ≤ v
+  · have hvabs : (v.natAbs : Int) = v := Int.natAbs_of_nonneg hv
+    rw [hvabs]
     constructor
     · intro h
-      subst h
-      have hEk := rb_dist_eq (n := n) (d := d) (k := n / d)
-      have hX : 2 * n - 2 * (n / d) * d = 2 * (n % d) := by omega
-      have hsign : 0 ≤ 2 * n - 2 * (n / d) * d := by omega
-      have hna : ((2 * n - 2 * (n / d) * d).natAbs : Int) = 2 * (n % d) :=
-        (Int.natAbs_of_nonneg hsign).trans hX
-      rw [hna]
-      exact hC
-    · intro hP
-      by_cases hkq : k = n / d
-      · subst k; rfl
-      · by_cases hkq1 : k = n / d + 1
-        · subst k
-          exfalso
-          have hEk := rb_dist_eq (n := n) (d := d) (k := n / d + 1)
-          have hB1 : d * (n / d + 1) = d * (n / d) + d := by
-            rw [Int.mul_add, Int.mul_one]
-          have hsign : 2 * n - 2 * (n / d + 1) * d ≤ 0 := by omega
-          rw [Int.ofNat_natAbs_of_nonpos hsign] at hP
-          omega
-        · have hkle : k ≤ n / d - 1 ∨ k ≥ n / d + 2 := by omega
-          exact (rb_far hd hR0 hRd hkle hP).elim
-  · rename_i hC
-    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at hC
+      constructor <;> omega
+    · intro h
+      exact h.2
+  · have hvabs : (v.natAbs : Int) = -v := by
+      have h := Int.natAbs_of_nonneg (a := -v) (by omega)
+      simpa [Int.natAbs_neg] using h
+    rw [hvabs]
     constructor
     · intro h
-      subst h
-      have hEk := rb_dist_eq (n := n) (d := d) (k := n / d + 1)
-      have hB1 : d * (n / d + 1) = d * (n / d) + d := by
-        rw [Int.mul_add, Int.mul_one]
-      have hsign : 2 * n - 2 * (n / d + 1) * d ≤ 0 := by omega
-      have hX : -(2 * n - 2 * (n / d + 1) * d) = 2 * d - 2 * (n % d) := by omega
-      have hna : ((2 * n - 2 * (n / d + 1) * d).natAbs : Int) = 2 * d - 2 * (n % d) := by
-        have h1 := Int.ofNat_natAbs_of_nonpos hsign
-        exact h1.trans hX
-      rw [hna]
+      constructor <;> omega
+    · intro h
       omega
-    · intro hP
-      by_cases hkq1 : k = n / d + 1
-      · subst k; rfl
-      · by_cases hkq : k = n / d
-        · subst k
-          exfalso
-          have hEk := rb_dist_eq (n := n) (d := d) (k := n / d)
-          have hsign : 0 ≤ 2 * n - 2 * (n / d) * d := by omega
-          rw [Int.natAbs_of_nonneg hsign] at hP
-          omega
-        · have hkle : k ≤ n / d - 1 ∨ k ≥ n / d + 2 := by omega
-          exact (rb_far hd hR0 hRd hkle hP).elim
 
-/-! ### CursorRanges -/
 
-/-- `cmpKey cur r == .lt` unfolds (via `cursor_key_lt`) to "same first key and
-smaller second key, or a strictly later first key". Pairwise `≠ .gt` ordering
-makes a peer and a later row incompatible (`cursor_disj`) and forces all rows
-after a later row to be later too (`cursor_sep`), so a single list induction
-rebuilds the filter as `peers ++ later`.
--/
-private theorem cursor_key_lt (cur r : Key) :
-    (cmpKey cur r == Ordering.lt) =
-      ((r.1 == cur.1 && decide (r.2 < cur.2)) ||
-       (match cur.1, r.1 with
-        | some x, some y => decide (x < y)
-        | some _, none => true
-        | _, _ => false)) := by
-  obtain ⟨c1, c2⟩ := cur
-  obtain ⟨r1, r2⟩ := r
-  unfold cmpKey
-  dsimp only
-  cases c1 <;> cases r1
-  · simp [Lean.Grind.beq_eq_decide_eq, Int.compare_eq_lt]
-  · simp
-  · simp
-  · rename_i cx ry
-    by_cases h : cx = ry
-    · subst h
-      simp [Lean.Grind.beq_eq_decide_eq, Int.compare_eq_lt]
-    · simp [h, Ne.symm h, Lean.Grind.beq_eq_decide_eq, Int.compare_eq_lt]
+private theorem le_natAbs_iff (v l : Int) (hl : 0 ≤ l) : l ≤ (v.natAbs : Int) ↔ v ≤ -l ∨ l ≤ v := by
+  by_cases hv : 0 ≤ v
+  · have hvabs : (v.natAbs : Int) = v := Int.natAbs_of_nonneg hv
+    rw [hvabs]
+    constructor
+    · intro h
+      exact Or.inr h
+    · intro h
+      rcases h with h | h <;> omega
+  · have hvabs : (v.natAbs : Int) = -v := by
+      have h := Int.natAbs_of_nonneg (a := -v) (by omega)
+      simpa [Int.natAbs_neg] using h
+    rw [hvabs]
+    constructor
+    · intro h
+      exact Or.inl (by omega)
+    · intro h
+      rcases h with h | h <;> omega
 
-private theorem cursor_sep (cur a b : Key)
-    (hla : (match cur.1, a.1 with
-        | some x, some y => decide (x < y)
-        | some _, none => true
-        | _, _ => false) = true)
-    (hpb : (b.1 == cur.1 && decide (b.2 < cur.2)) = true) :
-    cmpKey a b = Ordering.gt := by
-  obtain ⟨a1, a2⟩ := a
-  obtain ⟨b1, b2⟩ := b
-  obtain ⟨c1, c2⟩ := cur
-  dsimp only at hla hpb ⊢
-  rw [Bool.and_eq_true] at hpb
-  obtain ⟨hbeq, hlt⟩ := hpb
-  rw [beq_iff_eq] at hbeq
-  subst b1
-  cases c1 with
+
+private theorem perm_cons_append {α : Type} (a : α) (ys zs : List α) :
+    (ys ++ a :: zs).Perm (a :: (ys ++ zs)) := by
+  induction ys with
+  | nil => simp
+  | cons y ys ih =>
+      have h2 := ih.cons y
+      have h3 := List.Perm.swap a y (ys ++ zs)
+      exact h2.trans h3
+
+
+private theorem filter_perm_or {α : Type} (p q : α → Bool)
+    (hdisj : ∀ a, ¬ (p a = true ∧ q a = true)) : ∀ xs : List α,
+    (xs.filter p ++ xs.filter q).Perm (xs.filter (fun a => p a || q a)) := by
+  intro xs
+  induction xs with
+  | nil => simp
+  | cons a xs ih =>
+      by_cases hp : p a = true
+      · have hq : q a = false := by
+          cases hqa : q a with
+          | false => rfl
+          | true => exact False.elim (hdisj a ⟨hp, hqa⟩)
+        simpa [hp, hq] using ih.cons a
+      · by_cases hqtrue : q a = true
+        · have hswap := perm_cons_append a (xs.filter p) (xs.filter q)
+          have h1 := hswap.trans (ih.cons a)
+          simpa [hp, hqtrue] using h1
+        · have hq : q a = false := by
+            cases hqa : q a with
+            | false => rfl
+            | true => exact False.elim (hqtrue hqa)
+          simpa [hp, hq] using ih
+
+
+private theorem compare_lt_bool (a b : Int) : (compare a b == .lt) = decide (a < b) := by
+  by_cases h : a < b
+  · have hc : compare a b = .lt := Int.compare_eq_lt.mpr h
+    simp [h, hc]
+  · simp [h, Int.compare_eq_lt]
+
+
+private theorem compare_gt_bool (a b : Int) : (compare a b == .gt) = decide (b < a) := by
+  by_cases h : b < a
+  · have hc : compare a b = .gt := Int.compare_eq_gt.mpr h
+    simp [h, hc]
+  · simp [h, Int.compare_eq_gt]
+
+
+private theorem cmpKey_lt_char (a b : Key) : (cmpKey a b == .lt) =
+    (match a.1, b.1 with
+     | none, none => decide (b.2 < a.2)
+     | none, some _ => false
+     | some _, none => true
+     | some x, some y => decide (x < y || (x == y && b.2 < a.2))) := by
+  rcases a with ⟨a1,a2⟩
+  rcases b with ⟨b1,b2⟩
+  cases a1 with
   | none =>
-    cases a1 <;> simp at hla
-  | some cx =>
-    cases a1 with
-    | none =>
-      unfold cmpKey; dsimp only
-      simp
-    | some ay =>
-      have hay : cx < ay := of_decide_eq_true hla
-      have hayne : ay ≠ cx := by omega
-      unfold cmpKey; dsimp only
-      simp only [beq_iff_eq, Int.compare_eq_eq, hayne]
-      exact Int.compare_eq_gt.mpr hay
+      cases b1 with
+      | none => simp [cmpKey, compare_lt_bool]
+      | some byv => simp [cmpKey]
+  | some ax =>
+      cases b1 with
+      | none => simp [cmpKey]
+      | some byv =>
+          by_cases hxy : ax = byv
+          · simp [cmpKey, hxy, compare_lt_bool]
+          · simp [cmpKey, hxy, compare_lt_bool]
 
-private theorem cursor_disj (cur r : Key)
-    (hpb : (r.1 == cur.1 && decide (r.2 < cur.2)) = true)
-    (hla : (match cur.1, r.1 with
-        | some x, some y => decide (x < y)
-        | some _, none => true
-        | _, _ => false) = true) : False := by
-  obtain ⟨r1, r2⟩ := r
-  obtain ⟨c1, c2⟩ := cur
-  dsimp only at hpb hla ⊢
-  rw [Bool.and_eq_true] at hpb
-  obtain ⟨hbeq, hlt⟩ := hpb
-  rw [beq_iff_eq] at hbeq
+
+private theorem cmpKey_gt_char (a b : Key) : (cmpKey a b == .gt) =
+    (match a.1, b.1 with
+     | none, none => decide (a.2 < b.2)
+     | none, some _ => true
+     | some _, none => false
+     | some x, some y => decide (y < x || (x == y && a.2 < b.2))) := by
+  rcases a with ⟨a1,a2⟩
+  rcases b with ⟨b1,b2⟩
+  cases a1 with
+  | none =>
+      cases b1 with
+      | none => simp [cmpKey, compare_gt_bool]
+      | some byv => simp [cmpKey]
+  | some ax =>
+      cases b1 with
+      | none => simp [cmpKey]
+      | some byv =>
+          by_cases hxy : ax = byv
+          · simp [cmpKey, hxy, compare_gt_bool]
+          · simp [cmpKey, hxy, compare_gt_bool]
+
+
+private def peer (cur r : Key) : Bool := r.1 == cur.1 && r.2 < cur.2
+
+
+private def later (cur r : Key) : Bool :=
+  match cur.1, r.1 with
+  | some x, some y => decide (x < y)
+  | some _, none => true
+  | _,_ => false
+
+
+private theorem peer_after (cur r : Key) (h : peer cur r = true) : cmpKey cur r == .lt := by
+  rw [cmpKey_lt_char]
+  rcases cur with ⟨c1,c2⟩
+  rcases r with ⟨r1,r2⟩
+  simp [peer] at h ⊢
+  rcases h with ⟨h1, h2⟩
   subst r1
   cases c1 with
-  | none => simp at hla
+  | none => simp [h2]
+  | some cx => simp [h2]
+
+
+private theorem later_after (cur r : Key) (h : later cur r = true) : cmpKey cur r == .lt := by
+  rw [cmpKey_lt_char]
+  rcases cur with ⟨c1,c2⟩
+  rcases r with ⟨r1,r2⟩
+  simp [later] at h ⊢
+  cases c1 with
+  | none => simp at h
   | some cx =>
-    have : cx < cx := of_decide_eq_true hla
-    omega
+      cases r1 with
+      | none => simp
+      | some ry => simp [h]
 
-private theorem cursor_aux (cur : Key) :
-    ∀ rows : List Key, rows.Pairwise (fun a b => cmpKey a b ≠ Ordering.gt) →
-      (rows.filter fun r => r.1 == cur.1 && decide (r.2 < cur.2)) ++
-      (rows.filter fun r => match cur.1, r.1 with
-          | some x, some y => decide (x < y)
-          | some _, none => true
-          | _, _ => false) =
-      rows.filter (fun r => cmpKey cur r == Ordering.lt) := by
-  intro rows
-  induction rows with
-  | nil => intro _; rfl
-  | cons a rows ih =>
-    intro hsort
-    rw [List.pairwise_cons] at hsort
-    obtain ⟨hhead, htail⟩ := hsort
-    have hIH := ih htail
-    by_cases hpa : (a.1 == cur.1 && decide (a.2 < cur.2)) = true
-    · by_cases hla : (match cur.1, a.1 with
-          | some x, some y => decide (x < y)
-          | some _, none => true
-          | _, _ => false) = true
-      · exact (cursor_disj cur a hpa hla).elim
-      · have htarg : (cmpKey cur a == Ordering.lt) = true := by
-          rw [cursor_key_lt]; simp [hpa, hla]
-        simp [hpa, hla, htarg]
-        exact hIH
-    · by_cases hla : (match cur.1, a.1 with
-          | some x, some y => decide (x < y)
-          | some _, none => true
-          | _, _ => false) = true
-      · have hfp : rows.filter
-            (fun r => r.1 == cur.1 && decide (r.2 < cur.2)) = [] := by
-          apply List.filter_eq_nil_iff.mpr
-          intro y hy hpy
-          exact hhead y hy (cursor_sep cur a y hla hpy)
-        rw [hfp] at hIH
-        have htarg : (cmpKey cur a == Ordering.lt) = true := by
-          rw [cursor_key_lt]; simp [hpa, hla]
-        simp [hpa, hla, htarg, hfp]
-        exact hIH
-      · have htarg : (cmpKey cur a == Ordering.lt) = false := by
-          rw [cursor_key_lt]; simp [hpa, hla]
-        simp [hpa, hla, htarg]
-        exact hIH
 
-theorem sound_CursorRanges : CursorRanges.Goal := by
-  intro rows cur later peers hsort
-  exact cursor_aux cur rows hsort
+private theorem after_peer_or_later (cur r : Key) (h : cmpKey cur r == .lt) :
+    peer cur r = true ∨ later cur r = true := by
+  rw [cmpKey_lt_char] at h
+  rcases cur with ⟨c1,c2⟩
+  rcases r with ⟨r1,r2⟩
+  simp [peer, later] at h ⊢
+  cases c1 with
+  | none =>
+      cases r1 with
+      | none =>
+          left
+          exact ⟨rfl, of_decide_eq_true h⟩
+      | some ry => simp at h
+  | some cx =>
+      cases r1 with
+      | none => right; rfl
+      | some ry =>
+          by_cases hxy : cx = ry
+          · subst ry
+            simp at h
+            left
+            exact ⟨rfl, h⟩
+          · right
+            simpa [hxy] using h
 
-private theorem ps_emod_zero_iff {k r p : Int} (hr0 : 0 ≤ r) (hrp : r < p) :
-    (k - r) % p = 0 ↔ k % p = r := by
-  have hrp' : r % p = r := Int.emod_eq_of_lt hr0 hrp
-  constructor
-  · intro h
-    have h2 : k % p = r % p := (Int.emod_eq_emod_iff_emod_sub_eq_zero).mpr h
-    rw [hrp'] at h2
-    exact h2
-  · intro h
-    have h2 : k % p = r % p := by rw [h, hrp']
-    exact (Int.emod_eq_emod_iff_emod_sub_eq_zero).mp h2
 
-private theorem ps_ediv_hit {k r p : Int} (hp : 0 < p)
-    (h : k % p = r) :
-    (k - 1 - r) / p = (k - r) / p - 1 ∧ (k - r) / p = k / p := by
-  have hp0 : p ≠ 0 := Int.ne_of_gt hp
-  have hdec : p * (k / p) + k % p = k := Int.mul_ediv_add_emod k p
-  have hkr : k - r = p * (k / p) := by omega
-  have hQ1 : (k - r) / p = k / p := Int.ediv_eq_of_eq_mul_right hp0 hkr
-  have hQ0 : (k - 1 - r) / p = k / p - 1 := by
-    have hdecomp : (p - 1) + p * (k / p - 1) = k - 1 - r := by
-      have h1 : p * (k / p - 1) = p * (k / p) - p := by
-        rw [Int.mul_sub, Int.mul_one]
-      omega
-    have hge : 0 ≤ p - 1 := by omega
-    have hlt : p - 1 < p := by omega
-    have hpair := (Int.ediv_emod_unique hp).mpr ⟨hdecomp, hge, hlt⟩
-    exact hpair.1
-  exact ⟨by omega, hQ1⟩
+private theorem peer_later_disjoint (cur r : Key) : ¬ (peer cur r = true ∧ later cur r = true) := by
+  rcases cur with ⟨c1,c2⟩
+  rcases r with ⟨r1,r2⟩
+  simp [peer, later]
+  cases c1 with
+  | none =>
+      cases r1 with
+      | none => simp
+      | some ry => simp
+  | some cx =>
+      cases r1 with
+      | none => simp
+      | some ry =>
+          intro h1 h2
+          have h1' : ry = cx := by injection h1
+          simp [h1']
 
-private theorem ps_ediv_miss {k r p : Int} (hp : 0 < p) (hr0 : 0 ≤ r) (hrp : r < p)
-    (h : k % p ≠ r) :
-    (k - 1 - r) / p = (k - r) / p := by
-  have hp0 : p ≠ 0 := Int.ne_of_gt hp
-  have hs0 : (k - r) % p ≠ 0 := by
-    intro hs
-    exact h ((ps_emod_zero_iff hr0 hrp).mp hs)
-  have hsge : 0 ≤ (k - r) % p := Int.emod_nonneg _ hp0
-  have hslt : (k - r) % p < p := Int.emod_lt_of_pos _ hp
-  have hs1 : 1 ≤ (k - r) % p := by omega
-  have hdec : p * ((k - r) / p) + (k - r) % p = k - r := Int.mul_ediv_add_emod (k - r) p
-  have hdecomp : ((k - r) % p - 1) + p * ((k - r) / p) = k - 1 - r := by omega
-  have hge : 0 ≤ (k - r) % p - 1 := by omega
-  have hlt : (k - r) % p - 1 < p := by omega
-  have hpair := (Int.ediv_emod_unique hp).mpr ⟨hdecomp, hge, hlt⟩
-  exact hpair.1
 
-private theorem ps_enum_nat (k : Nat) (r p : Int) (hp : 0 < p)
-    (hr0 : 0 ≤ r) (hrp : r < p) :
-    ((List.range k).map (fun (i : Nat) => (i : Int))).filter (fun i => i % p == r) =
-      (List.range ((((k : Int) - 1 - r) / p + 1).toNat)).map
-        (fun (j : Nat) => r + (j : Int) * p) := by
-  induction k with
-  | zero =>
-    have hJ : ((((0 : Nat) : Int) - 1 - r) / p + 1).toNat = 0 := by
-      have hneg : ((0 : Nat) : Int) - 1 - r < 0 := by omega
-      have hq : (((0 : Nat) : Int) - 1 - r) / p < 0 := Int.ediv_neg_of_neg_of_pos hneg hp
-      have hle : (((0 : Nat) : Int) - 1 - r) / p + 1 ≤ 0 := by omega
-      exact Int.toNat_of_nonpos hle
-    rw [hJ]
-    simp
-  | succ k ih =>
-    have hk0 : 0 ≤ (k : Int) := Int.natCast_nonneg k
-    have hp0 : 0 ≤ p := by omega
-    by_cases hhit : (k : Int) % p = r
-    · -- ===== hit =====
-      have hdec := ps_ediv_hit hp hhit
-      have hJ : ((((k + 1 : Nat) : Int) - 1 - r) / p + 1).toNat =
-          ((((k : Nat) : Int) - 1 - r) / p + 1).toNat + 1 := by
-        rw [Int.natCast_add_one]
-        have harg : (k : Int) + 1 - 1 - r = (k : Int) - r := by omega
-        rw [harg, hdec.1]
-        have hsub : ((k : Int) - r) / p - 1 + 1 = ((k : Int) - r) / p := by omega
-        rw [hsub, hdec.2]
-        have hq0 : 0 ≤ (k : Int) / p := Int.ediv_nonneg hk0 hp0
-        rw [Int.toNat_add hq0 (by omega : (0 : Int) ≤ 1), Int.toNat_one]
-      have hJk : ((((k : Nat) : Int) - 1 - r) / p + 1).toNat = ((k : Int) / p).toNat := by
-        rw [hdec.1]
-        have hsub : ((k : Int) - r) / p - 1 + 1 = ((k : Int) - r) / p := by omega
-        rw [hsub, hdec.2]
-      have hgJ : r + ((((k : Nat) : Int) - 1 - r) / p + 1).toNat * p = (k : Int) := by
-        rw [hJk]
-        have hq0 : 0 ≤ (k : Int) / p := Int.ediv_nonneg hk0 hp0
-        rw [Int.toNat_of_nonneg hq0]
-        have h2 := Int.mul_ediv_add_emod (k : Int) p
-        rw [hhit] at h2
-        have h3 : ((k : Int) / p) * p = p * ((k : Int) / p) := Int.mul_comm _ _
-        rw [h3]
-        omega
-      rw [hJ]
-      simp only [Nat.add_one, List.range_succ, List.map_append, List.filter_append,
-        List.map_cons, List.map_nil, List.filter_cons, List.filter_nil]
-      rw [ih]
-      rw [ite_eq_left (beq_iff_eq.mpr hhit)]
-      rw [hgJ]
-    · -- ===== miss =====
-      have hdec := ps_ediv_miss hp hr0 hrp hhit
-      have hJ : ((((k + 1 : Nat) : Int) - 1 - r) / p + 1).toNat =
-          ((((k : Nat) : Int) - 1 - r) / p + 1).toNat := by
-        rw [Int.natCast_add_one]
-        have harg : (k : Int) + 1 - 1 - r = (k : Int) - r := by omega
-        rw [harg, hdec]
-      rw [hJ]
-      simp only [Nat.add_one, List.range_succ, List.map_append, List.filter_append,
-        List.map_cons, List.map_nil, List.filter_cons, List.filter_nil]
-      rw [ite_eq_right (mt beq_iff_eq.mp hhit)]
-      simp only [List.append_nil]
-      exact ih
+private theorem no_peer_after_later (cur a b : Key)
+    (hla : later cur a = true) (hab : (cmpKey a b != .gt) = true) : peer cur b = false := by
+  have hnotgt : ¬ ((cmpKey a b == .gt) = true) := by
+    simpa using hab
+  rw [cmpKey_gt_char] at hnotgt
+  unfold later at hla
+  unfold peer
+  rcases cur with ⟨c1,c2⟩
+  rcases a with ⟨a1,a2⟩
+  rcases b with ⟨b1,b2⟩
+  simp at hla hnotgt ⊢
+  cases c1 with
+  | none =>
+      cases a1 with
+      | none => simp at hla
+      | some ay => simp at hla
+  | some cx =>
+      cases a1 with
+      | none =>
+          cases b1 with
+          | none =>
+              simp at hnotgt
+              simp
+          | some byv => simp at hnotgt
+      | some ay =>
+          have hlax : cx < ay := by simpa using hla
+          cases b1 with
+          | none => simp
+          | some byv =>
+              by_cases hab_eq : ay = byv
+              · subst byv
+                simp at hnotgt
+                intro heq
+                have heq' : ay = cx := by injection heq
+                omega
+              · by_cases hcxcy : cx = ay
+                · subst ay
+                  omega
+                · simp [hcxcy] at hnotgt
+                  intro heq
+                  have heq' : byv = cx := by injection heq
+                  omega
 
-private theorem ps_bridge {lo i phase r p : Int} (hp : 0 < p)
-    (hphase0 : 0 ≤ phase) (hphasep : phase < p)
-    (hr : r = (phase - lo) % p) :
-    (lo + i) % p = phase ↔ i % p = r := by
-  have hph : phase % p = phase := Int.emod_eq_of_lt hphase0 hphasep
-  have hr0 : 0 ≤ r := by rw [hr]; exact Int.emod_nonneg _ (Int.ne_of_gt hp)
-  have hrp : r < p := by rw [hr]; exact Int.emod_lt_of_pos _ hp
-  have hrr : r % p = r := Int.emod_eq_of_lt hr0 hrp
-  have hdiff : p ∣ ((lo + i) - phase - (i - r)) := by
-    have harg : (lo + i) - phase - (i - r) = lo + r - phase := by omega
-    rw [harg]
-    have h1 : ((phase - lo) - r) % p = 0 := by
-      have h2 : (phase - lo) % p = r % p := hr.symm.trans hrr.symm
-      exact (Int.emod_eq_emod_iff_emod_sub_eq_zero).mp h2
-    have h3 : p ∣ (phase - lo) - r := (Int.dvd_iff_emod_eq_zero).mpr h1
-    have h4 : lo + r - phase = -((phase - lo) - r) := by omega
-    rw [h4]
-    exact Int.dvd_neg.mpr h3
-  constructor
-  · intro h
-    have hdvd : p ∣ (lo + i) - phase := by
-      have h2 : (lo + i) % p = phase % p := by rw [h, hph]
-      exact (Int.dvd_iff_emod_eq_zero).mpr ((Int.emod_eq_emod_iff_emod_sub_eq_zero).mp h2)
-    have h3 : p ∣ ((lo + i) - phase) - ((lo + i) - phase - (i - r)) := Int.dvd_sub hdvd hdiff
-    have heq : (lo + i) - phase - ((lo + i) - phase - (i - r)) = i - r := by omega
-    rw [heq] at h3
-    have h4 : (i - r) % p = 0 := (Int.dvd_iff_emod_eq_zero).mp h3
-    have h5 : i % p = r % p := (Int.emod_eq_emod_iff_emod_sub_eq_zero).mpr h4
-    rw [hrr] at h5
-    exact h5
-  · intro h
-    have hdvd : p ∣ i - r := by
-      have h2 : i % p = r % p := by rw [h, hrr]
-      exact (Int.dvd_iff_emod_eq_zero).mpr ((Int.emod_eq_emod_iff_emod_sub_eq_zero).mp h2)
-    have h3 : p ∣ (i - r) + ((lo + i) - phase - (i - r)) := Int.dvd_add hdvd hdiff
-    have heq : (i - r) + ((lo + i) - phase - (i - r)) = (lo + i) - phase := by omega
-    rw [heq] at h3
-    have h4 : ((lo + i) - phase) % p = 0 := (Int.dvd_iff_emod_eq_zero).mp h3
-    have h5 : (lo + i) % p = phase % p := (Int.emod_eq_emod_iff_emod_sub_eq_zero).mpr h4
-    rw [hph] at h5
-    exact h5
 
-private theorem ps_map_cast (l : List Nat) (c : Int) :
-    List.map (fun (i : Nat) => c + i) l =
-      List.map (fun (j : Int) => c + j)
-        (List.map (fun (i : Nat) => (i : Int)) l) := by
-  induction l with
+private theorem filter_nil_of_false {α : Type} (p : α → Bool) {xs : List α}
+    (h : ∀ x ∈ xs, p x = false) : xs.filter p = [] := by
+  induction xs with
   | nil => rfl
-  | cons a s ih =>
-    simp only [List.map_cons, ih]
+  | cons x xs ih =>
+      have hx : p x = false := h x (by simp)
+      have ht : ∀ y ∈ xs, p y = false := by intro y hy; exact h y (by simp [hy])
+      simp [List.filter_cons, hx, ih ht]
 
-private theorem ps_filter_cast (T : Nat) (r p : Int) :
-    List.map (fun (i : Nat) => (i : Int))
-        (List.filter (fun (i : Nat) => (i : Int) % p == r) (List.range T)) =
-      List.filter (fun (j : Int) => j % p == r)
-        (List.map (fun (i : Nat) => (i : Int)) (List.range T)) := by
-  rw [List.filter_map]
-  congr 1
 
-private theorem ps_rhs (lo hi period phase r : Int) (hp : 0 < period)
-    (hphase0 : 0 ≤ phase) (hphasep : phase < period)
-    (hr : r = (phase - lo) % period) :
-    List.filter (fun x => x % period == phase)
-        (List.map (fun (i : Nat) => lo + i) (List.range (hi - lo).toNat)) =
-      List.map (fun (j : Nat) => lo + r + (j : Int) * period)
-        (List.range ((((hi - 1 - (lo + r)) / period + 1).toNat))) := by
-  have hr0 : 0 ≤ r := by rw [hr]; exact Int.emod_nonneg _ (Int.ne_of_gt hp)
-  have hrp : r < period := by rw [hr]; exact Int.emod_lt_of_pos _ hp
-  have hbridge : ∀ i : Nat,
-      ((lo + (i : Int)) % period == phase) = ((i : Int) % period == r) := by
-    intro i
-    rw [Lean.Grind.beq_eq_decide_eq, Lean.Grind.beq_eq_decide_eq]
-    exact decide_eq_decide.mpr (ps_bridge hp hphase0 hphasep hr)
-  rw [List.filter_map]
-  have hfil : List.filter
-        ((fun x => x % period == phase) ∘ (fun (i : Nat) => lo + i))
-        (List.range (hi - lo).toNat) =
-      List.filter (fun (i : Nat) => (i : Int) % period == r)
-        (List.range (hi - lo).toNat) := by
-    apply List.filter_congr
-    intro i _
-    exact hbridge i
-  rw [hfil]
-  -- goal: map (fun i => lo+i) (filter Q (range T)) = map AP-target (range n')
-  -- Step A: ps_map_cast turns LHS into map (fun j => lo+j) (map (·:Int) (filter Q (range T)))
-  have hA := ps_map_cast
-    (List.filter (fun (i : Nat) => (i : Int) % period == r) (List.range (hi - lo).toNat)) lo
-  -- hA : map (fun i => lo+i) l' = map (fun j:Int => lo+j) (map (·:Int) l')
-  rw [hA]
-  -- Step B: swap inner map/filter via ps_filter_cast
-  have hB := ps_filter_cast (hi - lo).toNat r period
-  -- hB : map (·:Int) (filter Q (range T)) = filter R (map (·:Int) (range T))
-  rw [hB]
-  -- goal: map (fun j:Int => lo+j) (filter R (map (·:Int) (range T))) = map target (range n')
-  -- Step C: ps_enum_nat on filter R (map (·:Int) (range T))
-  have hC := ps_enum_nat (hi - lo).toNat r period hp hr0 hrp
-  -- hC : filter (fun i:Int => i%p==r) (map (·:Int)(range T)) = map AP (range J)
-  rw [hC]
-  -- goal: map (fun j:Int => lo+j) (map AP (range J)) = map target (range n')
-  rw [List.map_map]
-  -- goal: map ((fun j:Int=>lo+j) ∘ AP) (range J) = map target (range n')
-  -- relate J and n'
-  have hJeq : ((((hi - lo).toNat : Int) - 1 - r) / period + 1).toNat =
-      (((hi - 1 - (lo + r)) / period + 1).toNat) := by
-    by_cases h : 0 ≤ hi - lo
-    · have hT : ((hi - lo).toNat : Int) = hi - lo := Int.toNat_of_nonneg h
-      have harg : ((hi - lo).toNat : Int) - 1 - r = hi - 1 - (lo + r) := by
-        rw [hT]; omega
-      rw [harg]
-    · have hT0 : (hi - lo).toNat = 0 := Int.toNat_of_nonpos (by omega)
-      have harg1 : ((hi - lo).toNat : Int) - 1 - r < 0 := by
-        rw [hT0]; simp; omega
-      have hq1 : (((hi - lo).toNat : Int) - 1 - r) / period < 0 :=
-        Int.ediv_neg_of_neg_of_pos harg1 hp
-      have hle1 : (((hi - lo).toNat : Int) - 1 - r) / period + 1 ≤ 0 := by omega
-      have harg2 : hi - 1 - (lo + r) < 0 := by omega
-      have hq2 : (hi - 1 - (lo + r)) / period < 0 :=
-        Int.ediv_neg_of_neg_of_pos harg2 hp
-      have hle2 : (hi - 1 - (lo + r)) / period + 1 ≤ 0 := by omega
-      rw [Int.toNat_of_nonpos hle1, Int.toNat_of_nonpos hle2]
-  rw [hJeq]
-  -- goal: map (comp) (range n') = map target (range n') — functions pointwise equal
-  congr 1
-  funext j
-  simp only [Function.comp_apply]
-  show lo + (r + (j : Int) * period) = lo + r + (j : Int) * period
+private theorem morton_top (n x y : Nat) :
+    morton (n+1) x y = morton n x y + ((x.testBit n).toNat + 2*(y.testBit n).toNat) * 4^n := by
+  simp [morton, List.range_succ]
+
+
+private theorem pow4_succ (n : Nat) : 4^(n+1) = 4^n * 4 := by
+  rw [show n+1 = Nat.succ n by omega]
+  rw [Nat.pow_succ]
+
+
+private theorem morton_bound (b x y : Nat) : morton b x y ≤ 4^b - 1 := by
+  induction b with
+  | zero => simp [morton]
+  | succ b ih =>
+      rw [morton_top]
+      rw [pow4_succ]
+      have hbitx : (x.testBit b).toNat ≤ 1 := by
+        cases x.testBit b <;> simp
+      have hbity : (y.testBit b).toNat ≤ 1 := by
+        cases y.testBit b <;> simp
+      have hdig : (x.testBit b).toNat + 2*(y.testBit b).toNat ≤ 3 := by omega
+      have hmul : ((x.testBit b).toNat + 2*(y.testBit b).toNat) * 4^b ≤ 3 * 4^b :=
+        Nat.mul_le_mul_right _ hdig
+      rw [show 4^b * 4 = 4^b + 3*4^b by omega]
+      omega
+
+
+private theorem morton_lt (b x y : Nat) : morton b x y < 4^b := by
+  have h := morton_bound b x y
+  have hp : 0 < 4^b := Nat.pow_pos (by omega)
   omega
 
-theorem sound_PeriodicSeek : PeriodicSeek.Goal := by
-  intro lo hi period phase hp hphase0 hphasep
-  dsimp only
-  generalize hr : (phase - lo) % period = r
-  exact (ps_rhs lo hi period phase r hp hphase0 hphasep hr.symm).symm
 
-private theorem list_sum_const_mul (l : List Nat) (c : Nat) (f : Nat → Nat) :
-    (l.map (fun x => c * f x)).sum = c * (l.map f).sum := by
-  induction l with
-  | nil => rfl
-  | cons a s ih =>
-    simp only [List.map_cons, List.sum_cons, ih]
-    rw [Nat.mul_add]
+private theorem morton_split (b k x y : Nat) :
+    morton (b+k) x y = morton b x y + 4^b * morton k (x/2^b) (y/2^b) := by
+  induction k with
+  | zero => simp [morton]
+  | succ k ih =>
+      rw [Nat.add_succ, morton_top]
+      rw [ih]
+      rw [morton_top]
+      have hbit : (x/2^b).testBit k = x.testBit (b+k) := by
+        simpa [Nat.add_comm] using (Nat.testBit_add x k b).symm
+      have hbity : (y/2^b).testBit k = y.testBit (b+k) := by
+        simpa [Nat.add_comm] using (Nat.testBit_add y k b).symm
+      rw [← hbit, ← hbity]
+      rw [Nat.pow_add]
+      grind
 
-private theorem list_sum_map_congr (l : List Nat) (f g : Nat → Nat) :
-    (∀ i ∈ l, f i = g i) → (l.map f).sum = (l.map g).sum := by
-  induction l with
-  | nil => intro _; rfl
-  | cons a s ih =>
-    intro h
-    simp only [List.map_cons, List.sum_cons]
-    rw [h a (by simp), ih (fun i hi => h i (by simp [hi]))]
 
-private theorem morton_split' (b e x y : Nat) :
-    morton (b + e) x y = morton b x y + 4^b * morton e (x / 2^b) (y / 2^b) := by
-  have hL : morton (b + e) x y =
-      ((List.range (b + e)).map
-        (fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i)).sum := rfl
-  rw [hL, List.range_add, List.map_append, List.sum_append, List.map_map]
-  have h1 : ((List.range b).map
-      (fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i)).sum =
-      morton b x y := rfl
-  rw [h1]
-  congr 1
-  have hfun : ((fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i) ∘
-        (fun x => b + x)) =
-      (fun i => 4 ^ b *
-        ((((x / 2 ^ b).testBit i).toNat + 2 * ((y / 2 ^ b).testBit i).toNat) * 4 ^ i)) := by
-    funext i
-    simp only [Function.comp_apply]
-    show (((x.testBit (b + i)).toNat + 2 * (y.testBit (b + i)).toNat) * 4 ^ (b + i)) =
-      4 ^ b * ((((x / 2 ^ b).testBit i).toNat + 2 * ((y / 2 ^ b).testBit i).toNat) * 4 ^ i)
-    rw [Nat.add_comm b i, Nat.testBit_add, Nat.testBit_add, Nat.pow_add]
-    ac_rfl
-  rw [hfun, list_sum_const_mul]
-  congr 1
+private theorem morton_one (x y : Nat) : morton 1 x y = x%2 + 2*(y%2) := by
+  simp [morton, Nat.testBit_zero]
+  have hx : x % 2 < 2 := Nat.mod_lt _ (by omega)
+  have hy : y % 2 < 2 := Nat.mod_lt _ (by omega)
+  have hxdec : (decide (x % 2 = 1)).toNat = x % 2 := by
+    by_cases h : x % 2 = 1 <;> simp [h] <;> omega
+  have hydec : (decide (y % 2 = 1)).toNat = y % 2 := by
+    by_cases h : y % 2 = 1 <;> simp [h] <;> omega
+  omega
 
-private theorem morton_succ (d x y : Nat) :
-    morton (d + 1) x y = morton d x y +
-      ((x.testBit d).toNat + 2 * (y.testBit d).toNat) * 4 ^ d := by
-  have hL : morton (d + 1) x y =
-      ((List.range (d + 1)).map
-        (fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i)).sum := rfl
-  rw [hL, Nat.add_one, List.range_succ, List.map_append, List.sum_append]
-  rw [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil]
-  simp only [Nat.add_zero]
-  have h1 : ((List.range d).map
-      (fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i)).sum =
-      morton d x y := rfl
-  rw [h1]
 
-private theorem morton_one (a c : Nat) :
-    morton 1 a c = (a.testBit 0).toNat + 2 * (c.testBit 0).toNat := by
-  have hL : morton 1 a c =
-      ((List.range 1).map
-        (fun i => ((a.testBit i).toNat + 2 * (c.testBit i).toNat) * 4 ^ i)).sum := rfl
-  rw [hL, List.range_one]
-  simp only [List.map_cons, List.map_nil, List.sum_cons, List.sum_nil, Nat.pow_zero,
-    Nat.mul_one, Nat.add_zero]
+private theorem morton_split_one (k x y : Nat) :
+    morton (1+k) x y = x%2 + 2*(y%2) + 4*morton k (x/2) (y/2) := by
+  rw [morton_split, morton_one]
 
-private theorem morton_peel (e a c : Nat) :
-    morton (e + 1) a c =
-      (a.testBit 0).toNat + 2 * (c.testBit 0).toNat + 4 * morton e (a / 2) (c / 2) := by
-  have h := morton_split' 1 e a c
-  rw [Nat.add_comm 1 e, morton_one a c] at h
-  simp only [Nat.pow_one] at h
-  exact h
 
-private theorem morton_bound (d x y : Nat) : morton d x y < 4 ^ d := by
-  induction d with
+private theorem morton_inj (k q r q' r' : Nat)
+    (hq : q < 2^k) (hr : r < 2^k) (hq' : q' < 2^k) (hr' : r' < 2^k)
+    (h : morton k q r = morton k q' r') : q = q' ∧ r = r' := by
+  induction k generalizing q r q' r' with
   | zero =>
-    have hL : morton 0 x y = 0 := by
-      have h2 : morton 0 x y = ((List.range 0).map
-          (fun i => ((x.testBit i).toNat + 2 * (y.testBit i).toNat) * 4 ^ i)).sum := rfl
-      rw [h2, List.range_zero]
-      simp
-    rw [hL]
-    simp
-  | succ d ih =>
-    rw [morton_succ]
-    have ht : ((x.testBit d).toNat + 2 * (y.testBit d).toNat) * 4 ^ d ≤ 3 * 4 ^ d := by
-      have h1 : (x.testBit d).toNat ≤ 1 := Bool.toNat_le _
-      have h2 : (y.testBit d).toNat ≤ 1 := Bool.toNat_le _
-      have h3 : (x.testBit d).toNat + 2 * (y.testBit d).toNat ≤ 3 := by omega
-      exact Nat.mul_le_mul_right _ h3
-    have h4 : 4 ^ (d + 1) = 4 ^ d * 4 := by
-      rw [Nat.pow_add, Nat.pow_one]
-    rw [h4]
+      have hq0 : q = 0 := by omega
+      have hq0' : q' = 0 := by omega
+      have hr0 : r = 0 := by omega
+      have hr0' : r' = 0 := by omega
+      omega
+  | succ k ih =>
+      rw [Nat.pow_succ] at hq hr hq' hr'
+      rw [show k + 1 = 1 + k by omega] at h
+      rw [morton_split_one, morton_split_one] at h
+      have hlow : q%2 + 2*(r%2) = q'%2 + 2*(r'%2) := by
+        have hq2 : q%2 < 2 := Nat.mod_lt _ (by omega)
+        have hr2 : r%2 < 2 := Nat.mod_lt _ (by omega)
+        have hq2' : q'%2 < 2 := Nat.mod_lt _ (by omega)
+        have hr2' : r'%2 < 2 := Nat.mod_lt _ (by omega)
+        omega
+      have hhigh : morton k (q/2) (r/2) = morton k (q'/2) (r'/2) := by omega
+      have hq2 : q%2 < 2 := Nat.mod_lt _ (by omega)
+      have hr2 : r%2 < 2 := Nat.mod_lt _ (by omega)
+      have hq2' : q'%2 < 2 := Nat.mod_lt _ (by omega)
+      have hr2' : r'%2 < 2 := Nat.mod_lt _ (by omega)
+      have hqr2 : q%2 = q'%2 ∧ r%2 = r'%2 := by omega
+      have hhigh' := ih (q/2) (r/2) (q'/2) (r'/2) (by omega) (by omega) (by omega) (by omega) hhigh
+      constructor <;> omega
+
+
+private theorem div_bound (d b x : Nat) (hbd : b ≤ d) (hx : x < 2^d) : x/2^b < 2^(d-b) := by
+  have hpow := Nat.pow_sub_mul_pow 2 hbd
+  have hbpos : 0 < 2^b := Nat.pow_pos (by omega)
+  rw [← hpow] at hx
+  exact (Nat.div_lt_iff_lt_mul hbpos).mpr (by simpa [Nat.mul_comm] using hx)
+
+
+private theorem first_bounds (lo period phase : Int) (hp : 0 < period) :
+    lo ≤ lo + (phase-lo)%period ∧ lo + (phase-lo)%period < lo + period := by
+  have hpne : period ≠ 0 := by omega
+  constructor
+  · have := Int.emod_nonneg (phase-lo) hpne
+    omega
+  · have := Int.emod_lt_of_pos (phase-lo) hp
     omega
 
-private theorem nat_mod_two_testBit (a : Nat) : a % 2 = (a.testBit 0).toNat := by
-  rw [Nat.testBit_zero]
-  have hlt : a % 2 < 2 := Nat.mod_lt a (by omega)
-  have hcases : a % 2 = 0 ∨ a % 2 = 1 := by omega
-  rcases hcases with h0 | h1
-  · rw [h0]; rfl
-  · rw [h1]; rfl
 
-private theorem morton_inj (d : Nat) :
-    ∀ a c e f : Nat, a < 2 ^ d → c < 2 ^ d → e < 2 ^ d → f < 2 ^ d →
-      morton d a c = morton d e f → a = e ∧ c = f := by
-  induction d with
+private theorem first_mod (lo period phase : Int) (hp : 0 < period)
+    (hph0 : 0 ≤ phase) (hphp : phase < period) :
+    (lo + (phase-lo)%period) % period = phase := by
+  have hdvd : period ∣ (lo + (phase-lo)%period) - phase := by
+    have hself := dvd_emod_sub_self period (phase-lo)
+    have heq : lo + (phase-lo)%period - phase = (phase-lo)%period - (phase-lo) := by grind
+    rw [heq]
+    exact hself
+  have hmod := emod_eq_of_dvd_sub period _ _ hdvd
+  exact hmod.trans (Int.emod_eq_of_lt hph0 hphp)
+
+
+private theorem first_minimal (lo period phase x : Int) (hp : 0 < period)
+    (hph0 : 0 ≤ phase) (hphp : phase < period) (hlo : lo ≤ x)
+    (hxl : x < lo + (phase-lo)%period) : (x % period != phase) = true := by
+  have hne : x % period ≠ phase := by
+    intro hxprop
+    have hfmod := first_mod lo period phase hp hph0 hphp
+    have hdvd : period ∣ (lo + (phase-lo)%period) - x := by
+      apply (Int.dvd_iff_emod_eq_zero).mpr
+      rw [← Int.emod_eq_emod_iff_emod_sub_eq_zero]
+      rw [hfmod, hxprop]
+    have hdiffpos : 0 < (lo + (phase-lo)%period) - x := by omega
+    have hb := first_bounds lo period phase hp
+    have hdiff_lt : (lo + (phase-lo)%period) - x < period := by omega
+    have hq0 : ((lo + (phase-lo)%period) - x) / period = 0 :=
+      Int.ediv_eq_zero_of_lt (by omega) hdiff_lt
+    have hdecomp := Int.ediv_mul_add_emod ((lo + (phase-lo)%period) - x) period
+    rw [hq0] at hdecomp
+    simp at hdecomp
+    have hmodzero : ((lo + (phase-lo)%period) - x) % period = 0 := (Int.dvd_iff_emod_eq_zero).mp hdvd
+    omega
+  simp [hne]
+
+
+private theorem neg_count_zero (a p : Int) (hp : 0 < p) (ha : a < 0) : (a/p + 1).toNat = 0 := by
+  have hlt : a/p < 0 := (Int.ediv_lt_iff_lt_mul hp).mpr (by simpa using ha)
+  have hle : a/p + 1 ≤ 0 := by omega
+  exact Int.toNat_of_nonpos hle
+
+
+private theorem nonneg_count (a p : Int) (hp : 0 < p) (ha : 0 ≤ a) : (a/p + 1).toNat = a/p + 1 := by
+  have hq : 0 ≤ a/p := (Int.le_ediv_iff_mul_le hp).mpr (by simpa using ha)
+  rw [Int.toNat_of_nonneg]
+  omega
+
+
+private theorem prev_div_of_mod_zero (a p : Int) (hp : 0 < p) (hr : a % p = 0) :
+    (a - 1) / p = a / p - 1 := by
+  have hdecomp := Int.ediv_mul_add_emod a p
+  rw [hr] at hdecomp
+  simp at hdecomp
+  let q := a / p
+  have hrew : a - 1 = (p - 1) + p * (q - 1) := by
+    dsimp [q]
+    grind
+  rw [hrew]
+  rw [Int.add_mul_ediv_left]
+  · have hsmall : (p - 1) / p = 0 := Int.ediv_eq_zero_of_lt (by omega) (by omega)
+    rw [hsmall]
+    omega
+  · omega
+
+
+private theorem prev_div_of_mod_nezero (a p : Int) (hp : 0 < p) (ha : 0 ≤ a) (hr : (a % p != 0) = true) :
+    (a - 1) / p = a / p := by
+  let r := a % p
+  have hpne : p ≠ 0 := by omega
+  have hrpos : 0 < r := by
+    have hnon := Int.emod_nonneg a hpne
+    have hneprop : a % p ≠ 0 := by
+      have htmp := hr
+      simp at htmp
+      exact htmp
+    omega
+  have hrlt : r < p := Int.emod_lt_of_pos a hp
+  have hdecomp := Int.ediv_mul_add_emod a p
+  have hdecomp' : p * (a/p) + a%p = a := by simpa [Int.mul_comm] using hdecomp
+  have hrew : a - 1 = (r - 1) + p * (a/p) := by
+    dsimp [r] at *
+    grind
+  rw [hrew]
+  rw [Int.add_mul_ediv_left]
+  · have hsmall : (r - 1) / p = 0 := Int.ediv_eq_zero_of_lt (by omega) (by omega)
+    rw [hsmall]
+    omega
+  · omega
+
+
+private theorem seek_aux (lo period phase : Int) (hp : 0 < period)
+    (hph0 : 0 ≤ phase) (hphp : phase < period) : ∀ L : Nat,
+    let hi := lo + (L:Int)
+    let f := lo + (phase-lo)%period
+    let n := ((hi-1-f)/period+1).toNat
+    (List.range n).map (fun i => f+(Int.ofNat i)*period) =
+      ((List.range L).map (fun i => lo+(Int.ofNat i))).filter (fun x => x%period == phase) := by
+  intro L
+  induction L with
   | zero =>
-    intro a c e f ha hc he hf h
-    have ha0 : a = 0 := by omega
-    have hc0 : c = 0 := by omega
-    have he0 : e = 0 := by omega
-    have hf0 : f = 0 := by omega
-    exact ⟨ha0.trans he0.symm, hc0.trans hf0.symm⟩
-  | succ d ih =>
-    intro a c e f ha hc he hf h
-    rw [morton_peel, morton_peel] at h
-    have hmod : ((a.testBit 0).toNat + 2 * (c.testBit 0).toNat +
-          4 * morton d (a / 2) (c / 2)) % 4 =
-        ((e.testBit 0).toNat + 2 * (f.testBit 0).toNat +
-          4 * morton d (e / 2) (f / 2)) % 4 := by rw [h]
-    rw [Nat.add_mul_mod_self_left, Nat.add_mul_mod_self_left] at hmod
-    have ht0ac : (a.testBit 0).toNat + 2 * (c.testBit 0).toNat < 4 := by
-      have h1 := Bool.toNat_le (a.testBit 0)
-      have h2 := Bool.toNat_le (c.testBit 0)
-      omega
-    have ht0ef : (e.testBit 0).toNat + 2 * (f.testBit 0).toNat < 4 := by
-      have h1 := Bool.toNat_le (e.testBit 0)
-      have h2 := Bool.toNat_le (f.testBit 0)
-      omega
-    rw [Nat.mod_eq_of_lt ht0ac, Nat.mod_eq_of_lt ht0ef] at hmod
-    have ha01 : (a.testBit 0).toNat ≤ 1 := Bool.toNat_le _
-    have hc01 : (c.testBit 0).toNat ≤ 1 := Bool.toNat_le _
-    have he01 : (e.testBit 0).toNat ≤ 1 := Bool.toNat_le _
-    have hf01 : (f.testBit 0).toNat ≤ 1 := Bool.toNat_le _
-    have hbits : (a.testBit 0).toNat = (e.testBit 0).toNat ∧
-        (c.testBit 0).toNat = (f.testBit 0).toNat := by omega
-    have hbit0 : a.testBit 0 = e.testBit 0 := by
-      cases ha2 : a.testBit 0 <;> cases he2 : e.testBit 0 <;> simp_all
-    have hbit1 : c.testBit 0 = f.testBit 0 := by
-      cases hc2 : c.testBit 0 <;> cases hf2 : f.testBit 0 <;> simp_all
-    have h4 : 4 * morton d (a / 2) (c / 2) = 4 * morton d (e / 2) (f / 2) := by omega
-    have hMac : morton d (a / 2) (c / 2) = morton d (e / 2) (f / 2) :=
-      Nat.mul_left_cancel (by omega : 0 < 4) h4
-    have hpow : 2 ^ (d + 1) = 2 ^ d * 2 := by rw [Nat.pow_add, Nat.pow_one]
-    rw [hpow] at ha hc he hf
-    have ha2 : a / 2 < 2 ^ d := (Nat.div_lt_iff_lt_mul (by omega : 0 < 2)).mpr ha
-    have hc2 : c / 2 < 2 ^ d := (Nat.div_lt_iff_lt_mul (by omega : 0 < 2)).mpr hc
-    have he2 : e / 2 < 2 ^ d := (Nat.div_lt_iff_lt_mul (by omega : 0 < 2)).mpr he
-    have hf2 : f / 2 < 2 ^ d := (Nat.div_lt_iff_lt_mul (by omega : 0 < 2)).mpr hf
-    obtain ⟨hae, hcf⟩ := ih (a / 2) (c / 2) (e / 2) (f / 2) ha2 hc2 he2 hf2 hMac
-    have hamod : a % 2 = (a.testBit 0).toNat := nat_mod_two_testBit a
-    have hemod : e % 2 = (e.testBit 0).toNat := nat_mod_two_testBit e
-    have hcfmod : c % 2 = (c.testBit 0).toNat := nat_mod_two_testBit c
-    have hfmod : f % 2 = (f.testBit 0).toNat := nat_mod_two_testBit f
-    have hamodeq : a % 2 = e % 2 := by rw [hamod, hemod, hbit0]
-    have hcfmodeq : c % 2 = f % 2 := by rw [hcfmod, hfmod, hbit1]
-    have hae' : a = e := by
-      have h1 := Nat.div_add_mod a 2
-      have h2 := Nat.div_add_mod e 2
-      omega
-    have hcf' : c = f := by
-      have h1 := Nat.div_add_mod c 2
-      have h2 := Nat.div_add_mod f 2
-      omega
-    exact ⟨hae', hcf'⟩
+      dsimp
+      have hb := first_bounds lo period phase hp
+      have hneg : lo - 1 - (lo + (phase-lo)%period) < 0 := by omega
+      have hn := neg_count_zero (lo-1-(lo+(phase-lo)%period)) period hp hneg
+      simp [hn]
+  | succ L ih =>
+      dsimp at ih ⊢
+      let hi := lo + (L:Int)
+      let f := lo + (phase-lo)%period
+      let a := hi - f
+      have hb := first_bounds lo period phase hp
+      have hlohi : lo ≤ hi := by dsimp [hi]; omega
+      have hnext : lo + ((L : Int) + 1) = hi + 1 := by dsimp [hi]; omega
+      have hsimp1 : hi + 1 - 1 - (lo + (phase-lo)%period) = hi - f := by dsimp [f]; omega
+      have hsimp2 : lo + (L:Int) - 1 - (lo + (phase-lo)%period) = hi - 1 - f := by dsimp [hi, f]
+      rw [hnext]
+      rw [hsimp1]
+      rw [hsimp2] at ih
+      by_cases haneg : a < 0
+      · have hnnew : (((hi - f)/period+1).toNat) = 0 :=
+          neg_count_zero (hi-f) period hp (by simpa [a] using haneg)
+        have hnoldarg : hi - 1 - f < 0 := by dsimp [a] at haneg; omega
+        have hnold : (((hi-1-f)/period+1).toNat) = 0 := neg_count_zero (hi-1-f) period hp hnoldarg
+        have hmodnew : (hi % period != phase) = true := by
+          apply first_minimal lo period phase hi hp hph0 hphp hlohi
+          dsimp [a, f] at haneg
+          omega
+        rw [hnold] at ih
+        simp only [List.range_zero, List.map_nil] at ih
+        rw [hnnew]
+        rw [List.range_succ]
+        have hmodnew' : ((lo + (L:Int)) % period == phase) = false := by
+          have ht : ((lo + (L:Int)) % period != phase) = true := by simpa [hi] using hmodnew
+          simp at ht
+          simp [ht]
+        rw [List.map_append, List.map_singleton, List.filter_append]
+        simp [hmodnew', ih]
+      · have hanonneg : 0 ≤ a := by omega
+        have hqnonneg : 0 ≤ a / period := (Int.le_ediv_iff_mul_le hp).mpr (by simpa using hanonneg)
+        by_cases hEq : hi % period == phase
+        · have hfmod := first_mod lo period phase hp hph0 hphp
+          have hEqProp : hi % period = phase := of_decide_eq_true hEq
+          have hfmod' : f % period = phase := by simpa [f] using hfmod
+          have hdvdaf : period ∣ a := by
+            apply (Int.dvd_iff_emod_eq_zero).mpr
+            rw [← Int.emod_eq_emod_iff_emod_sub_eq_zero]
+            rw [hfmod', hEqProp]
+          have hr0 : a % period = 0 := (Int.dvd_iff_emod_eq_zero).mp hdvdaf
+          have hnnew : (((hi - f)/period+1).toNat) = a/period + 1 :=
+            nonneg_count (hi-f) period hp (by simpa [a] using hanonneg)
+          have hnold : (((hi-1-f)/period+1).toNat) = a/period := by
+            have hprev := prev_div_of_mod_zero a period hp hr0
+            have harg : hi - 1 - f = a - 1 := by dsimp [a]; omega
+            rw [harg, hprev]
+            rw [show a/period - 1 + 1 = a/period by omega]
+            exact Int.toNat_of_nonneg hqnonneg
+          have hlast : f + (a/period : Int)*period = hi := by
+            have hdecomp := Int.ediv_mul_add_emod a period
+            rw [hr0] at hdecomp
+            simp at hdecomp
+            dsimp [a] at *
+            grind
+          have hnoldNat : (((hi-1-f)/period+1).toNat) = (a/period).toNat := by omega
+          have hnnewNat : (((hi-f)/period+1).toNat) = (a/period+1).toNat := by omega
+          rw [hnoldNat] at ih
+          rw [hnnewNat]
+          have htoNat : (a/period+1).toNat = (a/period).toNat + 1 := by omega
+          rw [htoNat, List.range_succ]
+          rw [List.map_append, List.map_singleton]
+          rw [ih]
+          have hlast' : lo + (phase-lo)%period + (a/period : Int) * period = lo + (L:Int) := by
+            simpa [f, hi] using hlast
+          have hEq' : ((lo + (L:Int)) % period == phase) = true := by
+            simpa [hi] using hEq
+          rw [List.range_succ, List.map_append, List.map_singleton, List.filter_append]
+          have hmax : max (a/period) 0 = a/period := Int.max_eq_left hqnonneg
+          simp [hmax, hlast', hEq']
+        · have hneprop : a % period ≠ 0 := by
+            intro hzprop
+            have hfmod := first_mod lo period phase hp hph0 hphp
+            have hfmod' : f % period = phase := by simpa [f] using hfmod
+            have hEqProp : hi % period ≠ phase := by
+              have ht := hEq
+              simp at ht
+              exact ht
+            have hzp : a % period = 0 := hzprop
+            have hdecomp := Int.ediv_mul_add_emod a period
+            rw [hzp] at hdecomp
+            simp at hdecomp
+            have hmodeq : hi % period = f % period := by
+              apply emod_eq_of_dvd_sub
+              have hd : period ∣ a := (Int.dvd_iff_emod_eq_zero).mpr hzp
+              simpa [a] using hd
+            rw [hfmod'] at hmodeq
+            exact hEqProp hmodeq
+          have hrne : (a % period != 0) = true := by simp [hneprop]
+          have hprev := prev_div_of_mod_nezero a period hp hanonneg hrne
+          have hnnew : (((hi - f)/period+1).toNat) = a/period + 1 :=
+            nonneg_count (hi-f) period hp (by simpa [a] using hanonneg)
+          have hargEq : hi - 1 - f = a - 1 := by dsimp [a]; omega
+          have heqx : ((hi-1-f)/period+1) = a/period+1 := by rw [hargEq, hprev]
+          have hnon1 : 0 ≤ ((hi-1-f)/period+1) := by omega
+          have hnon2 : 0 ≤ a/period+1 := by omega
+          have hnoldNat : (((hi-1-f)/period+1).toNat) = (a/period+1).toNat := by
+            have hcast := congrArg (fun z : Int => z.toNat) heqx
+            simpa [Int.toNat_of_nonneg hnon1, Int.toNat_of_nonneg hnon2] using hcast
+          have hnnewNat : (((hi-f)/period+1).toNat) = (a/period+1).toNat := by
+            have hq : ((hi-f)/period+1).toNat = (a/period+1).toNat := by
+              have hweq : ((hi-f)/period+1) = a/period+1 := by simpa [a]
+              have hc := congrArg (fun z : Int => z.toNat) hweq
+              simpa [Int.toNat_of_nonneg (by omega), Int.toNat_of_nonneg hnon2] using hc
+            exact hq
+          rw [hnoldNat] at ih
+          rw [hnnewNat]
+          have hEqf : ((lo + (L:Int)) % period == phase) = false := by
+            have ht : (hi % period == phase) = false := by simp [hEq]
+            simpa [hi] using ht
+          rw [List.range_succ]
+          rw [List.map_append, List.map_singleton, List.filter_append]
+          simp [hEqf, ih]
 
-theorem sound_MortonSquare : MortonSquare.Goal := by
-  intro d b x y u v hb hx hy hu hv
-  dsimp only
-  have hsplit : morton d x y = morton b x y +
-      4 ^ b * morton (d - b) (x / 2 ^ b) (y / 2 ^ b) := by
-    have h := morton_split' b (d - b) x y
-    rw [Nat.add_sub_of_le hb] at h
-    exact h
-  have hsplit2 : morton d x y = morton b x y +
-      morton (d - b) (x / 2 ^ b) (y / 2 ^ b) * 4 ^ b := by
-    rw [hsplit]
+
+theorem TruncBucket_sound : TinylambOpt.ResearchGoals.IndexPreimages.TruncBucket.Goal := by
+  intro x d q hd
+  by_cases hx : 0 ≤ x
+  · rw [tdiv_of_nonneg hx hd]
+    by_cases hqneg : q < 0
+    · have hdiv : 0 ≤ x/d := div_nonneg x d hx hd
+      have hprod : q*d < 0 := Int.mul_neg_of_neg_of_pos hqneg hd
+      simp [truncBounds, hqneg]
+      constructor <;> intro h <;> omega
+    · have hq0 : 0 ≤ q := by omega
+      have hrange := ediv_eq_iff_range x d q hx hd
+      by_cases hqz : q = 0
+      · subst q
+        simp [truncBounds] at *
+        constructor
+        · intro h
+          have hb := hrange.mp h
+          omega
+        · intro h
+          apply hrange.mpr
+          omega
+      · have hqpos : 0 < q := by omega
+        simp [truncBounds, hqneg, hqz] at *
+        constructor
+        · intro h
+          have hb := hrange.mp h
+          omega
+        · intro h
+          apply hrange.mpr
+          omega
+  · have hxneg : x < 0 := by omega
+    rw [tdiv_of_neg hxneg hd]
+    have hy : 0 ≤ -x := by omega
+    by_cases hqpos : 0 < q
+    · have hdiv : 0 ≤ -x/d := div_nonneg (-x) d hy hd
+      have hprod : 0 < q*d := Int.mul_pos hqpos hd
+      have hqneg' : ¬ q < 0 := by omega
+      have hqz' : q ≠ 0 := by omega
+      simp [truncBounds, hqneg', hqz'] at *
+      constructor <;> intro h <;> omega
+    · have hqnonpos : q ≤ 0 := by omega
+      have hk : 0 ≤ -q := by omega
+      have hrange := ediv_eq_iff_range (-x) d (-q) hy hd
+      by_cases hqz : q = 0
+      · subst q
+        simp [truncBounds] at *
+        constructor
+        · intro h
+          have hb := hrange.mp (by omega)
+          omega
+        · intro h
+          apply hrange.mpr
+          omega
+      · have hqneg : q < 0 := by omega
+        simp [truncBounds, hqneg, hqz] at *
+        have hmulneg : q*d = -((-q)*d) := by grind
+        constructor
+        · intro h
+          have hkEq : (-x)/d = -q := by omega
+          have hb := hrange.mp hkEq
+          omega
+        · intro h
+          have hkEq : (-x)/d = -q := by
+            apply hrange.mpr
+            omega
+          omega
+
+theorem RoundedBucket_sound : TinylambOpt.ResearchGoals.IndexPreimages.RoundedBucket.Goal := by
+  intro n d k hd
+  dsimp
+  let q := n / d
+  let r := n % d
+  let twice := 2 * r
+  let C : Prop := twice < d ∨ (twice = d ∧ q % 2 = 0)
+  have hrnon : 0 ≤ r := Int.emod_nonneg n (by omega)
+  have hrlt : r < d := Int.emod_lt_of_pos n hd
+  have htw0 : 0 ≤ twice := by dsimp [twice]; omega
+  have htw2 : twice < 2*d := by dsimp [twice]; omega
+  have hn : n = q*d + r := by
+    have h := Int.ediv_mul_add_emod n d
+    dsimp [q, r]
+    grind
+  have hcond : ((decide (twice < d) || (twice == d && q % 2 == 0)) = true) ↔ C := by
+    dsimp [C]
+    constructor
+    · intro h
+      simp at h
+      rcases h with h | ⟨h, hq⟩
+      · exact Or.inl h
+      · exact Or.inr ⟨h, hq⟩
+    · intro h
+      rcases h with h | ⟨h, hq⟩
+      · simp [h]
+      · simp [h, hq]
+  have hnearest : nearestEven n d = (if (decide (twice < d) || (twice == d && q % 2 == 0)) = true then q else q+1) := by
+    simp [nearestEven, q, r, twice]
+  have hneqsucc : q+1 ≠ q := by omega
+  have hneqsucc' : q ≠ q+1 := by omega
+  have hnq : (nearestEven n d = q) ↔ C := by
+    rw [hnearest]
+    by_cases hc : (decide (twice < d) || (twice == d && q % 2 == 0)) = true
+    · have hcprop : C := hcond.mp hc
+      simp [hc, hcprop]
+    · have hcprop : ¬ C := by intro h; exact hc (hcond.mpr h)
+      simp [hc, hcprop, hneqsucc]
+  have hnq1 : (nearestEven n d = q+1) ↔ ¬ C := by
+    rw [hnearest]
+    by_cases hc : (decide (twice < d) || (twice == d && q % 2 == 0)) = true
+    · have hcprop : C := hcond.mp hc
+      simp [hc, hcprop, hneqsucc']
+    · have hcprop : ¬ C := by intro h; exact hc (hcond.mpr h)
+      simp [hc, hcprop]
+  have hdist_eq (k : Int) : (2*n - 2*k*d).natAbs = (2*(q-k)*d + twice).natAbs := by
     congr 1
-    exact Nat.mul_comm _ _
-  have hLb : morton b x y < 4 ^ b := morton_bound b x y
-  have hP2 : 0 < 2 ^ b := Nat.pow_pos (by omega : (0 : Nat) < 2)
-  have hP4 : 0 < 4 ^ b := Nat.pow_pos (by omega : (0 : Nat) < 4)
-  have hxp : x / 2 ^ b < 2 ^ (d - b) := by
-    apply (Nat.div_lt_iff_lt_mul hP2).mpr
-    have hpow : 2 ^ (d - b) * 2 ^ b = 2 ^ d := by
-      rw [← Nat.pow_add, Nat.sub_add_cancel hb]
-    rw [hpow]
-    exact hx
-  have hyp : y / 2 ^ b < 2 ^ (d - b) := by
-    apply (Nat.div_lt_iff_lt_mul hP2).mpr
-    have hpow : 2 ^ (d - b) * 2 ^ b = 2 ^ d := by
-      rw [← Nat.pow_add, Nat.sub_add_cancel hb]
-    rw [hpow]
-    exact hy
-  constructor
-  · -- forward: high parts equal → code in interval
-    intro hxy
-    have hH : morton (d - b) (x / 2 ^ b) (y / 2 ^ b) = morton (d - b) u v := by
-      rw [hxy.1, hxy.2]
-    rw [hsplit2, hH]
-    refine ⟨?_, ?_⟩ <;> omega
-  · -- backward: code in interval → high parts equal
-    intro hint
-    have hmdiv : morton d x y / 4 ^ b = morton (d - b) (x / 2 ^ b) (y / 2 ^ b) := by
-      rw [hsplit2, Nat.add_mul_div_right _ _ hP4, Nat.div_eq_of_lt hLb, Nat.zero_add]
-    have hsdiv : morton d x y / 4 ^ b = morton (d - b) u v := by
-      have h1 : morton (d - b) u v ≤ morton d x y / 4 ^ b :=
-        (Nat.le_div_iff_mul_le hP4).mpr hint.1
-      have h2 : morton d x y / 4 ^ b < morton (d - b) u v + 1 := by
-        apply (Nat.div_lt_iff_lt_mul hP4).mpr
-        have h3 : morton (d - b) u v * 4 ^ b + 4 ^ b =
-            (morton (d - b) u v + 1) * 4 ^ b := by
-          rw [Nat.add_mul, Nat.one_mul]
+    rw [hn]
+    dsimp [twice]
+    grind
+  have hfarpos : k ≤ q-1 → d < ((2*n-2*k*d).natAbs : Int) := by
+    intro hk
+    have hqk : 1 ≤ q-k := by omega
+    have hmul : d ≤ (q-k)*d := by
+      have htmp := Int.mul_le_mul_of_nonneg_right hqk (by omega : 0 ≤ d)
+      simpa using htmp
+    have hmul2 : 2*d ≤ 2*(q-k)*d := by
+      have htmp := Int.mul_le_mul_of_nonneg_left hmul (by omega : 0 ≤ (2:Int))
+      grind
+    have hv : 0 ≤ 2*(q-k)*d + twice := by omega
+    rw [hdist_eq, natAbs_nonneg_eq hv]
+    omega
+  have hfarneg : q+2 ≤ k → d < ((2*n-2*k*d).natAbs : Int) := by
+    intro hk
+    have hqk : q-k ≤ -2 := by omega
+    have hmul : (q-k)*d ≤ (-2)*d := Int.mul_le_mul_of_nonneg_right hqk (by omega : 0 ≤ d)
+    have hmul2 : 2*(q-k)*d ≤ (-4)*d := by
+      have htmp := Int.mul_le_mul_of_nonneg_left hmul (by omega : 0 ≤ (2:Int))
+      grind
+    have hv : 2*(q-k)*d + twice < 0 := by omega
+    rw [hdist_eq, natAbs_neg_eq hv]
+    omega
+  have hkcases : k ≤ q-1 ∨ k = q ∨ k = q+1 ∨ q+2 ≤ k := by omega
+  rcases hkcases with hklow | hkq | hkq1 | hkhigh
+  · have hfar := hfarpos hklow
+    have hneneq : ¬ (nearestEven n d = k) := by
+      intro h
+      by_cases hc : nearestEven n d = q
+      · have : q = k := hc ▸ h
         omega
-      have h4 : morton d x y / 4 ^ b ≤ morton (d - b) u v := by omega
-      exact Nat.le_antisymm h4 h1
-    have hH : morton (d - b) (x / 2 ^ b) (y / 2 ^ b) = morton (d - b) u v :=
-      hmdiv.symm.trans hsdiv
-    exact morton_inj (d - b) (x / 2 ^ b) (y / 2 ^ b) u v hxp hyp hu hv hH
+      · have hs : nearestEven n d = q+1 := by
+          have hcprop : ¬ C := by intro hC; exact hc (hnq.mpr hC)
+          exact hnq1.mpr hcprop
+        have : q+1 = k := hs ▸ h
+        omega
+    constructor
+    · intro h; exact False.elim (hneneq h)
+    · intro h; rcases h with hlt | heq <;> omega
+  · subst k
+    have hdist : ((2*n-2*q*d).natAbs : Int) = twice := by
+      rw [hdist_eq]
+      simp
+      exact natAbs_nonneg_eq htw0
+    rw [hdist]
+    constructor
+    · intro h
+      exact hnq.mp h
+    · intro hC
+      exact hnq.mpr hC
+  · subst k
+    have hv : 2*(q-(q+1))*d + twice < 0 := by omega
+    have hdist : ((2*n-2*(q+1)*d).natAbs : Int) = 2*d - twice := by
+      rw [hdist_eq, natAbs_neg_eq hv]
+      omega
+    rw [hdist]
+    have hrhs : (2*d - twice < d ∨ (2*d - twice = d ∧ (q+1) % 2 = 0)) ↔ ¬ C := by
+      dsimp [C]
+      constructor
+      · intro h
+        rcases h with hlt | ⟨heq1, hpar⟩
+        · intro hc
+          rcases hc with hc | ⟨hc, _⟩ <;> omega
+        · have hz : twice = d := by omega
+          have hqodd : q % 2 != 0 := (parity_succ_eq q).mp hpar
+          have hqoddprop : q % 2 ≠ 0 := by simpa using hqodd
+          intro hc
+          rcases hc with hc | ⟨hc, hqeven⟩ <;> omega
+      · intro h
+        have hcase : twice < d ∨ twice = d ∨ d < twice := by omega
+        rcases hcase with hlt | heq | hgt
+        · exact False.elim (h (Or.inl hlt))
+        · right
+          constructor
+          · omega
+          · have hqeven : ¬ q % 2 = 0 := by
+              intro hq
+              exact h (Or.inr ⟨heq, hq⟩)
+            have hqodd : q % 2 != 0 := by simp [hqeven]
+            exact (parity_succ_eq q).mpr hqodd
+        · left
+          omega
+    constructor
+    · intro h
+      exact hrhs.mpr (hnq1.mp h)
+    · intro h
+      exact hnq1.mpr (hrhs.mp h)
+  · have hfar := hfarneg hkhigh
+    have hneneq : ¬ (nearestEven n d = k) := by
+      intro h
+      by_cases hc : nearestEven n d = q
+      · have : q = k := hc ▸ h
+        omega
+      · have hs : nearestEven n d = q+1 := by
+          have hcprop : ¬ C := by intro hC; exact hc (hnq.mpr hC)
+          exact hnq1.mpr hcprop
+        have : q+1 = k := hs ▸ h
+        omega
+    constructor
+    · intro h; exact False.elim (hneneq h)
+    · intro h; rcases h with hlt | heq <;> omega
+
+theorem ModularLookup_sound : TinylambOpt.ResearchGoals.IndexPreimages.ModularLookup.Goal := by
+  intro m a inv bias x target hm hmul hx hxt ht htt
+  have hmpos : 0 < m := by omega
+  have htmod : target % m = target := Int.emod_eq_of_lt ht htt
+  have hxmod : x % m = x := Int.emod_eq_of_lt hx hxt
+  have hdvd_inv : m ∣ a*inv - 1 := dvd_of_emod_eq_one hm hmul
+  constructor
+  · intro h
+    have hdvd_h : m ∣ (a*x + bias) - target := by
+      have hz : ((a*x + bias) - target) % m = 0 := by
+        rw [← Int.emod_eq_emod_iff_emod_sub_eq_zero]
+        simpa [htmod] using h
+      exact (Int.dvd_iff_emod_eq_zero).mpr hz
+    have hdvd1 : m ∣ (a*inv - 1) * x := Int.dvd_mul_of_dvd_left hdvd_inv
+    have hdvd2 : m ∣ -inv * ((a*x + bias) - target) := Int.dvd_mul_of_dvd_right hdvd_h
+    have hdvd3 : m ∣ (a*inv - 1)*x + (-inv)*((a*x + bias) - target) := Int.dvd_add hdvd1 hdvd2
+    have heq : (a*inv - 1)*x + (-inv)*((a*x + bias) - target) = inv*(target-bias) - x := by grind
+    have hdvd : m ∣ inv*(target-bias) - x := by simpa [heq] using hdvd3
+    have hmod := emod_eq_of_dvd_sub m _ _ hdvd
+    rw [hxmod] at hmod
+    exact hmod.symm
+  · intro h
+    rw [h]
+    have hdvd1 : m ∣ (a*inv - 1)*(target-bias) := Int.dvd_mul_of_dvd_left hdvd_inv
+    have hdvd2 : m ∣ (inv*(target-bias)) % m - inv*(target-bias) := dvd_emod_sub_self m (inv*(target-bias))
+    have hdvd3 : m ∣ a*((inv*(target-bias)) % m - inv*(target-bias)) := Int.dvd_mul_of_dvd_right hdvd2
+    have hdvd4 : m ∣ (a*inv - 1)*(target-bias) + a*((inv*(target-bias)) % m - inv*(target-bias)) := Int.dvd_add hdvd1 hdvd3
+    have heq : (a*inv - 1)*(target-bias) + a*((inv*(target-bias)) % m - inv*(target-bias)) =
+        a*((inv*(target-bias)) % m) + bias - target := by grind
+    have hmod := emod_eq_of_dvd_sub m _ _ (by simpa [heq] using hdvd4)
+    simpa [htmod] using hmod
+
+theorem DescendingBand_sound : TinylambOpt.ResearchGoals.IndexPreimages.DescendingBand.Goal := by
+  intro x lo hi bias d hd
+  constructor
+  · intro h
+    have h' : lo ≤ bias - x*d ∧ bias - x*d < hi := by simpa [Int.mul_comm] using h
+    constructor
+    · rw [Int.add_one_le_iff]
+      apply (Int.ediv_lt_iff_lt_mul hd).mpr
+      omega
+    · apply (Int.le_ediv_iff_mul_le hd).mpr
+      omega
+  · intro h
+    have hxle : x*d ≤ bias-lo := (Int.le_ediv_iff_mul_le hd).mp h.2
+    have hxgt : bias-hi < x*d := by
+      have hlt : (bias-hi)/d < x := by omega
+      exact (Int.ediv_lt_iff_lt_mul hd).mp hlt
+    have h'' : lo ≤ bias - x*d ∧ bias - x*d < hi := by omega
+    simpa [Int.mul_comm] using h''
+
+theorem CheckedDistanceBand_sound : TinylambOpt.ResearchGoals.IndexPreimages.CheckedDistanceBand.Goal := by
+  intro rows m l h center rad hbounds hlo hhi
+  induction rows with
+  | nil => simp
+  | cons x xs ih =>
+      have hx_bounds := hbounds x (by simp)
+      have hxs_bounds : ∀ y ∈ xs, l ≤ y ∧ y ≤ h := by
+        intro y hy
+        exact hbounds y (by simp [hy])
+      have ih' := ih hxs_bounds
+      have hsafe : -m < x - center ∧ x - center < m := by
+        constructor <;> omega
+      have hcd : checkedDistance m x center = some (x - center).natAbs := by
+        simp [checkedDistance]
+        constructor <;> omega
+      have hdist : decide ((x - center).natAbs ≤ rad) =
+          decide (center - rad ≤ x ∧ x ≤ center + rad) := by
+        have hpq : ((x - center).natAbs ≤ rad) ↔ (center - rad ≤ x ∧ x ≤ center + rad) := by
+          rw [natAbs_le_iff]
+          omega
+        by_cases hp : (x - center).natAbs ≤ rad
+        · have hq := hpq.mp hp
+          simp [hp, hq]
+        · have hq : ¬ (center - rad ≤ x ∧ x ≤ center + rad) := by
+            intro hq
+            exact hp (hpq.mpr hq)
+          simp [hp, hq]
+      simp [List.mapM_cons, hcd, hdist, ih']
+
+theorem DistanceRing_sound : TinylambOpt.ResearchGoals.IndexPreimages.DistanceRing.Goal := by
+  intro rows o l h hl
+  let p : Int → Bool := fun x => o-h ≤ x && x ≤ o - max 1 l
+  let q : Int → Bool := fun x => o+l ≤ x && x ≤ o+h
+  let r : Int → Bool := fun x => let d : Int := (x-o).natAbs; l ≤ d && d ≤ h
+  have hdisj : ∀ x, ¬ (p x = true ∧ q x = true) := by
+    intro x hx
+    have hxp : o-h ≤ x ∧ x ≤ o - max 1 l := by simpa [p] using hx.1
+    have hxq : o+l ≤ x ∧ x ≤ o+h := by simpa [q] using hx.2
+    have hmax : 1 ≤ max 1 l := Int.le_max_left 1 l
+    omega
+  have hpr : ∀ x, (p x || q x) = r x := by
+    intro x
+    have hiff : ((p x = true) ∨ (q x = true)) ↔ (r x = true) := by
+      constructor
+      · intro hx
+        rcases hx with hpq | hqq
+        · have hpProp : o-h ≤ x ∧ x ≤ o - max 1 l := by simpa [p] using hpq
+          have hmaxl : l ≤ max 1 l := Int.le_max_right 1 l
+          have hmax1 : 1 ≤ max 1 l := Int.le_max_left 1 l
+          have hvlow : l ≤ (x-o).natAbs := (le_natAbs_iff (x-o) l hl).mpr (Or.inl (by omega))
+          have hvhigh : (x-o).natAbs ≤ h := (natAbs_le_iff (x-o) h).mpr (by constructor <;> omega)
+          simpa [r] using (show l ≤ (x-o).natAbs ∧ (x-o).natAbs ≤ h from ⟨hvlow, hvhigh⟩)
+        · have hqProp : o+l ≤ x ∧ x ≤ o+h := by simpa [q] using hqq
+          have hvlow : l ≤ (x-o).natAbs := (le_natAbs_iff (x-o) l hl).mpr (Or.inr (by omega))
+          have hvhigh : (x-o).natAbs ≤ h := (natAbs_le_iff (x-o) h).mpr (by constructor <;> omega)
+          simpa [r] using (show l ≤ (x-o).natAbs ∧ (x-o).natAbs ≤ h from ⟨hvlow, hvhigh⟩)
+      · intro hr
+        have hr' : l ≤ (x-o).natAbs ∧ (x-o).natAbs ≤ h := by simpa [r] using hr
+        have hhi := (natAbs_le_iff (x-o) h).mp hr'.2
+        by_cases hneg : x - o < 0
+        · apply Or.inl
+          have hvabs : ((x-o).natAbs : Int) = -(x-o) := by
+            have hz := Int.natAbs_of_nonneg (a := -(x-o)) (by omega)
+            simpa [Int.natAbs_neg] using hz
+          have hvle : x - o ≤ -l := by
+            have := hr'.1
+            rw [hvabs] at this
+            omega
+          have hmax1 : 1 ≤ max 1 l := Int.le_max_left 1 l
+          have hmaxl : l ≤ max 1 l := Int.le_max_right 1 l
+          have hxupper : x ≤ o - max 1 l := by
+            by_cases hl0 : l = 0
+            · simp [hl0]
+              omega
+            · have hl1 : 1 ≤ l := by omega
+              have hmaxeq : max 1 l = l := Int.max_eq_right hl1
+              rw [hmaxeq]
+              omega
+          have hpProp : o-h ≤ x ∧ x ≤ o - max 1 l := by omega
+          simpa [p] using hpProp
+        · apply Or.inr
+          have hqProp : o+l ≤ x ∧ x ≤ o+h := by omega
+          simpa [q] using hqProp
+    by_cases hp : p x = true
+    · have hq : q x = false := by
+        cases hqa : q x with
+        | false => rfl
+        | true => exact False.elim (hdisj x ⟨hp, hqa⟩)
+      have hr := hiff.mp (Or.inl hp)
+      simp [hp, hq, hr]
+    · by_cases hq : q x = true
+      · have hr := hiff.mp (Or.inr hq)
+        simp [hp, hq, hr]
+      · have hr : r x = false := by
+          cases hrv : r x with
+          | false => rfl
+          | true =>
+              have hpq : p x = true ∨ q x = true := hiff.mpr hrv
+              rcases hpq with hp' | hq'
+              · exact False.elim (hp hp')
+              · exact False.elim (hq hq')
+        simp [hp, hq, hr]
+  have hfilt := filter_perm_or p q hdisj rows
+  have hcongr : rows.filter (fun a => p a || q a) = rows.filter r := by
+    apply List.filter_congr
+    intro x hx
+    exact hpr x
+  rw [hcongr] at hfilt
+  change (rows.filter p ++ rows.filter q).Perm (rows.filter r)
+  exact hfilt
+
+theorem CursorRanges_sound : TinylambOpt.ResearchGoals.IndexPreimages.CursorRanges.Goal := by
+  intro rows cur
+  dsimp
+  intro hpair
+  change rows.filter (peer cur) ++ rows.filter (later cur) = rows.filter (fun r => cmpKey cur r == .lt)
+  induction rows with
+  | nil => simp
+  | cons a as ih =>
+      have htail : as.Pairwise (fun a b => cmpKey a b ≠ .gt) := List.Pairwise.of_cons hpair
+      have harel : ∀ b ∈ as, cmpKey a b ≠ .gt := (List.pairwise_cons.mp hpair).1
+      by_cases hpa : peer cur a = true
+      · have hla : later cur a = false := by
+          cases ht : later cur a with
+          | false => rfl
+          | true => exact False.elim (peer_later_disjoint cur a ⟨hpa, ht⟩)
+        have haa : cmpKey cur a == .lt := peer_after cur a hpa
+        simp [List.filter_cons, hpa, hla, haa, ih htail]
+      · by_cases hla : later cur a = true
+        · have haa : cmpKey cur a == .lt := later_after cur a hla
+          have hnoPeer : as.filter (peer cur) = [] := by
+            apply filter_nil_of_false
+            intro b hb
+            exact no_peer_after_later cur a b hla (by simpa using harel b hb)
+          have hcongr : as.filter (fun r => cmpKey cur r == .lt) = as.filter (later cur) := by
+            apply List.filter_congr
+            intro b hb
+            have hnpeer : peer cur b = false := no_peer_after_later cur a b hla (by simpa using harel b hb)
+            cases hltb : later cur b with
+            | false =>
+                have hnafter : (cmpKey cur b == .lt) = false := by
+                  cases hafter : cmpKey cur b == .lt with
+                  | false => rfl
+                  | true =>
+                      rcases after_peer_or_later cur b hafter with hp | hl
+                      · have : False := by rw [hp] at hnpeer; contradiction
+                        exact False.elim this
+                      · have : False := by rw [hl] at hltb; contradiction
+                        exact False.elim this
+                simp [hnafter, hltb]
+            | true =>
+                have hafter : cmpKey cur b == .lt := later_after cur b hltb
+                simp [hafter, hltb]
+          simp [List.filter_cons, hpa, hla, haa, hnoPeer, hcongr]
+        · have haa : (cmpKey cur a == .lt) = false := by
+            cases h' : cmpKey cur a == .lt with
+            | false => rfl
+            | true =>
+                rcases after_peer_or_later cur a h' with hp | hl
+                · exact False.elim (hpa hp)
+                · exact False.elim (hla hl)
+          simpa [List.filter_cons, hpa, hla, haa] using ih htail
+
+theorem MortonSquare_sound : TinylambOpt.ResearchGoals.IndexPreimages.MortonSquare.Goal := by
+  intro d b x y u v hbd hx hy hu hv
+  dsimp
+  let k := d - b
+  let q := x / 2^b
+  let r := y / 2^b
+  let low := morton b x y
+  let Mq := morton k q r
+  let Mu := morton k u v
+  let start := Mu * 4^b
+  have hd : d = b + k := by dsimp [k]; omega
+  have hsplit : morton d x y = low + Mq * 4^b := by
+    dsimp [low, Mq, q, r]
+    rw [hd, morton_split]
+    rw [Nat.mul_comm]
+  have hlowlt : low < 4^b := by
+    dsimp [low]
+    exact morton_lt b x y
+  have h4pos : 0 < 4^b := Nat.pow_pos (by omega)
+  have hqb : q < 2^k := by
+    dsimp [q, k]
+    exact div_bound d b x hbd hx
+  have hrb : r < 2^k := by
+    dsimp [r, k]
+    exact div_bound d b y hbd hy
+  have hstart_eq : morton (d-b) u v * 4^b = start := by rfl
+  constructor
+  · intro h
+    rcases h with ⟨hq, hr⟩
+    have hMq : Mq = Mu := by
+      dsimp [Mq, Mu, q, r, k]
+      rw [hq, hr]
+    have hm : morton d x y = low + start := by rw [hsplit, hMq]
+    constructor
+    · rw [hm]
+      omega
+    · rw [hm]
+      omega
+  · intro h
+    have hle : start ≤ morton d x y := by
+      rw [← hstart_eq]
+      exact h.1
+    have hlt : morton d x y < start + 4^b := by
+      rw [← hstart_eq]
+      exact h.2
+    rw [hsplit] at hle hlt
+    have hleMq : Mu * 4^b < (Mq+1) * 4^b := by
+      rw [Nat.add_mul]
+      omega
+    have hltStart : Mq * 4^b < (Mu+1) * 4^b := by
+      rw [Nat.add_mul]
+      omega
+    have hltMu : Mu < Mq+1 := Nat.lt_of_mul_lt_mul_right hleMq
+    have hltMq : Mq < Mu+1 := Nat.lt_of_mul_lt_mul_right hltStart
+    have hMqMu : Mq = Mu := by omega
+    have hinj := morton_inj k q r u v hqb hrb hu hv (by simpa [Mq, Mu] using hMqMu)
+    simpa [q, r] using hinj
+
+theorem PeriodicSeek_sound : TinylambOpt.ResearchGoals.IndexPreimages.PeriodicSeek.Goal := by
+  intro lo hi period phase hp hph0 hphp
+  dsimp
+  have hcases : hi < lo ∨ lo ≤ hi := by omega
+  rcases hcases with hlt | hge
+  · have hzero : (hi-lo).toNat = 0 := by exact Int.toNat_of_nonpos (by omega)
+    have hn : (((hi-1-(lo+(phase-lo)%period))/period+1).toNat) = 0 := by
+      have hb := first_bounds lo period phase hp
+      have hneg : hi-1-(lo+(phase-lo)%period) < 0 := by omega
+      exact neg_count_zero _ _ hp hneg
+    simp [hn, hzero]
+  · have hL : hi = lo + ((hi-lo).toNat : Int) := by
+      rw [Int.toNat_of_nonneg (by omega)]
+      omega
+    have h := seek_aux lo period phase hp hph0 hphp ((hi-lo).toNat)
+    dsimp at h
+    rw [← hL] at h
+    simpa using h
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.IndexPreimages
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp
+-- executor/zone_map.cpp

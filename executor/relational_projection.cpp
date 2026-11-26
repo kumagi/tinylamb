@@ -2116,7 +2116,7 @@ StatusOr<Relation> Project(TransactionContext& context,
       } else if (projection_programs[item] &&
                  SafeToReduceEvaluationCountWithSchema(
                      statement.SelectList()[item].expression, input.schema)) {
-        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
         //   (topn_deferred_safe_projection_sound)
         stage_a_slots.push_back(
             TopNOutputSlot{.program = &*projection_programs[item]});
@@ -2551,7 +2551,7 @@ StatusOr<Relation> Project(TransactionContext& context,
         };
         std::vector<size_t> positions;
         if (top1_with_ties) {
-          // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+          // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
           //   (single_pass_argmax_eq_filterMaxRows)
           // Every peer of the minimum row must be emitted; the reservation
           // above accounts for the worst case where all n_rows are peers.
@@ -4179,7 +4179,7 @@ bool SameSqlIdentifier(std::string_view a, std::string_view b) {
 //   SELECT ... FROM pts b WHERE NOT EXISTS (
 //     SELECT 1 FROM pts a WHERE a.x < b.x AND a.y < b.y)
 // (including `<` / `>` variants) into an O(n log n) skyline sweep.
-// Lean proof: lean/TinylambOpt/ProposedProofs/SkylineAntiJoin.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/SkylineAntiJoin.lean (sound)
 StatusOr<bool> TryApplySkylineAntiJoin(
     const SelectStatement& statement,
     const std::vector<Expression>& where_predicates, const Scope* outer,

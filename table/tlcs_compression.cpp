@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <span>
 #include <string>
@@ -148,10 +149,80 @@ class BitWriter {
   unsigned bits_in_buf_{0};
 };
 
+struct RawByteScratch {
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized uninitialized buf.
+  std::unique_ptr<uint8_t[]> data;
+  size_t capacity{0};
+
+  void Ensure(size_t need) {
+    if (need > capacity) {
+      const size_t new_cap = std::max(need, capacity * 2U);
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized uninit buf.
+      data = std::make_unique_for_overwrite<uint8_t[]>(new_cap);
+      capacity = new_cap;
+    }
+  }
+
+  void TrimIfLarge(size_t max_cap = 4U << 20U) {
+    if (capacity > max_cap) {
+      data.reset();
+      capacity = 0;
+    }
+  }
+};
+
+inline const uint8_t* FastMemmem(const uint8_t* haystack, size_t hlen,
+                                 const void* needle, size_t nlen) noexcept {
+  if (nlen == 0) {
+    return haystack;
+  }
+  if (hlen < nlen) {
+    return nullptr;
+  }
+#ifdef __linux__
+  return static_cast<const uint8_t*>(::memmem(haystack, hlen, needle, nlen));
+#else
+  const std::string_view h(reinterpret_cast<const char*>(haystack), hlen);
+  const std::string_view n(static_cast<const char*>(needle), nlen);
+  const size_t pos = h.find(n);
+  return pos == std::string_view::npos ? nullptr : haystack + pos;
+#endif
+}
+
 class BitReader {
  public:
   BitReader(std::span<const uint8_t> in, size_t byte_pos)
-      : in_(in), byte_pos_(byte_pos) {}
+      : data_(in.data()), size_(in.size()), byte_pos_(byte_pos) {}
+
+  void Refill() noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+      if (byte_pos_ + 8U <= size_) {
+        uint64_t word = 0;
+        std::memcpy(&word, data_ + byte_pos_, sizeof(word));
+        const unsigned empty_bytes = (64U - bits_in_buf_) >> 3U;
+        buf_ |= (word << bits_in_buf_);
+        byte_pos_ += empty_bytes;
+        bits_in_buf_ += empty_bytes << 3U;
+        return;
+      }
+    }
+    while (bits_in_buf_ <= 56U && byte_pos_ < size_) {
+      buf_ |= static_cast<uint64_t>(data_[byte_pos_++]) << bits_in_buf_;
+      bits_in_buf_ += 8U;
+    }
+  }
+
+  // Fast path for `0 < bit_count <= 32` when caller already verified total
+  // payload length is sufficient for all reads.
+  uint32_t ReadBits32Unchecked(unsigned bit_count, uint64_t mask) noexcept {
+    if (bits_in_buf_ < bit_count) {
+      Refill();
+    }
+    const auto v = static_cast<uint32_t>(buf_ & mask);
+    buf_ >>= bit_count;
+    bits_in_buf_ -= bit_count;
+    return v;
+  }
 
   bool ReadBits(unsigned bit_count, uint64_t* out) {
     if (bit_count == 0) {
@@ -161,29 +232,31 @@ class BitReader {
     if (bit_count > 64U) {
       return false;
     }
-    uint64_t result = 0;
-    unsigned filled = 0;
-    while (filled < bit_count) {
-      if (bits_in_buf_ == 0) {
-        if (byte_pos_ >= in_.size()) {
+    if (bit_count <= 56U) {
+      if (bits_in_buf_ < bit_count) {
+        Refill();
+        if (bits_in_buf_ < bit_count) {
           return false;
         }
-        buf_ = in_[byte_pos_++];
-        bits_in_buf_ = 8U;
       }
-      const unsigned take = std::min(bits_in_buf_, bit_count - filled);
-      const uint64_t mask = (uint64_t{1} << take) - 1ULL;
-      result |= (buf_ & mask) << filled;
-      buf_ >>= take;
-      bits_in_buf_ -= take;
-      filled += take;
+      const uint64_t mask = (uint64_t{1} << bit_count) - 1ULL;
+      *out = buf_ & mask;
+      buf_ >>= bit_count;
+      bits_in_buf_ -= bit_count;
+      return true;
     }
-    *out = result;
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    if (!ReadBits(32U, &lo) || !ReadBits(bit_count - 32U, &hi)) {
+      return false;
+    }
+    *out = lo | (hi << 32U);
     return true;
   }
 
  private:
-  std::span<const uint8_t> in_;
+  const uint8_t* data_{nullptr};
+  size_t size_{0};
   size_t byte_pos_{0};
   uint64_t buf_{0};
   unsigned bits_in_buf_{0};
@@ -213,22 +286,47 @@ inline bool ParseTemporalAscii22(std::string_view sv, uint64_t* packed_out) {
   return true;
 }
 
-inline void FormatTemporalAscii22(uint64_t packed, char* dst) {
-  // Format `YYYYMMDDHHMMSS` into `YYYY-MM-DD HH:MM:SS+00`.
-  static constexpr std::array<size_t, 14> kDigitIdx = {
-      0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+inline void FormatTemporalAscii22(uint64_t packed, char* dst) noexcept {
+  // Format 14-digit `YYYYMMDDHHMMSS` into `YYYY-MM-DD HH:MM:SS+00` using a
+  // 2-digit lookup table (replaces 14 64-bit divisions with fast 32-bit ops).
+  static constexpr std::array<char, 201> kDigits200 = {
+      "0001020304050607080910111213141516171819"
+      "2021222324252627282930313233343536373839"
+      "4041424344454647484950515253545556575859"
+      "6061626364656667686970717273747576777879"
+      "8081828384858687888990919293949596979899"};
+  const auto date = static_cast<uint32_t>(packed / 1000000ULL);
+  const auto hms = static_cast<uint32_t>(
+      packed - (static_cast<uint64_t>(date) * 1000000ULL));
+  const uint32_t yyyy = date / 10000U;
+  const uint32_t mmdd = date - (yyyy * 10000U);
+  const uint32_t yy_hi = yyyy / 100U;
+  const uint32_t yy_lo = yyyy - (yy_hi * 100U);
+  const uint32_t mo = mmdd / 100U;
+  const uint32_t dd = mmdd - (mo * 100U);
+  const uint32_t hh = hms / 10000U;
+  const uint32_t mmss = hms - (hh * 10000U);
+  const uint32_t mi = mmss / 100U;
+  const uint32_t ss = mmss - (mi * 100U);
+  const auto copy2 = [&](size_t dst_off, uint32_t v) noexcept {
+    std::memcpy(dst + dst_off,
+                kDigits200.data() + (static_cast<size_t>(v) * 2U), 2U);
+  };
+  copy2(0U, yy_hi);
+  copy2(2U, yy_lo);
   dst[4] = '-';
+  copy2(5U, mo);
   dst[7] = '-';
+  copy2(8U, dd);
   dst[10] = ' ';
+  copy2(11U, hh);
   dst[13] = ':';
+  copy2(14U, mi);
   dst[16] = ':';
+  copy2(17U, ss);
   dst[19] = '+';
   dst[20] = '0';
   dst[21] = '0';
-  for (int i = 13; i >= 0; --i) {
-    dst[kDigitIdx[i]] = static_cast<char>('0' + (packed % 10ULL));
-    packed /= 10ULL;
-  }
 }
 
 }  // namespace
@@ -454,35 +552,100 @@ bool TryEncodeTemporalText(std::span<const char> bytes,
   return true;
 }
 
-bool DecodeTemporalText(std::span<const uint8_t> encoded, const uint8_t* nulls,
-                        uint32_t n, std::vector<char>* bytes_out,
-                        std::vector<uint32_t>* ends_out) {
+namespace {
+
+template <typename ByteT>
+bool DecodeTemporalTextImpl(std::span<const uint8_t> encoded,
+                            const uint8_t* nulls, uint32_t n,
+                            std::vector<ByteT>* bytes_out,
+                            std::vector<uint32_t>* ends_out,
+                            bool lengths_only) {
   if (encoded.size() != static_cast<size_t>(n) * kTemporalTextPackedBytes) {
     return false;
   }
-  bytes_out->clear();
-  bytes_out->reserve(static_cast<size_t>(n) * kTemporalTextAsciiBytes);
   ends_out->resize(n);
-  std::array<char, kTemporalTextAsciiBytes> buf{};
+  if (lengths_only) {
+    bytes_out->clear();
+    uint32_t total = 0;
+    for (uint32_t r = 0; r < n; ++r) {
+      if (nulls != nullptr && nulls[r] != 0) {
+        (*ends_out)[r] = total;
+        continue;
+      }
+      const uint8_t* src =
+          encoded.data() + (static_cast<size_t>(r) * kTemporalTextPackedBytes);
+      uint64_t val = 0;
+      for (size_t b = 0; b < kTemporalTextPackedBytes; ++b) {
+        val |= static_cast<uint64_t>(src[b]) << (b * 8U);
+      }
+      if (val > 99999999999999ULL) {
+        return false;
+      }
+      total += static_cast<uint32_t>(kTemporalTextAsciiBytes);
+      (*ends_out)[r] = total;
+    }
+    return true;
+  }
+  bytes_out->resize(static_cast<size_t>(n) * kTemporalTextAsciiBytes);
+  char* dst = reinterpret_cast<char*>(bytes_out->data());
+  uint32_t* const ends_dst = ends_out->data();
+  const uint8_t* const enc_ptr = encoded.data();
+  uint32_t written = 0;
+  uint64_t prev_val = UINT64_MAX;
   for (uint32_t r = 0; r < n; ++r) {
     if (nulls != nullptr && nulls[r] != 0) {
-      (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+      ends_dst[r] = written;
       continue;
     }
-    const uint8_t* src =
-        encoded.data() + (static_cast<size_t>(r) * kTemporalTextPackedBytes);
+    const uint8_t* const src =
+        enc_ptr + (static_cast<size_t>(r) * kTemporalTextPackedBytes);
     uint64_t val = 0;
-    for (size_t b = 0; b < kTemporalTextPackedBytes; ++b) {
-      val |= static_cast<uint64_t>(src[b]) << (b * 8U);
+    if constexpr (std::endian::native == std::endian::little) {
+      if (r + 1U < n) {
+        std::memcpy(&val, src, sizeof(val));
+        val &= 0x0000FFFFFFFFFFFFULL;
+      } else {
+        std::memcpy(&val, src, kTemporalTextPackedBytes);
+      }
+    } else {
+      for (size_t b = 0; b < kTemporalTextPackedBytes; ++b) {
+        val |= static_cast<uint64_t>(src[b]) << (b * 8U);
+      }
     }
     if (val > 99999999999999ULL) {
+      bytes_out->clear();
       return false;
     }
-    FormatTemporalAscii22(val, buf.data());
-    bytes_out->insert(bytes_out->end(), buf.begin(), buf.end());
-    (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+    if (val == prev_val && written >= kTemporalTextAsciiBytes) {
+      std::memcpy(dst + written, dst + written - kTemporalTextAsciiBytes,
+                  kTemporalTextAsciiBytes);
+    } else {
+      FormatTemporalAscii22(val, dst + written);
+      prev_val = val;
+    }
+    written += static_cast<uint32_t>(kTemporalTextAsciiBytes);
+    ends_dst[r] = written;
   }
+  bytes_out->resize(written);
   return true;
+}
+
+}  // namespace
+
+bool DecodeTemporalText(std::span<const uint8_t> encoded, const uint8_t* nulls,
+                        uint32_t n, std::vector<char>* bytes_out,
+                        std::vector<uint32_t>* ends_out) {
+  return DecodeTemporalTextImpl(encoded, nulls, n, bytes_out, ends_out,
+                                /*lengths_only=*/false);
+}
+
+bool DecodeTemporalTextBytes(std::span<const uint8_t> encoded,
+                             const uint8_t* nulls, uint32_t n,
+                             std::vector<uint8_t>* bytes_out,
+                             std::vector<uint32_t>* ends_out,
+                             bool lengths_only) {
+  return DecodeTemporalTextImpl(encoded, nulls, n, bytes_out, ends_out,
+                                lengths_only);
 }
 
 bool DecodeTemporalTextRow(std::span<const uint8_t> encoded, uint32_t row,
@@ -597,10 +760,22 @@ bool TryEncodeVarCharFrontDict(std::span<const char> bytes,
   return true;
 }
 
-bool DecodeVarCharFrontDict(std::span<const uint8_t> encoded,
-                            const uint8_t* nulls, uint32_t n,
-                            std::vector<char>* bytes_out,
-                            std::vector<uint32_t>* ends_out) {
+namespace {
+
+inline bool ReadVarU32Fast(std::span<const uint8_t> in, size_t* pos,
+                           uint32_t* out) noexcept {
+  if (*pos < in.size() && in[*pos] < 0x80U) {
+    *out = in[(*pos)++];
+    return true;
+  }
+  return ReadVarU32(in, pos, out);
+}
+
+bool DecodeFrontDictHeader(std::span<const uint8_t> encoded, uint32_t n,
+                           uint32_t* dict_size_out, unsigned* bw_out,
+                           size_t* pos_out, RawByteScratch* dict_bytes,
+                           size_t* dict_bytes_len_out,
+                           std::vector<uint32_t>* dict_ends) {
   size_t pos = 0;
   uint32_t dict_size = 0;
   if (!ReadU32Le(encoded, &pos, &dict_size) || pos >= encoded.size() ||
@@ -614,61 +789,343 @@ bool DecodeVarCharFrontDict(std::span<const uint8_t> encoded,
   if (bw != expected_bw || bw > 32U) {
     return false;
   }
-
-  std::vector<std::string> dict(dict_size);
+  dict_ends->resize(dict_size);
+  dict_bytes->Ensure(std::max<size_t>(encoded.size() * 2U, 4096U));
+  size_t written = 0;
+  uint32_t prev_begin = 0;
+  uint32_t prev_len = 0;
+  const uint8_t* const enc_ptr = encoded.data();
+  const size_t enc_size = encoded.size();
   for (uint32_t i = 0; i < dict_size; ++i) {
     uint32_t lcp = 0;
     uint32_t suffix_len = 0;
-    if (!ReadVarU32(encoded, &pos, &lcp) ||
-        !ReadVarU32(encoded, &pos, &suffix_len)) {
+    if (!ReadVarU32Fast(encoded, &pos, &lcp) ||
+        !ReadVarU32Fast(encoded, &pos, &suffix_len)) {
       return false;
     }
     if (i == 0 && lcp != 0) {
       return false;
     }
-    if (i > 0 && lcp > dict[i - 1].size()) {
+    if (i > 0 && lcp > prev_len) {
       return false;
     }
-    if (suffix_len > encoded.size() - pos) {
+    if (suffix_len > enc_size - pos) {
       return false;
     }
-    dict[i].reserve(static_cast<size_t>(lcp) + suffix_len);
+    const size_t cur_len = static_cast<size_t>(lcp) + suffix_len;
+    if (written + cur_len > dict_bytes->capacity) {
+      const size_t new_cap =
+          std::max(written + cur_len, dict_bytes->capacity * 2U);
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): runtime-sized uninit buf.
+      auto next = std::make_unique_for_overwrite<uint8_t[]>(new_cap);
+      if (written > 0) {
+        std::memcpy(next.get(), dict_bytes->data.get(), written);
+      }
+      dict_bytes->data = std::move(next);
+      dict_bytes->capacity = new_cap;
+    }
+    uint8_t* const dst = dict_bytes->data.get() + written;
     if (lcp > 0) {
-      dict[i].append(dict[i - 1].data(), lcp);
+      std::memcpy(dst, dict_bytes->data.get() + prev_begin, lcp);
     }
     if (suffix_len > 0) {
-      dict[i].append(reinterpret_cast<const char*>(encoded.data() + pos),
-                     suffix_len);
+      std::memcpy(dst + lcp, enc_ptr + pos, suffix_len);
       pos += suffix_len;
     }
+    prev_begin = static_cast<uint32_t>(written);
+    prev_len = static_cast<uint32_t>(cur_len);
+    written += cur_len;
+    (*dict_ends)[i] = static_cast<uint32_t>(written);
+  }
+  const size_t expected_id_bytes = (static_cast<size_t>(n) * bw + 7ULL) / 8ULL;
+  if (enc_size - pos != expected_id_bytes) {
+    return false;
+  }
+  *dict_size_out = dict_size;
+  *bw_out = bw;
+  *pos_out = pos;
+  *dict_bytes_len_out = written;
+  return true;
+}
+
+template <typename ByteT>
+bool DecodeVarCharFrontDictImpl(std::span<const uint8_t> encoded,
+                                const uint8_t* nulls, uint32_t n,
+                                std::vector<ByteT>* bytes_out,
+                                std::vector<uint32_t>* ends_out,
+                                bool lengths_only,
+                                std::span<const uint32_t> selected_rows) {
+  if (lengths_only) {
+    size_t pos = 0;
+    uint32_t dict_size = 0;
+    if (!ReadU32Le(encoded, &pos, &dict_size) || pos >= encoded.size() ||
+        dict_size == 0 || dict_size > n) {
+      return false;
+    }
+    const unsigned bw = encoded[pos++];
+    const unsigned expected_bw =
+        dict_size <= 1 ? 0U
+                       : static_cast<unsigned>(std::bit_width(dict_size - 1));
+    if (bw != expected_bw || bw > 32U) {
+      return false;
+    }
+    thread_local std::vector<uint32_t> dict_lens;
+    dict_lens.resize(dict_size);
+    uint32_t prev_len = 0;
+    for (uint32_t i = 0; i < dict_size; ++i) {
+      uint32_t lcp = 0;
+      uint32_t suffix_len = 0;
+      if (!ReadVarU32Fast(encoded, &pos, &lcp) ||
+          !ReadVarU32Fast(encoded, &pos, &suffix_len)) {
+        return false;
+      }
+      if (i == 0 && lcp != 0) {
+        return false;
+      }
+      if (i > 0 && lcp > prev_len) {
+        return false;
+      }
+      if (suffix_len > encoded.size() - pos) {
+        return false;
+      }
+      pos += suffix_len;
+      const uint32_t cur_len = lcp + suffix_len;
+      dict_lens[i] = cur_len;
+      prev_len = cur_len;
+    }
+    const size_t expected_id_bytes =
+        (static_cast<size_t>(n) * bw + 7ULL) / 8ULL;
+    if (encoded.size() - pos != expected_id_bytes) {
+      return false;
+    }
+    bytes_out->clear();
+    ends_out->resize(n);
+    uint32_t* const ends_dst = ends_out->data();
+    const uint32_t* const dlens = dict_lens.data();
+    BitReader reader(encoded, pos);
+    const uint64_t mask = bw > 0 ? ((uint64_t{1} << bw) - 1ULL) : 0ULL;
+    uint32_t total = 0;
+    for (uint32_t r = 0; r < n; ++r) {
+      const uint32_t id = bw > 0 ? reader.ReadBits32Unchecked(bw, mask) : 0U;
+      if (nulls != nullptr && nulls[r] != 0) {
+        ends_dst[r] = total;
+        continue;
+      }
+      if (id >= dict_size) {
+        return false;
+      }
+      total += dlens[id];
+      ends_dst[r] = total;
+    }
+    return true;
   }
 
-  const size_t expected_id_bytes = (static_cast<size_t>(n) * bw + 7ULL) / 8ULL;
-  if (encoded.size() - pos != expected_id_bytes) {
+  thread_local RawByteScratch dict_bytes;
+  thread_local std::vector<uint32_t> dict_ends;
+  thread_local std::vector<uint32_t> row_ids;
+  uint32_t dict_size = 0;
+  unsigned bw = 0;
+  size_t pos = 0;
+  size_t dict_bytes_len = 0;
+  if (!DecodeFrontDictHeader(encoded, n, &dict_size, &bw, &pos, &dict_bytes,
+                             &dict_bytes_len, &dict_ends)) {
+    dict_bytes.TrimIfLarge();
     return false;
   }
 
-  bytes_out->clear();
-  ends_out->resize(n);
+  const uint32_t* const dends = dict_ends.data();
+  const uint8_t* const dict_data = dict_bytes.data.get();
+  const uint64_t mask = bw > 0 ? ((uint64_t{1} << bw) - 1ULL) : 0ULL;
   BitReader reader(encoded, pos);
-  for (uint32_t r = 0; r < n; ++r) {
-    uint64_t id = 0;
-    if (bw > 0 && !reader.ReadBits(bw, &id)) {
-      return false;
+
+  if (!selected_rows.empty()) {
+    row_ids.resize(selected_rows.size());
+    size_t sel_idx = 0;
+    uint64_t total_bytes = 0;
+    for (uint32_t r = 0; r < n; ++r) {
+      const uint32_t id = bw > 0 ? reader.ReadBits32Unchecked(bw, mask) : 0U;
+      if (sel_idx < selected_rows.size() && selected_rows[sel_idx] == r) {
+        if (nulls != nullptr && nulls[r] != 0) {
+          row_ids[sel_idx] = UINT32_MAX;
+        } else {
+          if (id >= dict_size) {
+            dict_bytes.TrimIfLarge();
+            return false;
+          }
+          row_ids[sel_idx] = id;
+          const uint32_t d_begin = id == 0 ? 0U : dends[id - 1];
+          total_bytes += dends[id] - d_begin;
+        }
+        ++sel_idx;
+      } else if ((nulls == nullptr || nulls[r] == 0) && id >= dict_size) {
+        dict_bytes.TrimIfLarge();
+        return false;
+      }
     }
+    bytes_out->resize(static_cast<size_t>(total_bytes));
+    ends_out->resize(n);
+    ByteT* dst = bytes_out->data();
+    uint32_t packed = 0;
+    uint32_t next_row = 0;
+    for (size_t si = 0; si < selected_rows.size(); ++si) {
+      const uint32_t row = selected_rows[si];
+      std::fill_n(ends_out->begin() + next_row, row - next_row, packed);
+      const uint32_t uid = row_ids[si];
+      if (uid != UINT32_MAX) {
+        const uint32_t d_begin = uid == 0 ? 0U : dends[uid - 1];
+        const uint32_t len = dends[uid] - d_begin;
+        if (len > 0) {
+          std::memcpy(dst + packed, dict_data + d_begin, len);
+          packed += len;
+        }
+      }
+      (*ends_out)[row] = packed;
+      next_row = row + 1;
+    }
+    std::fill(ends_out->begin() + next_row, ends_out->end(), packed);
+    dict_bytes.TrimIfLarge();
+    return true;
+  }
+
+  row_ids.resize(n);
+  ends_out->resize(n);
+  uint32_t* const ends_dst = ends_out->data();
+  uint32_t* const ids_dst = row_ids.data();
+  uint64_t total_bytes = 0;
+  for (uint32_t r = 0; r < n; ++r) {
+    const uint32_t id = bw > 0 ? reader.ReadBits32Unchecked(bw, mask) : 0U;
     if (nulls != nullptr && nulls[r] != 0) {
-      (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+      ids_dst[r] = UINT32_MAX;
+      ends_dst[r] = static_cast<uint32_t>(total_bytes);
       continue;
     }
     if (id >= dict_size) {
+      dict_bytes.TrimIfLarge();
       return false;
     }
-    const std::string& s = dict[static_cast<size_t>(id)];
-    if (!s.empty()) {
-      bytes_out->insert(bytes_out->end(), s.begin(), s.end());
-    }
-    (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+    ids_dst[r] = id;
+    const uint32_t d_begin = id == 0 ? 0U : dends[id - 1];
+    total_bytes += dends[id] - d_begin;
+    ends_dst[r] = static_cast<uint32_t>(total_bytes);
   }
+
+  bytes_out->resize(static_cast<size_t>(total_bytes));
+  ByteT* dst = bytes_out->data();
+  for (uint32_t r = 0; r < n; ++r) {
+    const uint32_t uid = ids_dst[r];
+    if (uid == UINT32_MAX) {
+      continue;
+    }
+    const uint32_t d_begin = uid == 0 ? 0U : dends[uid - 1];
+    const uint32_t len = dends[uid] - d_begin;
+    if (len > 0) {
+      std::memcpy(dst, dict_data + d_begin, len);
+      dst += len;
+    }
+  }
+  dict_bytes.TrimIfLarge();
+  return true;
+}
+
+}  // namespace
+
+bool DecodeVarCharFrontDict(std::span<const uint8_t> encoded,
+                            const uint8_t* nulls, uint32_t n,
+                            std::vector<char>* bytes_out,
+                            std::vector<uint32_t>* ends_out) {
+  return DecodeVarCharFrontDictImpl(encoded, nulls, n, bytes_out, ends_out,
+                                    /*lengths_only=*/false, {});
+}
+
+bool DecodeVarCharFrontDictBytes(std::span<const uint8_t> encoded,
+                                 const uint8_t* nulls, uint32_t n,
+                                 std::vector<uint8_t>* bytes_out,
+                                 std::vector<uint32_t>* ends_out,
+                                 bool lengths_only,
+                                 std::span<const uint32_t> selected_rows) {
+  return DecodeVarCharFrontDictImpl(encoded, nulls, n, bytes_out, ends_out,
+                                    lengths_only, selected_rows);
+}
+
+bool MatchVarCharFrontDictContains(std::span<const uint8_t> encoded,
+                                   const uint8_t* nulls, uint32_t n,
+                                   std::string_view needle,
+                                   std::vector<uint32_t>* matching_rows_out) {
+  matching_rows_out->clear();
+  if (needle.empty()) {
+    matching_rows_out->reserve(n);
+    for (uint32_t r = 0; r < n; ++r) {
+      if (nulls == nullptr || nulls[r] == 0) {
+        matching_rows_out->push_back(r);
+      }
+    }
+    return true;
+  }
+  thread_local RawByteScratch dict_bytes;
+  thread_local std::vector<uint32_t> dict_ends;
+  uint32_t dict_size = 0;
+  unsigned bw = 0;
+  size_t pos = 0;
+  size_t dict_bytes_len = 0;
+  if (!DecodeFrontDictHeader(encoded, n, &dict_size, &bw, &pos, &dict_bytes,
+                             &dict_bytes_len, &dict_ends)) {
+    dict_bytes.TrimIfLarge();
+    return false;
+  }
+  const uint8_t* const dict_data = dict_bytes.data.get();
+  const uint8_t* hit =
+      FastMemmem(dict_data, dict_bytes_len, needle.data(), needle.size());
+  if (hit == nullptr) {
+    dict_bytes.TrimIfLarge();
+    return true;
+  }
+
+  thread_local std::vector<uint8_t> dict_match;
+  dict_match.assign(dict_size, 0U);
+  bool any_dict_match = false;
+  const uint32_t* const dends = dict_ends.data();
+  const size_t nlen = needle.size();
+  while (hit != nullptr) {
+    const auto off = static_cast<uint32_t>(hit - dict_data);
+    const auto* const it = std::upper_bound(dends, dends + dict_size, off);
+    if (it == dends + dict_size) {
+      break;
+    }
+    const auto entry_idx = static_cast<uint32_t>(it - dends);
+    const uint32_t entry_end = *it;
+    if (off + nlen <= entry_end) {
+      dict_match[entry_idx] = 1U;
+      any_dict_match = true;
+    }
+    if (entry_end >= dict_bytes_len) {
+      break;
+    }
+    hit = FastMemmem(dict_data + entry_end, dict_bytes_len - entry_end,
+                     needle.data(), nlen);
+  }
+  if (!any_dict_match) {
+    dict_bytes.TrimIfLarge();
+    return true;
+  }
+
+  BitReader reader(encoded, pos);
+  const uint64_t mask = bw > 0 ? ((uint64_t{1} << bw) - 1ULL) : 0ULL;
+  const uint8_t* const dm = dict_match.data();
+  for (uint32_t r = 0; r < n; ++r) {
+    const uint32_t id = bw > 0 ? reader.ReadBits32Unchecked(bw, mask) : 0U;
+    if (nulls != nullptr && nulls[r] != 0) {
+      continue;
+    }
+    if (id >= dict_size) {
+      matching_rows_out->clear();
+      dict_bytes.TrimIfLarge();
+      return false;
+    }
+    if (dm[id] != 0U) {
+      matching_rows_out->push_back(r);
+    }
+  }
+  dict_bytes.TrimIfLarge();
   return true;
 }
 
@@ -730,6 +1187,51 @@ bool TryEncodeBitPackedFor(std::span<const int64_t> ints, const uint8_t* nulls,
   return out->size() == total_size;
 }
 
+namespace {
+
+template <bool kUnitStride>
+inline void UnpackBitPackedForFast56(const uint8_t* payload,
+                                     size_t payload_size, uint32_t n,
+                                     unsigned bw, uint64_t base_u,
+                                     uint64_t stride, int64_t* out) noexcept {
+  const uint64_t mask = (uint64_t{1} << bw) - 1ULL;
+  uint64_t buf = 0;
+  unsigned bits_in_buf = 0;
+  size_t bp = 0;
+  auto refill = [&]() noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+      if (bp + 8U <= payload_size) {
+        uint64_t word = 0;
+        std::memcpy(&word, payload + bp, sizeof(word));
+        const unsigned empty_bytes = (64U - bits_in_buf) >> 3U;
+        buf |= (word << bits_in_buf);
+        bp += empty_bytes;
+        bits_in_buf += empty_bytes << 3U;
+        return;
+      }
+    }
+    while (bits_in_buf <= 56U && bp < payload_size) {
+      buf |= static_cast<uint64_t>(payload[bp++]) << bits_in_buf;
+      bits_in_buf += 8U;
+    }
+  };
+  for (uint32_t r = 0; r < n; ++r) {
+    if (bits_in_buf < bw) {
+      refill();
+    }
+    const uint64_t q = buf & mask;
+    buf >>= bw;
+    bits_in_buf -= bw;
+    if constexpr (kUnitStride) {
+      out[r] = static_cast<int64_t>(base_u + q);
+    } else {
+      out[r] = static_cast<int64_t>(base_u + (q * stride));
+    }
+  }
+}
+
+}  // namespace
+
 bool DecodeBitPackedFor(std::span<const uint8_t> encoded, uint32_t n,
                         int64_t min_int, int64_t* out) {
   if (encoded.size() < 9U) {
@@ -749,6 +1251,17 @@ bool DecodeBitPackedFor(std::span<const uint8_t> encoded, uint32_t n,
     return false;
   }
   const auto base_u = static_cast<uint64_t>(min_int);
+  if (bw <= 56U) {
+    const uint8_t* const payload = encoded.data() + pos;
+    if (stride == 1ULL) {
+      UnpackBitPackedForFast56<true>(payload, expected_payload, n, bw, base_u,
+                                     1ULL, out);
+    } else {
+      UnpackBitPackedForFast56<false>(payload, expected_payload, n, bw, base_u,
+                                      stride, out);
+    }
+    return true;
+  }
   BitReader reader(encoded, pos);
   for (uint32_t r = 0; r < n; ++r) {
     uint64_t q = 0;
@@ -879,28 +1392,104 @@ bool DecodeXorDouble(std::span<const uint8_t> encoded, uint32_t n,
   if (n == 0) {
     return true;
   }
-  BitReader reader(encoded, 0);
-  uint64_t prev = 0;
-  if (!reader.ReadBits(64U, &prev)) {
+  if (encoded.size() < 8U) {
     return false;
+  }
+  const uint8_t* const data = encoded.data();
+  const size_t size = encoded.size();
+  uint64_t prev = 0;
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(&prev, data, sizeof(prev));
+  } else {
+    for (size_t b = 0; b < 8U; ++b) {
+      prev |= static_cast<uint64_t>(data[b]) << (b * 8U);
+    }
   }
   out[0] = static_cast<int64_t>(prev);
   unsigned prev_leading = 64U;
   unsigned prev_trailing = 0U;
 
+  // Register-local 64-bit bit-buffer eliminates 1-5 non-inlined BitReader
+  // calls per double on TPC-H Q01/Q06/Q19/Q20.
+  uint64_t buf = 0;
+  unsigned bits_in_buf = 0;
+  size_t bp = 8U;
+  auto refill = [&]() noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+      if (bp + 8U <= size) {
+        uint64_t word = 0;
+        std::memcpy(&word, data + bp, sizeof(word));
+        const unsigned empty_bytes = (64U - bits_in_buf) >> 3U;
+        buf |= (word << bits_in_buf);
+        bp += empty_bytes;
+        bits_in_buf += empty_bytes << 3U;
+        return;
+      }
+    }
+    while (bits_in_buf <= 56U && bp < size) {
+      buf |= static_cast<uint64_t>(data[bp++]) << bits_in_buf;
+      bits_in_buf += 8U;
+    }
+  };
+  auto read_sig = [&](unsigned sig_bits, uint64_t* sig_out) noexcept -> bool {
+    if (sig_bits <= 56U) {
+      if (bits_in_buf < sig_bits) {
+        refill();
+        if (bits_in_buf < sig_bits) {
+          return false;
+        }
+      }
+      const uint64_t mask = (uint64_t{1} << sig_bits) - 1ULL;
+      *sig_out = buf & mask;
+      buf >>= sig_bits;
+      bits_in_buf -= sig_bits;
+      return true;
+    }
+    if (bits_in_buf < 32U) {
+      refill();
+      if (bits_in_buf < 32U) {
+        return false;
+      }
+    }
+    const uint64_t lo = buf & 0xFFFFFFFFULL;
+    buf >>= 32U;
+    bits_in_buf -= 32U;
+    const unsigned hi_bits = sig_bits - 32U;
+    if (bits_in_buf < hi_bits) {
+      refill();
+      if (bits_in_buf < hi_bits) {
+        return false;
+      }
+    }
+    const uint64_t hi_mask =
+        hi_bits == 32U ? 0xFFFFFFFFULL : ((uint64_t{1} << hi_bits) - 1ULL);
+    const uint64_t hi = buf & hi_mask;
+    buf >>= hi_bits;
+    bits_in_buf -= hi_bits;
+    *sig_out = lo | (hi << 32U);
+    return true;
+  };
+
   for (uint32_t r = 1; r < n; ++r) {
-    uint64_t bit0 = 0;
-    if (!reader.ReadBits(1U, &bit0)) {
+    if (bits_in_buf < 14U) {
+      refill();
+    }
+    if (bits_in_buf == 0U) {
       return false;
     }
+    const uint64_t bit0 = buf & 1ULL;
+    buf >>= 1U;
+    --bits_in_buf;
     if (bit0 == 0ULL) {
       out[r] = static_cast<int64_t>(prev);
       continue;
     }
-    uint64_t bit1 = 0;
-    if (!reader.ReadBits(1U, &bit1)) {
+    if (bits_in_buf == 0U) {
       return false;
     }
+    const uint64_t bit1 = buf & 1ULL;
+    buf >>= 1U;
+    --bits_in_buf;
     uint64_t x = 0;
     if (bit1 == 0ULL) {
       if (prev_leading >= 64U || prev_leading + prev_trailing >= 64U) {
@@ -908,27 +1497,31 @@ bool DecodeXorDouble(std::span<const uint8_t> encoded, uint32_t n,
       }
       const unsigned sig_bits = 64U - prev_leading - prev_trailing;
       uint64_t sig = 0;
-      if (!reader.ReadBits(sig_bits, &sig)) {
+      if (!read_sig(sig_bits, &sig)) {
         return false;
       }
       x = sig << prev_trailing;
     } else {
-      uint64_t lead = 0;
-      uint64_t sig_minus_1 = 0;
-      if (!reader.ReadBits(6U, &lead) || !reader.ReadBits(6U, &sig_minus_1)) {
-        return false;
+      if (bits_in_buf < 12U) {
+        refill();
+        if (bits_in_buf < 12U) {
+          return false;
+        }
       }
-      const unsigned sig_bits = static_cast<unsigned>(sig_minus_1) + 1U;
+      const auto lead = static_cast<unsigned>(buf & 0x3FULL);
+      const auto sig_bits = static_cast<unsigned>(((buf >> 6U) & 0x3FULL) + 1U);
+      buf >>= 12U;
+      bits_in_buf -= 12U;
       if (lead + sig_bits > 64U) {
         return false;
       }
-      const unsigned trailing = 64U - static_cast<unsigned>(lead) - sig_bits;
+      const unsigned trailing = 64U - lead - sig_bits;
       uint64_t sig = 0;
-      if (!reader.ReadBits(sig_bits, &sig)) {
+      if (!read_sig(sig_bits, &sig)) {
         return false;
       }
       x = sig << trailing;
-      prev_leading = static_cast<unsigned>(lead);
+      prev_leading = lead;
       prev_trailing = trailing;
     }
     prev ^= x;
@@ -1088,16 +1681,20 @@ bool TryEncodeVarCharPhraseTable(std::span<const char> bytes,
   return out->size() < raw_total;
 }
 
-bool DecodeVarCharPhraseTable(std::span<const uint8_t> encoded,
-                              const uint8_t* nulls, uint32_t n,
-                              std::vector<char>* bytes_out,
-                              std::vector<uint32_t>* ends_out) {
+namespace {
+
+template <typename ByteT>
+bool DecodeVarCharPhraseTableImpl(std::span<const uint8_t> encoded,
+                                  const uint8_t* nulls, uint32_t n,
+                                  std::vector<ByteT>* bytes_out,
+                                  std::vector<uint32_t>* ends_out,
+                                  bool lengths_only) {
   if (encoded.empty()) {
     return false;
   }
   size_t pos = 0;
   const uint8_t num_phrases = encoded[pos++];
-  std::vector<std::string_view> phrases(num_phrases);
+  std::array<std::string_view, 256> phrases{};
   for (uint8_t i = 0; i < num_phrases; ++i) {
     if (pos >= encoded.size()) {
       return false;
@@ -1111,7 +1708,11 @@ bool DecodeVarCharPhraseTable(std::span<const uint8_t> encoded,
     pos += plen;
   }
   bytes_out->clear();
+  if (!lengths_only) {
+    bytes_out->reserve(encoded.size() * 2U);
+  }
   ends_out->resize(n);
+  uint32_t total = 0;
   for (uint32_t r = 0; r < n; ++r) {
     uint32_t enc_len = 0;
     if (!ReadVarU32(encoded, &pos, &enc_len) ||
@@ -1121,7 +1722,7 @@ bool DecodeVarCharPhraseTable(std::span<const uint8_t> encoded,
     const size_t row_end = pos + enc_len;
     if (nulls != nullptr && nulls[r] != 0) {
       pos = row_end;
-      (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+      (*ends_out)[r] = total;
       continue;
     }
     while (pos < row_end) {
@@ -1130,18 +1731,46 @@ bool DecodeVarCharPhraseTable(std::span<const uint8_t> encoded,
         if (pos >= row_end) {
           return false;
         }
-        bytes_out->push_back(static_cast<char>(encoded[pos++]));
+        const uint8_t lit = encoded[pos++];
+        if (!lengths_only) {
+          bytes_out->push_back(static_cast<ByteT>(lit));
+        }
+        ++total;
       } else {
         if (tok >= num_phrases) {
           return false;
         }
         const std::string_view sv = phrases[tok];
-        bytes_out->insert(bytes_out->end(), sv.begin(), sv.end());
+        if (!lengths_only) {
+          const size_t cur = bytes_out->size();
+          bytes_out->resize(cur + sv.size());
+          std::memcpy(bytes_out->data() + cur, sv.data(), sv.size());
+        }
+        total += static_cast<uint32_t>(sv.size());
       }
     }
-    (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+    (*ends_out)[r] = total;
   }
   return pos == encoded.size();
+}
+
+}  // namespace
+
+bool DecodeVarCharPhraseTable(std::span<const uint8_t> encoded,
+                              const uint8_t* nulls, uint32_t n,
+                              std::vector<char>* bytes_out,
+                              std::vector<uint32_t>* ends_out) {
+  return DecodeVarCharPhraseTableImpl(encoded, nulls, n, bytes_out, ends_out,
+                                      /*lengths_only=*/false);
+}
+
+bool DecodeVarCharPhraseTableBytes(std::span<const uint8_t> encoded,
+                                   const uint8_t* nulls, uint32_t n,
+                                   std::vector<uint8_t>* bytes_out,
+                                   std::vector<uint32_t>* ends_out,
+                                   bool lengths_only) {
+  return DecodeVarCharPhraseTableImpl(encoded, nulls, n, bytes_out, ends_out,
+                                      lengths_only);
 }
 
 // ============================================================================
@@ -1156,6 +1785,52 @@ bool HasZstdSupport() noexcept {
 #endif
 }
 
+#ifdef TINYLAMB_HAS_ZSTD
+namespace {
+
+struct ThreadLocalZstdCCtx {
+  ZSTD_CCtx* ctx{nullptr};
+  ThreadLocalZstdCCtx() = default;
+  ThreadLocalZstdCCtx(const ThreadLocalZstdCCtx&) = delete;
+  ThreadLocalZstdCCtx& operator=(const ThreadLocalZstdCCtx&) = delete;
+  ThreadLocalZstdCCtx(ThreadLocalZstdCCtx&&) = delete;
+  ThreadLocalZstdCCtx& operator=(ThreadLocalZstdCCtx&&) = delete;
+  ~ThreadLocalZstdCCtx() {
+    if (ctx != nullptr) {
+      ZSTD_freeCCtx(ctx);
+    }
+  }
+  ZSTD_CCtx* Get() noexcept {
+    if (ctx == nullptr) {
+      ctx = ZSTD_createCCtx();
+    }
+    return ctx;
+  }
+};
+
+struct ThreadLocalZstdDCtx {
+  ZSTD_DCtx* ctx{nullptr};
+  ThreadLocalZstdDCtx() = default;
+  ThreadLocalZstdDCtx(const ThreadLocalZstdDCtx&) = delete;
+  ThreadLocalZstdDCtx& operator=(const ThreadLocalZstdDCtx&) = delete;
+  ThreadLocalZstdDCtx(ThreadLocalZstdDCtx&&) = delete;
+  ThreadLocalZstdDCtx& operator=(ThreadLocalZstdDCtx&&) = delete;
+  ~ThreadLocalZstdDCtx() {
+    if (ctx != nullptr) {
+      ZSTD_freeDCtx(ctx);
+    }
+  }
+  ZSTD_DCtx* Get() noexcept {
+    if (ctx == nullptr) {
+      ctx = ZSTD_createDCtx();
+    }
+    return ctx;
+  }
+};
+
+}  // namespace
+#endif
+
 bool TryCompressZstdFrame(std::span<const uint8_t> payload, uint8_t inner_tag,
                           uint8_t inner_subtag, int level,
                           std::vector<uint8_t>* out) {
@@ -1169,8 +1844,13 @@ bool TryCompressZstdFrame(std::span<const uint8_t> payload, uint8_t inner_tag,
   // 10-byte header: [u8 inner_tag][u8 inner_subtag][u32 orig_len][u32 crc32c]
   constexpr size_t kHdr = 10U;
   out->resize(kHdr + bound);
-  const size_t csize = ZSTD_compress(out->data() + kHdr, bound, payload.data(),
-                                     payload.size(), level);
+  thread_local ThreadLocalZstdCCtx tl_cctx;
+  ZSTD_CCtx* cctx = tl_cctx.Get();
+  const size_t csize =
+      cctx != nullptr ? ZSTD_compressCCtx(cctx, out->data() + kHdr, bound,
+                                          payload.data(), payload.size(), level)
+                      : ZSTD_compress(out->data() + kHdr, bound, payload.data(),
+                                      payload.size(), level);
   if (ZSTD_isError(csize) != 0 || kHdr + csize >= payload.size()) {
     out->clear();
     return false;
@@ -1192,10 +1872,10 @@ bool TryCompressZstdFrame(std::span<const uint8_t> payload, uint8_t inner_tag,
 #endif
 }
 
-bool DecompressZstdFrame(std::span<const uint8_t> encoded,
-                         uint8_t* inner_tag_out, uint8_t* inner_subtag_out,
-                         std::vector<uint8_t>* payload_out) {
-  payload_out->clear();
+bool DecompressZstdFrameRaw(std::span<const uint8_t> encoded,
+                            uint8_t* inner_tag_out, uint8_t* inner_subtag_out,
+                            std::span<const uint8_t>* payload_out) {
+  *payload_out = {};
 #ifdef TINYLAMB_HAS_ZSTD
   constexpr size_t kHdr = 10U;
   if (encoded.size() <= kHdr) {
@@ -1210,24 +1890,27 @@ bool DecompressZstdFrame(std::span<const uint8_t> encoded,
   if (orig_len == 0 || orig_len > (256U << 20U)) {
     return false;
   }
-  // Validate the Zstd frame header before allocating `orig_len` bytes so a
-  // corrupt or fuzzed 15-byte header cannot trigger a 256 MiB OOM allocation.
   const unsigned long long frame_size =
       ZSTD_getFrameContentSize(encoded.data() + kHdr, encoded.size() - kHdr);
   if (frame_size == ZSTD_CONTENTSIZE_ERROR ||
       frame_size == ZSTD_CONTENTSIZE_UNKNOWN || frame_size != orig_len) {
     return false;
   }
-  payload_out->resize(orig_len);
+  thread_local RawByteScratch tl_buf;
+  tl_buf.TrimIfLarge();
+  tl_buf.Ensure(orig_len);
+  thread_local ThreadLocalZstdDCtx tl_dctx;
+  ZSTD_DCtx* dctx = tl_dctx.Get();
   const size_t dsize =
-      ZSTD_decompress(payload_out->data(), orig_len, encoded.data() + kHdr,
-                      encoded.size() - kHdr);
+      dctx != nullptr
+          ? ZSTD_decompressDCtx(dctx, tl_buf.data.get(), orig_len,
+                                encoded.data() + kHdr, encoded.size() - kHdr)
+          : ZSTD_decompress(tl_buf.data.get(), orig_len, encoded.data() + kHdr,
+                            encoded.size() - kHdr);
   if (ZSTD_isError(dsize) != 0 || dsize != orig_len) {
-    payload_out->clear();
     return false;
   }
-  if (Crc32C(payload_out->data(), orig_len) != expected_crc) {
-    payload_out->clear();
+  if (Crc32C(tl_buf.data.get(), orig_len) != expected_crc) {
     return false;
   }
   if (inner_tag_out != nullptr) {
@@ -1236,6 +1919,7 @@ bool DecompressZstdFrame(std::span<const uint8_t> encoded,
   if (inner_subtag_out != nullptr) {
     *inner_subtag_out = inner_subtag;
   }
+  *payload_out = std::span<const uint8_t>(tl_buf.data.get(), orig_len);
   return true;
 #else
   (void)encoded;
@@ -1243,6 +1927,18 @@ bool DecompressZstdFrame(std::span<const uint8_t> encoded,
   (void)inner_subtag_out;
   return false;
 #endif
+}
+
+bool DecompressZstdFrame(std::span<const uint8_t> encoded,
+                         uint8_t* inner_tag_out, uint8_t* inner_subtag_out,
+                         std::vector<uint8_t>* payload_out) {
+  payload_out->clear();
+  std::span<const uint8_t> raw;
+  if (!DecompressZstdFrameRaw(encoded, inner_tag_out, inner_subtag_out, &raw)) {
+    return false;
+  }
+  payload_out->assign(raw.begin(), raw.end());
+  return true;
 }
 
 bool TryEncodeZstdVarChar(std::span<const char> bytes,
@@ -1291,39 +1987,171 @@ bool TryEncodeZstdVarChar(std::span<const char> bytes,
 #endif
 }
 
+namespace {
+
+template <typename ByteT>
+bool DecodeZstdVarCharUnpackedImpl(std::span<const uint8_t> packed,
+                                   const uint8_t* nulls, uint32_t n,
+                                   std::vector<ByteT>* bytes_out,
+                                   std::vector<uint32_t>* ends_out,
+                                   bool lengths_only,
+                                   std::span<const uint32_t> selected_rows) {
+  ends_out->resize(n);
+  uint32_t* const ends_dst = ends_out->data();
+  const uint8_t* const base = packed.data();
+  const size_t packed_size = packed.size();
+  size_t pos = 0;
+
+  if (lengths_only) {
+    bytes_out->clear();
+    uint32_t total = 0;
+    for (uint32_t r = 0; r < n; ++r) {
+      uint32_t len = 0;
+      if (pos < packed_size && base[pos] < 0x80U) {
+        len = base[pos++];
+      } else if (!ReadVarU32(packed, &pos, &len)) {
+        return false;
+      }
+      if (len > packed_size - pos) {
+        return false;
+      }
+      if (nulls == nullptr || nulls[r] == 0) {
+        total += len;
+      }
+      pos += len;
+      ends_dst[r] = total;
+    }
+    return pos == packed_size;
+  }
+
+  if (!selected_rows.empty()) {
+    bytes_out->clear();
+    size_t sel_idx = 0;
+    uint32_t written = 0;
+    for (uint32_t r = 0; r < n; ++r) {
+      uint32_t len = 0;
+      if (pos < packed_size && base[pos] < 0x80U) {
+        len = base[pos++];
+      } else if (!ReadVarU32(packed, &pos, &len)) {
+        bytes_out->clear();
+        return false;
+      }
+      if (len > packed_size - pos) {
+        bytes_out->clear();
+        return false;
+      }
+      if (sel_idx < selected_rows.size() && selected_rows[sel_idx] == r) {
+        if ((nulls == nullptr || nulls[r] == 0) && len > 0) {
+          const size_t cur = bytes_out->size();
+          bytes_out->resize(cur + len);
+          std::memcpy(bytes_out->data() + cur, base + pos, len);
+          written += len;
+        }
+        ++sel_idx;
+      }
+      pos += len;
+      ends_dst[r] = written;
+    }
+    return pos == packed_size;
+  }
+
+  // Decoded bytes are always <= packed.size() (each row has >= 1 varint byte).
+  bytes_out->resize(packed_size);
+  ByteT* dst = bytes_out->data();
+  uint32_t written = 0;
+  for (uint32_t r = 0; r < n; ++r) {
+    uint32_t len = 0;
+    if (pos < packed_size && base[pos] < 0x80U) {
+      len = base[pos++];
+    } else if (!ReadVarU32(packed, &pos, &len)) {
+      bytes_out->clear();
+      return false;
+    }
+    if (len > packed_size - pos) {
+      bytes_out->clear();
+      return false;
+    }
+    if (nulls == nullptr || nulls[r] == 0) {
+      if (len > 0) {
+        std::memcpy(dst + written, base + pos, len);
+        written += len;
+      }
+    }
+    pos += len;
+    ends_dst[r] = written;
+  }
+  bytes_out->resize(written);
+  return pos == packed_size;
+}
+
+}  // namespace
+
 bool DecodeZstdVarChar(std::span<const uint8_t> encoded, const uint8_t* nulls,
                        uint32_t n, std::vector<char>* bytes_out,
                        std::vector<uint32_t>* ends_out) {
   uint8_t tag = 0;
   uint8_t subtag = 0;
-  std::vector<uint8_t> packed;
-  if (!DecompressZstdFrame(encoded, &tag, &subtag, &packed)) {
+  std::span<const uint8_t> packed;
+  if (!DecompressZstdFrameRaw(encoded, &tag, &subtag, &packed)) {
     return false;
   }
-  bytes_out->clear();
-  ends_out->resize(n);
-  size_t pos = 0;
-  for (uint32_t r = 0; r < n; ++r) {
-    uint32_t len = 0;
-    if (!ReadVarU32(packed, &pos, &len) || len > packed.size() - pos) {
-      return false;
-    }
-    if (nulls == nullptr || nulls[r] == 0) {
-      if (len > 0) {
-        bytes_out->insert(
-            bytes_out->end(),
-            reinterpret_cast<const char*>(packed.data() + pos),
-            reinterpret_cast<const char*>(packed.data() + pos + len));
+  return DecodeZstdVarCharUnpackedImpl(packed, nulls, n, bytes_out, ends_out,
+                                       /*lengths_only=*/false, {});
+}
+
+bool DecodeZstdVarCharUnpackedBytes(std::span<const uint8_t> packed,
+                                    const uint8_t* nulls, uint32_t n,
+                                    std::vector<uint8_t>* bytes_out,
+                                    std::vector<uint32_t>* ends_out,
+                                    bool lengths_only,
+                                    std::span<const uint32_t> selected_rows) {
+  return DecodeZstdVarCharUnpackedImpl(packed, nulls, n, bytes_out, ends_out,
+                                       lengths_only, selected_rows);
+}
+
+bool MatchZstdVarCharUnpackedContains(
+    std::span<const uint8_t> packed, const uint8_t* nulls, uint32_t n,
+    std::string_view needle, std::vector<uint32_t>* matching_rows_out) {
+  matching_rows_out->clear();
+  if (needle.empty()) {
+    matching_rows_out->reserve(n);
+    for (uint32_t r = 0; r < n; ++r) {
+      if (nulls == nullptr || nulls[r] == 0) {
+        matching_rows_out->push_back(r);
       }
     }
-    pos += len;
-    (*ends_out)[r] = static_cast<uint32_t>(bytes_out->size());
+    return true;
   }
-  return pos == packed.size();
+  const uint8_t* const base = packed.data();
+  const size_t packed_size = packed.size();
+  if (FastMemmem(base, packed_size, needle.data(), needle.size()) == nullptr) {
+    return true;
+  }
+  size_t pos = 0;
+  const size_t nlen = needle.size();
+  for (uint32_t r = 0; r < n; ++r) {
+    uint32_t len = 0;
+    if (pos < packed_size && base[pos] < 0x80U) {
+      len = base[pos++];
+    } else if (!ReadVarU32(packed, &pos, &len)) {
+      matching_rows_out->clear();
+      return false;
+    }
+    if (len > packed_size - pos) {
+      matching_rows_out->clear();
+      return false;
+    }
+    if ((nulls == nullptr || nulls[r] == 0) && len >= nlen &&
+        FastMemmem(base + pos, len, needle.data(), nlen) != nullptr) {
+      matching_rows_out->push_back(r);
+    }
+    pos += len;
+  }
+  return pos == packed_size;
 }
 
 // ============================================================================
-// 8. ClickBenchLayout.Storage: TieOrientation, ClockWindow, HashExceptions
+// 8. ClickstreamLayout.Storage: TieOrientation, ClockWindow, HashExceptions
 // ============================================================================
 
 namespace {

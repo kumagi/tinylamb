@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `CascadeFence` — Reuse a cached cascade even across FK additions/removals and cycles:
+  there must be no outgoing boundary edge, and every formerly dependent object must
+  still have a root path inside the cached set. Both tests are necessary.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -2,6 +2,20 @@ import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 import TinylambOpt.ResearchProofs.Compression.Wire
 import Std
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved (100 claims, including the following)
+
+- `AsciiOnly.Checkpoint` — A saved state at a prefix resumes scanning across further
+  phrase boundaries.
+- `AsciiOnly.ContextReuse` — Substitute a different grammar with the same transition
+  table inside a larger row.
+- `AsciiOnly.DictionaryMask` — Cache acceptance once per phrase; a missing local
+  dictionary code is rejected.
+-/
+
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans.Common

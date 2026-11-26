@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 import TinylambOpt.ResearchProofs.Atlas.Goal_PositiveJumps_SharedMagnitude
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `PositiveJumps.ReverseBalance` — `∀ x, measure x - measure x.reverse =
+  x.getLast?.getD 0-x.head?.getD 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

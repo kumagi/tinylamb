@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `PowerBucket.WidthRunCount` — `∀ rs, (rle ((physical key rs).map (fun p => width
+  p.1))).length = (rs.map (fun (p : Row) => width p.1)).eraseDups.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

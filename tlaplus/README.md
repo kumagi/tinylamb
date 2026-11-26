@@ -1,6 +1,6 @@
 # tlaplus/
 
-TLA+ による設計モデル。今は 1 本だけ。
+TLA+ による設計モデル。
 
 | モデル | 対象 |
 |---|---|
@@ -118,3 +118,49 @@ snap より後に追記されたコミットがこの穴を通る。
 は WAL の同期を止めたままチェックポイントを開始し、その時点のファイルを複写して
 再起動する。kCommit が WAL に届いていない更新について、復旧後の行が更新前の値
 `old` を保つことを検査する。
+
+## Primary + S3 のモデル（[docs/primary-s3.md](../docs/primary-s3.md)）
+
+| モデル | 対象 |
+|---|---|
+| `S3Wal.tla` | WAL のパイプライン送信（条件付き PUT、遅れた到着、応答の喪失、再送）、連続した接頭部での応答、エポックの封印と作成、追い越し、ゾンビ writer、再起動時のローカル状態（正式な履歴の末尾で切り詰める）、S3 チェックポイント、封印の削除（外した版だけ） |
+| `ReplyBarrier.tla` | 応答のバリア。現行の D4（版の依存）と、木ごとの公開済み変更 LSN・公開済みコミット LSN・`BufferedLSN` の各規則 |
+| `ObjectGc.tla` | データオブジェクトのアップロード・参照と、マーク・スイープの GC。消せるのは、マークの時点で確定済み（作成エポックが封印済みか、writer が確定を宣言した）のものだけ |
+
+設定名の接頭辞でモデルを選ぶ（`s3wal_*`、`barrier_*`、`objgc_*`）。`*_design*` と通過を期待する設定は全不変条件が成り立つこと、`*_bug_*` は設計の規則を 1 つ外すと狙った不変条件が落ちることを確かめる。
+
+| 設定 | 期待 | 落ちる不変条件 |
+|---|---|---|
+| `s3wal_design`、`s3wal_design_nofsync`、`s3wal_design_w3` | 通過 | — |
+| `s3wal_bug_noncontig` | 違反 | `DurableIsOfficial` |
+| `s3wal_bug_same_epoch` | 違反 | `ActiveWriterAgrees` |
+| `s3wal_bug_noseal` | 違反 | `HistoryMonotone` |
+| `s3wal_bug_trust412` | 違反 | `DurableIsOfficial` |
+| `s3wal_bug_reuse`、`s3wal_bug_tail` | 違反 | `RestoredIsOfficial` |
+| `s3wal_bug_ckpt` | 違反 | `CkptConsistent` |
+| `s3wal_bug_chase`、`s3wal_bug_t2race` | 違反 | `ActiveEpochUnsealed` |
+| `s3wal_bug_sealgc` | 違反 | `NoLostAck` |
+| `barrier_version_heap`、`barrier_tree`、`barrier_snapshot`、`barrier_buffered` | 通過 | — |
+| `barrier_version`、`barrier_version_gc`、`barrier_tree_late` | 違反 | `ObservedDurable` |
+| `objgc_design` | 通過 | — |
+| `objgc_bug_timebased`、`objgc_bug_tail`、`objgc_bug_late_seal`、`objgc_bug_dedupe`、`objgc_bug_settle_early` | 違反 | `RefsResolve` |
+
+`s3wal_design` は 32 コアで約 1.5 分（約 300 万状態）、`s3wal_design_nofsync` は約 3 分（約 380 万状態）かかる。`run.sh` は `-noGenerateSpecTE` を付けて実行するので、反例は `out/<設定名>.log` にだけ出て、`<Module>_TTrace_*` のファイルは残らない。
+
+### S3Wal.tla の要素
+
+| モデルの要素 | 設計 |
+|---|---|
+| `Cut` / `Land` / `Receive` / `Resend` / `DropResp` | チャンクの切り出しと条件付き PUT、S3 での適用、応答（412 はチェックサムで照合）、再送・ヘッジ、応答の喪失 |
+| `Ack` | S3 永続化 LSN 以下のコミットへの成功応答 |
+| `PublishCkpt` | S3 チェックポイントの公開 |
+| `Crash` / `DiskLoss` | プロセスの停止（送信中の要求は残る）、ディスクの交換 |
+| `BeginTransfer` → `PickTarget` → `ScanStep` → `CreateEpoch` → `Prepare` → `Activate` | 転送の T1〜T6（`PickTarget` が T2 の `tgen` の確認） |
+| `DeleteSeal` | 旧エポックの封印の削除（`SealsDeletable` のときだけ） |
+
+### 抽象化して省いたもの
+
+- 読み取りの隔離とリース、読者の登録、マニフェストの連鎖、standby の適用、LSN のパディング、マルチパート、範囲キャッシュ
+- WAL の GC（封印の削除だけは `s3wal_bug_sealgc` で扱う）
+- レコードの中身。レコードは一意な ID で、別の履歴が同じに見えることはない
+- 切り出しの方針。`Cut` は任意の時点・任意の範囲を選べるので、適応型の切り出しとヘッジはモデルの振る舞いに含まれる

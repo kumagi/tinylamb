@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `BalanceFloor.RepeatPower` — Evaluate grammar repetition by binary powers of the
+  summary.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

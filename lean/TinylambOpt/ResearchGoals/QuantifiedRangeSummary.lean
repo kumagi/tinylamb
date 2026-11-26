@@ -1,6 +1,15 @@
 import TinylambOpt.ThreeValued
 import Std
 
+/-!
+These claims use range summaries to represent quantified predicates. A SQL filter can
+use such a summary only where it preserves the modeled truth and empty-input behavior.
+
+Modeled claims
+
+- `Goal` — `∀ q rows key x, probe q (index rows) key x = reference q rows key x`
+-/
+
 namespace TinylambOpt.ResearchGoals.QuantifiedRangeSummary
 
 abbrev Cell := Option Int

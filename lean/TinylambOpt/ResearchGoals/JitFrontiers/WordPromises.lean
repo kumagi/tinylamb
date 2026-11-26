@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
 /-! Single-result i64 fragment with defined operands. None denotes a poison

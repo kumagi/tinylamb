@@ -1886,6 +1886,7 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
     return Status::kSuccess;
   };
 
+  const bool had_existing_tlcs = (existing_tlcs != nullptr);
   const size_t target_count =
       std::max<size_t>(1, pending.block_row_counts.size());
   lsn_t compaction_lsn = pending.max_chain_lsn;
@@ -1916,10 +1917,6 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
                          TlcsFile::Open(final_path, tbl.GetSchema()));
         RETURN_IF_FAIL(rebuild_indexes(compact_ctx.txn_, *temp_tlcs));
       }
-      for (size_t j = target_count; j < pending.old_pids.size(); ++j) {
-        RETURN_IF_FAIL(
-            compact_ctx.txn_.DestroyPageLog(pending.old_pids[j]).GetStatus());
-      }
       if (compact_ctx.txn_.HasLogRecord()) {
         RETURN_IF_FAIL(compact_ctx.txn_.PreCommit());
       }
@@ -1928,10 +1925,6 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
         ASSIGN_OR_RETURN(std::shared_ptr<TlcsFile>, temp_tlcs,
                          TlcsFile::Open(final_path, tbl.GetSchema()));
         RETURN_IF_FAIL(rebuild_indexes(ctx.txn_, *temp_tlcs));
-      }
-      for (size_t j = target_count; j < pending.old_pids.size(); ++j) {
-        RETURN_IF_FAIL(
-            ctx.txn_.DestroyPageLog(pending.old_pids[j]).GetStatus());
       }
     }
 
@@ -2001,7 +1994,7 @@ Status Database::CompactTableToTlcs(TransactionContext& ctx,
   incarnation->AbortDrop();
   resume_guard.active = false;
 
-  if (write_checkpoint) {
+  if (write_checkpoint || tbl.IndexCount() > 0 || had_existing_tlcs) {
     RETURN_IF_FAIL(storage_->cm_->WriteCheckpoint().GetStatus());
   }
 

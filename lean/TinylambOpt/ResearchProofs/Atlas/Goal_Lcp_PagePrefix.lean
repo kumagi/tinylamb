@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.PagePrefix` — `∀ (p a b w : Word), a ≤ w → w ≤ b → p.isPrefixOf a → p.isPrefixOf
+  b → p.isPrefixOf w`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

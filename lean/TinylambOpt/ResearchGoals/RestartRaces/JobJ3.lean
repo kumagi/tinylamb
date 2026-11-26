@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+-/
+
 namespace TinylambOpt.ResearchGoals.RestartRaces.JobJ3
 
 abbrev Edge := Nat × Nat -- role-qualified cast occurrence (person, movie)

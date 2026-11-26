@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Buggy cache keyed only by `(sqlId, schemaGen)` (omitting `optBits`) replays stale plans
+after toggling an optimization off via env/flag.
+
+Modeled claims
+
+- `Goal` — Plan cache invalidation with optimizer-toggle bitmask
+  (`query/plan_cache.hpp` `PreparedPlanCache` / `CurrentCompiledPlans`,
+  `expression/bytecode.cpp` `BytecodeOptToggleBits`): keying cached plans by `(sqlId,
+  schemaGen, optBits)` always produces the uncached plan and execution result without
+  ever recompiling an already-seen `(sqlId, schemaGen, optBits)` triple.
+-/
+
 namespace TinylambOpt.ResearchGoals.PlanCacheToggleInvalidation
 
 structure OptCfg where

@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.ScatterBack` — `∀ (payload : List Int) (ids : List Nat), let addresses :=
+  ids.mergeSort.eraseDups let cache := addresses.map (fun i => payload[i]?) ids.map
+  (fun i => (cache[addresses.idxOf i]?).join) = ids.map (fun i => payload[i]?)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

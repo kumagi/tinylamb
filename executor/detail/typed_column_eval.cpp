@@ -250,7 +250,7 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
     }
     const size_t mid_pct = literal.find('%');
     if (mid_pct != std::string_view::npos) {
-      // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+      // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
       //   (two_segment_like_greedy_earliest_iff,
       //    two_segment_like_no_first_literal)
       // Support `%seg1%seg2%` (leading + trailing `%` with one interior `%`
@@ -1918,7 +1918,7 @@ std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
   // T4824: cache each argument child's ToString alongside the spec; the
   // match loop used to re-serialize the stored expression on every probe.
   std::vector<std::string> argument_child_strs;
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (rollup_sum_homomorphic_arbitrary_expr_sound)
   const auto valid_partial_agg_child = [](const Expression& ch) -> bool {
     if (!ch || ContainsQuery(ch) || ContainsAggregate(ch) ||
@@ -2224,7 +2224,7 @@ bool CanUseExactIntegerGroupingSets(TransactionContext& context,
                // expression (e.g. TPC-DS Q67's COALESCE(a*b, 0)), not just a
                // bare column -- PlanExactIntegerGroupingSets already accepts
                // that shape via valid_partial_agg_child().
-               // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+               // Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
                //   (rollup_two_level_state_combine_sound,
                //    rollup_three_level_state_combine_sound),
                //   lean/TinylambOpt/ProposedProofs/GroupingSetsReuse.lean
@@ -2413,7 +2413,7 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       }
       return spec;
     }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (order_by_projected_expr_ordinal_sound)
     if (term.expression->Type() != TypeTag::kColumnValue) {
       const std::string want = term.expression->ToString();

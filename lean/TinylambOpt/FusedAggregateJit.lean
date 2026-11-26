@@ -112,3 +112,6 @@ theorem modular_reassociate (a b c d : BitVec 64) :
   bv_decide
 
 end TinylambOpt.FusedAggregateJit
+
+-- C++ references to this model or its proof.
+-- expression/jit.cpp

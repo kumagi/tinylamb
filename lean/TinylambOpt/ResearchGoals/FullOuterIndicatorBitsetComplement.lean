@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Single unified pass using a 2-bit tagger on non-null pairs `(k1, k2)` plus explicit
+tracking of partial-NULL distinct pairs `(some k1, none)`.
+
+Modeled claims
+
+- `Goal` — Single-table 2-bit indicator complement for `FULL OUTER JOIN` of two
+  deduplicated streams (TPC-DS Q97 `ssci FULL OUTER JOIN csci`): counting `tag=1`,
+  `tag=2`, `tag=3` in one unified non-null hash set plus `(some k1, none)`
+  partial-NULL orphans reproduces exact `(store_only, catalog_only,
+  store_and_catalog)` without materializing or joining two hash tables.
+-/
+
 namespace TinylambOpt.ResearchGoals.FullOuterIndicatorBitsetComplement
 
 abbrev Key := Option Int × Option Int

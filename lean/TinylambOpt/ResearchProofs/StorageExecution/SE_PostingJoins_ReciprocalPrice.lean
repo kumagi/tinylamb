@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved (10 claims, including the following)
+
+- `ReciprocalPrice.FreeItem` — `∀ u t ys, valid u ys → fan search u t 0 ys = ys.length`
+- `ReciprocalPrice.IntegralSum` — Subtraction on a stored prefix-sum column yields the
+  right payload sum.
+- `ReciprocalPrice.KthMatch` — Top offset within the matching postings preserves tie
+  multiplicity and right ordering.
+-/
+
 set_option maxHeartbeats 0
 
 namespace Helpers_ReciprocalPrice

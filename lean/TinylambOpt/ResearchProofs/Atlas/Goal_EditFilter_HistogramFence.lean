@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `EditFilter.HistogramFence` — `∀ k s t, Edits k s t → ((s++t).eraseDups.map (fun a =>
+  ((s.count a:Int)-t.count a).natAbs)).sum ≤ 2*k`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

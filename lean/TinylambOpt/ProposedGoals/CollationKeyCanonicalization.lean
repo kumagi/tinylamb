@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Values are byte strings; a collation maps them to canonical sort keys.
+
+The key must not merge two distinct raw values (no over-grouping). Congruence in the
+other direction is automatic because `key` is a function.
+
+Modeled claims
+
+- `Goal` — Key-based grouping and ordering may replace raw grouping and ordering as
+  long as the key does not merge distinct raw values and preserves order.
+-/
+
 namespace TinylambOpt.ProposedGoals.CollationKeyCanonicalization
 
 /-- Values are byte strings; a collation maps them to canonical sort keys. -/

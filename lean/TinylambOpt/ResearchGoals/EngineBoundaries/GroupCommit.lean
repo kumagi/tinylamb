@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
 /-! LSNs are exclusive byte ends. One successful sync may have been issued

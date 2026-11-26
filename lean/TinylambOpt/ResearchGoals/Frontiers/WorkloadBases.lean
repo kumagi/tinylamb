@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Frontiers.Contractions
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.Frontiers.WorkloadBases
 
 open Contractions (Vec Mat total dot)

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `RetireLocal` — An independent cycle survives retiring a victim chosen in a different
+  component.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

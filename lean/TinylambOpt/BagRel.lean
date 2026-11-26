@@ -1,5 +1,10 @@
 import TinylambOpt.ThreeValued
 
+/-!
+SQL filter, union, and join models preserve duplicates through list permutation. The
+proofs establish when rewriting a plan keeps the same multiset of result rows.
+-/
+
 /-
 # Step 2: Bag（多重集合）関係代数と Cascades 論理ルールの証明
 
@@ -158,3 +163,8 @@ theorem coalesce_filter_breaks_outer_to_inner :
   decide
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- plan/cascades.cpp
+-- plan/cascades_predicate_rules.cpp
+-- query/join_reduction.cpp

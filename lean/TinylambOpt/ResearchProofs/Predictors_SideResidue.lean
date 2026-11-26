@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `SideResidue.ByteBudget` — `∀ base period side i h xs w extra oldBytes, certificate
+  (predict base period) side i h xs w → extra + quote xs.length w < oldBytes → extra
+  + (frame (encode (predict base period) side i h xs)).length < oldBytes`
+- `SideResidue.PeriodShift` — `∀ base period side i h xs (k : Int), encode (predict
+  base period) (fun j => side j + k*(period+1:Nat)) i h xs = encode (predict base
+  period) side i h xs`
+- `SideResidue.ResidualRoundTrip` — `∀ base period side i h xs, restore (predict base
+  period) side i h (encode (predict base period) side i h xs) = xs`
+- `SideResidue.RestartSeed` — `∀ base period side i h xs, encode (predict base period)
+  side i (h.take (0)) xs = encode (predict base period) side i h xs`
+-/
+
 /-
   SideResidue predicts the current value from an affine function of the
   reference (side) column.  The predictor never reads the history, so a

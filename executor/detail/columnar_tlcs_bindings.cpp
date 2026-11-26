@@ -752,7 +752,7 @@ ColumnarStageSchedule BuildColumnarStageSchedule(
       payload_bytes[as.full_col] = 1;
     }
   }
-  // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+  // Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
   // (conditional_key_disjoint_partition_sound): isolate VARCHAR columns
   // referenced exclusively by a single `CASE WHEN` target (e.g. `Referer` in
   // ClickBench Q40) into `cond_cols` so blocks where 0 surviving rows satisfy
@@ -843,7 +843,7 @@ StatusOr<bool> ValidateDeltaKeysNoOverflow(
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+// Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
 // (group_by_functional_expr_reduction_sound, group_by_overflow_expr_drop_bug)
 StatusOr<KeyProjectionMap> BuildKeyProjectionMap(
     const TlcsFile& tlcs, const std::vector<uint32_t>& candidate_blocks,

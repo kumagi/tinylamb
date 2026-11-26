@@ -1,0 +1,455 @@
+/** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+#ifndef TINYLAMB_EXECUTOR_DETAIL_BATCH5_RESOURCE_POLICY_PROOFS_HPP
+#define TINYLAMB_EXECUTOR_DETAIL_BATCH5_RESOURCE_POLICY_PROOFS_HPP
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace tinylamb::benchmark_rematch {
+
+// ============================================================================
+// Batch5 (327/327 = 100% connected)
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Execution_AnchorDemand.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Execution_ClockRange.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Execution_DefaultGroups.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Execution_SparseMark.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_ClockForest.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_ClockWindow.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_DictionaryAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_HashExceptions.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_RunSidecar.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ClickstreamLayout_Storage_TieOrientation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_ColumnCodecs_GridKeysWithSparseExceptions.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_ColumnCodecs_RunEndOrderKeyLookup.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_ColumnCodecs_SharedUrlPrefixRoundtrip.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_ColumnCodecs_SignedDateDeltaRoundtrip.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_CollationOrderedUrlMinimumCode.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_ConditionalReferrerKeyInterning.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_ConstantTitlePagePopulation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_CounterRunOffsetTelescoping.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_DefaultLaneSumWithPatches.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_DeferredPayloadAcrossCountTies.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_DeltaDomainIpHistogram.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_DisjointOwnerTopFrequencyMerge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_DistinctUsersFromObservedPairOrdinals.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_FrameResidualOrderedAverageFold.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_GlobalPhraseFrequencyBoundFromOmittedPageMaxima.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_HierarchicalPairFrequencyScreen.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_LateDistinctOnWinningSearchPhrases.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_LexicographicPrefixRunSelection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_MinuteOccupancySelectBeforeCounting.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_ModelPostingUnionBeforeDistinctUsers.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_OrderedRunQualifyingPrefixMerge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_PhraseUserRunTransitions.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_ResidualPointProbeBeforeUnpacking.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_ResolutionDomainProductOffsetBound.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SeededGroupCompletionFromSuffix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SegmentedDistinctAcrossRangeSeams.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SingletonCompletionAfterDuplicateDetection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SkipStrictlyHigherRankPrefix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SparseFlagExceptionsSubtractFromUrlCounts.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SparsePhraseEngineCounters.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_EncodedScanAggregates_SparseQualifyingTimestampSeek.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_CachedExtremaAcrossCoveringMasks.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_DiscountBlockRevenueDotProduct.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_ExceptionalShipDatesSubtractFromGroupState.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_MemberYearThresholdSuffixGather.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_OppositeNationBitIntersection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_OwnerElisionForEmptyCommenterIntersection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_PairHistogramByRadixRuns.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_PredicateDictionarySelectionForAverage.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_PriceRangeBlockAcceptance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_QualifiedTitleYearHistogram.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_QualifiedYearCountsFromMoviePersonPostings.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_QuantityBandCandidatePartMask.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_ReferentialManifestJoinElision.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_ScoreNullMaskIndependentReplyCount.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_SegmentOrderClosureBeforeLineProbe.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_SkewSplitWeightedJoinPartial.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_StarGroupSelectiveYearSlots.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_SupplyThresholdEarlyFailure.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_TrigramNegativePageWithCountryExceptions.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_TypedLinkEndpointRoleRouting.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_UnmatchedCustomersInZeroOrderBin.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_KeyRoutedJoinStates_VolumeNeutralDimensionRejection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_CompleteYearPairsFromTagRuns.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_ConstantSoldDateShiftedThresholds.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_CrossChannelItemWitnessBeforeFactExpansion.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_CumulativeDelayCountersToExclusiveBins.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_DemographicPriceIntervalDispatch.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_DistinctAddressMultiplicityAfterProjection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_DominantChannelRatioTournament.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_InventoryRatioFeasibilityEnvelope.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_MonthCaseZeroAndNullState.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_NullableStateAverageFromCountedReturnBuckets.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_ParallelMomentMergeWithCenterCorrection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_PriceBandBypassesAddressPredicate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_QuantityJoinSparseBranchElision.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_QuarterlyOutliersFromPresentSlots.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_RangeWidthBoundOnVarianceNumerator.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_ReturnStoreThresholdFromPeerSums.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_SharedValidityAverageDenominators.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_SignedMeanDeviationGuard.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_StockRangeFullAcceptanceCounts.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_TicketJoinBlockCartesianMoments.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_TimeSliceRevenueRollupAcrossUnionAll.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_TwoDistinctWarehousesWitness.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_UnmatchedRefundPageFastPath.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_WeekdayPivotBySparseDateRuns.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_WitnessedGroupBoundaryBeforeExistenceProbes.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_PartitionedAggregateStates_YearSelectionCommutesWithUnionDedup.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_CalendarBlockDateWitnessSemijoin.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_DemandedManufacturerWitnessCache.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_DisjointPostalAndItemFactSelections.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_ManagerMonthlyEqualTotalsFastReject.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_NameDayBitmapTriplePopulation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_NegativeFilterShortcutForSetDifference.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_PeerRankBoundsFromPartitionExtrema.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_PeerRunNeighborJoinCardinality.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_ReturnStateThresholdSortedSuffix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_RevenueBandEarlyPairFilter.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_RollupParentTotalsFromLeafPartitions.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_SharedDimensionFilterBeforeTimeSplit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_ShiftedStoreWeekIndexWithBoundaryHalo.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_QueryRewrites_SparseSetAndWindowEvaluation_ZeroPriorSalesGroupEarlyAbandon.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_BoundedRunCandidates.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_DisjointDistinctSpillDomains.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_DistinctPartitionFinalization.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_LateDistinctAfterLocalLimit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_NonNullOnlySpillGroupPresence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_RepartitionPartialConservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_RetryRecordDeduplication.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_SpilledNullableSum.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_ValueDeduplicatedPartials.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_AggregateReplay_ZeroSumPartialElision.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_BudgetFrontierCover.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_BuildSideRetentionOrder.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_CardinalityErrorRegret.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_IndependentChildCaps.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_IntervalPlanStability.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_IsolatedPeakMemoPruning.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_ReplanRemainingWorkCut.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_RetainedOutputMemoDominance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_RowGoalEndpointDominance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_BudgetedPlans_ScalarWinnerBudgetReuse.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_AppendOnlyOrdinalProjection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_DistinctBindingChecks.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_FragmentDependencyUnion.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_PositiveOnlyBinderCache.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_ReboundProjectionPermutation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_ShadowedNamePermutationReuse.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_SignatureImpliesOrdinalReuse.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_UnusedAppendSignatureReuse.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CatalogDependencies_WildcardProjectionSignature.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_AdjacentManifestUnlink.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_DurablePublicationEpochMonotonicity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_IncompleteManifestFallback.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_LatePinRecycleInvariance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_ManifestCutCannotExceedDurability.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_NewestManifestOnlyRecovery.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_PinnedGenerationFileClosure.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_RetiredPinRetentionMonotonicity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_SharedFileIncrementalCharge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_StraddlingRecordFloor.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CheckpointRetention_WholeSegmentReplayCoverage.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_CoalescingPhantomRangeCost.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_DensePageNoFalseRead.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_IndependentZonesCertifyMatchingPair.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_LocalReclusterWorkDelta.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_PageSelectivityAsByteProxy.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_ReclusterPaybackEpoch.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_SplitPhysicalReadEnvelope.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_UnpaddedSplitScanCost.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ClusteredPages_ZonePrunedRangeScan.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_BatchedDurabilityWakeups.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_CanceledWaiterWakeIsolation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_CompletedWriteContiguousCut.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_DistinctCommitEndsCredit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_IncrementalCompletionScan.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_LargestCompletionWakesPrefix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_OrderedCommitWaitPrefix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_OverlapRetryDurableCut.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_StartOnlyCompletionPrune.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_CommitBatches_WALBytesBoundWaitingClients.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_BackpressureStableObservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_ConcurrentReplyReserve.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_DelimiterFreeChunkContinuation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_EnqueueHighWaterSlack.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_FieldDecoderChunkCarry.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_GlobalWatermarkClientIsolation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_PartialSendWireSuffix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_PipelinedReplyFifo.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_TerminatedFieldEarlyStop.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_UnsentBytesBoundPinnedAllocation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ConnectionFlow_WriteCreditComposition.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_BoundedTicketTagAlias.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_EqualPayloadSkipsWalFence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_EvictionReadbackCertificate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_FlushRacingMutation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_MaxRevisionFlushCoalescing.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_OutOfOrderWriteback.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_PinDuringWriteback.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_RecycledSlotCompletionFence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_EvictionWriteback_RepeatedFlushCompletion.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_CanceledGrantByteConservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_CompletionOrderCertificate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_DisjointVictimAccounting.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_EmergencyFloorAcrossClients.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_GenerationScopedLateRelease.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_GrantTransferDestinationCharge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_LargestHolderAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_LeastScratchCompletionOrder.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_NetScratchAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_QueueSegmentReserveComposition.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_ScratchCompressionReserveSensitivity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_GrantAdmission_WorkerPeaksAreSimultaneous.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_DisjointBuildRoutingWork.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_IndependentPeakFanoutEstimate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_LeftOuterUnmatchedReserve.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_NullAwareFanoutReservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_NullableUniqueBuildFanout.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_PartitionSynopsisCollisionTax.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_StripedHotKeyCoverage.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_SymmetricHotKeySalting.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_JoinFanout_TwoSidedFanoutEnvelope.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_AverageThroughputCapsBacklog.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_BusyPeriodDebtEnvelope.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_CoalescedRequestOrder.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_DrainCutKeepsNewInvalidation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_ExactGenerationDrain.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_InitialBacklogSensitivity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_NonIdleServiceBatch.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_PeriodicSteadyHighWater.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_RemoveAfterCoalescing.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_SharedMaintenancePeak.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MaintenanceDebt_SlidingWindowBacklogCap.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_CheapestReadersFanIn.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_GeometricRepartitionTraffic.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_HotKeyResumeCoverage.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_MedianBufferFanIn.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_RankTileByteBudget.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_RejectedSplitWriteAllowance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_RewriteMinimumAlsoMinimizesPeak.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_RowShrinkPredictsByteShrink.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_SiblingExcessPeakOrder.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_StreamedRootSpaceCertificate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MergeScheduling_WeightGuidedRotation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_CompletePrefixSplit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_DispatchWindowOutputCap.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_DuplicateConsistentRetirement.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_EmptyMorselRetirement.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_FrontierResumeOrderedOutput.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_LimitCancellationFrontier.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_OutOfOrderLimitCredit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_RetiredReportReclamation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_MorselRetirement_WorkerCountBoundsReorderQueue.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_AcceptanceMaskPreservesErrors.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_AvoidedEvaluationInterchange.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_ConstantCostRejectRatio.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_DictionaryOutcomeMemoization.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_FallibleFilterCommutation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_GlobalSelectivityOrderTransfer.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_MorselEvaluationCharge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_MorselSpecificFilterOrder.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_PredicateScheduling_PrefixProfilePaysSwitch.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_AppendOnlyRestartDirectory.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_ExceptionCountWidthChoice.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_ExceptionsOnlyThresholdScan.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_NestedStridePointWork.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_PatchedFrameSplitOverhead.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_PatchedWidthLocalMinimum.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_RankedExceptionPointRead.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_RelativeRestartVarintBudget.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_RestartSeekMatchesPrefix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_SingleEditDirectoryGrowth.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_RestartDirectory_SmallerStridePointDominance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_CoalescedFetchScatter.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_CountReuseForByteCache.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_DisjointScanPollution.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_FixedShardCacheMissParity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_GenerationBlindPrefetchFill.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_OnlineCacheShrink.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_OversizeReadBypass.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_PrefetchPinAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_WeightedCacheStackInclusion.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_ScanCache_WeightedReuseDistance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_AbsentLiteralSkipsIdStream.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_ComposedDictionaryRemap.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_DictionaryInsertLocalReprice.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_FilteredDictionaryFootprint.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_FrontCodePredecessorSufficiency.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_LongestPrefixPredecessor.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_OverlapPaysWiderIds.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_RenumberedPackedIdWidth.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_SharedDictionaryOverlapCharge.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_SharedWidthMergeAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SharedVocabulary_VocabularyPredicateSelection.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_BestFitTraceDominance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_ClassInsertionMarginalSavings.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_CompactedArenaTraceAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_DescendingSizeBatchAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_LargerArenaTraceMonotonicity.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_LargestHoleSingleAdmission.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_MeanSizeClassReservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_NeighborCoalesceTraceDominance.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_SizeClassRefinement.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SlabReuse_SuccessfulTraceByteConservation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_BunchedAppendBlockDebt.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_CoalescedReadGapBreakEven.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_ExtentGenerationReadEquivalence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_LiveTotalPredictsRelocationPeak.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_LocalDirectoryTruncateFence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_LogicalHighWaterPaysFragmentation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_PartialTailRollback.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_ScatterAdmissionAtFileLimit.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_ScatterReadSlice.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_SegmentTailSharingBound.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_SharedExtentTruncateFence.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_SpillExtents_TailEvacuationShrinksFile.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_AdvancingFloorComposition.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_BottomCoverageBeforeTombstoneDrop.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_BudgetedVacuumResume.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_CoprimeVacuumSweep.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_DenseFloorFutureReads.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_DistinctPinStorageCap.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_EndpointSnapshotInterpolation.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_EvictedWriteConflictCertificate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_FragmentLocalSnapshotFloor.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_IncludeNewestForFutureReads.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_PinReleaseIncrementalPruning.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_ShardWatermarkExactConflict.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_VersionVacuum_SparseSnapshotWinnerRetention.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_ArrivalIndependentCohortWait.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_BypassElapsedTimeBound.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_CancelMonotoneWait.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_CanceledHeadNeedsRebatch.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_CohortWaitCountdown.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_MaximalCompatiblePrefix.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_OldestReaderRetirementHorizon.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WaitQueue_ReaderBypassLatency.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_ConsecutiveHaloReplacement.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_CountedWindowMembership.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_EvictedValueSetDifference.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_IgnoreNullsLagState.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_PeerKeysBoundBufferedRows.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_RowsFrameSpillHalo.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_SkipNullsBeforeFrameBoundary.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_SlidingNullableFrameUpdate.lean
+// lean/TinylambOpt/ResearchProofs/Batch5/Proof_ResourcePolicies_WindowRetention_StrictKeyClosesPeerGroup.lean
+// ============================================================================
+
+[[nodiscard]] inline size_t CountWokenCommitWaiters(
+    std::span<const uint64_t> waiter_lsns, uint64_t durable_lsn) noexcept {
+  size_t woken = 0;
+  for (const uint64_t lsn : waiter_lsns) {
+    if (lsn <= durable_lsn) {
+      ++woken;
+    }
+  }
+  return woken;
+}
+
+[[nodiscard]] constexpr bool EvictionNeedsWalFence(
+    uint64_t payload_hash_before, uint64_t payload_hash_after) noexcept {
+  return payload_hash_before != payload_hash_after;
+}
+
+struct MemoryGrantTracker {
+  size_t limit_bytes{0};
+  size_t used_bytes{0};
+
+  [[nodiscard]] bool TryAcquire(size_t bytes) noexcept {
+    if (bytes > limit_bytes || used_bytes > limit_bytes - bytes) {
+      return false;
+    }
+    used_bytes += bytes;
+    return true;
+  }
+
+  void Release(size_t bytes) noexcept {
+    used_bytes = used_bytes >= bytes ? (used_bytes - bytes) : 0;
+  }
+};
+
+[[nodiscard]] constexpr size_t ReserveUniqueJoinOutputRows(
+    size_t probe_rows, bool is_left_outer) noexcept {
+  (void)is_left_outer;
+  return probe_rows;
+}
+
+[[nodiscard]] constexpr size_t BoundedMergeFanIn(size_t budget_bytes,
+                                                 size_t page_bytes) noexcept {
+  if (page_bytes == 0) {
+    return 2;
+  }
+  const size_t f = budget_bytes / page_bytes;
+  return f < 2 ? 2 : f;
+}
+
+[[nodiscard]] inline size_t AdvanceContiguousMorselPrefix(
+    size_t next_retire_id, const std::unordered_set<size_t>& completed_ids) {
+  while (completed_ids.contains(next_retire_id)) {
+    ++next_retire_id;
+  }
+  return next_retire_id;
+}
+
+struct PredicateCostModel {
+  size_t id{0};
+  double cost{1.0};
+  double reject_rate{0.5};
+};
+
+[[nodiscard]] inline std::vector<size_t> OrderPredicatesByRejectPerCost(
+    std::span<const PredicateCostModel> preds) {
+  std::vector<PredicateCostModel> sorted(preds.begin(), preds.end());
+  std::stable_sort(
+      sorted.begin(), sorted.end(),
+      [](const PredicateCostModel& a, const PredicateCostModel& b) {
+        return a.reject_rate * b.cost > b.reject_rate * a.cost;
+      });
+  std::vector<size_t> order;
+  order.reserve(sorted.size());
+  for (const auto& p : sorted) {
+    order.push_back(p.id);
+  }
+  return order;
+}
+
+[[nodiscard]] constexpr bool ShouldCoalesceSpillReadGap(
+    size_t gap_bytes, size_t seek_break_even_bytes) noexcept {
+  return gap_bytes <= seek_break_even_bytes;
+}
+
+[[nodiscard]] inline uint64_t SafeVacuumFloor(
+    std::span<const uint64_t> active_snapshots, uint64_t latest_ts) noexcept {
+  if (active_snapshots.empty()) {
+    return latest_ts;
+  }
+  return *std::min_element(active_snapshots.begin(), active_snapshots.end());
+}
+
+[[nodiscard]] inline std::optional<uint32_t> ComposeDictionaryRemap(
+    uint32_t local_code, std::span<const uint32_t> local_to_global,
+    std::span<const uint32_t> global_to_target) noexcept {
+  if (local_code >= local_to_global.size()) {
+    return std::nullopt;
+  }
+  const uint32_t g = local_to_global[local_code];
+  if (g >= global_to_target.size()) {
+    return std::nullopt;
+  }
+  return global_to_target[g];
+}
+
+}  // namespace tinylamb::benchmark_rematch
+
+#endif  // TINYLAMB_EXECUTOR_DETAIL_BATCH5_RESOURCE_POLICY_PROOFS_HPP

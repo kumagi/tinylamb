@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Reference correlated threshold evaluation over full CTE.
+
+When outer predicate depends ONLY on `partKey`, pushing it into `rows` before computing
+partition aggregates is sound.
+
+Modeled claims
+
+- `Goal` — Correlated partition-average filter pushdown vs semi-join partition pruning
+  (TPC-DS Q01 `s_state='TN'` on `ctr_store_sk`, Q30/Q81 `ca_state='GA'` on
+  `c_customer_sk`, Q65): (1) pushing a `partKey`-only predicate into the CTE
+  preserves exact averages, (2) for an `entityKey` predicate, pruning unreferenced
+  `partKey`s (while retaining all entity rows in active partitions) preserves exact
+  averages, and (3) naively pushing an `entityKey` predicate changes partition
+  averages.
+-/
+
 namespace TinylambOpt.ResearchGoals.CorrelatedAggPartitionKeyFilterPushdown
 
 structure CteRow where

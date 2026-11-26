@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims locate a frame's nth non-NULL value. An indexed SQL window path must
+preserve both positions and the treatment of NULLs.
+
+Modeled claims
+
+- `Goal` — `∀ xs (requests : List Request), requests.map (selectNth (build xs)) =
+  requests.map (reference xs)`
+-/
+
 namespace TinylambOpt.ResearchGoals.NthNonNullFrame
 
 abbrev Cells := List (Option Int)

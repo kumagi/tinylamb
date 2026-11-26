@@ -1812,7 +1812,7 @@ StatusOr<Relation> BuildOrderedJoinInput(
             proj_vc_ordinal[rc] = vc_ord++;
           }
         }
-        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
         //   (multi_col_page_zone_map_prune_sound)
         // Prune pages conjunctively across ALL join-key columns with cached
         // per-page [min, max] zone maps (e.g. on TPC-DS Q72 `inventory`,
@@ -3786,9 +3786,9 @@ StatusOr<Relation> BuildOrderedJoinInput(
     // Final ordered-join step of a fusable grouped statement with an empty
     // WHERE (or, for a trailing LEFT JOIN, where every remaining unplaced
     // WHERE conjunct is a null-rejecting `right.col IS NULL` anti-join test —
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     //   (fused_antijoin_groupby_sound))
-    // Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+    // Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
     //   (eager_channel_preagg_before_left_join_sound,
     //    eager_channel_preagg_requires_unique_dimension):
     // the join feeds the aggregation directly and never materializes.
@@ -3843,7 +3843,7 @@ StatusOr<Relation> BuildOrderedJoinInput(
             });
       }
     }
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     // (unused_unique_left_join_elim_sound)
     if (can_prune_columns && !result.HasSpill() && !result.using_columns &&
         source.join_type == JoinType::kLeft && last_null_extension[i] == i &&
@@ -3991,7 +3991,7 @@ StatusOr<Relation> BuildOrderedJoinInput(
         }
       }
     }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (left_join_lookup_restrict_right)
     // When loading a deferred right-hand source of a LEFT OUTER JOIN after
     // the left side (`result`) is already materialized and smaller than the

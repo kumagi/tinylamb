@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims describe when a compact key preserves the modeled ordering. A SQL sort can
+compare packed keys once the component ranges and ordering assumptions hold.
+
+Modeled claims
+
+- `Goal` — `∀ a b, before a b = decide ((encode a).toNat < (encode b).toNat) ∧ (encode
+  a = encode b ↔ a.major = b.major ∧ a.minor = b.minor)`
+-/
+
 namespace TinylambOpt.ResearchGoals.PackedOrderKey
 
 structure Row where

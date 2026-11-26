@@ -1,6 +1,14 @@
 import Std.Tactic
 import TinylambOpt.BagRel
 
+/-!
+Splitting a disjunctive LEFT JOIN predicate into ordered branches preserves matching
+pairs and unmatched left rows. SQL can execute separate branches while emitting each
+matching pair and each unmatched placeholder with the reference multiplicity.
+
+Named results include `outer_or_branches_sound`, `boundary_branch_examples`.
+-/
+
 /-
 # LEFT JOIN の `ON p OR q` を排他的な 2 マッチ枝 + 1 未マッチ枝に分解する
 
@@ -98,3 +106,8 @@ theorem boundary_branch_examples :
   decide
 
 end TinylambOpt.OuterOrBranches
+
+-- C++ references to this model or its proof.
+-- executor/batch_nested_loop_join.cpp
+-- executor/detail/disjunctive_join_branches.hpp
+-- executor/detail/pipeline/ooc_join_cte_sources.cpp

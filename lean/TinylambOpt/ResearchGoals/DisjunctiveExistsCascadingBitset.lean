@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Cascading bitset-narrowing evaluation for `EXISTS(S1) AND (EXISTS(S2) OR EXISTS(S3))`
+(TPC-DS Q10/Q35): filter candidates by `S1`, partition into hits in `S2` vs remaining
+candidates `B_rem = B_1 \ B_2`, and probe `S3` ONLY for `B_rem`.
+
+Modeled claims
+
+- `Goal` — Disjunctive `EXISTS` cascading short-circuit bitset narrowing (TPC-DS
+  Q10/Q35): rows satisfying `EXISTS(S1) ∧ EXISTS(S2)` never probe `S3`, preserving
+  exact filtered output across NULLs while executing zero `S3` probes whenever `B_1 ⊆
+  B_2`.
+-/
+
 namespace TinylambOpt.ResearchGoals.DisjunctiveExistsCascadingBitset
 
 def optExistsIn (ok : Option Int) (s : List (Option Int)) : Bool :=

@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `RetentionProbe` — Are no pending commits and one pending commit at a time a complete
+  test for every possible future commit subset? If true, a retention certificate for
+  after-images needs only linearly many crash outcomes per key. Stamps are globally
+  unique image identities shared by old and new representations.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

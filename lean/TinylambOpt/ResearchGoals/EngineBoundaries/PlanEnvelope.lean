@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
 /-! Deterministic startup, per-row, and excess-memory costs in integer cost

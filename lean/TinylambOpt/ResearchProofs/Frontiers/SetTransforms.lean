@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Frontiers.SetTransforms
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `DisjointJoin` — `∀ d (a b : Hist), combine d (· &&& ·) a b 0 = total (2^d) (fun x =>
+  a x * below d b ((2^d-1) ^^^ x))`
+- `InvisibleRefresh` — `∀ d (query delta : Hist), (∀ k < 2^d, spectrum d query k = 0 ∨
+  spectrum d delta k = 0) → total (2^d) (fun i => query i * delta i) = 0`
+- `OrJoin` — `∀ d a b k, k < 2^d → below d (combine d (· ||| ·) a b) k = below d a k *
+  below d b k`
+
+Refuted by counterexample
+
+- `PairStats` — `∀ (a b : Hist), (∀ m ∈ [3,5,6], ∀ v < 8, marginal m v a = marginal m v
+  b) → ∀ v < 8, a v = b v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1098,3 +1117,6 @@ theorem sound_DisjointJoin :
   rw [hrhs]
 
 end TinylambOpt.ResearchProofs.Frontiers.SetTransforms
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

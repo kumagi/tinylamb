@@ -31,9 +31,9 @@
 
 ## 次の計測で切り分けたい差
 
-- **ClickBench Q37** は tinylamb 87.763 ms、DuckDB 18.376 ms、ClickHouse 18.775 ms。同じ上位10 URL でも、対 DuckDB の命題は未走査ページから増え得る件数の上界を使い、既に10候補に届かない URL を落とせる条件を問う。対 ClickHouse の命題はページごとに同じ文字列を指す辞書コードが違っても、通過 RID の局所カウントから最終件数を復元できるかを問う。保持したグループ数と文字列を復元した回数を別々に測れる。[ClickBench の提出型](../../TinylambOpt/ResearchGoals/BenchmarkRematch/Click.lean)
-- **JOB J3** は tinylamb 23.070 ms、DuckDB 8.885 ms、ClickHouse 21.608 ms。役柄条件を通る出演は999,750行あるが、人物 ID は1～20,000に収まる。対 DuckDB ではこの範囲だけで女性かを引けるビット表、対 ClickHouse では女性・役柄条件を通った出演を映画別に束ねてから制作年を引く案を登録した。後者では出演の多重度が COUNT と AVG の両方に効く。[J3 の分布調査](restart-races.md)・[派生分析の提出型](../../TinylambOpt/ResearchGoals/BenchmarkRematch/Analytics.lean)
-- **Public BI MLB Q108** は絞り込み後に同じ4列の最大と最小を取る。対 DuckDB では3条件の RID 集合からグループが存在するかを決める。対 ClickHouse ではページが全件条件を満たす場合に4列の極値を再利用する。空グループの出力有無と、行はあるが全値 NULL の結果を区別する。[クラウド・BI の提出型](../../TinylambOpt/ResearchGoals/BenchmarkRematch/Cloud.lean)
+- **ClickBench Q37** は tinylamb 87.763 ms、DuckDB 18.376 ms、ClickHouse 18.775 ms。同じ上位10 URL でも、対 DuckDB の命題は未走査ページから増え得る件数の上界を使い、既に10候補に届かない URL を落とせる条件を問う。対 ClickHouse の命題はページごとに同じ文字列を指す辞書コードが違っても、通過 RID の局所カウントから最終件数を復元できるかを問う。保持したグループ数と文字列を復元した回数を別々に測れる。[ClickBench の提出型](../../TinylambOpt/ResearchGoals/QueryRewrites/DictionaryFiltersAndRanking.lean)
+- **JOB J3** は tinylamb 23.070 ms、DuckDB 8.885 ms、ClickHouse 21.608 ms。役柄条件を通る出演は999,750行あるが、人物 ID は1～20,000に収まる。対 DuckDB ではこの範囲だけで女性かを引けるビット表、対 ClickHouse では女性・役柄条件を通った出演を映画別に束ねてから制作年を引く案を登録した。後者では出演の多重度が COUNT と AVG の両方に効く。[J3 の分布調査](restart-races.md)・[派生分析の提出型](../../TinylambOpt/ResearchGoals/QueryRewrites/AnalyticalJoins.lean)
+- **Public BI MLB Q108** は絞り込み後に同じ4列の最大と最小を取る。対 DuckDB では3条件の RID 集合からグループが存在するかを決める。対 ClickHouse ではページが全件条件を満たす場合に4列の極値を再利用する。空グループの出力有無と、行はあるが全値 NULL の結果を区別する。[クラウド・BI の提出型](../../TinylambOpt/ResearchGoals/QueryRewrites/FileRangesAndExtrema.lean)
 
 各命題は候補演算の正しさを検証する提出型。SQL 全体に適用するときは結合の多重度、NULL、照合順、同順位、数値精度を保つ必要がある。たとえば順位キーが等しい場合の決定規則を含む局所 Top-K、結合キーの一意性を確認した場合の単一行集約を扱う。Lean の整数和は正確な算術であり、FLOAT の再結合を採用する経路には別途、対象型での丸めの検証が要る。カウンタは候補が効いたかを診断するためのもので、時間の逆転は次回の実行で測る。
 
@@ -43,7 +43,7 @@ TPC-H・TPC-DS・ClickBench は、双方で行数を照合した保存済み fix
 
 派生分析では5種が1つの DB に同居する。36表・18,223,012行を対象に、tinylamb は保存セットのコピーを再オープン、DuckDB 2.0.0 は読取専用で開き、各表の行数を manifest と照合した。ClickHouse も各表の非重複 part の行数を照合した。tinylamb は DB・blocks・再起動に必要な WAL とメタデータを含む **1,082,859,325 B**。DuckDB は **190,328,832 B**、ClickHouse の対象 part は **324,908,462 B**。共有カタログや WAL の容量を5種に配賦していない。クラウド・BI の速度結果には同条件で比較できる保存サイズの記録がない。[データセット manifest](../../../build/benchmarks/analytics-sf10-waves1-13/dataset/manifest.json)
 
-この派生分析 DB では **blocks だけ**を1 MiBごとに Zstandard レベル6で圧縮する実験も行った。全1,017フレームで復号したバイトが元と一致した。32 B のファイルヘッダとフレームごとの17 B の索引を課金し、カタログと WAL をそのまま足すと **270,530,617 B**。同じ集計で ClickHouse を **54,377,845 B** 下回る。各フレームで元配列と4・8・16列のバイト転置から短い形式を選ぶと **209,099,213 B**。DuckDB に勝つにはここからもう **18,770,382 B** 要る。いずれもメモリ上で生成した圧縮本体長に索引費用を足した試算で、エンジンでの再起動や読取速度は今後の検証項目。[保存形式の提出型](../../TinylambOpt/ResearchGoals/BenchmarkRematch/Storage.lean)
+この派生分析 DB では **blocks だけ**を1 MiBごとに Zstandard レベル6で圧縮する実験も行った。全1,017フレームで復号したバイトが元と一致した。32 B のファイルヘッダとフレームごとの17 B の索引を課金し、カタログと WAL をそのまま足すと **270,530,617 B**。同じ集計で ClickHouse を **54,377,845 B** 下回る。各フレームで元配列と4・8・16列のバイト転置から短い形式を選ぶと **209,099,213 B**。DuckDB に勝つにはここからもう **18,770,382 B** 要る。いずれもメモリ上で生成した圧縮本体長に索引費用を足した試算で、エンジンでの再起動や読取速度は今後の検証項目。[保存形式の提出型](../../TinylambOpt/ResearchGoals/QueryRewrites/ColumnCodecs.lean)
 
 ## 再現と監査
 

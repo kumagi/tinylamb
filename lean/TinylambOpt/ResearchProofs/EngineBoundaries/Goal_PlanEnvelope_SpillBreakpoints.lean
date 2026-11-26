@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Proved
+
+- `SpillBreakpoints` — Include both working-set breakpoints, clamped to the grant
+  interval.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

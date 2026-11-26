@@ -1,6 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved (10 claims, including the following)
+
+- `ContainsSlash.SearchOnce` — `∀ a k, 0<k → matched reader (.rep k a) 0 = matched
+  reader a 0`
+- `ContainsSlash.SlashWitness` — `∀ x, matched reader x 0 = (expand x).contains 47`
+- `EndsInDigit.LastByte` — `∀ x, matched reader x 0 = (expand x).getLast?.any (fun b =>
+  48≤b && b≤57)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -985,3 +998,6 @@ theorem sound_LineBoundary_FinalPair :
 #guard matched LineBoundary.reader (Rope.rep 1000 (Rope.lit [10])) 0 = false
 
 end TinylambOpt.ResearchProofs.StorageExecution.GrammarScansA
+
+-- C++ references to this model or its proof.
+-- executor/detail/columnar_tlcs_predicates.cpp

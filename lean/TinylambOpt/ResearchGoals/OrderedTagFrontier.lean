@@ -1,5 +1,16 @@
 import TinylambOpt.Research.RegexTaggedDeterminize
 
+/-!
+These claims track which ordered tagged rows are safe to emit at a frontier. A SQL
+executor can release a certified prefix while preserving its required order.
+
+Modeled claims
+
+- `Goal` — `∀ nfa limit input, winner nfa input.length (frontier nfa limit input) =
+  winner nfa input.length (fullRun nfa limit input) ∧ ((frontier nfa limit input).map
+  Prod.fst).Nodup`
+-/
+
 namespace TinylambOpt.ResearchGoals.OrderedTagFrontier
 
 open Research.RegexTaggedDeterminize

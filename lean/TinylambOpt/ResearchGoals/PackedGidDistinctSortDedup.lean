@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Path A: pack `(gid, val)`, sort lexicographically, deduplicate adjacent pairs, and count
+per `gid`.
+
+Path B: partition non-null rows across `W` workers by value hash `h v % W` so per-worker
+distinct sets per `gid` are disjoint and sum directly with zero cross-worker set
+merging.
+
+Modeled claims
+
+- `Goal` — Zero-merge `COUNT(DISTINCT)` strategies (TPC-H Q16, ClickBench Q09/Q12/Q14):
+  (1) sorting packed `(gid, val)` pairs and adjacent-deduping matches exact
+  `COUNT(DISTINCT val)`, and (2) partitioning non-null values by `h v % W` makes
+  worker local distinct counts disjoint so summing equals the global distinct count.
+-/
+
 namespace TinylambOpt.ResearchGoals.PackedGidDistinctSortDedup
 
 abbrev Row := Nat × Option Int

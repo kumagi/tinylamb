@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.DistributedPageFence
 
+/-!
+Proved
+
+- `Goal`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.DistributedPageFence`.
+-/
+
 namespace TinylambOpt.ResearchProofs.DistributedPageFence
 
 open TinylambOpt.ResearchGoals.DistributedPageFence hiding Spec Row

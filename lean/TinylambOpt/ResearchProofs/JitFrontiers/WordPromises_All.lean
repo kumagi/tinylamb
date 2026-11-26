@@ -109,3 +109,11 @@ import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.Goal_SignedNarrow_De
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.Goal_SignedNarrow_Unguarded
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.Goal_SignedNarrow_BiasBoundary
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.Goal_SignedNarrow_KeyIdentity
+
+/-!
+This module collects proofs for Goal Signed Add Guard Exact, Goal Signed Add Drop Flag,
+Goal Signed Add Speculate Select, Goal Signed Add First Poison and related cases.
+
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+-/

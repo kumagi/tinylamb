@@ -1,3 +1,11 @@
+/-!
+Sort direction for one ORDER BY term.
+
+NULL placement for one ORDER BY term.
+
+Named results include `termLess_trans`, `lexLess_trans`, `leKey_trans`.
+-/
+
 /-
   TinylambOpt/TopNBlockFenceExplicitTerms.lean
 

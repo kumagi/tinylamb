@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+
+Proved
+
+- `TypedFunction.TypeGate` — `∀ q e, q.kind ≠ e.kind → model.accept q e = false`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

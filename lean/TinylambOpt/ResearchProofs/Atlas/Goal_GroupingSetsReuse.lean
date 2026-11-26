@@ -1,5 +1,14 @@
 import TinylambOpt.ProposedGoals.GroupingSetsReuse
 
+/-!
+Proved
+
+- `Goal` — All four grouping sets agree with a fresh scan, and the reuse path never
+  reads the input more than once.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.GroupingSetsReuse`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

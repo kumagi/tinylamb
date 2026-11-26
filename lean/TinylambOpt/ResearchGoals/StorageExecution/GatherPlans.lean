@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 import TinylambOpt.ResearchGoals.StorageExecution.Boundaries
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 open TinylambOpt.ResearchGoals.Compression.Wire
 

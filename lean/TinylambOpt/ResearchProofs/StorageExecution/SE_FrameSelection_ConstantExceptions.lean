@@ -1,6 +1,25 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_FrameSelection_Common
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved (9 claims, including the following)
+
+- `ConstantExceptions.BoundedRaw` — A forced frame cap still limits worst-case
+  expansion to raw cells and per-frame overhead.
+- `ConstantExceptions.ByteFrontier` — Use the actual codec and raw fallback in the
+  size/seek optimum.
+- `ConstantExceptions.ConstantCharge` — `∀ x n, (write (List.replicate n x)).length =
+  5`
+
+Refuted by counterexample
+
+- `ConstantExceptions.GreedyCut` — Aggressive hypothesis: the cheapest two adjacent
+  groups never need reconsideration when a third arrives.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

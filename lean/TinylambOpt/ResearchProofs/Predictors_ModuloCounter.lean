@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `ModuloCounter.ByteBudget` — `∀ step period side i h xs w extra oldBytes, certificate
+  (predict step period) side i h xs w → extra + quote xs.length w < oldBytes → extra
+  + (frame (encode (predict step period) side i h xs)).length < oldBytes`
+- `ModuloCounter.ResidualRoundTrip` — `∀ step period side i h xs, restore (predict step
+  period) side i h (encode (predict step period) side i h xs) = xs`
+- `ModuloCounter.RestartSeed` — `∀ step period side i h xs, encode (predict step
+  period) side i (h.take (1)) xs = encode (predict step period) side i h xs`
+- `ModuloCounter.WrappedProgression` — `∀ step period a side i n, restore (predict step
+  period) side i [a-step] (List.replicate n 0) = (List.range n).map (fun (j : Nat) =>
+  (a+step*j)%(period+1:Nat))`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.ModuloCounter
 
 open TinylambOpt.ResearchGoals.Compression.Wire

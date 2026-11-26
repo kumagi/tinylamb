@@ -1,4 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Optimizer
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `NullableGroupKey` — Exactly which observed dependency licenses a narrower GROUP BY
+  hash key? The output includes both original grouping values and their multiplicity.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

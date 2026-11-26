@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `AdditiveProduct.SecondMoment` — `∀ a b, weighted bag (a,b) (fun x => x*x) =
+  b.length*(a.map (fun x => x*x)).sum+2*a.sum*b.sum+a.length*(b.map (fun x =>
+  x*x)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

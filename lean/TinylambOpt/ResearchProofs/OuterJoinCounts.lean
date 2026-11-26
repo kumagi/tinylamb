@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.OuterJoinCounts
 
+/-!
+Proved
+
+- `Goal` — `∀ l r key, groupCount (histogram l) (histogram r) key = (projected l
+  r).count key`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.OuterJoinCounts`.
+-/
+
 namespace TinylambOpt.ResearchProofs.OuterJoinCounts
 
 open TinylambOpt.ResearchGoals.OuterJoinCounts
@@ -267,3 +276,7 @@ theorem sound : TinylambOpt.ResearchGoals.OuterJoinCounts.Goal := by
         simp [groupCount, ha, hb] <;> omega
 
 end TinylambOpt.ResearchProofs.OuterJoinCounts
+
+-- C++ references to this model or its proof.
+-- query/select_grouped_rewrites.cpp
+-- query/select_rewrites.hpp

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `LocalDetection` — A fresh wait must belong to any cycle newly created by installing
+  it.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

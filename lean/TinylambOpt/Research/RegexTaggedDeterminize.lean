@@ -1,5 +1,13 @@
 import Std.Tactic
 
+/-!
+One epsilon step, preserving the source order of the edges.
+
+`c` dominates `d`: same state, no-later start tags.
+
+Named results include `tagBetterEq_refl`, `tagBetterEq_trans`, `length_set`.
+-/
+
 namespace TinylambOpt.Research.RegexTaggedDeterminize
 
 /-

@@ -554,5 +554,61 @@ TEST(PipelineP3aTest, FilteredHashProbeSwitchKeepsOrderAndDuplicateChains) {
   }
 }
 
+TEST(PipelineP3aTest, OocGroupAggSinkSpillsSharedChildMultiDistinctInO1Ram) {
+  // Multiple DISTINCT aggregates sharing the same child expression
+  // (e.g. COUNT(DISTINCT v), SUM(DISTINCT v), AVG(DISTINCT v)) plus a
+  // non-distinct sibling must use the O(1)-RAM sorted skew fallback instead of
+  // failing with TooBigData under a tight 16 KiB operator budget.
+  const Schema in_schema("t", {Column("v", ValueType::kInt64)});
+  const Schema out_schema("out", {Column("cd", ValueType::kInt64),
+                                  Column("sd", ValueType::kInt64),
+                                  Column("ad", ValueType::kDouble),
+                                  Column("cnt", ValueType::kInt64)});
+  std::vector<Expression> aggs = {
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("v"),
+                             /*distinct=*/true),
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("v"),
+                             /*distinct=*/true),
+      AggregateExpressionExp(AggregationType::kAvg, ColumnValueExp("v"),
+                             /*distinct=*/true),
+      AggregateExpressionExp(AggregationType::kCount, Expression()),
+  };
+  ASSIGN_OR_ASSERT_FAIL(
+      QueryMemoryGrant, grant,
+      QueryMemoryCoordinator::Global().AcquireGrant(16384, 0));
+  PipelineContext ctx(nullptr, std::move(grant), 1);
+  OocGroupAggSink sink(in_schema, {}, std::move(aggs), out_schema);
+  ASSERT_SUCCESS(sink.Init(&ctx, 1));
+  constexpr int64_t kDistinctVals = 400;
+  for (int rep = 0; rep < 3; ++rep) {
+    DataChunk chunk;
+    chunk.Initialize(in_schema, kDistinctVals);
+    for (int64_t v = 1; v <= kDistinctVals; ++v) {
+      chunk.Append(Row({Value(v)}));
+    }
+    ASSERT_SUCCESS(sink.Consume(&ctx, 0, chunk));
+  }
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<PipelineSource>, out_src,
+                        sink.Finalize(&ctx));
+  ASSERT_SUCCESS(out_src->Open(&ctx));
+  std::vector<Row> rows;
+  DataChunk out_chunk;
+  while (true) {
+    ASSIGN_OR_ASSERT_FAIL(bool, has, out_src->NextBatch(&ctx, &out_chunk, 64));
+    if (!has) {
+      break;
+    }
+    for (size_t r = 0; r < out_chunk.Size(); ++r) {
+      rows.push_back(out_chunk.RowAt(r));
+    }
+  }
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0].AsInt64(), kDistinctVals);
+  EXPECT_EQ(rows[0][1].AsInt64(), kDistinctVals * (kDistinctVals + 1) / 2);
+  EXPECT_DOUBLE_EQ(rows[0][2].AsDouble(),
+                   static_cast<double>(kDistinctVals + 1) / 2.0);
+  EXPECT_EQ(rows[0][3].AsInt64(), kDistinctVals * 3);
+}
+
 }  // namespace
 }  // namespace tinylamb

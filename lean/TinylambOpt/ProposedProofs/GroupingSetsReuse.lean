@@ -1,5 +1,14 @@
 import TinylambOpt.ProposedGoals.GroupingSetsReuse
 
+/-!
+Proved
+
+- `Goal` — All four grouping sets agree with a fresh scan, and the reuse path never
+  reads the input more than once.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.GroupingSetsReuse`.
+-/
+
 namespace TinylambOpt.ProposedProofs.GroupingSetsReuse
 
 open TinylambOpt.ProposedGoals.GroupingSetsReuse
@@ -319,3 +328,6 @@ theorem sound : Goal := by
     have hlen : 0 < rows.length := List.length_pos_iff.mpr hne
     simp [reuseReads, directReads, masks]
     omega
+
+-- C++ references to this model or its proof.
+-- executor/detail/typed_column_eval.cpp

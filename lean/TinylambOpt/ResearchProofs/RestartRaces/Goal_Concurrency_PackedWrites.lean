@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Concurrency
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `PackedWrites` — Replace a whole-row write conflict by an exact field certificate
+  when the storage update is atomic. Both orders must preserve both isolated read
+  observations for every base and produce the same final packed value.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

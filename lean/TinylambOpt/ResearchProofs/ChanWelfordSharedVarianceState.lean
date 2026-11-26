@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.ChanWelfordSharedVarianceState
 
+/-!
+Proved
+
+- `Goal` — Shared Chan/Welford statistical accumulator for `(COUNT, AVG, STDDEV_SAMP)`
+  (TPC-DS Q17/Q39): (1) computing one shared tuple state yields exact `COUNT`, `AVG`,
+  and `VAR_SAMP` (matching `n ≤ 1 → none`), (2) `n * sumSq - sum^2` equals the scaled
+  sum of squared deviations `∑ (n * x - sum)^2 / n`, and (3) parallel chunks satisfy
+  the exact integer Chan cross-term identity `n1 * n2 * M2_num(xs ++ ys) =
+  n2*(n1+n2)*M2_num(xs) + n1*(n1+n2)*M2_num(ys) + (n2*s1 - n1*s2)^2`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.ChanWelfordSharedVarianceState`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ChanWelfordSharedVarianceState
 
 open TinylambOpt.ResearchGoals.ChanWelfordSharedVarianceState

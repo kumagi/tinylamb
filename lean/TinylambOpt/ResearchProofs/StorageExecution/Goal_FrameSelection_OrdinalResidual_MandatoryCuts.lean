@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `OrdinalResidual.MandatoryCuts` — A page budget must cover at least the required
+  number of tags and restart entries.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.LeftJoinRightMultiplicityCollapse
 
+/-!
+Proved
+
+- `Goal` — Right-side multiplicity collapse for `LEFT OUTER JOIN` without right-column
+  references (STATS-CEB C4): replacing materialization of `R` matches with
+  per-non-NULL-key multiplicity weights `max 1 mult(k)` (and `1` for NULL join keys)
+  yields identical `(COUNT(*), COUNT(L.v), SUM(L.v))`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.LeftJoinRightMultiplicityCollapse`.
+-/
+
 namespace TinylambOpt.ResearchProofs.LeftJoinRightMultiplicityCollapse
 
 open TinylambOpt.ResearchGoals.LeftJoinRightMultiplicityCollapse
@@ -312,3 +324,6 @@ theorem sound : TinylambOpt.ResearchGoals.LeftJoinRightMultiplicityCollapse.Goal
   exact (opt_eq_fold ls rs).trans (ref_eq_fold ls rs).symm
 
 end TinylambOpt.ResearchProofs.LeftJoinRightMultiplicityCollapse
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

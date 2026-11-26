@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ReferenceEdits
 import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits.Common
 
+/-!
+Foreign-key checking must respect the observation point of the constraint and the parent
+keys still present after each modeled edit.
+
+Proved
+
+- `ParentFirst.FrameKeys` — References outside the write footprint preserve their
+  violation status.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,10 @@
 import Std
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.RangePlans
 
 /-! A probe supplies two parameters. Build rows have two integer coordinates

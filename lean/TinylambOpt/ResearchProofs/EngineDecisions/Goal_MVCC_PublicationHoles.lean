@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `PublicationHoles` — A read-only query may cross an unpublished timestamp on a
+  certified footprint. Even a pending write to a queried key is harmless if a newer
+  published version masks it at this snapshot.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -156,3 +167,6 @@ theorem sound : Goal := by
     exact List.all_eq_true.mp ((key_equiv txs snap k hpair).mpr (fun finishes => h finishes k hk))
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_PublicationHoles
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

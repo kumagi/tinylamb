@@ -1,5 +1,17 @@
 import Std
 
+/-!
+These claims concern looking up the first qualifying key using block information. An
+ordered SQL scan must preserve the boundary at which the key first occurs.
+
+Modeled claims
+
+- `Goal` — `∀ bs, (∀ b ∈ bs, b.header = summary b.rows) → let s := scan bs
+  s.kept.reverse = reference (bs.flatMap Block.rows) ∧ ∀ b ∈ bs.zipIdx, b.2 ∈
+  s.opened ↔ ∃ r ∈ b.1.rows, ∀ old ∈ (bs.take b.2).flatMap Block.rows, old.key ≠
+  r.key`
+-/
+
 namespace TinylambOpt.ResearchGoals.FirstKeyBlock
 
 abbrev W := BitVec 64

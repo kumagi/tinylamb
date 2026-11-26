@@ -1,6 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `XorPredecessor.JoinCorrection` — `∀ a b, b≠[] → let p:=a.getLast?.getD 0; let
+  x:=b.head?.getD 0; (write (a++b)).length+ubytes x=(write a).length+(write
+  b).length+ubytes (p ^^^ x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

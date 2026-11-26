@@ -1,6 +1,16 @@
 import TinylambOpt.Research.TieWatermark
 import TinylambOpt.Research.IncrementalSortPage
 
+/-!
+Rank after OFFSET. All rows strictly ahead count, including duplicates; peers at the
+boundary share their rank. Input is in SQL order.
+
+Modeled claims
+
+- `Goal` — The stable tie order used here is stream concatenation order. For the
+  incremental sorter, occurrence IDs encode that order.
+-/
+
 namespace TinylambOpt.ResearchGoals.SqlFetchWithTies
 
 open Research

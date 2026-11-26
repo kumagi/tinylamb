@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `DoubleHalf.LastPositive` — `∀ w, 1<w → scalar rule w (limit w/2) 0=.error 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

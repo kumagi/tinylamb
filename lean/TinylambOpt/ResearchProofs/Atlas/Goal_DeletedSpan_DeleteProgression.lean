@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas_EncodedPages_DeletedSpan_Remaining
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeletedSpanSeekAndProgressions
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `DeletedSpan.DeleteProgression` — `∀ c mask, (((rows layout c).filter (fun r =>
+  !contains mask r.1)).map Prod.snd).sum = ((layout.lanes c).map (fun a => partialSum
+  a a.n - deletedSum a mask)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -31,9 +42,9 @@ open TinylambOpt.ResearchGoals.Atlas.EncodedPages.DeletedSpan
 
 /-- The goal is true.  The full proof (CRT intersection, stride-1 lane point
 enumeration, and the flatMap/permutation reduction) is registered in
-`TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeletedSpan.Remaining`; here we
+`TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeletedSpanSeekAndProgressions`; here we
 expose it as the goal's theorem. -/
 theorem sound_DeletedSpan_DeleteProgression : DeletedSpan.DeleteProgression.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeletedSpan.Remaining.sound_DeleteProgression
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeletedSpanSeekAndProgressions.sound_DeleteProgression
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_DeletedSpan_DeleteProgression

@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Common_PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+Proved
+
+- `SignedSum.LateCancellation` — `∀ w, 1<w → execute update w 0 (limit w-1) [some
+  1,some (-1)]=.error 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

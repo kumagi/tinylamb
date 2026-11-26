@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
-import TinylambOpt.ResearchProofs.Atlas.RangePlans4
+import TinylambOpt.ResearchProofs.Atlas.RangePlans.WeekSessionAndVarianceIndexes
+
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `VarianceBudget.PrefixIndex` — `∀ b p rs, (∀ r ∈ rs, bounded b r.1) → indexed shape b
+  p (prefixMass rs) = scan shape p rs`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -15,6 +25,6 @@ open TinylambOpt.ResearchGoals.Atlas.RangePlans.VarianceBudget
     このモデルのスタンシル識別子に適用した証明を再利用する。 -/
 theorem sound_VarianceBudget_PrefixIndex :
     TinylambOpt.ResearchGoals.Atlas.RangePlans.VarianceBudget.PrefixIndex.Goal :=
-  TinylambOpt.ResearchProofs.Atlas.RangePlans4.VarianceBudget.sound_VarianceBudget_PrefixIndex
+  TinylambOpt.ResearchProofs.Atlas.RangePlans.WeekSessionAndVarianceIndexes.VarianceBudget.sound_VarianceBudget_PrefixIndex
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_VarianceBudget_PrefixIndex

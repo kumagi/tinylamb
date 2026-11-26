@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved
+
+- `ExceptionOverlay.OverrideHead` — `∀ n d es i x k, i<n → let old := (es.lookup
+  i).getD d bag.mass (n,d,(i,x)::es) k + (decide (old=k)).toNat = bag.mass (n,d,es) k
+  + (decide (x=k)).toNat`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

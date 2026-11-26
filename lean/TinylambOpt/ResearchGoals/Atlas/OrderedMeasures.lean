@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.PairAggregates
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
 /-! A partition of non-NULL exact integer values, in a deterministic SQL order.

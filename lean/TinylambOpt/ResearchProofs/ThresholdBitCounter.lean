@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.ThresholdBitCounter
 
+/-!
+Proved
+
+- `Goal` — `∀ active a b c, ∀ i < 64, let (yes,unknown) := masks active a b c let r :=
+  reference (atom a i) (atom b i) (atom c i) yes.getLsbD i = (active.getLsbD i &&
+  decide (r = .tTrue)) ∧ unknown.getLsbD i = (active.getLsbD i && decide (r =
+  .tNull))`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.ThresholdBitCounter`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ThresholdBitCounter
 
 open TinylambOpt.ResearchGoals.ThresholdBitCounter

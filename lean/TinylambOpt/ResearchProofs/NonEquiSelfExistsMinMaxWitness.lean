@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.NonEquiSelfExistsMinMaxWitness
 
+/-!
+Proved
+
+- `Goal` — Group `(min, max)` witness reduction for non-equi self-`EXISTS` (TPC-DS Q16
+  `EXISTS (SELECT * FROM catalog_sales cs2 WHERE cs1.oid = cs2.oid AND cs1.wh <>
+  cs2.wh)`): checking `minWh < maxWh ∨ wh ≠ minWh` against the group summary matches
+  quadratic self-join lookup (returning `false` whenever `wh` is `NULL`).
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.NonEquiSelfExistsMinMaxWitness`.
+-/
+
 namespace TinylambOpt.ResearchProofs.NonEquiSelfExistsMinMaxWitness
 
 open TinylambOpt.ResearchGoals.NonEquiSelfExistsMinMaxWitness

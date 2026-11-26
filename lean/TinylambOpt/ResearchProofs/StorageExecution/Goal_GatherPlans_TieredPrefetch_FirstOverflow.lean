@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `TieredPrefetch.FirstOverflow` — `∀ lim fee x, price lim fee x (x+lim)=lim+fee+3`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

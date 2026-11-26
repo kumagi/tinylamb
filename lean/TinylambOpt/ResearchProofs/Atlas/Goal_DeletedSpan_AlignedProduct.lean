@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_P7
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.OrdinalProgressionsAndDeletedSpans
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `DeletedSpan.AlignedProduct` — `∀ c (b : Lane), 0 < b.stride → ((rows layout c).map
+  (fun r => ((List.range b.n).map (fun i => if r.1 == b.start+i*b.stride then
+  r.2*(b.base+b.step*(i:Int)) else 0)).sum)).sum = ((layout.lanes c).map (aligned ·
+  b)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -41,6 +53,6 @@ private def alignedProductHolds (c : Config) (b : Lane) : Bool :=
     `Auto_EncodedPages_P7`. -/
 theorem sound_DeletedSpan_AlignedProduct :
     TinylambOpt.ResearchGoals.Atlas.EncodedPages.DeletedSpan.AlignedProduct.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_P7.sound_DeletedSpan_AlignedProduct
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.OrdinalProgressionsAndDeletedSpans.sound_DeletedSpan_AlignedProduct
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_DeletedSpan_AlignedProduct

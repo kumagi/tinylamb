@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
 
+/-!
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+
+Refuted by counterexample
+
+- `TwoLiterals.SeekMinimum` — The emitted seek count equals the number of maximal
+  contiguous true regions.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

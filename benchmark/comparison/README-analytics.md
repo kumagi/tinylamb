@@ -102,7 +102,7 @@ python3 benchmark/comparison/analytics_bench.py --report /var/tmp/analytics-sf1
   再現したエンジニアリング probe です。
 - 主キー／二次索引は張りません。索引選択の比較ではなく、結合順序・
   基数推定・GROUP BY/JOIN カーネルとメモリ圧力の比較に焦点を当てます。
-- ClickHouse は HTTP経由、tinylamb は PostgreSQL Simple Query 経由、
+- ClickHouse は HTTP経由、tinylamb は PostgreSQL Extended Query（Binary Format）経由、
   DuckDB は組込みAPI経由なので、通信・ドライバ費用は同一ではありません。
 - 認定ベンチマーク結果ではありません。
 

@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Refuted by counterexample
+
+- `RiskEnvelope.MeanReserve` — `∀ xs, 0 < mass xs (fun _ => true) → let avg : Int :=
+  (xs.map (fun (v,w) => v*(w:Int))).sum / (mass xs (fun _ => true):Int) ∀ z, loss xs
+  avg 1 1 ≤ loss xs z 1 1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

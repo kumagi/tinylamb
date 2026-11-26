@@ -1,6 +1,15 @@
 import Std.Tactic
 import TinylambOpt.ThreeValued
 
+/-!
+Swapping SQL filters is sound when their modeled results and error behavior agree.
+Counterexamples show how short-circuiting can suppress or change an error if that
+condition fails.
+
+Named results include `evalAndShort_swap`, `filter_eval_order_sound`,
+`error_and_false_break_swap`.
+-/
+
 /-
 # Cheap-filter reordering that preserves both passing rows and observed errors
 
@@ -150,3 +159,7 @@ theorem div_zero_reorder_static_conditions :
       simp [zeroPred] at he2
 
 end TinylambOpt.FilterEvalOrder
+
+-- C++ references to this model or its proof.
+-- executor/detail/scan_filter.cpp
+-- expression/bytecode.cpp

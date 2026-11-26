@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.SlotPlacement
 
+/-!
+Page allocation for stored SQL rows must preserve the byte ranges, alignment, and live
+data required by the modeled layout.
+
+Refuted by counterexample
+
+- `TrailerWord.CapacityOnly` — Strong admission hypothesis: enough unoccupied bytes
+  always allow this request.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

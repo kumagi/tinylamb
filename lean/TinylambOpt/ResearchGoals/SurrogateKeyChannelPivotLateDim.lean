@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Reference: join dimension before grouping/pivoting in wide `(bk, wide)` space.
+
+Optimized: aggregate `fSmall` directly by integer `sk`, semijoin-filter `fLarge` to
+valid `sk`s with `s1 > 0` before aggregating `fLarge`, pivot in integer `sk` space, and
+materialize wide dimension attributes at the end.
+
+Modeled claims
+
+- `Goal` — Integer surrogate-key channel pivot + semijoin narrowing + late wide-column
+  dimension lookup (TPC-DS Q04/Q11/Q74/Q79): when `sk` is unique in `D` and `sk ↦ bk`
+  is injective, pivoting on integer `sk`, narrowing large channels by valid `y1 > 0`
+  `sk`s, and attaching wide attributes only for winners equals wide-string pre-join
+  grouping, whereas non-injective `bk` breaks it.
+-/
+
 namespace TinylambOpt.ResearchGoals.SurrogateKeyChannelPivotLateDim
 
 structure DimRow where

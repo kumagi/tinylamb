@@ -1,5 +1,19 @@
 import Std
 
+/-!
+Optimized single-pass partition sweep using adjacent `LAG`/`LEAD` offsets without
+computing `RANK()` or joining `V1 ⋈ V1_lag ⋈ V1_lead`.
+
+Modeled claims
+
+- `Goal` — Window rank self-join -> adjacent `LAG`/`LEAD` sweep (TPC-DS Q57) and
+  orderless partition-window hash aggregation (TPC-DS Q63/Q89/Q86): (1) when `(part,
+  ord)` pairs are unique, the 3-way self-join on `rn = rn_lag + 1 ∧ rn = rn_lead - 1`
+  equals an adjacent 3-element window sweep without self-joins (whereas ties break
+  equivalence because `RANK()` skips numbers), and (2) orderless `SUM/COUNT OVER
+  (PARTITION BY part)` computed via unsorted hashing matches sorting by `part` first.
+-/
+
 namespace TinylambOpt.ResearchGoals.RankSelfJoinToLagLeadAndHashWindow
 
 structure WRow where

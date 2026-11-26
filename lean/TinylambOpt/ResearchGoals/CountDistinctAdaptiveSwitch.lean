@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Buggy NULL handling that encodes SQL NULL as `0` inflates `COUNT(DISTINCT)` when `0` is
+absent.
+
+Modeled claims
+
+- `Goal` — Adaptive 4-state `COUNT(DISTINCT)` (`empty`/`single`/`small`/`large`)
+  (`executor/detail/typed_stream_aggregate_compact.cpp`,
+  `executor/detail/aggregate_accumulator.cpp`): ignoring `none` (SQL NULL) and
+  promoting through `empty -> single -> small -> large` across worker fold + tree
+  merge preserves exact distinct cardinality and invariants.
+-/
+
 namespace TinylambOpt.ResearchGoals.CountDistinctAdaptiveSwitch
 
 inductive State where

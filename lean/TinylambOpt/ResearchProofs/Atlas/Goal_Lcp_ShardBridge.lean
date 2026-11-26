@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.ShardBridge` — `∀ a b, frontBytes (a++b) + common (a.getLast?.getD [])
+  (b.head?.getD []) = frontBytes a + frontBytes b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

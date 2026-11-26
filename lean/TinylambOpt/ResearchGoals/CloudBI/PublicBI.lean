@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+-/
+
 namespace TinylambOpt.ResearchGoals.CloudBI.PublicBI
 
 /-- Nullable dimensions are group keys. A comparison with a non-NULL literal

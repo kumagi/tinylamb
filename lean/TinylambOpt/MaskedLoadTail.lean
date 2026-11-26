@@ -1,5 +1,15 @@
 import Std.Tactic
 
+/-!
+Addresses read by the scalar reference: `base + i` for `i < r`.
+
+Addresses read by the lowered short masked-load sequence. Each chunk contributes only
+lanes that are still live; out-of-tail lanes are absent.
+
+Named results include `chunk_events_eq_ref`, `masked_load_tail_sound`,
+`full_width_load_reads_unassigned`.
+-/
+
 namespace TinylambOpt.MaskedLoadTail
 
 /-

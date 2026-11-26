@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `Samples.SampleMean` — `∀ xs k, 0 < k → k ≤ xs.length → (sums xs k).sum = (choose
+  (xs.length-1) (k-1):Int)*xs.sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

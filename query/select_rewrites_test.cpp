@@ -1742,7 +1742,8 @@ TEST_F(SelectRewritesTest, WindowHaloAndOuterFetchTiesSqlParity) {
 }
 
 // Lean proofs:
-//   Wave9TpcdsMultiChannelAndTpch.lean (CteVarianceCoeffSelfJoinPivot_sound,
+//   lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
+//   (CteVarianceCoeffSelfJoinPivot_sound,
 //                                       GroupAvgThresholdTwoPassSplit_sound)
 //   CloudBI/PublicBI.lean (sound_GroupBeforeSuffix)
 TEST_F(SelectRewritesTest, Wave9Q39Q65AndCloudBiPreGroupSuffixRewrites) {
@@ -1994,7 +1995,8 @@ TEST_F(SelectRewritesTest, Wave9Q39Q65AndCloudBiPreGroupSuffixRewrites) {
 }
 
 TEST_F(SelectRewritesTest, PushSharedCteRestrictionsThroughUnionGroupBy) {
-  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
   //   (LeftJoinRightSideKeyFilterPushdown_sound)
   SqlEngine engine(*db_);
   auto exec_stmt = [&](const std::string& q) {

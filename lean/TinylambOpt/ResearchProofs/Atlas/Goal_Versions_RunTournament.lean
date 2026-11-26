@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `Versions.RunTournament` — `∀ (runs : List (List Event)) k t v, winner runs.flatten k
+  t v = newest (runs.filterMap (fun r => winner r k t v))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

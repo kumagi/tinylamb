@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Refuted by counterexample
+
+- `Couplings.AlignedMarginals` — `∀ rs, (rs.map Prod.fst).Perm (rs.map Prod.snd) → cost
+  rs = 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

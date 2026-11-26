@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `RingNeighborhood.PrefixIndex` — `∀ b p rs, (∀ r ∈ rs, bounded b r.1) → indexed shape
+  b p (prefixMass rs) = scan shape p rs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

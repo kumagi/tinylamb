@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Reference strict-overflow `GROUP BY k, k-1, k-2, k-3 ORDER BY COUNT(*) DESC LIMIT K`:
+fails (`none`) if any input row overflows `int64` on `k - 1`, `k - 2`, or `k - 3`.
+
+Optimized functional-key reduction: group ONLY by `k`, take Top-`K`, then compute `(k-1,
+k-2, k-3)` only on the `≤ K` output rows (guarded by explicit per-row overflow check
+`int64Min + 3 ≤ k ≤ int64Max` when domain isn't bounded).
+
+Modeled claims
+
+- `Goal` — Functional-dependent group-key elimination (`GROUP BY k, k-1, k-2, k-3` on
+  ClickBench Q36): when all inputs satisfy `k ∈ [MIN_I64 + 3, MAX_I64]`, grouping
+  only by `k` and materializing `(k-1, k-2, k-3)` after `Top-K` yields exact equality
+  with 4-key grouping; deferring `k-1` evaluation past `LIMIT K` without checking all
+  inputs silently hides overflow errors on dropped rows.
+-/
+
 namespace TinylambOpt.ResearchGoals.FunctionalDependentGroupKeyElim
 
 def int64Min : Int := -9223372036854775808

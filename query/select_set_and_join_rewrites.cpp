@@ -348,7 +348,7 @@ bool ExtractPureUnionAllBranches(  // NOLINT(misc-no-recursion)
   return out_branches->size() >= 2;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
 // (using_join_inner_prefix_reorder_and_filter_sound,
 //  outer_and_using_join_prefix_reorder_sound)
 namespace {
@@ -507,7 +507,7 @@ bool PullInnerJoinsBeforeLeftJoinsOne(
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (outer_join_intervening_inner_to_antijoin_sound,
 //    inner_prefix_reorder_and_filter_under_left_joins_sound)
 bool PullInnerJoinsBeforeLeftJoins(SelectStatement* select,
@@ -1071,7 +1071,7 @@ bool DistributeOneUnionGroupBy(SelectStatement* stmt, TransactionContext& ctx) {
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (zero_padded_union_branch_preagg_sound,
 //    zero_padded_union_naive_null_bug,
 //    zero_padded_union_naive_coalesce_bug)
@@ -1091,7 +1091,7 @@ bool DistributeZeroPaddedUnionGroupBy(SelectStatement* select,
   return changed;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (union_cte_disjunctive_pushdown_and_branch_prune_sound,
 //    grouped_self_join_conditional_pivot_sound,
 //    self_join_pivot_null_key_bug,
@@ -1377,7 +1377,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
 
     // Resolve body relations and certified PK relations.
     // Lean proof:
-    // lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+    // lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
     //   (YearPairPivotSelfJoinElim_sound)
     // Also supports a single derived-table source (e.g. TPC-DS Q75 `all_sales`
     // over a UNION DISTINCT `sales_detail` subquery) so the discriminator
@@ -1599,7 +1599,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
       // branch WHERE clause so all base-table scans and UNION DISTINCT drop
       // non-target years upfront.
       // Lean proof:
-      // lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+      // lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
       //   (YearPairPivotSelfJoinElim_sound)
       if (body_is_single_derived && !body.Sources().empty() &&
           body.Sources()[0].query != nullptr) {
@@ -1758,7 +1758,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
         outer->Sources()[site_indices[0]].alias.empty()
             ? outer->Sources()[site_indices[0]].table
             : outer->Sources()[site_indices[0]].alias;
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     // (bijective_dim_key_cte_deferral_sound)
     auto find_body_table_name =
         [&](const std::string& rel_name) -> std::string {
@@ -2163,7 +2163,7 @@ bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
   return any_changed;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (full_outer_indicator_inclusion_exclusion_sound,
 //    full_outer_indicator_partial_null_key_bug,
 //    full_outer_indicator_empty_null_bug)
@@ -3176,7 +3176,7 @@ bool RewriteCorrelatedCteScalarAggToWindow(SelectStatement* outer) {
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (self_join_group_agg_to_window_sound,
 //    self_join_agg_window_null_key_bug)
 bool RewriteSelfJoinAggregateToWindow(SelectStatement* outer) {
@@ -3335,7 +3335,7 @@ bool DerivedQueryIsSelfContainedAndExpensive(const SelectStatement& q) {
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (shared subquery factorization / multiset reflexivity)
 bool HoistIdenticalDerivedSubqueriesToCte(SelectStatement* outer) {
   if (outer == nullptr || !outer->UnionAll().empty() ||
@@ -3392,7 +3392,7 @@ bool HoistIdenticalDerivedSubqueriesToCte(SelectStatement* outer) {
   return hoisted;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+// Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
 //   (disjoint_union_group_by_bypass_sound,
 //    agg_union_null_tag_collision_bug)
 bool BypassDisjointUnionGroupBy(SelectStatement* select) {
@@ -3694,7 +3694,7 @@ bool BypassDisjointUnionGroupBy(SelectStatement* select) {
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+// Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
 // (group_by_functional_expr_reduction_sound)
 bool PruneRedundantGroupByKeys(SelectStatement* select) {
   if (select == nullptr) {
@@ -4098,7 +4098,7 @@ bool CanonicalizeTwoValuedStmtImpl(  // NOLINT(misc-no-recursion)
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (two_valued_predicate_not_involution_sound, sqlIsNull_never_tNull)
 bool CanonicalizeTwoValuedNegations(SelectStatement* select) {
   std::unordered_set<SelectStatement*> visited;
@@ -4351,7 +4351,7 @@ bool CanonicalizeAliasGroupByStmtImpl(  // NOLINT(misc-no-recursion)
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (select_alias_group_by_canonicalization_sound)
 bool CanonicalizeSelectAliasGroupBy(SelectStatement* select,
                                     TransactionContext& ctx) {
@@ -5026,7 +5026,7 @@ bool CollectSharedGroupedCteSites(SelectStatement* outer,
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (shared_grouped_union_distinct_cte_disjunctive_pushdown_sound)
 bool PushSharedGroupedCteKeyRestrictions(SelectStatement* outer,
                                          TransactionContext& ctx) {
@@ -5871,7 +5871,7 @@ bool PushDistinctSurrogateKeysImpl(  // NOLINT(misc-no-recursion)
 
 }  // namespace select_rewrite_detail
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (eager_distinct_surrogate_keys_setop_sound,
 //    except_below_non_injective_dim_unsound)
 bool PushDistinctSurrogateKeysBeforeDimJoins(SelectStatement* outer,

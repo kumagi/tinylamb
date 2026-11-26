@@ -1,4 +1,25 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
+
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.BetweenCodes` — `∀ (xs : Word) level lo hi, lo ≤ hi → xs.countP (fun x =>
+  lo*2^level ≤ x && x < hi*2^level) = xs.countP (fun x => lo ≤ x/2^level && x/2^level
+  < hi)`
+- `Wavelet.DictionaryGrowth` — `∀ d old more k, (∀ x ∈ old, x < 2^d) → (∀ y ∈ more, 2^d
+  ≤ y ∧ y < 2^(d+1)) → k < old.length+more.length → kth (d+1) (old++more) k = if k <
+  old.length then kth d old k else 2^d+kth d more (k-old.length)`
+- `Wavelet.Quantile` — `∀ d xs k, (∀ x ∈ xs, x < 2^d) → k < xs.length →
+  xs.mergeSort[k]? = some (kth d xs k)`
+- `Wavelet.RangeMap` — `∀ bit l w xs high, let branch := fun x : Nat => x.testBit bit
+  == high let (start,len) := remap bit l w xs high (((xs.drop l).take w).filter
+  branch) = (((xs.filter branch).drop start).take len)`
+- `Wavelet.SameBranch` — `∀ a b bit, pairs a b = pairs (lower bit a) (lower bit b) +
+  pairs (upper bit a) (upper bit b)`
+-/
 namespace TinylambOpt.ResearchProofs.Atlas.TextExecution.Wavelet
 open TinylambOpt.ResearchGoals.Atlas.TextExecution
 open TinylambOpt.ResearchGoals.Atlas.TextExecution.Wavelet

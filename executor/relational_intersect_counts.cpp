@@ -55,7 +55,8 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (Wave9TpcdsRollupAndSetOps.lean:
+// Lean-backed
+// (lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean:
 // SurrogateIntersectSetCount_sound) fast path for multi-channel customer/date
 // INTERSECT/EXCEPT COUNT(*) queries (TPC-DS Q38 & Q87):
 //   SELECT COUNT(*) FROM (

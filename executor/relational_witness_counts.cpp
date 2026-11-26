@@ -48,9 +48,10 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (DuckDBGaps/Orders.lean: LateSlack_sound, RetireWitness_sound)
-// fast path for single-table grouped COUNT(*) with correlated EXISTS on a
-// paired inequality `l_commitdate < l_receiptdate` (TPC-H Q4):
+// Lean-backed (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean:
+// LateSlack_sound, RetireWitness_sound) fast path for single-table grouped
+// COUNT(*) with correlated EXISTS on a paired inequality `l_commitdate <
+// l_receiptdate` (TPC-H Q4):
 //   SELECT o_orderpriority, COUNT(*) FROM orders
 //   WHERE o_orderdate >= lo AND o_orderdate < hi
 //     AND EXISTS (SELECT * FROM lineitem
@@ -613,8 +614,9 @@ StatusOr<std::optional<Relation>> TryExecuteRetireWitnessExists(
   return std::optional<Relation>(std::move(out));
 }
 
-// Lean-backed (DuckDBGaps/Orders.lean: RebucketOrders_sound) fast path for
-// LEFT OUTER JOIN order-count distribution histograms (TPC-H Q13):
+// Lean-backed (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean:
+// RebucketOrders_sound) fast path for LEFT OUTER JOIN order-count distribution
+// histograms (TPC-H Q13):
 //   SELECT c_count, COUNT(*) AS custdist
 //   FROM (SELECT c_custkey, COUNT(o_orderkey) AS c_count
 //         FROM customer LEFT OUTER JOIN orders

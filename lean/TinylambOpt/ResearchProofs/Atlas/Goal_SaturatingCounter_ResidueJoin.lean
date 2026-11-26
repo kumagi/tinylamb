@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `SaturatingCounter.ResidueJoin` — `∀ c (b : Lane), ((rows layout c).map (fun r =>
+  (List.range b.n).countP (fun (i : Nat) => r.2 == b.base+b.step*(i:Int)))).sum =
+  ((layout.lanes c).map (joinCount · b)).sum`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.Goal_SaturatingCounter_ResidueJoin
 
 open TinylambOpt.ResearchGoals.Atlas.EncodedPages

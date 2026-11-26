@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+Refuted by counterexample
+
+- `SignedSum.FinalCheck` — Aggressive proposal: replace every prefix guard by one check
+  on the final state.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 open TinylambOpt.ResearchGoals.Compression.Wire
 

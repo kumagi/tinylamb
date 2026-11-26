@@ -333,3 +333,6 @@ theorem sound : TinylambOpt.ResearchGoals.BytecodeSideTableEquiv.Goal := by
   exact h
 
 end TinylambOpt.ResearchProofs.BytecodeSideTableEquiv
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_raw_aggregates.cpp

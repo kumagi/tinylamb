@@ -1,5 +1,28 @@
 import TinylambOpt.ResearchGoals.Frontiers.PlanMarkets
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (8 claims, including the following)
+
+- `ApproxMemo` — `∀ (ps cache : List Line) e n, ps ≠ [] → (∀ p ∈ ps, ∃ q ∈ cache,
+  q.startup ≤ p.startup+e ∧ q.perRow ≤ p.perRow+e) → (optimum cache n).getD 0 ≤
+  (optimum ps n).getD 0 + e*(n+1)`
+- `BoxWorst` — `∀ (dims : List (Int × Int × Int × Int)), (∀ d ∈ dims, d.2.1 ≤ d.2.2.2 ∧
+  d.2.2.2 ≤ d.2.2.1) → (dims.map (fun (w,_,_,x) => w*x)).sum ≤ (dims.map (fun
+  (w,lo,hi,_) => w*(if 0 ≤ w then hi else lo))).sum`
+- `DiminishingReuse` — `∀ qs small large v, (∀ x ∈ small, x ∈ large) → gain qs large v
+  ≤ gain qs small v`
+
+Refuted by counterexample
+
+- `ComplementaryViews` — `∀ qs small large v, (∀ x ∈ small, x ∈ large) → bundles qs
+  (v::large) - bundles qs large ≤ bundles qs (v::small) - bundles qs small`
+- `TwoWinners` — `∀ a b ps hi, optimum ps 0 = some (cost a 0) → optimum ps hi = some
+  (cost b hi) → a ∈ ps → b ∈ ps → ∀ n ≤ hi, optimum [a,b] n = optimum ps n`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

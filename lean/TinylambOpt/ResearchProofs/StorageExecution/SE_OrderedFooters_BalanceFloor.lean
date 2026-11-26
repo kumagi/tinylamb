@@ -1,4 +1,18 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_OrderedFooters_Common
+
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved (10 claims, including the following)
+
+- `BalanceFloor.AmendLeaf` — Update one cached block using the left and right partial
+  states.
+- `BalanceFloor.CreditLimit` — `∀ xs (credit : Int), 0 ≤ credit+(agg.reference xs).2 ↔
+  ∀ i≤xs.length, 0≤credit+(agg.reference (xs.take i)).1`
+- `BalanceFloor.FrameSlice` — Use only the two ragged boundaries and whole-page
+  summaries for a window.
+-/
 set_option maxHeartbeats 0
 
 /-! Balance-floor fold: signed steps, running sum and minimum prefix sum.

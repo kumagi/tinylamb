@@ -68,12 +68,12 @@ enum class BytecodeOp : uint8_t {
   kDup,
   // Applies CastSpec casts_[operand] to the stack top.
   kCast,
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean (in_const_set_3vl_sound)
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean (in_const_set_3vl_sound)
   // Pops one uncollated VARCHAR value and pushes 3VL membership
   // (TRUE/FALSE/NULL) against StringSetSpec string_sets_[operand] in O(1) flat
   // hash lookup.
   kInStringSet,
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (ascii_substr_1based_slice_sound)
   // Pops `operand` (2 or 3) slots (str, start [, length]) and pushes SUBSTR.
   kSubstr,

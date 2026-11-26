@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
+
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (10 claims, including the following)
+
+- `Product.CrossPageJoin` — Disjoint derived score intervals imply an empty equijoin
+  between pages.
+- `Product.DominatedTop` — A bounded page cannot change the descending top k once k
+  strictly better witnesses are known.
+- `Product.ProductDivisor` — `∀ x y k, 0<x → (k≤kernel.score 0 (x,y) ↔ (k+x-1)/x≤y)`
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZones.Product

@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `HistoricalCover` — Recover a historical covering scan from today's index plus the
+  first before-image per touched row. This restores keys moved out of range as well
+  as changed INCLUDE values, without a historical full-table scan.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -203,3 +214,6 @@ theorem sound : Goal := by
   exact (List.Perm.append hnot_part hdirty_part).trans hjoin
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_HistoricalCover
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

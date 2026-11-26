@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.FactorizedJoinTreeCountPropagation
 
+/-!
+Proved
+
+- `Goal` — Factorized join-tree bottom-up count propagation for acyclic multi-way
+  `COUNT(*)` joins (LDBC L1 / JOB J4, J5 / STATS-CEB C1, C2, C5 / LDBC L2, L5 /
+  DictionaryJoinsAndLateLabels B3): propagating per-key subtree multiplicities
+  bottom-up without materializing intermediate M:N join tuples matches flattening the
+  full join tree (`refRootTuples`) for every group `g` on any tree shape, including
+  NULL join keys and unmatched dead branches (zero weight absorption).
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.FactorizedJoinTreeCountPropagation`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FactorizedJoinTreeCountPropagation
 
 open TinylambOpt.ResearchGoals.FactorizedJoinTreeCountPropagation
@@ -164,3 +178,6 @@ theorem sound : TinylambOpt.ResearchGoals.FactorizedJoinTreeCountPropagation.Goa
       rw [← foldl_if_eq]
 
 end TinylambOpt.ResearchProofs.FactorizedJoinTreeCountPropagation
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

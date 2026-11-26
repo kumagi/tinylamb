@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `CoalesceWrites` — Coalescing adjacent partial writes preserves the next sync's
+  coverage.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

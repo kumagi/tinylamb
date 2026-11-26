@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `SquareDistance.Sufficient` — The proposed strength-reduced guard excludes every
+  fault of the removed instruction.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

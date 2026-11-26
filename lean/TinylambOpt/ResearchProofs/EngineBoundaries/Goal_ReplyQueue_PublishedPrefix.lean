@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `PublishedPrefix` — The observable residue of a failed reply is exactly the prefix
+  already sent.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

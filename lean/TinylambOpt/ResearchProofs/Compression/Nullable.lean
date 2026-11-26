@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Compression.Nullable
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (17 claims, including the following)
+
+- `AllNullZeroWidth` — `∀ n, striped [] [] 0 n = List.replicate n none`
+- `DenseRoundTrip` — `∀ xs, fill (flags xs) (dense xs) = xs`
+- `DenseVsSentinel` — `∀ xs, let d := distinct xs let vs := dense xs let w :=
+  ordinalWidth d.length ((marks (flags xs)).length + (pack w (vs.map d.idxOf)).length
+  < (pack (width d.length) (codes xs)).length ↔ byteCount xs.length + byteCount
+  (vs.length*w) < byteCount (xs.length*width d.length))`
+
+Refuted by counterexample
+
+- `RunsFromDistinct` — `∀ (fs gs : List Bool), fs.Perm gs → (flips fs).length = (flips
+  gs).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1670,3 +1689,7 @@ theorem refutation_RunsFromDistinct : ¬ RunsFromDistinct.Goal := by
   native_decide
 
 end TinylambOpt.ResearchProofs.Compression.Nullable
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp

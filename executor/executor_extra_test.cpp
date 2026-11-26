@@ -46,7 +46,13 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "common/random_string.hpp"
+#include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "expression/window_function_expression.hpp"
+#include "executor/detail/columnar_table.hpp"
+#include "executor/detail/relation.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -1672,6 +1678,53 @@ TEST(TopNExecutorTest,
       }
     }
   }
+}
+
+TEST(WindowEvalTest, EmptyArgsCountMatchesColumnar) {
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Database>, db,
+                        Database::Create("win_count_empty_" + RandomString()));
+  TransactionContext ctx = db->BeginReadOnlyContext();
+  const Schema schema("t", {Column("p", ValueType::kInt64),
+                            Column("x", ValueType::kInt64)});
+  std::vector<Row> rows = {
+      Row({Value(), Value()}),
+      Row({Value(int64_t{1}), Value()}),
+      Row({Value(int64_t{1}), Value(int64_t{42})}),
+  };
+  Expression win_expr = WindowFunctionCallExp(
+      "COUNT", {}, {ColumnValueExp("p")}, {});
+  const auto* win_ptr =
+      dynamic_cast<const WindowFunctionCallExpression*>(win_expr.get());
+  ASSERT_NE(win_ptr, nullptr);
+
+  relational_detail::CteMap empty_ctes;
+  std::vector<Row> row_copy = rows;
+  std::vector<std::vector<Value>> row_out;
+  ASSERT_SUCCESS(relational_detail::ComputeWindowColumns(
+      ctx, {win_ptr}, row_copy, schema, nullptr, empty_ctes, &row_out));
+
+  relational_detail::Relation col_rel;
+  col_rel.schema = schema;
+  ASSIGN_OR_ASSERT_FAIL(
+      std::shared_ptr<relational_detail::ColumnarTable>, col_tbl,
+      relational_detail::BuildColumnarTableFromRows(schema, rows));
+  col_rel.SetColumnarTable(std::move(col_tbl), /*uniform_types=*/true);
+  const std::vector<const WindowFunctionCallExpression*> ptrs = {win_ptr};
+  const std::vector<std::string> names = {"$win0"};
+  ASSIGN_OR_ASSERT_FAIL(
+      relational_detail::Relation, col_out,
+      relational_detail::ExtendColumnarRelationWithWindows(
+          ctx, std::move(col_rel), ptrs, names, nullptr, empty_ctes));
+  ASSERT_SUCCESS(col_out.EnsureRowsMaterialized());
+  ASSERT_EQ(col_out.rows.size(), rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(row_out[0][i], col_out.rows[i][schema.ColumnCount()])
+        << "row " << i;
+  }
+  EXPECT_EQ(row_out[0][0], Value(int64_t{1}));
+  EXPECT_EQ(row_out[0][1], Value(int64_t{2}));
+  EXPECT_EQ(row_out[0][2], Value(int64_t{2}));
+  ASSERT_SUCCESS(ctx.PreCommit());
 }
 
 }  // namespace tinylamb

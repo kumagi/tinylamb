@@ -298,13 +298,20 @@ def session(engine):
             yield lambda sql: conn.execute(sql).fetchall(), conn.execute
     else:
         import psycopg2
+        from pg_binary_client import PgExtendedBinaryClient
         with contextlib.closing(psycopg2.connect(**engine.endpoint)) as conn:
             conn.autocommit = True
-            with conn.cursor() as cur:
-                def query(sql):
-                    cur.execute(sql)
-                    return cur.fetchall()
-                yield query, cur.execute
+            dsn_params = conn.get_dsn_parameters()
+            with contextlib.closing(
+                PgExtendedBinaryClient(
+                    host=dsn_params.get("host", "127.0.0.1") or "127.0.0.1",
+                    port=int(dsn_params.get("port", 55433)),
+                    user=dsn_params.get("user", "bench"),
+                    dbname=dsn_params.get("dbname", "bench"),
+                )
+            ) as bin_client:
+                with conn.cursor() as cur:
+                    yield bin_client.query, cur.execute
 
 
 def quotes(batch):

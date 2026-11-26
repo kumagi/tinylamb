@@ -1,5 +1,19 @@
 import Std
 
+/-!
+Naive materialization of the joined pairs `(l, r)` for group `g`.
+
+Reference post-join aggregate `(COUNT(*), SUM(L.v), SUM(R.v))` for group `g`.
+
+Modeled claims
+
+- `Goal` — Bilateral eager aggregation pushdown across an M:N inner equi-join (H2O H5 /
+  STATS-CEB C1 / LDBC L2): pre-aggregating both `L` and `R` per join key into
+  `(COUNT(*), COUNT(v), SUM(v))` and multiplying orthogonal counts/sums matches full
+  pair materialization for every group, including empty, all-NULL, zero-canceling
+  sums, and NULL-join-key inputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown
 
 structure LRow where

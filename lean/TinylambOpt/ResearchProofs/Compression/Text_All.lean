@@ -20,3 +20,11 @@ import TinylambOpt.ResearchProofs.Compression.Goal_Text_SuffixDictionary
 import TinylambOpt.ResearchProofs.Compression.Goal_Text_TokenBreakEven
 import TinylambOpt.ResearchProofs.Compression.Goal_Text_TokenInverse
 import TinylambOpt.ResearchProofs.Compression.Goal_Text_TruncatedFrame
+
+/-!
+This module collects proofs for Goal Text Adjacent Exchange, Goal Text Boundary Token,
+Goal Text Common Stem Budget, Goal Text Empty Term and related cases.
+
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+-/

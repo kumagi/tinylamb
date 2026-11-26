@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Foreign-key checking must respect the observation point of the constraint and the parent
+keys still present after each modeled edit.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.ReferenceEdits
 
 /-! Referential existence over parent keys and nullable child references. Parent

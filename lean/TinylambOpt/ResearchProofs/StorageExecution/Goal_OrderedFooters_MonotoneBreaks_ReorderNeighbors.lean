@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_OrderedFooters_MonotoneBreaks_Stitch
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `MonotoneBreaks.ReorderNeighbors` — Two neighboring states may be scheduled in
+  reverse if they commute on their reachable values.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

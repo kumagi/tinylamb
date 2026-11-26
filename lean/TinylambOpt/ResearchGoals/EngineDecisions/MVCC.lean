@@ -1,6 +1,11 @@
 import Std
 import TinylambOpt.ResearchGoals.ExecutionStrategies.VersionedIndexes
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
 namespace PublicationHoles

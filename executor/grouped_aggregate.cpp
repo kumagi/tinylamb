@@ -331,13 +331,23 @@ Status AggregateGroupTable::Accumulate(size_t group, const Row& row) {
 
 Status AggregateGroupTable::AccumulateExcluding(size_t group, const Row& row,
                                                 size_t skip_index) {
+  std::vector<uint8_t> mask;
+  if (skip_index < AggregateCount()) {
+    mask.assign(AggregateCount(), 0);
+    mask[skip_index] = 1;
+  }
+  return AccumulateExcludingMask(group, row, mask);
+}
+
+Status AggregateGroupTable::AccumulateExcludingMask(
+    size_t group, const Row& row, const std::vector<uint8_t>& skip_mask) {
   RETURN_IF_FAIL(CheckAggregateList());
   if (group >= keys_.size()) {
     return StatusError(StatusCode::kInvalidArgument,
                        "aggregate group index out of range");
   }
   for (size_t i = 0; i < AggregateCount(); ++i) {
-    if (i == skip_index) {
+    if (i < skip_mask.size() && skip_mask[i] != 0) {
       continue;
     }
     const AggregateExpression* aggregate = (*aggregates_)[i];

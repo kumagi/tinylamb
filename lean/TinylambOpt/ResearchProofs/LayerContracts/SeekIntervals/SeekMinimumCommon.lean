@@ -1,6 +1,13 @@
 import TinylambOpt.ResearchGoals.LayerContracts.SeekIntervals
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Common_SeekIntervals
 
+/-!
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+
+Named results include `start_span`, `countP_rising_of_sep`, `separated_clamped_strict`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

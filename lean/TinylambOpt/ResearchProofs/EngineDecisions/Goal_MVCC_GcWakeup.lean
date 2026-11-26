@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `GcWakeup` — After one sweep, watch the second version's timestamp and the last
+  version's joint snapshot/durability fence. Revisit exactly when another sweep would
+  release an entry, even when only WAL durability advances.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -173,3 +184,7 @@ theorem sound : Goal := by
   exact due_change live pending h' d' hpair
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_GcWakeup
+
+-- C++ references to this model or its proof.
+-- transaction/gc_wakeup.hpp
+-- transaction/transaction_manager.cpp

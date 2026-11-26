@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Two independent ways of describing key multiplicities agree, and every physically
+produced key is among the declared candidates.
+
+Named results include `beq_tt`, `beq_ff`, `beq_comm`.
+-/
+
 set_option maxHeartbeats 0
 set_option linter.unusedVariables false
 

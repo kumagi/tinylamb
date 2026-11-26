@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `EitherEndpointInside.SplitBoundaryDebt` — `∀ p m rs, p.x ≤ m → m ≤ p.y → scan shape
+  p rs = scan shape ⟨p.x,m⟩ rs + scan shape ⟨m,p.y⟩ rs - ((rs.filter (fun r =>
+  shape.qualifies ⟨p.x,m⟩ r.1 && shape.qualifies ⟨m,p.y⟩ r.1)).map Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

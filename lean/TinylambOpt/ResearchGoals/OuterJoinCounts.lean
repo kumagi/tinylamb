@@ -1,5 +1,16 @@
 import Std
 
+/-!
+These claims derive outer-join row counts from match multiplicities and unmatched rows.
+A SQL aggregate can count the result without materializing every joined pair when the
+formulas apply.
+
+Modeled claims
+
+- `Goal` — `∀ l r key, groupCount (histogram l) (histogram r) key = (projected l
+  r).count key`
+-/
+
 namespace TinylambOpt.ResearchGoals.OuterJoinCounts
 
 abbrev Key := Option Int

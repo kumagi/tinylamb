@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 import TinylambOpt.ResearchProofs.StorageExecution.SE_DerivedZones_BitwiseXor
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `BitwiseXor.DominatedTop` — A bounded page cannot change the descending top k once k
+  strictly better witnesses are known.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

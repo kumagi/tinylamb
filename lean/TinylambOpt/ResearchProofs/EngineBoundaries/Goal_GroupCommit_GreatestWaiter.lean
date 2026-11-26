@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.GroupCommit
 
+/-!
+A commit batching policy must preserve the durability and visibility guarantees of
+committed SQL transactions.
+
+Proved
+
+- `GreatestWaiter` — Wait for just the greatest target in a group if all waiters need
+  synchronous durability.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

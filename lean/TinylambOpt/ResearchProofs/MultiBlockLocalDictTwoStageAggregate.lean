@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.MultiBlockLocalDictTwoStageAggregate
 
+/-!
+Proved
+
+- `Goal` — Multi-block per-block local-dictionary two-stage aggregation
+  (DictionaryJoinsAndLateLabels B1 / JOB J4 / LDBC L1, L5): accumulating into local
+  code arrays without reading dictionary strings per row and decoding only occupied
+  dictionary slots at global merge matches eager full-string decoding across blocks
+  with distinct codebooks, duplicate dictionary entries, and NULL keys/values.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.MultiBlockLocalDictTwoStageAggregate`.
+-/
+
 namespace TinylambOpt.ResearchProofs.MultiBlockLocalDictTwoStageAggregate
 
 open TinylambOpt.ResearchGoals.MultiBlockLocalDictTwoStageAggregate
@@ -899,3 +912,6 @@ theorem sound : TinylambOpt.ResearchGoals.MultiBlockLocalDictTwoStageAggregate.G
 
 end TinylambOpt.ResearchProofs.MultiBlockLocalDictTwoStageAggregate
 
+-- C++ references to this model or its proof.
+-- executor/detail/typed_stream_aggregate_partitioned.cpp
+-- executor/detail/typed_stream_aggregate_partitioned.hpp

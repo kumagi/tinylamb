@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Refuted by counterexample
+
+- `SingleRed.ShardUnion` — Can independently traversed edge shards be unioned without a
+  cross-shard work queue?
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

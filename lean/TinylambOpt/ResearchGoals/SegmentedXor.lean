@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims recover XOR aggregates for segments. A grouped or windowed SQL operator can
+reuse segment summaries under the specified boundaries.
+
+Modeled claims
+
+- `Goal` — `∀ carry t, parallel carry t = stream carry (flatten t)`
+-/
+
 namespace TinylambOpt.ResearchGoals.SegmentedXor
 
 inductive Token where

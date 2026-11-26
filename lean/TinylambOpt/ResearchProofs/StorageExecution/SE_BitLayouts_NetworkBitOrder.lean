@@ -1,6 +1,20 @@
 import Std
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved (10 claims, including the following)
+
+- `NetworkBitOrder.BitReversal` — `∀ n w i b, let p := i*w+b; (layout.bit n w i b)%8 +
+  p%8 = 7 ∧ layout.bit n w i b/8=p/8`
+- `NetworkBitOrder.ByteFootprint` — `∀ n w i, footprint layout n w i = footprint
+  RowMajor.layout n w i`
+- `NetworkBitOrder.DictionaryProbe` — Read only lanes requested by a probe and
+  translate them through a possibly short dictionary.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.BitLayouts.NetworkBitOrder
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.Compression.Wire

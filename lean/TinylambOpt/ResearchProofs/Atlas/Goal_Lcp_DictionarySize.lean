@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.DictionarySize` — `∀ ws, frontBytes ws + (lcpEdges ws).sum = (ws.map
+  List.length).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

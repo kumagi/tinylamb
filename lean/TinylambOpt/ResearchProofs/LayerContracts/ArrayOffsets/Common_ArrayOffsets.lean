@@ -1,5 +1,28 @@
 import Lean
 import TinylambOpt.ResearchGoals.LayerContracts.ArrayOffsets
+
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+
+Proved (88 claims, including the following)
+
+- `AppendFields.AddressValidity` — All present coordinates refer to an actual array
+  cell, possibly a NULL one.
+- `AppendFields.Boundary` — `∀ s, 0 < s.right.length → selectPos model s s.left.length
+  = some (none,some 0)`
+- `AppendFields.Cardinality` — Avoid materializing UNNEST when only its row count is
+  consumed.
+
+Refuted by counterexample (12 claims, including the following)
+
+- `AppendFields.PayloadDedup` — Can DISTINCT on output payloads be dropped if offsets
+  are distinct?
+- `Cartesian.PayloadDedup` — Can DISTINCT on output payloads be dropped if offsets are
+  distinct?
+- `EvenOffsets.PayloadDedup` — Can DISTINCT on output payloads be dropped if offsets
+  are distinct?
+-/
 open Lean Elab Term
 
 set_option maxHeartbeats 0

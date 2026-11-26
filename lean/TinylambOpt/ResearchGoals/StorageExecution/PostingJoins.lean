@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 open TinylambOpt.ResearchGoals.Compression.Wire
 

@@ -48,7 +48,7 @@ ClickHouse の保存済み DDL は `MergeTree ORDER BY (CounterID, EventDate, Us
 | `DictionaryAdmission` | 共有辞書の保存費に加え、クエリが辞書を初めて読む費用を入れて採用 frame を選ぶ。読取集合が入れ子か互いに素の場合、木上の DP が達成可能な最大削減を返すか。 |
 | `HashExceptions` | URL 辞書の各エントリに最頻ハッシュを付け、異なる値だけ行 ID で補正する。固定長例外の件数を最小化し、ハッシュ衝突を含めて述語に通る元行を復元できるか。 |
 
-[保存形式の Lean 定義](../../TinylambOpt/ResearchGoals/ClickBenchLayout/Storage.lean)
+[保存形式の Lean 定義](../../TinylambOpt/ResearchGoals/ClickstreamLayout/Storage.lean)
 
 | 実行時の命題 | 証明・反証で決めたいこと |
 |---|---|
@@ -59,7 +59,7 @@ ClickHouse の保存済み DDL は `MergeTree ORDER BY (CounterID, EventDate, Us
 | `SparseMark` | 辞書順に格納した2列への矩形条件について、隣接マークだけから安全に飛ばせる granule を判定する。同じキーが次の granule に続く場合を含む。 |
 | `DefaultGroups` | 多列の既定値と疎な例外で、`GROUP BY` の各組の重複度を例外行だけから求める。複数列に現れた同じ行、すべて既定値の行、NULL とゼロを区別する。 |
 
-[実行の Lean 定義](../../TinylambOpt/ResearchGoals/ClickBenchLayout/Execution.lean)
+[実行の Lean 定義](../../TinylambOpt/ResearchGoals/ClickstreamLayout/Execution.lean)
 
 実装の接続先は TLCS のブロック writer、列の選択読取り、辞書・文字列用の集約経路。時刻を数値にするには元の綴りを復元できる書式、列参照には同じ世代・同じ行対応が必要になる。残差モデルの整数は Lean の `Int` であり、機械整数での差分は範囲チェックが必要。[TLCS 読取り](../../../table/tlcs_file.cpp)・[列実行経路](../../../executor/detail/columnar_tlcs_fast_path.cpp)
 
@@ -67,5 +67,5 @@ ClickHouse の保存済み DDL は `MergeTree ORDER BY (CounterID, EventDate, Us
 
 ```sh
 python3 lean/issues/research/fixtures/clickbench_layout.py build/benchmarks
-(cd lean && lake build TinylambOpt.ResearchGoals.ClickBenchLayout CheckProofs)
+(cd lean && lake build TinylambOpt.ResearchGoals.ClickstreamLayout CheckProofs)
 ```

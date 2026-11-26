@@ -388,7 +388,7 @@ std::optional<SchemaBoundExprType> MakeConstantSchemaBoundType(
   return std::nullopt;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (closed_const_non_throwing_eval_independent_of_row,
 //    trap_throwing_closed_const_not_droppable)
 std::optional<SchemaBoundExprType>
@@ -1737,6 +1737,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                   : CaseExpressionExp(std::move(clauses), std::move(otherwise));
           if (orig_is_double && !safe_is_double(simplified)) {
             simplified = CastExpressionExp(std::move(simplified), "FLOAT64");
+          } else if (!orig_is_double && safe_is_double(simplified)) {
+            return Expression{};
           }
           return simplified;
         }));
@@ -1834,7 +1836,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           return UnaryExpressionExp(bindings.at("child"),
                                     UnaryOperation::kIsNull);
         }));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (xor_rules_three_valued_sound)
     built.Add(ExpressionRule(
         "xor_boolean_identity",
@@ -2488,7 +2490,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return outer.Child();
         }));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "factor_or_common_and", AnyBinary(Any("left"), Any("right")),
@@ -2542,7 +2544,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // UNKNOWN on the left side but FALSE on the right).
 
     // nullif(a, b) -> CASE WHEN a = b THEN NULL ELSE a END
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (coalesce_and_nullif_rules_sound)
     built.Add(ExpressionRule(
         "nullif_to_case", Is(TypeTag::kFunctionCallExp, "expr"),
@@ -2605,7 +2607,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // three-valued logic.  `x = NULL` is UNKNOWN for every row, so the
     // honest constant result is the NULL (unknown) value; the old rewrite
     // made `WHERE x = NULL` return exactly the rows with x IS NULL.)
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "contradiction_from_null_eq", AnyBinary(Any("left"), Any("right")),
@@ -2671,7 +2673,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // x IN (NULL) -> NULL, but only when x cannot raise: evaluating the
     // left operand precedes the NULL comparison in the AST reference
     // (oracle-found: `(INT64_MIN / 0) IN (NULL)` folded to NULL).
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "in_single_null", Is(TypeTag::kInExp),
@@ -2695,7 +2697,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // not_in_null_semantics: x NOT IN (c1, ..., NULL) -> CASE WHEN x IN (c1,
     // ...) THEN FALSE ELSE NULL END
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (not_in_null_semantics_sound)
     built.Add(ExpressionRule(
         "not_in_null_semantics",
@@ -2935,7 +2937,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // a XOR b -> (a OR b) AND NOT(a AND b)
     // Safe under SQL three-valued logic.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (xor_rules_three_valued_sound)
     built.Add(ExpressionRule(
         "xor_to_or_and_not",
@@ -2974,7 +2976,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // fold an equality against a boolean 0/1 literal into the IS-predicate.
     // The IS TRUE / IS FALSE check is on the left; the right side must be a
     // literal 1/0 that came from a boolean context.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (boolean_eq_true_false_three_valued_sound)
     built.Add(ExpressionRule(
         "boolean_eq_true_false_three_valued",
@@ -3048,7 +3050,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
     // coalesce_and_nullif_simplification: Simplify COALESCE when leading
     // arguments are non-null constants, eliminate trailing and redundant NULL
     // literals, and simplify NULLIF.
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (coalesce_and_nullif_rules_sound)
     built.Add(ExpressionRule(
         "coalesce_and_nullif_simplification",
@@ -3171,7 +3173,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
         }));
 
     // empty IN list -> FALSE
-    // Lean proof: lean/TinylambOpt/CppRuleAudit.lean (cpp_empty_in_isFalse_bug)
+    // Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean (cpp_empty_in_isFalse_bug)
     built.Add(ExpressionRule(
         "empty_in_list", Is(TypeTag::kInExp),
         [](const Expression& expression, const ExpressionBindings&) {
@@ -3780,27 +3782,75 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                                        std::move(new_else));
             }
           }
-          // CAST expression where child is CASE
+          // CAST expression where child is CASE.
+          // CaseExpression::TryEvaluate coerces INT64 branches to DOUBLE when
+          // another branch is DOUBLE (CoerceCaseBranch). Pushing CAST(... AS
+          // INT64 / STRING / BOOL / ...) inside CASE bypasses that promotion
+          // (e.g. CAST(CASE WHEN NULL THEN (i + d) WHEN i THEN i END AS INT64)
+          // for i = INT64_MAX promotes INT64_MAX -> 9223372036854775808.0 and
+          // overflows INT64, whereas pushing CAST inside yields INT64_MAX
+          // without error). Only DOUBLE/FLOAT64 is invariant under INT64 ->
+          // DOUBLE coercion.
           if (expression->Type() == TypeTag::kCastExp) {
             const auto& cast = expression->AsCastExpression();
+            std::string target_lower = cast.TargetTypeName();
+            for (char& ch : target_lower) {
+              if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+              }
+            }
             if (cast.Child() && cast.Child()->Type() == TypeTag::kCaseExp) {
               const auto& c = cast.Child()->AsCaseExpression();
-              std::vector<std::pair<Expression, Expression>> new_whens;
-              new_whens.reserve(c.when_clauses_.size());
-              for (const auto& w : c.when_clauses_) {
-                new_whens.emplace_back(
-                    w.first, CastExpressionExp(w.second, cast.TargetTypeName(),
-                                               cast.ReturnNullOnError()));
+              bool safe_cast_pushdown =
+                  (target_lower == "double" || target_lower == "float64");
+              if (!safe_cast_pushdown) {
+                // Without a schema, we can still prove no INT64 -> DOUBLE
+                // CoerceCaseBranch promotion happens when every branch is a
+                // constant sharing one non-NULL ValueType.
+                bool all_const_same_type = true;
+                std::optional<ValueType> seen_type;
+                auto check_branch = [&](const Expression& b) {
+                  if (!b || b->Type() != TypeTag::kConstantValue) {
+                    all_const_same_type = false;
+                    return;
+                  }
+                  const Value& v = b->AsConstantValue().GetValue();
+                  if (v.IsNull()) {
+                    return;
+                  }
+                  if (!seen_type.has_value()) {
+                    seen_type = v.type;
+                  } else if (*seen_type != v.type) {
+                    all_const_same_type = false;
+                  }
+                };
+                for (const auto& w : c.when_clauses_) {
+                  check_branch(w.second);
+                }
+                if (c.else_clause_) {
+                  check_branch(c.else_clause_);
+                }
+                safe_cast_pushdown = all_const_same_type;
               }
-              Expression new_else =
-                  c.else_clause_
-                      ? CastExpressionExp(c.else_clause_, cast.TargetTypeName(),
-                                          cast.ReturnNullOnError())
-                      : CastExpressionExp(ConstantValueExp(Value()),
-                                          cast.TargetTypeName(),
-                                          cast.ReturnNullOnError());
-              return CaseExpressionExp(std::move(new_whens),
-                                       std::move(new_else));
+              if (safe_cast_pushdown) {
+                std::vector<std::pair<Expression, Expression>> new_whens;
+                new_whens.reserve(c.when_clauses_.size());
+                for (const auto& w : c.when_clauses_) {
+                  new_whens.emplace_back(
+                      w.first, CastExpressionExp(w.second, cast.TargetTypeName(),
+                                                 cast.ReturnNullOnError()));
+                }
+                Expression new_else =
+                    c.else_clause_
+                        ? CastExpressionExp(c.else_clause_,
+                                            cast.TargetTypeName(),
+                                            cast.ReturnNullOnError())
+                        : CastExpressionExp(ConstantValueExp(Value()),
+                                            cast.TargetTypeName(),
+                                            cast.ReturnNullOnError());
+                return CaseExpressionExp(std::move(new_whens),
+                                         std::move(new_else));
+              }
             }
           }
           return Expression{};
@@ -4070,7 +4120,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
 
     // boolean_filter_pullup: Pull up common conditions out of disjunctions
     // (A AND B) OR (A AND C) -> A AND (B OR C).
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "boolean_filter_pullup", AnyBinary(Any("left"), Any("right")),
@@ -4180,7 +4230,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           }
           return UnaryExpressionExp(*boolean_side, UnaryOperation::kNot);
         }));
-    // Lean proof: lean/TinylambOpt/HighRiskRulesAudit.lean
+    // Lean proof: lean/TinylambOpt/SetJoinAndScalarRewrites.lean
     //   (three_valued_distributive_and_absorption_sound)
     built.Add(ExpressionRule(
         "distribute_or_over_and_budgeted",
@@ -5251,7 +5301,7 @@ ExtractWindowCalls(const Expression& expression, size_t* counter,
   return std::make_pair(std::move(*rewritten), std::move(specs));
 }
 
-// Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+// Lean proof: lean/TinylambOpt/NullRejectionAndGroupRewrites.lean
 //   (repairedIsStrict_sound, cpp_empty_in_isFalse_bug)
 bool IsNullStrictWhere(
     const Expression& expression,  // NOLINT(misc-no-recursion)

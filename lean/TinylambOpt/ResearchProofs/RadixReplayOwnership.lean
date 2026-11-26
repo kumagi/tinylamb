@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.RadixReplayOwnership
 
+/-!
+Proved
+
+- `Goal` — `∀ (rows : List Occ) (cmds : List Cmd), (occIds rows).Nodup → let s :=
+  cmds.foldl step (start rows) ((consumedIds s.events ++ s.live.flatMap (fun b =>
+  occIds b.pending)).Perm (occIds rows)) ∧ (s.live.map Batch.token).Nodup ∧ (∀ b ∈
+  s.live, b.token < s.fresh ∧ ∀ o ∈ b.pending, o.key % 2^b.depth = b.bucket) ∧ (∀ o ∈
+  rows, consumptionCount (finish s) o.id = 1) ∧ (∀ k, optAgg rows (finish s) k =
+  refAgg rows k)`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.RadixReplayOwnership`.
+-/
+
 namespace TinylambOpt.ResearchProofs.RadixReplayOwnership
 open ResearchGoals.RadixReplayOwnership
 open Research.AdaptiveRadixReplay

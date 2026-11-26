@@ -1,4 +1,4 @@
-import TinylambOpt.HighRiskRulesAudit
+import TinylambOpt.SetJoinAndScalarRewrites
 
 /-!
 # ROWS-frame halo cutting (`executor/detail/window_eval.cpp`)
@@ -145,3 +145,7 @@ theorem window_halo_sound {Row V O : Type} (a b i j : Nat)
   simp [hf]
 
 end TinylambOpt.WindowHalo
+
+-- C++ references to this model or its proof.
+-- executor/detail/window_eval.cpp
+-- plan/cascades.cpp

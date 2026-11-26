@@ -1,0 +1,12 @@
+-- Proof aggregation for DatabaseCorrectness.WinnerRecovery
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_SegmentedWinnerReplayAgreement
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_ReplayLastCommittedImage
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_RemoveCrashLoserWithoutEffect
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_ClosedCheckpointCutReplay
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_RestartAfterImageIdempotence
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_ReorderedSegmentsPerKeyCriterion
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_WinnerRecovery_RestartAllocatorAboveLosers
+
+/-! Aggregates the seven winner-replay proofs: segmented agreement, last-image
+recovery, loser removal, checkpoint-cut composition, idempotence, per-key
+reordering invariance, and allocator seeding above uncommitted owners. -/

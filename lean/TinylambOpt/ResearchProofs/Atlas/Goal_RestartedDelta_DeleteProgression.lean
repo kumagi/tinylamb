@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E7
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeltaProgressionsAndTombstoneEpochs
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `RestartedDelta.DeleteProgression` — `∀ c mask, (((rows layout c).filter (fun r =>
+  !contains mask r.1)).map Prod.snd).sum = ((layout.lanes c).map (fun a => partialSum
+  a a.n - deletedSum a mask)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -35,6 +46,6 @@ open TinylambOpt.ResearchGoals.Atlas.EncodedPages.RestartedDelta
 `RestartedDelta.layout`. -/
 theorem sound_RestartedDelta_DeleteProgression :
     TinylambOpt.ResearchGoals.Atlas.EncodedPages.RestartedDelta.DeleteProgression.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E7.RD.RD_DeleteProgression
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.DeltaProgressionsAndTombstoneEpochs.RD.RD_DeleteProgression
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_RestartedDelta_DeleteProgression

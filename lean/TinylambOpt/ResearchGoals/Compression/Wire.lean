@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+-/
+
 namespace TinylambOpt.ResearchGoals.Compression.Wire
 
 /-! Natural-number wire models. A Byte is a natural in [0,256) on canonical

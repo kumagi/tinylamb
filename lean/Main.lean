@@ -1,5 +1,10 @@
 import TinylambOpt
 
+/-!
+This executable illustrates selected rewrite rules using finite Lean examples. It lets a
+reader compare the observable rows or values of modeled SQL plans.
+-/
+
 open TinylambOpt
 
 /-- `lake exe demo` でターミナルから実行できる具体例デモ。
@@ -238,7 +243,7 @@ def main : IO Unit := do
   -- (B) Q97: FULL OUTER JOIN 3 指標 SUM -> SemiJoin 包除原理 (+ 部分 NULL キー罠)
   let ssci : Rel (SqlVal Int × SqlVal Int) := [(some 1, some 100), (some 2, some 200), (some 10, none)]
   let csci : Rel (SqlVal Int × SqlVal Int) := [(some 2, some 200), (some 3, some 300), (some 10, none)]
-  let q97Orig := evalQ97FullOuter ssci csci
+  let q97Orig := evalFullOuterCustomerPresenceCounts ssci csci
   let sOk := ssci.filter (fun x => x.1.isSome && x.2.isSome)
   let cOk := csci.filter (fun x => x.1.isSome && x.2.isSome)
   let sPart := ssci.filter (fun x => x.1.isSome && x.2.isNone)

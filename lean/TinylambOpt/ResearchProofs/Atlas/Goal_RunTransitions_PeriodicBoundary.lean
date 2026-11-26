@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `RunTransitions.PeriodicBoundary` — `∀ x n, measure ((List.replicate n x).flatten) =
+  (n:Int)*measure x + ((n-1:Nat):Int)*seam x x (fun a b => if a == b then 0 else 1)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

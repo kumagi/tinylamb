@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Proved
+
+- `EvenHops.EdgeDedup` — Dropping duplicate edges before starting a recursive UNION
+  preserves reached vertices.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `MovieCredits.TriangleNorm` — `∀ n db b, (reference pattern n db b)^2 ≤ normSq n db 0
+  * normSq n db 1 * normSq n db 2`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

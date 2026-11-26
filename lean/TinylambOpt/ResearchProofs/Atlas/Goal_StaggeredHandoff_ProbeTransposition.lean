@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `StaggeredHandoff.ProbeTransposition` — `∀ b (ps rs : Rows), (∀ r ∈ rs, bounded b
+  r.1) → (ps.map (fun (p,w) => w * scan shape p rs)).sum = (rs.map (fun (r,w) => w *
+  atPoint (compile shape b ps) r)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

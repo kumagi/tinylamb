@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Frontiers.SpillScheduling
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `SingleSlot` — `∀ t state, legal t 1 state → saved t state ≤ selectArcs ((arcs
+  t).mergeSort (fun a b => a.2 ≤ b.2)) 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

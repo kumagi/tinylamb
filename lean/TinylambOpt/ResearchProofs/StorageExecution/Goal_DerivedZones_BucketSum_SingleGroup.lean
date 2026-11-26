@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `BucketSum.SingleGroup` — `∀ t a b, (a.hi+b.hi)/(t+1)=(a.lo+b.lo)/(t+1) →
+  (kernel.bounds t a b).lo=(kernel.bounds t a b).hi`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

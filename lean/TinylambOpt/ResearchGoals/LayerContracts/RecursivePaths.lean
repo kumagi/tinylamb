@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
 
 /-! A recursive query traverses a finite labeled edge bag, using UNION

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.CompareSkip` — `∀ a b needle, common a b > common a needle → compare a needle =
+  compare b needle`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

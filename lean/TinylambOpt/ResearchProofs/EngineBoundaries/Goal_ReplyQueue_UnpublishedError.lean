@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `UnpublishedError` — If no current-reply byte escaped, a failed response can be
+  replaced exactly.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

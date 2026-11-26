@@ -1,6 +1,14 @@
 import Std
 import TinylambOpt.ResearchGoals.DemandScalar
 
+/-!
+Proved
+
+- `Goal` — `∀ inner outer, probe (index inner) outer = reference inner 0 outer`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.DemandScalar`.
+-/
+
 namespace TinylambOpt.ResearchProofs.DemandScalar
 open TinylambOpt.ResearchGoals.DemandScalar
 
@@ -287,3 +295,8 @@ theorem sound : TinylambOpt.ResearchGoals.DemandScalar.Goal := by
   exact (probe_eq_probeAccIdx (index inner) outer).trans (probeAccIdx_eq_reference inner 0 outer)
 
 end TinylambOpt.ResearchProofs.DemandScalar
+
+-- C++ references to this model or its proof.
+-- executor/detail/subquery_runtime.cpp
+-- executor/detail/subquery_runtime.hpp
+-- executor/relational_regression_test_part11.cpp

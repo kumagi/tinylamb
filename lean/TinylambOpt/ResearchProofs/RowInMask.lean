@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.RowInMask
 
+/-!
+Proved
+
+- `Goal` — `∀ enabled cols, vector enabled cols = scalar enabled cols`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.RowInMask`.
+-/
+
 namespace TinylambOpt.ResearchProofs.RowInMask
 
 open TinylambOpt.ResearchGoals.RowInMask
@@ -403,3 +411,8 @@ theorem sound : TinylambOpt.ResearchGoals.RowInMask.Goal := by
       rw [if_neg h1, if_neg h2, if_neg h3, if_neg h4]
 
 end TinylambOpt.ResearchProofs.RowInMask
+
+-- C++ references to this model or its proof.
+-- expression/bytecode.cpp
+-- expression/bytecode.hpp
+-- expression/bytecode_test.cpp

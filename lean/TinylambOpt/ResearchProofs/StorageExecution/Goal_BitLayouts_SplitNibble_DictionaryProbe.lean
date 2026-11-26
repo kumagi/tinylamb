@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_SplitNibble_Lossless
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `SplitNibble.DictionaryProbe` — Read only lanes requested by a probe and translate
+  them through a possibly short dictionary.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

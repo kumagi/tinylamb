@@ -57,7 +57,7 @@ bool DenseIntBlockMayMatch(const LSTablePageBlock& meta_blk, slot_t full_key,
 // Keeps the 28M-row rejection loop out of TryFusedGroupedJoin's large stack
 // frame (zero stack spills) and checks the unsigned range test BEFORE null
 // bitmaps or bitset loads.
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (dense_rf_prefilter_block_sound)
 [[gnu::noinline]] size_t PrefilterDenseRfBlock(
     const int64_t* __restrict__ vals, uint32_t nrows, int64_t rf_lo,

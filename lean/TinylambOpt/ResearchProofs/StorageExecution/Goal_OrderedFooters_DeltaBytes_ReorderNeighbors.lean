@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `DeltaBytes.ReorderNeighbors` — Two neighboring states may be scheduled in reverse if
+  they commute on their reachable values.
+- `DeltaBytes.Stitch` — Compute a page boundary correction using only the two
+  serialized states.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

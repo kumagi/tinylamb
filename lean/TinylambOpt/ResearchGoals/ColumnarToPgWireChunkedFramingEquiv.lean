@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Reference `DataRow` PG wire encoding via row-by-row `Row` materialization: `'D' (0x44 =
+68)` + BE32 `(4 + 2 + payload.length)` + BE16 `cols.length` + encoded fields.
+
+Computes decimal digit count without allocating any string buffer.
+
+Modeled claims
+
+- `Goal` — Direct columnar-to-PostgreSQL `DataRow` chunked wire serialization (H2O H2,
+  H4 / DictionaryJoinsAndLateLabels B1 / LDBC L2 / STATS-CEB C2): computing `be32`
+  frame headers directly via `intDecimalLen` / `bytes.length` without intermediate
+  `Row` materialization and streaming `chunkBytes`-sized frames yields the exact same
+  concatenated byte stream as `refRowEncode (transposeCols cols n)`.
+-/
+
 namespace TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv
 
 inductive ColVec where
@@ -149,7 +164,7 @@ def optChunkedEncode (cols : List ColVec) (n chunkBytes : Nat) :
   if rem.isEmpty then fullChunks else fullChunks ++ [rem]
 
 /-- Direct columnar-to-PostgreSQL `DataRow` chunked wire serialization (H2O H2,
-    H4 / BigBench B1 / LDBC L2 / STATS-CEB C2): computing `be32` frame headers
+    H4 / DictionaryJoinsAndLateLabels B1 / LDBC L2 / STATS-CEB C2): computing `be32` frame headers
     directly via `intDecimalLen` / `bytes.length` without intermediate `Row`
     materialization and streaming `chunkBytes`-sized frames yields the exact same
     concatenated byte stream as `refRowEncode (transposeCols cols n)`. -/

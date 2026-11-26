@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The SQL frontend can scan input in chunks when its carried lexical state preserves
+delimiter recognition across chunk boundaries.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.LexicalCuts
 
 /-! Streaming boundary recognizers over lexer symbols. The input alphabet

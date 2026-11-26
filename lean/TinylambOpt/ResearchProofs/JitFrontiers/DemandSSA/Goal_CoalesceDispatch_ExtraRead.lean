@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Common_DemandSSA
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+
+Proved
+
+- `CoalesceDispatch.ExtraRead` — `∀ e, present e 0 → (run e rule.dst).2.length=(run e
+  rule.src).2.length+1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

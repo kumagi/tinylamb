@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `SeparatedLengths.BoundedRaw` — A forced frame cap still limits worst-case expansion
+  to raw cells and per-frame overhead.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,18 @@
 import Std
 
+/-!
+If NULLs (`none`) appear in the middle of an otherwise sorted array and sort as
+`-infinity` below `lo`, binary search can overshoot and miss valid matches to the right.
+
+Modeled claims
+
+- `Goal` — Monotone contiguous compressed fact binary-search slice
+  (`executor/detail/fused_grouped_join.cpp` `mono_contiguous_rf`, TPC-DS Q65): over a
+  non-null key-sorted fact column, `bsLower lo .. bsUpper hi` selects a contiguous
+  range covering every row satisfying any predicate whose support lies within `[lo,
+  hi]` (even when `lo > hi`).
+-/
+
 namespace TinylambOpt.ResearchGoals.MonoContiguousFactSlice
 
 def SortedByKey (rows : List (Int × Int)) : Prop :=

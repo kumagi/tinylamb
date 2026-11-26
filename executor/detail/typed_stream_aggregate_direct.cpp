@@ -270,7 +270,8 @@ struct CompiledLSTableBlockFilter {
     int64_t hi{std::numeric_limits<int64_t>::max()};
     bool empty{false};
   };
-  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
   // (InRangeSynopsis_sound).
   struct IntInList {
     slot_t full_col{0};
@@ -2173,7 +2174,7 @@ std::optional<std::vector<Value>> TryScalarBlockMetaMinMax(
   return finished;
 }
 
-// Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+// Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
 //   (dict_exact_freq_filtered_count_sound, filtered_extremum_bound_unsound_bug)
 // O(|D|) exact frequency fold for single-column (filtered) or multi-column
 // (unfiltered marginal) dictionary-encoded scalar aggregates.
@@ -3215,7 +3216,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
             const bool is_min = (b.kind == SlimAggKind::kMinInt64 ||
                                  b.kind == SlimAggKind::kMinDate);
             // Lean proof:
-            // lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+            // lean/TinylambOpt/ResearchProofs/AnalyticalOperators/DictionarySlicesAndExtrema.lean
             //   (sound_DominatedColumn).
             // A block whose non-NULL range cannot improve the current extremum
             // is skipped regardless of which rows survived the filter.
@@ -3269,7 +3270,8 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
           }
           // kMinDouble / kMaxDouble
           const bool is_min = (b.kind == SlimAggKind::kMinDouble);
-          // Lean proof: lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/AnalyticalOperators/DictionarySlicesAndExtrema.lean
           //   (sound_DominatedColumn).
           if (!coalesce && st.counts[a] > 0 && (st.flags[a] & 1) == 0 &&
               !std::isnan(st.double_totals[a])) {
@@ -3629,9 +3631,11 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
     const std::string& fold_cache_key,
     std::chrono::steady_clock::time_point scan_begin) {
   const size_t nkeys = plan.key_offsets.size();
-  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (CountTail_sound)
-  // Allow ORDER BY COUNT(*) / COUNT(col) DESC so 2-key bounded aggregates (e.g.
-  // H2O H2) use the direct dense array + hybrid bucket/tail ordering.
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
+  // (CountTail_sound) Allow ORDER BY COUNT(*) / COUNT(col) DESC so 2-key
+  // bounded aggregates (e.g. H2O H2) use the direct dense array + hybrid
+  // bucket/tail ordering.
   bool count_tail_order = false;
   size_t count_tail_agg_idx = 0;
   if (plan.order_items.size() == 1 && plan.order_ascending.size() == 1 &&
@@ -3698,7 +3702,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   size_t s1 = 1;
   if (nkeys == 2) {
     // Lean proof:
-    // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
+    // lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
     // (sound)
     key_proj1 = plan.key_offsets[1];
     key_type1 = proj_types[key_proj1];
@@ -3808,7 +3812,8 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
     workers_used = std::max<size_t>(
         1, std::min<size_t>(workers_used, (size_t{4} * 262144) / total_slots));
   }
-  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
   // (EpochAverage_sound): reuse a pooled 16-byte (stamp, count, sum) dense
   // buffer across queries via an epoch bump without zeroing or allocating a
   // separate present/row_gidx array, recording each touched gid even when its
@@ -4545,7 +4550,7 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
                                workers_used > 1 && !active_workers.empty())
                                   ? workers_used
                                   : 1;
-  // Lean-backed (IndividualQueryGaps.lean:
+  // Lean-backed (SemijoinFiltersAndGroupThresholds.lean:
   // FrequencyUpperBoundHavingPrune_sound): when HAVING enforces `COUNT(...) >
   // T` or `COUNT(...) >= T` and no sibling aggregate can raise a SUM(INT64)
   // overflow error, check the group's exact count first before
@@ -4840,7 +4845,8 @@ StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
   }
   output.rows.reserve(total_out_rows);
   if (count_tail_order && total_out_rows > 1) {
-    // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
     // (CountTail_sound): bucket counts <= kCountTailThreshold directly in O(N)
     // and only sort the small head with count > kCountTailThreshold.
     constexpr int64_t kCountTailThreshold = 4096;

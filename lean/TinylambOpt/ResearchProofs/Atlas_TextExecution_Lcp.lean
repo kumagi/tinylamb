@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.CompareSkip` — `∀ a b needle, common a b > common a needle → compare a needle =
+  compare b needle`
+- `Lcp.DictionarySize` — `∀ ws, frontBytes ws + (lcpEdges ws).sum = (ws.map
+  List.length).sum`
+- `Lcp.PagePrefix` — `∀ (p a b w : Word), a ≤ w → w ≤ b → p.isPrefixOf a → p.isPrefixOf
+  b → p.isPrefixOf w`
+- `Lcp.RangeMinimum` — `∀ (ws : List Word) i j, ws.Pairwise (· ≤ ·) → i < j → j <
+  ws.length → ((lcpEdges ws).drop i |>.take (j-i)).min? = some (common (ws[i]?.getD
+  []) (ws[j]?.getD []))`
+- `Lcp.ShardBridge` — `∀ a b, frontBytes (a++b) + common (a.getLast?.getD [])
+  (b.head?.getD []) = frontBytes a + frontBytes b`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.TextExecution.Lcp
 
 open TinylambOpt.ResearchGoals.Atlas.TextExecution

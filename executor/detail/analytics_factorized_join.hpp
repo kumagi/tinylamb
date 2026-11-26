@@ -41,10 +41,10 @@ inline std::optional<uint64_t> PackShortString7(std::string_view s) noexcept {
 }
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave8BigBench.lean (UrlGrouping_sound)
-// Bijective canonical parser for "page-<N>" URLs (0 <= N <= max_id, no leading
-// zeros except "page-0"), keeping non-canonical strings in a disjoint literal
-// map so decode(encode(s)) == s holds identically.
+// lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/DictionaryJoinsAndLateLabels.lean
+// (UrlGrouping_sound) Bijective canonical parser for "page-<N>" URLs (0 <= N <=
+// max_id, no leading zeros except "page-0"), keeping non-canonical strings in a
+// disjoint literal map so decode(encode(s)) == s holds identically.
 inline bool TryParseCanonicalPageUrl(std::string_view sv, uint32_t* out_id,
                                      uint32_t max_id = 262144) noexcept {
   if (sv.size() < 6 || sv.size() > 11 || sv[0] != 'p' || sv[1] != 'a' ||
@@ -159,7 +159,7 @@ class LazyDictionaryPredicateCache {
 };
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
 //   (DisjointRangeBucketHistogram_sound)
 // Maps a non-NULL `ship - sold` day difference to its unique disjoint 5-bin
 // bucket (<=30, 31..60, 61..90, 91..120, >120) in one dispatch.
@@ -180,7 +180,7 @@ constexpr uint8_t ClassifyDisjointRangeBucket5(int64_t diff) noexcept {
 }
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
 //   (LeftJoinNullFlagSplitCount_sound)
 // Accumulates (no_match, matched, total) for a LEFT JOIN whose nullable side
 // is only inspected via `right_key IS NULL` / `IS NOT NULL`.
@@ -197,7 +197,7 @@ inline void FoldLeftJoinNullFlagCounts(uint64_t right_mult, uint64_t* no_match,
 }
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+// lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
 //   (TopKCountPruneByRemainingRows_sound)
 // Returns the K-th largest count (0 if fewer than K groups exist). Once this
 // threshold strictly exceeds the remaining unread rows, unseen keys cannot

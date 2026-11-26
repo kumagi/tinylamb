@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.BinaryText
 
 /-! Binary collation over complete byte strings. NUL and 0xff are ordinary bytes.

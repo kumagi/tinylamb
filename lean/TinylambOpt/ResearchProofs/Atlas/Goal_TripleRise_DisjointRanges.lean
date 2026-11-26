@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `TripleRise.Concatenate` — `∀ x y, measure (x++y) = measure x + measure y + ((pairs
+  x).filter rising |>.map (fun t => y.countP (t.2 < ·))).sum + ((pairs y).filter
+  rising |>.map (fun t => x.countP (· < t.1))).sum`
+- `TripleRise.DisjointRanges` — `∀ x y, (∀ a ∈ x, ∀ b ∈ y, a < b) → measure (x++y) =
+  measure x + measure y + RisePairs.measure x*size y + size x*RisePairs.measure y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,4 +1,14 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `DemandRedo` — Instant restart from a sliced checkpoint and WAL: the surviving base
+  keys are precisely the initial values that can influence the requested output.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

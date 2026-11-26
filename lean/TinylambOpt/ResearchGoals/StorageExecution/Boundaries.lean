@@ -1,5 +1,13 @@
 import Std
 
+/-!
+A scan can use a boundary or restart state only when a range read preserves the
+reference decode and cursor semantics.
+
+Minimum segmentation cost. Edge i j prices the nonempty interval [i,j). At iteration d
+the array stores suffix costs for n, n-1, …, n-d.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution
 
 /-- Minimum segmentation cost. Edge i j prices the nonempty interval [i,j).

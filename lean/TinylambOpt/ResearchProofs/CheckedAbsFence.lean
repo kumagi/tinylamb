@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.CheckedAbsFence
 
+/-!
+Proved
+
+- `Goal` — `∀ ps limit, (∀ p ∈ ps, valid p) → let ref := run false limit ps let opt :=
+  run true limit ps opt.hits = ref.hits ∧ opt.failure = ref.failure ∧ opt.opened =
+  ref.opened.filter (fun i => ps[i]?.any (fun p => !canSkip p limit))`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.CheckedAbsFence`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CheckedAbsFence
 
 open TinylambOpt.ResearchGoals.CheckedAbsFence

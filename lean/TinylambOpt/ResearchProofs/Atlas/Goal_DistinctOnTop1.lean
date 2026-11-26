@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.DistinctOnTop1
 
+/-!
+Proved
+
+- `Goal` — The one-pass top-1 state equals sorting and dropping duplicates, for every
+  key including NULL and for tied ORDER BY values.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.DistinctOnTop1`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

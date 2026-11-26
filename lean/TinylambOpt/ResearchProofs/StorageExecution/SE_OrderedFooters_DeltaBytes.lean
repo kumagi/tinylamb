@@ -1,4 +1,18 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_OrderedFooters_Common
+
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved (10 claims, including the following)
+
+- `DeltaBytes.AmendLeaf` — Update one cached block using the left and right partial
+  states.
+- `DeltaBytes.FrameSlice` — Use only the two ragged boundaries and whole-page summaries
+  for a window.
+- `DeltaBytes.PrefixCheckpoint` — A saved prefix plus page states yields a scan
+  checkpoint at each boundary.
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.OrderedFooters.DeltaBytes

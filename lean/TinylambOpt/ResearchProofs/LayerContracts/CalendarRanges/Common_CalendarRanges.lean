@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.LayerContracts.CalendarRanges
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Named results include `seekLoop_step_commute`, `forIn_seek_foldl`, `foldl_seek_loop`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.FilterLoopFootprint
 
+/-!
+Proved
+
+- `Goal` — `∀ (xs : List Int64) (k : Int64), (schedule xs.length).flatMap accessed =
+  List.range xs.length ∧ writes xs k = xs.zipIdx.map (fun (x,i) => (i, some (if x ==
+  k then 1 else 0)))`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.FilterLoopFootprint`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FilterLoopFootprint
 
 open TinylambOpt.ResearchGoals.FilterLoopFootprint

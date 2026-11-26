@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Reference: evaluate `shipdate ≤ cutoff` per row across all blocks and compute each
+aggregate expression independently on matching rows.
+
+Optimized block-skip + unconditional loop + shared `discPrice` & `(sumQty, cntQty)`
+accumulator.
+
+Modeled claims
+
+- `Goal` — Block-level zone-map pruning, unconditional inner loop without per-row date
+  predicate evaluation, and shared `discPrice` / `(sumQty, cntQty)` state (TPC-H Q01,
+  TPC-DS Q17/Q35) match independent SQL aggregates when headers are valid, while
+  executing zero date checks on fully covered or excluded blocks.
+-/
+
 namespace TinylambOpt.ResearchGoals.UnconditionalBlockSumAvgReuse
 
 structure Row where

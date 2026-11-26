@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `LatestPerKey` — Keep only the latest mutation for a key when checking a historical
+  change, regardless of multiplicity.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

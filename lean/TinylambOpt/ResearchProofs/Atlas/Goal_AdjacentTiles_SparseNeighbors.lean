@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `AdjacentTiles.SparseNeighbors` — `∀ p rs, let freq := fun q => ((rs.filter (fun r =>
+  r.1 == q)).map Prod.snd).sum scan shape p rs = freq ⟨p.x-1,p.y⟩ + freq ⟨p.x+1,p.y⟩
+  + freq ⟨p.x,p.y-1⟩ + freq ⟨p.x,p.y+1⟩`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

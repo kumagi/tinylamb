@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `Couplings.PrefixTransport` — `∀ rs, let bins := ((rs.map Prod.fst)++(rs.map
+  Prod.snd)).mergeSort.eraseDups cost (monotone rs) = ((bins.zip (bins.drop 1)).map
+  (fun (a,b) => (b-a).toNat * ((rs.countP (·.1 ≤ a):Int)-rs.countP (·.2 ≤
+  a)).natAbs)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.CrossTableDisjunctiveBranchMask
 
+/-!
+Proved
+
+- `Goal` — Cross-table disjunctive branch bitmask reduction (TPC-DS Q48/Q15/Q79): under
+  Kleene 3VL `(pD_0 ∧ pF_0) ∨ ... ∨ (pD_{k-1} ∧ pF_{k-1})`, precomputing bit `j` on
+  dimension `D` (`pD_j = some true`), dropping zero-mask dimension rows before
+  joining, and probing fact rows via `(maskD &&& maskF) ≠ 0` reproduces exact join
+  output even when branch predicates evaluate to `NULL` (`none`).
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.CrossTableDisjunctiveBranchMask`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CrossTableDisjunctiveBranchMask
 
 open TinylambOpt.ResearchGoals.CrossTableDisjunctiveBranchMask
@@ -297,3 +310,6 @@ theorem sound : TinylambOpt.ResearchGoals.CrossTableDisjunctiveBranchMask.Goal :
   rw [maskCondition_eq]
 
 end TinylambOpt.ResearchProofs.CrossTableDisjunctiveBranchMask
+
+-- C++ references to this model or its proof.
+-- executor/detail/disjunctive_join_branches.hpp

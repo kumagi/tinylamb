@@ -1,5 +1,21 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `LongestHole.BridgeRun` — `∀ (a b : List Nat), let s := (a.reverse.takeWhile (· ==
+  0)).length let p := (b.takeWhile (· == 0)).length longestZero (a++b)=max (max
+  (longestZero a) (longestZero b)) (s+p)`
+- `LongestHole.ZeroFill` — `∀ n, agg.reference (List.replicate n 0) = (n,n,n,n)`
+- `PairSubsequence.BatchedMarkers` — `∀ a b, agg.reference (List.replicate a 1 ++
+  List.replicate b 2)=(a,b,a*b)`
+- `PairSubsequence.ReversalComplement` — `∀ xs, (agg.reference xs).2.2 + (agg.reference
+  xs.reverse).2.2 = xs.count 1 * xs.count 2`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.OrderedFootersA
 
 open TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
@@ -780,3 +796,7 @@ theorem sound_PairSubsequence_BatchedMarkers :
 end PairSubsequence
 
 end TinylambOpt.ResearchProofs.StorageExecution.OrderedFootersA
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/columnar_tlcs_scan_executor.cpp

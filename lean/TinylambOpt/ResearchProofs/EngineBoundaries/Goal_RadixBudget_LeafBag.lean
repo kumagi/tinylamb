@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `LeafBag` — A repartition changes order but preserves the entire input multiset.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

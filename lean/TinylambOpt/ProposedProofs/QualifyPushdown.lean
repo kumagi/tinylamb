@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.QualifyPushdown
 
+/-!
+Proved
+
+- `Goal` — `∀ (w : Row → Bool) (q : Int → Bool) (rows : List Row), PartitionOnly w →
+  whereFilter w (qualify q rows) = qualify q (whereFilter w rows)`
+
+The reference model is defined in `TinylambOpt.ProposedGoals.QualifyPushdown`.
+-/
+
 open TinylambOpt.ProposedGoals.QualifyPushdown
 
 namespace TinylambOpt.ProposedProofs.QualifyPushdown
@@ -39,3 +48,7 @@ theorem sound : TinylambOpt.ProposedGoals.QualifyPushdown.Goal := by
   rw [partSum_filter_of_w w hw rows r hwr]
 
 end TinylambOpt.ProposedProofs.QualifyPushdown
+
+-- C++ references to this model or its proof.
+-- query/select_grouped_rewrites.cpp
+-- query/select_rewrites.hpp

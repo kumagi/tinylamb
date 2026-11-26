@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_BagKernels_Common
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved (10 claims, including the following)
+
+- `CoGroup.AntiRevenue` — Compute revenue of all left rows whose key is absent on the
+  right.
+- `CoGroup.BuildSwap` — `∀ a b k, bag.mass (a,b) k = bag.mass (b,a) k`
+- `CoGroup.DistinctOutput` — Output live grouping keys once even if physical codes
+  alias.
+-/
+
 open TinylambOpt.ResearchProofs.StorageExecution.BagKernels
 open TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 

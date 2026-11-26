@@ -1,5 +1,20 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.DeltaMaintenance
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+
+Proved (8 claims, including the following)
+
+- `TinylambOpt.ResearchGoals.DeltaMaintenance.ChainBatch` — Delta of an equijoin chain.
+  Telescoping alternates old and new side indexes.
+- `TinylambOpt.ResearchGoals.DeltaMaintenance.DistinctCrossing` — `∀ xs ys k, delta
+  xs.eraseDups ys.eraseDups k = thresholdChange (freq xs k) (delta xs ys k)`
+- `TinylambOpt.ResearchGoals.DeltaMaintenance.IntersectionDelete` — `∀ (a b removed :
+  Bag) k, let b' := removed.foldl List.erase b delta (common a b) (common a b') k =
+  -((min (a.count k) (b.count k) - b'.count k : Nat) : Int)`
+-/
+
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.DeltaMaintenance
 
 open TinylambOpt.ResearchGoals.DeltaMaintenance
@@ -36,7 +51,7 @@ private theorem count_chainKeys (a b c : Bag) (k : Int) :
     (joinKeys (joinKeys a b) c).count k = a.count k * b.count k * c.count k := by
   rw [count_joinKeys, count_joinKeys]
 
-theorem joinBatch_deltaDecomposition : TinylambOpt.ResearchGoals.DeltaMaintenance.JoinBatch.Goal := by
+theorem JoinBatch_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.JoinBatch.Goal := by
   intro a b a' b' k
   unfold delta freq
   repeat rw [count_joinKeys]
@@ -44,7 +59,7 @@ theorem joinBatch_deltaDecomposition : TinylambOpt.ResearchGoals.DeltaMaintenanc
   simp only [Int.sub_eq_add_neg, Int.mul_add, Int.add_mul, Int.neg_mul, Int.mul_neg]
   omega
 
-theorem chainBatch_telescopingDelta : TinylambOpt.ResearchGoals.DeltaMaintenance.ChainBatch.Goal := by
+theorem ChainBatch_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.ChainBatch.Goal := by
   intro a b c a' b' c' k
   unfold delta freq
   repeat rw [count_chainKeys]
@@ -118,7 +133,7 @@ private theorem thresholdChange_count (xs ys : Bag) (k : Int) :
       have hyposI : 0 < (ys.count k : Int) := by omega
       simp [thresholdChange, freq, delta, hxne, hyne, hxmem, hymem, hyposI, hnd]
 
-theorem distinctCrossing_zeroCrossing : TinylambOpt.ResearchGoals.DeltaMaintenance.DistinctCrossing.Goal := by
+theorem DistinctCrossing_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.DistinctCrossing.Goal := by
   intro xs ys k
   unfold delta freq
   repeat rw [count_eraseDups]
@@ -168,7 +183,7 @@ private theorem threshold_eq_indicator (n d : Int) (hnnonneg : 0 ≤ n) (hsum_no
       have hsumpos : 0 < n + d := by omega
       simp [thresholdChange, hn0, hnpos, hsumpos, hsne]
 
-theorem semiWitness_rightCrossing : TinylambOpt.ResearchGoals.DeltaMaintenance.SemiWitness.Goal := by
+theorem SemiWitness_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.SemiWitness.Goal := by
   intro a b a' b' k
   unfold delta freq
   repeat rw [count_semi]
@@ -265,7 +280,7 @@ private theorem cast_max_one (n : Nat) : ((max 1 n : Nat) : Int) = max 1 (n : In
     rw [Int.max_eq_left hi]
     simp
 
-theorem outerJoin_paddingDelta : TinylambOpt.ResearchGoals.DeltaMaintenance.OuterPadding.Goal := by
+theorem OuterPadding_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.OuterPadding.Goal := by
   intro a b b' k
   cases k with
   | none =>
@@ -344,7 +359,7 @@ private theorem count_foldl_erase_le (xs b : Bag) (k : Int) :
       simp only [List.foldl_cons]
       exact Nat.le_trans (ih (b.erase x)) (by rw [List.count_erase]; omega)
 
-theorem intersectionAll_deletionDelta : TinylambOpt.ResearchGoals.DeltaMaintenance.IntersectionDelete.Goal := by
+theorem IntersectionDelete_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.IntersectionDelete.Goal := by
   intro a b removed k
   dsimp only
   unfold delta freq
@@ -455,7 +470,7 @@ private theorem repairMin_some_case (xs dels adds : Bag) (v : Int)
     exact min_append_of_min (removeBatch xs dels) adds v hmem hlo
   · rw [if_neg h]
 
-theorem minimumRepair_survivorBase : TinylambOpt.ResearchGoals.DeltaMaintenance.MinimumRepair.Goal := by
+theorem MinimumRepair_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.MinimumRepair.Goal := by
   intro xs dels adds
   cases xs with
   | nil => simp [repairMin, removeBatch_nil]
@@ -738,7 +753,7 @@ private theorem removeBatch_perm (dels : List Int) {l1 l2 : List Int} (p : l1.Pe
       simp only [List.foldl_cons]
       exact ih (List.Perm.erase d p)
 
-theorem topKRepair_runnerUpList : TinylambOpt.ResearchGoals.DeltaMaintenance.TopKRepair.Goal := by
+theorem TopKRepair_sound : TinylambOpt.ResearchGoals.DeltaMaintenance.TopKRepair.Goal := by
   intro xs dels adds k
   change ((dels.foldl List.erase (xs.mergeSort.take (k + dels.length)) ++ adds).mergeSort.take k) =
     ((dels.foldl List.erase xs ++ adds).mergeSort.take k)
@@ -867,3 +882,7 @@ theorem topKRepair_runnerUpList : TinylambOpt.ResearchGoals.DeltaMaintenance.Top
         rw [hm1, hm2]
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.DeltaMaintenance
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

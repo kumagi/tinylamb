@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `PostDiamond.SquarePathCounts` — `∀ n db b, reference pattern n db b = total n (fun t
+  => (bridge n db 0 0 (b 0) t)^2)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

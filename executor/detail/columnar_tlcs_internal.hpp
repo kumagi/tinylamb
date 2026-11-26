@@ -265,7 +265,7 @@ struct RuntimeAggState {
   // must NOT set it, or MergeAggState would silence the finish-time raise.
   bool saw_inf{false};
   // Order-preserving / table-owned dictionary tracking for `kMinVarChar` /
-  // `kMaxVarChar` (Lean: ClickBenchDiscovery.lean
+  // `kMaxVarChar` (Lean: GroupKeyAndDictionaryRewrites.lean
   // order_preserving_dict_min_code_sound, unsorted_dict_min_code_bug).
   const LSTableColumnDictionary* dict_ptr{nullptr};
   uint8_t dict_code{0};
@@ -479,7 +479,8 @@ struct ColumnarStageSchedule {
   std::vector<uint8_t> stage2_len_only;
   // Conditional `CASE WHEN` target columns decoded only when at least one
   // surviving row in the block satisfies the guard conjunction (Lean:
-  // ClickBenchDiscovery.lean conditional_key_disjoint_partition_sound).
+  // GroupKeyAndDictionaryRewrites.lean
+  // conditional_key_disjoint_partition_sound).
   std::vector<slot_t> cond_cols;
   std::vector<std::vector<TypedFilterCompare>> cond_guards;
 };
@@ -499,8 +500,8 @@ struct BlockDecodeScratch {
 
 // Reconstructs full key specifications (minus redundant functionally dependent
 // `kColInt64Delta` or `kConstInt64` keys when collapsed) -> physical keys
-// (Lean: ClickBenchDiscovery.lean group_by_functional_expr_reduction_sound,
-// group_by_overflow_expr_drop_bug).
+// (Lean: GroupKeyAndDictionaryRewrites.lean
+// group_by_functional_expr_reduction_sound, group_by_overflow_expr_drop_bug).
 struct KeyProjectionMap {
   std::vector<ColGroupKeySpec> phys_specs;
   std::vector<int32_t> full_to_phys;
@@ -700,7 +701,7 @@ struct TimestampPrefixCache {
 
 // Per-worker dictionary homomorphism + direct-mapped session memo cache for
 // `REGEXP_REPLACE(col, pat, rep)` group keys (ClickBench Q29; Lean:
-// ClickBenchDiscovery.lean dict_code_homomorphism_group_agg_sound).
+// GroupKeyAndDictionaryRewrites.lean dict_code_homomorphism_group_agg_sound).
 struct RegexReplaceCache {
   static constexpr size_t kMemoSlots = 1024;
   static constexpr size_t kMemoRingBytes = size_t{128} << 10;
@@ -891,7 +892,7 @@ inline bool ExtractSingleKeyCell(
     out_cell->int_val = ks.const_int;
     return true;
   }
-  // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+  // Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
   // (conditional_key_disjoint_partition_sound): evaluate `CASE WHEN` guard
   // columns BEFORE touching `col_ptrs[ks.full_col]` so blocks where 0 surviving
   // rows satisfy `ks.case_conditions` never need to decode `ks.full_col`, and

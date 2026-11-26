@@ -1,5 +1,26 @@
 import TinylambOpt.ResearchGoals.Frontiers.SpillScheduling
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `AdjacentPenalty` — `∀ a b c, adjacentThree a b c - huffman 3 [a,b,c] = b-max a c`
+- `ExcessFirst` — `∀ l r n, bestPeak l - width l ≥ bestPeak r - width r → bestPeak
+  (.node n l r) = max (width l+width r+n) (max (bestPeak l) (width l+bestPeak r))`
+- `TileImbalance` — `∀ (jobs : List Nat) m cap, 0 < m → (∀ j ∈ jobs, j ≤ cap) → let
+  loads := dispatch (List.replicate m 0) jobs makespan loads - loads.min?.getD 0 ≤
+  cap`
+- `TreePeak` — `∀ t, (∃ s, Order t s ∧ peak s = bestPeak t) ∧ ∀ s, Order t s → bestPeak
+  t ≤ peak s`
+
+Refuted by counterexample
+
+- `AdjacentRuns` — `∀ (ns : List Nat), ns ≠ [] → ∃ t, leaves t = ns ∧ writes t =
+  huffman ns.length ns`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -477,3 +498,6 @@ theorem TileImbalance_sound : TinylambOpt.ResearchGoals.Frontiers.SpillSchedulin
   · exact hjob
 
 end TinylambOpt.ResearchProofs.Frontiers.SpillScheduling
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

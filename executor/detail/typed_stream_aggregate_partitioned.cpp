@@ -606,7 +606,7 @@ Relation FinalizePartitionedRelation(
         fast_order_kind == PartOrderKind::kInt &&
         req.order_bindings.size() == 1 && survivors.size() >= 1024 &&
         // Lean proof:
-        // lean/TinylambOpt/ResearchProofs/SortRadixKeyPartitionSoundness.lean
+        // lean/TinylambOpt/ResearchProofs/StableRadix.lean
         // (sound)
         TryStableRadixSortNullableInt64(
             survivors, req.order_bindings[0].order.Ascending(),
@@ -4334,7 +4334,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
 }
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean (sound)
+// lean/TinylambOpt/ResearchProofs/ExactIntTotalOverflowGuard.lean (sound)
 bool CanFoldAggsInParallel(
     const PartitionedColumnarAggRequest& req,
     const std::vector<std::shared_ptr<const TlcsFile::DirGroup>>& dir_groups) {
@@ -4568,7 +4568,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
     const PartitionedColumnarAggRequest& req,
     const KeyProjectionMap* precomputed_km) {
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean
+  // lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
   // (sound)
   if (::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_TWO_KEY_DIRECT_AGG") !=
           nullptr ||
@@ -4686,7 +4686,7 @@ StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
   //   -
   //   lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
   //     (sound)
-  //   - lean/TinylambOpt/ResearchProofs/Wave8H2o.lean (EpochAverage_sound)
+  //   - lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean (EpochAverage_sound)
   //   - lean/TinylambOpt/ResearchProofs/TwoLevelPartitionedAggMerge.lean
   //     (sound)
   // For single-agg COUNT(*) / AVG / SUM(double) over bounded 2-key integer
@@ -5195,13 +5195,10 @@ StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     const PartitionedColumnarAggRequest& req,
     const KeyProjectionMap* precomputed_km) {
   // Lean proofs:
-  //   - lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean (sound)
-  //   -
-  //   lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean
-  //     (sound)
-  //   - lean/TinylambOpt/ResearchProofs/ShortStringPrefix7Bijection.lean
+  //   - lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean (sound)
+  //   - lean/TinylambOpt/ResearchProofs/CompressedStringPrefixHashEquiv.lean
   //   (sound)
-  //   - lean/TinylambOpt/ResearchProofs/UnboundedSumInt64OverflowGuard.lean
+  //   - lean/TinylambOpt/ResearchProofs/ExactIntTotalOverflowGuard.lean
   //   (sound)
   if (::tinylamb::platform::GetEnv(
           "TINYLAMB_DISABLE_LOCAL_DICT_TWO_STAGE_AGG") != nullptr ||

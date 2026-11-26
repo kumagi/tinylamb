@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `AlignedWeek.BucketEquality` — `∀ p (rs : Rows), let bucket := fun q : Point =>
+  (q.x/7,q.y/10) let states := rs.map (fun r => (bucket r.1,r.2)) scan shape p rs =
+  ((states.filter (fun e => e.1 == bucket p)).map Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

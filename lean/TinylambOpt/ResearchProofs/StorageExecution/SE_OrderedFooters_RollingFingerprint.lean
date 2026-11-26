@@ -1,4 +1,18 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_OrderedFooters_Common
+
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved (10 claims, including the following)
+
+- `RollingFingerprint.AmendLeaf` — Update one cached block using the left and right
+  partial states.
+- `RollingFingerprint.CollisionBoundary` — `agg.reference [0] = agg.reference [65521]`
+- `RollingFingerprint.EqualWindowResidues` — `∀ a b pre z, a.length=b.length →
+  (agg.reference a).2=(agg.reference b).2 → agg.reference (pre++a++z)=agg.reference
+  (pre++b++z)`
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.OrderedFooters.RollingFingerprint

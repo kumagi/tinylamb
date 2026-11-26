@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PrefixKernels
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Common_PrefixKernels
 
+/-!
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+
+Proved
+
+- `PositiveFilter.NonpositiveSkip` — `∀ x, x≤0 → update (some x)=update none`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

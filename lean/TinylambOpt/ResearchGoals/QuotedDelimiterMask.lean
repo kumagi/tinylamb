@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims distinguish real delimiters from delimiter bytes inside quoted fields. A
+SQL input parser can use a mask to find field boundaries under the stated quoting rules.
+
+Modeled claims
+
+- `Goal` — `∀ prior len q c, len ≤ 64 → q &&& c = 0 → chunk prior len q c = scalar
+  prior len q c`
+-/
+
 namespace TinylambOpt.ResearchGoals.QuotedDelimiterMask
 
 abbrev W := BitVec 64

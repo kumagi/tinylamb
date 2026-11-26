@@ -3627,9 +3627,10 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
   // derived sources last. All rewrites preserve the row multiset;
   // anything they reject keeps the existing materialized/relational
   // path untouched.
-  // Lean-proven TPC-DS AST rewrites (lean/TinylambOpt/TpcdsDiscovery.lean):
-  // skipped under `force_relational_fallback_` so differential oracle tests
-  // cross-check the rewritten plans against the unrewritten interpreter.
+  // Lean-proven TPC-DS AST rewrites
+  // (lean/TinylambOpt/UnionAndJoinRewrites.lean): skipped under
+  // `force_relational_fallback_` so differential oracle tests cross-check the
+  // rewritten plans against the unrewritten interpreter.
   if (!force_relational_fallback_) {
     (void)CanonicalizeTwoValuedNegations(select.get());
     if (CanonicalizeSelectAliasGroupBy(select.get(), ctx)) {
@@ -3804,7 +3805,8 @@ StatusOr<Executor> SqlEngine::ExecuteSelect(
   }
   // Hoist structurally identical grouped derived-table sources (e.g. TPC-DS
   // Q65 `sa` and `sc`) into a shared CTE before CTE restriction pushdown and
-  // materialization (Lean: Wave9TpcdsMultiChannelAndTpch.lean
+  // materialization (Lean:
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
   // GroupAvgThresholdTwoPassSplit_sound).
   if (HoistDuplicateDerivedTablesToCte(select.get())) {
     dml_fold_applied_ = true;

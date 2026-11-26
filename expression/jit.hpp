@@ -391,7 +391,7 @@ inline void InsertPacked2x32Bloom(uint64_t hash, uint64_t* bloom_words,
 
 // Proof-backed LLVM ORC JIT kernels for 1-PK dense-split 2-phase radix
 // grouped aggregation over decoded LSTable blocks (TPC-DS Q11/Q74/Q04/etc.).
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (jit_dense_split_radix_agg_sound)
 class JitDenseSplitRadixAgg {
  public:
@@ -507,7 +507,7 @@ class JitDenseSplitRadixAgg {
 
 // Proof-backed LLVM ORC JIT kernel for 2-key packed int32x32 open-addressing
 // hash probing with optional L2 bloom filter and hardware prefetch (Q78/Q75).
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (jit_packed2x32_hash_probe_sound)
 class JitPacked2x32HashProbe {
  public:
@@ -534,7 +534,7 @@ class JitPacked2x32HashProbe {
 
 // Proof-backed LLVM ORC JIT kernels for 2-key packed int32x32 radix partition
 // pack/scatter and generation-stamped open-addressing deduplication (Q97).
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (jit_packed2x32_radix_dedup_sound)
 class JitPacked2x32RadixDedup {
  public:
@@ -604,7 +604,7 @@ class JitPacked2x32RadixDedup {
 
 // Proof-backed LLVM ORC JIT kernel for generation-stamped open-addressing
 // radix-partition double SUM/AVG accumulation with software prefetch (Q67/Q65).
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (jit_radix_key_double_agg_sound)
 class JitRadixKeyDoubleAgg {
  public:

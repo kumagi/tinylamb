@@ -500,7 +500,8 @@ TEST(AnalyticsFactorizedJoinTest, TwoKeyBoundedLocalDictAndRadixSortParity) {
 }
 
 TEST(AnalyticsFactorizedJoinTest, Wave8UrlGroupingAndSparseOuterCorrection) {
-  // Wave8BigBench.UrlGrouping_sound: canonical "page-<N>" bijection.
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/DictionaryJoinsAndLateLabels.lean.UrlGrouping_sound:
+  // canonical "page-<N>" bijection.
   uint32_t id = 0;
   EXPECT_TRUE(relational_detail::TryParseCanonicalPageUrl("page-0", &id));
   EXPECT_EQ(id, 0U);
@@ -619,8 +620,9 @@ TEST(AnalyticsFactorizedJoinTest,
   EXPECT_FALSE(cache.Test(7, pred));
   EXPECT_EQ(cache.EvalCount(), 2U);
 
-  // Wave8H2o.EpochAverage_sound + TwoLevelPartitionedAggMerge +
-  // EmptyStringKeyPartitionSplit + Wave8Job.FixedGender_sound
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean.EpochAverage_sound
+  // + TwoLevelPartitionedAggMerge + EmptyStringKeyPartitionSplit +
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/MovieJoinFiltersAndFanout.lean.FixedGender_sound
   auto db = Database::Create("afj_ab_" + RandomString()).MoveValue();
   SqlEngine engine(*db);
   ExecDml(
@@ -688,7 +690,8 @@ TEST(AnalyticsFactorizedJoinTest,
 }
 
 TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
-  // Wave9TpcdsRollupAndSetOps.lean (DisjointRangeBucketHistogram_sound)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
+  // (DisjointRangeBucketHistogram_sound)
   EXPECT_EQ(relational_detail::ClassifyDisjointRangeBucket5(-5), 0U);
   EXPECT_EQ(relational_detail::ClassifyDisjointRangeBucket5(30), 0U);
   EXPECT_EQ(relational_detail::ClassifyDisjointRangeBucket5(31), 1U);
@@ -699,7 +702,8 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
   EXPECT_EQ(relational_detail::ClassifyDisjointRangeBucket5(120), 3U);
   EXPECT_EQ(relational_detail::ClassifyDisjointRangeBucket5(121), 4U);
 
-  // Wave9TpcdsRollupAndSetOps.lean (LeftJoinNullFlagSplitCount_sound)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
+  // (LeftJoinNullFlagSplitCount_sound)
   uint64_t no_m = 0, m = 0, tot = 0;
   relational_detail::FoldLeftJoinNullFlagCounts(0, &no_m, &m, &tot);
   relational_detail::FoldLeftJoinNullFlagCounts(3, &no_m, &m, &tot);
@@ -708,14 +712,16 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
   EXPECT_EQ(m, 4U);
   EXPECT_EQ(tot, 5U);
 
-  // Wave9ClickBenchHighCardAndFilter.lean (TopKCountPruneByRemainingRows_sound)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
+  // (TopKCountPruneByRemainingRows_sound)
   EXPECT_EQ(relational_detail::ComputeTopKRemainingPruneThreshold(
                 {10, 50, 20, 40, 30}, 3),
             30U);
   EXPECT_EQ(relational_detail::ComputeTopKRemainingPruneThreshold({10, 20}, 3),
             0U);
 
-  // Wave9AnalyticsRemaining.lean (SelfJoinBridgeBipartiteWeights_sound — C3)
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/JoinMultiplicityAndZoneFilters.lean
+  // (SelfJoinBridgeBipartiteWeights_sound — C3)
   auto db = Database::Create("afj_wave9_" + RandomString()).MoveValue();
   SqlEngine engine(*db);
   ExecDml(&engine, db.get(),
@@ -764,8 +770,9 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
         << c3_sql;
   }
 
-  // Wave9TpcdsMultiChannelAndTpch.lean (YearPairPivotSelfJoinElim_sound —
-  // Q75 derived UNION DISTINCT CTE year-pair self-join pivot).
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
+  // (YearPairPivotSelfJoinElim_sound — Q75 derived UNION DISTINCT CTE year-pair
+  // self-join pivot).
   {
     auto q75_db = Database::Create("afj_w9_q75_" + RandomString()).MoveValue();
     SqlEngine q75_eng(*q75_db);
@@ -821,8 +828,9 @@ TEST(AnalyticsFactorizedJoinTest, Wave9ProvedKernelsAndSelfJoinBridgeParity) {
     }
   }
 
-  // Wave9TpcdsRollupAndSetOps.lean (LeftJoinNullFlagSplitCount_sound — Q72
-  // complementary IS NULL / NOT IS NULL split counts).
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
+  // (LeftJoinNullFlagSplitCount_sound — Q72 complementary IS NULL / NOT IS NULL
+  // split counts).
   {
     auto q72_db = Database::Create("afj_w9_q72_" + RandomString()).MoveValue();
     SqlEngine q72_eng(*q72_db);

@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Compression.IntegerFrames
 import TinylambOpt.ResearchGoals.ExecutionStrategies.EncodedBlocks
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+-/
+
 namespace TinylambOpt.ResearchGoals.Compression.Nullable
 open Wire
 open IntegerFrames (gaps undoGaps)

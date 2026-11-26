@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Refuted by counterexample
+
+- `RetractPublished` — A full abort after exposing some reply bytes can recover the old
+  stream for arbitrary replies.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Refuted by counterexample
+
+- `WrappedEpoch` — Limiting the stored generation to k bits keeps generations
+  distinguishable for all lifetimes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

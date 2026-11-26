@@ -1,6 +1,17 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_GrammarScans_Common
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `LineBoundary.FinalPair` — `∀ x, matched reader x 0 = [13,10].isSuffixOf (expand x)`
+- `LineBoundary.RunBoundaryCRLF` — `∀ x k, 1<k → extent x=1 → matched reader (.rep k x)
+  0=false`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GrammarScans
 
 namespace LineBoundary

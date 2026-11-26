@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `QuotedField.DoublePhrase` — `∀ x, compile reader (.rep 2 x) = List.range
+  reader.states`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

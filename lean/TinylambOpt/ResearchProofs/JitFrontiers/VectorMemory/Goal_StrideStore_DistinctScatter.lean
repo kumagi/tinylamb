@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Common_VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Proved
+
+- `StrideStore.DistinctScatter` — `∀ j n, 0<j.stride → ((List.range n).map
+  (kernel.store j)).Nodup`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.PairAggregates
 
 /-! Exact widened integer accumulators. Results are COUNT or COALESCE(SUM(...),0).

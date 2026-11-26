@@ -60,9 +60,9 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (DuckDBGaps/Orders.lean: MarketShareWeights_sound,
-// YearRoutes_sound) fast path for 8-table star/snowflake market-share queries
-// (TPC-H Q8):
+// Lean-backed (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean:
+// MarketShareWeights_sound, YearRoutes_sound) fast path for 8-table
+// star/snowflake market-share queries (TPC-H Q8):
 //   SELECT EXTRACT(year FROM o_orderdate) AS o_year,
 //          SUM(CASE WHEN n2.n_name = 'X' THEN l_extendedprice * (1 -
 //          l_discount)

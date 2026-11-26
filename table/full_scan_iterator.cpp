@@ -1079,7 +1079,7 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
     if (!pos_.IsValid()) {
       break;
     }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (fast_readonly_row_page_filter_eq)
     // Tight in-page batch loop for clean read-only all-fixed-width RowPages
     // (e.g. uncompacted 133M-row `inventory` in TPC-DS Q21/Q22/Q72): avoids
@@ -2231,7 +2231,7 @@ bool FullScanIterator::EnsureStubBlockColumns(
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (filterColumnAtATime_eq_row_at_a_time)
 void FullScanIterator::ComputeStubBlockMatches() {
   stub_match_rows_.clear();

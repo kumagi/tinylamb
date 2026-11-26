@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
 
+/-!
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+
+Proved
+
+- `FloorMean.ExactDividend` — `∀ xs x, x ∈ xs → xs.sum%xs.length=0 → repaired model xs
+  x = value model (xs.erase x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

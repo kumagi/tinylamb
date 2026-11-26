@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Sharing sentinel `0` between NULL and unreferenced/first IDs merges NULL rows into group
+`dict[0]`.
+
+Modeled claims
+
+- `Goal` — Compact gathered dictionary remap (`executor/detail/fused_grouped_join.cpp`
+  `left_pack` `kGathered` `total_rows ≤ 4096`): remapping active canonical dictionary
+  IDs to dense IDs `0..m-1` while keeping `none` (NULL) separate from unreferenced
+  entries preserves grouped `SUM` for every key `k`.
+-/
+
 namespace TinylambOpt.ResearchGoals.GatheredSmallDictFastPath
 
 def addAssoc {α : Type} [DecidableEq α] (m : List (α × Int)) (k : α) (v : Int) :

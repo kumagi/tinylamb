@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Common_VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Proved
+
+- `StrideRead.BroadcastRead` — `∀ j ids, j.stride=0 → ids≠[] → addresses kernel j
+  ids=[j.src]`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

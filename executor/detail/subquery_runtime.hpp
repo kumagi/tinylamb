@@ -384,7 +384,7 @@ struct CorrelatedIndex {
   std::array<slot_t, 2> cached_outer_slots{};
   bool cached_outer_slots_valid{false};
 
-  // Lean proof: lean/TinylambOpt/ProposedProofs/QuantifiedRangeSummary.lean
+  // Lean proof: lean/TinylambOpt/ResearchProofs/QuantifiedRangeSummary.lean
   // (sound)
   struct QuantifiedRangeSummaryEntry {
     bool has_non_null{false};
@@ -396,7 +396,7 @@ struct CorrelatedIndex {
   ValueType quantified_value_type{ValueType::kInt64};
   FlatIntKeyMap<QuantifiedRangeSummaryEntry> quantified_int_summaries;
 
-  // Lean proof: lean/TinylambOpt/ProposedProofs/DemandScalar.lean (sound)
+  // Lean proof: lean/TinylambOpt/ResearchProofs/DemandScalar.lean (sound)
   struct DemandScalarHit {
     Value value;
     bool many{false};
@@ -404,7 +404,7 @@ struct CorrelatedIndex {
   bool has_demand_int_scalars{false};
   FlatIntKeyMap<DemandScalarHit> demand_int_scalars;
 
-  // Lean proof: lean/TinylambOpt/ProposedProofs/IntervalCountSweep.lean (sound)
+  // Lean proof: lean/TinylambOpt/ResearchProofs/IntervalCountSweep.lean (sound)
   struct IntervalCheckpoint {
     int64_t coord{0};
     int64_t count{0};

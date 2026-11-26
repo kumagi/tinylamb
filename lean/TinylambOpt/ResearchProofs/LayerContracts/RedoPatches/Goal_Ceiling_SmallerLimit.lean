@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RedoPatches
 import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Common_RedoPatches
 
+/-!
+Database recovery can combine or replay edits only where the resulting state agrees with
+LSN-ordered replay.
+
+Proved
+
+- `Ceiling.SmallerLimit` — `∀ a b x, b.1 ≤ a.1 → model.patch b (model.patch a x) =
+  model.patch b x`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

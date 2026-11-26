@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `GenerationGC` — Which sidecars can be retired while the durable manifest generation
+  is in doubt? Retain the union of dependencies of the winners across all modeled
+  crash cuts, plus any live leases checked separately.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

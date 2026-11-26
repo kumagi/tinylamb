@@ -1,4 +1,24 @@
 import TinylambOpt.ResearchGoals.Frontiers.SparseRecovery
+
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `BoundedMoments` — `∀ (a b : List Nat) d, a.length ≤ d → b.length ≤ d → (∀ k ≤ d,
+  moment a k = moment b k) → a.Perm b`
+- `DisjointResultant` — `∀ (a b : List Nat), (b.map (fun (x : Nat) => poly a x)).prod =
+  0 ↔ ∃ x ∈ a, x ∈ b`
+- `IsolatedHash` — `∀ xs (hashes : List (Nat → Nat)) key, (∃ h ∈ hashes, ∀ x ∈ xs, h x
+  = h key → x = key) → (hashes.map (fun h => buckets xs h key)).min? = some (xs.count
+  key)`
+
+Refuted by counterexample
+
+- `ThreeFromTwo` — `∀ (a b : List Nat), a.length = 3 → b.length = 3 → moment a 1 =
+  moment b 1 → moment a 2 = moment b 2 → ∀ p, a.contains p = b.contains p`
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

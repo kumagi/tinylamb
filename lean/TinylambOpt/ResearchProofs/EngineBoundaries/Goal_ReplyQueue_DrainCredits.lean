@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `DrainCredits` — A credit-limited writer can drain the pending response in a finite
+  list of writes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

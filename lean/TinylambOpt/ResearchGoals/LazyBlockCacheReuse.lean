@@ -1,5 +1,15 @@
 import Std
 
+/-!
+Naive cache lookup without checking `gen == curGen` serves stale values after `mutate`.
+
+Modeled claims
+
+- `Goal` — C++ `ReuseLazyDecodedBlock` (`table/tlcs_file.cpp`): bumping
+  `LayoutGeneration` invalidates stale cache entries lazily without eagerly flushing
+  the per-block cache, while per-key `evict` drops only that key.
+-/
+
 namespace TinylambOpt.ResearchGoals.LazyBlockCacheReuse
 
 abbrev Key := Nat × Nat

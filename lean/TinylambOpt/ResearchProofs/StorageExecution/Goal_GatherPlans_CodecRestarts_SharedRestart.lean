@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `CodecRestarts.SharedRestart` — `∀ stride fee x y, x≤y → x/(stride+1)=y/(stride+1) →
+  price stride fee x y = price stride fee y y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchProofs.Compression.Text
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `FrontPageInverse` — `∀ ws, readBody ws.length (frontBody ws) = some ws`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

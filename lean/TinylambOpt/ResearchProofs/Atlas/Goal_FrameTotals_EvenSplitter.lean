@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `FrameTotals.EvenSplitter` — `∀ x, measure x.reverse = measure x`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

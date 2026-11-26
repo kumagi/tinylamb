@@ -3,6 +3,16 @@ import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarR
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Facts_CivilYear
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved
+
+- `CivilYear.CyclePopulation` — Analytical cardinality of a UNION of consecutive whole
+  buckets.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

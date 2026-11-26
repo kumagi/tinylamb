@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `UnorderedPair.OrientationTies` — `∀ x y, key (x,y) = key (y,x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

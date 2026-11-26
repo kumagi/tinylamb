@@ -92,6 +92,9 @@ class AggregateGroupTable {
   // Folds one input row into every aggregate of `group` except `skip_index`.
   [[nodiscard]] Status AccumulateExcluding(size_t group, const Row& row,
                                            size_t skip_index);
+  // Folds one input row into every aggregate `i` where `skip_mask[i] == 0`.
+  [[nodiscard]] Status AccumulateExcludingMask(
+      size_t group, const Row& row, const std::vector<uint8_t>& skip_mask);
   // [group keys..., aggregate results...] for one group.
   [[nodiscard]] StatusOr<Row> Finish(size_t group);
   // Folds `other`'s groups into this one; a group seen by both merges its

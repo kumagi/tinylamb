@@ -1,5 +1,17 @@
 import Std
 
+/-!
+Naive average merging (`(avg1 + avg2) / 2`) fails when worker tuple counts differ.
+
+Modeled claims
+
+- `Goal` — Two-level radix partitioned parallel aggregate merge
+  (`executor/detail/typed_stream_aggregate_partitioned.cpp`, ClickBench Q14/17/
+  19/29/32/34/35): routing worker-local `(count, sum)` maps to `numParts` disjoint
+  partitions by `hash k % numParts` yields zero duplicate output keys across
+  partitions and exact parity with single-thread aggregation.
+-/
+
 namespace TinylambOpt.ResearchGoals.TwoLevelPartitionedAggMerge
 
 abbrev Key := Option Int

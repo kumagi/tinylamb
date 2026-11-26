@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `FriendBridge.BoundaryMessages` — `∀ n db b, elimination pattern n db b = reference
+  pattern n db b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

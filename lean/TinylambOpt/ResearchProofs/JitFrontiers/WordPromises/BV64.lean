@@ -1,4 +1,11 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
+
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Named results include `or_eq_xor_iff`, `and_eq_zero_iff_beq`.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

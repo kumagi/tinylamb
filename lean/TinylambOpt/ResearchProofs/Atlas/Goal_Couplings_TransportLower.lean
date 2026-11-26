@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `Couplings.TransportLower` — `∀ rs, cost (monotone rs) ≤ cost rs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

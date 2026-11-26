@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 open TinylambOpt.ResearchGoals.Compression.Wire
 

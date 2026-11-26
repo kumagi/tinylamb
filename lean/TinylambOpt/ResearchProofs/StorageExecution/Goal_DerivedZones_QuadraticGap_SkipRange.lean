@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `QuadraticGap.SkipRange` — Drop a whole page for a range test, preserving empty and
+  NULL pages.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

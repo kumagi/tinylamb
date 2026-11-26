@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `DoubleHalf.Necessary` — Aggressive converse: no safe input is unnecessarily sent to
+  the slow path.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

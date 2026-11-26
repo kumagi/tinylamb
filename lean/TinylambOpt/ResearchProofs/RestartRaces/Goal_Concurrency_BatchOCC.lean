@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Concurrency
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `BatchOCC` — Can a commit combiner accept *exactly* the serializable snapshot-read
+  cohorts using anti-dependencies on value-changing writes? Asks for existence of a
+  serial order, including read/write skew cycles and same-value updates.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,22 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.BatchSummary` — `∀ a b, finish (a++b) = max (finish a + (b.map
+  Prod.snd).sum) ((a.map Prod.fst).sum + finish b)`
+- `Pipeline.CriticalCut` — `∀ xs, finish xs = (xs.zipIdx.map (fun (_,i) => ((xs.take
+  (i+1)).map Prod.fst).sum + ((xs.drop i).map Prod.snd).sum)).max?.getD 0`
+- `Pipeline.SplitOverlap` — `∀ l r a b c d, finish (l++[(a,b),(c,d)]++r) ≤ finish
+  (l++[(a+c,b+d)]++r)`
+- `Pipeline.SteadyState` — `∀ n a b, 0 < n → finish (List.replicate n (a,b)) =
+  a+b+(n-1)*max a b`
+- `Pipeline.TwoStageOrder` — `∀ xs ys, xs.Perm ys → finish (johnson xs) ≤ finish ys`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.ExecutorResources.Pipeline
 
 open TinylambOpt.ResearchGoals.Atlas.ExecutorResources.Pipeline

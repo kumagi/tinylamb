@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `Backpressure` — A writable callback can honor a queue high-water mark using just
+  remaining unsent bytes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

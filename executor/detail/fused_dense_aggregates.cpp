@@ -191,7 +191,7 @@ StatusOr<std::optional<Relation>> DenseFilteredGroups::TryRun() const {
     const ValueType gtype = left.schema.GetColumn(g_pcol).Type();
     size_t total_out_groups = 0;
     if (fusion->post_having_active) {
-      // Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+      // Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
       //   (grouped_having_global_sum_fubini_sound)
       double threshold = fusion->post_having_constant_or_factor;
       bool valid_threshold = true;

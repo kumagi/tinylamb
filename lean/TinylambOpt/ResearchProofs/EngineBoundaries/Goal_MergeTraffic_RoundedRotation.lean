@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+
+Proved
+
+- `RoundedRotation` — Choosing a rotation by page-rounded traffic still admits the
+  byte-optimal orientation.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

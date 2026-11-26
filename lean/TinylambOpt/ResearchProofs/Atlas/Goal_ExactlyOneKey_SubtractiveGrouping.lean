@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `ExactlyOneKey.SubtractiveGrouping` — `∀ p rs, scan shape p rs = ((rs.filter (fun r
+  => r.1.x == p.x)).map Prod.snd).sum + ((rs.filter (fun r => r.1.y == p.y)).map
+  Prod.snd).sum - 2*((rs.filter (fun r => r.1 == p)).map Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

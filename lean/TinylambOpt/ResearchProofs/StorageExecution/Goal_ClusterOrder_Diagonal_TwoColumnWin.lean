@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Refuted by counterexample
+
+- `Diagonal.TwoColumnWin` — Aggressive hypothesis: the combined RLE payload always
+  compensates for the permutation on nonconstant pages.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BlockCountModel
 
+/-!
+These claims count positions in a range that satisfy a congruence. A SQL scan can derive
+counts from regular layouts without enumerating each qualifying position.
+
+Modeled claims
+
+- `Goal` — `∀ m r (pages : List (Block Nat Meta)), 0 < m → (∀ b ∈ pages, b.header =
+  summary b.data ∧ b.size = b.data.length) → let res := execute (classify m r) (test
+  m r) pages res.count = ((pages.flatMap Block.data).filter (test m r)).length ∧ ∀ b
+  ∈ pages.zipIdx, b.2 ∈ reads res → let s := b.1.header (∃ k, test m r (s.anchor +
+  k*s.stride) = true) ∧ (∃ k, test m r (s.anchor + k*s.stride) = false)`
+-/
+
 namespace TinylambOpt.ResearchGoals.CongruenceCount
 
 open BlockCountModel

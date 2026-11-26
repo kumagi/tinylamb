@@ -1,5 +1,24 @@
 import TinylambOpt.ResearchGoals.Compression.Partition
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (15 claims, including the following)
+
+- `AlignedComposition` — `∀ (cost : Cost) ps unit, 0 < unit → (∀ p ∈ ps, unit ∣ cost p)
+  → align unit (bytes cost ps) = bytes cost ps`
+- `AppendEnvelope` — `∀ cost a b, best cost (a++b) ≤ best cost a + best cost b`
+- `CappedAppend` — `∀ cost a b cap ca cb, boundedBest cost cap a = some ca →
+  boundedBest cost cap b = some cb → ∃ merged ≤ ca+cb, boundedBest cost cap (a++b) =
+  some merged`
+
+Refuted by counterexample
+
+- `PairwiseLocal` — `∀ (cost : Cost) (a b c : List Nat), cost a+cost b ≤ cost (a++b) →
+  cost b+cost c ≤ cost (b++c) → cost a+cost b+cost c ≤ cost (a++b++c)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

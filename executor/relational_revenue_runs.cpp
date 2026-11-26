@@ -48,8 +48,9 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean-backed (DuckDBGaps/Orders.lean: RevenueRuns_sound) fast path for
-// 3-table shipping-priority revenue Top-K queries (TPC-H Q3):
+// Lean-backed (AnalyticalOperators/RevenueAggregatesAndJoinWitnesses.lean:
+// RevenueRuns_sound) fast path for 3-table shipping-priority revenue Top-K
+// queries (TPC-H Q3):
 //   SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue,
 //          o_orderdate, o_shippriority
 //   FROM customer, orders, lineitem

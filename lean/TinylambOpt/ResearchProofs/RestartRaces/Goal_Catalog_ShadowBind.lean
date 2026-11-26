@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `ShadowBind` — Optimistic cache reuse from partial revalidation: checking the old
+  search prefix suffices if it still resolves to the old descriptor. If its winner
+  vanishes, require the unread suffix to be empty or otherwise certified. Here
+  quantify over every possible suffix binding on fresh namespace keys.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

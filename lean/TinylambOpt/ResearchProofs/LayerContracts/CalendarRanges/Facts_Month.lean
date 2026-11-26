@@ -2,6 +2,23 @@ import TinylambOpt.ResearchGoals.LayerContracts.CalendarRanges
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarRanges
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved
+
+- `Month.CoverBlocks` — Minimal bucket interval covering every day of a nonempty page
+  range.
+- `Month.CyclePopulation` — Analytical cardinality of a UNION of consecutive whole
+  buckets.
+- `Month.Locate` — Cycle reduction and binary search identify the unique half-open
+  interval.
+- `Month.Predecessor` — On the day before a boundary, the previous bucket must win.
+- `Month.PredicateRange` — Replace a truncated-date equality filter with two raw date
+  comparisons.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

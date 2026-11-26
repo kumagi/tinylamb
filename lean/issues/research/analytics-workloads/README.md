@@ -1,6 +1,6 @@
 # 派生分析ベンチマークの実行計画と物理演算（第八波・未証明）
 
-リポジトリの JOB、STATS-CEB、H2O、LDBC-SNB、BigBench に含まれる **全 26 クエリに対する 33 件**の提出型。各表の宣言名に `.Goal` を付けると、リンク先モジュールの命題になる。たとえば `TinylambOpt.ResearchGoals.AnalyticsWorkloads.Ldbc.ActiveFriends.Goal` は L1 の国別件数と隣接リストの読取り数を同時に問う。[実際の SQL と生成器](../../../../benchmark/comparison/analytics_bench.py)
+リポジトリの JOB、STATS-CEB、H2O、LDBC-SNB、BigBench に含まれる **全 26 クエリに対する 33 件**の提出型。各表の宣言名に `.Goal` を付けると、リンク先モジュールの命題になる。たとえば `TinylambOpt.ResearchGoals.AnalyticsWorkloads.SocialGraphJoinWeights.ActiveFriends.Goal` は L1 の国別件数と隣接リストの読取り数を同時に問う。[実際の SQL と生成器](../../../../benchmark/comparison/analytics_bench.py)
 
 ### 候補を選んだ根拠
 
@@ -24,7 +24,7 @@
 
 ## JOB（6 件）
 
-[Job の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/Job.lean)
+[Job の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/MovieJoinFiltersAndFanout.lean)
 
 | 宣言名 | 問 | 選択・削減する処理 |
 | --- | --- | --- |
@@ -37,7 +37,7 @@
 
 ## STATS-CEB（6 件）
 
-[Ceb の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/Ceb.lean)
+[Ceb の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/UserRolesAndCommentJoins.lean)
 
 | 宣言名 | 問 | 選択・削減する処理 |
 | --- | --- | --- |
@@ -50,7 +50,7 @@
 
 ## H2O（6 件）
 
-[H2o の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/H2o.lean)
+[H2o の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean)
 
 | 宣言名 | 問 | 選択・削減する処理 |
 | --- | --- | --- |
@@ -63,7 +63,7 @@
 
 ## LDBC-SNB（5 件）
 
-[Ldbc の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/Ldbc.lean)
+[Ldbc の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/SocialGraphJoinWeights.lean)
 
 | 宣言名 | 問 | 選択・削減する処理 |
 | --- | --- | --- |
@@ -75,7 +75,7 @@
 
 ## BigBench（5 件）
 
-[BigBench の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/BigBench.lean)
+[BigBench の提出型](../../../TinylambOpt/ResearchGoals/AnalyticsWorkloads/DictionaryJoinsAndLateLabels.lean)
 
 | 宣言名 | 問 | 選択・削減する処理 |
 | --- | --- | --- |

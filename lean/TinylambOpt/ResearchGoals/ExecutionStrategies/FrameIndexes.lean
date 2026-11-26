@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.FrameIndexes
 
 /-! One partition in deterministic SQL order. Frame indices are zero-based and half-open. -/

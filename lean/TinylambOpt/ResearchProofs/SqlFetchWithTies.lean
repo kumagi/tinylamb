@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.SqlFetchWithTies
 
+/-!
+Proved
+
+- `Goal` — The stable tie order used here is stream concatenation order. For the
+  incremental sorter, occurrence IDs encode that order.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.SqlFetchWithTies`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SqlFetchWithTies
 
 open TinylambOpt.ResearchGoals.SqlFetchWithTies hiding Goal
@@ -1562,3 +1571,6 @@ theorem sound : TinylambOpt.ResearchGoals.SqlFetchWithTies.Goal := by
     | succ k => exact conj2 offset k files hp hind
 
 end TinylambOpt.ResearchProofs.SqlFetchWithTies
+
+-- C++ references to this model or its proof.
+-- executor/detail/relational_sort_limit.cpp

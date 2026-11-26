@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `CancelAdd.PositiveRoom` — `∀ w x y, 0≤y → fits w x → (rule.guard w x y = true ↔ y <
+  limit w-x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

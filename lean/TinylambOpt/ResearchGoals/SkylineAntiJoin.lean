@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims relate dominance testing to the modeled skyline anti-join. A SQL executor
+can reduce candidate comparisons while retaining all nondominated rows.
+
+Modeled claims
+
+- `Goal` — `∀ rows, (sweep rows).Perm (reference rows)`
+-/
+
 namespace TinylambOpt.ResearchGoals.SkylineAntiJoin
 
 structure Row where

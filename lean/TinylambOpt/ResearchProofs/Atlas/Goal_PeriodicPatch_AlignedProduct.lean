@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `PeriodicPatch.AlignedProduct` — `∀ c (b : Lane), 0 < b.stride → ((rows layout c).map
+  (fun r => ((List.range b.n).map (fun i => if r.1 == b.start+i*b.stride then
+  r.2*(b.base+b.step*(i:Int)) else 0)).sum)).sum = ((layout.lanes c).map (aligned ·
+  b)).sum`
+- `PeriodicPatch.DeleteProgression` — `∀ c mask, (((rows layout c).filter (fun r =>
+  !contains mask r.1)).map Prod.snd).sum = ((layout.lanes c).map (fun a => partialSum
+  a a.n - deletedSum a mask)).sum`
+- `PeriodicPatch.ResidueJoin` — `∀ c (b : Lane), ((rows layout c).map (fun r =>
+  (List.range b.n).countP (fun (i : Nat) => r.2 == b.base+b.step*(i:Int)))).sum =
+  ((layout.lanes c).map (joinCount · b)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

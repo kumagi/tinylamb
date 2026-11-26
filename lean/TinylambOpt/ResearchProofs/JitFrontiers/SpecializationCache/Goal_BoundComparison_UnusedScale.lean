@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common_SpecializationCache
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+
+Proved
+
+- `BoundComparison.UnusedScale` — `∀ c p, shape.key {c with scale:=p}=shape.key c`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

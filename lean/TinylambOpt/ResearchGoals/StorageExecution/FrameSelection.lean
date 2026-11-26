@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 import TinylambOpt.ResearchGoals.StorageExecution.Boundaries
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 open TinylambOpt.ResearchGoals.Compression.Wire
 

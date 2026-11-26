@@ -1047,7 +1047,7 @@ bool TryParallelTableScan(
       return false;
     }
     bool zm_pruned = false;
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (page_zone_map_rf_prune_sound, page_zone_map_list_prune_sound)
     if (!page_rfs.empty() && context.txn_.IsReadOnly() &&
         !context.txn_.IsFailed() && !table.RowsRewrittenInPlace() &&
@@ -2335,7 +2335,7 @@ bool TryParallelTableScan(
            scan_filter->prebuilt_scalar_compare.empty() &&
            residual_decided_by_null_tests;
   }();
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (filterColumnAtATime_eq_row_at_a_time, filter_skip_always_true)
   // Direct streaming TLCS -> ColumnarTable fast path when the projected table
   // exceeds LSTableStore::kBuildByteLimit (e.g. 5-6 columns of 60M-row
@@ -3022,7 +3022,7 @@ bool TryParallelTableScan(
     estimated_scan_rows = std::min(estimated_scan_rows, surviving_rows);
   }
   if (lstable_store != nullptr) {
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (dict_code_counts_rf_upper_bound_sound)
     // For any active RF whose column has a complete dictionary with
     // code_counts, summing code_counts[code] over non-rejected int_entries
@@ -4589,7 +4589,7 @@ bool TryParallelTableScan(
                 }
               }
             }
-            // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+            // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
             //   (filterColumnAtATime_eq_row_at_a_time)
             // When candidate_col already produced a selection vector, refine it
             // in-place column-at-a-time with narrow dict filters and int

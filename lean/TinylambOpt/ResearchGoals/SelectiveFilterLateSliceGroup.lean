@@ -1,5 +1,20 @@
 import Std
 
+/-!
+Late offset-slice string group aggregation (ClickBench Q37/Q38/Q40): evaluate cheap
+integer filters to build sparse selection vector `sel`, screen `len > 0` from offset
+array before slicing strings, and slice/decode `refVal` ONLY on surviving rows where
+`useRef = true`.
+
+Modeled claims
+
+- `Goal` — Selective integer pre-filter + lazy VarChar slice group-by + guarded `CASE`
+  string decode (ClickBench Q37/Q38/Q40): delaying string slicing past integer
+  selection and length checks while guarding secondary string decodes under `CASE
+  WHEN cond THEN ref ELSE ""` produces exact group counts with zero decodes on
+  filtered-out or constant-branch rows.
+-/
+
 namespace TinylambOpt.ResearchGoals.SelectiveFilterLateSliceGroup
 
 structure RawRow where

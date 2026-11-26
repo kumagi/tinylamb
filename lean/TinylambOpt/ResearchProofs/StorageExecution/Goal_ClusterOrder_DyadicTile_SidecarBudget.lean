@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `DyadicTile.SidecarBudget` — Decide whether RLE savings cover the materialized
+  permutation and format tag.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -398,6 +398,99 @@ TEST_F(DatabaseExtraTest, MissingWalFailsClosed) {
   std::filesystem::remove(prefix_ + ".last_checkpoint", ec);
   ASSERT_FALSE(ec) << ec.message();
 }
+
+TEST_F(DatabaseExtraTest, CompactTableToTlcsWithoutCheckpointSurvivesCrash) {
+  // Multi-page table compacted to TLCS with write_checkpoint=false must not
+  // emit premature DestroyPageLog records into the WAL that corrupt the
+  // pre-compaction RowPage chain if a crash occurs before the next checkpoint.
+  db_->SetSynchronousCommit(true);
+  SqlEngine engine(*db_);
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(RunStatement(
+        &engine, &ctx,
+        "CREATE TABLE tlcs_crash (id INT64, pad VARCHAR);"))
+        << engine.LastError();
+    const std::string big(400, 'x');
+    for (int i = 0; i < 60; ++i) {
+      ASSERT_TRUE(RunStatement(&engine, &ctx,
+                               "INSERT INTO tlcs_crash VALUES (" +
+                                   std::to_string(i) + ", '" + big + "');"))
+          << engine.LastError();
+    }
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CompactTableToTlcs(ctx, "tlcs_crash",
+                                           /*write_checkpoint=*/false,
+                                           /*refresh_statistics=*/false));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db_->EmulateCrash();
+  db_.reset();
+  db_ = Database::Create(prefix_).MoveValue();
+  SqlEngine reopened(*db_);
+  TransactionContext ctx = db_->BeginReadOnlyContext();
+  std::vector<Row> rows;
+  ASSERT_TRUE(RunStatement(&reopened, &ctx,
+                           "SELECT COUNT(*) FROM tlcs_crash;", &rows))
+      << reopened.LastError();
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{60}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
+TEST_F(DatabaseExtraTest, RecompactTlcsWithoutCheckpointDoesNotDuplicateRows) {
+  // Compact -> insert tail row -> checkpoint -> re-compact(write_checkpoint=false)
+  // -> crash -> reopen must not duplicate the tail row by reading it from both
+  // the overwritten .tlcs file and the checkpointed tail RowPage.
+  db_->SetSynchronousCommit(true);
+  SqlEngine engine(*db_);
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(
+        RunStatement(&engine, &ctx, "CREATE TABLE t_recompact (id INT64);"))
+        << engine.LastError();
+    ASSERT_TRUE(RunStatement(&engine, &ctx, "INSERT INTO t_recompact VALUES (5);"))
+        << engine.LastError();
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CompactTableToTlcs(ctx, "t_recompact",
+                                           /*write_checkpoint=*/false,
+                                           /*refresh_statistics=*/false));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_TRUE(
+        RunStatement(&engine, &ctx, "INSERT INTO t_recompact VALUES (15);"))
+        << engine.LastError();
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  ASSERT_SUCCESS(db_->WriteCheckpoint().GetStatus());
+  {
+    TransactionContext ctx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->CompactTableToTlcs(ctx, "t_recompact",
+                                           /*write_checkpoint=*/false,
+                                           /*refresh_statistics=*/false));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  db_->EmulateCrash();
+  db_.reset();
+  db_ = Database::Create(prefix_).MoveValue();
+  SqlEngine reopened(*db_);
+  TransactionContext ctx = db_->BeginReadOnlyContext();
+  std::vector<Row> rows;
+  ASSERT_TRUE(
+      RunStatement(&reopened, &ctx, "SELECT COUNT(*) FROM t_recompact;", &rows))
+      << reopened.LastError();
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{2}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
 TEST_F(DatabaseExtraTest, CleanReopenSkipsNoOpEndOfRecoveryCheckpoint) {
   SqlEngine engine(*db_);
   TransactionContext ctx = db_->BeginContext();

@@ -52,12 +52,14 @@ StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
     const PartitionedColumnarAggRequest& req);
 
 // Lean proof:
-// lean/TinylambOpt/ResearchProofs/DirectTwoKeyArrayIndexBijection.lean (sound)
+// lean/TinylambOpt/ResearchProofs/BoundedMultiKeyDirectArrayAggregate.lean
+// (sound)
 StatusOr<std::optional<Relation>> TryRunDirectTwoKeyBoundedIntAggregate(
     const PartitionedColumnarAggRequest& req,
     const KeyProjectionMap* precomputed_km = nullptr);
 
-// Lean proof: lean/TinylambOpt/ResearchProofs/LocalDictTwoStageAggEquiv.lean
+// Lean proof:
+// lean/TinylambOpt/ResearchProofs/MultiBlockLocalDictTwoStageAggregate.lean
 // (sound)
 StatusOr<std::optional<Relation>> TryRunSingleVarCharLocalDictAggregate(
     const PartitionedColumnarAggRequest& req,

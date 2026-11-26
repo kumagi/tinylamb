@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `SquareDistance.SymmetricSuccess` — `∀ w x y v, scalar rule w x y=.ok v → scalar rule
+  w y x=.ok v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

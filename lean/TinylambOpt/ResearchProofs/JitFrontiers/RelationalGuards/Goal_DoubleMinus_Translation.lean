@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.RelationalGuards
 
+/-!
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+
+Proved
+
+- `DoubleMinus.Translation` — `∀ t x y d, expr.score t (x+d,y+d)=expr.score t (x,y)+d`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

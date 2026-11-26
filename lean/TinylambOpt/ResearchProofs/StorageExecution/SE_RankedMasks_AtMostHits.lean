@@ -1,4 +1,16 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `AtMostHits.Cofactor` — Compute a parallel shard count by conditioning on its prefix
+  state.
+- `AtMostHits.Decoder` — Recreate every accepted bitmap from its compact code.
+- `AtMostHits.OneOutlier` — `∀ n, count model n 1 = n+1`
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/AtMostHits` goals.
 -- Eight follow from the generic kernel `K3.lean`; the two model-specific
 -- goals are proven directly from the count recurrence.

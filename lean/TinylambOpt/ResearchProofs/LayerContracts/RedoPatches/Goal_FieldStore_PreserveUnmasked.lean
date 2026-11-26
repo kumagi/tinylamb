@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RedoPatches
 import TinylambOpt.ResearchProofs.LayerContracts.RedoPatches.Common_RedoPatches
 
+/-!
+Database recovery can combine or replay edits only where the resulting state agrees with
+LSN-ordered replay.
+
+Proved
+
+- `FieldStore.PreserveUnmasked` — `∀ a x i, a.1.testBit i = false → (model.patch a
+  x).testBit i = x.testBit i`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

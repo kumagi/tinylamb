@@ -5,7 +5,7 @@
  * columns are grouping keys may be pushed.  Aggregate outputs must keep the
  * body unfiltered.
  *
- * Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+ * Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
  *   (shared_cte_disjunct_pushdown_sound, cte_volatile_inline_unsound)
  */
 

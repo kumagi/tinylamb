@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `EvenParity.Cofactor` — Compute a parallel shard count by conditioning on its prefix
+  state.
+- `EvenParity.ComplementOrder` — `∀ xs, xs.length%2=0 → legal model 0 xs → (rank model
+  0 xs).getD 0 + (rank model 0 (xs.map (!·))).getD 0 = count model xs.length 0-1`
+- `EvenParity.Decoder` — Recreate every accepted bitmap from its compact code.
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/EvenParity` goals.
 -- Eight follow from the generic kernel `K3.lean`; the two model-specific
 -- goals use `count model (n+1) q = 2^n` for `q < 2`.

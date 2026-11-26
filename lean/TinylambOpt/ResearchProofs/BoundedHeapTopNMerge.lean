@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.BoundedHeapTopNMerge
 
+/-!
+Proved
+
+- `Goal` — Two-stage worker-local Top-(offset + limit) merge (`executor/topn.cpp`,
+  `executor/detail/relational_sort_limit.cpp`): pruning each worker to `offset +
+  limit` rows and taking `(sorted.drop offset).take limit` on the merged union equals
+  full global sorting across arbitrary chunk splits.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.BoundedHeapTopNMerge`.
+-/
+
 -- # Soundness of bounded-heap Top-N merge
 --
 -- `refTopN off lim chunks` sorts the flattened chunks once and cuts the

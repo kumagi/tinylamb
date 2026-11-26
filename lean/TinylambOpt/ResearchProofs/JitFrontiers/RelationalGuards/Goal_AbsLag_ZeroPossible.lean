@@ -1,6 +1,16 @@
 import Std
 import TinylambOpt.ResearchGoals.JitFrontiers.RelationalGuards
 
+/-!
+A JIT can use certified operand and difference bounds to choose guards, fold
+comparisons, or eliminate unreachable paths for active rows.
+
+Proved
+
+- `AbsLag.ZeroPossible` — `∀ t z hi, estimate expr t z=some (0,hi) ↔ (∃ p, inZone z
+  p=true ∧ p.1-p.2=t) ∧ (estimate expr t z).map Prod.snd=some hi`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

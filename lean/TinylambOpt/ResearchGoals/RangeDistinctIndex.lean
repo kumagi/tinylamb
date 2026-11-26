@@ -1,5 +1,14 @@
 import Std
 
+/-!
+These claims relate a range index to distinct values read from the underlying rows. A
+SQL DISTINCT can use the indexed range while suppressing duplicate occurrences.
+
+Modeled claims
+
+- `Goal` — `∀ xs lo hi, query (build xs) lo hi = reference xs lo hi`
+-/
+
 namespace TinylambOpt.ResearchGoals.RangeDistinctIndex
 
 -- Each version is a prefix. A key contributes one mark at its last position.

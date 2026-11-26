@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Refuted by counterexample
+
+- `MinimumDelta.GreedyCut` — Aggressive hypothesis: the cheapest two adjacent groups
+  never need reconsideration when a third arrives.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

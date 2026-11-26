@@ -1356,9 +1356,9 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
       return true;
     }
     // Lean proof:
-    // lean/TinylambOpt/ResearchProofs/Wave8BigBench.lean (UrlGrouping_sound)
-    // Canonical "page-<N>" URLs map bijectively into a dense flat array,
-    // disjoint from pack7/literal string maps.
+    // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/DictionaryJoinsAndLateLabels.lean
+    // (UrlGrouping_sound) Canonical "page-<N>" URLs map bijectively into a
+    // dense flat array, disjoint from pack7/literal string maps.
     uint32_t page_id = 0;
     if (TryParseCanonicalPageUrl(skey, &page_id)) {
       if (page_id >= page_url_slots.size()) {
@@ -1512,10 +1512,11 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
   }
 
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave8Ceb.lean (SparseOuterCorrection_sound)
-  // For a LEFT JOIN whose right side contributes no aggregate payloads, every
-  // probe row contributes max(1, mult(key)) times. When no right key has
-  // multiplicity > 1, every probe row has weight 1 with zero hash lookups.
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/UserRolesAndCommentJoins.lean
+  // (SparseOuterCorrection_sound) For a LEFT JOIN whose right side contributes
+  // no aggregate payloads, every probe row contributes max(1, mult(key)) times.
+  // When no right key has multiplicity > 1, every probe row has weight 1 with
+  // zero hash lookups.
   bool left_outer_unit_weight = false;
   if (join_type == JoinType::kLeft && n_build_aggs == 0) {
     left_outer_unit_weight = true;
@@ -2027,7 +2028,8 @@ StatusOr<std::optional<Relation>> TryCollapsedRightGroupedJoin(
 //     (sound)
 //   - lean/TinylambOpt/ResearchProofs/StarHubMultiwayWeightedProduct.lean
 //     (sound)
-//   - lean/TinylambOpt/ResearchProofs/Wave9AnalyticsRemaining.lean
+//   -
+//   lean/TinylambOpt/ResearchProofs/QueryRewrites/JoinMultiplicityAndZoneFilters.lean
 //     (SelfJoinBridgeBipartiteWeights_sound,
 //      FilteredSemiJoinCountBeforeGroup_sound)
 StatusOr<std::optional<Relation>> TryFactorizedJoinTreeAggregate(
@@ -4245,7 +4247,9 @@ StatusOr<std::optional<Relation>> TrySmallDimStarDirectAggregate(
   }
 
   // Lean proofs:
-  // - lean/TinylambOpt/ResearchProofs/Wave8Job.lean (FixedGender_sound):
+  // -
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/MovieJoinFiltersAndFanout.lean
+  // (FixedGender_sound):
   //   discharge a sole constant-value dim GROUP BY key to a 1-group scalar
   //   fold.
   // - lean/TinylambOpt/ResearchProofs/RestartRaces/Goal_JobJ3_PersonPages.lean:

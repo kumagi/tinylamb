@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `DictionaryCycle.DuplicateCodes` — `∀ c v, c.dict ≠ [] → occurrence layout c v =
+  (c.n/c.dict.length)*c.dict.count v + (c.dict.take (c.n%c.dict.length)).count v`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

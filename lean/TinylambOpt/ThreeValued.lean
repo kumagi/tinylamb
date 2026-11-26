@@ -1,3 +1,9 @@
+/-!
+SQL predicates can return TRUE, FALSE, or UNKNOWN. The equivalence proofs and
+counterexamples identify which Boolean rewrites preserve three-valued results and which
+filters may pass rows.
+-/
+
 /-
 # Step 1: SQL 三値論理（TRUE / FALSE / NULL）とスカラー式書き換えの検証
 
@@ -244,3 +250,8 @@ theorem or_branches_exact_count (p0 p1 : SqlBool) :
   cases p0 <;> cases p1 <;> rfl
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- expression/rewrite.cpp
+-- plan/cascades.cpp
+-- plan/cascades_predicate_rules.cpp

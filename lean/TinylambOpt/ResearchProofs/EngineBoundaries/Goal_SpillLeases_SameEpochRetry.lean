@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Refuted by counterexample
+
+- `SameEpochRetry` — Can the epoch alone distinguish two reads when a ticket is reused
+  within one generation?
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

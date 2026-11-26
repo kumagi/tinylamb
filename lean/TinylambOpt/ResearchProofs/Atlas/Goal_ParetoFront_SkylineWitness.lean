@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `ParetoFront.SkylineWitness` — `∀ p (points : List Point), points.any
+  (shape.qualifies p) = (points.filter (fun r => !points.any (shape.qualifies
+  r))).any (shape.qualifies p)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

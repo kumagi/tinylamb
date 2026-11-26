@@ -677,9 +677,10 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             }
           }
         }
-        // Lean-backed (DuckDBGaps/Hits.lean: DatePostings_sound): track per-
-        // predicate whole-block satisfaction so interior blocks skip redundant
-        // per-row date/integer range checks when other predicates remain.
+        // Lean-backed (AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean:
+        // DatePostings_sound): track per- predicate whole-block satisfaction so
+        // interior blocks skip redundant per-row date/integer range checks when
+        // other predicates remain.
         uint64_t simple_all_pass_mask = 0;
         if (can_inline_simple && !kleene_all_pass) {
           bool zone_rejected = false;
@@ -864,10 +865,12 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             const int64_t c = pred.int_constant;
             const uint32_t n = blk.row_count;
             size_t out_idx = 0;
-            // Lean-backed (DuckDBGaps/Hits.lean: StridedPoint_sound): when the
-            // column is FOR-encoded (1/2/4-byte packed offsets, no int_cells),
-            // reject out-of-frame targets before touching packed offsets and
-            // filter directly in the narrowed code domain.
+            // Lean-backed
+            // (AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean:
+            // StridedPoint_sound): when the column is FOR-encoded (1/2/4-byte
+            // packed offsets, no int_cells), reject out-of-frame targets before
+            // touching packed offsets and filter directly in the narrowed code
+            // domain.
             if (pred.op == BinaryOperation::kEquals && col.int_cells.empty() &&
                 !col.for_bytes.empty() &&
                 (col.for_width == 1 || col.for_width == 2 ||

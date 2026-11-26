@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.NullOrLikeDictBitmapPrefilter
 
+/-!
+Proved
+
+- `Goal` — Dictionary-level bitmap prefilter for `(col IS NULL OR LIKE ...)` predicates
+  (STATS-CEB C4 / JOB J4 / JOB J5): evaluating `matchStr` once per dictionary entry
+  rather than per row and folding `NULL` to `TRUE` matches SQL 3-valued logic
+  whenever all non-NULL codes are valid indices `< dict.length`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.NullOrLikeDictBitmapPrefilter`.
+-/
+
 namespace TinylambOpt.ResearchProofs.NullOrLikeDictBitmapPrefilter
 
 open TinylambOpt.ResearchGoals.NullOrLikeDictBitmapPrefilter
@@ -149,3 +161,6 @@ theorem sound : TinylambOpt.ResearchGoals.NullOrLikeDictBitmapPrefilter.Goal := 
             (fun c' he => by rw [← Option.some.inj he]; exact hc)).symm
 
 end TinylambOpt.ResearchProofs.NullOrLikeDictBitmapPrefilter
+
+-- C++ references to this model or its proof.
+-- executor/detail/parallel_table_scan.cpp

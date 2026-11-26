@@ -51,3 +51,8 @@ import TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_TileTranspose
 
 /-! BitLayoutsA: proofs for the 50 fixed goals of RowMajor, Vertical,
 SerpentineRow, SerpentinePlane, and TileTranspose. -/
+
+-- C++ references to this model or its proof.
+-- executor/detail/columnar_tlcs_predicates.cpp
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp

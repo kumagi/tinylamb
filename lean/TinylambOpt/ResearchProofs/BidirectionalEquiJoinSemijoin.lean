@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.BidirectionalEquiJoinSemijoin
 
+/-!
+Proved
+
+- `Goal` — Bidirectional multi-hop semijoin filter propagation (TPC-H Q07/Q08, TPC-DS
+  Q17/Q25/Q29/Q58/Q83) preserves exact join tuples & multiplicity across NULLs and
+  duplicate keys; factoring symmetric OR pairs `(a=x∧b=y)∨(a=y∧b=x)` into unilateral
+  domain filters + `a≠b` is exact iff `x ≠ y`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BidirectionalEquiJoinSemijoin`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BidirectionalEquiJoinSemijoin
 
 open TinylambOpt.ResearchGoals.BidirectionalEquiJoinSemijoin

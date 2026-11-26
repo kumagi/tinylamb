@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `Manhattan.SoundInterval` — Bound a computed group or predicate key from independent
+  column min/max.
+- `Manhattan.ThresholdCount` — Estimate the number of passing rows using only certified
+  and possible pages.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.Common_PackedKeys
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Named results include `signedHalves_back`, `orderBiased_back`, `mixedDirection_back`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

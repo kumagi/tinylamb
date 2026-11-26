@@ -1,5 +1,9 @@
 import Std
 
+/-!
+opened is recorded in reverse for constant-time append at observation.
+-/
+
 namespace TinylambOpt.ResearchGoals.BlockCountModel
 
 inductive Mode where | skip | all | inspect

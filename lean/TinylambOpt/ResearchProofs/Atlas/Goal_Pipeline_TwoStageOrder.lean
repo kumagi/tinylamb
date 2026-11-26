@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.TwoStageOrder` — `∀ xs ys, xs.Perm ys → finish (johnson xs) ≤ finish ys`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

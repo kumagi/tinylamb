@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 import TinylambOpt.ResearchProofs.Atlas.Goal_PeakCount_BoundaryPeaks
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `PeakCount.BoundedRepair` — `∀ x y a b, (measure (x++a::y)-measure (x++b::y)).natAbs
+  ≤ 2`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

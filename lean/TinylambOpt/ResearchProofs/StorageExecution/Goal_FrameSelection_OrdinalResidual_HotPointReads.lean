@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `OrdinalResidual.HotPointReads` — Raising point-read cost can only reduce the squared
+  decoded lengths of optimal pages.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

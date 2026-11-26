@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `RisePairs.HistogramBridge` — `∀ x y, measure (x++y) = measure x + measure y +
+  ((x.eraseDups.map (fun a => x.count a * y.countP (a < ·))).sum:Nat)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

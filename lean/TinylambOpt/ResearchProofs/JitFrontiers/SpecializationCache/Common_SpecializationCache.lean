@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+
+Mapping a scalar function over an output respects pointwise equality.
+
+Reading a concrete value cell yields that value.
+
+Named results include `mapV_congr`, `get_eq_val`, `get_eq_hole`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `UnsignedSub.FirstPoison` — Find first unsafe selected lane by a ballot on guard
+  bits.
+- `UnsignedSub.GuardExact` — A concrete machine-bit test recognizes precisely the
+  defined domain.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

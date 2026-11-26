@@ -1,4 +1,13 @@
 import Std.Tactic
+
+/-!
+SUM merge for nullable values: NULL is the identity, and an all-NULL group stays NULL
+(never `some 0`).
+
+Aggregator state: COUNT of non-NULL lanes, and nullable SUM.
+
+Named results include `mergeSum_assoc`, `mergeSum_comm`, `mergeSum_none_left`.
+-/
 -- C++ counterpart: expression/jit.cpp (see issues/README.md).
 
 /-! Soundness of SIMD grouped aggregation in the presence of hash-slot

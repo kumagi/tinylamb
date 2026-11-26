@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Dominance
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Proved
+
+- `LastBlue.PlainDepth` — Aggressive recursion cap: one round per graph vertex even
+  with path constraints.
+-/
+
 set_option maxHeartbeats 0
 set_option linter.unusedSimpArgs false
 

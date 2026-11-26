@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `BoundedWalk` — A nonempty simple cycle returns to its first waiter in exactly its
+  length steps.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

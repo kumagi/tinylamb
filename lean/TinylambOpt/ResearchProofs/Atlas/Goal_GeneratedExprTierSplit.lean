@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.GeneratedExprTierSplit
 
+/-!
+Proved
+
+- `Goal` — Staging an unsupported expression into a bytecode pipeline plus host calls
+  preserves values, NULL and the first error.
+
+The reference model is defined in `TinylambOpt.ProposedGoals.GeneratedExprTierSplit`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

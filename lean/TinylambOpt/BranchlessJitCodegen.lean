@@ -1,5 +1,13 @@
 import Std.Tactic.BVDecide
-import TinylambOpt.ClickBenchDiscovery
+import TinylambOpt.GroupKeyAndDictionaryRewrites
+
+/-!
+SUM after the join sees only key 2. Eagerly computing the key-1 partial instead raises
+an overflow, even with a unique key on the opposite side.
+
+Named results include `jit_3vl_lane_sound`, `bitmask64_3vl_sound`,
+`branchlessAbsBV_exact`.
+-/
 
 /-
 # Step 12: 物理プラン後段（Bytecode → Branchless LLVM JIT / SIMD）の形式検証と積極的コード生成
@@ -900,3 +908,11 @@ theorem zonemap_prefix_sum_masked_sound
       (fun o ho w hw => hRange o (by simp [ho]) w hw) hNextBounds hNextLo hNextHi
 
 end TinylambOpt
+
+-- C++ references to this model or its proof.
+-- executor/aggregation.cpp
+-- executor/detail/columnar_table.cpp
+-- executor/projection.cpp
+-- executor/selection.cpp
+-- expression/jit.cpp
+-- expression/jit.hpp

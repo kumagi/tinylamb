@@ -1168,7 +1168,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                                 return;
                               }
                               // Lean proof:
-                              // lean/TinylambOpt/TpchSf10VectorizedExec.lean
+                              // lean/TinylambOpt/VectorizedJoinAndPruning.lean
                               //   (parallel_bitset_or_eq_union)
                               // When the dense bitset fits comfortably per
                               // worker (<= 4 MiB), set bits in a thread-local
@@ -2150,7 +2150,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
     if (cte_rel == nullptr || cte_rel->HasSpill()) {
       return std::nullopt;
     }
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     //   (packed_int32_pair_bijection_sound)
     const CompiledScanFilter rest_filter =
         rest.empty() ? CompiledScanFilter{}
@@ -2279,7 +2279,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
       return std::nullopt;
     }
   }
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (prebuilt_exists_outer_domain_filter_sound,
   //    not_exists_on_null_outer_key_is_true)
   // Restrict the inner membership build to the non-NULL probe keys actually
@@ -2386,7 +2386,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
                                               sub)) {
     return std::nullopt;
   }
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (distinct_witness_exists_to_minmax_sound,
   //    prebuilt_exists_outer_domain_filter_sound)
   if (local_witness) {
@@ -3463,7 +3463,7 @@ CompiledScanFilter CompileScanFilterUncached(
           }
           new_branches.push_back(std::move(branch));
         }
-        // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+        // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
         //   (contiguous_interval_union_eq)
         // Collapse a contiguous union of closed intervals on a single numeric
         // column `(col >= lo_1 AND col <= hi_1) OR ...` (e.g. TPC-DS Q48/Q13/

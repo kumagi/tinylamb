@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `PredicateOrder.ConditionalSwap` — `∀ ca cb pa pb rest rows, (actual
+  ((ca,pa)::(cb,pb)::rest) rows:Int) - actual ((cb,pb)::(ca,pa)::rest) rows =
+  (ca:Int)*rows.countP (fun x => !pb x) - (cb:Int)*rows.countP (fun x => !pa x)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

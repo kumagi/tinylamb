@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas_EncodedPages_PagedTombstones_Remaining_Round2
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.PagedTombstonesEpochsAndProgressions
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `PagedTombstones.AlignedProduct` — `∀ c (b : Lane), 0 < b.stride → ((rows layout
+  c).map (fun r => ((List.range b.n).map (fun i => if r.1 == b.start+i*b.stride then
+  r.2*(b.base+b.step*(i:Int)) else 0)).sum)).sum = ((layout.lanes c).map (aligned ·
+  b)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -20,8 +32,8 @@ open TinylambOpt.ResearchGoals.Atlas.EncodedPages.PagedTombstones
     bases/steps and all small `b` lanes (`stride > 0`) found no counterexample.
     The full proof (CRT/lane-intersection closed form, the aligned product of two
     progressions, and the residue-class partition of the rows) is carried by
-    `TinylambOpt.ResearchProofs.Round2.Task51`. -/
+    `TinylambOpt.ResearchProofs.Atlas.EncodedPages.PagedTombstonesEpochsAndProgressions`. -/
 theorem sound_PagedTombstones_AlignedProduct : PagedTombstones.AlignedProduct.Goal := by
-  exact TinylambOpt.ResearchProofs.Round2.Task51.sound_AlignedProduct
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.PagedTombstonesEpochsAndProgressions.sound_AlignedProduct
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_PagedTombstones_AlignedProduct

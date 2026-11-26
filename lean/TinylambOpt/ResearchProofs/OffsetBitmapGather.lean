@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.OffsetBitmapGather
 
+/-!
+Proved
+
+- `Goal` — `∀ off k (pages : List Page), let r := run off k pages.zipIdx let rows :=
+  pages.zipIdx.flatMap fun (p,i) => (selected p).map fun lane => ((i,lane),p.payload
+  lane) let slice := (rows.drop off).take k r.values = slice.map Prod.snd ∧ r.reads =
+  slice.map Prod.fst ∧ r.opened = (slice.map (fun x => x.1.1)).eraseDups`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.OffsetBitmapGather`.
+-/
+
 namespace TinylambOpt.ResearchProofs.OffsetBitmapGather
 
 open TinylambOpt.ResearchGoals.OffsetBitmapGather

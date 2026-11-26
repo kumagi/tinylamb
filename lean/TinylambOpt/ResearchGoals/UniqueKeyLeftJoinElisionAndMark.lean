@@ -1,5 +1,19 @@
 import Std
 
+/-!
+These claims model removing an unused left-join input or replacing it with an existence
+mark under uniqueness assumptions. SQL must preserve all left rows and any observable
+match information.
+
+Modeled claims
+
+- `Goal` — Unique-key `LEFT JOIN` elision, 1-bit Mark reduction, and non-equi `<`
+  upper-bound semijoin pushdown (TPC-DS Q40/Q72/Q80): (1) when right non-null keys
+  are unique, projecting only left columns elides the `LEFT JOIN`, (2) testing `r.key
+  IS NOT NULL` reduces to a key-membership 1-bit mark without reading right payloads,
+  and (3) `l.val < r.val` allows pre-filtering `L` by `l.val < max(r.val)`.
+-/
+
 namespace TinylambOpt.ResearchGoals.UniqueKeyLeftJoinElisionAndMark
 
 abbrev LRow := Option Int × Int

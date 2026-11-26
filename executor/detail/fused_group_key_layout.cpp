@@ -133,7 +133,7 @@ Status FusedGroupKeyLayout::Prepare(const FusedKeyInputs& input) {
         right_dict_guard.active = true;
       }
     }
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (unique_col_identity_subgid_sound)
     // If any dimension key column in col_indices is unique and non-null on the
     // right relation (PK or promoted unique-nonnull column), every right row

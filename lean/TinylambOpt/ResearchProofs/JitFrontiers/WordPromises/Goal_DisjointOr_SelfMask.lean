@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 import TinylambOpt.ResearchProofs.JitFrontiers.WordPromises.BV64
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `DisjointOr.SelfMask` — `∀ x, op.test x x=true ↔ x=0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

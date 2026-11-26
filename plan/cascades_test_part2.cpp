@@ -580,10 +580,10 @@ TEST(CascadesTest, OuterToAntiJoinRewrite) {
 }
 
 TEST(CascadesTest, OuterToAntiJoinFiresOnNullableJoinKeyRejectedByOn) {
-  // Lean proof (TinylambOpt/Discovery.lean): Even when t2.id is nullable in the
-  // table schema, `ON t1.id = t2.id` is null-rejecting on t2.id, so no matched
-  // row can carry t2.id = NULL; `WHERE t2.id IS NULL` still selects strictly
-  // the unmatched rows and converts soundly to AntiJoin.
+  // Lean proof (TinylambOpt/OuterJoinToAntiJoin.lean): Even when t2.id is
+  // nullable in the table schema, `ON t1.id = t2.id` is null-rejecting on
+  // t2.id, so no matched row can carry t2.id = NULL; `WHERE t2.id IS NULL`
+  // still selects strictly the unmatched rows and converts soundly to AntiJoin.
   Memo memo;
   (void)memo.Build({"t1", "t2"});
   memo.SetTableSchemas(

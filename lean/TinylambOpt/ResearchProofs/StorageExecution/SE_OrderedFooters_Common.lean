@@ -1,4 +1,13 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
+
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+`edges` of an appended non-empty pair, with the bridging edge spelled out.
+
+Named results include `foldl_map_reference`, `combine_ref`, `treeReduce_of_stitch`.
+-/
 set_option maxHeartbeats 0
 
 /-! Generic machinery: every Fold contract follows from `stitch` alone. -/

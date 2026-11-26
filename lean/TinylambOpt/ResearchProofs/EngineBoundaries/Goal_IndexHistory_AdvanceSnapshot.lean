@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `AdvanceSnapshot` — A clean range for an old snapshot is also clean for later
+  snapshots.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,11 @@
 import Init.Data.Rat.Lemmas
 
+/-!
+These identities and counterexamples characterize the effect of floating-point values on
+scalar rewrites. An optimizer must preserve the modeled behavior at rounding and
+exceptional-value boundaries.
+-/
+
 namespace TinylambOpt.FloatIdentities
 
 /-- Values after numeric promotion to FLOAT64. A separate sign distinguishes
@@ -75,3 +81,6 @@ theorem pow_one_after_promotion_sound (round : Rat → Except ε Rat) (promoted 
       | nan => rfl
 
 end TinylambOpt.FloatIdentities
+
+-- C++ references to this model or its proof.
+-- expression/rewrite.cpp

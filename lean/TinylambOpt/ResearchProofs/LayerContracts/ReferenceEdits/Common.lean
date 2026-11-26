@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ReferenceEdits
 
+/-!
+Foreign-key checking must respect the observation point of the constraint and the parent
+keys still present after each modeled edit.
+
+Named results include `contains_true`, `mem_violations`, `ok_iff_no_bad`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

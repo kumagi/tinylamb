@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.ArrayOffsets.Common_ArrayOffsets
 
+/-!
+SQL UNNEST and array operators must preserve the modeled element offsets, NULL padding,
+and row multiplicities.
+
+Proved
+
+- `MatchValue.LateSlice` — Generate only the requested offset interval for a correlated
+  LIMIT.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

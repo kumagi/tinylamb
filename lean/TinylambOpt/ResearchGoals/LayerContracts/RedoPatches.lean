@@ -1,5 +1,10 @@
 import Std
 
+/-!
+Database recovery can combine or replay edits only where the resulting state agrees with
+LSN-ordered replay.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.RedoPatches
 
 /-! Committed updates to one logical cell. A strictly larger LSN applies a

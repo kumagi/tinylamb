@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `DisjointOr.CarryFree` — `∀ x y v, ir op (x,y)=some v → v=x+y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

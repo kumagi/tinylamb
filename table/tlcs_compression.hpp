@@ -65,6 +65,12 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                       std::vector<char>* bytes_out,
                                       std::vector<uint32_t>* ends_out);
 
+[[nodiscard]] bool DecodeTemporalTextBytes(std::span<const uint8_t> encoded,
+                                           const uint8_t* nulls, uint32_t n,
+                                           std::vector<uint8_t>* bytes_out,
+                                           std::vector<uint32_t>* ends_out,
+                                           bool lengths_only = false);
+
 // O(1) single-row random access (`TemporalText.sound_PackedSeek`).
 [[nodiscard]] bool DecodeTemporalTextRow(std::span<const uint8_t> encoded,
                                          uint32_t row, std::string* out);
@@ -90,6 +96,18 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                           const uint8_t* nulls, uint32_t n,
                                           std::vector<char>* bytes_out,
                                           std::vector<uint32_t>* ends_out);
+
+[[nodiscard]] bool DecodeVarCharFrontDictBytes(
+    std::span<const uint8_t> encoded, const uint8_t* nulls, uint32_t n,
+    std::vector<uint8_t>* bytes_out, std::vector<uint32_t>* ends_out,
+    bool lengths_only = false, std::span<const uint32_t> selected_rows = {});
+
+// Evaluates `row contains needle` directly over a front-coded dictionary block
+// without expanding row strings. Writes ascending matching row ordinals into
+// `matching_rows_out`. Returns false only on corrupt input.
+[[nodiscard]] bool MatchVarCharFrontDictContains(
+    std::span<const uint8_t> encoded, const uint8_t* nulls, uint32_t n,
+    std::string_view needle, std::vector<uint32_t>* matching_rows_out);
 
 // ============================================================================
 // 4. Bit-Packed Strided Frame-of-Reference
@@ -152,6 +170,11 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                             std::vector<char>* bytes_out,
                                             std::vector<uint32_t>* ends_out);
 
+[[nodiscard]] bool DecodeVarCharPhraseTableBytes(
+    std::span<const uint8_t> encoded, const uint8_t* nulls, uint32_t n,
+    std::vector<uint8_t>* bytes_out, std::vector<uint32_t>* ends_out,
+    bool lengths_only = false);
+
 // ============================================================================
 // 7. Zstandard Per-Block Frame Container
 //    (Compression/Container.lean: sound_VerifiedContainer, sound_RawEnvelope,
@@ -172,6 +195,13 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                        uint8_t* inner_subtag_out,
                                        std::vector<uint8_t>* payload_out);
 
+// Zero-memset variant backed by a thread-local uninitialized scratch buffer.
+// The returned span in `payload_out` remains valid until the next call to
+// `DecompressZstdFrameRaw` on the same thread.
+[[nodiscard]] bool DecompressZstdFrameRaw(
+    std::span<const uint8_t> encoded, uint8_t* inner_tag_out,
+    uint8_t* inner_subtag_out, std::span<const uint8_t>* payload_out);
+
 // Packs VARCHAR rows as `(ULEB128 len, bytes)` and compresses with Zstd.
 // Returns true iff Zstd is available and strictly smaller than `max_bytes`.
 [[nodiscard]] bool TryEncodeZstdVarChar(std::span<const char> bytes,
@@ -185,12 +215,25 @@ inline constexpr size_t kTemporalTextPackedBytes = 6;
                                      std::vector<char>* bytes_out,
                                      std::vector<uint32_t>* ends_out);
 
+// Decodes an already-decompressed `(ULEB128 len, bytes)` VARCHAR payload
+// directly into `uint8_t` bytes (or lengths only when `lengths_only` is true).
+[[nodiscard]] bool DecodeZstdVarCharUnpackedBytes(
+    std::span<const uint8_t> packed, const uint8_t* nulls, uint32_t n,
+    std::vector<uint8_t>* bytes_out, std::vector<uint32_t>* ends_out,
+    bool lengths_only = false, std::span<const uint32_t> selected_rows = {});
+
+// Evaluates `row contains needle` directly over an unpacked `(len, bytes)`
+// payload without copying row strings. Returns false only on corrupt input.
+[[nodiscard]] bool MatchZstdVarCharUnpackedContains(
+    std::span<const uint8_t> packed, const uint8_t* nulls, uint32_t n,
+    std::string_view needle, std::vector<uint32_t>* matching_rows_out);
+
 // ============================================================================
-// 8. ClickBenchLayout.Storage: TieOrientation, ClockWindow, HashExceptions
+// 8. ClickstreamLayout.Storage: TieOrientation, ClockWindow, HashExceptions
 // Lean proofs:
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_TieOrientation.lean
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_ClockWindow.lean
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_HashExceptions.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/OptimalEqualKeyOrientation.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/ClockResidualWindow.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/ModalHashExceptions.lean
 // ============================================================================
 struct TieOrientationPlan {
   size_t min_bytes{0};

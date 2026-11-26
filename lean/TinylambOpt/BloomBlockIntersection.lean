@@ -1,3 +1,13 @@
+/-!
+Configuration shared by build and probe sides (functions are parameters, not computed
+here).
+
+A join key: NULL, or a non-NULL integer key.
+
+Named results include `keyBits_subset_sigOfKeys`, `bloom_block_intersection_sound`,
+`bloomSkip_sound`.
+-/
+
 /-
   TinylambOpt/BloomBlockIntersection.lean
 
@@ -187,3 +197,6 @@ theorem nullSafeSkip_sound (cfg : BloomCfg) (bs ps : List JoinKey)
   cases x <;> cases y <;> simp_all
 
 end TinylambOpt.BloomBlockIntersection
+
+-- C++ references to this model or its proof.
+-- executor/zone_map.hpp

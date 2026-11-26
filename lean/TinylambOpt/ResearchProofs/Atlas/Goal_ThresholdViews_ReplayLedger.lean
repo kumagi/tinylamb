@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `ThresholdViews.ReplayLedger` — `∀ old p k, indicator (active old k) + weight
+  (changes old p) k = indicator (active (old++p) k)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

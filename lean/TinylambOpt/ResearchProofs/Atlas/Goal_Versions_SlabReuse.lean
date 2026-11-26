@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `Versions.SlabReuse` — `∀ es k t l h, l ≤ h → (∀ e ∈ es, e.key = k → e.tx ≤ t →
+  (e.since ≤ l ∨ h < e.since) ∧ (e.stop ≤ l ∨ h < e.stop)) → ∀ v, l ≤ v → v ≤ h →
+  winner es k t v = winner es k t l`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,6 +1,15 @@
 import Std
 import TinylambOpt.ProposedGoals.QualifyPushdown
 
+/-!
+Proved
+
+- `Goal` — `∀ (w : Row → Bool) (q : Int → Bool) (rows : List Row), PartitionOnly w →
+  whereFilter w (qualify q rows) = qualify q (whereFilter w rows)`
+
+The reference model is defined in `TinylambOpt.ProposedGoals.QualifyPushdown`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

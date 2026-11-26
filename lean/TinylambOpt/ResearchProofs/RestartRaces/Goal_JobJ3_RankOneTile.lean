@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.JobJ3
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `RankOneTile` — Is equality of every cross product both necessary and sufficient to
+  represent a tile by two *integer*, nonnegative vectors for every selection and
+  year-weighted sum? Allows proportional neighborhoods beyond exact twins.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

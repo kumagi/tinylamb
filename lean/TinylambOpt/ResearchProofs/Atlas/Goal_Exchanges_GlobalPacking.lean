@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Refuted by counterexample
+
+- `Exchanges.GlobalPacking` — `∀ cap xs, 0 < cap → traffic cap xs = packets cap (xs.map
+  Prod.snd).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

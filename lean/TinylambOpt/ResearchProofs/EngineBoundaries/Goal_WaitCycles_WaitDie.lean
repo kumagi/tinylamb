@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Proved
+
+- `WaitDie` — Timestamp-ordered wait-die edges cannot form a closed wait chain.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

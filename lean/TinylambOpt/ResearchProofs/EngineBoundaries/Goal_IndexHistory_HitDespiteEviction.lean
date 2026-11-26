@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `HitDespiteEviction` — An observed hit settles the query even when older evidence was
+  discarded.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.CriticalCut` — `∀ xs, finish xs = (xs.zipIdx.map (fun (_,i) => ((xs.take
+  (i+1)).map Prod.fst).sum + ((xs.drop i).map Prod.snd).sum)).max?.getD 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `DecimalMod.DecimalSuffix` — `∀ a x y, x<10 → y<10 → let q:=applyT (compile reader a)
+  0; q<7 → applyT (compile reader (.cat a (.lit [48+x,48+y]))) 0 = (100*q+10*x+y)%7`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

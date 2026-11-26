@@ -217,7 +217,7 @@ Status FoldRowIntoAggState(
       break;
     }
     case ColAggKind::kMinVarChar: {
-      // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+      // Lean proof: lean/TinylambOpt/GroupKeyAndDictionaryRewrites.lean
       // (order_preserving_dict_min_code_sound, unsorted_dict_min_code_bug)
       if (chunk.dict_encoded && chunk.dict != nullptr &&
           row < chunk.dict_codes.size()) {

@@ -1,6 +1,13 @@
 import Std
 import TinylambOpt.ResearchGoals.JitFrontiers.VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Named results include `option_bind_map_isSome`, `option_bind_cons`, `mapM_option_congr`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

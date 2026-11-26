@@ -1,5 +1,15 @@
 # 次の SQL 最適化の未証明課題
 
+[現行 RDBMS の正しさを問う107件](database-correctness.md)。再監査は証明104件・反証3件。MERGE の順序で成功とエラーが変わる実測、ソート再試行の前提、108組の SQL 照合を収録。
+
+[JIT 高速化の境界を問う281件](jit-kernels.md)。30モデルの索引と、31件について登録済みの式を直接評価した有限探索。
+
+[性能・ストレージ・長時間運転に関する224件の研究命題](resource-policies.md)。メモリ不足、部分書き込み、回収、並列実行の境界を22モデルで扱う。
+
+[最新 TLCS の負け89クエリに対応する未証明命題](fresh-tlcs-query-losses.md)。演算別の提出型、クエリごとの実測値、Q28・Q35 の入力調査。
+
+証明を書く前に [既存の補題を探す](../../README.md#既存の補題を探す) を参照してください。
+
 [11月26日の敗北83クエリの未証明命題](november26-queries.md)。最新のクエリ別中央値と次回の計測項目。
 
 [速度・保存サイズの各敗北に対応する94件の未証明命題](benchmark-rematch.md)。各クエリと対戦相手ごとの逆転目標、候補演算、観測量。
@@ -39,7 +49,7 @@
 [50 件の Issue と提出型](duckdb-gaps.md)。Cloud/BI 6 件、TPC-DS 8 件、ClickBench 8 件、
 TPC-H 7 件、Slices/FileMasks/Refresh/BridgeStates の派生 21 件。全 50 件
 `theorem sound_* : *.Goal` 証明済み（反例なし）。対応する証明は
-`ResearchProofs/DuckDBGaps/` の 7 モジュール。
+`ResearchProofs/AnalyticalOperators/` の 7 モジュール。
 
 ## クラウド・BI ワークロードの命題（第九波・証明済み）
 

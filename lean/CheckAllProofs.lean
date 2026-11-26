@@ -2,6 +2,11 @@ import TinylambOpt
 import Lean.Util.CollectAxioms
 import Lean.Elab.Command
 
+/-!
+This audit checks exported Lean theorems for dependencies on admitted proofs. It
+verifies that the SQL equivalence and execution results do not rely on sorry.
+-/
+
 open Lean
 
 run_cmd do

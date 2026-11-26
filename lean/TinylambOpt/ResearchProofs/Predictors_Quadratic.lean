@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `Quadratic.ByteBudget` — `∀ side i h xs w extra oldBytes, certificate predict side i
+  h xs w → extra + quote xs.length w < oldBytes → extra + (frame (encode predict side
+  i h xs)).length < oldBytes`
+- `Quadratic.PolynomialRun` — `∀ (a b c : Int) n side i, let q := fun (j : Int) =>
+  a*j^2+b*j+c restore predict side i [q (-1),q (-2),q (-3)] (List.replicate n 0) =
+  (List.range n).map (fun (j : Nat) => q j)`
+- `Quadratic.ResidualRoundTrip` — `∀ side i h xs, restore predict side i h (encode
+  predict side i h xs) = xs`
+- `Quadratic.RestartSeed` — `∀ side i h xs, encode predict side i (h.take (3)) xs =
+  encode predict side i h xs`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.Quadratic
 
 open TinylambOpt.ResearchGoals.Compression.Predictors

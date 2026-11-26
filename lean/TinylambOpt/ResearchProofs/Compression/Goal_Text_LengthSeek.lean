@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.Compression.Text
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `LengthSeek` — `∀ (ws : Words) (i : Nat), i < ws.length → (((ws.flatten.drop
+  ((ws.take i).map List.length).sum).take (ws[i]?.getD []).length)) = ws[i]?.getD []`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

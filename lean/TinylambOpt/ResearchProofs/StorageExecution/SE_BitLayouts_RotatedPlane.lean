@@ -1,6 +1,19 @@
 import Std
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved (10 claims, including the following)
+
+- `RotatedPlane.BankCycle` — `∀ n w i b, 0<n → layout.bit n w (i+n) b = layout.bit n w
+  i b`
+- `RotatedPlane.DictionaryProbe` — Read only lanes requested by a probe and translate
+  them through a possibly short dictionary.
+- `RotatedPlane.Lossless` — Read one lane from serialized bytes, including zero width.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.BitLayouts.RotatedPlane
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.Compression.Wire

@@ -1,5 +1,26 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.CoarserPages` — `∀ ids cap n, 0 < cap → 0 < n → (pages (cap*n) ids).length ≤
+  (pages cap ids).length`
+- `Gather.CostEnvelope` — `∀ ids cap setup price, 0 < cap → let ps := (pages cap
+  ids).mergeSort runCost ps setup price ≤ min (ps.length*(setup+price)) (setup +
+  price*(ps.getLast?.getD 0 + 1 - ps.head?.getD 0))`
+- `Gather.ExtentCount` — `∀ cap ids, 0 < cap → let ps := pages cap ids extents cap ids
+  + ps.countP (fun p => ps.contains (p+1)) = ps.length`
+- `Gather.OptimalRead` — `∀ ids cap setup price ext, 0 < cap → (∀ e ∈ ext, e.1 < e.2) →
+  (∀ p ∈ pages cap ids, covers ext p = true) → runCost (pages cap ids |>.mergeSort)
+  setup price ≤ readCost setup price ext`
+- `Gather.ScatterBack` — `∀ (payload : List Int) (ids : List Nat), let addresses :=
+  ids.mergeSort.eraseDups let cache := addresses.map (fun i => payload[i]?) ids.map
+  (fun i => (cache[addresses.idxOf i]?).join) = ids.map (fun i => payload[i]?)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.ExecutorResources.Gather
 
 open TinylambOpt.ResearchGoals.Atlas.ExecutorResources.Gather

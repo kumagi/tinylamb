@@ -68,143 +68,143 @@ python3 benchmark/comparison/analytics_bench.py --generate-only --families h2o s
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [MovieCredits](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L96) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TriangleNorm`、`CollisionCorrection` |
-| [KeywordCompany](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L128) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TerminalKey`、`CollisionCorrection` |
-| [CastOverlap](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L161) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`GramSquare`、`CollisionCorrection` |
-| [DoubleBilling](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L193) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SquaredDelta`、`CollisionCorrection` |
-| [PostDiamond](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L227) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SquarePathCounts`、`CollisionCorrection` |
-| [VoteBadge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L259) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`IndependentArms`、`CollisionCorrection` |
-| [ReplyCycle](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L293) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`UndirectedTrace`、`CollisionCorrection` |
-| [FriendBridge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L326) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`BidirectionalMeet`、`CollisionCorrection` |
-| [CoLikes](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L359) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DistinctMessages`、`CollisionCorrection` |
-| [ForumBowtie](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L394) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`ArticulationSquare`、`CollisionCorrection` |
-| [CountryReturn](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L426) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
-| [OrderSupplier](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L460) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SharedDestination`、`CollisionCorrection` |
-| [ReturnedItem](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L493) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`AnchoredChord`、`CollisionCorrection` |
-| [ChannelBridge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L526) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TripleOverlap`、`CollisionCorrection` |
-| [PromoInventory](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L559) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
-| [TwoHopAntiWitness](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L593) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`IndependentWitness`、`CollisionCorrection` |
-| [HubWithChords](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L627) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`ChordComponents`、`CollisionCorrection` |
-| [SupplierClique](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L661) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`OrbitRepresentative`、`CollisionCorrection` |
-| [IntersectingCycles](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L695) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TwoSeparators`、`CollisionCorrection` |
-| [ParallelLineage](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L729) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
+| [MovieCredits](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L101) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TriangleNorm`、`CollisionCorrection` |
+| [KeywordCompany](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L133) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TerminalKey`、`CollisionCorrection` |
+| [CastOverlap](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L166) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`GramSquare`、`CollisionCorrection` |
+| [DoubleBilling](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L198) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SquaredDelta`、`CollisionCorrection` |
+| [PostDiamond](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L232) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SquarePathCounts`、`CollisionCorrection` |
+| [VoteBadge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L264) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`IndependentArms`、`CollisionCorrection` |
+| [ReplyCycle](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L298) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`UndirectedTrace`、`CollisionCorrection` |
+| [FriendBridge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L331) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`BidirectionalMeet`、`CollisionCorrection` |
+| [CoLikes](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L364) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DistinctMessages`、`CollisionCorrection` |
+| [ForumBowtie](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L399) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`ArticulationSquare`、`CollisionCorrection` |
+| [CountryReturn](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L431) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
+| [OrderSupplier](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L465) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`SharedDestination`、`CollisionCorrection` |
+| [ReturnedItem](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L498) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`AnchoredChord`、`CollisionCorrection` |
+| [ChannelBridge](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L531) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TripleOverlap`、`CollisionCorrection` |
+| [PromoInventory](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L564) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
+| [TwoHopAntiWitness](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L598) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`IndependentWitness`、`CollisionCorrection` |
+| [HubWithChords](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L632) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`ChordComponents`、`CollisionCorrection` |
+| [SupplierClique](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L666) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`OrbitRepresentative`、`CollisionCorrection` |
+| [IntersectingCycles](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L700) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`TwoSeparators`、`CollisionCorrection` |
+| [ParallelLineage](../../TinylambOpt/ResearchGoals/Atlas/JoinPlans.lean#L734) | `BoundaryMessages`、`AnchoredRepair`、`FractionalCap`、`DeltaForecast`、`CollisionCorrection` |
 
 ### RangePlans（100 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [ContainsTick](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L71) | `PrefixIndex`、`PageVerdict`、`EndpointSweep`、`UnionAnti`、`RankSeek` |
-| [StrictOverlap](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L110) | `PrefixIndex`、`PageVerdict`、`StartMinusEnd`、`UnionAnti`、`RankSeek` |
-| [NestedVersion](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L149) | `PrefixIndex`、`PageVerdict`、`OuterCertificate`、`UnionAnti`、`RankSeek` |
-| [StaggeredHandoff](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L187) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
-| [EndpointContact](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L227) | `PrefixIndex`、`PageVerdict`、`EndpointHash`、`UnionAnti`、`RankSeek` |
-| [PriceCorridor](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L269) | `PrefixIndex`、`PageVerdict`、`SlidingStrip`、`UnionAnti`、`RankSeek` |
-| [ParetoFront](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L308) | `PrefixIndex`、`PageVerdict`、`SkylineWitness`、`UnionAnti`、`RankSeek` |
-| [ReversedRank](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L348) | `PrefixIndex`、`PageVerdict`、`InversionPairs`、`UnionAnti`、`RankSeek` |
-| [OutsideBand](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L389) | `PrefixIndex`、`PageVerdict`、`ComplementSum`、`UnionAnti`、`RankSeek` |
-| [RingNeighborhood](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L429) | `PrefixIndex`、`PageVerdict`、`PerimeterHistogram`、`UnionAnti`、`RankSeek` |
-| [ExactlyOneKey](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L469) | `PrefixIndex`、`PageVerdict`、`SubtractiveGrouping`、`UnionAnti`、`RankSeek` |
-| [PriorTradingDay](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L511) | `PrefixIndex`、`PageVerdict`、`DailyState`、`UnionAnti`、`RankSeek` |
-| [LexSuccessor](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L551) | `PrefixIndex`、`PageVerdict`、`ReverseCursor`、`UnionAnti`、`RankSeek` |
-| [EitherEndpointInside](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L591) | `PrefixIndex`、`PageVerdict`、`SplitBoundaryDebt`、`UnionAnti`、`RankSeek` |
-| [CrossChannel](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L632) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
-| [VarianceBudget](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L673) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
-| [AlignedWeek](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L715) | `PrefixIndex`、`PageVerdict`、`BucketEquality`、`UnionAnti`、`RankSeek` |
-| [GapSession](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L755) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
-| [OverdueOrLost](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L795) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
-| [AdjacentTiles](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L836) | `PrefixIndex`、`PageVerdict`、`SparseNeighbors`、`UnionAnti`、`RankSeek` |
+| [ContainsTick](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L76) | `PrefixIndex`、`PageVerdict`、`EndpointSweep`、`UnionAnti`、`RankSeek` |
+| [StrictOverlap](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L115) | `PrefixIndex`、`PageVerdict`、`StartMinusEnd`、`UnionAnti`、`RankSeek` |
+| [NestedVersion](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L154) | `PrefixIndex`、`PageVerdict`、`OuterCertificate`、`UnionAnti`、`RankSeek` |
+| [StaggeredHandoff](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L192) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
+| [EndpointContact](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L232) | `PrefixIndex`、`PageVerdict`、`EndpointHash`、`UnionAnti`、`RankSeek` |
+| [PriceCorridor](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L274) | `PrefixIndex`、`PageVerdict`、`SlidingStrip`、`UnionAnti`、`RankSeek` |
+| [ParetoFront](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L313) | `PrefixIndex`、`PageVerdict`、`SkylineWitness`、`UnionAnti`、`RankSeek` |
+| [ReversedRank](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L353) | `PrefixIndex`、`PageVerdict`、`InversionPairs`、`UnionAnti`、`RankSeek` |
+| [OutsideBand](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L394) | `PrefixIndex`、`PageVerdict`、`ComplementSum`、`UnionAnti`、`RankSeek` |
+| [RingNeighborhood](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L434) | `PrefixIndex`、`PageVerdict`、`PerimeterHistogram`、`UnionAnti`、`RankSeek` |
+| [ExactlyOneKey](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L474) | `PrefixIndex`、`PageVerdict`、`SubtractiveGrouping`、`UnionAnti`、`RankSeek` |
+| [PriorTradingDay](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L516) | `PrefixIndex`、`PageVerdict`、`DailyState`、`UnionAnti`、`RankSeek` |
+| [LexSuccessor](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L556) | `PrefixIndex`、`PageVerdict`、`ReverseCursor`、`UnionAnti`、`RankSeek` |
+| [EitherEndpointInside](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L596) | `PrefixIndex`、`PageVerdict`、`SplitBoundaryDebt`、`UnionAnti`、`RankSeek` |
+| [CrossChannel](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L637) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
+| [VarianceBudget](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L678) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
+| [AlignedWeek](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L720) | `PrefixIndex`、`PageVerdict`、`BucketEquality`、`UnionAnti`、`RankSeek` |
+| [GapSession](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L760) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
+| [OverdueOrLost](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L800) | `PrefixIndex`、`PageVerdict`、`ProbeTransposition`、`UnionAnti`、`RankSeek` |
+| [AdjacentTiles](../../TinylambOpt/ResearchGoals/Atlas/RangePlans.lean#L841) | `PrefixIndex`、`PageVerdict`、`SparseNeighbors`、`UnionAnti`、`RankSeek` |
 
 ### OrderedMeasures（100 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [TotalVariation](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L35) | `Seam`、`Rescale`、`Monotone`、`DropDuplicates`、`EndpointFence` |
-| [QuadraticVariation](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L66) | `SeamEnergy`、`Affine`、`EndpointEnergy`、`LinearRamp`、`LocalEdit` |
-| [RisePairs](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L97) | `HistogramBridge`、`ReverseDebt`、`RankCoding`、`BlockRepeat`、`MergeSorted` |
-| [TiePairs](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L130) | `Multiplicity`、`DeleteBatch`、`DisjointKeys`、`CollisionPenalty`、`FanoutBound` |
-| [Drawdown](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L163) | `CrossExtreme`、`Bidirectional`、`QuoteFlip`、`DeleteMonotone`、`DuplicatePeriods` |
-| [BestFrame](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L196) | `CrossFrame`、`RepeatedGain`、`NegativePage`、`PrefixDrawdown`、`DeletionFence` |
-| [RunTransitions](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L229) | `PageBoundary`、`CoarseDictionary`、`MaskedSubsequence`、`PeriodicBoundary`、`SortedDictionary` |
-| [PlateauFrames](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L263) | `BoundaryRuns`、`Uniform`、`InjectiveCodes`、`ExpandRuns`、`TieFence` |
-| [PrefixExposure](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L297) | `Multiplicities`、`InheritedBalance`、`ReverseComplement`、`Deposit`、`BatchRepeat` |
-| [PrefixEnergy](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L329) | `OffsetQuadratic`、`ConstantPage`、`UnitScaling`、`ReverseEnergy`、`ThresholdBound` |
-| [LagProduct](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L359) | `BoundaryProduct`、`CenterShift`、`EnergyIdentity`、`RunStretch`、`RemoveInterior` |
-| [FrameTotals](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L390) | `RowIncidence`、`PrefixSuffix`、`UniformShift`、`LocalCorrection`、`EvenSplitter` |
-| [TripleRise](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L422) | `MiddlePivot`、`Concatenate`、`DisjointRanges`、`StrictPage`、`StableExpand` |
-| [AlternatingBalance](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L454) | `ParityCarry`、`BackwardPhase`、`PeriodicParity`、`DuplicateCancellation`、`ShiftResidue` |
-| [PositiveJumps](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L486) | `BoundaryJump`、`ReverseBalance`、`SharedMagnitude`、`NonincreasingSkip`、`FilterBudget` |
-| [CenteredScatter](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L518) | `MomentCollapse`、`PairMerge`、`Translation`、`ReplicatedGroup`、`OutlierCap` |
-| [GiniDistance](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L549) | `SortedWeights`、`SeparatedBlocks`、`DictionaryPairs`、`Lipschitz`、`VarianceFence` |
-| [ZeroFrames](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L579) | `PrefixCollision`、`BoundaryBalances`、`Nonnegative`、`Uniform`、`EarliestPrune` |
-| [EdgeCurvature](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L611) | `AffineTrend`、`Backward`、`EndpointRepair`、`FlatAcceleration`、`TrendCertificate` |
-| [PeakCount](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L643) | `BoundaryPeaks`、`OrderDictionary`、`AdjacentCap`、`DuplicateLoss`、`BoundedRepair` |
+| [TotalVariation](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L40) | `Seam`、`Rescale`、`Monotone`、`DropDuplicates`、`EndpointFence` |
+| [QuadraticVariation](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L71) | `SeamEnergy`、`Affine`、`EndpointEnergy`、`LinearRamp`、`LocalEdit` |
+| [RisePairs](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L102) | `HistogramBridge`、`ReverseDebt`、`RankCoding`、`BlockRepeat`、`MergeSorted` |
+| [TiePairs](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L135) | `Multiplicity`、`DeleteBatch`、`DisjointKeys`、`CollisionPenalty`、`FanoutBound` |
+| [Drawdown](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L168) | `CrossExtreme`、`Bidirectional`、`QuoteFlip`、`DeleteMonotone`、`DuplicatePeriods` |
+| [BestFrame](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L201) | `CrossFrame`、`RepeatedGain`、`NegativePage`、`PrefixDrawdown`、`DeletionFence` |
+| [RunTransitions](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L234) | `PageBoundary`、`CoarseDictionary`、`MaskedSubsequence`、`PeriodicBoundary`、`SortedDictionary` |
+| [PlateauFrames](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L268) | `BoundaryRuns`、`Uniform`、`InjectiveCodes`、`ExpandRuns`、`TieFence` |
+| [PrefixExposure](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L302) | `Multiplicities`、`InheritedBalance`、`ReverseComplement`、`Deposit`、`BatchRepeat` |
+| [PrefixEnergy](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L334) | `OffsetQuadratic`、`ConstantPage`、`UnitScaling`、`ReverseEnergy`、`ThresholdBound` |
+| [LagProduct](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L364) | `BoundaryProduct`、`CenterShift`、`EnergyIdentity`、`RunStretch`、`RemoveInterior` |
+| [FrameTotals](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L395) | `RowIncidence`、`PrefixSuffix`、`UniformShift`、`LocalCorrection`、`EvenSplitter` |
+| [TripleRise](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L427) | `MiddlePivot`、`Concatenate`、`DisjointRanges`、`StrictPage`、`StableExpand` |
+| [AlternatingBalance](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L459) | `ParityCarry`、`BackwardPhase`、`PeriodicParity`、`DuplicateCancellation`、`ShiftResidue` |
+| [PositiveJumps](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L491) | `BoundaryJump`、`ReverseBalance`、`SharedMagnitude`、`NonincreasingSkip`、`FilterBudget` |
+| [CenteredScatter](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L523) | `MomentCollapse`、`PairMerge`、`Translation`、`ReplicatedGroup`、`OutlierCap` |
+| [GiniDistance](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L554) | `SortedWeights`、`SeparatedBlocks`、`DictionaryPairs`、`Lipschitz`、`VarianceFence` |
+| [ZeroFrames](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L584) | `PrefixCollision`、`BoundaryBalances`、`Nonnegative`、`Uniform`、`EarliestPrune` |
+| [EdgeCurvature](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L616) | `AffineTrend`、`Backward`、`EndpointRepair`、`FlatAcceleration`、`TrendCertificate` |
+| [PeakCount](../../TinylambOpt/ResearchGoals/Atlas/OrderedMeasures.lean#L648) | `BoundaryPeaks`、`OrderDictionary`、`AdjacentCap`、`DuplicateLoss`、`BoundedRepair` |
 
 ### EncodedPages（100 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [LinearOrdinal](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L97) | `SliceState`、`InverseLookup`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [SaturatingCounter](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L140) | `SliceState`、`PlateauFrequency`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [SegmentedSlope](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L180) | `SliceState`、`TurnExtrema`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [MirroredTail](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L221) | `SliceState`、`OverlapDistinct`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [BucketRuns](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L261) | `SliceState`、`PartialBucket`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [WrappingSequence](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L302) | `SliceState`、`QuotientHistogram`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [DictionaryCycle](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L343) | `SliceState`、`DuplicateCodes`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [DictionaryDrift](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L385) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [AlternatingSign](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L427) | `SliceState`、`CancelPairs`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [TriangleWave](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L468) | `SliceState`、`PeakPositions`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [LaneMajor](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L509) | `SliceState`、`FrequencySeparation`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [Boustrophedon](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L550) | `SliceState`、`FullTiles`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [RaggedStripe](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L590) | `SliceState`、`NullCount`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [PeriodicPatch](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L631) | `SliceState`、`PatchBudget`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [SparseSample](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L672) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [DeletedSpan](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L713) | `SliceState`、`SeekSurvivor`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [RotatedPage](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L755) | `SliceState`、`PermutationAggregate`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [GrayTile](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L796) | `SliceState`、`PowerOfTwo`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [RestartedDelta](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L837) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
-| [PagedTombstones](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L878) | `SliceState`、`SkipEpochs`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [LinearOrdinal](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L102) | `SliceState`、`InverseLookup`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [SaturatingCounter](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L145) | `SliceState`、`PlateauFrequency`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [SegmentedSlope](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L185) | `SliceState`、`TurnExtrema`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [MirroredTail](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L226) | `SliceState`、`OverlapDistinct`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [BucketRuns](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L266) | `SliceState`、`PartialBucket`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [WrappingSequence](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L307) | `SliceState`、`QuotientHistogram`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [DictionaryCycle](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L348) | `SliceState`、`DuplicateCodes`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [DictionaryDrift](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L390) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [AlternatingSign](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L432) | `SliceState`、`CancelPairs`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [TriangleWave](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L473) | `SliceState`、`PeakPositions`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [LaneMajor](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L514) | `SliceState`、`FrequencySeparation`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [Boustrophedon](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L555) | `SliceState`、`FullTiles`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [RaggedStripe](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L595) | `SliceState`、`NullCount`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [PeriodicPatch](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L636) | `SliceState`、`PatchBudget`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [SparseSample](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L677) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [DeletedSpan](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L718) | `SliceState`、`SeekSurvivor`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [RotatedPage](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L760) | `SliceState`、`PermutationAggregate`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [GrayTile](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L801) | `SliceState`、`PowerOfTwo`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [RestartedDelta](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L842) | `SliceState`、`PredicateRank`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
+| [PagedTombstones](../../TinylambOpt/ResearchGoals/Atlas/EncodedPages.lean#L883) | `SliceState`、`SkipEpochs`、`ResidueJoin`、`DeleteProgression`、`AlignedProduct` |
 
 ### PlanSearch（20 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [PredicateOrder](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L7) | `RatioSort`、`ConditionalSwap`、`RepeatedGuard`、`DeferredPass`、`MarginalTie` |
-| [AlphabeticMerge](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L47) | `OptimalTree`、`MonotoneCut`、`Quadrangle`、`ReweightBound`、`ScaleReuse` |
-| [ParallelCuts](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L84) | `Feasible`、`CapacitySearch`、`ReverseScan`、`BoundarySlack`、`LocalCorrection` |
-| [RiskEnvelope](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L116) | `QuantileReserve`、`ReservationSlope`、`HistogramFold`、`RareWorkload`、`MeanReserve` |
+| [PredicateOrder](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L12) | `RatioSort`、`ConditionalSwap`、`RepeatedGuard`、`DeferredPass`、`MarginalTie` |
+| [AlphabeticMerge](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L52) | `OptimalTree`、`MonotoneCut`、`Quadrangle`、`ReweightBound`、`ScaleReuse` |
+| [ParallelCuts](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L89) | `Feasible`、`CapacitySearch`、`ReverseScan`、`BoundarySlack`、`LocalCorrection` |
+| [RiskEnvelope](../../TinylambOpt/ResearchGoals/Atlas/PlanSearch.lean#L121) | `QuantileReserve`、`ReservationSlope`、`HistogramFold`、`RareWorkload`、`MeanReserve` |
 
 ### SnapshotMaintenance（20 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [Versions](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L5) | `DominancePrune`、`RunTournament`、`SlabReuse`、`LocalPublish`、`DropTombstones` |
-| [IntervalDeletes](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L46) | `SignedEndpoints`、`FooterRuns`、`OverlapDebt`、`LiveSelect`、`RebaseMask` |
-| [ThresholdViews](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L84) | `ZeroCrossing`、`Coalesce`、`SemijoinRepair`、`MarginCertificate`、`ReplayLedger` |
-| [BatchWatermarks](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L118) | `PartialOpen`、`CoarseTime`、`HistoricalBand`、`EquivalentHistory`、`FinalSummary` |
+| [Versions](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L10) | `DominancePrune`、`RunTournament`、`SlabReuse`、`LocalPublish`、`DropTombstones` |
+| [IntervalDeletes](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L51) | `SignedEndpoints`、`FooterRuns`、`OverlapDebt`、`LiveSelect`、`RebaseMask` |
+| [ThresholdViews](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L89) | `ZeroCrossing`、`Coalesce`、`SemijoinRepair`、`MarginCertificate`、`ReplayLedger` |
+| [BatchWatermarks](../../TinylambOpt/ResearchGoals/Atlas/SnapshotMaintenance.lean#L123) | `PartialOpen`、`CoarseTime`、`HistoricalBand`、`EquivalentHistory`、`FinalSummary` |
 
 ### TextExecution（20 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [Grammar](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L9) | `BoundaryHits`、`LongPower`、`ShortPower`、`SliceDecode`、`InteriorCache` |
-| [EditFilter](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L52) | `GramLowerBound`、`PigeonholeAnchor`、`PositionalAnchor`、`ClassLength`、`HistogramFence` |
-| [Wavelet](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L83) | `RangeMap`、`Quantile`、`SameBranch`、`BetweenCodes`、`DictionaryGrowth` |
-| [Lcp](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L121) | `RangeMinimum`、`DictionarySize`、`PagePrefix`、`CompareSkip`、`ShardBridge` |
+| [Grammar](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L14) | `BoundaryHits`、`LongPower`、`ShortPower`、`SliceDecode`、`InteriorCache` |
+| [EditFilter](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L57) | `GramLowerBound`、`PigeonholeAnchor`、`PositionalAnchor`、`ClassLength`、`HistogramFence` |
+| [Wavelet](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L88) | `RangeMap`、`Quantile`、`SameBranch`、`BetweenCodes`、`DictionaryGrowth` |
+| [Lcp](../../TinylambOpt/ResearchGoals/Atlas/TextExecution.lean#L126) | `RangeMinimum`、`DictionarySize`、`PagePrefix`、`CompareSkip`、`ShardBridge` |
 
 ### ExecutorResources（20 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [Pipeline](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L4) | `TwoStageOrder`、`CriticalCut`、`BatchSummary`、`SteadyState`、`SplitOverlap` |
-| [Exchanges](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L36) | `PacketLowerBound`、`FlushDebt`、`FrameScale`、`ReceiverCoalesce`、`GlobalPacking` |
-| [Gather](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L64) | `OptimalRead`、`CostEnvelope`、`CoarserPages`、`ExtentCount`、`ScatterBack` |
-| [LaneCompaction](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L103) | `MaskCompose`、`ChunkOffsets`、`ExpandBack`、`DecodeSavings`、`EarlyDemand` |
+| [Pipeline](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L9) | `TwoStageOrder`、`CriticalCut`、`BatchSummary`、`SteadyState`、`SplitOverlap` |
+| [Exchanges](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L41) | `PacketLowerBound`、`FlushDebt`、`FrameScale`、`ReceiverCoalesce`、`GlobalPacking` |
+| [Gather](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L69) | `OptimalRead`、`CostEnvelope`、`CoarserPages`、`ExtentCount`、`ScatterBack` |
+| [LaneCompaction](../../TinylambOpt/ResearchGoals/Atlas/ExecutorResources.lean#L108) | `MaskCompose`、`ChunkOffsets`、`ExpandBack`、`DecodeSavings`、`EarlyDemand` |
 
 ### SynopsisBounds（20 件）
 
 | モデル | 個別の宣言名 |
 | --- | --- |
-| [Samples](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L5) | `EmptySample`、`SampleMean`、`SampleEnergy`、`SelectivityLaw`、`ShardSampling` |
-| [Couplings](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L43) | `Rearrangement`、`TransportLower`、`PrefixTransport`、`FarRows`、`AlignedMarginals` |
-| [HeavyBounds](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L70) | `TailFanout`、`MonotoneRefine`、`AliasError`、`TwoHashes`、`JointKey` |
-| [PageMoments](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L102) | `UnroundedTail`、`ShiftOrigin`、`TrimError`、`AllInside`、`MomentHistogram` |
+| [Samples](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L10) | `EmptySample`、`SampleMean`、`SampleEnergy`、`SelectivityLaw`、`ShardSampling` |
+| [Couplings](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L48) | `Rearrangement`、`TransportLower`、`PrefixTransport`、`FarRows`、`AlignedMarginals` |
+| [HeavyBounds](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L75) | `TailFanout`、`MonotoneRefine`、`AliasError`、`TwoHashes`、`JointKey` |
+| [PageMoments](../../TinylambOpt/ResearchGoals/Atlas/SynopsisBounds.lean#L107) | `UnroundedTail`、`ShiftOrigin`、`TrimError`、`AllInside`、`MomentHistogram` |

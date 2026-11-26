@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `PromoInventory.DeltaForecast` — `∀ n db delta b table (t : Nat), (∀ r x y, r ≠ table
+  → delta r x y = 0) → let eval := fun u => reference pattern n (slope db delta u) b
+  eval t = forecast eval (pattern.atoms.countP (fun a => a.rel == table)) t`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

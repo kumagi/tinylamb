@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `DelayEnqueue` — Moving enqueue past an already capped write is safe if that write
+  cannot reach new bytes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

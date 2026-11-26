@@ -558,14 +558,14 @@ void RegisterAggregateAndDistinctRules(RuleSet& built) {
       LogicalOperator::kSelection));
 
   // eager_aggregation_over_join (the relevant Lean theorems,
-  // AggJoinDiscovery.lean & AvgMinMaxHavingDistinct.lean): Push a 2-stage
+  // JoinPreaggregation.lean & AvgMinMaxHavingDistinct.lean): Push a 2-stage
   // partial Aggregation below an inner equi-join Join(L, R, equi_pred) onto
   // side S when all aggregates (COUNT, MIN, MAX) depend exclusively on S
   // and GROUP BY is non-empty. Pre-aggregates S by (outer_keys_in_S ∪
   // join_keys_in_S), joins the collapsed table with the other side, and
   // finishes with final SUM/MIN/MAX above the join (COUNT -> SUM(partial)).
   // Cascades across multi-hop star/snowflake joins automatically.
-  // Lean proof: lean/TinylambOpt/AggJoinDiscovery.lean
+  // Lean proof: lean/TinylambOpt/JoinPreaggregation.lean
   //   (eager_group_agg_over_mn_join_sound,
   //   eager_scalar_agg_over_mn_join_sound,
   //    star_cascade_two_hop_agg_sound) &
@@ -926,7 +926,7 @@ void RegisterAggregateAndDistinctRules(RuleSet& built) {
   // provably disjoint, so the full Aggregation (including AVG, COUNT
   // DISTINCT, compound expressions, and HAVING) pushes into each branch and
   // emits UNION ALL directly without any outer re-aggregation.
-  // Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+  // Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
   //   (disjoint_union_group_by_bypass_sound,
   //    agg_union_null_tag_collision_bug)
   built.Add(Rule(
@@ -1077,7 +1077,7 @@ void RegisterAggregateAndDistinctRules(RuleSet& built) {
   // into Selection(AntiJoin(Join(A, C, pC), B, pB), resAC) when `pC` touches
   // only `A ∪ C` and `b_col` is provably non-NULL on every `pB` match (e.g.
   // TPC-DS Q78 `sales LEFT JOIN returns JOIN date_dim WHERE r_key IS NULL`).
-  // Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+  // Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
   //   (outer_join_intervening_inner_to_antijoin_sound)
   built.Add(Rule(
       "outer_to_anti_join_through_inner_join", Selection(Any("input")),
@@ -1276,7 +1276,7 @@ void RegisterAggregateAndDistinctRules(RuleSet& built) {
   // a grouped aggregate `SELECT g, AGG(x) FROM s GROUP BY g` over the exact
   // same unfiltered base table by computing `AGG(x) OVER (PARTITION BY s.g)`
   // in a single pass and enforcing `s.g IS NOT NULL` (TPC-DS Q1/Q30/Q65/Q81).
-  // Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+  // Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
   //   (self_join_group_agg_to_window_sound,
   //    self_join_agg_window_null_key_bug)
   built.Add(Rule(
@@ -1705,7 +1705,7 @@ void RegisterAggregateAndDistinctRules(RuleSet& built) {
   // most 4 columns of `fact`, deduplicating `fact` onto those join surrogate
   // keys before joining `d1` and `d2` preserves the final set exactly while
   // shrinking multi-million-row fact inputs early (TPC-DS Q38, Q87).
-  // Lean proof: lean/TinylambOpt/TpcdsDiscovery.lean
+  // Lean proof: lean/TinylambOpt/UnionAndJoinRewrites.lean
   //   (eager_distinct_surrogate_keys_before_dim_joins_sound)
   built.Add(Rule(
       "eager_distinct_fact_keys_before_join", Distinct(Any("input")),

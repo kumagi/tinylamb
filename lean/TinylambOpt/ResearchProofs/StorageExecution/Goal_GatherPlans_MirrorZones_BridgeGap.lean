@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Named results include `disproof_BridgeGap`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

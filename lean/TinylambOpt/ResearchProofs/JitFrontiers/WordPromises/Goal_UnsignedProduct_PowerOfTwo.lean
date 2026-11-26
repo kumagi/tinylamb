@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `UnsignedProduct.GuardExact` — A concrete machine-bit test recognizes precisely the
+  defined domain.
+- `UnsignedProduct.PowerOfTwo` — `∀ x k, k<64 → (op.test x (1 <<< k)=true ↔
+  x.toNat<2^(64-k))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

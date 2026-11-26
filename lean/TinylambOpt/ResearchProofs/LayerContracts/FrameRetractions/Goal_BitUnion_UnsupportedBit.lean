@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
 
+/-!
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+
+Proved
+
+- `BitUnion.UnsupportedBit` — `∀ xs x i, x ∈ xs → ((xs.erase x).all (fun y =>
+  !y.testBit i)) → ((repaired model xs x).getD 0).testBit i = false`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

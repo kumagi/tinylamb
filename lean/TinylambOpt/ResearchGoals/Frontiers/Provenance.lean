@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.Frontiers.Provenance
 
 /-! A witness is one derivation of a result from physical tuple IDs in a fixed

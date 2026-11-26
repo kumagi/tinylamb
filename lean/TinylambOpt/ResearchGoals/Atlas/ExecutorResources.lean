@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 namespace Pipeline
 /-! Two serial stages on distinct resources, unlimited queue between them.

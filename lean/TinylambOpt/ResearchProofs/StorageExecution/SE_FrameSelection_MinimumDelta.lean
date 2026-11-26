@@ -1,6 +1,25 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_FrameSelection_Common
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved (9 claims, including the following)
+
+- `MinimumDelta.ArithmeticKeys` — `∀ d n, 0<n → (write ((List.range n).map (fun i =>
+  (i+1)*d))).length = ubytes (2*d)+1`
+- `MinimumDelta.BoundedRaw` — A forced frame cap still limits worst-case expansion to
+  raw cells and per-frame overhead.
+- `MinimumDelta.ByteFrontier` — Use the actual codec and raw fallback in the size/seek
+  optimum.
+
+Refuted by counterexample
+
+- `MinimumDelta.GreedyCut` — Aggressive hypothesis: the cheapest two adjacent groups
+  never need reconsideration when a third arrives.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

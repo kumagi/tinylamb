@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.LimitOffsetPrefixComposition
 
+/-!
+Proved
+
+- `Goal` — Limit/TopN prefix-offset algebra (`plan/limit_plan.hpp` `prior_offset_`,
+  `plan/topn_plan.hpp`, `plan/cascades.cpp` `window_halo_topn` /
+  `topn_push_through_projection`): when an inner operator already skipped `p ≤ O`
+  prefix rows and retained at least `m ≥ (O - p) + L` rows, an outer `limitOp L (O -
+  p)` recovers the exact slice `limitOp L O` (and commutes with any row-wise
+  projection `f`).
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.LimitOffsetPrefixComposition`.
+-/
+
 namespace TinylambOpt.ResearchProofs.LimitOffsetPrefixComposition
 
 open TinylambOpt.ResearchGoals.LimitOffsetPrefixComposition

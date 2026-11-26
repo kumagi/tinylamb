@@ -1,3 +1,11 @@
+/-!
+Inclusive range summary with the generation it describes.
+
+One physical row version.
+
+Named results include `latestStep_mem`, `referenceScan_mem`, `visibleVersions_mem`.
+-/
+
 /-
   TinylambOpt/SnapshotZoneMap.lean
 
@@ -257,3 +265,6 @@ example :
       readKeyAt 10 1 xs [] deleted = some 90 := by cbv
 
 end TinylambOpt.SnapshotZoneMap
+
+-- C++ references to this model or its proof.
+-- executor/zone_map.hpp

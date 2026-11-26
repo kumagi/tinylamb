@@ -1,5 +1,19 @@
 import Std
 
+/-!
+Reference: evaluate the FILTER predicate in row order, stop at the first error, and add
+only rows classified TRUE.
+
+Staged path: first materialize the predicate outcomes for the whole batch, then fold
+values. Speculative evaluation after the first error is harmless for deterministic
+predicates (it only must not change the observation).
+
+Modeled claims
+
+- `Goal` — Staged evaluation preserves value, NULL and first error; the FILTER
+  aggregate is chunk-mergeable under the row-order contract.
+-/
+
 namespace TinylambOpt.ProposedGoals.FilterAggregateContract
 
 inductive TV where | t | f | u deriving DecidableEq

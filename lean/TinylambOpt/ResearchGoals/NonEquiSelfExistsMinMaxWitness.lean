@@ -1,5 +1,19 @@
 import Std
 
+/-!
+Reference SQL 3VL self-EXISTS `r2.oid = r.oid ∧ r2.wh <> r.wh`.
+
+O(1) per-group witness check using precomputed `(minWh, maxWh)` without self-joining on
+`cs_order_number`.
+
+Modeled claims
+
+- `Goal` — Group `(min, max)` witness reduction for non-equi self-`EXISTS` (TPC-DS Q16
+  `EXISTS (SELECT * FROM catalog_sales cs2 WHERE cs1.oid = cs2.oid AND cs1.wh <>
+  cs2.wh)`): checking `minWh < maxWh ∨ wh ≠ minWh` against the group summary matches
+  quadratic self-join lookup (returning `false` whenever `wh` is `NULL`).
+-/
+
 namespace TinylambOpt.ResearchGoals.NonEquiSelfExistsMinMaxWitness
 
 abbrev Row := Int × Option Int  -- (order_number, warehouse_sk)

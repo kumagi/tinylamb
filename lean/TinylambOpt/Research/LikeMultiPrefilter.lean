@@ -1,5 +1,13 @@
 import Std.Tactic
 
+/-!
+`seg` occurs as a contiguous substring of `row`.
+
+Ordered disjoint in-order occurrences starting at `start`.
+
+Named results include `prefix_drop_le`, `occurs_iff`, `chainMatchFrom_cand`.
+-/
+
 namespace TinylambOpt.Research.LikeMultiPrefilter
 
 /-

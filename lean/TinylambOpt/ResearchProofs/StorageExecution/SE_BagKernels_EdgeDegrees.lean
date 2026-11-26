@@ -1,5 +1,20 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_BagKernels_Common
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+
+Proved (10 claims, including the following)
+
+- `EdgeDegrees.AntiRevenue` — Compute revenue of all left rows whose key is absent on
+  the right.
+- `EdgeDegrees.CutWeight` — `∀ es (inside : Nat → Bool), weighted bag es (fun v =>
+  (inside v).toNat) = 2*es.countP (fun (a,b) => inside a && inside b)+es.countP (fun
+  (a,b) => xor (inside a) (inside b))`
+- `EdgeDegrees.DistinctOutput` — Output live grouping keys once even if physical codes
+  alias.
+-/
+
 open TinylambOpt.ResearchProofs.StorageExecution.BagKernels
 open TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 

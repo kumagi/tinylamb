@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `WrappedSum.SemijoinFilter` — Apply the footer to the build-key set before probing;
+  retain left bag order and duplicates.
+- `WrappedSum.SoundInterval` — Bound a computed group or predicate key from independent
+  column min/max.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

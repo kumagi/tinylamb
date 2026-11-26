@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.PageLoadTrace
 
+/-!
+Proved
+
+- `Goal` — `∀ pages needle width, 0 < width → let r := scan pages needle width r.hits =
+  reference needle (pages.flatMap Page.bytes) ∧ r.reads = (if needle.isEmpty then []
+  else pages.flatMap fun p => (List.range p.bytes.length).map (p.base + ·))`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.PageLoadTrace`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PageLoadTrace
 open ResearchGoals.PageLoadTrace
 open List

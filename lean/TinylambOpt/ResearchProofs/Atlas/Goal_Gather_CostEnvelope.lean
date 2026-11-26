@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.CostEnvelope` — `∀ ids cap setup price, 0 < cap → let ps := (pages cap
+  ids).mergeSort runCost ps setup price ≤ min (ps.length*(setup+price)) (setup +
+  price*(ps.getLast?.getD 0 + 1 - ps.head?.getD 0))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

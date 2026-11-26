@@ -1,0 +1,14 @@
+import TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
+import TinylambOpt.ResearchProofs.JitKernels.Goal_DeltaLaneScan_RepeatedDeltaRunDirectSelect
+
+/-! SOUND: verified DeltaLaneScan.RepeatedDeltaRunDirectSelect. -/
+
+set_option maxHeartbeats 0
+set_option maxRecDepth 10000
+set_option linter.unusedSimpArgs false
+namespace Nov26.Proof_DeltaLaneScan_RepeatedDeltaRunDirectSelect
+open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
+open TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan.RepeatedDeltaRunDirectSelect
+theorem sound : Goal := by
+  exact TinylambOpt.ResearchProofs.JitKernels.DeltaLaneScan.Goal_RepeatedDeltaRunDirectSelect.sound
+end Nov26.Proof_DeltaLaneScan_RepeatedDeltaRunDirectSelect

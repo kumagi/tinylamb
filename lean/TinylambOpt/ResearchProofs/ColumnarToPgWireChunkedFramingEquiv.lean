@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv
 
+/-!
+Proved
+
+- `Goal` — Direct columnar-to-PostgreSQL `DataRow` chunked wire serialization (H2O H2,
+  H4 / DictionaryJoinsAndLateLabels B1 / LDBC L2 / STATS-CEB C2): computing `be32`
+  frame headers directly via `intDecimalLen` / `bytes.length` without intermediate
+  `Row` materialization and streaming `chunkBytes`-sized frames yields the exact same
+  concatenated byte stream as `refRowEncode (transposeCols cols n)`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ColumnarToPgWireChunkedFramingEquiv
 
 open TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv
@@ -160,3 +173,9 @@ theorem sound : TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv.Go
   exact finalEquiv cols n chunkBytes
 
 end TinylambOpt.ResearchProofs.ColumnarToPgWireChunkedFramingEquiv
+
+-- C++ references to this model or its proof.
+-- query/sql_engine.hpp
+-- server/postgres_protocol.cpp
+-- server/postgres_protocol.hpp
+-- server/postgres_server.cpp

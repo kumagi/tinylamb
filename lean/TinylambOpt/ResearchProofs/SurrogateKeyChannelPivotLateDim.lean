@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.SurrogateKeyChannelPivotLateDim
 
+/-!
+Proved
+
+- `Goal` — Integer surrogate-key channel pivot + semijoin narrowing + late wide-column
+  dimension lookup (TPC-DS Q04/Q11/Q74/Q79): when `sk` is unique in `D` and `sk ↦ bk`
+  is injective, pivoting on integer `sk`, narrowing large channels by valid `y1 > 0`
+  `sk`s, and attaching wide attributes only for winners equals wide-string pre-join
+  grouping, whereas non-injective `bk` breaks it.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SurrogateKeyChannelPivotLateDim`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SurrogateKeyChannelPivotLateDim
 
 open TinylambOpt.ResearchGoals.SurrogateKeyChannelPivotLateDim

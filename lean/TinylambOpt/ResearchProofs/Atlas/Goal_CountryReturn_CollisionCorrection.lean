@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `CountryReturn.CollisionCorrection` — `∀ n db b, injective pattern n db b =
+  ((partitions pattern.freeVars).map (fun bs => mobius bs * collapsed pattern n db b
+  bs)).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

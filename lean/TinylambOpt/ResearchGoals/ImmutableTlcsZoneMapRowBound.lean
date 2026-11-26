@@ -1,5 +1,18 @@
 import Std
 
+/-!
+Stale block-lazy header example where `maxKey` underreports the rows, causing
+`zmRowUpperBound` to undercount actual surviving rows.
+
+Modeled claims
+
+- `Goal` — Immutable TLCS v3 zone-map row-count upper bound (TPC-DS Q22 1-pass ROLLUP
+  `exact_integer_total` restore): when blocks carry immutable valid headers, summing
+  row counts of zone-map-matching blocks upper-bounds surviving probe rows, so
+  `zmRows * buildFanout * maxAbs ≤ exactLimit` guarantees `(survivingRows *
+  buildFanout) * maxAbs ≤ exactLimit`.
+-/
+
 namespace TinylambOpt.ResearchGoals.ImmutableTlcsZoneMapRowBound
 
 structure Block where

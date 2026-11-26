@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved
+
+- `PairedHoles.EraseZeroPair` — `∀ a b, legal model 0 (a++[false,false]++b) = legal
+  model 0 (a++b)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

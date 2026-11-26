@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.BitPatterns
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (13 claims, including the following)
+
+- `AmortizedWindow` — `∀ (n oldWidth newWidth header : Nat), newWidth ≤ oldWidth →
+  (header+n*newWidth < n*oldWidth ↔ header < n*(oldWidth-newWidth))`
+- `ByteShuffle` — `∀ xs i, i < xs.length → (∀ x ∈ xs, x < 2^64) → fromLittle
+  ((List.range 8).map (fun j => (bytePlanes xs)[j*xs.length+i]?.getD 0)) =
+  xs[i]?.getD 0`
+- `CommonHighBits` — `∀ a b k, a/2^k = b/2^k → (a ^^^ b) < 2^k`
+
+Refuted by counterexample
+
+- `ZeroAlias` — `∀ xs : List Nat, (xs.map (fun x => if x == 2^63 then 0 else x)) = xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -523,3 +541,8 @@ theorem NarrowWithExceptions_sound :
   constructor <;> intro hlt <;> omega
 
 end TinylambOpt.ResearchProofs.Compression.BitPatterns
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp
+-- table/tlcs_file.hpp

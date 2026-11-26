@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.Frontiers.PlanMarkets
 
 /-! Cascades alternatives and materialization. Costs are explicit model units:

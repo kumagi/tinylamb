@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+
+Proved
+
+- `PageMoments.TrimError` — `∀ s c r, let inside := trimmed s c r let err :=
+  (s.sum-(s.length:Int)*c) - (inside.sum-(inside.length:Int)*c) err^2 ≤
+  ((s.length-inside.length:Nat):Int)*(energy s c-energy inside c)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

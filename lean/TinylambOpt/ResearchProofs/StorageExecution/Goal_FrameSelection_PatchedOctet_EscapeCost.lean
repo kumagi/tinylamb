@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `PatchedOctet.EscapeCost` — `∀ xs, (write xs).length = xs.length + ((xs.filter (· ≥
+  255)).map (fun v => ubytes (v-255))).sum`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

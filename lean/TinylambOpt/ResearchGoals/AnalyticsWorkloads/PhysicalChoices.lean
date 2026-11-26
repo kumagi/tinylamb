@@ -2,6 +2,11 @@ import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Common
 import TinylambOpt.ResearchGoals.CheckedAggregateTree
 import TinylambOpt.ResearchGoals.ColumnarToPgWireChunkedFramingEquiv
 
+/-!
+These models describe plan alternatives for analytical SQL, with row multiplicity and
+aggregate state made explicit.
+-/
+
 namespace TinylambOpt.ResearchGoals.AnalyticsWorkloads.PhysicalChoices
 
 /-- J2/C1/H5. Keep exact heavy-key frequencies and aggregate the remaining keys

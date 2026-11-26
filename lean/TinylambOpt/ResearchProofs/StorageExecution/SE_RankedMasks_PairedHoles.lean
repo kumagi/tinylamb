@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_RankedMasks_Common
+
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+
+Proved (10 claims, including the following)
+
+- `PairedHoles.Cofactor` — Compute a parallel shard count by conditioning on its prefix
+  state.
+- `PairedHoles.Decoder` — Recreate every accepted bitmap from its compact code.
+- `PairedHoles.EraseZeroPair` — `∀ a b, legal model 0 (a++[false,false]++b) = legal
+  model 0 (a++b)`
+-/
 -- Proves all 10 `StorageExecution.RankedMasks/PairedHoles` goals.
 open TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 set_option maxHeartbeats 0

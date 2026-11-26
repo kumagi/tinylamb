@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Naive 3-way FK-FK star-hub join `(H ⋈_{k} B1) ⋈_{k} B2` followed by `GROUP BY H.g`
+computing `(COUNT(*), COUNT(B1.v), SUM(B1.v))`.
+
+Star-hub 3-way factorization without FK-FK blowup: summarizes `B1` per key to `(c1, nn1,
+s1)` and `B2` per key to `c2`, then scans `H` once, summing `c1 * c2`, `nn1 * c2`, and
+`s1 * c2` per matching hub row.
+
+Modeled claims
+
+- `Goal` — Star-hub 3-way FK-FK weighted-product factorization (STATS-CEB C1, C5 / JOB
+  J5 / LDBC L2 / DictionaryJoinsAndLateLabels B3): independent pre-aggregation of
+  value branch `B1` and multiplicity branch `B2` keyed by hub FK `k`, combined in a
+  single scan over `H`, avoids intermediate FK-FK tuple blowup while preserving exact
+  `(COUNT(*), COUNT(B1.v), SUM(B1.v))`.
+-/
+
 namespace TinylambOpt.ResearchGoals.StarHubMultiwayWeightedProduct
 
 structure HRow where
@@ -89,7 +106,7 @@ def optStarHub (hs : List HRow) (b1s : List B1Row) (b2s : List B2Row) (g : Int) 
   (st.1, st.2.1, if st.2.1 == 0 then none else some st.2.2)
 
 /-- Star-hub 3-way FK-FK weighted-product factorization (STATS-CEB C1, C5 /
-    JOB J5 / LDBC L2 / BigBench B3): independent pre-aggregation of value branch
+    JOB J5 / LDBC L2 / DictionaryJoinsAndLateLabels B3): independent pre-aggregation of value branch
     `B1` and multiplicity branch `B2` keyed by hub FK `k`, combined in a single
     scan over `H`, avoids intermediate FK-FK tuple blowup while preserving exact
     `(COUNT(*), COUNT(B1.v), SUM(B1.v))`. -/

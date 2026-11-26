@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved (10 claims, including the following)
+
+- `Contiguous.BridgeGap` — `∀ fee x y, x<y → (price fee x y ≤ price fee x x+price fee y
+  y ↔ y-x-1≤fee)`
+- `Contiguous.GatherOrder` — `∀ (seekFee : Nat), gatherOrder (price seekFee)`
+- `Contiguous.LatencyCap` — `∀ (seekFee : Nat), latencyCap (price seekFee)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.GatherPlans.Contiguous
 open TinylambOpt.ResearchGoals.StorageExecution
 open TinylambOpt.ResearchGoals.StorageExecution.GatherPlans

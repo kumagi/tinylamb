@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+
+Bag sum of `Totals` as a right fold.
+
+Named results include `totals_ext`, `plus_comm`, `plus_assoc`.
+-/
+
 namespace TinylambOpt.ResearchProofs.CloudBI.Helpers
 
 open TinylambOpt.ResearchGoals.AnalyticsWorkloads

@@ -881,8 +881,11 @@ class PostgresServer::
     size_t chunk_row_count{0};
     std::vector<std::string> column_names;
     std::vector<ValueType> column_types;
+    std::vector<uint16_t> result_formats;
     size_t row_count{0};
     bool header_sent{false};
+    bool emit_row_description{true};
+    bool emit_ready_for_query_on_finish{true};
     // Set when the wire chunk for the final (exhausted) result has been
     // queued: PumpActiveStream skips the pull and runs the continuation, so
     // the stream object can also serve as the per-turn re-arm marker for
@@ -980,6 +983,24 @@ class PostgresServer::
     std::unordered_map<std::string, std::string, SqlTextHash, std::equal_to<>>
         literal_constant_replies;
     size_t literal_constant_reply_bytes{0};
+
+    // PostgreSQL v3 Extended Query Protocol per-session state.
+    struct PreparedStatementState {
+      std::string query;
+      std::vector<uint32_t> param_types;
+    };
+    struct PortalState {
+      std::string query;
+      std::vector<uint16_t> result_formats;
+      bool described{false};
+      bool is_select{false};
+      std::unique_ptr<ActiveSelectStream> stream;
+    };
+    std::unordered_map<std::string, PreparedStatementState> prepared_statements;
+    std::unordered_map<std::string, PortalState> portals;
+    // Set after an error in an Extended Query message; subsequent P/B/D/E/C
+    // messages are ignored until Sync ('S') clears it.
+    bool extended_query_failed{false};
   };
 
   struct ReadTask {
@@ -1501,15 +1522,33 @@ class PostgresServer::
         continue;  // Flush: queued output is already writable.
       }
       if (type == 'S') {
+        client.extended_query_failed = false;
         Queue(client, pgwire::ReadyForQuery(client.transaction_status));
         continue;
       }
-      // Unsupported extended-protocol messages get an ErrorResponse only;
-      // ReadyForQuery is owed by Sync so that one Sync always closes with
-      // exactly one RFQ (Parse+Sync must not yield two).
+      if (type == 'P' || type == 'B' || type == 'D' || type == 'E' ||
+          type == 'C') {
+        if (client.extended_query_failed) {
+          continue;  // PostgreSQL v3: ignore extended messages until Sync.
+        }
+        if (type == 'P') {
+          HandleParseMessage(client, payload);
+        } else if (type == 'B') {
+          HandleBindMessage(client, payload);
+        } else if (type == 'D') {
+          HandleDescribeMessage(client, payload);
+        } else if (type == 'E') {
+          HandleExecuteMessage(client, payload);
+        } else {
+          HandleCloseMessage(client, payload);
+        }
+        continue;
+      }
+      // Unsupported frontend messages get an ErrorResponse only; ReadyForQuery
+      // is owed by Sync so that one Sync always closes with exactly one RFQ.
       Queue(client, pgwire::ErrorResponse(
                         "frontend message type is not supported", "0A000"));
-      // P1660: a Parse/Bind sprinkled into an explicit block is likewise a
+      // P1660: an unsupported message sprinkled into an explicit block is a
       // protocol violation; abort the block rather than letting it ride to
       // a later COMMIT at status 'T'.
       AbortTransactionForProtocolViolation(client);
@@ -1836,6 +1875,525 @@ class PostgresServer::
       return;
     }
     ExecuteStatements(client, statements);
+  }
+
+  void FailExtendedProtocol(Client& client, std::string_view message,
+                            std::string_view sqlstate,
+                            bool abort_tx_block = true) {
+    client.extended_query_failed = true;
+    Queue(client, pgwire::ErrorResponse(message, sqlstate));
+    if (abort_tx_block) {
+      AbortTransactionForProtocolViolation(client);
+    }
+  }
+
+  void HandleParseMessage(Client& client, std::string_view payload) {
+    auto parsed = pgwire::ParseParseMessage(payload);
+    if (!parsed.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
+      return;
+    }
+    pgwire::ParseMessage msg = std::move(parsed).MoveValue();
+    client.prepared_statements.insert_or_assign(
+        std::move(msg.statement_name),
+        Client::PreparedStatementState{
+            .query = std::move(msg.query),
+            .param_types = std::move(msg.param_types),
+        });
+    Queue(client, pgwire::ParseComplete());
+  }
+
+  void HandleBindMessage(Client& client, std::string_view payload) {
+    auto parsed = pgwire::ParseBindMessage(payload);
+    if (!parsed.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
+      return;
+    }
+    pgwire::BindMessage msg = std::move(parsed).MoveValue();
+    const auto it = client.prepared_statements.find(msg.statement_name);
+    if (it == client.prepared_statements.end()) {
+      FailExtendedProtocol(
+          client, "prepared statement \"" + msg.statement_name + "\" does not exist",
+          "26000");
+      return;
+    }
+    auto bound = pgwire::BindSqlParameters(
+        it->second.query, it->second.param_types, msg.param_formats, msg.params);
+    if (!bound.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(bound.GetStatus()), "08P01");
+      return;
+    }
+    Client::PortalState portal;
+    portal.query = std::move(bound).MoveValue();
+    portal.result_formats = std::move(msg.result_formats);
+    client.portals.insert_or_assign(std::move(msg.portal_name),
+                                    std::move(portal));
+    Queue(client, pgwire::BindComplete());
+  }
+
+  void HandleCloseMessage(Client& client, std::string_view payload) {
+    auto parsed = pgwire::ParseCloseMessage(payload);
+    if (!parsed.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
+      return;
+    }
+    const pgwire::CloseMessage msg = std::move(parsed).MoveValue();
+    if (msg.target == 'S') {
+      client.prepared_statements.erase(msg.name);
+    } else {
+      client.portals.erase(msg.name);
+    }
+    Queue(client, pgwire::CloseComplete());
+  }
+
+  void HandleDescribeMessage(Client& client, std::string_view payload) {
+    auto parsed = pgwire::ParseDescribeMessage(payload);
+    if (!parsed.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
+      return;
+    }
+    const pgwire::DescribeMessage msg = std::move(parsed).MoveValue();
+    if (msg.target == 'S') {
+      const auto it = client.prepared_statements.find(msg.name);
+      if (it == client.prepared_statements.end()) {
+        FailExtendedProtocol(
+            client, "prepared statement \"" + msg.name + "\" does not exist",
+            "26000");
+        return;
+      }
+      Queue(client, pgwire::ParameterDescription(it->second.param_types));
+      auto split = pgwire::SplitSqlStatementsWithPositions(it->second.query);
+      if (!split.HasValue() || split.Value().empty()) {
+        Queue(client, pgwire::NoData());
+        return;
+      }
+      if (client.transaction_status == 'E') {
+        FailExtendedProtocol(
+            client,
+            "current transaction is aborted, commands ignored until end of "
+            "transaction block",
+            "25P02");
+        return;
+      }
+      // Execute read-only inspection only when there are no unbound parameters.
+      if (!it->second.param_types.empty() ||
+          it->second.query.find('$') != std::string::npos) {
+        Queue(client, pgwire::NoData());
+        return;
+      }
+      const std::string& sql = split.Value()[0].text;
+      if (!IsReadOnly(split.Value())) {
+        Queue(client, pgwire::NoData());
+        return;
+      }
+      try {
+        ScopedUdfSessionScope udf_scope(client.id);
+        ScopedPreparedPlanSession plan_cache_scope(client.plan_cache.get());
+        auto ctx = std::make_unique<TransactionContext>(
+            database_->BeginReadOnlyContext());
+        SqlEngine engine(*database_);
+        StatusOr<QueryResult> executed = engine.Execute(*ctx, sql);
+        if (!executed.HasValue()) {
+          const std::string error = engine.LastError().empty()
+                                        ? StatusMessage(executed.GetStatus())
+                                        : engine.LastError();
+          FailExtendedProtocol(client, error,
+                               SqlStateForStatus(executed.GetStatus(), "42601"));
+          return;
+        }
+        QueryResult result = std::move(executed.Value());
+        if (!result.Statement() ||
+            *result.Statement() != StatementType::kSelect) {
+          Queue(client, pgwire::NoData());
+          return;
+        }
+        Queue(client,
+              pgwire::RowDescription(BuildColumnDescriptions(
+                  result.ColumnNames(), Row(), result.ColumnNames().size(),
+                  result.ColumnTypes())));
+      } catch (const std::exception&) {
+        const Status failure =
+            StatusFromCurrentException("statement describe failed");
+        FailExtendedProtocol(client, failure.GetMessage(),
+                             SqlStateForStatus(failure, "XX000"));
+      }
+      return;
+    }
+
+    // Describe Portal ('P').
+    const auto it = client.portals.find(msg.name);
+    if (it == client.portals.end()) {
+      FailExtendedProtocol(client,
+                           "portal \"" + msg.name + "\" does not exist",
+                           "34000");
+      return;
+    }
+    Client::PortalState& portal = it->second;
+    if (client.transaction_status == 'E') {
+      FailExtendedProtocol(
+          client,
+          "current transaction is aborted, commands ignored until end of "
+          "transaction block",
+          "25P02");
+      return;
+    }
+    auto split = pgwire::SplitSqlStatementsWithPositions(portal.query);
+    if (!split.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(split.GetStatus()), "54000");
+      return;
+    }
+    if (split.Value().empty()) {
+      portal.described = true;
+      portal.is_select = false;
+      Queue(client, pgwire::NoData());
+      return;
+    }
+    const std::string& sql = split.Value()[0].text;
+    if (!IsReadOnly(split.Value())) {
+      portal.described = true;
+      portal.is_select = false;
+      Queue(client, pgwire::NoData());
+      return;
+    }
+    try {
+      ScopedUdfSessionScope udf_scope(client.id);
+      ScopedPreparedPlanSession plan_cache_scope(client.plan_cache.get());
+      std::unique_ptr<TransactionContext> owned_txn;
+      TransactionContext* ctx = client.transaction.get();
+      if (ctx == nullptr) {
+        owned_txn = std::make_unique<TransactionContext>(
+            database_->BeginReadOnlyContext());
+        ctx = owned_txn.get();
+      }
+      SqlEngine engine(*database_);
+      StatusOr<QueryResult> executed = engine.Execute(*ctx, sql);
+      if (!executed.HasValue()) {
+        const std::string error = engine.LastError().empty()
+                                      ? StatusMessage(executed.GetStatus())
+                                      : engine.LastError();
+        FailExtendedProtocol(client, error,
+                             SqlStateForStatus(executed.GetStatus(), "42601"));
+        return;
+      }
+      QueryResult result = std::move(executed.Value());
+      if (!result.Statement() ||
+          *result.Statement() != StatementType::kSelect) {
+        portal.described = true;
+        portal.is_select = false;
+        Queue(client, pgwire::NoData());
+        return;
+      }
+      auto stream = std::make_unique<ActiveSelectStream>();
+      stream->column_names = result.ColumnNames();
+      stream->column_types = result.ColumnTypes();
+      stream->result_formats = portal.result_formats;
+      stream->emit_row_description = false;
+      stream->emit_ready_for_query_on_finish = false;
+      stream->owned_txn = std::move(owned_txn);
+      stream->in_client_txn = (client.transaction != nullptr);
+      stream->in_statement_block = true;
+      stream->statements =
+          std::make_shared<const std::vector<pgwire::SqlStatement>>();
+      stream->next_statement_idx = 0;
+      stream->result = std::make_unique<QueryResult>(std::move(result));
+      if (stream->result_formats.size() > 1 &&
+          stream->result_formats.size() != stream->column_names.size()) {
+        stream->result.reset();
+        FailExtendedProtocol(
+            client, "result format count does not match column count", "08P01");
+        return;
+      }
+      // Pull the first batch so RowDescription can infer types when plan-level
+      // ColumnTypes() is empty, without re-executing in Execute('E').
+      stream->chunk_row_offset = 0;
+      stream->chunk_row_count = stream->result->NextBatch(&stream->chunk);
+      if (stream->chunk_row_count == 0) {
+        const Status st = stream->result->GetStatus();
+        if (st != Status::kSuccess) {
+          stream->result.reset();
+          FailExtendedProtocol(client, st.GetMessage(),
+                               SqlStateForStatus(st, "XX000"));
+          return;
+        }
+        Queue(client, pgwire::RowDescription(
+                          BuildColumnDescriptions(
+                              stream->column_names, Row(),
+                              stream->column_names.size(), stream->column_types),
+                          stream->result_formats));
+      } else {
+        Queue(client, pgwire::RowDescription(
+                          BuildColumnDescriptions(
+                              stream->column_names, stream->chunk.RowAt(0),
+                              stream->column_names.size(), stream->column_types),
+                          stream->result_formats));
+      }
+      stream->header_sent = true;
+      portal.described = true;
+      portal.is_select = true;
+      portal.stream = std::move(stream);
+    } catch (const std::exception&) {
+      const Status failure =
+          StatusFromCurrentException("portal describe failed");
+      FailExtendedProtocol(client, failure.GetMessage(),
+                           SqlStateForStatus(failure, "XX000"));
+    }
+  }
+
+  void HandleExecuteMessage(Client& client, std::string_view payload) {
+    auto parsed = pgwire::ParseExecuteMessage(payload);
+    if (!parsed.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(parsed.GetStatus()), "08P01");
+      return;
+    }
+    const pgwire::ExecuteMessage msg = std::move(parsed).MoveValue();
+    const auto it = client.portals.find(msg.portal_name);
+    if (it == client.portals.end()) {
+      FailExtendedProtocol(client,
+                           "portal \"" + msg.portal_name + "\" does not exist",
+                           "34000");
+      return;
+    }
+    Client::PortalState& portal = it->second;
+    if (client.transaction_status == 'E') {
+      FailExtendedProtocol(
+          client,
+          "current transaction is aborted, commands ignored until end of "
+          "transaction block",
+          "25P02");
+      return;
+    }
+
+    auto stream_select = [&](std::unique_ptr<ActiveSelectStream> stream) {
+      stream->emit_ready_for_query_on_finish = false;
+      stream->in_statement_block = true;
+      if (!stream->statements) {
+        stream->statements =
+            std::make_shared<const std::vector<pgwire::SqlStatement>>();
+        stream->next_statement_idx = 0;
+      }
+      if (msg.max_rows > 0) {
+        // Bounded fetch: emit up to max_rows rows and suspend portal if more
+        // remain.
+        std::string wire;
+        size_t sent_this_call = 0;
+        while (sent_this_call < msg.max_rows) {
+          if (stream->chunk_row_offset >= stream->chunk_row_count) {
+            stream->chunk_row_offset = 0;
+            stream->chunk_row_count = stream->result->NextBatch(&stream->chunk);
+            if (stream->chunk_row_count == 0) {
+              const Status st = stream->result->GetStatus();
+              if (st != Status::kSuccess) {
+                stream->result.reset();
+                FailExtendedProtocol(client, st.GetMessage(),
+                                     SqlStateForStatus(st, "XX000"));
+                return;
+              }
+              if (!stream->header_sent) {
+                if (stream->emit_row_description) {
+                  wire += pgwire::RowDescription(
+                      BuildColumnDescriptions(
+                          stream->column_names, Row(),
+                          stream->column_names.size(), stream->column_types),
+                      stream->result_formats);
+                }
+                stream->header_sent = true;
+              }
+              wire += pgwire::CommandComplete(
+                  "SELECT " + std::to_string(stream->row_count));
+              stream->result.reset();
+              Queue(client, wire);
+              return;
+            }
+            if (!stream->header_sent) {
+              if (stream->emit_row_description) {
+                wire += pgwire::RowDescription(
+                    BuildColumnDescriptions(
+                        stream->column_names, stream->chunk.RowAt(0),
+                        stream->column_names.size(), stream->column_types),
+                    stream->result_formats);
+              }
+              stream->header_sent = true;
+            }
+          }
+          const size_t avail = stream->chunk_row_count - stream->chunk_row_offset;
+          const size_t want =
+              std::min(avail, static_cast<size_t>(msg.max_rows) - sent_this_call);
+          size_t written = 0;
+          const Status row_st = pgwire::AppendDataRowsFromChunk(
+              &wire, stream->chunk, stream->chunk_row_offset,
+              stream->chunk_row_offset + want, /*max_bytes=*/0,
+              stream->result_formats, &written);
+          if (row_st != Status::kSuccess) {
+            stream->result.reset();
+            FailExtendedProtocol(client, row_st.GetMessage(),
+                                 SqlStateForStatus(row_st, "XX000"));
+            return;
+          }
+          stream->chunk_row_offset += written;
+          stream->row_count += written;
+          sent_this_call += written;
+        }
+        wire += pgwire::PortalSuspended();
+        Queue(client, wire);
+        portal.stream = std::move(stream);
+        return;
+      }
+
+      // Unbounded fetch (max_rows == 0): reuse the chunked streaming pipeline.
+      std::string wire;
+      bool eof = false;
+      const Status chunk_st = PullSelectWireChunk(
+          stream.get(), kClientStreamChunkBytes, &wire, &eof);
+      if (chunk_st != Status::kSuccess) {
+        stream->result.reset();
+        FailExtendedProtocol(client, chunk_st.GetMessage(),
+                             SqlStateForStatus(chunk_st, "XX000"));
+        return;
+      }
+      if (!eof) {
+        if (stream->owned_txn) {
+          RecordReplyDependency(client, *stream->owned_txn);
+        }
+        if (client.transaction) {
+          RecordReplyDependency(client, *client.transaction);
+        }
+        if (client.output.size() - client.output_offset + wire.size() >
+            kMaxQueuedOutputBytes) {
+          stream->result.reset();
+          FailExtendedProtocol(
+              client, "result exceeds the server's queued-output limit",
+              "53200");
+          return;
+        }
+        stream->reply_durability_target = client.reply_durability_target;
+        client.last_activity = std::chrono::steady_clock::now();
+        if (client.output_offset != 0) {
+          client.output.erase(0, client.output_offset);
+          client.output_offset = 0;
+        }
+        Queue(client, wire);
+        client.active_stream = std::move(stream);
+        return;
+      }
+      stream->result.reset();
+      if (stream->owned_txn && !stream->owned_txn->IsFinished()) {
+        RecordReplyDependency(client, *stream->owned_txn);
+        const Status commit = CommitForReply(client, *stream->owned_txn);
+        if (commit != Status::kSuccess) {
+          FailExtendedProtocol(client,
+                               "transaction commit failed: " +
+                                   StatusMessage(commit),
+                               SqlStateForStatus(commit, "40001"));
+          return;
+        }
+      }
+      Queue(client, wire);
+    };
+
+    if (portal.stream != nullptr) {
+      std::unique_ptr<ActiveSelectStream> cached = std::move(portal.stream);
+      stream_select(std::move(cached));
+      return;
+    }
+
+    auto split = pgwire::SplitSqlStatementsWithPositions(portal.query);
+    if (!split.HasValue()) {
+      FailExtendedProtocol(client, StatusMessage(split.GetStatus()), "54000");
+      return;
+    }
+    if (split.Value().empty()) {
+      Queue(client, pgwire::EmptyQueryResponse());
+      return;
+    }
+    if (split.Value().size() > 1) {
+      FailExtendedProtocol(
+          client,
+          "cannot insert multiple commands into a prepared statement",
+          "42601");
+      return;
+    }
+    const pgwire::SqlStatement& stmt = split.Value()[0];
+    std::unique_ptr<TransactionContext> automatic;
+    TransactionContext* context = client.transaction.get();
+    if (context == nullptr) {
+      automatic = std::make_unique<TransactionContext>(
+          IsReadOnly(split.Value())
+              ? database_->BeginReadOnlyContext()
+              : database_->BeginContext());
+      context = automatic.get();
+    }
+    try {
+      ScopedSqlCpuAffinity sql_affinity;
+      ScopedUdfSessionScope udf_scope(client.id);
+      ScopedPreparedPlanSession plan_cache_scope(client.plan_cache.get());
+      SqlEngine engine(*database_);
+      StatusOr<QueryResult> executed = engine.Execute(*context, stmt.text);
+      if (!executed.HasValue()) {
+        const std::string error = engine.LastError().empty()
+                                      ? StatusMessage(executed.GetStatus())
+                                      : engine.LastError();
+        FailExtendedProtocol(client, error,
+                             SqlStateForStatus(executed.GetStatus(), "42601"));
+        return;
+      }
+      QueryResult result = std::move(executed.Value());
+      if (!result.Statement()) {
+        FailExtendedProtocol(client, "SQL statement type is unavailable",
+                             "XX000");
+        return;
+      }
+      const StatementType type = *result.Statement();
+      if (type == StatementType::kSelect) {
+        auto stream = std::make_unique<ActiveSelectStream>();
+        stream->column_names = result.ColumnNames();
+        stream->column_types = result.ColumnTypes();
+        stream->result_formats = portal.result_formats;
+        stream->emit_row_description = !portal.described;
+        stream->emit_ready_for_query_on_finish = false;
+        stream->owned_txn = std::move(automatic);
+        stream->in_client_txn = (client.transaction != nullptr);
+        stream->in_statement_block = true;
+        stream->statements =
+            std::make_shared<const std::vector<pgwire::SqlStatement>>();
+        stream->next_statement_idx = 0;
+        stream->result = std::make_unique<QueryResult>(std::move(result));
+        if (stream->result_formats.size() > 1 &&
+            stream->result_formats.size() != stream->column_names.size()) {
+          stream->result.reset();
+          FailExtendedProtocol(
+              client, "result format count does not match column count",
+              "08P01");
+          return;
+        }
+        stream_select(std::move(stream));
+        return;
+      }
+      int64_t affected_rows = 0;
+      const Status drain_status = DrainCommandResult(result, &affected_rows);
+      if (drain_status != Status::kSuccess) {
+        FailExtendedProtocol(
+            client,
+            "statement execution failed: " + StatusMessage(drain_status),
+            SqlStateForStatus(drain_status, "XX000"));
+        return;
+      }
+      if (automatic) {
+        RecordReplyDependency(client, *automatic);
+        const Status commit = CommitForReply(client, *automatic);
+        if (commit != Status::kSuccess) {
+          FailExtendedProtocol(
+              client, "transaction commit failed: " + StatusMessage(commit),
+              SqlStateForStatus(commit, "40001"));
+          return;
+        }
+      }
+      Queue(client, pgwire::CommandComplete(CommandTag(type, affected_rows)));
+    } catch (const std::exception&) {
+      const Status failure =
+          StatusFromCurrentException("statement execution failed");
+      FailExtendedProtocol(client, failure.GetMessage(),
+                           SqlStateForStatus(failure, "XX000"));
+    }
   }
 
   void EndOpenBlockDdl(Client& client) {
@@ -2371,9 +2929,13 @@ class PostgresServer::
               return st;
             }
             if (!stream->header_sent) {
-              *wire_out += pgwire::RowDescription(BuildColumnDescriptions(
-                  stream->column_names, Row(), stream->column_names.size(),
-                  stream->column_types));
+              if (stream->emit_row_description) {
+                *wire_out += pgwire::RowDescription(
+                    BuildColumnDescriptions(stream->column_names, Row(),
+                                            stream->column_names.size(),
+                                            stream->column_types),
+                    stream->result_formats);
+              }
               stream->header_sent = true;
             }
             *wire_out += pgwire::CommandComplete(
@@ -2387,9 +2949,13 @@ class PostgresServer::
                                "too many columns for PostgreSQL protocol");
           }
           if (!stream->header_sent) {
-            *wire_out += pgwire::RowDescription(BuildColumnDescriptions(
-                stream->column_names, stream->chunk.RowAt(0),
-                stream->column_names.size(), stream->column_types));
+            if (stream->emit_row_description) {
+              *wire_out += pgwire::RowDescription(
+                  BuildColumnDescriptions(
+                      stream->column_names, stream->chunk.RowAt(0),
+                      stream->column_names.size(), stream->column_types),
+                  stream->result_formats);
+            }
             stream->header_sent = true;
           }
           if (stream->chunk.ColumnCount() != stream->column_names.size()) {
@@ -2398,13 +2964,13 @@ class PostgresServer::
                 "SELECT row width disagrees with RowDescription");
           }
         }
-        while (stream->chunk_row_offset < stream->chunk_row_count &&
-               wire_out->size() < max_bytes) {
-          RETURN_IF_FAIL(pgwire::AppendDataRowFromChunk(
-              wire_out, stream->chunk, stream->chunk_row_offset));
-          ++stream->chunk_row_offset;
-          ++stream->row_count;
-        }
+        size_t rows_written = 0;
+        RETURN_IF_FAIL(pgwire::AppendDataRowsFromChunk(
+            wire_out, stream->chunk, stream->chunk_row_offset,
+            stream->chunk_row_count, max_bytes, stream->result_formats,
+            &rows_written));
+        stream->chunk_row_offset += rows_written;
+        stream->row_count += rows_written;
       }
       return Status::kSuccess;
     }
@@ -2416,9 +2982,13 @@ class PostgresServer::
           return st;
         }
         if (!stream->header_sent) {
-          *wire_out += pgwire::RowDescription(BuildColumnDescriptions(
-              stream->column_names, Row(), stream->column_names.size(),
-              stream->column_types));
+          if (stream->emit_row_description) {
+            *wire_out += pgwire::RowDescription(
+                BuildColumnDescriptions(stream->column_names, Row(),
+                                        stream->column_names.size(),
+                                        stream->column_types),
+                stream->result_formats);
+          }
           stream->header_sent = true;
         }
         *wire_out += pgwire::CommandComplete("SELECT " +
@@ -2435,9 +3005,13 @@ class PostgresServer::
                            "too many columns for PostgreSQL protocol");
       }
       if (!stream->header_sent) {
-        *wire_out += pgwire::RowDescription(BuildColumnDescriptions(
-            stream->column_names, row, stream->column_names.size(),
-            stream->column_types));
+        if (stream->emit_row_description) {
+          *wire_out += pgwire::RowDescription(
+              BuildColumnDescriptions(stream->column_names, row,
+                                      stream->column_names.size(),
+                                      stream->column_types),
+              stream->result_formats);
+        }
         stream->header_sent = true;
       }
       if (row.values_.size() != stream->column_names.size()) {
@@ -2456,7 +3030,7 @@ class PostgresServer::
                              "PostgreSQL DataRow cell exceeds uint32 length");
         }
       }
-      *wire_out += pgwire::DataRow(row);
+      *wire_out += pgwire::DataRow(row, stream->result_formats);
     }
     return Status::kSuccess;
   }
@@ -2552,7 +3126,11 @@ class PostgresServer::
         Queue(client,
               pgwire::ErrorResponse(chunk_st.GetMessage(),
                                     SqlStateForStatus(chunk_st, "XX000")));
-        Queue(client, pgwire::ReadyForQuery(client.transaction_status));
+        if (failed->emit_ready_for_query_on_finish) {
+          Queue(client, pgwire::ReadyForQuery(client.transaction_status));
+        } else {
+          client.extended_query_failed = true;
+        }
         return;
       }
 
@@ -2628,7 +3206,9 @@ class PostgresServer::
                     SqlStateForStatus(durable, "XX000")));
         }
       }
-      Queue(client, pgwire::ReadyForQuery(client.transaction_status));
+      if (finished->emit_ready_for_query_on_finish) {
+        Queue(client, pgwire::ReadyForQuery(client.transaction_status));
+      }
       return;
     }
 

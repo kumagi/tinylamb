@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Proved
+
+- `RectangleCutoff` — A lower bound at the smallest row count and largest grant prunes
+  a whole rectangle.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Refuted by counterexample
+
+- `CornersOnly` — Four corners alone certify a rectangle even across spill transitions.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

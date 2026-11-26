@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Proved
+
+- `SingleCrossing` — A crossing between a high-startup and a high-per-row plan is
+  one-directional.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

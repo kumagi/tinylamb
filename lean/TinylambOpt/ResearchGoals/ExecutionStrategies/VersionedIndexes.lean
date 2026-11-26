@@ -1,5 +1,10 @@
 import Std
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.VersionedIndexes
 
 /-! Immutable, committed versions with a total commit sequence per key. A tombstone

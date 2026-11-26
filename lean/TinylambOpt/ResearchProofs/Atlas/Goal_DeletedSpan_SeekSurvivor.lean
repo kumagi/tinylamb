@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `DeletedSpan.SeekSurvivor` — `∀ c (k : Nat), k < (rows layout c).length → ((rows
+  layout c)[k]?).map Prod.fst = some (if k < c.split then k else k+width c)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

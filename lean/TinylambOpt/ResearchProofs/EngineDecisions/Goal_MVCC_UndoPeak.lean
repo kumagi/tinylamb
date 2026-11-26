@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `UndoPeak` — Reserve the sum of the owners' maximum prefix demands. This is the least
+  sufficient space if rollbacks can interleave in any legal order.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -535,3 +545,6 @@ theorem sound : Goal := by
     omega
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_UndoPeak
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

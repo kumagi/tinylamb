@@ -1,5 +1,15 @@
 import Std.Tactic
 
+/-!
+Walk children of `r` on lane `l`, collecting the pairs it actually evaluates (in source
+order). `cells` is the list of cells of those already evaluated children; it is the
+argument to `needNext`.
+
+Reference: sequential evaluation of one lane.
+
+Named results include `childWalk_subset`, `childWalk_congr`, `rootEvalW_congr`.
+-/
+
 namespace TinylambOpt.Research.RuntimePredicateDag
 
 /-

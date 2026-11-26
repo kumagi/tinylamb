@@ -1,6 +1,14 @@
 import Std.Tactic
 import TinylambOpt.ThreeValued
 
+/-!
+Build one mark table by a right fold; each inner row updates only its non-NULL
+correlation key. The outer rows can reuse the resulting table.
+
+Named results include `evalInList_none_not_true`, `mem_values_iff_true`,
+`hasNull_of_in_false`.
+-/
+
 /-
 # 相関 NOT IN を NULL 対応マーク結合に置き換える
 

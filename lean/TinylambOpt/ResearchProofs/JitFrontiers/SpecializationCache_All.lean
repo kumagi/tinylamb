@@ -99,3 +99,12 @@ import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_Truncate
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_TruncateKey_DropLastField
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_TruncateKey_Period
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Goal_TruncateKey_CanonicalRange
+
+/-!
+This module collects proofs for Goal Bound Comparison One Version, Goal Bound Comparison
+Substitute, Goal Bound Comparison Key Minimal, Goal Bound Comparison Replay Batch and
+related cases.
+
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+-/

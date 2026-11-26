@@ -1,6 +1,25 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_FrameSelection_Common
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved (9 claims, including the following)
+
+- `SplitHigh.BoundedRaw` — A forced frame cap still limits worst-case expansion to raw
+  cells and per-frame overhead.
+- `SplitHigh.ByteFrontier` — Use the actual codec and raw fallback in the size/seek
+  optimum.
+- `SplitHigh.CommonUpper` — `∀ xs h, xs≠[] → (∀ x∈xs, x/256=h) → (write xs).length =
+  xs.length+ubytes h+ubytes xs.length`
+
+Refuted by counterexample
+
+- `SplitHigh.GreedyCut` — Aggressive hypothesis: the cheapest two adjacent groups never
+  need reconsideration when a third arrives.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

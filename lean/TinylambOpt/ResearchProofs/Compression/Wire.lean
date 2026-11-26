@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (17 claims, including the following)
+
+- `AlignmentDebt` — `∀ unit (sizes : List Nat), 0 < unit → (sizes.map (align unit)).sum
+  - align unit sizes.sum ≤ (sizes.length-1)*unit`
+- `BitPackBreakEven` — `∀ rows bits oldBytes overhead, overhead < rows*oldBytes →
+  (overhead + byteCount (rows*bits) < rows*oldBytes ↔ rows*bits ≤
+  8*(rows*oldBytes-overhead-1))`
+- `BitSplice` — `∀ w a b, pack w (a++b) = little (fromLittle (pack w a) +
+  2^(w*a.length)*fromLittle (pack w b)) (byteCount ((a.length+b.length)*w))`
+
+Refuted by counterexample
+
+- `MeanWidth` — `∀ xs : List Nat, xs ≠ [] → pack (width (xs.sum/xs.length)) xs = pack
+  (width (peak xs)) xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -791,3 +811,8 @@ theorem refutation_MeanWidth : ¬ MeanWidth.Goal := by
   exact hne hbad
 
 end TinylambOpt.ResearchProofs.Compression.Wire
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.cpp
+-- table/tlcs_file.hpp

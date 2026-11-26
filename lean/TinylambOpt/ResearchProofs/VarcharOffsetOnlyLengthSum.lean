@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.VarcharOffsetOnlyLengthSum
 
+/-!
+Proved
+
+- `Goal` — Offset-only `BYTE_LENGTH` & non-empty count on VarChar blocks (ClickBench
+  Q28): when a block satisfies `ValidVarcharBlock` (monotone end-offsets with
+  zero-length NULL spans), `∑_{URL≠""} BYTE_LENGTH(URL)` equals `ends.getLast!` in
+  `O(1)` time and `O(1)` byte reads, and `COUNT(*)` reads only `(nulls, ends)`
+  without touching string payload bytes.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.VarcharOffsetOnlyLengthSum`.
+-/
+
 namespace TinylambOpt.ResearchProofs.VarcharOffsetOnlyLengthSum
 
 open TinylambOpt.ResearchGoals.VarcharOffsetOnlyLengthSum
@@ -343,3 +356,6 @@ theorem sound : TinylambOpt.ResearchGoals.VarcharOffsetOnlyLengthSum.Goal := by
   · decide
 
 end TinylambOpt.ResearchProofs.VarcharOffsetOnlyLengthSum
+
+-- C++ references to this model or its proof.
+-- executor/detail/columnar_tlcs_bindings.cpp

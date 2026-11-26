@@ -1,5 +1,26 @@
 import TinylambOpt.ResearchGoals.Frontiers.WorkloadBases
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `DirtyWeights` — `∀ n (row old new : Vec) (dirty : List Nat), dirty.Nodup → (∀ j ∈
+  dirty, j < n) → (∀ j < n, old j ≠ new j → j ∈ dirty) → dot n row new = dot n row
+  old + (dirty.map (fun j => row j*(new j-old j))).sum`
+- `EnergyBound` — `∀ n (row actual code : Vec), (dot n row actual - dot n row code)^2 ≤
+  dot n row row * total n (fun j => (actual j-code j)^2)`
+- `Indistinguishable` — `∀ n k (a b : Vec) (basis : Mat), (∀ h < k, dot n a (basis h) =
+  dot n b (basis h)) ↔ ∀ c : Vec, dot n a (fun j => dot k c (fun h => basis h j)) =
+  dot n b (fun j => dot k c (fun h => basis h j))`
+
+Refuted by counterexample
+
+- `FanoutOnly` — `∀ n (rc rs left : Vec) (rep : Nat → Nat), (∀ j < n, rep j < n ∧ rc
+  (rep j) = rc j) → dot n left rs = dot n left (fun j => rs (rep j))`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.WorkloadBases
 
 noncomputable section

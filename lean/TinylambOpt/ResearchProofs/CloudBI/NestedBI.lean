@@ -1,6 +1,24 @@
 import TinylambOpt.ResearchGoals.CloudBI.NestedBI
 import TinylambOpt.ResearchProofs.CloudBI.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+
+Proved (10 claims, including the following)
+
+- `BranchHistogram` — Flatten UNION ALL under an exact aggregate. Evaluate each
+  distinct branch as one partial state and multiply it by its number of occurrences
+  in the nested plan.
+- `CanonicalFilters` — Canonicalize conjunct sets for memo lookup once column bindings
+  have been resolved. Idempotence and reordering apply to pure total three-valued
+  expressions observed in WHERE. A duplicate UNION ALL consumer still contributes its
+  full bag.
+- `FlattenSum` — `∀ (groups : List (List (List (Option Int)))), finish (summarize
+  (groups.map (fun group => finish (summarize (group.map (fun leaf => finish
+  (summarize leaf))))))) = finish (summarize groups.flatten.flatten)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1180,3 +1198,9 @@ theorem sound_RangeMultiplicity : RangeMultiplicity.Goal := by
   rfl
 
 end TinylambOpt.ResearchProofs.CloudBI.NestedBI
+
+-- C++ references to this model or its proof.
+-- query/select_grouped_rewrites.cpp
+-- query/select_rewrites.hpp
+-- query/select_rewrites_test.cpp
+-- query/sql_engine.cpp

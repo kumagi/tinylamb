@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 
 open TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites (fits)

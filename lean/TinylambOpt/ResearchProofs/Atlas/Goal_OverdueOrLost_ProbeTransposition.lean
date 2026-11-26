@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
-import TinylambOpt.ResearchProofs.Atlas.RangePlans4
+import TinylambOpt.ResearchProofs.Atlas.RangePlans.WeekSessionAndVarianceIndexes
+
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `OverdueOrLost.ProbeTransposition` — `∀ b (ps rs : Rows), (∀ r ∈ rs, bounded b r.1) →
+  (ps.map (fun (p,w) => w * scan shape p rs)).sum = (rs.map (fun (r,w) => w * atPoint
+  (compile shape b ps) r)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -20,7 +31,7 @@ open TinylambOpt.ResearchGoals.Atlas.RangePlans.OverdueOrLost
 theorem sound_OverdueOrLost_ProbeTransposition :
     TinylambOpt.ResearchGoals.Atlas.RangePlans.OverdueOrLost.ProbeTransposition.Goal := by
   intro b ps rs hb
-  exact (TinylambOpt.ResearchProofs.Atlas.RangePlans4.OverdueOrLost.sound_OverdueOrLost_ProbeTransposition)
+  exact (TinylambOpt.ResearchProofs.Atlas.RangePlans.WeekSessionAndVarianceIndexes.OverdueOrLost.sound_OverdueOrLost_ProbeTransposition)
     b ps rs hb
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_OverdueOrLost_ProbeTransposition

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+
+Proved
+
+- `Variadic.LargerCall` — `∀ q e n, model.accept q e → q.pos ≤ n → model.accept {q with
+  pos := n} e`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

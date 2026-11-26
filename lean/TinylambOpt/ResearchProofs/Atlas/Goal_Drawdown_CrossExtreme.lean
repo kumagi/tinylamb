@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `Drawdown.CrossExtreme` — `∀ x y, x ≠ [] → y ≠ [] → measure (x++y) = max (max
+  (measure x) (measure y)) (x.max?.getD 0-y.min?.getD 0)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

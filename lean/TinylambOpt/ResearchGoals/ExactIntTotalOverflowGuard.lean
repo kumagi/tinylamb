@@ -1,5 +1,18 @@
 import Std
 
+/-!
+These claims relate a widened total to the bounds of a checked integer representation.
+SQL can choose a narrower aggregate path under the required range guarantee.
+
+Modeled claims
+
+- `Goal` — Parallel `exact_integer_total` + O(1) `constBlock` fold
+  (`executor/detail/fused_grouped_join.cpp`): when the sum of per-block absolute
+  magnitude bounds fits strictly within `int64Max` (`2^63 - 1`), associative
+  block-parallel summation and constant multiplication cannot overflow in any
+  evaluation order and match sequential checked SQL `SUM`.
+-/
+
 namespace TinylambOpt.ResearchGoals.ExactIntTotalOverflowGuard
 
 def int64Min : Int := -9223372036854775808

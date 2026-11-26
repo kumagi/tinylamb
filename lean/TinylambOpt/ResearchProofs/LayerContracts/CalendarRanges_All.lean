@@ -111,3 +111,15 @@ import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Goal_Payroll_Ave
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Goal_Payroll_CoverBlocks
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Goal_Payroll_ShortPeriod
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Goal_Payroll_OddBoundary
+
+/-!
+This module collects proofs for Common Calendar Ranges, Years Common, Facts Month, Facts
+Quarter and related cases.
+
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+-/
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/detail/columnar_tlcs_predicates.cpp

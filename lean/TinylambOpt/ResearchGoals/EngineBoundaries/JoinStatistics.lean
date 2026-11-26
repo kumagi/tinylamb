@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.SearchBounds
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+-/
+
 namespace TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
 open TinylambOpt.ResearchGoals.SearchBounds (fanout)

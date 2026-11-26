@@ -1,4 +1,19 @@
 import TinylambOpt.ResearchProofs.StorageExecution.SE_OrderedFooters_Common
+
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved (10 claims, including the following)
+
+- `LongestHole.AmendLeaf` — Update one cached block using the left and right partial
+  states.
+- `LongestHole.BridgeRun` — `∀ (a b : List Nat), let s := (a.reverse.takeWhile (· ==
+  0)).length let p := (b.takeWhile (· == 0)).length longestZero (a++b)=max (max
+  (longestZero a) (longestZero b)) (s+p)`
+- `LongestHole.FrameSlice` — Use only the two ragged boundaries and whole-page
+  summaries for a window.
+-/
 set_option maxHeartbeats 0
 set_option linter.unusedVariables false
 

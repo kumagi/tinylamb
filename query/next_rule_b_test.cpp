@@ -2,7 +2,7 @@
  * Regression tests for rule B: reordering a safe inner-join prefix in front of
  * a trailing LEFT JOIN, including USING joins.
  *
- * Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+ * Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
  *   (using_join_inner_prefix_reorder_and_filter_sound,
  *    outer_and_using_join_prefix_reorder_sound)
  */

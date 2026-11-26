@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Refuted by counterexample
+
+- `PredicateOrder.MarginalTie` — `∀ (rows : List Nat) (a b gate : Nat → Bool),
+  rows.countP a = rows.countP b → actual [(1,gate),(1,a),(1,b)] rows = actual
+  [(1,gate),(1,b),(1,a)] rows`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

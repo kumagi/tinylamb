@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.MVCC
 
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Proved
+
+- `ChainSummary` — Intern a run of identical values without losing (1) the visible
+  payload, (2) the commit dependency of a read, or (3) the conflict of a stale
+  writer.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false
@@ -154,3 +165,6 @@ theorem sound : Goal := by
       rw [hpay, hdep, hthird]
 
 end TinylambOpt.ResearchProofs.EngineDecisions.MVCC_ChainSummary
+
+-- C++ references to this model or its proof.
+-- transaction/mvcc_decisions.hpp

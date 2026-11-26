@@ -106,7 +106,7 @@ TEST_F(SqlGroupingSetsTest, RollupSingleKeyProducesSubtotalAndGrandTotal) {
 // An immutable INT64-valued expression as the aggregate child must take the
 // exact-partial ROLLUP path too (TPC-DS Q67 uses COALESCE(a*b, 0)), not just a
 // bare column reference.
-// Lean proof: lean/TinylambOpt/TpcdsNextDiscovery.lean
+// Lean proof: lean/TinylambOpt/RollupAndJoinFilterRewrites.lean
 //   (rollup_two_level_state_combine_sound,
 //   rollup_three_level_state_combine_sound)
 TEST_F(SqlGroupingSetsTest, RollupWithExpressionAggregateChildKeepsTotals) {

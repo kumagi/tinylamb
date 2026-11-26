@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.ExtentCount` — `∀ cap ids, 0 < cap → let ps := pages cap ids extents cap ids
+  + ps.countP (fun p => ps.contains (p+1)) = ps.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

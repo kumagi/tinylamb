@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `IntervalDeletes.OverlapDebt` — `∀ n a b, (live n (a++b)).length + ((live n a).countP
+  (blocked b)) = (live n a).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

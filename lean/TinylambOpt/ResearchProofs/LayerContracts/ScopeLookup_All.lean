@@ -99,3 +99,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.ScopeLookup.Goal_VisiblePrefix_
 import TinylambOpt.ResearchProofs.LayerContracts.ScopeLookup.Goal_VisiblePrefix_IncrementalInvalidate
 import TinylambOpt.ResearchProofs.LayerContracts.ScopeLookup.Goal_VisiblePrefix_EmptyPrefix
 import TinylambOpt.ResearchProofs.LayerContracts.ScopeLookup.Goal_VisiblePrefix_ExactIncluded
+
+/-!
+This module collects proofs for Goal Bare Column Posting, Goal Bare Column Indexed
+Scope, Goal Bare Column Flatten, Goal Bare Column Shadow Cut and related cases.
+
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+-/

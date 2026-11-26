@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+
+Proved
+
+- `FieldNumber.IndexedScope` — Posting lookup preserves missing, unique and ambiguous
+  outcomes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,27 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved (16 claims, including the following)
+
+- `AlphabeticMerge.OptimalTree` — `∀ ws, ws ≠ [] → (∃ t, weights t = ws ∧ work t = best
+  ws) ∧ ∀ t, weights t = ws → best ws ≤ work t`
+- `AlphabeticMerge.ReweightBound` — `∀ t i d, i < (weights t).length → work t = best
+  (weights t) → best ((weights t).modify i (·+d)) ≤ work t + d*depth t i`
+- `AlphabeticMerge.ScaleReuse` — `∀ ws c, 0 < c → cut (ws.map (c*·)) = cut ws`
+
+Refuted by counterexample
+
+- `PredicateOrder.MarginalTie` — `∀ (rows : List Nat) (a b gate : Nat → Bool),
+  rows.countP a = rows.countP b → actual [(1,gate),(1,a),(1,b)] rows = actual
+  [(1,gate),(1,b),(1,a)] rows`
+- `RiskEnvelope.MeanReserve` — `∀ xs, 0 < mass xs (fun _ => true) → let avg : Int :=
+  (xs.map (fun (v,w) => v*(w:Int))).sum / (mass xs (fun _ => true):Int) ∀ z, loss xs
+  avg 1 1 ≤ loss xs z 1 1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

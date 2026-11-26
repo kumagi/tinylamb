@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `KeywordCompany.TerminalKey` — `∀ n db b, reference pattern n db b = dot n (bridge n
+  db 0 2 (b 0)) (bridge n db 1 3 (b 0))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

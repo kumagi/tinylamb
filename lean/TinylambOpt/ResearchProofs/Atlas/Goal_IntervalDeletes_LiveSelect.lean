@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `IntervalDeletes.LiveSelect` — `∀ n rs (k : Nat), seek ((pieces n rs).filter (fun r
+  => !blocked rs r.1)) k = (live n rs)[k]?`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

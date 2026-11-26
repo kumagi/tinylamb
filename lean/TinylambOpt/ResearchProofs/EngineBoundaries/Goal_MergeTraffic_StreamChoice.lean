@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+
+Proved
+
+- `StreamChoice` — Streaming the root changes no cost ordering among plans for the same
+  non-leaf input.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

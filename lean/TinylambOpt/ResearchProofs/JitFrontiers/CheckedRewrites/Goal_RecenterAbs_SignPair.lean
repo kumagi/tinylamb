@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `RecenterAbs.SignPair` — `∀ w x y, fits w x → fits w (-x) → scalar rule w x y=scalar
+  rule w (-x) y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

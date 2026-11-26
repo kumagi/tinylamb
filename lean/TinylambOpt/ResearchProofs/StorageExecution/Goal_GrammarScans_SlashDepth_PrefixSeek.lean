@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `SlashDepth.PrefixSeek` — Only a partial final phrase needs to be interpreted to
+  obtain the state at an offset.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

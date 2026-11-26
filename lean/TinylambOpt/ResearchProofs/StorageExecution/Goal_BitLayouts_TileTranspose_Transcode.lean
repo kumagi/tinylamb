@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_BitLayouts_TileTranspose_Lossless
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `TileTranspose.Transcode` — Convert from this physical order to tight row-major bytes
+  using lane reads.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

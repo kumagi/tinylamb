@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.CoarserPages` — `∀ ids cap n, 0 < cap → 0 < n → (pages (cap*n) ids).length ≤
+  (pages cap ids).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.MergeTraffic
 
+/-!
+A merge or compaction can reorganize its input streams subject to the modeled ordering,
+traffic, and retention constraints.
+
+Refuted by counterexample
+
+- `RoundOnce` — Summing byte costs then rounding once can undercount per-run transfers.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

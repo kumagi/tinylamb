@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Refuted by counterexample
+
+- `StagnationIsPermanent` — A heavy first bit need not imply that deeper bits are
+  useless.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

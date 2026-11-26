@@ -1,6 +1,16 @@
 import Std
 import Std.Tactic
-import TinylambOpt.AggJoinDiscovery
+import TinylambOpt.JoinPreaggregation
+
+/-!
+SQL equality cannot match NULL, including NULL on both sides. The right input is a bag:
+each matching row produces another copy of the left row.
+
+Outer Option = arithmetic success, inner Option = presence of a GROUP BY row; the value
+inside that row is itself nullable.
+
+Named results include `posPart_nonneg`, `negPart_nonpos`, `pos_neg`.
+-/
 
 /-
 # 検査付き SUM の事前集約を結合前に移せる値域

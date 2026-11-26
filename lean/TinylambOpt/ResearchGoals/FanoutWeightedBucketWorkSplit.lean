@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Parallel probe over fanout-weighted probe chunks `pChunks` and build shards `bShards`:
+tracks global `anyMatched` across shards before emitting a single unmatched `(l, none)`
+sentinel.
+
+Buggy per-shard outer join that emits `(l, none)` independently on any shard that fails
+to match `l`, duplicating NULL extensions when match occurs only in other shards.
+
+Modeled claims
+
+- `Goal` — Fanout-weighted bucket-shard parallel join split for skewed `LEFT` and
+  `INNER` joins (STATS-CEB C4 / DictionaryJoinsAndLateLabels B2 / H2O H5 / JOB J4):
+  splitting skewed build buckets across `bShards` and probe batches by fanout cost
+  preserves the exact multiset of `(LRow, Option RRow)` pairs iff unmatched NULL
+  emission waits on global `anyMatched` across all shards.
+-/
+
 namespace TinylambOpt.ResearchGoals.FanoutWeightedBucketWorkSplit
 
 structure LRow where
@@ -52,7 +69,7 @@ def buggyPerShardLeftJoin (ls : List LRow) (bShards : List (List RRow)) :
     (bShards.map fun shard => refLeftJoin [l] shard).flatten).flatten
 
 /-- Fanout-weighted bucket-shard parallel join split for skewed `LEFT` and `INNER`
-    joins (STATS-CEB C4 / BigBench B2 / H2O H5 / JOB J4): splitting skewed build
+    joins (STATS-CEB C4 / DictionaryJoinsAndLateLabels B2 / H2O H5 / JOB J4): splitting skewed build
     buckets across `bShards` and probe batches by fanout cost preserves the exact
     multiset of `(LRow, Option RRow)` pairs iff unmatched NULL emission waits on
     global `anyMatched` across all shards. -/

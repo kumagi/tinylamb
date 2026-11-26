@@ -99,3 +99,16 @@ import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_XorLowBit_Pa
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_XorLowBit_SingletonSwap
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_Residue_SeekMinimum
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals.Goal_TwoLiterals_SeekMinimum
+
+/-!
+This module collects proofs for Goal Not Equal Seek Minimum, Goal Outside Closed Seek
+Minimum, Goal Ring Slice Seek Minimum, Goal Distance Band Seek Minimum and related
+cases.
+
+An index range plan must cover every qualifying key and preserve any gaps excluded by
+the SQL predicate.
+-/
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/detail/columnar_tlcs_predicates.cpp

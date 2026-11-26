@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `NullPeerFront` — NULL peers at the front all have rank one; their cumulative
+  fraction counts the full run.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

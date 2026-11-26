@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `DistributeScale.FinalImpliesInner` — `∀ w x y, fits w (3*x+3*y) → fits w (x+y)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

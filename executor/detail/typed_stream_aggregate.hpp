@@ -63,7 +63,7 @@ struct TypedFilterCompare {
 // The compiler admits only literal LIKE segments with optional edge '%'.
 // These byte comparisons match the AST's no-'_' LIKE path, without creating
 // owned Values. NULL rejection remains the caller's responsibility.
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (two_segment_like_greedy_earliest_iff, two_segment_like_no_first_literal)
 inline bool MatchTypedStringCompare(
     std::string_view value, const TypedFilterCompare& compare) noexcept {

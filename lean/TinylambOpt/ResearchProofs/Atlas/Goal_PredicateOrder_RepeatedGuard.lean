@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `PredicateOrder.RepeatedGuard` — `∀ c p middle tail rows, actual
+  ((c,p)::middle++(c,p)::tail) rows = actual ((c,p)::middle++tail) rows + c *
+  (rows.filter (fun r => p r && middle.all (fun t => t.2 r))).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PlanEnvelope
 
+/-!
+A cached or specialized plan needs the modeled validity conditions before it can serve a
+SQL invocation.
+
+Refuted by counterexample
+
+- `ReuseFirstRow` — Aggressive memo reuse: the LIMIT 1 winner remains a winner at every
+  larger row count.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

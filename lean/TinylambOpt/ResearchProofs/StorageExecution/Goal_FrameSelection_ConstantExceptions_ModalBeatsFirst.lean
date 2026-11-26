@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `ConstantExceptions.ModalBeatsFirst` — `∀ a b n, a≠b → 3≤n → (write
+  (b::a::List.replicate (n-1) b)).length < (write (a::List.replicate n b)).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

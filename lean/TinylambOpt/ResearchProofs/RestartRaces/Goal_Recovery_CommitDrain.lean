@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Recovery
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `CommitDrain` — Can a single-pass owner-buffered redo replace two-pass WAL-order
+  replay even for interleaved writers? A cheap boundary to test is whether the owner
+  of the last eligible image is also the last committer touching this key.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

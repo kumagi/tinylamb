@@ -1,4 +1,11 @@
 import TinylambOpt.ResearchGoals.EngineDecisions.Executor
+
+/-!
+These models compare concrete implementation choices in planning, execution,
+concurrency, or recovery against their stated observable contracts.
+
+Named results include `sound`.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false
@@ -293,3 +300,6 @@ theorem sound : Goal := by
   exact main_lemma runs.zipIdx (nodup_snd_zipIdx runs) off n
 
 end TinylambOpt.ResearchProofs.EngineDecisions.Exec_RunOffset
+
+-- C++ references to this model or its proof.
+-- executor/incremental_sort.cpp

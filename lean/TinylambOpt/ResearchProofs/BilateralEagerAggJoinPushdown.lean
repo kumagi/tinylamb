@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown
 
+/-!
+Proved
+
+- `Goal` — Bilateral eager aggregation pushdown across an M:N inner equi-join (H2O H5 /
+  STATS-CEB C1 / LDBC L2): pre-aggregating both `L` and `R` per join key into
+  `(COUNT(*), COUNT(v), SUM(v))` and multiplying orthogonal counts/sums matches full
+  pair materialization for every group, including empty, all-NULL, zero-canceling
+  sums, and NULL-join-key inputs.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BilateralEagerAggJoinPushdown
 
 open TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown
@@ -1268,3 +1281,6 @@ theorem sound : TinylambOpt.ResearchGoals.BilateralEagerAggJoinPushdown.Goal := 
     rw [optStats_eq, refStats_eq]
   rw [hstats]
 end TinylambOpt.ResearchProofs.BilateralEagerAggJoinPushdown
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

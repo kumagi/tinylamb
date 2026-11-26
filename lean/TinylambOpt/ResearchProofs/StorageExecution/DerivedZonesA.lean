@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (15 claims, including the following)
+
+- `BucketSum.BucketInverse` — `∀ t x y k, kernel.score t (x,y)=k ↔ k*(t+1)≤x+y ∧
+  x+y<(k+1)*(t+1)`
+- `BucketSum.SingleGroup` — `∀ t a b, (a.hi+b.hi)/(t+1)=(a.lo+b.lo)/(t+1) →
+  (kernel.bounds t a b).lo=(kernel.bounds t a b).hi`
+- `BucketSum.SoundInterval` — Bound a computed group or predicate key from independent
+  column min/max.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZonesA
 
 open TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
@@ -545,3 +559,10 @@ theorem sound_BucketSum_SingleGroup : TinylambOpt.ResearchGoals.StorageExecution
 end BucketSum
 
 end TinylambOpt.ResearchProofs.StorageExecution.DerivedZonesA
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/columnar_tlcs_scan_executor.cpp
+-- executor/detail/columnar_tlcs_fast_path.hpp
+-- executor/detail/columnar_tlcs_predicates.cpp
+-- executor/relational_scalar_counts.cpp

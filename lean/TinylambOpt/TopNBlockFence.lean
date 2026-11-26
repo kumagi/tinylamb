@@ -1,4 +1,12 @@
 import Std.Tactic
+
+/-!
+Sort direction of one ORDER BY term.
+
+NULL placement of one ORDER BY term.
+
+Named results include `optLt_irrefl`, `optLt_trans`, `optLt_trichotomy`.
+-/
 -- C++ counterpart: executor/topn.cpp (see issues/README.md).
 
 /-!
@@ -820,3 +828,6 @@ theorem sorted_payload_fence (key : α → Key) (k : Nat) (pre block : List α) 
     (leKey_trans _ _ _ hkb (hkb.symm.trans sy.symm) (leKey_of_better _ _ strict) (bound y hyb))
 
 end TinylambOpt.TopNBlockFence
+
+-- C++ references to this model or its proof.
+-- executor/topn.cpp

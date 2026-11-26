@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims describe when an execution path actually demands a scalar and its error.
+SQL evaluation can defer computing that scalar only while preserving the observed
+results.
+
+Modeled claims
+
+- `Goal` — `∀ inner outer, probe (index inner) outer = reference inner 0 outer`
+-/
+
 namespace TinylambOpt.ResearchGoals.DemandScalar
 
 abbrev Cell := Option Int

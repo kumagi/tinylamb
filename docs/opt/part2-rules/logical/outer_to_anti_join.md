@@ -38,7 +38,7 @@ graph TD
     // (wrapped in Selection(left_residual) when left-only conjuncts remain).
     // Sound when R.key is declared NOT NULL OR when ON predicate p rejects
     // NULLs on R.key.
-    // Lean proof: lean/TinylambOpt/Discovery.lean
+    // Lean proof: lean/TinylambOpt/OuterJoinToAntiJoin.lean
     //   (outer_to_anti_join_aggressive, outer_to_anti_join_equi_nullable_sound,
     //    bug_when_testing_non_join_nullable_col,
     //    bug_when_join_allows_null_match)
@@ -48,7 +48,7 @@ graph TD
 
 1. **左外部結合の特定**: 入力グループ内の式が `kOuterJoin` かつ `join_type == 0`（LEFT OUTER JOIN）であること（RIGHT および FULL は対象外。RIGHT は `right_to_left_outer_join` で正規化されます）。
 2. **NULL 検査と左側残余連言への分離**: 選択述語を `SplitConjuncts` で分解した各連言が、(a) 右側リレーション $R$ の列に対する `kIsNull`（少なくとも 1 つ以上）であるか、または (b) サブクエリ・集約・ウィンドウを含まず `SafeToReduceEvaluationCount` を満たす左側リレーション $L$ のみの純粋な残余連言であること。
-3. **一致行における非 NULL 保証（Lean 証明済み拡張）**: NULL 検査対象の列 $R.\text{col}$ が、カタログスキーマで NOT NULL / Primary Key と宣言されている（`ColumnIsDeclaredNonNull`）**または** 結合述語 $p$ が $R.\text{col}$ に対して NULL 拒否（`ExpressionRejectsNullsWhere`）であること（例: `ON t1.id = t2.id` では nullable な `t2.id` でも一致行では決して NULL になりません。Lean 証明: `lean/TinylambOpt/Discovery.lean`）。
+3. **一致行における非 NULL 保証（Lean 証明済み拡張）**: NULL 検査対象の列 $R.\text{col}$ が、カタログスキーマで NOT NULL / Primary Key と宣言されている（`ColumnIsDeclaredNonNull`）**または** 結合述語 $p$ が $R.\text{col}$ に対して NULL 拒否（`ExpressionRejectsNullsWhere`）であること（例: `ON t1.id = t2.id` では nullable な `t2.id` でも一致行では決して NULL になりません。Lean 証明: `lean/TinylambOpt/OuterJoinToAntiJoin.lean`）。
 4. **残余連言の保持**: 左側残余連言が存在する場合は裸の `kAntiJoin` を Selection グループに直接登録せず、派生グループ `outer_to_anti_base:...` に AntiJoin を置いた上で `Selection(left_residuals, AntiJoin(L, R, p))` を構築します（`InheritBranchLocal` で branch-local 性を継承。派生グループが元グループと一致する場合はスキップ）。
 
 ## 意味論的根拠と安全性制約

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `MirrorZones.JumpUnprofitable` — `∀ z fee x y, x<y → 1<fee → x/(z+1)<y/(z+1) → price
+  z fee x x + price z fee y y < price z fee x y`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

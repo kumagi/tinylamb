@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.SlotPlacement
 
+/-!
+Page allocation for stored SQL rows must preserve the byte ranges, alignment, and live
+data required by the modeled layout.
+
+Proved
+
+- `Interleave.FreeOtherLane` — `∀ r cap u i, fits model r cap u i → fits model r cap
+  ((band 0 cap).filter (fun x => x%2 != i%2) ++ u) i`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

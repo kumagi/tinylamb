@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.WaitCycles
 
+/-!
+Concurrency control must account for the modeled wait dependencies of SQL transactions.
+
+Refuted by counterexample
+
+- `OneVictim` — Aggressive: retiring the youngest in one detected cycle clears all
+  graph cycles.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

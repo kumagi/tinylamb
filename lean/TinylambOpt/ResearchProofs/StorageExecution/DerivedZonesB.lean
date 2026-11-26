@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (14 claims, including the following)
+
+- `BitwiseXor.AlignedSiblings` — `∀ k a b, (kernel.bounds 0 ⟨a*2^k,(a+1)*2^k-1⟩
+  ⟨b*2^k,(b+1)*2^k-1⟩).lo = (a ^^^ b)*2^k`
+- `BitwiseXor.FixedPrefix` — `∀ x y, kernel.bounds 0 ⟨x,x⟩ ⟨y,y⟩=⟨x ^^^ y,x ^^^ y⟩`
+- `BitwiseXor.SoundInterval` — Bound a computed group or predicate key from independent
+  column min/max.
+
+Refuted by counterexample
+
+- `QuadraticGap.GapWitness` — `∀ t a b, a.hi<b.lo → (kernel.bounds t a b).lo =
+  kernel.score t (a.hi,b.lo)`
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZonesB
 
 open TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
@@ -680,3 +698,8 @@ theorem sound_BitwiseXor_FixedPrefix : BitwiseXor.FixedPrefix.Goal := by
 #guard (BitwiseXor.kernel.bounds 0 ⟨2*8,3*8-1⟩ ⟨1*8,2*8-1⟩).lo == 3*8
 
 end TinylambOpt.ResearchProofs.StorageExecution.DerivedZonesB
+
+-- C++ references to this model or its proof.
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/detail/columnar_tlcs_fast_path.hpp
+-- executor/detail/columnar_tlcs_predicates.cpp

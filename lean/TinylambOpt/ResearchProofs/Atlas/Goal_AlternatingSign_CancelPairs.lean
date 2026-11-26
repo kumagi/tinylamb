@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `AlternatingSign.CancelPairs` — `∀ c, ((rows layout c).map Prod.snd).sum =
+  -c.step*((c.n/2:Nat):Int) + if c.n%2 == 1 then c.base+c.step*(c.n-1:Nat) else 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

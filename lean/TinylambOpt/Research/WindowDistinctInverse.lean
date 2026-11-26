@@ -299,3 +299,6 @@ theorem empty_edge_frame :
   decide
 
 end TinylambOpt.Research.WindowDistinctInverse
+
+-- C++ references to this model or its proof.
+-- executor/detail/window_eval.cpp

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `NegateTwice.SingleHole` — `∀ w x, fits w x → (scalar rule w x 0=.error 0 ↔ x= -limit
+  w)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

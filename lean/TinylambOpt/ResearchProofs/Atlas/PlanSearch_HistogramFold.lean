@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `RiskEnvelope.HistogramFold` — `∀ xs z a b, loss xs z a b = loss ((xs.map
+  Prod.fst).eraseDups.map (fun v => (v,mass xs (· == v)))) z a b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

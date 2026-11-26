@@ -1,0 +1,11 @@
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_ThreadStatisticsRefinesCatalog
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_SameLiveEpochDifferentSnapshot
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_CatalogLookupFailureCanRetry
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_CaseAliasInvalidationComplete
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_RenameInvalidationPreservesOtherTables
+import TinylambOpt.ResearchProofs.DatabaseCorrectness.Goal_StatisticsCache_AbortDdlEpochRevalidatesSnapshot
+
+/-! Aggregates the six registered proofs and counterexamples for the
+thread-local statistics cache model: catalog refinement, snapshot isolation,
+failed-fetch retry, case-alias invalidation, rename preservation, and
+epoch-based revalidation after aborted DDL. -/

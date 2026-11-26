@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.ReplyQueue
 
+/-!
+Sending query replies in batches must preserve the modeled order and delivery state.
+
+Proved
+
+- `CombineDrains` — A burst of short writes is observationally one write with the
+  combined quota.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

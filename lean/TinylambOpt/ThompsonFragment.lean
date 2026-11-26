@@ -1,5 +1,15 @@
 import Std.Tactic
 
+/-!
+Source semantics, independent of states, transitions and the compiler.
+
+Two independent directions. The forward field propagates a real match through any closed
+labeling. The invariant field constructs a labeling separating all spurious accepting
+paths from the source language.
+
+Named results include `assembled_state_count`.
+-/
+
 /- This file is a component of `TinylambOpt.RegexBitsetNfa`; the umbrella
    module imports it, and its declarations intentionally live in that API
    namespace rather than a namespace matching this fragment's file name. -/

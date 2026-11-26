@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.SpillLeases
 
+/-!
+A spillable operator's resource accounting must protect partitions still referenced by
+execution.
+
+Proved
+
+- `GenerationFence` — Recycling the same physical block cannot satisfy a read from its
+  former generation.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

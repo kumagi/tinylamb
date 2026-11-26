@@ -1743,7 +1743,7 @@ bool MayTlcsBlockMatch(const TlcsFile::BlockDirEntry& blk,
   }
 
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
   //   (BlockConjunctionZoneBitmapPrune_sound)
   // lean/TinylambOpt/ResearchProofs/StorageExecution/DerivedZonesA.lean
   //   (Product, SaturatingLoss, Distance, BucketSum: SoundInterval, SkipRange)
@@ -1949,7 +1949,7 @@ bool MayTlcsBlockMatch(const TlcsFile::BlockDirEntry& blk,
   }
 
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave9AnalyticsRemaining.lean
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/JoinMultiplicityAndZoneFilters.lean
   //   (MultiKeyInRangeZoneBlockSkip_sound)
   for (const TypedInListCompare& in : preds.inlists) {
     if (in.column >= blk.columns.size()) {
@@ -2404,7 +2404,7 @@ bool RowMatchesColPtrs(
     }
   }
   // Lean proof:
-  // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
   //   (BlockConjunctionZoneBitmapPrune_sound)
   for (const TypedFilterCompare& cmp : preds.compares) {
     const auto* lcol = col_ptrs[cmp.left];
@@ -2491,7 +2491,7 @@ bool RowMatchesColPtrs(
     }
     if (cmp.string_payload) {
       // Lean proof:
-      // lean/TinylambOpt/ResearchProofs/Wave9ClickBenchHighCardAndFilter.lean
+      // lean/TinylambOpt/ResearchProofs/QueryRewrites/BlockPruningAndBoundedGrouping.lean
       //   (NonEmptyStringFilterBeforeDictDecode_sound)
       if (cmp.string_match == TypedFilterCompare::StringMatchKind::kExact &&
           cmp.string_constant.empty() &&
@@ -2739,9 +2739,9 @@ bool RowMatchesColPtrs(
 // Lean proofs:
 //   lean/TinylambOpt/PhysicalJitFusion.lean
 //     (first_hit_decides_row, refine_candidates_sound)
-//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean
 //     (FrontCodedContains_sound)
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_ConcatSearch.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/BoundaryAwareSubstringSearch.lean
 //     (ConcatSearch.Goal)
 bool TryJitContainsRows(
     const ColumnarPredicateSet& preds,
@@ -2875,7 +2875,7 @@ bool TryJitContainsRows(
     if (!std::ranges::is_sorted(ends)) {
       continue;
     }
-    // ClickBenchLayout.Execution.ConcatSearch: search the concatenated byte
+    // ClickstreamLayout.Execution.ConcatSearch: search the concatenated byte
     // stream once, resolve each hit's row via monotonic upper_bound on `ends`,
     // reject cross-row matches (`needle_len <= end - match`), and jump to
     // `end` so each matching row is emitted at most once in row order.

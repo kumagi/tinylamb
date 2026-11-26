@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `Lexicographic.LateGather` — Restore the projected column through the serialized
+  ordinal map.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

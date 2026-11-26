@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `Drawdown.PeakRecovery` — `∀ a b, a≠[] → b≠[] → ((agg.reference (a++b)).map (fun r =>
+  r.2.2)).getD 0 ≥ peak a - b.min?.getD 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

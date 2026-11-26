@@ -99,3 +99,12 @@ import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Goal_SignedSum_Merg
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Goal_SignedSum_PeakEnvelope
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Goal_SignedSum_TwoEntryChecks
 import TinylambOpt.ResearchProofs.JitFrontiers.PrefixKernels.Goal_SignedSum_UncheckedFold
+
+/-!
+This module collects proofs for Goal Alternating Difference Drop Masked, Goal
+Alternating Difference Even Pairs, Goal Alternating Difference Exact Entry Guard, Goal
+Alternating Difference Failing Lane and related cases.
+
+Prefix computations can use vector or block summaries when their carried state produces
+the same per-row results.
+-/

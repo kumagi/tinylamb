@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Refuted by counterexample
+
+- `BatchWatermarks.FinalSummary` — `∀ a b, stamp a = stamp b → (a.map Prod.snd).sum =
+  (b.map Prod.snd).sum → ∀ t, score t a = score t b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

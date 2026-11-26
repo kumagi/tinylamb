@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Common_DemandSSA
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+
+Proved
+
+- `TrueGuard.DropGuardInFilter` — Can the guard be removed specifically at the WHERE
+  consumer?
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

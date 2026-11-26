@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.JoinStatistics
 
+/-!
+Join summaries and statistics must retain the multiplicity or bounds that the SQL
+planner derives from them.
+
+Proved
+
+- `EmptyCertificate` — Semijoin pruning can drop residuals when the *certified* upper
+  bound is zero.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Reference flat join followed by checked signed 64-bit `SUM(L.v)`. Returns `none` on
+overflow, `some none` when no non-NULL value joined.
+
+Unguarded pre-aggregation checks partial sums on ALL keys in `ls`, including dead
+unmatched keys!
+
+Modeled claims
+
+- `Goal` — Semijoin-guarded checked eager `SUM` (H2O H5 / STATS-CEB C1 / LDBC L2 /
+  BigBench B2): filtering the pre-aggregation side by semijoin existence against `R`
+  and bounding post-fanout positive and negative contributions within `[i64Min,
+  i64Max]` ensures exact agreement with sequential checked post-join `SUM`, while
+  eliminating false overflows caused by unmatched dead keys (`[i64Max, 1]`).
+-/
+
 namespace TinylambOpt.ResearchGoals.SemijoinGuardedCheckedEagerSum
 
 def i64Min : Int := -9223372036854775808

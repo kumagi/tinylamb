@@ -1,5 +1,12 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.PredicateBallots
 
+/-!
+Vector predicates use lane masks to carry the SQL truth or selection state into later
+operators.
+
+Named results include `bitvec_eq_of_lanes`, `ballotAux_getLsbD`, `ballot_getLsbD`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

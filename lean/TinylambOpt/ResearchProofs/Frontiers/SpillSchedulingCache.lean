@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.Frontiers.SpillScheduling
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `OfflineCache` — `∀ t cap k, (∃ state, legal t cap state ∧ k ≤ saved t state) ↔ ∃
+  chosen : List Arc, chosen.Nodup ∧ (∀ e ∈ chosen, e ∈ arcs t) ∧ fits t cap chosen ∧
+  k ≤ chosen.length`
+- `StackDistance` — `∀ trace cap, lru cap trace [] = trace.zipIdx.countP (fun (p,i) =>
+  (reuseDistance (trace.take i) p).any (· < cap))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unnecessarySimpa false

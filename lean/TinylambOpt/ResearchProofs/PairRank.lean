@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.PairRank
 
+/-!
+Proved
+
+- `Goal` — `∀ left right k, selectSum left right k = reference left right k`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.PairRank`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PairRank
 
 open TinylambOpt.ResearchGoals.PairRank

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `BalanceFloor.CreditLimit` — `∀ xs (credit : Int), 0 ≤ credit+(agg.reference xs).2 ↔
+  ∀ i≤xs.length, 0≤credit+(agg.reference (xs.take i)).1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

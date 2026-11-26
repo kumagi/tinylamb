@@ -1,5 +1,16 @@
 import Std
 
+/-!
+Unchecked truncation to 32 bits aliases `(lo1 + 2^32, lo2)` with `(lo1, lo2)`.
+
+Modeled claims
+
+- `Goal` — Worker-local `packed_2x32` fast aggregation + NULL/out-of-range fallback
+  merge (`executor/detail/fused_grouped_join.cpp` `packed_2x32`): fast-packed keys
+  and fallback keys remain disjoint and exact across arbitrary worker splits and
+  negative key bases.
+-/
+
 namespace TinylambOpt.ResearchGoals.PackedRadix2x32BatchAgg
 
 def twoPow32 : Int := 4294967296

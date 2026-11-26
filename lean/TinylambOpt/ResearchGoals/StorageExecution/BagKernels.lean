@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 
+/-!
+A grouped or join aggregate can operate on distinct keys and multiplicities instead of
+expanded non-NULL rows when the weighted result agrees.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.BagKernels
 open TinylambOpt.ResearchGoals.Compression.Wire
 

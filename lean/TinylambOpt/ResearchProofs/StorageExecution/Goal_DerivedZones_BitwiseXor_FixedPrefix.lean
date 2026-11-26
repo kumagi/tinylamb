@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `BitwiseXor.FixedPrefix` — `∀ x y, kernel.bounds 0 ⟨x,x⟩ ⟨y,y⟩=⟨x ^^^ y,x ^^^ y⟩`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

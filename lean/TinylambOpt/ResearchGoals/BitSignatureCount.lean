@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BlockCountModel
 
+/-!
+These claims use compact bit signatures to count matching keys. A scan must retain any
+information needed to distinguish keys sharing the same signature.
+
+Modeled claims
+
+- `Goal` — `∀ mask want (pages : List (Block W Meta)), (∀ b ∈ pages, b.header = summary
+  b.data ∧ b.size = b.data.length) → let r := execute (classify mask want) (test mask
+  want) pages r.count = ((pages.flatMap Block.data).filter (test mask want)).length ∧
+  ∀ b ∈ pages.zipIdx, b.2 ∈ reads r → ∃ i < 64, mask.getLsbD i = true ∧ (∃ x ∈
+  b.1.data, x.getLsbD i = true) ∧ (∃ y ∈ b.1.data, y.getLsbD i = false)`
+-/
+
 namespace TinylambOpt.ResearchGoals.BitSignatureCount
 
 open BlockCountModel

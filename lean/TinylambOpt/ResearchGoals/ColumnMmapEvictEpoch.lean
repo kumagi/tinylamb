@@ -1,5 +1,18 @@
 import Std
 
+/-!
+These claims describe the interaction between mapped column lifetimes and eviction
+epochs. A columnar SQL scan needs its mapped data to remain valid for the modeled
+access.
+
+Modeled claims
+
+- `Goal` — Pinned-block-safe LRU reclamation (`table/tlcs_file.cpp`
+  `EvictDecodedCacheForReclaim` / `EvictIdleColumnarHeadroom`): evicts the oldest
+  unpinned resident blocks until `target` bytes are reclaimed without ever touching
+  pinned blocks.
+-/
+
 namespace TinylambOpt.ResearchGoals.ColumnMmapEvictEpoch
 
 structure Entry where

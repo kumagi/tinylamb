@@ -1,5 +1,16 @@
 import Std.Tactic
 
+/-!
+A summary is just a mapping from an incoming state to (outgoing state, "accept seen
+after at least one consumed byte").
+
+Compose the summary of the first chunk with the summary of the second. The accept flag
+is the OR of the two chunks, while the end state flows from the first chunk into the
+second.
+
+Named results include `id_compose_left`, `id_compose_right`, `compose_assoc`.
+-/
+
 namespace TinylambOpt.DfaBlockSummary
 
 /-- Formal model of DFA block summaries for existence search on one long row.

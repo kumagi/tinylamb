@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.VectorMemory
 
 /-! Affine and indirect lane footprints. Buffers are one flat array of words;

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `SerpentinePlane.PageBudget` — Count addressed bytes once and bound a gather by both
+  the physical frame and the naive per-bit read count.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

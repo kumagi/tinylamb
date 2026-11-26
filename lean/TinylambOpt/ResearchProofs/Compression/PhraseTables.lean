@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.Compression.PhraseTables
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (13 claims, including the following)
+
+- `AliasPrune` — `∀ d ws, d.length ≤ 255 → charge d.eraseDups ws ≤ charge d ws`
+- `AmortizeSymbol` — `∀ d w ws, d.length < 255 → (charge (d++[w]) ws < charge d ws ↔
+  tableBytes (d++[w])-tableBytes d < (ws.map (fun s => (rowFrame d
+  s).length-(rowFrame (d++[w]) s).length)).sum)`
+- `ExternalTable` — `∀ d (blocks : List Words), blocks ≠ [] → (blocks.map (charge
+  d)).sum = charge d blocks.flatten + (blocks.length-1)*tableBytes d`
+
+Refuted by counterexample
+
+- `LongestIsOptimal` — `∀ d s, (greedy d s.length s).length = (encode d s).length`
+- `TrainOnPrefix` — `∀ a b train tail, charge a train ≤ charge b train → charge a
+  (train++tail) ≤ charge b (train++tail)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.PhraseTables
 
 open TinylambOpt.ResearchGoals.Compression.PhraseTables
@@ -1392,3 +1412,8 @@ theorem sound_AmortizeSymbol : TinylambOpt.ResearchGoals.Compression.PhraseTable
     exact (nat_add_lt_iff_sub_lt htbl hsumle).mpr hlt
 
 end TinylambOpt.ResearchProofs.Compression.PhraseTables
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.cpp
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.hpp

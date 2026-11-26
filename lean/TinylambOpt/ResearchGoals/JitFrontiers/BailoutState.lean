@@ -1,5 +1,10 @@
 import Std
 
+/-!
+An expression JIT must carry sufficient cursor and accumulator state when it resumes
+execution in a slower path.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.BailoutState
 
 /-! A compact grouped state backed by an association list. Bailout reports the

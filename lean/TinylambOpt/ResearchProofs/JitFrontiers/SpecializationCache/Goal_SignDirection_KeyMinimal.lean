@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.SpecializationCache
 import TinylambOpt.ResearchProofs.JitFrontiers.SpecializationCache.Common_SpecializationCache
 
+/-!
+Reusing compiled SQL expressions depends on which specialization inputs preserve the
+same observable behavior.
+
+Proved
+
+- `SignDirection.KeyMinimal` — Aggressive claim: different keys have distinguishable
+  behavior on a mutually eligible row.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

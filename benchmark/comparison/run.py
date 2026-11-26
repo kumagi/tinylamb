@@ -65,6 +65,12 @@ class Client:
             self.connection.autocommit = True
             # Bound network stalls on libpq too; the supervising process remains the hard deadline.
         self.cursor = self.connection.cursor()
+        self.binary_client = None
+        if engine == "tinylamb":
+            from pg_binary_client import PgExtendedBinaryClient
+            self.binary_client = PgExtendedBinaryClient(
+                host="127.0.0.1", port=ports[engine], user="bench", dbname="bench",
+                timeout=timeout)
         if engine == "mysql":
             self.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
             self.execute(f"SET SESSION max_execution_time = {timeout * 1000}")
@@ -77,6 +83,10 @@ class Client:
             return self.oracle.execute(sql)
         if self.engine == "duckdb":
             return self.duckdb.execute(sql)
+        if self.binary_client is not None:
+            from pg_binary_client import is_single_select_sql
+            if is_single_select_sql(sql):
+                return self.binary_client.query(sql)
         self.cursor.execute(sql)
         return self.cursor.fetchall() if self.cursor.description else []
 
@@ -84,6 +94,9 @@ class Client:
         if self.engine == "duckdb":
             self.duckdb.close()
             return
+        if self.binary_client is not None:
+            self.binary_client.close()
+            self.binary_client = None
         self.cursor.close()
         self.connection.close()
 

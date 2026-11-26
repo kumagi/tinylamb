@@ -1,5 +1,21 @@
 import Std
 
+/-!
+O(1) block length sum: reads ONLY the last offset without scanning any payload bytes or
+individual offsets.
+
+Counterexample: if a NULL row has a non-zero offset span (`ends = [5, 5]`),
+`ends.getLast!` overcounts actual non-NULL string lengths.
+
+Modeled claims
+
+- `Goal` — Offset-only `BYTE_LENGTH` & non-empty count on VarChar blocks (ClickBench
+  Q28): when a block satisfies `ValidVarcharBlock` (monotone end-offsets with
+  zero-length NULL spans), `∑_{URL≠""} BYTE_LENGTH(URL)` equals `ends.getLast!` in
+  `O(1)` time and `O(1)` byte reads, and `COUNT(*)` reads only `(nulls, ends)`
+  without touching string payload bytes.
+-/
+
 namespace TinylambOpt.ResearchGoals.VarcharOffsetOnlyLengthSum
 
 structure VarcharBlock where

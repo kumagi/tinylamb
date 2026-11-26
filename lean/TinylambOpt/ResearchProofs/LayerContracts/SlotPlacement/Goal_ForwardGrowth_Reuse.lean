@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement.ModelFacts_SlotPlacement
 
+/-!
+Page allocation for stored SQL rows must preserve the byte ranges, alignment, and live
+data required by the modeled layout.
+
+Proved
+
+- `ForwardGrowth.Reuse` — `∀ r cap u, fits model r cap u r.old → quick model r cap u =
+  some r.old`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

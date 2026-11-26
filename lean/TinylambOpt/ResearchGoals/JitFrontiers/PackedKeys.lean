@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+-/
+
 namespace TinylambOpt.ResearchGoals.JitFrontiers.PackedKeys
 
 /-! A word-key specialization returns none to route a row to the general

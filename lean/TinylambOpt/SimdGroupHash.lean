@@ -1,5 +1,12 @@
 import Std.Tactic
 
+/-!
+The partition routing can reorder sightings in other words. Every sighting of this word
+still reaches its single reduction owner.
+
+Named results include `int_hash_lane`, `full_vector_fits`, `decimal_pair_little_endian`.
+-/
+
 namespace TinylambOpt.SimdGroupHash
 
 def mix64 (key : BitVec 64) : BitVec 64 :=

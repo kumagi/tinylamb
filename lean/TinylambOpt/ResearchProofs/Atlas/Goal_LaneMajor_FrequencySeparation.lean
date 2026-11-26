@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `LaneMajor.FrequencySeparation` — `∀ c, c.step ≠ 0 → c.step.natAbs*(c.n/width c) <
+  c.bias.natAbs → (distinctValues layout c).length = c.n`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

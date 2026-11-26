@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.BoundedCountRadixDescSortEquiv
 
+/-!
+Proved
+
+- `Goal` — Signed 64-bit order-reversing LSB descending radix sort equivalence (H2O H2
+  / LDBC L2 / DictionaryJoinsAndLateLabels B1 / STATS-CEB C2 / JOB J4): for all
+  inputs with `key ∈ [i64Min, i64Max]` and any `(radix, passes)` with `2^64 ≤ radix ^
+  passes` (including both `(256, 8)` byte passes and `(16, 16)` nibble passes),
+  `radixSortDescWith` preserves the exact multiset (`count`), produces monotonically
+  descending keys (`b.key ≤ a.key`), and is stable.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BoundedCountRadixDescSortEquiv`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BoundedCountRadixDescSortEquiv
 
 open TinylambOpt.ResearchGoals.BoundedCountRadixDescSortEquiv
@@ -349,3 +363,6 @@ theorem sound : TinylambOpt.ResearchGoals.BoundedCountRadixDescSortEquiv.Goal :=
     exact pairwise_flip _ hflip hall'
 
 end TinylambOpt.ResearchProofs.BoundedCountRadixDescSortEquiv
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.hpp

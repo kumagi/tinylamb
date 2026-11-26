@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
 
 /-! Retracting one *present* non-NULL input from a window aggregate. The fast

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `CumeFromRuns` — Peer compression keeps CUME_DIST exact only if the peer run
+  contributes its full weight.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

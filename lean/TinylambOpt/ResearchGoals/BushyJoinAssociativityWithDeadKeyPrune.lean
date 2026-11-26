@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Left-deep chain evaluation `((A ⋈_{k1} B) ⋈_{k2} C) ⋈_{k3} D` retaining all intermediate
+columns.
+
+Bushy join plan with immediate dead-key projection pruning: `AB := π_{outA, k2}(A ⋈_{k1}
+B)` and `CD := π_{k2, outD}(C ⋈_{k3} D)`, dropping `k1` and `k3` before computing `AB
+⋈_{k2} CD`.
+
+Modeled claims
+
+- `Goal` — Bushy join associativity with dead-key column pruning on 4-table chain joins
+  (LDBC L1 / STATS-CEB C2 / JOB J4 / DictionaryJoinsAndLateLabels B3): reassociating
+  `((A ⋈ B) ⋈ C) ⋈ D` into `(A ⋈ B) ⋈ (C ⋈ D)` while immediately dropping dead join
+  keys (`k1`, `k3`) from intermediate schemas preserves exact multiset equality
+  across duplicates and NULL join keys.
+-/
+
 namespace TinylambOpt.ResearchGoals.BushyJoinAssociativityWithDeadKeyPrune
 
 structure ARow where
@@ -68,7 +85,7 @@ def optBushyPruned (aRows : List ARow) (bRows : List BRow)
       | _, _ => none
 
 /-- Bushy join associativity with dead-key column pruning on 4-table chain joins
-    (LDBC L1 / STATS-CEB C2 / JOB J4 / BigBench B3): reassociating
+    (LDBC L1 / STATS-CEB C2 / JOB J4 / DictionaryJoinsAndLateLabels B3): reassociating
     `((A ⋈ B) ⋈ C) ⋈ D` into `(A ⋈ B) ⋈ (C ⋈ D)` while immediately dropping dead
     join keys (`k1`, `k3`) from intermediate schemas preserves exact multiset
     equality across duplicates and NULL join keys. -/

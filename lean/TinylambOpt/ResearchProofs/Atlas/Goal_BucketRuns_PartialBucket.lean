@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
 
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `BucketRuns.PartialBucket` — `∀ c (j : Nat), c.step ≠ 0 → occurrence layout c
+  (c.base+c.step*j) = min (width c) (c.n-j*width c)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

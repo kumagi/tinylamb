@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `GrayPair.NeighborMask` — `∀ rs x y, let s := physical key rs; ((s.map key).count
+  (key (x,y))) = rs.count (x,y)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

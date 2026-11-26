@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.UnconditionalBlockSumAvgReuse
 
+/-!
+Proved
+
+- `Goal` — Block-level zone-map pruning, unconditional inner loop without per-row date
+  predicate evaluation, and shared `discPrice` / `(sumQty, cntQty)` state (TPC-H Q01,
+  TPC-DS Q17/Q35) match independent SQL aggregates when headers are valid, while
+  executing zero date checks on fully covered or excluded blocks.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.UnconditionalBlockSumAvgReuse`.
+-/
+
 namespace TinylambOpt.ResearchProofs.UnconditionalBlockSumAvgReuse
 
 open TinylambOpt.ResearchGoals.UnconditionalBlockSumAvgReuse
@@ -178,3 +190,6 @@ theorem sound : TinylambOpt.ResearchGoals.UnconditionalBlockSumAvgReuse.Goal := 
     exact dateChecks_zero cutoff bs { out := {}, dateChecks := 0 } hcover
 
 end TinylambOpt.ResearchProofs.UnconditionalBlockSumAvgReuse
+
+-- C++ references to this model or its proof.
+-- table/pax_chunk/pax_chunk_aggregate.cpp

@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.SemijoinGuardedCheckedEagerSum
 
+/-!
+Proved
+
+- `Goal` — Semijoin-guarded checked eager `SUM` (H2O H5 / STATS-CEB C1 / LDBC L2 /
+  BigBench B2): filtering the pre-aggregation side by semijoin existence against `R`
+  and bounding post-fanout positive and negative contributions within `[i64Min,
+  i64Max]` ensures exact agreement with sequential checked post-join `SUM`, while
+  eliminating false overflows caused by unmatched dead keys (`[i64Max, 1]`).
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SemijoinGuardedCheckedEagerSum`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SemijoinGuardedCheckedEagerSum
 
 open TinylambOpt.ResearchGoals.SemijoinGuardedCheckedEagerSum
@@ -1336,3 +1349,7 @@ theorem sound : TinylambOpt.ResearchGoals.SemijoinGuardedCheckedEagerSum.Goal :=
   · decide
 
 end TinylambOpt.ResearchProofs.SemijoinGuardedCheckedEagerSum
+
+-- C++ references to this model or its proof.
+-- executor/detail/analytics_factorized_join.cpp
+-- executor/detail/analytics_factorized_join.hpp

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.DemandSSA.Common_DemandSSA
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+
+Proved
+
+- `AndCommute.MaskedFault` — `∀ s, (run [.no,.fault s] rule.src).1=.no ∧ (run
+  [.no,.fault s] rule.dst).1=.fault s`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

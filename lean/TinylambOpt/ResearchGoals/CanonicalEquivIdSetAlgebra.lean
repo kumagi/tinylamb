@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Probe smallest set first (`f3`, then `f2`, then `f1`) in integer canonical
+equivalence-ID space for `INTERSECT DISTINCT`.
+
+Single-table bitmask/filter deletion in canonical equivalence-ID space for `(f1 \ f2) \
+f3` (`EXCEPT DISTINCT`).
+
+Modeled claims
+
+- `Goal` — Canonical integer equivalence-ID set algebra for `INTERSECT` / `EXCEPT`
+  (TPC-DS Q38/Q87/Q14): mapping projected join attributes via an injective canonical
+  ID preserves exact `INTERSECT` and `EXCEPT` cardinalities under smallest-channel
+  probing and direct deletion, whereas comparing raw surrogate keys is unsound when
+  multiple SKs share the same attribute.
+-/
+
 namespace TinylambOpt.ResearchGoals.CanonicalEquivIdSetAlgebra
 
 def insertUniq {α : Type} [BEq α] (xs : List α) (x : α) : List α :=

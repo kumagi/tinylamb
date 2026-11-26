@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved
+
+- `ScaledFloor.PartitionDomain` — `∀ u x ys, valid u ys → ((List.range (u/(x+1)+1)).map
+  (fun t => fan search u t x ys)).sum=ys.length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

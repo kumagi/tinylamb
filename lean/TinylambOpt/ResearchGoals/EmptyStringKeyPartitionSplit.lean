@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Split 3-way partition aggregation: hot `""` and `NULL` partitions aggregate over `Int`
+(`uid`) keys alone with zero string hashing/comparison, then merge their Top-K with the
+non-empty `(uid, s)` partition.
+
+Modeled claims
+
+- `Goal` — Empty-string partition split + cheap predicate reorder + exact int AVG
+  (ClickBench Q17/Q22/Q31/Q32): (1) partitioning `GROUP BY (uid, phrase)` into
+  `phrase = ""`, `phrase = NULL`, and `phrase ≠ ""` avoids string hashing on the hot
+  empty partition and agrees with unified Top-K, (2) checking `phrase ≠ ""` before
+  expensive `URL LIKE` preserves total boolean filtering while bounding substring
+  checks to `phrase ≠ ""` rows, and (3) integer `(sum, cnt)` accumulation preserves
+  `AVG(CAST(int AS FLOAT))`.
+-/
+
 namespace TinylambOpt.ResearchGoals.EmptyStringKeyPartitionSplit
 
 structure HitRow where

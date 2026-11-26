@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.DemandSSA
 
+/-!
+SQL expression lowering must preserve which values and errors are demanded on each
+active control-flow path.
+
+Named results include `run_eq_of_trace_slots`, `projection_imp_whereMask`,
+`readSetGuard_of_projection`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

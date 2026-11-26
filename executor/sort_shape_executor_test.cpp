@@ -531,7 +531,7 @@ TEST(SortShapeExecutorTest, MixedSignednessSingleKeyMatchesCanonicalOrder) {
   }
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/PackedOrderKey.lean (sound)
 TEST(SortShapeExecutorTest,
      PackedTwoKeyInt64MatchesFallbackAcrossNullOrdersAndOverflow) {
   struct ScopedEnv {  // NOLINT(cppcoreguidelines-special-member-functions):

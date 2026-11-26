@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.PackedRadix2x32BatchAgg
 
+/-!
+Proved
+
+- `Goal` — Worker-local `packed_2x32` fast aggregation + NULL/out-of-range fallback
+  merge (`executor/detail/fused_grouped_join.cpp` `packed_2x32`): fast-packed keys
+  and fallback keys remain disjoint and exact across arbitrary worker splits and
+  negative key bases.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.PackedRadix2x32BatchAgg`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PackedRadix2x32BatchAgg
 
 open TinylambOpt.ResearchGoals.PackedRadix2x32BatchAgg
@@ -905,3 +916,6 @@ theorem sound : TinylambOpt.ResearchGoals.PackedRadix2x32BatchAgg.Goal :=
   ⟨unpack_of_tryPack, sound_part2, sound_part3⟩
 
 end TinylambOpt.ResearchProofs.PackedRadix2x32BatchAgg
+
+-- C++ references to this model or its proof.
+-- executor/detail/fused_group_key_layout.cpp

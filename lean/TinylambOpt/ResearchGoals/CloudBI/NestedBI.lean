@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.AnalyticsWorkloads.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+-/
+
 namespace TinylambOpt.ResearchGoals.CloudBI.NestedBI
 open AnalyticsWorkloads
 

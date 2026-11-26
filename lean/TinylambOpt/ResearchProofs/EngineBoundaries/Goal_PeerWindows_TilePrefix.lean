@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `TilePrefix` — A cutoff on NTILE can become a bounded prefix read with no tile
+  computations per row.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

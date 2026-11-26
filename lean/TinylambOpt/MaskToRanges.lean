@@ -187,3 +187,6 @@ example : runs 0 (wordMask [0x8000000000000000#64, 0xffffffffffffffff#64] 65) =
     [(63,2)] := by decide
 
 end TinylambOpt.MaskToRanges
+
+-- C++ references to this model or its proof.
+-- executor/selection_vector.hpp

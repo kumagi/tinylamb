@@ -1,5 +1,10 @@
 import Std
 
+/-!
+A query can use a synopsis to avoid inspecting some input only when the claimed bounds
+hold for the underlying data.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
 namespace Samples

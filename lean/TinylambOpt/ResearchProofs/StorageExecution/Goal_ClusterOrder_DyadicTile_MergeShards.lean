@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
 import TinylambOpt.ResearchProofs.StorageExecution.Goal_ClusterOrder_DyadicTile_TileBijection
 
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved
+
+- `DyadicTile.MergeShards` — A stable merge of independently clustered shards recovers
+  the global physical order.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.QuantifiedRangeSummary
 
+/-!
+Proved
+
+- `Goal` — `∀ q rows key x, probe q (index rows) key x = reference q rows key x`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.QuantifiedRangeSummary`.
+-/
+
 namespace TinylambOpt.ResearchProofs.QuantifiedRangeSummary
 
 open TinylambOpt.ResearchGoals.QuantifiedRangeSummary
@@ -920,3 +928,8 @@ theorem sound : TinylambOpt.ResearchGoals.QuantifiedRangeSummary.Goal := by
                     rw [if_neg hc1, if_neg hc2, if_neg hR1, if_neg hR2]
 
 end TinylambOpt.ResearchProofs.QuantifiedRangeSummary
+
+-- C++ references to this model or its proof.
+-- executor/detail/subquery_runtime.cpp
+-- executor/detail/subquery_runtime.hpp
+-- executor/relational_regression_test_part11.cpp

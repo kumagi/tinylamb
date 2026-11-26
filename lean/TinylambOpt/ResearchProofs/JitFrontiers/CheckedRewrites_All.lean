@@ -99,3 +99,11 @@ import TinylambOpt.ResearchProofs.JitFrontiers.CheckedRewrites.Goal_RecenterAbs_
 import TinylambOpt.ResearchProofs.JitFrontiers.CheckedRewrites.Goal_RecenterAbs_FinalOnly
 import TinylambOpt.ResearchProofs.JitFrontiers.CheckedRewrites.Goal_RecenterAbs_MinFault
 import TinylambOpt.ResearchProofs.JitFrontiers.CheckedRewrites.Goal_RecenterAbs_SignPair
+
+/-!
+This module collects proofs for Goal Cancel Add Fold Value, Goal Cancel Add Sufficient,
+Goal Cancel Add Necessary, Goal Cancel Add First Fault and related cases.
+
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+-/

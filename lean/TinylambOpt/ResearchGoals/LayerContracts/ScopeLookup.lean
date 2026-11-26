@@ -1,5 +1,10 @@
 import Std
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+-/
+
 namespace TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
 /-! A binder searches lexical tiers from nearest to farthest. One syntactic

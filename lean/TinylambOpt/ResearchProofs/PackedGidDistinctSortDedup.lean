@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.PackedGidDistinctSortDedup
 
+/-!
+Proved
+
+- `Goal` — Zero-merge `COUNT(DISTINCT)` strategies (TPC-H Q16, ClickBench Q09/Q12/Q14):
+  (1) sorting packed `(gid, val)` pairs and adjacent-deduping matches exact
+  `COUNT(DISTINCT val)`, and (2) partitioning non-null values by `h v % W` makes
+  worker local distinct counts disjoint so summing equals the global distinct count.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.PackedGidDistinctSortDedup`.
+-/
+
 namespace TinylambOpt.ResearchProofs.PackedGidDistinctSortDedup
 
 open TinylambOpt.ResearchGoals.PackedGidDistinctSortDedup

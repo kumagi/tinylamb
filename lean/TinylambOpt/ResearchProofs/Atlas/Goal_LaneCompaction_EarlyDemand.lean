@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `LaneCompaction.EarlyDemand` — `∀ m (xs : List Int) k, m.length = xs.length → let
+  stop := ((slots m)[k]?).getD m.length (pack m xs).take k = pack (m.take stop)
+  (xs.take stop)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

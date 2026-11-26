@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `TwoPhase.ByteBudget` — `∀ evenStep oddStep side i h xs w extra oldBytes, certificate
+  (predict evenStep oddStep) side i h xs w → extra + quote xs.length w < oldBytes →
+  extra + (frame (encode (predict evenStep oddStep) side i h xs)).length < oldBytes`
+- `TwoPhase.ResidualRoundTrip` — `∀ evenStep oddStep side i h xs, restore (predict
+  evenStep oddStep) side i h (encode (predict evenStep oddStep) side i h xs) = xs`
+- `TwoPhase.RestartSeed` — `∀ evenStep oddStep side i h xs, encode (predict evenStep
+  oddStep) side i (h.take (2)) xs = encode (predict evenStep oddStep) side i h xs`
+- `TwoPhase.TwoLanes` — `∀ a b d e side n, restore (predict d e) side 0 [b-e,a-d]
+  (List.replicate n 0) = (List.range n).map (fun j => if j%2 == 0 then a+d*(j/2:Nat)
+  else b+e*(j/2:Nat))`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.TwoPhase
 
 open TinylambOpt.ResearchGoals.Compression.Wire

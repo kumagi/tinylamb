@@ -1,0 +1,26 @@
+import TinylambOpt.ResearchGoals.ResourcePolicies.AggregateReplay
+import TinylambOpt.ResearchGoals.ResourcePolicies.BudgetedPlans
+import TinylambOpt.ResearchGoals.ResourcePolicies.CatalogDependencies
+import TinylambOpt.ResearchGoals.ResourcePolicies.CheckpointRetention
+import TinylambOpt.ResearchGoals.ResourcePolicies.ClusteredPages
+import TinylambOpt.ResearchGoals.ResourcePolicies.CommitBatches
+import TinylambOpt.ResearchGoals.ResourcePolicies.ConnectionFlow
+import TinylambOpt.ResearchGoals.ResourcePolicies.EvictionWriteback
+import TinylambOpt.ResearchGoals.ResourcePolicies.GrantAdmission
+import TinylambOpt.ResearchGoals.ResourcePolicies.JoinFanout
+import TinylambOpt.ResearchGoals.ResourcePolicies.MaintenanceDebt
+import TinylambOpt.ResearchGoals.ResourcePolicies.MergeScheduling
+import TinylambOpt.ResearchGoals.ResourcePolicies.MorselRetirement
+import TinylambOpt.ResearchGoals.ResourcePolicies.PredicateScheduling
+import TinylambOpt.ResearchGoals.ResourcePolicies.RestartDirectory
+import TinylambOpt.ResearchGoals.ResourcePolicies.ScanCache
+import TinylambOpt.ResearchGoals.ResourcePolicies.SharedVocabulary
+import TinylambOpt.ResearchGoals.ResourcePolicies.SlabReuse
+import TinylambOpt.ResearchGoals.ResourcePolicies.SpillExtents
+import TinylambOpt.ResearchGoals.ResourcePolicies.VersionVacuum
+import TinylambOpt.ResearchGoals.ResourcePolicies.WaitQueue
+import TinylambOpt.ResearchGoals.ResourcePolicies.WindowRetention
+
+/-! Open research goals on resource use and failure boundaries in query execution,
+storage layout, concurrent admission, and long-running database maintenance. Each
+import defines its operational model and the decisions that its claims can justify. -/

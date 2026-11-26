@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved
+
+- `RowMajor.SharedEdgeByte` — `∀ n w i, 0<w → ((footprint layout n w i).any (footprint
+  layout n w (i+1)).contains) = decide ((i+1)*w%8≠0)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

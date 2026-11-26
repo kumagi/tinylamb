@@ -2,6 +2,26 @@ import TinylambOpt.ResearchGoals.LayerContracts.CalendarRanges
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.Common_CalendarRanges
 import TinylambOpt.ResearchProofs.LayerContracts.CalendarRanges.YearsCommon
 
+/-!
+Date and timestamp predicates can use calendar bucket boundaries and range seeks where
+the modeled endpoints agree.
+
+Proved (8 claims, including the following)
+
+- `Retail445.CoverBlocks` — Minimal bucket interval covering every day of a nonempty
+  page range.
+- `Retail445.CyclePopulation` — Analytical cardinality of a UNION of consecutive whole
+  buckets.
+- `Retail445.CycleShift` — Translate a bucket boundary by one calendar cycle.
+
+Refuted by counterexample
+
+- `Retail445.AverageDivision` — Can the optimizer replace calendar lookup by scaling
+  with the mean width?
+- `Retail445.ConstantWidth` — Can the JIT use a constant width learned from the first
+  bucket?
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

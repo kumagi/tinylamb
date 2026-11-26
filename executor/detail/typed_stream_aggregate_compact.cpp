@@ -1979,7 +1979,7 @@ StatusOr<bool> TryBuildPackedGroupingSets(
     return Status::kSuccess;
   };
   if (use_row_ids) {
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     //   (unique_group_key_fiber_is_singleton)
     // The fused partial aggregate already emitted one row per finest key.
     // Use its row index as the group ID and keep the original row order.
@@ -2794,7 +2794,7 @@ bool AccumulateCompactColumnarRow(
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 // (columnar_null_indicator_popcount_sound)
 struct NullIndicatorBoolOp {
   enum class Kind : uint8_t {
@@ -2815,7 +2815,9 @@ struct NullIndicatorCaseSpec {
   bool else_is_null{true};
   int64_t else_int{0};
   // Single-column NULL/NOT-NULL flag metadata for complementary split-count
-  // reuse (Wave9TpcdsRollupAndSetOps.lean: LeftJoinNullFlagSplitCount_sound).
+  // reuse
+  // (lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean:
+  // LeftJoinNullFlagSplitCount_sound).
   bool is_single_col_null_flag{false};
   bool flag_is_not_null{false};
   slot_t flag_col{0};
@@ -3093,7 +3095,7 @@ Status AccumulateScalarChunkSlice(
   }
   if (can_fast_tile) {
     // Lean proof:
-    // lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+    // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
     //   (LeftJoinNullFlagSplitCount_sound)
     // Cache the single-column IS NULL count across complementary
     // `SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END)` and
@@ -5020,7 +5022,7 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
   // ColumnarTable (e.g. merged multi-bucket scalar counts such as TPC-DS Q88
   // and Q90). Bypasses PlanTypedAggregation's CASE rejection and runs across
   // all query workers with zero Row materialization.
-  // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+  // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
   //   (scalar_count_case_int_cmps_sound)
   if ((!columnar_only || input.columnar != nullptr) &&
       statement.GroupBy().empty() && !statement.Having() &&

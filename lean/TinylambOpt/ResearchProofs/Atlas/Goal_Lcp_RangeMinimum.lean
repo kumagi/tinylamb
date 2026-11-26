@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Lcp.RangeMinimum` — `∀ (ws : List Word) i j, ws.Pairwise (· ≤ ·) → i < j → j <
+  ws.length → ((lcpEdges ws).drop i |>.take (j-i)).min? = some (common (ws[i]?.getD
+  []) (ws[j]?.getD []))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

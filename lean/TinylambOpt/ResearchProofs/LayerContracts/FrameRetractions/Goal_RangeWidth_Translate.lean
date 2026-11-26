@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
 import TinylambOpt.ResearchProofs.LayerContracts.FrameRetractions.Common_FrameRetractions
 
+/-!
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+
+Proved
+
+- `RangeWidth.Translate` — `∀ xs k, value model (xs.map (·+k)) = value model xs`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

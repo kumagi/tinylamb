@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.LayerContracts.RecursivePaths
 
+/-!
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+
+Proved (10 claims, including the following)
+
+- `Alternating.Pairs` — `∀ n, advance model 0 ((List.replicate n [0,1]).flatten) = some
+  0`
+- `Alternating.RepeatedColor` — `∀ q x, q<2 → x<2 → advance model q [x,x] = none`
+- `AtLeastOneRed.Absorbing` — `∀ ls, advance model 1 ls = some 1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedVariables false

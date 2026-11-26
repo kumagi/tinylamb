@@ -1,5 +1,23 @@
 import TinylambOpt.ResearchGoals.Compression.Predictors
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved
+
+- `ClampLinear.BoundedResidual` — `∀ h side i x lo hi, lo ≤ x → x ≤ hi → lo ≤ lag h 1 →
+  lag h 1 ≤ hi → lo ≤ lag h 2 → lag h 2 ≤ hi → (x-predict i h side).natAbs ≤
+  (hi-lo).toNat`
+- `ClampLinear.ByteBudget` — `∀ side i h xs w extra oldBytes, certificate predict side
+  i h xs w → extra + quote xs.length w < oldBytes → extra + (frame (encode predict
+  side i h xs)).length < oldBytes`
+- `ClampLinear.ResidualRoundTrip` — `∀ side i h xs, restore predict side i h (encode
+  predict side i h xs) = xs`
+- `ClampLinear.RestartSeed` — `∀ side i h xs, encode predict side i (h.take (3)) xs =
+  encode predict side i h xs`
+-/
+
 namespace TinylambOpt.ResearchProofs.Compression.Predictors.ClampLinear
 
 open TinylambOpt.ResearchGoals.Compression.Wire

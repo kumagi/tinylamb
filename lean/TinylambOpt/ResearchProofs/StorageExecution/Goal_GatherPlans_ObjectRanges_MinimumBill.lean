@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `ObjectRanges.MinimumBill` — `∀ u f a b, a≤b → span a b≤u+1 → price u f a b=f+u+1`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

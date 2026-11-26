@@ -1,4 +1,15 @@
 import TinylambOpt.ResearchGoals.RestartRaces.Catalog
+
+/-!
+These models specify the ordering of SQL transaction, recovery, and concurrent
+maintenance events.
+
+Proved
+
+- `RenameMoves` — A batch requires exactly one move per changed name plus one extra per
+  nontrivial permutation cycle. Can every permutation attain that lower bound with
+  just one temporary name, including multiple independent rename cycles?
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

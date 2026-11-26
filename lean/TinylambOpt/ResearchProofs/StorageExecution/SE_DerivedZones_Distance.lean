@@ -1,4 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
+
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved (10 claims, including the following)
+
+- `Distance.BandInverse` — `∀ t x y, kernel.score 0 (x,y)≤t ↔ x≤y+t ∧ y≤x+t`
+- `Distance.CrossPageJoin` — Disjoint derived score intervals imply an empty equijoin
+  between pages.
+- `Distance.DominatedTop` — A bounded page cannot change the descending top k once k
+  strictly better witnesses are known.
+-/
 set_option maxHeartbeats 0
 
 namespace TinylambOpt.ResearchProofs.StorageExecution.DerivedZones.Distance

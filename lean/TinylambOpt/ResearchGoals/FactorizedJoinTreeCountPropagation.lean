@@ -1,5 +1,22 @@
 import Std
 
+/-!
+Arbitrary-depth, arbitrary-fanout acyclic join tree where `children[idx]` equi-joins
+against `row.childKeys.getD idx none`.
+
+Reference full flat join-tuple expansion (`flatMap` cartesian product) for a child
+branch matching `parentKey = some pk` (empty when `expectedParent = none`).
+
+Modeled claims
+
+- `Goal` — Factorized join-tree bottom-up count propagation for acyclic multi-way
+  `COUNT(*)` joins (LDBC L1 / JOB J4, J5 / STATS-CEB C1, C2, C5 / LDBC L2, L5 /
+  DictionaryJoinsAndLateLabels B3): propagating per-key subtree multiplicities
+  bottom-up without materializing intermediate M:N join tuples matches flattening the
+  full join tree (`refRootTuples`) for every group `g` on any tree shape, including
+  NULL join keys and unmatched dead branches (zero weight absorption).
+-/
+
 namespace TinylambOpt.ResearchGoals.FactorizedJoinTreeCountPropagation
 
 structure NodeRow where
@@ -86,7 +103,7 @@ end
 
 /-- Factorized join-tree bottom-up count propagation for acyclic multi-way
     `COUNT(*)` joins (LDBC L1 / JOB J4, J5 / STATS-CEB C1, C2, C5 / LDBC L2, L5
-    / BigBench B3): propagating per-key subtree multiplicities bottom-up without
+    / DictionaryJoinsAndLateLabels B3): propagating per-key subtree multiplicities bottom-up without
     materializing intermediate M:N join tuples matches flattening the full join
     tree (`refRootTuples`) for every group `g` on any tree shape, including
     NULL join keys and unmatched dead branches (zero weight absorption). -/

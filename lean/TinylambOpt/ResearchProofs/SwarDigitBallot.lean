@@ -1,5 +1,13 @@
 import TinylambOpt.ResearchGoals.SwarDigitBallot
 
+/-!
+Proved
+
+- `Goal` — `∀ x i, i < 64 → (ballot x).getLsbD i = (i % 8 == 7 && scalar x (i/8))`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.SwarDigitBallot`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SwarDigitBallot
 
 open TinylambOpt.ResearchGoals.SwarDigitBallot

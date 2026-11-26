@@ -1,6 +1,19 @@
 import Std
 import TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 
+/-!
+SQL column readers can work with packed bits when lookup and filtering preserve the
+represented values and row positions.
+
+Proved (10 claims, including the following)
+
+- `TileTranspose.DictionaryProbe` — Read only lanes requested by a probe and translate
+  them through a possibly short dictionary.
+- `TileTranspose.Lossless` — Read one lane from serialized bytes, including zero width.
+- `TileTranspose.MaskedPatch` — Replace one lane by clearing its mask and inserting a
+  new value.
+-/
+
 namespace TinylambOpt.ResearchProofs.StorageExecution.BitLayouts.TileTranspose
 open TinylambOpt.ResearchGoals.StorageExecution.BitLayouts
 open TinylambOpt.ResearchGoals.Compression.Wire

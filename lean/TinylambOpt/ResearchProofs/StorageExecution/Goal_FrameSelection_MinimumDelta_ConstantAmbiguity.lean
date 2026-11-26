@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Proved
+
+- `MinimumDelta.ConstantAmbiguity` — `∀ x n, 0<n → (write (List.replicate n 0)).length
+  ≤ (write (List.replicate n x)).length`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

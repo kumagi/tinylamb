@@ -1,5 +1,20 @@
 import TinylambOpt.ResearchGoals.EmptyStringKeyPartitionSplit
 
+/-!
+Proved
+
+- `Goal` — Empty-string partition split + cheap predicate reorder + exact int AVG
+  (ClickBench Q17/Q22/Q31/Q32): (1) partitioning `GROUP BY (uid, phrase)` into
+  `phrase = ""`, `phrase = NULL`, and `phrase ≠ ""` avoids string hashing on the hot
+  empty partition and agrees with unified Top-K, (2) checking `phrase ≠ ""` before
+  expensive `URL LIKE` preserves total boolean filtering while bounding substring
+  checks to `phrase ≠ ""` rows, and (3) integer `(sum, cnt)` accumulation preserves
+  `AVG(CAST(int AS FLOAT))`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.EmptyStringKeyPartitionSplit`.
+-/
+
 namespace TinylambOpt.ResearchProofs.EmptyStringKeyPartitionSplit
 
 open List
@@ -722,3 +737,6 @@ theorem sound : TinylambOpt.ResearchGoals.EmptyStringKeyPartitionSplit.Goal := b
 
 
 end TinylambOpt.ResearchProofs.EmptyStringKeyPartitionSplit
+
+-- C++ references to this model or its proof.
+-- executor/detail/typed_stream_aggregate_partitioned.cpp

@@ -1,5 +1,22 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Exchanges.FlushDebt` — `∀ cap a b, 0 < cap → traffic cap a + traffic cap b - traffic
+  cap (a++b) ≤ (a.map Prod.fst).eraseDups.countP (fun d => (b.map Prod.fst).contains
+  d)`
+- `Exchanges.FrameScale` — `∀ cap xs n, 0 < cap → 0 < n → traffic (cap*n) xs ≤ traffic
+  cap xs ∧ traffic cap xs ≤ n*traffic (cap*n) xs`
+- `Exchanges.PacketLowerBound` — `∀ cap xs wire, 0 < cap → (∀ d, volume wire d = volume
+  xs d) → (∀ p ∈ wire, p.2 ≤ cap) → traffic cap xs ≤ wire.length`
+- `Exchanges.ReceiverCoalesce` — `∀ cap xs (route : Nat → Nat), 0 < cap → traffic cap
+  (xs.map (fun (d,w) => (route d,w))) ≤ traffic cap xs`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.ExecutorResources.Exchanges
 
 open TinylambOpt.ResearchGoals.Atlas.ExecutorResources.Exchanges

@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.Compression.TemporalText
 
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (10 claims, including the following)
+
+- `CodeDomain` — `∀ v, (∃ w, code w = some v) ↔ v < 10^14`
+- `CrossColumnDate` — `∀ (a b : Words) xs ys, a.mapM code = some xs → b.mapM code =
+  some ys → xs.map (· / 10^6) = ys.map (· / 10^6) → xs.zipWith (fun x y => spell
+  ((x/10^6)*10^6+y%10^6)) ys = b`
+- `ExceptionCharge` — `∀ ws h, (h+(masked ws).length+(exceptionBody ws).length <
+  Text.raw ws ↔ h + byteCount (47*ws.length) + ((exceptions ws).map (fun (w,i) =>
+  ubytes i+ubytes w.length+w.length)).sum < Text.raw ws)`
+
+Refuted by counterexample
+
+- `DiscardSuffix` — `∀ x (off : Bytes), x < 10^14 → off.length = 3 → (spell x).take 19
+  ++ off = spell x`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 
@@ -1364,3 +1384,7 @@ theorem sound_RangeScan : RangeScan.Goal := by
             simp [hb, hv, hspell, ih vs htail]
 
 end TinylambOpt.ResearchProofs.Compression.TemporalText
+
+-- C++ references to this model or its proof.
+-- table/tlcs_compression.hpp
+-- table/tlcs_file.hpp

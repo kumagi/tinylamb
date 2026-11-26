@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Wavelet.BetweenCodes` — `∀ (xs : Word) level lo hi, lo ≤ hi → xs.countP (fun x =>
+  lo*2^level ≤ x && x < hi*2^level) = xs.countP (fun x => lo ≤ x/2^level && x/2^level
+  < hi)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

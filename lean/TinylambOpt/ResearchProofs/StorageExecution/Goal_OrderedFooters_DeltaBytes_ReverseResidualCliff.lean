@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `DeltaBytes.ReverseResidualCliff` — `∀ xs, let n:=(xs.length-1); let size:=fun (l :
+  List Nat) => ((agg.reference l).map (fun v => v.2.2)).getD 0; size xs.reverse ≤
+  size xs+n`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

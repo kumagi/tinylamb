@@ -1,46 +1,18 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.PairAggregates
 
 /-!
-# Proofs for the pair-aggregate research goals
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
 
-Each `Goal` is a `∀`-statement equating an optimized aggregate (sorted scan,
-moment sums, hash-table lookups, histogram `toList` folds, bit-plane counts,
-or a layer-cake survival sum) with the direct nested-list definition.
+Proved (8 claims, including the following)
 
-Proof strategy per goal:
-
-* `AbsoluteDistance`: `distanceScan` on the sorted list is unfolded into a
-  positional fold whose accumulator counts, for each new element `x`, the
-  `n*x - prefixSum` contribution; on a `Pairwise (· ≤ ·)` list this equals
-  the sum of `y - x` over earlier `x`, i.e. half of the unordered
-  `natAbs` pair sum. `mergeSort_perm`/`pairwise_mergeSort` transport the
-  identity back to the original list via permutation invariance of `pairs`.
-* `SquaredDistance`: induction on `xs`; the inner `ys` sum is expanded by
-  `sum_sqdiff` and the three moments are collected by `grind`/`omega`.
-* `ComplementProbe`: `hist ys` lookups are rewritten to filter lengths by
-  the general `hist_getD_count` lemma (induction over `foldl` using
-  `Std.HashMap.getD_insert`), and `y == t - x` is shown equivalent to
-  `x + y == t`.
-* `ResidualInequality`: tenant and row histograms are rewritten to filter
-  lengths; `tenant_sub_row` partitions `r` by `y.1 == x.1` and shows the
-  tenant-minus-row difference equals the `x.1 == y.1 && x.2 != y.2` count.
-* `SameGroupPairs`: `hist_sum_choose2` evaluates `∑ choose2 (count)` as the
-  number of equal unordered position pairs (`equalPairs` /
-  `prefixEqualSum`), via the `histFrom_weighted_sum` invariant that tracks
-  how each inserted element changes the weighted `toList` sum; a second
-  induction (`sameGroup_sum`) splits tenant-equal pairs into row-equal and
-  same-group/different-value pairs.
-* `IncreasingTriples`: the same `histFrom_weighted_sum` invariant with
-  `g k n = n * L_a(k) * L_c(k)` turns the histogram `toList` sum into a sum
-  over `b`'s elements; `sum_between_a` exchanges the outer `a`/`b` sums and
-  evaluates the `x < y && y < z` filter count.
-* `XorDistance`: each byte XOR is expanded into its eight test bits
-  (`nat_binary_expansion`, proved by induction on the bit index using
-  `Nat.testBit_succ`/`Nat.div_add_mod`); bit-plane population counts are
-  then exchanged with the pair sum by `bit_term`.
-* `LayerCakeMinimum`: `min x y` is written as the number of levels
-  `t < min x y` inside `range cap` (`min_survival`), the product of survival
-  counts is distributed over `a`/`b` by induction (`survival_sum`).
+- `TinylambOpt.ResearchGoals.PairAggregates.AbsoluteDistance` — `∀ xs, 2 * distanceScan
+  (xs.mergeSort) = pairs xs xs (fun x y => (x-y).natAbs)`
+- `TinylambOpt.ResearchGoals.PairAggregates.ComplementProbe` — Pair sums equal to a
+  target, reusing a complement-frequency table for every probe.
+- `TinylambOpt.ResearchGoals.PairAggregates.IncreasingTriples` — `∀ a b c,
+  anchoredTriples a b c = (a.map fun x => (b.map fun y => (c.filter fun z => x < y &&
+  y < z).length).sum).sum`
 -/
 
 namespace TinylambOpt.ResearchProofs.ExecutionStrategies.PairAggregates
@@ -171,7 +143,7 @@ private theorem distanceScan_sorted_abs (s : List Int) (hs : s.Pairwise (fun a b
       rw [hs1, hs2]
       omega
 
-theorem sound_AbsoluteDistance : TinylambOpt.ResearchGoals.PairAggregates.AbsoluteDistance.Goal := by
+theorem AbsoluteDistance_sound : TinylambOpt.ResearchGoals.PairAggregates.AbsoluteDistance.Goal := by
   intro xs
   let s := xs.mergeSort
   have hs : s.Pairwise (fun a b => a ≤ b) := sorted_mergeSort xs
@@ -187,6 +159,8 @@ theorem sound_AbsoluteDistance : TinylambOpt.ResearchGoals.PairAggregates.Absolu
 
 private def histFrom {α : Type} [BEq α] [Hashable α] (h : Std.HashMap α Nat) (xs : List α) : Std.HashMap α Nat :=
   xs.foldl (fun h x => h.insert x (h.getD x 0 + 1)) h
+
+set_option pp.all false in
 
 private theorem histFrom_getD {α : Type} [BEq α] [Hashable α] [EquivBEq α] [LawfulHashable α]
     (h : Std.HashMap α Nat) (xs : List α) (k : α) :
@@ -218,7 +192,7 @@ private theorem sum_sqdiff (x : Int) (ys : List Int) :
       rw [hs]
       grind
 
-theorem sound_SquaredDistance : TinylambOpt.ResearchGoals.PairAggregates.SquaredDistance.Goal := by
+theorem SquaredDistance_sound : TinylambOpt.ResearchGoals.PairAggregates.SquaredDistance.Goal := by
   intro xs ys
   induction xs with
   | nil => simp [pairs, squares]
@@ -254,7 +228,7 @@ private theorem filter_eq_complement (x t : Int) (ys : List Int) :
             omega
         simp [h1, h2, ih]
 
-theorem sound_ComplementProbe : TinylambOpt.ResearchGoals.PairAggregates.ComplementProbe.Goal := by
+theorem ComplementProbe_sound : TinylambOpt.ResearchGoals.PairAggregates.ComplementProbe.Goal := by
   intro xs ys t
   induction xs with
   | nil => rfl
@@ -345,7 +319,7 @@ private theorem map_filter_fst (x : Row) (r : List Row) :
       · have hf : (y.1 == x.1) = false := by simpa using h
         simp [hf, ih]
 
-theorem sound_ResidualInequality : TinylambOpt.ResearchGoals.PairAggregates.ResidualInequality.Goal := by
+theorem ResidualInequality_sound : TinylambOpt.ResearchGoals.PairAggregates.ResidualInequality.Goal := by
   intro l r
   induction l with
   | nil => simp [differentUsers]
@@ -446,7 +420,7 @@ private theorem survival_sum (x cap : Nat) (hx : x ≤ cap) (b : List Nat) :
         | cons t ts iht => by_cases htx : t < x <;> by_cases hty : t < y <;> simp [htx, hty, iht]
       rw [hff, min_survival x y cap hx]
 
-theorem sound_LayerCakeMinimum : TinylambOpt.ResearchGoals.PairAggregates.LayerCakeMinimum.Goal := by
+theorem LayerCakeMinimum_sound : TinylambOpt.ResearchGoals.PairAggregates.LayerCakeMinimum.Goal := by
   intro a b cap ha
   induction a with
   | nil => simp [sum_map_zero]
@@ -500,59 +474,11 @@ private theorem sum_sum_range_two (xs ys : List UInt8) (f : Nat → UInt8 → UI
           (ys.map fun y => f i x y).sum + (xs.map fun x => (ys.map fun y => f i x y).sum).sum).sum
       rw [sum_map_sum_range, ih, sum_map_add_nat]
 
-private theorem sum_const_mul {α : Type} (l : List α) (c : Nat) (f : α → Nat) :
-    (l.map fun i => c * f i).sum = c * (l.map f).sum := by
-  induction l with
-  | nil => rfl
-  | cons a l ih => simp [ih, Nat.mul_add]
-
-/-- Binary expansion: `n < 2^k` equals the sum of its set bit weights
-`2^i` for `i < k`. Proved by induction on `k`, peeling off bit `0`
-(`Nat.testBit_zero`) and recursing on `n / 2` (`Nat.testBit_succ`). -/
-private theorem nat_binary_expansion (n k : Nat) (h : n < 2^k) :
-    n = ((List.range k).map fun i => if n.testBit i then 2^i else 0).sum := by
-  induction k generalizing n with
-  | zero =>
-      have hn : n = 0 := by omega
-      simp [hn]
-  | succ k ih =>
-      have hpow : (2:Nat) ^ (k+1) = 2^k * 2 := by
-        rw [← Nat.succ_eq_add_one, Nat.pow_succ]
-      have hdiv : n / 2 < 2^k := by
-        rw [Nat.div_lt_iff_lt_mul (by omega : (0:Nat) < 2), ← hpow]
-        exact h
-      rw [List.range_succ_eq_map]
-      simp only [List.map_cons, List.map_map, Function.comp_def, List.sum_cons]
-      have hstep : ∀ i : Nat,
-          (if n.testBit i.succ then 2 ^ i.succ else 0) =
-            2 * (if (n/2).testBit i then 2 ^ i else 0) := by
-        intro i
-        rw [Nat.testBit_succ, Nat.pow_succ]
-        by_cases hb : (n/2).testBit i <;> simp [hb] <;> omega
-      rw [show ((List.range k).map fun i => if n.testBit i.succ then 2 ^ i.succ else 0) =
-          (List.range k).map fun i => 2 * (if (n/2).testBit i then 2 ^ i else 0) by
-        apply List.map_congr_left
-        intro i hi
-        exact hstep i]
-      rw [sum_const_mul, ← ih (n/2) hdiv]
-      have hbit0 : (if n.testBit 0 then 2^0 else 0) = n % 2 := by
-        rw [Nat.testBit_zero]
-        have hmod : n % 2 < 2 := Nat.mod_lt _ (by omega)
-        by_cases h1 : n % 2 = 1
-        · simp [h1]
-        · have h0 : n % 2 = 0 := by omega
-          simp [h0]
-      rw [hbit0, Nat.mod_add_div]
-
 private theorem xor_bits (x y : UInt8) :
     (x ^^^ y).toNat =
       ((List.range 8).map fun i => if (x.toNat.testBit i ^^ y.toNat.testBit i) then 2^i else 0).sum := by
-  rw [UInt8.toNat_xor]
-  rw [nat_binary_expansion _ 8 (Nat.xor_lt_two_pow (UInt8.toNat_lt x) (UInt8.toNat_lt y))]
-  apply congrArg List.sum
-  apply List.map_congr_left
-  intro i hi
-  rw [Nat.testBit_xor]
+  revert x y
+  native_decide
 
 private def bitCount (i : Nat) (xs : List UInt8) :=
   (xs.filter fun x => x.toNat.testBit i).length
@@ -642,7 +568,7 @@ private theorem bit_term (i : Nat) (xs ys : List UInt8) :
       · simp [hx, hsubT2, Nat.mul_add, Nat.add_mul, Nat.mul_comm, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
       · simp [hx, hsubF, Nat.mul_add, Nat.add_mul, Nat.mul_comm, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
 
-theorem sound_XorDistance : TinylambOpt.ResearchGoals.PairAggregates.XorDistance.Goal := by
+theorem XorDistance_sound : TinylambOpt.ResearchGoals.PairAggregates.XorDistance.Goal := by
   intro xs ys
   change ((List.range 8).map fun i =>
     let a := (xs.filter fun x => x.toNat.testBit i).length
@@ -1185,7 +1111,7 @@ private theorem sameGroup_sum (xs : List Row) :
       have hle := row_filter_subset x xs
       omega
 
-theorem sound_SameGroupPairs : TinylambOpt.ResearchGoals.PairAggregates.SameGroupPairs.Goal := by
+theorem SameGroupPairs_sound : TinylambOpt.ResearchGoals.PairAggregates.SameGroupPairs.Goal := by
   intro xs
   rw [hist_sum_choose2 (xs.map Prod.fst), hist_sum_choose2 xs]
   change equalPairs (xs.map Prod.fst) - equalPairs xs =
@@ -1259,7 +1185,7 @@ private theorem sum_between_a (a b c : List Int) :
         (fun y => (c.filter fun z => x < y && y < z).length)
         (fun y => (a.filter fun x' => x' < y).length * (c.filter fun z => y < z).length)]
 
-theorem sound_IncreasingTriples : TinylambOpt.ResearchGoals.PairAggregates.IncreasingTriples.Goal := by
+theorem IncreasingTriples_sound : TinylambOpt.ResearchGoals.PairAggregates.IncreasingTriples.Goal := by
   intro a b c
   unfold anchoredTriples
   rw [sum_between_a]
@@ -1279,3 +1205,7 @@ theorem sound_IncreasingTriples : TinylambOpt.ResearchGoals.PairAggregates.Incre
   exact zipIdx_map_sum b (fun y => (a.filter fun x => x < y).length * (c.filter fun z => y < z).length)
 
 end TinylambOpt.ResearchProofs.ExecutionStrategies.PairAggregates
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp
+-- executor/detail/execution_strategies_test.cpp

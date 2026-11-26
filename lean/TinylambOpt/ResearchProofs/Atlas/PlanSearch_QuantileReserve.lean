@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+
+Proved
+
+- `RiskEnvelope.QuantileReserve` — `∀ xs z a b, (a+b)*mass xs (· < z) ≤ a*mass xs (fun
+  _ => true) → a*mass xs (fun _ => true) ≤ (a+b)*mass xs (· ≤ z) → ∀ y, loss xs z a b
+  ≤ loss xs y a b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

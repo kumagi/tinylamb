@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `TwoHopAntiWitness.IndependentWitness` — `∀ n db b, (∀ r i j, 0 ≤ db r i j) → (0 <
+  reference pattern n db b ↔ ∃ z < n, 0 < bridge n db 0 1 (b 0) z ∧ 0 < bridge n db 2
+  1 (b 0) z ∧ 0 < total n (db 0 z))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

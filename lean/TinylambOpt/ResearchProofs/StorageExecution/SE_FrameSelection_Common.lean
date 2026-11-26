@@ -1,6 +1,13 @@
 import TinylambOpt.ResearchGoals.StorageExecution.FrameSelection
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A scan can skip or partially decode compressed frames while preserving selected values
+and their positions.
+
+Named results include `uleb_len`, `ubytes_pos`, `little_len`.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.VectorMemory.Common_VectorMemory
 
+/-!
+A vectorized execution path must respect active lanes, valid row positions, and the
+modeled memory access bounds.
+
+Proved
+
+- `IndexedScatter.StableCollisions` — `∀ j i t, j.ids[i]?=j.ids[t]? → kernel.store j
+  i=kernel.store j t`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.IndexHistory
 
+/-!
+Index reads across version changes must still observe the keys appropriate to the SQL
+snapshot.
+
+Proved
+
+- `ExtendClean` — Reusing a clean result after new commits requires checking only the
+  appended suffix.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

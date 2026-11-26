@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Reference `LEFT OUTER JOIN` aggregation `(COUNT(*), COUNT(L.v), SUM(L.v))` over
+`σ_pred(L) ⟕_{L.k = R.k} R` when `R` columns are unreferenced.
+
+Optimized right-multiplicity weight collapse: counts right multiplicities on non-NULL
+keys only, scans `σ_pred(L)` once, and weights each surviving left row by `w = 1` (if `k
+IS NULL`) or `max 1 mult(k)`.
+
+Modeled claims
+
+- `Goal` — Right-side multiplicity collapse for `LEFT OUTER JOIN` without right-column
+  references (STATS-CEB C4): replacing materialization of `R` matches with
+  per-non-NULL-key multiplicity weights `max 1 mult(k)` (and `1` for NULL join keys)
+  yields identical `(COUNT(*), COUNT(L.v), SUM(L.v))`.
+-/
+
 namespace TinylambOpt.ResearchGoals.LeftJoinRightMultiplicityCollapse
 
 structure LRow where

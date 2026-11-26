@@ -55,7 +55,8 @@
 
 namespace tinylamb::relational_detail {
 
-// Lean proofs: lean/TinylambOpt/ResearchProofs/DuckDBGaps/Retail.lean
+// Lean proofs:
+// lean/TinylambOpt/ResearchProofs/AnalyticalOperators/RollupsAndChannelSetCounts.lean
 //   (PromoReturnCounts_sound, ThresholdFanout_sound)
 // Executes TPC-DS Q72-shaped queries:
 //   catalog_sales JOIN inventory JOIN warehouse JOIN item

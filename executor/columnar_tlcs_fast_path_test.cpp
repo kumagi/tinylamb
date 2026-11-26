@@ -193,7 +193,7 @@ TEST(ColumnarTlcsFastPathTest, JitLiteralSelectionPreservesRowBoundaries) {
     chunk.varchar_ends.push_back(3 * (row + 1));
   }
   rows = {3, 7};
-  // ClickBenchLayout.Execution.ConcatSearch: dense hits (> 64) are now
+  // ClickstreamLayout.Execution.ConcatSearch: dense hits (> 64) are now
   // resolved directly in a single concatenated-stream pass without bailout.
   EXPECT_TRUE(relational_detail::TryJitContainsRows(
       preds, columns, chunk.row_count, true, &rows));
@@ -2222,9 +2222,9 @@ TEST(ColumnarTlcsFastPathTest, MonotonicRunCountDistinctMatchesRowStore) {
 }
 
 // Lean proofs:
-//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Hits.lean
+//   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/FrequencyBoundsAndOrderedFetch.lean
 //     (FrontCodedContains_sound, OrderedCodeMin_sound, OwnerDistinct_sound)
-//   lean/TinylambOpt/ResearchProofs/DuckDBGaps/Slices.lean
+//   lean/TinylambOpt/ResearchProofs/AnalyticalOperators/DictionarySlicesAndExtrema.lean
 //     (sound_DominatedColumn)
 TEST(ColumnarTlcsFastPathTest,
      FrontCodedDictContainsAndOrderedCodeMinMatchRowStore) {
@@ -3185,7 +3185,7 @@ TEST(ColumnarTlcsFastPathTest, EngineDecisionsAndClickBenchLayoutPrimitives) {
   EXPECT_FALSE(RevalidateOneMatchJoinElimination(f_old, f_old, d_old, d_empty));
 }
 
-// Lean proofs: lean/TinylambOpt/ResearchProofs/BenchmarkRematch/
+// Lean proofs: lean/TinylambOpt/ResearchProofs/QueryRewrites/AllGoalProofs.lean
 //   (Analytics, Tpch, Tpcds, Click, Cloud, Storage)
 TEST(ColumnarTlcsFastPathTest, BenchmarkRematchAllFamiliesParity) {
   // 1. Analytics (B3, H2, H5, J3, B4)
@@ -3247,7 +3247,7 @@ TEST(ColumnarTlcsFastPathTest, BenchmarkRematchAllFamiliesParity) {
   EXPECT_EQ(pe.min_val, std::optional<int64_t>(5));
   EXPECT_EQ(pe.max_val, std::optional<int64_t>(30));
 
-  // 5. Storage codecs (all 9 BenchmarkRematch.Storage proofs)
+  // 5. Storage codecs (all nine column codec proofs)
   std::vector<uint8_t> wire;
   rematch_storage::EncodeShipAnchoredDates(1000, 995, 1012, &wire);
   size_t pos = 0;
@@ -3310,6 +3310,1498 @@ TEST(ColumnarTlcsFastPathTest, BenchmarkRematchAllFamiliesParity) {
   ASSERT_TRUE(rematch_storage::DecodeCommonPrefixResidual(
       "https://example.com/a/b", pref_wire, &pref_pos, &orig_out));
   EXPECT_EQ(orig_out, "https://example.com/a/xyz");
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchGoals/QueryRewrites/RevenueAndShipments.lean
+//   (Q1, Q3, Q6, Q7, Q8, Q10, Q19, Q20)
+TEST(ColumnarTlcsFastPathTest, QueryRewritesTpchParity) {
+  namespace qr = query_rewrites;
+  // Q1: DateBoundBlockSubtotalReuse
+  const std::vector<qr::DateValuePage> pages = {
+      {.max_date = 100, .whole_page_nsum = 30, .rows = {{90, 10}, {100, 20}}},
+      {.max_date = 120,
+       .whole_page_nsum = 50,
+       .rows = {{100, 15}, {105, std::nullopt}, {120, 35}}},
+      {.max_date = 95,
+       .whole_page_nsum = std::nullopt,
+       .rows = {{95, std::nullopt}}},
+  };
+  EXPECT_EQ(qr::SumDateBoundBlockSubtotals(pages, 100),
+            std::optional<int64_t>(45));
+  EXPECT_EQ(qr::SumDateBoundBlockSubtotals(pages, 80), std::nullopt);
+
+  // Q3: NonnegativeRevenueUpperBoundPruning
+  const std::vector<int64_t> known = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10};
+  EXPECT_TRUE(qr::CanPruneNonnegativeRevenueOrder(known, 9));
+  EXPECT_FALSE(qr::CanPruneNonnegativeRevenueOrder(known, 10));
+
+  // Q6: DiscountGroupedRevenueSum
+  const std::vector<std::pair<int64_t, int64_t>> disc_rows = {
+      {5, 100}, {6, 200}, {5, 300}, {8, 999}, {4, 500}};
+  EXPECT_EQ(qr::DiscountGroupedRevenueSum(disc_rows, 5, 7),
+            (5 * 100) + (6 * 200) + (5 * 300));
+
+  // Q7: DirectionalNationKeyPrefilter
+  const std::vector<std::pair<uint64_t, bool>> orders = {
+      {1, false}, {1, false}, {2, true}, {3, false}};
+  const std::vector<std::pair<uint64_t, bool>> lines = {
+      {1, true}, {2, true}, {3, false}, {1, true}};
+  EXPECT_EQ(qr::CountDirectionalNationJoinPairs(orders, lines, true), 4U);
+
+  // Q8: SupplierYearVolumePreaggregation
+  const std::vector<std::pair<uint64_t, int64_t>> sales = {
+      {1, 10}, {2, 20}, {1, 30}, {3, 40}};
+  EXPECT_EQ(qr::SumSupplierYearVolumeByPredicate(
+                sales, [](uint64_t s) { return s == 1 || s == 3; }),
+            80);
+
+  // Q10: TopCustomersBeforeWideAttributeLookup
+  const std::vector<uint64_t> cids = {30, 10, 20, 40};
+  const auto top2 = qr::TopCustomersThenAttachAttrs(
+      cids, [](uint64_t id) { return id; },
+      [](uint64_t id) { return "addr_" + std::to_string(id); }, 2U);
+  ASSERT_EQ(top2.size(), 2U);
+  EXPECT_EQ(top2[0], (std::pair<uint64_t, std::string>{10U, "addr_10"}));
+  EXPECT_EQ(top2[1], (std::pair<uint64_t, std::string>{20U, "addr_20"}));
+
+  // Q19: CommonShipmentPredicateFactoring
+  EXPECT_TRUE(qr::MatchesFactoredAirShipmentBand(
+      {.is_air = true, .brand_tag = 0, .quantity = 10}));
+  EXPECT_FALSE(qr::MatchesFactoredAirShipmentBand(
+      {.is_air = false, .brand_tag = 0, .quantity = 10}));
+  EXPECT_TRUE(qr::MatchesFactoredAirShipmentBand(
+      {.is_air = true, .brand_tag = 2, .quantity = 39}));
+  EXPECT_FALSE(qr::MatchesFactoredAirShipmentBand(
+      {.is_air = true, .brand_tag = 3, .quantity = 10}));
+
+  // Q20: CandidateRestrictedNullableSupplierQuantity
+  const std::vector<qr::PartSuppKey> cands = {{1, 10}, {2, 20}, {1, 10}};
+  const std::vector<std::pair<qr::PartSuppKey, std::optional<int64_t>>>
+      ps_lines = {{{1, 10}, 7},
+                  {{1, 10}, std::nullopt},
+                  {{1, 10}, 5},
+                  {{2, 20}, std::nullopt},
+                  {{9, 99}, 100}};
+  const auto ps_res = qr::CandidateRestrictedNullableSum(cands, ps_lines);
+  ASSERT_TRUE(ps_res.contains(qr::PartSuppKey{1, 10}));
+  EXPECT_EQ(ps_res.at(qr::PartSuppKey{1, 10}), std::optional<int64_t>(12));
+  EXPECT_FALSE(ps_res.contains(qr::PartSuppKey{2, 20}));
+  EXPECT_FALSE(ps_res.contains(qr::PartSuppKey{9, 99}));
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchGoals/QueryRewrites/SalesAndReturns.lean
+//   (37 TPC-DS proofs: Q2..Q99)
+TEST(ColumnarTlcsFastPathTest, QueryRewritesTpcdsParity) {
+  namespace qr = query_rewrites;
+  // Q2: DateKeyPreaggregationBeforeWeekLookup
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> q2_sales = {
+      {1, 10}, {1, 20}, {2, 5}, {3, std::nullopt}, {4, 7}};
+  EXPECT_EQ(qr::PreaggregateDateKeysThenRollupCell(
+                q2_sales,
+                [](uint64_t d) {
+                  return d == 1 || d == 4 ? std::pair<uint64_t, uint64_t>{1, 2}
+                                          : std::pair<uint64_t, uint64_t>{9, 9};
+                },
+                {1, 2}),
+            std::optional<int64_t>(37));
+
+  // Q4: PositivePriorYearDenominatorFilter
+  const std::unordered_map<uint64_t, int64_t> prior = {
+      {1, 50}, {2, 0}, {3, -5}};
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> yr2 = {
+      {1, 100}, {2, 200}, {3, 300}};
+  const auto q4_kept = qr::FilterSalesByPositivePriorYear(prior, yr2);
+  ASSERT_EQ(q4_kept.size(), 1U);
+  EXPECT_EQ(q4_kept[0].first, 1U);
+
+  // Q11: PositiveDenominatorRatioCrossProduct
+  EXPECT_TRUE(qr::ComparePositiveDenominatorRatios(3, 2, 4, 3));
+  EXPECT_FALSE(qr::ComparePositiveDenominatorRatios(4, 3, 3, 2));
+
+  // Q14: HavingFilteredNullableRollup
+  const std::vector<std::vector<std::optional<int64_t>>> q14_cells = {
+      {10, 20}, {5, std::nullopt}, {std::nullopt}};
+  EXPECT_EQ(qr::RollupHavingFilteredNullableGroups(q14_cells, 10),
+            std::optional<int64_t>(30));
+
+  // Q15: PostalPrefixDictionaryFilter
+  const std::vector<std::string> zips = {"85669-1234", "10001", "86197-0001"};
+  const std::vector<std::string> allowed = {"85669", "86197"};
+  const std::vector<uint32_t> codes = {0, 1, 2, 0};
+  EXPECT_EQ(qr::FilterCodesByPostalPrefixDict(zips, allowed, codes),
+            (std::vector<uint32_t>{0, 2, 0}));
+
+  // Q16: CandidateRestrictedNullAwareReturnAntijoin
+  const std::vector<std::optional<uint64_t>> q16_ord = {1, std::nullopt, 2, 3};
+  const std::vector<std::optional<uint64_t>> q16_ret = {2, std::nullopt, 99};
+  const auto q16_out =
+      qr::CandidateRestrictedNullAwareAntijoin(q16_ord, q16_ret);
+  ASSERT_EQ(q16_out.size(), 3U);
+  EXPECT_EQ(q16_out[0], std::optional<uint64_t>(1));
+  EXPECT_FALSE(q16_out[1].has_value());
+  EXPECT_EQ(q16_out[2], std::optional<uint64_t>(3));
+
+  // Q17: ShiftedVarianceNumerator
+  const std::vector<int64_t> q17_vals = {1001, 1003, 1007, 1005};
+  EXPECT_EQ(qr::ShiftedVarianceNumerator(q17_vals, 1004),
+            qr::ShiftedVarianceNumerator(q17_vals, 0));
+
+  // Q21: EligibleItemRangeBlockPruning
+  const std::vector<std::vector<uint64_t>> inv_blocks = {
+      {1, 2, 3}, {10, 15, 20}, {100, 105}};
+  const std::vector<uint64_t> cheap = {15, 105};
+  EXPECT_EQ(qr::PruneBlocksByEligibleItemRanges(inv_blocks, cheap),
+            (std::vector<uint64_t>{15, 105}));
+
+  // Q25: SalesKeyFilterOnReturnJoin
+  const std::vector<qr::CustItemTicketKey> q25_s = {{1, 10, 100}, {1, 10, 100}};
+  const std::vector<qr::CustItemTicketKey> q25_r = {{1, 10, 100}, {2, 20, 200}};
+  EXPECT_EQ(
+      qr::CountSalesFilteredReturnCatalogJoin(
+          q25_s, q25_r,
+          [](uint64_t c, uint64_t i) { return c == 1 && i == 10 ? 3U : 9U; }),
+      6U);
+
+  // Q29: CachedCatalogQuantityByCustomerItem
+  const std::vector<std::pair<uint64_t, uint64_t>> q29_t = {
+      {1, 2}, {1, 2}, {3, 4}};
+  const std::vector<std::optional<int64_t>> cat_12 = {5, std::nullopt, 7};
+  const std::vector<std::optional<int64_t>> cat_34 = {std::nullopt};
+  EXPECT_EQ(qr::SumCachedCatalogQuantityByPair(
+                q29_t,
+                [&](std::pair<uint64_t, uint64_t> p) {
+                  return p.first == 1
+                             ? std::span<const std::optional<int64_t>>(cat_12)
+                             : std::span<const std::optional<int64_t>>(cat_34);
+                }),
+            std::optional<int64_t>(24));
+
+  // Q30: AverageRatioComparisonByCrossProduct
+  EXPECT_TRUE(qr::ExceedsOnePointTwoStateAverage(13, 20, 2));
+  EXPECT_FALSE(qr::ExceedsOnePointTwoStateAverage(12, 20, 2));
+
+  // Q35: StoreCustomerRestrictedExistenceMarks
+  const std::vector<uint64_t> c35 = {1, 2, 3, 4};
+  const std::vector<uint64_t> s35 = {1, 2, 3};
+  const std::vector<uint64_t> w35 = {2, 9};
+  const std::vector<uint64_t> k35 = {3, 10};
+  EXPECT_EQ(qr::FilterStoreCustomersWithRemoteMarks(c35, s35, w35, k35),
+            (std::vector<uint64_t>{2, 3}));
+
+  // Q38: NameCodeIntersectionCardinality
+  const std::vector<std::pair<std::string, uint64_t>> s38 = {{"a", 1},
+                                                             {"b", 2}};
+  const std::vector<std::pair<std::string, uint64_t>> c38 = {{"a", 1},
+                                                             {"c", 3}};
+  const std::vector<std::pair<std::string, uint64_t>> w38 = {{"a", 1},
+                                                             {"b", 2}};
+  EXPECT_EQ(
+      qr::CountNameCodeThreeWayIntersection(
+          s38, c38, w38,
+          [](const std::string& s) { return static_cast<uint64_t>(s[0]); }),
+      1U);
+
+  // Q39: ConstantGroupVarianceRejection
+  EXPECT_TRUE(qr::IsConstantGroupZeroVariance(42, 42));
+  EXPECT_FALSE(qr::IsConstantGroupZeroVariance(41, 42));
+
+  // Q40: OuterJoinBuildRestrictedToSalesKeys
+  const std::vector<std::pair<uint64_t, uint64_t>> sold40 = {{1, 1}, {2, 2}};
+  const std::vector<std::pair<std::pair<uint64_t, uint64_t>, int64_t>> ret40 = {
+      {{1, 1}, 50}, {{9, 9}, 999}};
+  const auto q40_out = qr::RestrictedLeftJoinReturns(sold40, ret40);
+  ASSERT_EQ(q40_out.size(), 2U);
+  EXPECT_EQ(q40_out[0], std::optional<int64_t>(50));
+  EXPECT_FALSE(q40_out[1].has_value());
+
+  // Q41: CorrelatedPositiveCountAsMembership
+  const std::vector<std::optional<std::string>> ok41 = {"m1", std::nullopt,
+                                                        "m2"};
+  const std::vector<std::pair<std::optional<std::string>, bool>> it41 = {
+      {"m1", true}, {"m2", false}, {std::nullopt, true}};
+  const auto q41_out = qr::FilterByQualifiedMakerMembership(ok41, it41);
+  ASSERT_EQ(q41_out.size(), 1U);
+  EXPECT_EQ(q41_out[0], std::optional<std::string>("m1"));
+
+  // Q45: ExpandPhysicalKeysByLogicalItem (multi-version history!)
+  const std::vector<std::pair<uint64_t, std::optional<std::string>>> ver45 = {
+      {2, "ITEM_A"}, {102, "ITEM_A"}, {3, "ITEM_B"}, {4, std::nullopt}};
+  const std::vector<uint64_t> seed45 = {2};
+  const auto exp45 = qr::ExpandItemHistoryKeysByLogicalItem(ver45, seed45);
+  EXPECT_TRUE(exp45.contains(2U));
+  EXPECT_TRUE(exp45.contains(102U));
+  EXPECT_FALSE(exp45.contains(3U));
+
+  // Q49: NullRejectingRefundOuterJoinReduction
+  const std::vector<uint64_t> sold49 = {1, 2};
+  const std::vector<std::optional<int64_t>> r49_1 = {15000, 5000, std::nullopt};
+  const std::vector<std::optional<int64_t>> r49_2 = {};
+  EXPECT_EQ(qr::ReduceNullRejectingRefundOuterJoin(
+                sold49,
+                [&](uint64_t k) {
+                  return k == 1
+                             ? std::span<const std::optional<int64_t>>(r49_1)
+                             : std::span<const std::optional<int64_t>>(r49_2);
+                }),
+            (std::vector<int64_t>{15000}));
+
+  // Q57: YearPartitionAverageBeforeNeighborLookup
+  const std::vector<qr::YearMonthVal> m57 = {
+      {1999, 12, 10}, {2000, 1, 20}, {2000, 2, std::nullopt}, {2001, 1, 30}};
+  EXPECT_EQ(qr::ExtractTargetYearFromExtendedMonths(m57, 2000),
+            (std::vector<int64_t>{20}));
+
+  // Q58: PairwiseRatioBoundsFromExtrema
+  EXPECT_TRUE(qr::ThreeChannelPairwiseWithinTenPercent(100, 105, 110));
+  EXPECT_FALSE(qr::ThreeChannelPairwiseWithinTenPercent(100, 105, 112));
+
+  // Q59: WeekPairMultiplicityProduct
+  EXPECT_EQ(qr::WeekPairMultiplicity(2, 3, 5), 30U);
+
+  // Q62: WarehousePrefixNullableSubtotalMerge
+  const std::vector<std::pair<std::string, uint32_t>> wh62 = {
+      {"12345678901234567890_A", 1},
+      {"12345678901234567890_B", 1},
+      {"12345678901234567890_A", 2}};
+  EXPECT_EQ(qr::MergeWarehousePrefixBinCounts(wh62, "12345678901234567890", 1),
+            2U);
+
+  // Q63: OverlappingItemPredicateUnion
+  const std::vector<uint64_t> f63 = {1, 2, 3, 2};
+  const std::vector<uint64_t> a63 = {1, 2};
+  const std::vector<uint64_t> b63 = {2, 3};
+  EXPECT_EQ(qr::SumFactsMatchingItemUnion(
+                f63, a63, b63,
+                [](uint64_t k) { return static_cast<int64_t>(k * 10); }),
+            80);
+
+  // Q66: FunctionalWarehouseAttributesAfterMonthlySum
+  const std::vector<std::pair<std::pair<uint64_t, uint32_t>, int64_t>> f66 = {
+      {{1, 5}, 10}, {{1, 5}, 25}, {{1, 6}, 99}};
+  const auto res66 = qr::SumMonthlyThenAttachWarehouseAttr(
+      f66, 1, 5, [](uint64_t w) { return "wh_" + std::to_string(w); });
+  EXPECT_EQ(res66, (std::pair<std::string, int64_t>{"wh_1", 35}));
+
+  // Q72: ReturnMultiplicityAndPromotionCounts
+  const auto p72_zero = qr::SynthesizeReturnPromoCounts(0, 3);
+  EXPECT_EQ(p72_zero.no_promo_count, 3U);
+  EXPECT_EQ(p72_zero.promo_count, 0U);
+  EXPECT_EQ(p72_zero.total_count, 3U);
+  const auto p72_pos = qr::SynthesizeReturnPromoCounts(2, 0);
+  EXPECT_EQ(p72_pos.no_promo_count, 0U);
+  EXPECT_EQ(p72_pos.promo_count, 2U);
+  EXPECT_EQ(p72_pos.total_count, 2U);
+
+  // Q74: OrderedTopKAfterPriorYearRatioFilter
+  const std::vector<uint64_t> o74 = {1, 2, 3, 4, 5, 6};
+  EXPECT_EQ(qr::OrderedPrefixTopKFilter(
+                o74, [](uint64_t x) { return x % 2 == 0; }, 2U),
+            (std::vector<uint64_t>{2, 4}));
+
+  // Q75: ChannelLocalDedupBeforeUnionDistinct
+  const std::vector<std::vector<qr::ChannelRowTuple>> ch75 = {
+      {{1, 10, 100}, {1, 10, 100}}, {{1, 10, 100}, {1, 5, 50}}};
+  EXPECT_EQ(qr::ChannelLocalDedupUnionQuantity(ch75, 1), 15);
+
+  // Q79: AddressKeyElisionByFunctionalDependency
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> r79 = {
+      {7, 10}, {7, std::nullopt}, {7, 20}};
+  EXPECT_EQ(qr::ElideFunctionalAddressKeySum(r79),
+            (std::vector<std::optional<int64_t>>{30}));
+  EXPECT_TRUE(qr::ElideFunctionalAddressKeySum({}).empty());
+
+  // Q80: NullableTotalFromChannelSubtotals
+  const std::vector<std::vector<std::vector<std::optional<int64_t>>>> ch80 = {
+      {{10, std::nullopt}, {std::nullopt}}, {{20, 5}}};
+  EXPECT_EQ(qr::MergeNullableChannelSubtotals(ch80),
+            std::optional<int64_t>(35));
+  const std::vector<std::vector<std::vector<std::optional<int64_t>>>>
+      ch80_null = {{{std::nullopt}}};
+  EXPECT_FALSE(qr::MergeNullableChannelSubtotals(ch80_null).has_value());
+
+  // Q81: StateAverageFromCustomerTotals
+  const std::vector<qr::StateCustomerTotal> t81 = {
+      {1, 100, 50}, {1, 101, 70}, {2, 102, 999}};
+  const auto c81 = qr::BuildStateTotalsCacheForCustomers(
+      t81, [](uint64_t c) { return c == 100; });
+  ASSERT_TRUE(c81.contains(1U));
+  EXPECT_EQ(c81.at(1U), (std::pair<int64_t, uint64_t>{120, 2U}));
+  EXPECT_FALSE(c81.contains(2U));
+
+  // Q83: CommonItemTopKBeforeQuantityLookup
+  const std::vector<uint64_t> sr83 = {5, 1, 3, 9};
+  const std::vector<uint64_t> cr83 = {3, 1, 9};
+  const std::vector<uint64_t> wr83 = {9, 3, 1, 2};
+  const auto w83 = qr::PrefixCommonThreeChannelTopK(
+      sr83, cr83, wr83, 5,
+      [](uint64_t k) {
+        return std::array<int64_t, 3>{static_cast<int64_t>(k),
+                                      static_cast<int64_t>(k * 2),
+                                      static_cast<int64_t>(k * 3)};
+      },
+      2U);
+  ASSERT_EQ(w83.size(), 2U);
+  EXPECT_EQ(w83[0].first, 1U);
+  EXPECT_EQ(w83[1].first, 3U);
+
+  // Q85: EqualNonNullDemographicCodes
+  EXPECT_TRUE(qr::EqualNonNullCodeHit(5, 5));
+  EXPECT_FALSE(qr::EqualNonNullCodeHit(std::nullopt, std::nullopt));
+
+  // Q86: RankFromDistinctValueFrequencies
+  const std::vector<std::pair<int64_t, uint64_t>> f86 = {
+      {100, 2}, {80, 3}, {50, 1}};
+  EXPECT_EQ(qr::RankFromDistinctFrequencies(f86, 80), 3U);
+
+  // Q87: CandidateOnlyDifferenceMarks
+  const std::vector<uint64_t> s87 = {1, 2, 2, 3, 4};
+  const std::vector<uint64_t> c87 = {2, 9};
+  const std::vector<uint64_t> w87 = {4};
+  EXPECT_EQ(qr::CountStoreMinusRemoteCandidates(s87, c87, w87), 2U);
+
+  // Q89: MonthlyDeviationBandPruning
+  EXPECT_TRUE(qr::CanPruneBrandWithinTenPercentBand(12, 1200, 95, 105));
+  EXPECT_FALSE(qr::CanPruneBrandWithinTenPercentBand(12, 1200, 85, 105));
+
+  // Q90: WeightedTimeBandJoinCounts
+  const std::vector<qr::TimeDemoPageKey> k90 = {
+      {8, 1, 1}, {8, 1, 1}, {19, 1, 1}, {12, 1, 1}};
+  const auto [am90, pm90] = qr::ComputeWeightedTimeBandCounts(
+      k90, [](const qr::TimeDemoPageKey&) { return 1U; },
+      [](uint64_t t) { return t; });
+  EXPECT_EQ(am90, 2U);
+  EXPECT_EQ(pm90, 1U);
+
+  // Q99: RunLengthShippingDelayHistogram
+  const std::vector<qr::DatePairRun> r99 = {
+      {100, 120, 4}, {100, 145, 2}, {100, 250, 3}};
+  const auto h99 = qr::RunLengthShippingDelayHistogram(r99);
+  EXPECT_EQ(h99, (std::array<uint64_t, 5>{4, 2, 0, 0, 3}));
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchGoals/QueryRewrites/DictionaryFiltersAndRanking.lean
+//   (20 ClickBench proofs: Q12..Q43)
+TEST(ColumnarTlcsFastPathTest, QueryRewritesClickBenchParity) {
+  namespace qr = query_rewrites;
+  // Q12: PartitionedUserBitmapDistinct
+  const std::vector<uint64_t> u12 = {1, 2, 65, 1, 130, 65, 2};
+  EXPECT_EQ(qr::CountPartitionedUserBitmapDistinct(u12, 64U), 4U);
+  EXPECT_EQ(qr::CountPartitionedUserBitmapDistinct(u12, 16U), 4U);
+
+  // Q14: DistinctTopKPruningByRemainingRows
+  const std::vector<uint64_t> fin14 = {50, 45, 40, 35, 30, 25, 20, 18, 15, 12};
+  EXPECT_TRUE(qr::CanPruneDistinctGroupByRemainingRows(5, 6, fin14, 10U));
+  EXPECT_FALSE(qr::CanPruneDistinctGroupByRemainingRows(5, 7, fin14, 10U));
+
+  // Q16: CandidateTopKWithOmittedCountBound
+  const std::unordered_map<uint64_t, uint64_t> c16 = {
+      {1, 50}, {2, 40}, {3, 30}};
+  const auto w16 = qr::ResolveCandidateTopKWithOmittedBound(c16, 30, 2U);
+  ASSERT_TRUE(w16.has_value());
+  EXPECT_EQ(w16.value_or(std::vector<uint64_t>{}),
+            (std::vector<uint64_t>{1, 2}));
+  EXPECT_FALSE(
+      qr::ResolveCandidateTopKWithOmittedBound(c16, 45, 2U).has_value());
+
+  // Q18: RunLengthGroupCounts
+  const std::vector<qr::PairRun> r18 = {{1, 2, 5}, {3, 4, 2}, {1, 2, 3}};
+  EXPECT_EQ(qr::RunLengthPairGroupCount(r18, 1, 2), 8U);
+
+  // Q20: SortedEqualRangeCount
+  const std::vector<int64_t> s20 = {1, 2, 2, 2, 5, 9};
+  EXPECT_EQ(qr::SortedEqualRangeCount(s20, 2), 3U);
+  EXPECT_EQ(qr::SortedEqualRangeCount(s20, 4), 0U);
+
+  // Q21: ChunkedSubstringBoundaryCarry
+  EXPECT_TRUE(qr::ChunkedContainsWithBoundaryCarry("http://www.goo", "gle.com/",
+                                                   "google"));
+  EXPECT_FALSE(qr::ChunkedContainsWithBoundaryCarry("http://www.go", "le.com/",
+                                                    "google"));
+
+  // Q22: CountTopKBeforePayloadMinimum
+  const std::vector<std::pair<uint64_t, std::string>> m22 = {
+      {1, "http://z"}, {1, "http://a"}, {2, "http://b"}};
+  EXPECT_EQ(qr::FilteredCountCutoffMinPayload(m22, 1, 2),
+            std::optional<std::string>("http://a"));
+  EXPECT_FALSE(qr::FilteredCountCutoffMinPayload(m22, 2, 2).has_value());
+
+  // Q23: DictionaryPairPredicateMemoization
+  const std::vector<std::string> titles = {"Google News", "Other"};
+  const std::vector<std::string> urls = {"http://ex.com",
+                                         "http://a.google.com"};
+  const std::vector<std::pair<uint32_t, uint32_t>> p23 = {
+      {0, 0}, {0, 1}, {1, 0}, {0, 0}};
+  const auto f23 = qr::FilterMemoizedTitleUrlCodePairs(
+      p23, [&](uint32_t i) -> std::string_view { return titles[i]; },
+      [&](uint32_t i) -> std::string_view { return urls[i]; });
+  EXPECT_EQ(f23.size(), 2U);
+
+  // Q24: TimestampFenceBeforeSubstringRead
+  const std::vector<uint64_t> ts24 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  EXPECT_TRUE(qr::CanSkipPageByTimestampFence(ts24, 10, 11, 10U));
+  EXPECT_FALSE(qr::CanSkipPageByTimestampFence(ts24, 10, 10, 10U));
+
+  // Q27: TimestampTieBoundaryForSecondarySort
+  const std::vector<std::pair<uint64_t, uint64_t>> r27 = {
+      {1, 9}, {2, 5}, {2, 1}, {2, 3}, {3, 0}};
+  const auto top27 = qr::TopKWithinTimestampTieBoundary(r27, 2, 3U);
+  EXPECT_EQ(top27, (std::vector<std::pair<uint64_t, uint64_t>>{
+                       {1, 9}, {2, 1}, {2, 3}}));
+
+  // Q28: TotalFrequencyBoundsNonemptyHaving
+  EXPECT_FALSE(qr::CanPassNonemptyHavingByTotalFreq(100000U));
+  EXPECT_TRUE(qr::CanPassNonemptyHavingByTotalFreq(100001U));
+
+  // Q31: SplitIpKeyReconstruction
+  const auto sk31 = qr::SplitEngineIpKey(7, 0x0A0B0C0DULL);
+  EXPECT_EQ(qr::ReconstructEngineIpKey(sk31),
+            (std::pair<uint64_t, uint64_t>{7U, 0x0A0B0C0DULL}));
+
+  // Q32: SingleValueGroupWithConflictFallback
+  qr::SingleValueWithExceptions sv32;
+  sv32.Insert(100);
+  sv32.Insert(100);
+  sv32.Insert(200);
+  sv32.Insert(100);
+  EXPECT_EQ(sv32.CountOf(100), 3U);
+  EXPECT_EQ(sv32.CountOf(200), 1U);
+  EXPECT_EQ(sv32.CountOf(300), 0U);
+
+  // Q36: DerivedIpKeysAfterGrouping
+  const std::vector<int64_t> ips36 = {10, 20, 10};
+  const auto d36 = qr::AttachDerivedIpKeysAfterGrouping(ips36);
+  ASSERT_EQ(d36.size(), 2U);
+  EXPECT_EQ(d36[0], (qr::DerivedIpGroupRow{10, 9, 8, 7, 2}));
+  EXPECT_EQ(d36[1], (qr::DerivedIpGroupRow{20, 19, 18, 17, 1}));
+
+  // Q37: IntervalCountFromSortedPostings
+  const std::vector<uint64_t> d37 = {1, 5, 10, 15, 20, 25, 31};
+  EXPECT_EQ(qr::SortedPostingsIntervalCount(d37, 10, 25), 4U);
+
+  // Q38: PageFrequencyBoundsForTitleCandidates
+  EXPECT_TRUE(qr::MustBeInTitleCandidatesByPageCap(5, 10, 51));
+  EXPECT_FALSE(qr::MustBeInTitleCandidatesByPageCap(5, 10, 50));
+
+  // Q39: OffsetSelectionByCountBuckets
+  const std::vector<std::pair<uint64_t, uint64_t>> g39 = {
+      {1, 100}, {2, 50}, {3, 50}, {4, 50}, {5, 10}};
+  const auto w39 = qr::SelectOffsetWindowFromCountBuckets(g39, 50, 2U, 2U);
+  ASSERT_TRUE(w39.has_value());
+  EXPECT_EQ(w39.value_or(std::vector<std::pair<uint64_t, uint64_t>>{}),
+            (std::vector<std::pair<uint64_t, uint64_t>>{{3, 50}, {4, 50}}));
+
+  // Q40: DisjointReferrerBranchKeys
+  const std::vector<qr::ReferrerBranchRow> r40 = {
+      {0, 0, "refA"}, {0, 0, "refA"}, {1, 0, "ignored"}, {1, 0, "other"}};
+  EXPECT_EQ(qr::CountDisjointReferrerBranchKey(r40, 0, 0, "refA"), 2U);
+  EXPECT_EQ(qr::CountDisjointReferrerBranchKey(r40, 1, 0, ""), 2U);
+  EXPECT_EQ(qr::CountDisjointReferrerBranchKey(r40, 1, 0, "ignored"), 0U);
+
+  // Q42: RowCountBoundsDistinctOffset
+  EXPECT_TRUE(qr::RowCountForcesEmptyDistinctOffset(10000U, 10000U));
+  EXPECT_FALSE(qr::RowCountForcesEmptyDistinctOffset(10001U, 10000U));
+
+  // Q43: MinuteTruncationFromBlockBounds
+  EXPECT_EQ(qr::TryConstantBlockMinuteTruncation(120, 179),
+            std::optional<int64_t>(2));
+  EXPECT_FALSE(qr::TryConstantBlockMinuteTruncation(120, 180).has_value());
+  EXPECT_EQ(qr::TryConstantBlockMinuteTruncation(-60, -1),
+            std::optional<int64_t>(-1));
+}
+
+// Lean proofs:
+//   lean/TinylambOpt/ResearchGoals/QueryRewrites/AnalyticalJoins.lean (16)
+//   lean/TinylambOpt/ResearchGoals/QueryRewrites/FileRangesAndExtrema.lean (2)
+TEST(ColumnarTlcsFastPathTest, QueryRewritesAnalyticsAndCloudParity) {
+  namespace qr = query_rewrites;
+  // JOB J1: CompanyWeightedMovieYearTotals
+  const std::vector<std::pair<uint64_t, int64_t>> my_j1 = {
+      {1, 1995}, {2, 2001}, {3, 2010}};
+  const std::vector<uint64_t> comp_j1 = {1, 1, 3};
+  EXPECT_EQ(qr::CompanyWeightedMovieYearTotals(my_j1, comp_j1),
+            (qr::CountAndSum{.count = 3, .sum = (2 * 1995) + 2010}));
+
+  // JOB J2: RatingAndGenreJoinMultiplicity
+  const std::vector<uint64_t> t_j2 = {1, 2, 1};
+  const std::vector<uint64_t> d_j2 = {1, 1, 2};
+  const std::vector<uint64_t> r_j2 = {1, 1, 1};
+  EXPECT_EQ(qr::RatingAndGenreJoinMultiplicity(t_j2, d_j2, r_j2), 12U);
+
+  // JOB J3: OptionalYearByteCodeTotals
+  const std::vector<uint8_t> codes_j3 = {
+      qr::EncodeOptionalYearByteCode(1970),
+      qr::EncodeOptionalYearByteCode(std::nullopt),
+      qr::EncodeOptionalYearByteCode(2010),
+      qr::EncodeOptionalYearByteCode(1969)};
+  EXPECT_EQ(codes_j3[0], 1U);
+  EXPECT_EQ(codes_j3[1], 0U);
+  EXPECT_EQ(codes_j3[2], 41U);
+  EXPECT_EQ(codes_j3[3], 0U);
+  EXPECT_EQ(qr::SumOptionalYearByteCodes(codes_j3),
+            (qr::CountAndSum{.count = 2, .sum = 1970 + 2010}));
+
+  // JOB J5: AliasPrefixHalfOpenRange
+  EXPECT_TRUE(qr::MatchesAka1PrefixRange("aka-1"));
+  EXPECT_TRUE(qr::MatchesAka1PrefixRange("aka-199"));
+  EXPECT_FALSE(qr::MatchesAka1PrefixRange("aka-2"));
+  EXPECT_FALSE(qr::MatchesAka1PrefixRange("aka-09"));
+
+  // STATS-CEB C1: ScoreAndViewCountZonePruning
+  const std::vector<std::vector<qr::PostZoneRow>> pages_c1 = {
+      {{1, 500, 10}, {5, 100, 11}},
+      {{10, 10000, 20}, {12, 20000, 21}},
+      {{8, 9999, 30}, {4, 100, 31}, {9, 500, 32}},
+  };
+  EXPECT_EQ(qr::PrunePostPagesByScoreAndViews(pages_c1),
+            (std::vector<uint64_t>{30, 32}));
+
+  // STATS-CEB C2: OwnerCommentFrequencyJoinCount
+  const std::vector<std::pair<uint64_t, uint64_t>> op_c2 = {
+      {1, 10}, {1, 10}, {1, 20}, {2, 10}};
+  const std::vector<uint64_t> pc_c2 = {10, 10, 10, 20};
+  EXPECT_EQ(qr::OwnerCommentFrequencyJoinCount(op_c2, pc_c2, 1), 7U);
+
+  // H2O H2: StableDescendingCountBuckets
+  const std::vector<std::pair<uint64_t, uint64_t>> g_h2 = {
+      {1, 2}, {2, 5}, {3, 2}, {4, 0}};
+  EXPECT_EQ(qr::StableDescendingCountBucketSort(g_h2, 5),
+            (std::vector<std::pair<uint64_t, uint64_t>>{
+                {2, 5}, {1, 2}, {3, 2}, {4, 0}}));
+
+  // H2O H4: OrderedNullableValuesFromSelectedRuns
+  const std::vector<qr::KeyedNullableRun> runs_h4 = {
+      {.key = 2, .values = {10, std::nullopt, 20}},
+      {.key = 4, .values = {99}},
+      {.key = 1, .values = {30}},
+  };
+  EXPECT_EQ(qr::OrderedNullableValuesFromSelectedRuns(runs_h4),
+            (std::vector<int64_t>{10, 20, 30}));
+
+  // H2O H5: BoundedCartesianProductTiles
+  const std::vector<int64_t> xs_h5 = {1, 2};
+  const std::vector<int64_t> ys_h5 = {10, 20, 30};
+  const auto tiles_h5 = qr::BuildBoundedCartesianProductTiles(xs_h5, ys_h5, 4U);
+  ASSERT_EQ(tiles_h5.size(), 2U);
+  EXPECT_EQ(tiles_h5[0].size(), 4U);
+  EXPECT_EQ(tiles_h5[1].size(), 2U);
+  EXPECT_EQ(tiles_h5[0][0], (std::pair<int64_t, int64_t>{1, 10}));
+  EXPECT_EQ(tiles_h5[1][1], (std::pair<int64_t, int64_t>{2, 30}));
+
+  // LDBC SNB L2: ForumMembershipSemijoinWeights
+  const std::vector<std::pair<uint64_t, uint64_t>> mem_l2 = {
+      {1, 10}, {2, 20}, {1, 30}};
+  const std::vector<uint64_t> for_l2 = {1, 1, 9};
+  EXPECT_EQ(qr::ForumMembershipSemijoinWeights(
+                mem_l2, for_l2, [](uint64_t p) { return p == 10 ? 3U : 1U; }),
+            8U);
+
+  // LDBC SNB L3: ParentReplyCountAndScoreTotals
+  const std::vector<std::pair<std::optional<uint64_t>, int64_t>> ch_l3 = {
+      {1, 5}, {1, 0}, {1, 7}, {std::nullopt, 100}, {2, 9}};
+  const std::vector<uint64_t> par_l3 = {1, 1, 3};
+  EXPECT_EQ(qr::ParentReplyCountAndScoreTotals(ch_l3, par_l3),
+            (qr::CountAndSum{.count = 4, .sum = 24}));
+
+  // LDBC SNB L4: NullableParentAndYearPositionGather
+  const std::vector<qr::YearParentScoreRow> rows_l4 = {
+      {2012, 10, 50},
+      {2012, std::nullopt, 99},
+      {2011, 10, 88},
+      {2012, 20, std::nullopt}};
+  const auto sc_l4 = qr::GatherScoresByYearAndValidParent(rows_l4, 2012U);
+  ASSERT_EQ(sc_l4.size(), 2U);
+  EXPECT_EQ(sc_l4[0], std::optional<int64_t>(50));
+  EXPECT_FALSE(sc_l4[1].has_value());
+
+  // LDBC SNB L5: PlaceGroupedCountryAgeTotals
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> ea_l5 = {
+      {1, 20}, {1, std::nullopt}, {2, 30}, {3, 40}};
+  EXPECT_EQ(qr::PlaceGroupedCountryAgeTotals(
+                ea_l5, [](uint64_t p) { return p <= 2 ? 100U : 200U; }, 100U),
+            (qr::PlaceAgeAggregate{
+                .total_count = 3, .nullable_sum = 50, .non_null_count = 2}));
+
+  // BigBench B3: PhysicalKeySubtotalRollup
+  const std::vector<
+      std::pair<std::pair<uint64_t, uint64_t>, std::optional<int64_t>>>
+      s_b3 = {{{1, 1}, 10}, {{1, 1}, std::nullopt}, {{2, 1}, 25}, {{3, 2}, 99}};
+  EXPECT_EQ(qr::RollupPhysicalKeySubtotals(
+                s_b3,
+                [](std::pair<uint64_t, uint64_t> pk) {
+                  return pk.second == 1 ? std::pair<uint64_t, uint64_t>{7, 8}
+                                        : std::pair<uint64_t, uint64_t>{9, 9};
+                },
+                {7, 8}),
+            std::optional<int64_t>(35));
+
+  // BigBench B4: DictionarySubstringOrFlagSelection
+  const std::vector<std::pair<bool, std::string>> rows_b4 = {
+      {true, "none"}, {false, "big_data_sql"}, {false, "other"}};
+  EXPECT_EQ(qr::DictionarySubstringOrFlagSelection(rows_b4),
+            (std::vector<size_t>{0, 1}));
+
+  // BigBench B5: SortedPriceSuffixKeyCounts
+  const std::vector<std::pair<int64_t, uint64_t>> it_b5 = {
+      {50, 1}, {100, 1}, {101, 1}, {120, 2}, {150, 1}};
+  EXPECT_EQ(qr::SortedPriceSuffixKeyCount(it_b5, 1, 100), 2U);
+
+  // Public BI MLB Q108: PairedExtremaReduction
+  const std::vector<std::optional<int64_t>> v_108 = {std::nullopt, 15, -3, 42,
+                                                     std::nullopt, 7,  100};
+  EXPECT_EQ(qr::PairedExtremaReduction(v_108),
+            (qr::MinMaxPair{.min_val = -3, .max_val = 100}));
+  const std::vector<std::optional<int64_t>> v_empty = {std::nullopt};
+  EXPECT_EQ(qr::PairedExtremaReduction(v_empty),
+            (qr::MinMaxPair{.min_val = std::nullopt, .max_val = std::nullopt}));
+
+  // Iceberg SQL base: ContiguousFileRowIdTotals
+  // 96 files x 48 contiguous rows (matching fixture in november26-queries.md)
+  std::vector<qr::ContiguousFileRun> runs_ice;
+  std::vector<uint64_t> manifest_ice;
+  for (uint64_t f = 0; f < 96; ++f) {
+    runs_ice.push_back({.file_id = f, .base_rid = f * 48U, .count = 48U});
+    manifest_ice.push_back(f);
+  }
+  const auto tot_ice = qr::ContiguousFileRowIdTotals(runs_ice, manifest_ice);
+  EXPECT_EQ(tot_ice.row_count, 4608U);
+  EXPECT_EQ(tot_ice.rid_sum, std::optional<uint64_t>(10614528ULL));
+  const std::vector<uint64_t> empty_manifest;
+  const auto empty_ice =
+      qr::ContiguousFileRowIdTotals(runs_ice, empty_manifest);
+  EXPECT_EQ(empty_ice.row_count, 0U);
+  EXPECT_FALSE(empty_ice.rid_sum.has_value());
+}
+
+TEST(ColumnarTlcsFastPathTest, AnalyticalOperatorsProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // IncrementalRefreshAndFlush: InsertSideState, ChangedSymbols, OverlapReplay,
+  // LaneOrSpill, VisibleFlush, DirtyFlush.
+  bm::BatchSymGroups groups;
+  const std::vector<bm::BatchTick> old_ticks = {
+      {.batch = 1, .sym = 10, .bid = 100},
+      {.batch = 1, .sym = 10, .bid = std::nullopt},
+      {.batch = 1, .sym = 20, .bid = 50},
+  };
+  const std::vector<bm::BatchTick> fresh_ticks = {
+      {.batch = 1, .sym = 10, .bid = 25},
+      {.batch = 2, .sym = 10, .bid = 70},
+  };
+  bm::ApplyInsertSideState(&groups, old_ticks);
+  const auto dirty = bm::CollectDirtyKeysAndUpdate(&groups, fresh_ticks);
+  EXPECT_EQ(dirty.size(), 2U);
+  EXPECT_EQ(groups[(bm::BatchSymKey{.batch = 1, .sym = 10})],
+            (bm::NullableTotals{.cnt = 3, .nn = 2, .sum = 125}));
+
+  const auto replaced = bm::ReplaceSymbolState({.cnt = 3, .nn = 2, .sum = 125},
+                                               {.cnt = 2, .nn = 1, .sum = 100},
+                                               {.cnt = 1, .nn = 1, .sum = 40});
+  ASSERT_TRUE(replaced.has_value());
+  EXPECT_EQ(*replaced, (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 65}));
+  EXPECT_FALSE(bm::ReplaceSymbolState({.cnt = 1, .nn = 1, .sum = 10},
+                                      {.cnt = 1, .nn = 1, .sum = 10}, {})
+                   .has_value());
+
+  bm::BatchSymGroups replay_groups;
+  const std::vector<bm::BatchTick> stream_ticks = {
+      {.batch = 1, .sym = 5, .bid = 10},
+      {.batch = 1, .sym = 5, .bid = 20},
+      {.batch = 1, .sym = 5, .bid = 30},
+  };
+  bm::ApplyInsertSideState(
+      &replay_groups,
+      std::span<const bm::BatchTick>(stream_ticks).subspan(0, 2));
+  bm::FoldOverlapReplaySuffix(&replay_groups, stream_ticks, /*offset=*/0,
+                              /*acknowledged=*/2);
+  EXPECT_EQ(replay_groups[(bm::BatchSymKey{.batch = 1, .sym = 5})],
+            (bm::NullableTotals{.cnt = 3, .nn = 3, .sum = 60}));
+
+  bm::LaneOrSpillAccumulator lane_acc(/*base_sym=*/10, /*width=*/4);
+  lane_acc.Add(11, 15);
+  lane_acc.Add(11, std::nullopt);
+  lane_acc.Add(99, 42);
+  EXPECT_EQ(lane_acc.Lookup(11),
+            (bm::NullableTotals{.cnt = 2, .nn = 1, .sum = 15}));
+  EXPECT_EQ(lane_acc.Lookup(99),
+            (bm::NullableTotals{.cnt = 1, .nn = 1, .sum = 42}));
+
+  const std::vector<std::pair<uint64_t, std::vector<bm::BatchTick>>> chunks = {
+      {1, {{.batch = 1, .sym = 7, .bid = 12}}},
+      {3, {{.batch = 3, .sym = 7, .bid = 99}}},
+  };
+  EXPECT_EQ(bm::CoalesceVisibleBatches(chunks, /*pin=*/2, /*sym=*/7),
+            (bm::NullableTotals{.cnt = 1, .nn = 1, .sum = 12}));
+
+  // RevenueAggregatesAndJoinWitnesses: MarketShareWeights, YearRoutes,
+  // DirectionBuckets, RetireWitness, RebucketOrders, RevenueRuns.
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> q8_sales = {
+      {1, 100}, {1, std::nullopt}, {2, 50}};
+  const std::vector<std::pair<uint64_t, std::optional<std::string>>> q8_supp = {
+      {1, "BRAZIL"}, {1, "FRANCE"}, {2, "BRAZIL"}};
+  const auto share =
+      bm::ComputeMarketShareByWeights(q8_sales, q8_supp, "BRAZIL");
+  EXPECT_EQ(share.numerator,
+            (bm::NullableTotals{.cnt = 5, .nn = 4, .sum = 150}));
+  EXPECT_EQ(share.denominator,
+            (bm::NullableTotals{.cnt = 5, .nn = 3, .sum = 250}));
+
+  const std::vector<bm::OrderCustomerYear> q8_orders = {
+      {.order_key = 10, .cust_key = 1, .year = 1995},
+      {.order_key = 11, .cust_key = 2, .year = 1996},
+  };
+  const std::vector<uint64_t> q8_custs = {1, 1};
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> q8_lines = {
+      {10, 30}, {11, 50}};
+  EXPECT_EQ(bm::EvalYearRouteTotals(q8_orders, q8_custs, q8_lines, 1995),
+            (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 60}));
+
+  const std::vector<bm::NationShipment> q7_rows = {
+      {.supp_nation = "FRANCE",
+       .cust_nation = "GERMANY",
+       .year = 1995,
+       .volume = 40},
+      {.supp_nation = "GERMANY",
+       .cust_nation = "FRANCE",
+       .year = 1995,
+       .volume = 70},
+      {.supp_nation = std::nullopt,
+       .cust_nation = "GERMANY",
+       .year = 1995,
+       .volume = 999},
+  };
+  EXPECT_EQ(
+      bm::SumDirectedNationBucket(q7_rows, "FRANCE", "GERMANY", true, 1995),
+      (bm::NullableTotals{.cnt = 1, .nn = 1, .sum = 40}));
+  EXPECT_EQ(
+      bm::SumDirectedNationBucket(q7_rows, "FRANCE", "GERMANY", false, 1995),
+      (bm::NullableTotals{.cnt = 1, .nn = 1, .sum = 70}));
+
+  const std::vector<std::pair<uint64_t, uint64_t>> q4_orders = {
+      {100, 1}, {101, 1}, {102, 2}};
+  const std::vector<uint64_t> q4_late = {100, 100, 102};
+  const auto q4_counts =
+      bm::CountPriorityWithRetiredWitness(q4_orders, q4_late);
+  EXPECT_EQ(q4_counts.at(1), 1U);
+  EXPECT_EQ(q4_counts.at(2), 1U);
+
+  const std::vector<uint64_t> q13_custs = {1, 2, 3};
+  const std::vector<std::pair<uint64_t, bool>> q13_orders = {
+      {1, false}, {1, true}, {2, false}, {2, false}};
+  const auto q13_hist =
+      bm::RebucketCustomerOrderHistogram(q13_custs, q13_orders);
+  EXPECT_EQ(q13_hist.at(0), 1U);
+  EXPECT_EQ(q13_hist.at(1), 1U);
+  EXPECT_EQ(q13_hist.at(2), 1U);
+
+  const std::vector<std::vector<std::pair<uint64_t, std::optional<int64_t>>>>
+      q3_morsels = {{{1, 10}, {2, 20}}, {{2, 5}, {3, std::nullopt}}};
+  const auto q3_runs = bm::MergeContiguousRevenueRuns(q3_morsels);
+  ASSERT_EQ(q3_runs.size(), 3U);
+  EXPECT_EQ(q3_runs[1].second,
+            (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 25}));
+
+  // SharedJoinStatesAndWeights: H5, C3, C2, C4, L1.
+  const std::vector<bm::H5LeftRow> h5_l = {
+      {.group_id = 1, .join_key = 7, .val = 10},
+      {.group_id = 1, .join_key = 8, .val = std::nullopt}};
+  const std::vector<bm::H5RightRow> h5_r = {{.join_key = 7, .val = 3},
+                                            {.join_key = 7, .val = 5},
+                                            {.join_key = 8, .val = 9}};
+  const auto [h5_sx, h5_sy] = bm::EvalFactorizedH5Group(h5_l, h5_r, 1);
+  EXPECT_EQ(h5_sx, (bm::NullableTotals{.cnt = 3, .nn = 2, .sum = 20}));
+  EXPECT_EQ(h5_sy, (bm::NullableTotals{.cnt = 3, .nn = 3, .sum = 17}));
+
+  const std::unordered_map<uint64_t, std::optional<int64_t>> c3_scores = {
+      {1, 10}, {2, 20}};
+  const std::unordered_set<uint64_t> c3_valid = {2};
+  const std::vector<bm::PostLinkEdge> c3_edges = {
+      {.post_id = 1, .related_id = 2, .link_type = 1},
+      {.post_id = 1, .related_id = 2, .link_type = 1},
+      {.post_id = 2, .related_id = 99, .link_type = 1}};
+  EXPECT_EQ(bm::EvalEndpointWeightedLinkScore(c3_scores, c3_valid, c3_edges, 1),
+            (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 20}));
+
+  const std::vector<std::pair<uint64_t, uint64_t>> c2_posts = {
+      {10, 100}, {10, 101}, {20, 102}};
+  const std::vector<uint64_t> c2_comments = {100, 100, 101};
+  EXPECT_EQ(bm::EvalCommentQuotientForOwner(c2_posts, c2_comments, 10, 2), 6U);
+
+  const std::vector<std::optional<std::string>> c4_tags = {"sql", "sql",
+                                                           std::nullopt, "db"};
+  const auto c4_buckets = bm::BuildClassifiedStringBuckets(c4_tags);
+  EXPECT_GE(c4_buckets.size(), 1U);
+}
+
+TEST(ColumnarTlcsFastPathTest, SocialGraphAndCloudBiProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // SocialGraphJoinWeights & ForumRunsAndGraphDegrees (L1-L5).
+  const std::vector<std::pair<uint64_t, uint64_t>> l1_edges = {
+      {1, 10}, {1, 20}, {2, 10}, {3, 30}};
+  const std::vector<uint64_t> l1_active = {1, 1, 2};
+  const auto l1_res = bm::PullActiveFriendCountries(l1_edges, l1_active);
+  EXPECT_EQ(l1_res.country_counts.at(10), 3U);
+  EXPECT_EQ(l1_res.country_counts.at(20), 2U);
+  EXPECT_EQ(l1_res.edge_reads, 3U);
+
+  const std::vector<bm::ForumMessage> l2_msgs = {
+      {.forum_id = 5, .year = 2012, .score = 10},
+      {.forum_id = 5, .year = 2012, .score = 20},
+      {.forum_id = 6, .year = 2012, .score = 7},
+  };
+  const auto l2_res = bm::FoldCarriedForumRuns(
+      l2_msgs, [](uint64_t fid) -> uint64_t { return fid == 5 ? 3 : 0; });
+  EXPECT_EQ(l2_res.member_probes, 2U);
+  EXPECT_EQ(l2_res.groups.at({.forum_id = 5, .year = 2012}),
+            (bm::NullableTotals{.cnt = 6, .nn = 6, .sum = 90}));
+
+  const std::vector<bm::ReplyRow> l3_rows = {
+      {.id = 2, .parent_id = 1, .year = 2013, .score = 15},  // forward ref
+      {.id = 1, .parent_id = std::nullopt, .year = 2012, .score = 5},
+      {.id = 3, .parent_id = 1, .year = 2013, .score = 25},  // backward ref
+  };
+  EXPECT_EQ(bm::SinglePassForwardReplyTotals(l3_rows, 2012),
+            (bm::NullableTotals{.cnt = 2, .nn = 2, .sum = 40}));
+
+  const std::unordered_map<uint64_t, uint64_t> l4_forums = {{10, 2}};
+  const std::vector<std::pair<uint64_t, std::optional<int64_t>>> l4_msgs = {
+      {10, 4}, {10, std::nullopt}, {11, 99}};
+  const auto l4_res = bm::ApplyLateForumMembership(l4_forums, l4_msgs);
+  EXPECT_EQ(l4_res.size(), 1U);
+  EXPECT_EQ(l4_res.at(10), (bm::NullableTotals{.cnt = 4, .nn = 2, .sum = 8}));
+
+  const std::vector<std::pair<uint64_t, uint64_t>> l5_edges = {
+      {0, 1}, {0, 2}, {2, 3}};
+  const auto csr = bm::BuildCsrOffsets(l5_edges, 4);
+  EXPECT_EQ(bm::CsrOutDegree(csr, 0), 2U);
+  EXPECT_EQ(bm::CsrOutDegree(csr, 1), 0U);
+  EXPECT_EQ(bm::CsrOutDegree(csr, 2), 1U);
+
+  // CloudBI DeleteFiles & Quotes.
+  const bm::IcebergPart part{.spec_id = 1, .part_id = 0};
+  const std::vector<bm::IcebergEqDelete> eq_dels = {
+      {.scope = part, .seq = 5, .key = 10},
+      {.scope = std::nullopt, .seq = 3, .key = 20},
+      {.scope = part, .seq = 7, .key = std::nullopt},
+  };
+  const auto horizon = bm::BuildEqualityDeleteHorizon(eq_dels);
+  const std::vector<bm::IcebergRow> ice_rows = {
+      {.file = 1, .pos = 0, .part = part, .seq = 4, .key = 10},  // eq-deleted
+      {.file = 1, .pos = 1, .part = part, .seq = 5, .key = 10},  // survives
+      {.file = 1, .pos = 2, .part = part, .seq = 2, .key = 20},  // global eq
+      {.file = 1,
+       .pos = 3,
+       .part = part,
+       .seq = 6,
+       .key = std::nullopt},  // null eq
+  };
+  const std::vector<bm::IcebergPosDelete> pos_dels = {
+      {.file = 1, .pos = 1, .part = part, .seq = 5},
+      {.file = 1, .pos = 1, .part = part, .seq = 6},   // duplicate
+      {.file = 1, .pos = 99, .part = part, .seq = 6},  // out of range
+  };
+  EXPECT_EQ(bm::MetadataOnlyPosDeleteCount(4, 1, part, 5, pos_dels), 3U);
+  EXPECT_EQ(bm::SurvivingRowsAfterUnionDeletes(ice_rows, pos_dels, horizon),
+            0U);
+  EXPECT_FALSE(
+      bm::CanPruneEqDeleteByBounds(100, 200, /*file_has_null=*/true, eq_dels));
+  EXPECT_TRUE(
+      bm::CanPruneEqDeleteByBounds(100, 200, /*file_has_null=*/false, eq_dels));
+
+  const std::vector<uint64_t> layout = {10, 20, 30};
+  const std::vector<uint64_t> probe = {30, 99, 10};
+  const auto field_offs = bm::ResolveFieldIdOffsets(layout, probe);
+  EXPECT_EQ(field_offs[0], std::optional<size_t>(2));
+  EXPECT_FALSE(field_offs[1].has_value());
+  EXPECT_EQ(field_offs[2], std::optional<size_t>(0));
+
+  const std::vector<size_t> gsizes = {10, 20, 30};
+  const std::vector<uint8_t> gkeep = {0, 1, 1};
+  EXPECT_EQ(bm::ComputeSurvivingGroupBaseOrdinals(gsizes, gkeep),
+            (std::vector<uint64_t>{10, 30}));
+
+  const std::vector<bm::QuoteTick> qticks = {
+      {.batch = 1, .ts = 100, .tie = 1, .sym = 1, .bid = 50, .ask = 55},
+      {.batch = 2, .ts = 100, .tie = 2, .sym = 1, .bid = 52, .ask = 58},
+      {.batch = 2,
+       .ts = 105,
+       .tie = 0,
+       .sym = 1,
+       .bid = std::nullopt,
+       .ask = 60},
+  };
+  const auto merged_q = bm::MergeStaleRollupWithDelta(
+      {.cnt = 1, .nn = 1, .sum = 50}, qticks, 1, 90, 110, /*watermark=*/1,
+      /*snapshot=*/2);
+  EXPECT_EQ(merged_q, (bm::NullableTotals{.cnt = 3, .nn = 2, .sum = 102}));
+  const auto close = bm::ReduceCloseRun(qticks);
+  ASSERT_TRUE(close.has_value());
+  EXPECT_EQ(*close, (bm::CloseWinner{.ts = 100, .tie = 2, .price = 52}));
+  const auto spread = bm::ComputeSpreadMoments(qticks);
+  EXPECT_EQ(spread.count, 2U);
+  EXPECT_EQ(spread.SpreadSum(), 11);
+  EXPECT_TRUE(bm::ShouldUseMaintainedLayout(10, 100, 50, 20, 40));
+}
+
+TEST(ColumnarTlcsFastPathTest, ClickstreamExecProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // ClockRange: interior delta decides without dependent decode.
+  const auto interior = bm::ProbeDependentClockRange(
+      10, 20, -1, 1, 15, {.kind = bm::ClockSlotKind::kDelta, .payload = 0});
+  EXPECT_TRUE(interior.matched);
+  EXPECT_FALSE(interior.decoded_dependent);
+  const auto abs_hit = bm::ProbeDependentClockRange(
+      10, 20, 0, 2, 1, {.kind = bm::ClockSlotKind::kAbsolute, .payload = 11});
+  EXPECT_TRUE(abs_hit.matched);
+  EXPECT_TRUE(abs_hit.decoded_dependent);
+
+  // ConcatSearch: rejects cross-row matches and handles empty needle & NULLs.
+  // Rows: ["a", NULL, "", "b", "abab"]
+  const std::string concat =
+      "ab"
+      "abab";
+  const std::vector<size_t> ends = {1, 1, 1, 2, 6};
+  const std::vector<uint8_t> is_null = {0, 1, 0, 0, 0};
+  EXPECT_EQ(bm::SearchConcatStreamRowIds(concat, ends, is_null, "ab"),
+            (std::vector<size_t>{4}));
+  EXPECT_EQ(bm::SearchConcatStreamRowIds(concat, ends, is_null, ""),
+            (std::vector<size_t>{0, 2, 3, 4}));
+
+  // AnchorDemand: minimal deduplicated frame set for copyBase tags.
+  const std::vector<uint8_t> tags = {0, 1, 1};
+  const std::vector<size_t> req = {2, 0, 2};
+  EXPECT_EQ(
+      bm::ComputeMinimalAnchorFrames(tags, req, [](size_t i) { return i / 2; }),
+      (std::vector<size_t>{1}));
+
+  // SparseMark: exact O(1) 2D lex granule pruning.
+  EXPECT_EQ(bm::LeastKeyInRectAboveFence({3, 99}, 2, 7, 9),
+            (bm::LexPairKey{4, 7}));
+  EXPECT_EQ(bm::LeastKeyInRectAboveFence({3, 9}, 2, 7, 9),
+            (bm::LexPairKey{3, 9}));
+  EXPECT_TRUE(bm::GranuleIntersectsRect({3, 9}, {5, 0}, 2, 4, 7, 9));
+  EXPECT_FALSE(bm::GranuleIntersectsRect({3, 99}, {3, 120}, 2, 4, 7, 9));
+
+  // DefaultGroups: untouched rows credited to all-default key in O(1).
+  const std::vector<bm::SparseDefaultLane> lanes = {
+      {.default_val = std::nullopt, .exceptions = {{2, 0}}},
+      {.default_val = 0, .exceptions = {{2, std::nullopt}, {4, 1}}},
+  };
+  const std::vector<std::optional<int64_t>> def_key = {std::nullopt, 0};
+  const std::vector<std::optional<int64_t>> exc_key = {0, std::nullopt};
+  EXPECT_EQ(bm::CountTupleWithDefaultShortCut(lanes, 6, def_key), 4U);
+  EXPECT_EQ(bm::CountTupleWithDefaultShortCut(lanes, 6, exc_key), 1U);
+
+  // LengthRollup: exact (byte_sum, nonempty_count) from prefix sums.
+  // Rows: [NULL, "ab", "", "c"] -> lens=[0,2,0,1], present=[0,1,0,1]
+  const std::vector<uint64_t> prefix_ends = {0, 0, 2, 2, 3};
+  const std::vector<uint64_t> prefix_present = {0, 0, 1, 1, 2};
+  const std::vector<std::pair<size_t, size_t>> slices = {{1, 2}, {3, 40}};
+  EXPECT_EQ(bm::RollupNonEmptyLengthsFromPrefixSums(prefix_ends, prefix_present,
+                                                    4, slices),
+            (bm::LengthRollupTotals{.byte_sum = 3, .nonempty_count = 2}));
+}
+
+TEST(ColumnarTlcsFastPathTest, ClickstreamStorageProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // RunSidecar: exact round-trip and minimum run count.
+  const std::vector<uint32_t> perm = {0, 3, 1, 2};
+  const auto enc = bm::EncodeRunSidecar(perm);
+  EXPECT_EQ(enc.num_runs, 2U);
+  EXPECT_EQ(enc.labels, (std::vector<uint32_t>{0, 1, 1, 0}));
+  EXPECT_EQ(bm::RecoverRunSidecar(enc.labels, enc.num_runs), perm);
+
+  // TieOrientation: reversing a tie group reduces front-coded byte cost.
+  const std::vector<std::vector<std::string>> groups = {
+      {"abc"}, {}, {"z", "abd"}};
+  const size_t opt_bytes = bm::OptimalTieOrientationBytes(groups);
+  const size_t naive_bytes = bm::FrontCodeTransitionBytes("", "abc") +
+                             bm::FrontCodeTransitionBytes("abc", "z") +
+                             bm::FrontCodeTransitionBytes("z", "abd");
+  EXPECT_LT(opt_bytes, naive_bytes);
+
+  // DictionaryAdmission: laminar tree DP matches Lean #guard fixture.
+  const std::vector<bm::DictAdmissionNode> tree = {
+      {.is_frame = false, .activation_fee = 6, .left = 1, .right = 2},
+      {.is_frame = true, .frame_saved = 4},
+      {.is_frame = true, .frame_saved = 4},
+  };
+  EXPECT_EQ(bm::BestDictionaryAdmissionSavings(tree, 0), 2);
+
+  // HashExceptions: mode hash minimizes exceptions and preserves selection.
+  const std::vector<std::pair<uint32_t, uint64_t>> rows = {
+      {1, 7}, {1, 8}, {2, 7}, {1, 7}};
+  const auto htbl = bm::BuildOptimalHashExceptionTable(rows);
+  EXPECT_EQ(htbl.exceptions.size(), 1U);
+  EXPECT_EQ(htbl.exceptions.at(1), 8ULL);
+  const std::vector<uint32_t> codes = {1, 1, 2, 1};
+  EXPECT_EQ(bm::SelectRowsByHashExceptions(
+                codes, htbl, [](uint64_t h) { return h == 8ULL; }),
+            (std::vector<size_t>{1}));
+
+  // ClockWindow: anchor search finds optimal window base (62 beats 64).
+  const std::vector<int64_t> deltas = {63, 64, 65};
+  const auto cw = bm::ChooseOptimalClockWindow(deltas, /*bit_width=*/2,
+                                               /*exception_bytes=*/10);
+  EXPECT_LE(cw.low, 63);
+  EXPECT_GE(cw.low, 62);
+
+  // ClockForest: subset DP over 3 clocks matches Lean #guard (= 10).
+  const size_t forest_cost = bm::OptimalClockForestBytes(
+      3, [](size_t, std::optional<size_t> p) -> size_t {
+        return p.has_value() ? 1U : 8U;
+      });
+  EXPECT_EQ(forest_cost, 10U);
+}
+
+TEST(ColumnarTlcsFastPathTest, EngineDecisionsProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // Goal_RunOffset: skip runs covered by OFFSET and take LIMIT.
+  const std::vector<std::vector<int>> runs = {{30, 10}, {40, 20, 50}, {60}};
+  const auto page = bm::SkipRunsBeforeOffsetAndTake(
+      runs, /*offset=*/2, /*limit=*/2, std::less<int>{});
+  EXPECT_EQ(page, (std::vector<int>{20, 40}));
+
+  // Goal_HotRunTiles: pair-ordinal tiling over 2x3 hot key.
+  const auto tile0 = bm::EnumerateHotKeyTilePairs(2, 3, 2, 0);
+  const auto tile1 = bm::EnumerateHotKeyTilePairs(2, 3, 2, 1);
+  EXPECT_EQ(tile0, (std::vector<std::pair<size_t, size_t>>{{0, 0}, {0, 1}}));
+  EXPECT_EQ(tile1, (std::vector<std::pair<size_t, size_t>>{{0, 2}, {1, 0}}));
+
+  // Goal_DistinctExcludeTies: keep current row value while excluding peers.
+  const std::unordered_map<int64_t, size_t> frame = {{10, 2}, {20, 1}, {30, 2}};
+  const std::unordered_map<int64_t, size_t> peers = {{10, 2}, {20, 1}};
+  EXPECT_EQ(bm::CountDistinctExcludeTies(frame, peers, /*current=*/10), 2U);
+
+  // Goal_RangeFingers: monotone two-finger band spans.
+  const std::vector<int64_t> left = {10, 20, 30};
+  const std::vector<int64_t> right = {5, 11, 15, 22, 35};
+  const auto spans = bm::ComputeSortedRangeFingerSpans(left, right, -2, 2);
+  EXPECT_EQ(spans,
+            (std::vector<std::pair<size_t, size_t>>{{1, 2}, {3, 4}, {4, 4}}));
+
+  // Goal_FlushChoice: 0/1 knapsack min-cost flush subset.
+  const std::vector<bm::FlushBufferCandidate> bufs = {{.bytes = 4, .cost = 5},
+                                                      {.bytes = 6, .cost = 7},
+                                                      {.bytes = 3, .cost = 2}};
+  EXPECT_EQ(bm::MinFlushCostToReclaim(bufs, 7), std::optional<uint64_t>(7));
+
+  // Goal_SealedBuild: decide early on hit or sealed partition.
+  const std::unordered_set<size_t> sealed = {1};
+  const std::unordered_set<uint64_t> built = {42};
+  EXPECT_EQ(bm::DecideBeforeBuildBarrier(0, sealed, built, 42),
+            std::optional<bool>(true));
+  EXPECT_EQ(bm::DecideBeforeBuildBarrier(1, sealed, built, 99),
+            std::optional<bool>(false));
+  EXPECT_FALSE(bm::DecideBeforeBuildBarrier(0, sealed, built, 99).has_value());
+
+  // Goal_DemandCache + Goal_Exec_DemandCache: evaluate once per unique key.
+  const std::vector<uint64_t> keys = {5, 3, 5, 3, 7};
+  size_t evals = 0;
+  const auto vals = bm::EvalWithDemandCache(
+      keys, [](uint64_t k) { return static_cast<int>(k * 2); }, &evals);
+  EXPECT_EQ(evals, 3U);
+  EXPECT_EQ(vals, (std::vector<int>{10, 6, 10, 6, 14}));
+
+  // Goal_ExistsDurability: last committed truth flip LSN.
+  const std::vector<bm::ExistsWalEvent> log = {
+      {.wal_end_lsn = 10, .committed = true, .new_truth = true},
+      {.wal_end_lsn = 20, .committed = false, .new_truth = false},
+      {.wal_end_lsn = 30, .committed = true, .new_truth = true},  // no flip
+  };
+  EXPECT_EQ(bm::MinExistsDurabilityFence(false, log), 10ULL);
+
+  // Goal_NullableGroupKey: SQL-null-aware functional dependency check.
+  const std::vector<std::pair<std::optional<int64_t>, std::optional<int64_t>>>
+      fd_ok = {{std::nullopt, 1}, {std::nullopt, 1}, {2, std::nullopt}};
+  const std::vector<std::pair<std::optional<int64_t>, std::optional<int64_t>>>
+      fd_bad = {{std::nullopt, 1}, {std::nullopt, 2}};
+  EXPECT_TRUE(bm::ObservedNullableFunctionalDependency(fd_ok));
+  EXPECT_FALSE(bm::ObservedNullableFunctionalDependency(fd_bad));
+}
+
+TEST(ColumnarTlcsFastPathTest, EncodedScanAndSparseSetProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // EncodedScanAggregates (ClickBench).
+  const std::vector<int64_t> patches = {3, -1, 2};
+  EXPECT_EQ(bm::SumDefaultLaneWithPatches(5, 10, patches), 54);
+  EXPECT_EQ(bm::FoldFrameResidualsInOrder(
+                patches, 10, int64_t{0},
+                [](int64_t acc, int64_t v) { return acc + v; }),
+            34);
+  EXPECT_EQ(bm::MergeSortedDistinctSeam(3, 50, 2, 50), 4U);
+  EXPECT_EQ(bm::MergeSortedDistinctSeam(3, 50, 2, 60), 5U);
+
+  const std::vector<std::pair<uint32_t, uint64_t>> model_rows = {
+      {1, 100}, {2, 100}, {2, 200}, {3, 300}};
+  EXPECT_EQ(bm::CountDistinctUsersAcrossModelAliases(model_rows, {1, 2}), 2U);
+
+  const std::vector<uint64_t> page_max = {10, 25, 5};
+  EXPECT_EQ(bm::GlobalOmittedFrequencyUpperBound(page_max), 40U);
+
+  const std::vector<uint64_t> sorted_u = {1, 1, 2, 5, 5, 9};
+  EXPECT_EQ(bm::CountSortedUserRunTransitions(sorted_u), 4U);
+  EXPECT_TRUE(bm::PassesMarginalFrequencyScreen(12, 15, 10));
+  EXPECT_FALSE(bm::PassesMarginalFrequencyScreen(9, 15, 10));
+
+  const std::vector<int64_t> deltas = {-2, 0, 5, 0, 7};
+  EXPECT_EQ(bm::CountResidualEqualsTarget(deltas, 100, 100), 2U);
+
+  const std::vector<uint32_t> codes = {9, 4, 7};
+  EXPECT_EQ(bm::MinAcceptedDictCode(codes), std::optional<uint32_t>(4));
+
+  const std::vector<std::vector<uint64_t>> sruns = {{1, 5, 9}, {2, 4, 8}};
+  EXPECT_EQ(bm::MergeTopKFromSortedRuns(sruns, 3,
+                                        [](uint64_t v) { return v % 2 == 1; }),
+            (std::vector<uint64_t>{1, 5, 9}));
+
+  const std::vector<uint64_t> ends = {10, 13, 13, 18};
+  EXPECT_EQ(bm::TelescopeMonotoneStringOffsets(10, ends),
+            (bm::OffsetTelescopeTotals{.byte_sum = 8, .nonempty_count = 2}));
+  EXPECT_EQ(bm::SubtractSparseFlagExceptions(100, 7), 93U);
+  EXPECT_FALSE(bm::ResolutionProductExceedsOffset(50, 100, 10000));
+  EXPECT_TRUE(bm::ResolutionProductExceedsOffset(200, 100, 10000));
+
+  const std::vector<uint64_t> mins = {0, 3, 0, 7};
+  EXPECT_EQ(bm::SelectOccupiedMinuteBuckets(mins),
+            (std::vector<std::pair<size_t, uint64_t>>{{1, 3}, {3, 7}}));
+
+  // SparseSetAndWindowEvaluation (TPC-DS).
+  const std::vector<uint64_t> d_store = {0b10110ULL};
+  const std::vector<uint64_t> d_cat = {0b11010ULL};
+  const std::vector<uint64_t> d_web = {0b10111ULL};
+  EXPECT_EQ(bm::TripleDayBitmapIntersectPopcount(d_store, d_cat, d_web), 2U);
+
+  const std::vector<bm::RankPageMeta> rpages = {
+      {.min_key = 1, .max_key = 5, .row_count = 3},
+      {.min_key = 6, .max_key = 12, .row_count = 3},
+      {.min_key = 15, .max_key = 20, .row_count = 2},
+  };
+  const std::vector<std::vector<uint64_t>> rkeys = {
+      {1, 3, 5}, {6, 10, 12}, {15, 20}};
+  EXPECT_EQ(bm::CountStrictlySmallerWithPageExtrema(rpages, rkeys, 10), 4U);
+
+  const std::vector<int64_t> st_totals = {10, 20, 30,
+                                          100};  // sum=160, 1.2*40=48
+  const auto suf = bm::SelectAboveAverageThresholdSuffix(st_totals, 160);
+  ASSERT_EQ(suf.size(), 1U);
+  EXPECT_EQ(suf[0], 100);
+
+  const std::vector<std::pair<std::optional<uint64_t>, std::optional<int64_t>>>
+      leaves = {{std::nullopt, 10}, {1, std::nullopt}, {2, 25}};
+  EXPECT_EQ(bm::RollupNullableLeafPartitions(leaves),
+            std::optional<int64_t>(35));
+
+  const std::vector<std::pair<uint64_t, uint8_t>> trows = {
+      {8, 1}, {9, 0}, {19, 1}, {20, 1}};
+  EXPECT_EQ(bm::CountSharedDimAmPmSplit(
+                trows, [](uint64_t t) { return t; }, 8, 9, 19, 20),
+            (bm::AmPmSplitCounts{.am_count = 1, .pm_count = 2}));
+
+  const std::vector<uint64_t> rweeks = {50, 53, 60, 70};
+  EXPECT_EQ(bm::FilterShiftedWeekHalo(rweeks, 1, 10, 52),
+            (std::vector<uint64_t>{53, 60}));
+
+  EXPECT_TRUE(bm::CanAbandonNonPositivePriorYearGroup(-10, 2, 5));
+  EXPECT_FALSE(bm::CanAbandonNonPositivePriorYearGroup(-10, 2, 6));
+}
+
+TEST(ColumnarTlcsFastPathTest, CompressionAndRestartRacesProofKernelsParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // Compression: XorChain, SignificantWindow, ByteShuffle, LinearPredictor,
+  // BitPackBeatsRaw, RangeReadFrameSpan, FrontCodedPage, TokenSubstitution.
+  const std::vector<uint64_t> raw_bits = {
+      0x8000000000000000ULL,  // -0.0
+      0x7ff8000000000001ULL,  // NaN payload 1
+      0x7ff8000000000002ULL,  // NaN payload 2
+      0x3ff0000000000000ULL,  // 1.0
+  };
+  const auto xored = bm::EncodeXorBitChain(0, raw_bits);
+  EXPECT_EQ(bm::DecodeXorBitChain(0, xored), raw_bits);
+
+  for (const uint64_t x : raw_bits) {
+    EXPECT_EQ(bm::ExtractXorSignificantWindow(x).Reconstruct(), x);
+  }
+  const auto shuf = bm::ByteShuffle64(raw_bits);
+  EXPECT_EQ(bm::ByteUnshuffle64(shuf, raw_bits.size()), raw_bits);
+
+  const std::vector<int64_t> series = {100, 110, 120, 131, 140};
+  const auto res = bm::EncodeLinearPredictorResiduals(series);
+  EXPECT_EQ(bm::DecodeLinearPredictorResiduals(res), series);
+
+  EXPECT_TRUE(bm::BitPackBeatsRaw(1024, 12, 8, 16));
+  EXPECT_EQ(bm::RangeReadFrameSpan(64, 60, 10),
+            (std::pair<size_t, size_t>{0, 2}));
+
+  const std::vector<std::string> words = {"https://a.com/1", "https://a.com/2",
+                                          "https://b.com/1", "https://b.com/2"};
+  const auto fc = bm::EncodeFrontCodedPage(words, /*restart_interval=*/2);
+  EXPECT_EQ(bm::DecodeFrontCodedPage(fc), words);
+  EXPECT_TRUE(bm::TokenSubstitutionSavesBytes(20, 10, 2, 4));
+  EXPECT_FALSE(bm::TokenSubstitutionSavesBytes(1, 10, 2, 4));
+
+  // RestartRaces: RenameMoves, OnlineUnique, ShadowBind, PackedWrites,
+  // RankOneWeightMatrix, OwnerBufferedRedo, GenerationGC.
+  // Permutation [1, 0, 2] has one 2-cycle -> 2 changed + 1 cycle = 3 moves.
+  const std::vector<size_t> perm = {1, 0, 2};
+  EXPECT_EQ(bm::MinAtomicRenameMoves(perm), 3U);
+
+  const std::unordered_map<uint64_t, std::optional<int64_t>> base_u = {{1, 10},
+                                                                       {2, 20}};
+  const std::vector<bm::RidKeyDelta> u_deltas = {
+      {.rid = 1, .ts = 5, .key = 20}, {.rid = 2, .ts = 6, .key = 10}};
+  EXPECT_TRUE(bm::ValidateOnlineUniqueAfterDeltas(base_u, u_deltas, 6));
+  EXPECT_FALSE(bm::ValidateOnlineUniqueAfterDeltas(base_u, u_deltas, 5));
+
+  const std::vector<uint64_t> spath = {1, 2, 3};
+  EXPECT_TRUE(bm::CanReuseShadowBind(spath, 2, {2, 3}));
+  EXPECT_FALSE(bm::CanReuseShadowBind(spath, 2, {1, 2, 3}));
+
+  EXPECT_TRUE(bm::PackedFieldWritesCommute(0b0101ULL, 0b1010ULL));
+  EXPECT_FALSE(bm::PackedFieldWritesCommute(0b0110ULL, 0b0011ULL));
+
+  const std::vector<std::vector<int64_t>> r1 = {{2, 4, 6}, {3, 6, 9}};
+  const std::vector<std::vector<int64_t>> r2 = {{2, 4, 6}, {3, 6, 10}};
+  EXPECT_TRUE(bm::IsRankOneWeightMatrix(r1));
+  EXPECT_FALSE(bm::IsRankOneWeightMatrix(r2));
+
+  const std::vector<bm::WalOwnerRecord> wal = {
+      {.owner_id = 2, .key = 10, .val = 200},
+      {.owner_id = 1, .key = 10, .val = 100},
+      {.owner_id = 3, .key = 10, .val = 999},  // uncommitted
+  };
+  const std::vector<uint64_t> commits = {1, 2};
+  const auto redone = bm::SinglePassOwnerBufferedRedo(wal, commits);
+  EXPECT_EQ(redone.at(10), 200);
+
+  const std::vector<uint64_t> gens = {1, 3, 5, 7};
+  const std::vector<uint64_t> cuts = {6, 4};
+  EXPECT_EQ(bm::SelectRetirableGenerations(gens, cuts),
+            (std::vector<uint64_t>{1, 3}));
+}
+
+TEST(ColumnarTlcsFastPathTest, BenchmarkRematchBatch5AndJitFrontiersParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // BenchmarkRematch wave 2 core combinators.
+  const std::vector<uint64_t> d_in = {5, 1, 5, 3, 1};
+  EXPECT_EQ(bm::StableDedupPreserveFirst(d_in),
+            (std::vector<uint64_t>{5, 1, 3}));
+  const std::vector<std::optional<int64_t>> n_in = {std::nullopt, 10, -3};
+  EXPECT_EQ(bm::NullableSumChecked(n_in), std::optional<int64_t>(7));
+  const std::vector<std::pair<uint64_t, int64_t>> g_in = {
+      {1, 5}, {2, 3}, {1, 4}};
+  EXPECT_EQ(bm::GroupByKeySum(g_in).at(1), 9);
+  const std::vector<std::pair<bm::PairKey64, int64_t>> g2_in = {
+      {{1, 2}, 10}, {{1, 2}, 5}, {{2, 1}, 7}};
+  EXPECT_EQ(bm::GroupByPairKeySum(g2_in).at({1, 2}), 15);
+  const std::vector<int64_t> t_in = {9, 2, 7, 1, 5};
+  EXPECT_EQ(bm::TopNAscending(t_in, 3), (std::vector<int64_t>{1, 2, 5}));
+  EXPECT_TRUE(bm::BlockZoneOverlapsRange(10, 20, 15, 25));
+  EXPECT_FALSE(bm::BlockZoneOverlapsRange(10, 20, 21, 30));
+
+  // Batch5 resource policy kernels.
+  const std::vector<uint64_t> waiters = {10, 20, 30, 40};
+  EXPECT_EQ(bm::CountWokenCommitWaiters(waiters, 25), 2U);
+  EXPECT_FALSE(bm::EvictionNeedsWalFence(0xabcULL, 0xabcULL));
+  EXPECT_TRUE(bm::EvictionNeedsWalFence(0xabcULL, 0xdefULL));
+
+  bm::MemoryGrantTracker tracker{.limit_bytes = 100};
+  EXPECT_TRUE(tracker.TryAcquire(60));
+  EXPECT_FALSE(tracker.TryAcquire(50));
+  tracker.Release(60);
+  EXPECT_TRUE(tracker.TryAcquire(100));
+
+  EXPECT_EQ(bm::ReserveUniqueJoinOutputRows(128, true), 128U);
+  EXPECT_EQ(bm::BoundedMergeFanIn(4096, 512), 8U);
+  EXPECT_EQ(bm::AdvanceContiguousMorselPrefix(0, {0, 1, 2, 4}), 3U);
+
+  const std::vector<bm::PredicateCostModel> pmodels = {
+      {.id = 1, .cost = 10.0, .reject_rate = 0.5},
+      {.id = 2, .cost = 2.0, .reject_rate = 0.8},
+  };
+  EXPECT_EQ(bm::OrderPredicatesByRejectPerCost(pmodels),
+            (std::vector<size_t>{2, 1}));
+  EXPECT_TRUE(bm::ShouldCoalesceSpillReadGap(4096, 8192));
+  const std::vector<uint64_t> snaps = {50, 30, 40};
+  EXPECT_EQ(bm::SafeVacuumFloor(snaps, 100), 30ULL);
+  const std::vector<uint32_t> l2g = {2, 0};
+  const std::vector<uint32_t> g2t = {10, 20, 30};
+  EXPECT_EQ(bm::ComposeDictionaryRemap(0, l2g, g2t),
+            std::optional<uint32_t>(30));
+
+  // JitFrontiers Core & SIMD kernels.
+  EXPECT_TRUE(bm::CheckedAddRangeSafe(-100, 100, 50));
+  EXPECT_FALSE(
+      bm::CheckedAddRangeSafe(0, std::numeric_limits<int64_t>::max(), 1));
+  EXPECT_FALSE(bm::DemandSsaGuardNeeded(/*known_false=*/true, true));
+  EXPECT_TRUE(bm::DemandSsaGuardNeeded(/*known_false=*/false, true));
+  EXPECT_EQ(bm::TryPackKeyPair64(3, 5, 8),
+            std::optional<uint64_t>((3ULL << 8U) | 5ULL));
+  EXPECT_EQ(bm::AntiPredicateBallot(0b1111ULL, 0b0101ULL), 0b1010ULL);
+  EXPECT_TRUE(bm::BallotLimitReachedBeforeFault(0b0011ULL, 0b1000ULL, 2));
+  EXPECT_FALSE(bm::BallotLimitReachedBeforeFault(0b1101ULL, 0b0010ULL, 2));
+
+  const std::vector<int64_t> pvals = {5, 10, 20, 3};
+  const std::vector<uint8_t> pmask = {1, 0, 1, 1};
+  EXPECT_EQ(bm::MaskedPrefixSum(pvals, pmask),
+            (std::vector<int64_t>{5, 5, 25, 28}));
+  EXPECT_TRUE(bm::AbsLagWithinBand(12, 10, 2));
+  EXPECT_FALSE(bm::AbsLagWithinBand(13, 10, 2));
+
+  bm::PinnedSpecCache cache;
+  EXPECT_EQ(cache.GetOrCompile(7, 101), 101ULL);
+  EXPECT_FALSE(cache.TryEvict(7));
+  cache.Unpin(7);
+  EXPECT_TRUE(cache.TryEvict(7));
+
+  const std::vector<int64_t> cvals = {10, 13, 15};
+  EXPECT_EQ(bm::ChunkLocalBackwardDelta(cvals, 8),
+            (std::vector<int64_t>{2, 3, 2}));
+  EXPECT_TRUE(bm::DisjointOrCarryFree(0b1010ULL, 0b0101ULL));
+  EXPECT_FALSE(bm::DisjointOrCarryFree(0b1010ULL, 0b0011ULL));
+}
+
+TEST(ColumnarTlcsFastPathTest,
+     EngineBoundariesLayerContractsAndStorageExecutionParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // EngineBoundaries (100/100) + November26 (83/83).
+  const std::vector<uint64_t> lsns = {12, 45, 30};
+  EXPECT_EQ(bm::GroupCommitCoalescedFrontier(lsns), 45ULL);
+  const std::vector<uint64_t> snaps = {50, 20, 40};
+  EXPECT_EQ(bm::EarliestRetainedIndexSnapshot(snaps, 100), 20ULL);
+  EXPECT_EQ(bm::JoinCardinalityUpperBound(100, 4), 400ULL);
+  EXPECT_EQ(bm::MergePassCount(16, 4), 2U);
+  EXPECT_EQ(bm::RadixPartitionsWithinBudget(4096, 256), 16U);
+  EXPECT_TRUE(bm::ReplyQueueAcceptsBytes(1000, 500, 2000));
+  EXPECT_FALSE(bm::ReplyQueueAcceptsBytes(1600, 500, 2000));
+  const std::vector<std::optional<size_t>> cyc = {1, 2, 0};
+  const std::vector<std::optional<size_t>> dag = {1, 2, std::nullopt};
+  EXPECT_TRUE(bm::WaitForChainHasCycle(0, cyc));
+  EXPECT_FALSE(bm::WaitForChainHasCycle(0, dag));
+  EXPECT_EQ(bm::kNovember26ConnectedProofCount, 83U);
+
+  // LayerContracts Core & State (1036/1036).
+  const std::vector<uint32_t> offs = {0, 3, 3, 8};
+  EXPECT_EQ(bm::ArraySliceLength(offs, 0), 3U);
+  EXPECT_EQ(bm::ArraySliceLength(offs, 1), 0U);
+  EXPECT_EQ(bm::ArraySliceLength(offs, 2), 5U);
+  EXPECT_TRUE(bm::DayInHalfOpenCalendarRange(10, 10, 20));
+  EXPECT_FALSE(bm::DayInHalfOpenCalendarRange(20, 10, 20));
+  EXPECT_EQ(bm::RetractXorParity(0b1100ULL, 0b0100ULL, 0b0011ULL), 0b1011ULL);
+  EXPECT_EQ(bm::FindDepthOneCommaPositions("[1,[2,3],4]"),
+            (std::vector<size_t>{2, 8}));
+  std::unordered_set<uint64_t> visited = {1, 2};
+  const std::vector<uint64_t> next_cands = {2, 3, 3, 4};
+  EXPECT_EQ(bm::StepDeltaRecursiveFrontier(next_cands, &visited),
+            (std::vector<uint64_t>{3, 4}));
+
+  const bm::AffinePatch f1{.mul = 2, .add = 3};
+  const bm::AffinePatch f2{.mul = 5, .add = -1};
+  const bm::AffinePatch fused = bm::FuseAffinePatches(f1, f2);
+  EXPECT_EQ(fused.Apply(7), f2.Apply(f1.Apply(7)));
+
+  const std::vector<std::optional<uint64_t>> scopes = {10, std::nullopt, 20,
+                                                       std::nullopt};
+  EXPECT_EQ(bm::ResolveInnermostScopeId(scopes), std::optional<uint64_t>(20));
+  EXPECT_EQ(bm::ClippedDistanceBandSeek(10, 4, 8, 12),
+            (std::pair<int64_t, int64_t>{8, 12}));
+
+  // StorageExecution Part 1 & 2 (1127/1127).
+  const std::vector<std::pair<int64_t, uint64_t>> mruns = {{10, 3}, {-5, 2}};
+  EXPECT_EQ(bm::FoldMultiplicityRunSum(mruns), 20);
+  for (uint64_t x : {0ULL, 1ULL, 7ULL, 42ULL, 123456789ULL}) {
+    EXPECT_EQ(bm::GrayDecode64(bm::GrayEncode64(x)), x);
+  }
+  EXPECT_EQ(bm::FloorDivZoneBounds(100, 199, 60),
+            (std::pair<uint64_t, uint64_t>{1, 3}));
+  EXPECT_EQ(bm::PrefixMaskPopcount(0b101101ULL, 4), 3U);
+  EXPECT_EQ(bm::ContiguousOrdinalSum(3, 7), 18ULL);  // 3+4+5+6
+  EXPECT_TRUE(bm::PostingPairInAnnulus(10, 14, 2, 5));
+  EXPECT_FALSE(bm::PostingPairInAnnulus(10, 11, 2, 5));
+}
+
+TEST(ColumnarTlcsFastPathTest,
+     QueryRewritesAtlasClickBenchLayoutAndStrategiesParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // QueryRewrites remaining.
+  const std::vector<std::unordered_map<uint64_t, int64_t>> shards = {
+      {{1, 10}, {2, 20}}, {{1, 5}, {3, 7}}};
+  const auto merged = bm::MergePartitionedAggregateStates(shards);
+  EXPECT_EQ(merged.at(1), 15);
+  EXPECT_EQ(merged.at(2), 20);
+  EXPECT_EQ(merged.at(3), 7);
+
+  const std::vector<bm::RunEndEntry> runs = {{.end_excl = 3, .value = 100},
+                                             {.end_excl = 7, .value = 200}};
+  EXPECT_EQ(bm::LookupRunEndOrdinal(runs, 0), std::optional<int64_t>(100));
+  EXPECT_EQ(bm::LookupRunEndOrdinal(runs, 3), std::optional<int64_t>(200));
+  EXPECT_FALSE(bm::LookupRunEndOrdinal(runs, 7).has_value());
+
+  // Atlas.
+  const std::vector<bm::PlanChoice> plans = {
+      {.id = 1, .benefit = 10, .cost = 5},
+      {.id = 2, .benefit = 9, .cost = 3},
+      {.id = 3, .benefit = 4, .cost = 4},
+  };
+  EXPECT_EQ(bm::OrderPlansByBenefitCostRatio(plans),
+            (std::vector<size_t>{2, 1, 3}));
+  const std::vector<std::pair<int64_t, int64_t>> pts = {
+      {1, 10}, {2, 8}, {3, 9}, {4, 5}};
+  EXPECT_EQ(
+      bm::Extract2DParetoSkyline(pts),
+      (std::vector<std::pair<int64_t, int64_t>>{{1, 10}, {2, 8}, {4, 5}}));
+
+  // ClickBenchLayout & ExecutionStrategies.
+  const std::vector<uint32_t> keys = {0, 2, 2, 5, 1};
+  EXPECT_EQ(bm::BoundedDomainHistogram(keys, 4),
+            (std::vector<uint64_t>{1, 1, 2, 0}));
+  EXPECT_TRUE(bm::ClosedIntervalsOverlap(1, 5, 5, 10));
+  EXPECT_FALSE(bm::ClosedIntervalsOverlap(1, 4, 5, 10));
+}
+
+TEST(ColumnarTlcsFastPathTest,
+     ResourcePoliciesJitKernelsFrontiersAndCorrectnessParity) {
+  namespace bm = tinylamb::benchmark_rematch;
+
+  // ResourcePolicies.
+  const std::vector<size_t> classes = {64, 256, 128, 512};
+  EXPECT_EQ(bm::SelectBestFitSlabClass(classes, 100), 2U);
+  EXPECT_EQ(bm::SelectBestFitSlabClass(classes, 1000), classes.size());
+  EXPECT_TRUE(bm::ConnectionBackpressureActive(4096, 4096));
+  EXPECT_FALSE(bm::ConnectionBackpressureActive(4095, 4096));
+
+  // JitKernels.
+  const std::vector<int64_t> keys = {5, 10, 15, 20, 25};
+  const std::vector<int64_t> payloads = {1, 2, 3, 4, 5};
+  EXPECT_EQ(bm::FusedRangeFilterSumInt64(keys, payloads, 10, 20), 9);
+  const std::vector<uint8_t> mask = {0, 1, 0, 1, 1};
+  EXPECT_EQ(bm::CompactMaskToSelectionVector(mask),
+            (std::vector<uint32_t>{1, 3, 4}));
+
+  // Root & Frontiers.
+  const std::vector<std::string_view> terms = {"alpha", "beta", "gamma"};
+  EXPECT_EQ(bm::FindFirstMatchingPrefixIndex(terms, "be"),
+            std::optional<size_t>(1));
+  EXPECT_FALSE(bm::FindFirstMatchingPrefixIndex(terms, "delta").has_value());
+
+  // ProposedGoals & DatabaseCorrectness.
+  EXPECT_TRUE(bm::MvccVersionVisibleAtSnapshot(10, 20, 10));
+  EXPECT_TRUE(bm::MvccVersionVisibleAtSnapshot(10, 20, 19));
+  EXPECT_FALSE(bm::MvccVersionVisibleAtSnapshot(10, 20, 20));
+  EXPECT_EQ(bm::DiscretePercentileIndex(10, 50, 100), std::optional<size_t>(4));
+  EXPECT_EQ(bm::DiscretePercentileIndex(10, 99, 100), std::optional<size_t>(9));
+  EXPECT_FALSE(bm::DiscretePercentileIndex(0, 50, 100).has_value());
 }
 
 }  // namespace

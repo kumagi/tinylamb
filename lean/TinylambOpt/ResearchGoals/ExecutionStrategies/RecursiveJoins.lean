@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.RecursiveDelta
 
+/-!
+These contracts describe the state or ordering needed for alternative SQL execution
+strategies.
+-/
+
 namespace TinylambOpt.ResearchGoals.RecursiveJoins
 open RecursiveDelta (Edge Reach)
 

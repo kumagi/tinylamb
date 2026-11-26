@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims map compact selection bits back to original lane positions. A SQL vector
+scan must retain that mapping when combining masks from filtered batches.
+
+Modeled claims
+
+- `Goal` — `∀ parent child, lanes (deposit 64 child parent) = ((lanes
+  parent).zipIdx.filter (fun p => child.getLsbD p.2)).map Prod.fst`
+-/
+
 namespace TinylambOpt.ResearchGoals.SelectionMaskDeposit
 
 abbrev W := BitVec 64

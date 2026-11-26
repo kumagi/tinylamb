@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims derive the mask of digit positions using packed word operations. A SQL text
+parser can classify multiple bytes together if the represented byte and lane conditions
+hold.
+
+Modeled claims
+
+- `Goal` — `∀ x i, i < 64 → (ballot x).getLsbD i = (i % 8 == 7 && scalar x (i/8))`
+-/
+
 namespace TinylambOpt.ResearchGoals.SwarDigitBallot
 
 abbrev W := BitVec 64

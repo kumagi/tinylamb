@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.BoundedMultiKeyDirectArrayAggregate
 
+/-!
+Proved
+
+- `Goal` — Bounded 2-key dense direct-array parallel aggregation with NULL sentinel
+  slots (H2O H2, H4 / LDBC L2 / DictionaryJoinsAndLateLabels B3 / STATS-CEB C5):
+  mapping bounded non-NULL keys onto `[0..span-1]` and `NULL` onto index `span`
+  produces a collision-free 2D table per worker whose elementwise merge matches full
+  hash-based `GROUP BY (k1, k2)` across empty, zero-canceling, and NULL-key groups.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.BoundedMultiKeyDirectArrayAggregate`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BoundedMultiKeyDirectArrayAggregate
 
 open TinylambOpt.ResearchGoals.BoundedMultiKeyDirectArrayAggregate
@@ -432,3 +445,8 @@ theorem sound : TinylambOpt.ResearchGoals.BoundedMultiKeyDirectArrayAggregate.Go
   · simp [hMempty, sumOptList_eq]
 
 end TinylambOpt.ResearchProofs.BoundedMultiKeyDirectArrayAggregate
+
+-- C++ references to this model or its proof.
+-- executor/detail/typed_stream_aggregate_direct.cpp
+-- executor/detail/typed_stream_aggregate_partitioned.cpp
+-- executor/detail/typed_stream_aggregate_partitioned.hpp

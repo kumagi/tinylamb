@@ -1,5 +1,25 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `LaneCompaction.ChunkOffsets` — `∀ a b, slots (a++b) = slots a ++ (slots b).map
+  (a.length+·)`
+- `LaneCompaction.DecodeSavings` — `∀ m (widths : List Nat), m.length = widths.length →
+  widths.sum - (pack m widths).sum = (pack (m.map (!·)) widths).sum`
+- `LaneCompaction.EarlyDemand` — `∀ m (xs : List Int) k, m.length = xs.length → let
+  stop := ((slots m)[k]?).getD m.length (pack m xs).take k = pack (m.take stop)
+  (xs.take stop)`
+- `LaneCompaction.ExpandBack` — `∀ m (v : List Int), m.length = v.length → recover m
+  (pack m v) = (m.zip v).map (fun (ok,x) => if ok then some x else none)`
+- `LaneCompaction.MaskCompose` — `∀ (v : List Int) m second, m.length = v.length →
+  second.length = m.count true → pack second (pack m v) = pack ((recover m
+  second).map (·.getD false)) v`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.ExecutorResources.LaneCompaction
 
 open TinylambOpt.ResearchGoals.Atlas.ExecutorResources

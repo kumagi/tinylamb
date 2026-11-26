@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
-import TinylambOpt.ResearchProofs.Atlas_JoinPlans_ParallelLineage_Remaining_Round2
+import TinylambOpt.ResearchProofs.Atlas.JoinPlans.ParallelLineageCapsAndCollisionCorrection
+
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `ParallelLineage.FractionalCap` — `∀ n db b weights den, cover pattern weights den →
+  (reference pattern n (fun r x y => if db r x y == 0 then 0 else 1) b).toNat ^ den ≤
+  ((pattern.atoms.zip weights).map (fun (a,w) => support n db a pattern b ^ w)).prod`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -17,9 +28,9 @@ open TinylambOpt.ResearchGoals.Atlas.JoinPlans.ParallelLineage
     `den ∈ {1,2}` before proving it.  The fully elaborated argument (finite
     range-sum infrastructure, five pointwise cover bounds and the splitting
     of `den` over them) is the already type-checked per-model proof in
-    `Atlas_JoinPlans_ParallelLineage_Remaining_Round2`, reused verbatim here. -/
+    `Atlas.JoinPlans.ParallelLineageCapsAndCollisionCorrection`, reused verbatim here. -/
 theorem sound_ParallelLineage_FractionalCap :
     TinylambOpt.ResearchGoals.Atlas.JoinPlans.ParallelLineage.FractionalCap.Goal :=
-  TinylambOpt.ResearchProofs.Round2.Task81.sound_FractionalCap
+  TinylambOpt.ResearchProofs.Atlas.JoinPlans.ParallelLineageCapsAndCollisionCorrection.sound_FractionalCap
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_ParallelLineage_FractionalCap

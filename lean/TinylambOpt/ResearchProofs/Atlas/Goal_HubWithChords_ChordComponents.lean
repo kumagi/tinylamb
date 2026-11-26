@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `HubWithChords.ChordComponents` — `∀ n db b, let arm := fun (x a d e : Nat) => total
+  n (fun i => db a x i * dot n (db e i) (db d x)) reference pattern n db b = total n
+  (fun x => arm x 0 1 5 * arm x 2 3 6 * total n (db 4 x))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.WordPromises
 
+/-!
+A fixed-width SQL expression fast path depends on the integer range and representation
+facts used to justify its machine operations.
+
+Proved
+
+- `SignedProduct.TimesNegOne` — `∀ x, op.test x (-1)=true ↔ x≠0x8000000000000000`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

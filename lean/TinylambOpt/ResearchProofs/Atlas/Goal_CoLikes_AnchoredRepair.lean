@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
-import TinylambOpt.ResearchProofs.Atlas.JoinPlans1
+import TinylambOpt.ResearchProofs.Atlas.JoinPlans.MovieJoinBoundaryMessages
+
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `CoLikes.AnchoredRepair` — `∀ n old new b, reference pattern n new b - reference
+  pattern n old b = (pattern.atoms.zipIdx.map (fun (a,i) => pivotTerm pattern n old
+  new b i a)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -33,7 +44,7 @@ example : ∀ a ∈ CoLikes.pattern.atoms, a.src ≠ a.dst := by native_decide
 
 theorem sound_CoLikes_AnchoredRepair : CoLikes.AnchoredRepair.Goal := by
   intro n old new b
-  exact TinylambOpt.ResearchProofs.Atlas.JoinPlans1.anchored_repair_generic
+  exact TinylambOpt.ResearchProofs.Atlas.JoinPlans.MovieJoinBoundaryMessages.anchored_repair_generic
     CoLikes.pattern n old new b (by native_decide) (by native_decide)
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_CoLikes_AnchoredRepair

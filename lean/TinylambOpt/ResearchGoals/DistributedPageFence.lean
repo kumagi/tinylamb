@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.SqlFetchWithTies
 
+/-!
+These claims describe which page state a distributed reader can observe after a fence.
+SQL reads depend on enforcing the modeled visibility across ownership or version
+changes.
+
+Modeled claims
+
+- `Goal`
+-/
+
 namespace TinylambOpt.ResearchGoals.DistributedPageFence
 
 abbrev Row := Research.TieWatermark.Row

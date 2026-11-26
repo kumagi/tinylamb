@@ -1,5 +1,14 @@
 import Std.Tactic
 
+/-!
+Explicit NULL placement is independent of direction; direction orders values only.
+
+Strict part of the key order. NULL-vs-NULL and equal keys are never "better"; a boundary
+is never confused with an appearance id.
+
+Named results include `optLt_irrefl`, `optLt_trans`, `optLt_trichotomy`.
+-/
+
 set_option maxRecDepth 100000
 
 /-!

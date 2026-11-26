@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.TwoLevelPartitionedAggMerge
 
+/-!
+Proved
+
+- `Goal` — Two-level radix partitioned parallel aggregate merge
+  (`executor/detail/typed_stream_aggregate_partitioned.cpp`, ClickBench Q14/17/
+  19/29/32/34/35): routing worker-local `(count, sum)` maps to `numParts` disjoint
+  partitions by `hash k % numParts` yields zero duplicate output keys across
+  partitions and exact parity with single-thread aggregation.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.TwoLevelPartitionedAggMerge`.
+-/
+
 -- # Soundness of two-level radix-partitioned parallel `(count, sum)` merge
 -- Lean proof: lean/TinylambOpt/ResearchProofs/TwoLevelPartitionedAggMerge.lean (sound)
 
@@ -555,3 +568,6 @@ theorem sound : Goal := by
         simp [hPf]
 
 end TinylambOpt.ResearchProofs.TwoLevelPartitionedAggMerge
+
+-- C++ references to this model or its proof.
+-- executor/detail/typed_stream_aggregate_partitioned.cpp

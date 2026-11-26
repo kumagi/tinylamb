@@ -1,5 +1,17 @@
 import Std
 
+/-!
+These claims relate offsets and selection bits to a reference gather. A scan can read
+the selected payloads late while preserving their positions and order.
+
+Modeled claims
+
+- `Goal` — `∀ off k (pages : List Page), let r := run off k pages.zipIdx let rows :=
+  pages.zipIdx.flatMap fun (p,i) => (selected p).map fun lane => ((i,lane),p.payload
+  lane) let slice := (rows.drop off).take k r.values = slice.map Prod.snd ∧ r.reads =
+  slice.map Prod.fst ∧ r.opened = (slice.map (fun x => x.1.1)).eraseDups`
+-/
+
 namespace TinylambOpt.ResearchGoals.OffsetBitmapGather
 
 abbrev W := BitVec 64

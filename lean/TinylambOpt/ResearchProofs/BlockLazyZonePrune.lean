@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.BlockLazyZonePrune
 
+/-!
+Proved
+
+- `Goal` — Two-stage lazy block pruning (`table/tlcs_file.cpp`,
+  `executor/relational_regression_test_part4.cpp`): ZoneMap headers gate key
+  decoding, and payload columns are decoded only on blocks with ≥ 1 match.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.BlockLazyZonePrune`.
+-/
+
 namespace TinylambOpt.ResearchProofs.BlockLazyZonePrune
 open ResearchGoals.BlockLazyZonePrune
 open List

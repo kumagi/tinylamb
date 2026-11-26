@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.MonotonicKeyStreamTopK
 
+/-!
+Proved
+
+- `Goal` — Streaming monotonic-key Top-K group-by (TPC-H Q03 on `lineitem.l_orderkey`
+  joining `orders`): under globally non-decreasing keys across worker chunks, each
+  worker buffers at most `K` closed groups while boundary seam stitching reproduces
+  exact full-table grouped Top-K.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.MonotonicKeyStreamTopK`.
+-/
+
 -- Soundness of monotonic-key streaming Top-K.
 --
 -- The proof transports the Boolean comparator `betterEntry` to a strict total

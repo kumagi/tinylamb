@@ -1,4 +1,21 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
+
+/-!
+Ordered SQL scans and limits depend on preserving key order and ties across physical
+clusters.
+
+Proved (12 claims, including the following)
+
+- `LocalRead` — `∀ bs w i, (∀ b ∈ bs, b < 256) → takeAt bs w i = get bs w i`
+- `PackedCharge` — `∀ w xs, (pack w xs).length = byteCount (xs.length*w)`
+- `PackedInverse` — `∀ w xs, (∀ x ∈ xs, x < 2^w) → (List.range xs.length).map (get
+  (pack w xs) w) = xs`
+
+Refuted by counterexample
+
+- `AttributeFirst.TwoColumnWin` — Aggressive hypothesis: the combined RLE payload
+  always compensates for the permutation on nonconstant pages.
+-/
 set_option maxHeartbeats 0
 namespace TinylambOpt.ResearchProofs.StorageExecution.ClusterOrder.AttributeFirst
 open TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder

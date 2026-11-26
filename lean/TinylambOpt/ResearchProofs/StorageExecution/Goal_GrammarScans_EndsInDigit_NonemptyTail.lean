@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `EndsInDigit.NonemptyTail` — `∀ a b, 0<extent b → matched reader (.cat a b) 0 =
+  matched reader b 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

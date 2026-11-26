@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.RangePlans
 
+/-!
+An ordered access path needs to preserve the rows and boundaries selected by the SQL
+range predicate.
+
+Proved
+
+- `PriceCorridor.SlidingStrip` — `∀ p rs, let stripe := fun (x : Int) => ((rs.filter
+  (fun r => r.1.x == x && p.y-2 ≤ r.1.y && r.1.y ≤ p.y+5)).map Prod.snd).sum scan
+  shape ⟨p.x+1,p.y⟩ rs - scan shape p rs = stripe (p.x+4) - stripe (p.x-3)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -168,7 +168,7 @@ int ExternalSorter::CompareRows(const Row& lhs, const Row& rhs) const noexcept {
   return 0;
 }
 
-// Lean proof: lean/TinylambOpt/ProposedProofs/PackedOrderKey.lean (sound)
+// Lean proof: lean/TinylambOpt/ResearchProofs/PackedOrderKey.lean (sound)
 // Lean proof: lean/TinylambOpt/ResearchProofs/StableRadix.lean (sound)
 bool ExternalSorter::TrySortRowsPackedTwoKey(std::vector<Row>* rows) const {
   const char* disable_env = ::tinylamb::platform::GetEnv("TINYLAMB_DISABLE_PACKED_ORDER_KEY");

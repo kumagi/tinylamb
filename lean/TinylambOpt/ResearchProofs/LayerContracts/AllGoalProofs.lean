@@ -8,3 +8,8 @@ import TinylambOpt.ResearchProofs.LayerContracts.ReferenceEdits_All
 import TinylambOpt.ResearchProofs.LayerContracts.ScopeLookup_All
 import TinylambOpt.ResearchProofs.LayerContracts.SeekIntervals_All
 import TinylambOpt.ResearchProofs.LayerContracts.SlotPlacement_All
+
+/-!
+This module collects proofs for Array Offsets, Calendar Ranges, Frame Retractions,
+Lexical Cuts and related cases.
+-/

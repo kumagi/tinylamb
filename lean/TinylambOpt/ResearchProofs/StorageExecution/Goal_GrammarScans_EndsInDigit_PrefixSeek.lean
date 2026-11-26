@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 import TinylambOpt.ResearchProofs.Compression.Wire
 
+/-!
+A compressed string scan uses grammar or chunk summaries to evaluate string predicates
+without always reconstructing the full value.
+
+Proved
+
+- `EndsInDigit.PrefixSeek` — Only a partial final phrase needs to be interpreted to
+  obtain the state at an offset.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

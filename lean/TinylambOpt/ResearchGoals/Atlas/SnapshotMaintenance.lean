@@ -1,5 +1,10 @@
 import TinylambOpt.ResearchGoals.ExecutionStrategies.PairAggregates
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
 namespace Versions

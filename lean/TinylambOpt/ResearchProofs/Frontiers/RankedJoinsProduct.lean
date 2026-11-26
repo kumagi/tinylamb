@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Frontiers.RankedJoins
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved
+
+- `BoundedProduct` — `∀ a b k, best k (sums a b) = best k (sums (best k a) (best k b))`
+- `HolesPerAxis` — `∀ a b ok k h, (∀ x ∈ a, b.countP (fun y => !ok x y) ≤ h) → (∀ y ∈
+  b, a.countP (fun x => !ok x y) ≤ h) → best k (qualified a b ok) = best k (qualified
+  (best (k+h) a) (best (k+h) b) ok)`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.RankedJoinsProduct
 
 open TinylambOpt.ResearchGoals.Frontiers.RankedJoins

@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.ImmutableTlcsZoneMapRowBound
 
+/-!
+Proved
+
+- `Goal` — Immutable TLCS v3 zone-map row-count upper bound (TPC-DS Q22 1-pass ROLLUP
+  `exact_integer_total` restore): when blocks carry immutable valid headers, summing
+  row counts of zone-map-matching blocks upper-bounds surviving probe rows, so
+  `zmRows * buildFanout * maxAbs ≤ exactLimit` guarantees `(survivingRows *
+  buildFanout) * maxAbs ≤ exactLimit`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.ImmutableTlcsZoneMapRowBound`.
+-/
+
 namespace TinylambOpt.ResearchProofs.ImmutableTlcsZoneMapRowBound
 open ResearchGoals.ImmutableTlcsZoneMapRowBound
 

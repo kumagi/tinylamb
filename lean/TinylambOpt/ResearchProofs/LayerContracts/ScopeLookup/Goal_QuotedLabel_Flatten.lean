@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+
+Refuted by counterexample
+
+- `QuotedLabel.Flatten` — Aggressive binder: concatenate all scopes before testing
+  ambiguity.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

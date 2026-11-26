@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Refuted by counterexample
+
+- `ProportionalTile` — The commonly proposed scaled-row formula describes every NTILE
+  bucket.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

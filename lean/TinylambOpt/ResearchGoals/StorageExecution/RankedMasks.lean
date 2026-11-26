@@ -1,6 +1,11 @@
 import TinylambOpt.ResearchGoals.Compression.Wire
 import TinylambOpt.ResearchGoals.Atlas.SynopsisBounds
 
+/-!
+A validity or selection mask plus its prefix rank can map logical row positions to
+packed values for SQL scans.
+-/
+
 namespace TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
 open TinylambOpt.ResearchGoals.Compression.Wire
 

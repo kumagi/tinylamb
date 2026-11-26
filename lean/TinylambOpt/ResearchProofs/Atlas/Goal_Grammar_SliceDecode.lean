@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+SQL string predicates can use encoded or summarized text when the modeled match,
+boundaries, and collation are preserved.
+
+Proved
+
+- `Grammar.SliceDecode` — `∀ g l w, ((expand g).drop l).take w = (List.range
+  w).filterMap (fun j => atChar g (l+j))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

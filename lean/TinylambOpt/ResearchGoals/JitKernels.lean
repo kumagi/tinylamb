@@ -1,0 +1,32 @@
+import TinylambOpt.ResearchGoals.JitKernels.BailoutPackets
+import TinylambOpt.ResearchGoals.JitKernels.BorrowMasks
+import TinylambOpt.ResearchGoals.JitKernels.BytecodeStackMaps
+import TinylambOpt.ResearchGoals.JitKernels.CivilTextGathers
+import TinylambOpt.ResearchGoals.JitKernels.CodeReachability
+import TinylambOpt.ResearchGoals.JitKernels.ConflictScatter
+import TinylambOpt.ResearchGoals.JitKernels.ControlByteProbe
+import TinylambOpt.ResearchGoals.JitKernels.DecimalChunks
+import TinylambOpt.ResearchGoals.JitKernels.DeltaLaneScan
+import TinylambOpt.ResearchGoals.JitKernels.DispatchTables
+import TinylambOpt.ResearchGoals.JitKernels.DivergentWaves
+import TinylambOpt.ResearchGoals.JitKernels.ExcursionGuards
+import TinylambOpt.ResearchGoals.JitKernels.FloatingReduction
+import TinylambOpt.ResearchGoals.JitKernels.FusionTraffic
+import TinylambOpt.ResearchGoals.JitKernels.GuardCertificates
+import TinylambOpt.ResearchGoals.JitKernels.InListLowering
+import TinylambOpt.ResearchGoals.JitKernels.InductionLowering
+import TinylambOpt.ResearchGoals.JitKernels.LiteralSkip
+import TinylambOpt.ResearchGoals.JitKernels.MaskSpecialization
+import TinylambOpt.ResearchGoals.JitKernels.NullWordFusion
+import TinylambOpt.ResearchGoals.JitKernels.PackedFieldLoads
+import TinylambOpt.ResearchGoals.JitKernels.ParallelMoves
+import TinylambOpt.ResearchGoals.JitKernels.PlanePredicates
+import TinylambOpt.ResearchGoals.JitKernels.PredicatedStores
+import TinylambOpt.ResearchGoals.JitKernels.RadixCursors
+import TinylambOpt.ResearchGoals.JitKernels.ReciprocalWindows
+import TinylambOpt.ResearchGoals.JitKernels.SampledEquality
+import TinylambOpt.ResearchGoals.JitKernels.SelectionNetworks
+import TinylambOpt.ResearchGoals.JitKernels.TierInvestment
+import TinylambOpt.ResearchGoals.JitKernels.VersionDispatch
+
+/-! Open kernel and code-generation hypotheses for the SQL JIT. Each module defines the observable behavior or cost of a proposed specialization. -/

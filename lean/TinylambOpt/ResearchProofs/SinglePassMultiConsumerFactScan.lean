@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.SinglePassMultiConsumerFactScan
 
+/-!
+Proved
+
+- `Goal` — Multi-consumer single-pass fact scan sharing (TPC-DS Q14 `cross_items` +
+  `avg_sales` + branches, Q44 dual-RANK `store_sales`, Q65 `sb`+`sc` `store_sales`):
+  dispatching one scan with union predicate `p1 || p2 || p3` across heterogeneous
+  consumers produces identical outputs while bounding row reads to `rows.length` vs
+  `3 * rows.length`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SinglePassMultiConsumerFactScan`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SinglePassMultiConsumerFactScan
 
 open TinylambOpt.ResearchGoals.SinglePassMultiConsumerFactScan

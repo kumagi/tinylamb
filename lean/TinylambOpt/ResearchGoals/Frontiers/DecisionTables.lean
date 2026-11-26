@@ -1,6 +1,11 @@
 import Std
 import TinylambOpt.ThreeValued
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+-/
+
 namespace TinylambOpt.ResearchGoals.Frontiers.DecisionTables
 
 /-! A finite relation of valuations for deterministic, total predicate atoms.

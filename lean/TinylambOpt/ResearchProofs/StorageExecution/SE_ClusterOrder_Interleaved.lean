@@ -1,4 +1,21 @@
 import TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder
+
+/-!
+The modeled encoding and decoding contracts support compressed columns without changing
+the values observed by SQL scans.
+
+Proved (12 claims, including the following)
+
+- `LocalRead` — `∀ bs w i, (∀ b ∈ bs, b < 256) → takeAt bs w i = get bs w i`
+- `PackedCharge` — `∀ w xs, (pack w xs).length = byteCount (xs.length*w)`
+- `PackedInverse` — `∀ w xs, (∀ x ∈ xs, x < 2^w) → (List.range xs.length).map (get
+  (pack w xs) w) = xs`
+
+Refuted by counterexample
+
+- `Interleaved.TwoColumnWin` — Aggressive hypothesis: the combined RLE payload always
+  compensates for the permutation on nonconstant pages.
+-/
 set_option maxHeartbeats 0
 namespace TinylambOpt.ResearchProofs.StorageExecution.ClusterOrder.Interleaved
 open TinylambOpt.ResearchGoals.StorageExecution.ClusterOrder

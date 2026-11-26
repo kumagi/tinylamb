@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `QuadraticGap.CrossPageJoin` — Disjoint derived score intervals imply an empty
+  equijoin between pages.
+- `QuadraticGap.SoundInterval` — Bound a computed group or predicate key from
+  independent column min/max.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 
+/-!
+A footer can guide sorted scans and key-range probes when its indexed summary is
+consistent with the stored blocks.
+
+Proved
+
+- `MonotoneBreaks.PrefixCheckpoint` — A saved prefix plus page states yields a scan
+  checkpoint at each boundary.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

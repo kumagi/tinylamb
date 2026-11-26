@@ -931,3 +931,10 @@ theorem sound_SlidingOffsets : SlidingOffsets.Goal := by
 end Following
 
 end TinylambOpt.ResearchProofs.StorageExecution.PostingJoinsA
+
+-- C++ references to this model or its proof.
+-- executor/band_join.cpp
+-- executor/band_join.hpp
+-- executor/band_join_test.cpp
+-- executor/columnar_tlcs_fast_path_test.cpp
+-- executor/relational_scalar_counts.cpp

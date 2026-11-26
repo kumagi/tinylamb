@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.JoinPlans
 
+/-!
+Join planning can change the order or representation of matching work while preserving
+the modeled result and multiplicity.
+
+Proved
+
+- `SupplierClique.OrbitRepresentative` — `∀ n db b, (∀ i < n, ∀ j < n, db 0 i j = db 0
+  j i) → injective pattern n db b = 24*integrate n pattern.freeVars b (fun x => if x
+  0 < x 1 && x 1 < x 2 && x 2 < x 3 then product (factors pattern db) x else 0)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

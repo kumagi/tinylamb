@@ -1,6 +1,16 @@
 import TinylambOpt.ResearchGoals.StorageExecution.DerivedZones
 import TinylambOpt.ResearchProofs.StorageExecution.SE_DerivedZones_BitwiseXor
 
+/-!
+Scan pruning can exploit derived bounds only when every matching row remains covered by
+the block summary.
+
+Proved
+
+- `BitwiseXor.ThresholdCount` — Estimate the number of passing rows using only
+  certified and possible pages.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

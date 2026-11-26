@@ -1,5 +1,19 @@
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 
+/-!
+Posting-list execution can use key and interval structure to reduce the rows it examines
+while preserving the modeled join or count.
+
+Proved (10 claims, including the following)
+
+- `ScaledFloor.BucketWidth` — `∀ t x, search.spans ((t+1)*(x+1)) t
+  x=[(t*(x+1),(t+1)*(x+1))]`
+- `ScaledFloor.IntegralSum` — Subtraction on a stored prefix-sum column yields the
+  right payload sum.
+- `ScaledFloor.KthMatch` — Top offset within the matching postings preserves tie
+  multiplicity and right ordering.
+-/
+
 set_option maxHeartbeats 0
 
 namespace Helpers_ScaledFloor

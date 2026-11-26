@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.RadixBudget
 
+/-!
+Partitioning for a spillable SQL operator must satisfy the modeled size or resource
+bound for its partitions.
+
+Proved
+
+- `GeometricProgress` — A non-stagnant oversized path of d passes has a geometric bound
+  on its bytes.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

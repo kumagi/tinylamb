@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.SelfJoinSharedScanDualFilterSplit
 
+/-!
+Proved
+
+- `Goal` — Self-join shared base scan with dual role bitmasks (LDBC L1 `person p / p2`
+  / STATS-CEB C2 `users u / u2`): building a single tagged node table with 2 role
+  filter bits `(cond1, cond2)` in one pass over `T` yields the exact same join pairs
+  as two independent base scans for every table and edge set, while halving base-row
+  scan touches whenever `T ≠ []`.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.SelfJoinSharedScanDualFilterSplit`.
+-/
+
 namespace TinylambOpt.ResearchProofs.SelfJoinSharedScanDualFilterSplit
 
 open TinylambOpt.ResearchGoals.SelfJoinSharedScanDualFilterSplit
@@ -101,3 +114,6 @@ theorem sound : TinylambOpt.ResearchGoals.SelfJoinSharedScanDualFilterSplit.Goal
         simp
 
 end TinylambOpt.ResearchProofs.SelfJoinSharedScanDualFilterSplit
+
+-- C++ references to this model or its proof.
+-- executor/detail/build_input.cpp

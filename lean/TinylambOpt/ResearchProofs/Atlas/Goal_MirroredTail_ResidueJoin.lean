@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E2
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.TailRunAndWrappingResidueJoins
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `MirroredTail.ResidueJoin` — `∀ c (b : Lane), ((rows layout c).map (fun r =>
+  (List.range b.n).countP (fun (i : Nat) => r.2 == b.base+b.step*(i:Int)))).sum =
+  ((layout.lanes c).map (joinCount · b)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -25,6 +36,6 @@ def residueJoinCheck (c : Config) (b : Lane) : Bool :=
     so the generic residue-join reduction applies. -/
 theorem sound_MirroredTail_ResidueJoin :
     TinylambOpt.ResearchGoals.Atlas.EncodedPages.MirroredTail.ResidueJoin.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E2.MirroredTail_ResidueJoin
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.TailRunAndWrappingResidueJoins.MirroredTail_ResidueJoin
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_MirroredTail_ResidueJoin

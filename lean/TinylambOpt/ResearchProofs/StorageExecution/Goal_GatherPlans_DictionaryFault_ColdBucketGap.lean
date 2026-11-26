@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `DictionaryFault.ColdBucketGap` — `∀ g f a b c, a≤b → b<c → b/(g+1)=c/(g+1) → price g
+  f a c - price g f a b = c-b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

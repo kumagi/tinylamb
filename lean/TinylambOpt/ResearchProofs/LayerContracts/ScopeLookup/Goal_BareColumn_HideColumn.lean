@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LayerContracts.ScopeLookup
 
+/-!
+SQL binding and compilation depend on preserving the chosen name, overload, or ordinal
+when narrowing the lookup.
+
+Proved
+
+- `BareColumn.HideColumn` — `∀ (q e : Name), model.accept q {e with hidden := true} =
+  false`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

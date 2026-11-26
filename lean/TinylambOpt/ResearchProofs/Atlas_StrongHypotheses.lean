@@ -2,6 +2,23 @@ import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 import TinylambOpt.ResearchGoals.Atlas.TextExecution
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Refuted by counterexample
+
+- `Exchanges.GlobalPacking` — `∀ cap xs, 0 < cap → traffic cap xs = packets cap (xs.map
+  Prod.snd).sum`
+- `BatchWatermarks.FinalSummary` — `∀ a b, stamp a = stamp b → (a.map Prod.snd).sum =
+  (b.map Prod.snd).sum → ∀ t, score t a = score t b`
+- `Versions.DropTombstones` — `∀ es k t v, readAt (es.filter (fun e =>
+  e.payload.isSome)) k t v = readAt es k t v`
+- `Grammar.InteriorCache` — `∀ a b p, a.length = b.length → (positions a p).length =
+  (positions b p).length → ∀ tail, (positions (a++tail) p).length = (positions
+  (b++tail) p).length`
+-/
+
 namespace TinylambOpt.ResearchProofs.Atlas.StrongHypotheses
 
 open TinylambOpt.ResearchGoals.Atlas.ExecutorResources

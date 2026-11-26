@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `QuadraticDecode.MergeNeighbors` — `∀ f a m b, a≤m → m<b → (price f a b ≤ price f a m
+  + price f (m+1) b ↔ 2*(m+1-a)*(b-m)≤f)`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

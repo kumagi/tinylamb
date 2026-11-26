@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `GiniDistance.Lipschitz` — `∀ x a b, ((measure (a::x)-measure (b::x)).natAbs:Int) ≤
+  size x * distance a b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

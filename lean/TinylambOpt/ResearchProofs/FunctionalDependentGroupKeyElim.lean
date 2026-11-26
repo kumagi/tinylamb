@@ -1,5 +1,18 @@
 import TinylambOpt.ResearchGoals.FunctionalDependentGroupKeyElim
 
+/-!
+Refuted by counterexample
+
+- `Goal` — Functional-dependent group-key elimination (`GROUP BY k, k-1, k-2, k-3` on
+  ClickBench Q36): when all inputs satisfy `k ∈ [MIN_I64 + 3, MAX_I64]`, grouping
+  only by `k` and materializing `(k-1, k-2, k-3)` after `Top-K` yields exact equality
+  with 4-key grouping; deferring `k-1` evaluation past `LIMIT K` without checking all
+  inputs silently hides overflow errors on dropped rows.
+
+The reference model is defined in
+`TinylambOpt.ResearchGoals.FunctionalDependentGroupKeyElim`.
+-/
+
 namespace TinylambOpt.ResearchProofs.FunctionalDependentGroupKeyElim
 
 open TinylambOpt.ResearchGoals.FunctionalDependentGroupKeyElim

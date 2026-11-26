@@ -956,7 +956,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   }
   const std::vector<PredicateInfo> where_predicates =
       AnalyzePredicates(statement.WhereClause(), relations);
-  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
   //   (single_source_exists_pushdown_before_inner_join_sound,
   //    prebuilt_exists_outer_domain_filter_sound)
   // Boolean trees of single-key prebuildable EXISTS/NOT EXISTS predicates
@@ -5152,7 +5152,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     RETURN_IF_FAIL(relations[idx].GetStatus());
     if (!post_load_exists_predicates[idx].empty() &&
         relations[idx].TotalRows() > 0) {
-      // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+      // Lean proof:
+      // lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
       //   (MultiChannelExistsBitsetPushdown_sound,
       //    MultiChannelAntiExistsBitsetPushdown_sound)
       // Evaluate plain single-EXISTS conjuncts before disjunctive OR-EXISTS
@@ -6754,8 +6755,9 @@ run_zero_payload_first:
   }
   // Factorized join tree (#9, #11, #12) and small-dim star direct scan (#14)
   // for 3+ table acyclic equality join trees with grouped or scalar aggregates.
-  // Lean proofs: Wave9AnalyticsRemaining.lean (SelfJoinBridgeBipartiteWeights,
-  // FilteredSemiJoinCountBeforeGroup).
+  // Lean proofs:
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/JoinMultiplicityAndZoneFilters.lean
+  // (SelfJoinBridgeBipartiteWeights, FilteredSemiJoinCountBeforeGroup).
   // For 3..5-table ANSI INNER JOINs with multi-column GROUP BY (e.g. LDBC L2,
   // BigBench B3), the downstream typed-stream / greedy path avoids per-row
   // string key encoding; restrict 3..5-table ANSI entry to <= 1 group key.
@@ -6877,7 +6879,7 @@ run_zero_payload_first:
               << " res=" << join_residual.size() << "\n";
   }
 
-  // Lean-backed (IndividualQueryGaps.lean:
+  // Lean-backed (SemijoinFiltersAndGroupThresholds.lean:
   // CompositeKeySemiJoinChainReduction_sound): for all-INNER multi-way join
   // chains with composite (2+ column) int64 equijoins `A ⋈_{k1=k2} B ⋈_{j2=j3}
   // C`, propagate composite-key semi-joins from smaller relations to larger
@@ -7652,7 +7654,8 @@ run_zero_payload_first:
     result = std::move(result_r);
     joined.insert(next);
     remaining.erase(next);
-    // Lean proof: lean/TinylambOpt/ResearchProofs/PostJoinDeadColumnPrune.lean
+    // Lean proof:
+    // lean/TinylambOpt/ResearchProofs/BushyJoinAssociativityWithDeadKeyPrune.lean
     // (sound)
     static const bool post_join_prune_disabled =
         ::tinylamb::platform::GetEnv(

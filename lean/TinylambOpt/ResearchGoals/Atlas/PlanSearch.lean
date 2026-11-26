@@ -1,5 +1,10 @@
 import Std
 
+/-!
+The SQL optimizer can prune or reorganize its plan search only under the relevant
+ordering and cost assumptions.
+-/
+
 namespace TinylambOpt.ResearchGoals.Atlas.PlanSearch
 
 /-! Explicit integer cost models. A job or view can be replayed on counterexample

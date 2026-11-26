@@ -1,6 +1,23 @@
 import TinylambOpt.ResearchGoals.CloudBI.DeleteFiles
 import TinylambOpt.ResearchProofs.CloudBI.Common
 
+/-!
+These models describe SQL scans and aggregates over file metadata and selected column
+data.
+
+Proved (11 claims, including the following)
+
+- `BitmapEpoch` — A key-only bitmap computed for several files cannot be reused past
+  its data sequence frontier. Adjacent sequence intervals with no applicable delete
+  boundary have the same equality-delete bitmap, including where the row key is NULL.
+- `CompactOrdinal` — After applying pinned deletes, compaction densely renumbers
+  survivors. Translate a later predicate on old file positions by prefix survivor
+  rank, preserving row identity.
+- `DeleteAwareLimit` — Ordered scan can overfetch by an upper bound on the number of
+  dead rows. Only qualifying survivors consume LIMIT slots, including when the same
+  row is deleted twice.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

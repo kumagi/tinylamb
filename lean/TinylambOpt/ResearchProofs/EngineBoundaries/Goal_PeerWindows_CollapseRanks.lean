@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.EngineBoundaries.PeerWindows
 
+/-!
+Window execution must preserve peer membership and frame results at ordering boundaries.
+
+Proved
+
+- `CollapseRanks` — For a present key, rank and dense rank coincide exactly without
+  repeated smaller keys.
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

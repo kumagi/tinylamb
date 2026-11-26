@@ -1,5 +1,28 @@
 import TinylambOpt.ResearchGoals.Frontiers.Arithmetic
 
+/-!
+The modeled contracts identify when an incremental SQL operator can advance its frontier
+while preserving its outputs.
+
+Proved (9 claims, including the following)
+
+- `BinnedAccumulator` — `∀ (groups : List (Nat × List (Int × Nat))) base, (∀ g ∈
+  groups, base ≤ g.1 ∧ ∀ x ∈ g.2, g.1 ≤ x.2) → ((groups.flatMap Prod.snd).map (dyadic
+  base)).sum = (groups.map (fun (e,xs) => 2^(e-base) * (xs.map (dyadic e)).sum)).sum`
+- `CenteredProduct` — `∀ (rows : List (Int × Int)) (bits a b : Nat), 0 < bits → (∀ r ∈
+  rows, r.1.natAbs ≤ a ∧ r.2.natAbs ≤ b) → rows.length*a*b < 2^(bits-1) → let modulus
+  : Int := 2^bits let residues := rows.map (fun (x,y) =>
+  ((x%modulus)*(y%modulus))%modulus) let z := lane modulus residues (rows.map (fun
+  (x,y) => x*y)).sum = if 2*z < modulus then z else z-modulus`
+- `FirstOverflow`
+
+Refuted by counterexample
+
+- `LocalRounding` — `∀ (parts : List Int) scale, 0 < scale → (∀ s ∈ parts,
+  2*(s-scale*rounded s scale).natAbs ≤ scale) → (parts.map (rounded · scale)).sum =
+  rounded parts.sum scale`
+-/
+
 namespace TinylambOpt.ResearchProofs.Frontiers.Arithmetic
 
 open TinylambOpt.ResearchGoals.Frontiers.Arithmetic
@@ -944,3 +967,6 @@ theorem sound_ShiftedCovariance :
   grind
 
 end TinylambOpt.ResearchProofs.Frontiers.Arithmetic
+
+-- C++ references to this model or its proof.
+-- executor/detail/execution_strategies.hpp

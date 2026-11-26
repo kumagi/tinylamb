@@ -99,3 +99,11 @@ import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_TollBudget_
 import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_TollBudget_ShardUnion
 import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_TollBudget_StateDomain
 import TinylambOpt.ResearchProofs.LayerContracts.RecursivePaths.Goal_TollBudget_VertexOnly
+
+/-!
+This module collects proofs for Goal Alternating Delta Only, Goal Alternating Edge
+Dedup, Goal Alternating Pairs, Goal Alternating Plain Depth and related cases.
+
+A recursive query uses visited states and frontier updates to avoid redundant work while
+retaining visits that affect path acceptance.
+-/

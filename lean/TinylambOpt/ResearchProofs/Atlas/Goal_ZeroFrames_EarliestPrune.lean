@@ -1,6 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.OrderedMeasures
 import TinylambOpt.ResearchProofs.Atlas.Goal_ZeroFrames_PrefixCollision
 
+/-!
+SQL execution can use cumulative counts or ordered measures to answer range and rank
+queries under the modeled bounds.
+
+Proved
+
+- `ZeroFrames.EarliestPrune` — `∀ x, measure x = 0 ↔ (0::prefs x).Nodup`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

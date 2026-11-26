@@ -1,5 +1,16 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Gather.OptimalRead` — `∀ ids cap setup price ext, 0 < cap → (∀ e ∈ ext, e.1 < e.2) →
+  (∀ p ∈ pages cap ids, covers ext p = true) → runCost (pages cap ids |>.mergeSort)
+  setup price ≤ readCost setup price ext`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

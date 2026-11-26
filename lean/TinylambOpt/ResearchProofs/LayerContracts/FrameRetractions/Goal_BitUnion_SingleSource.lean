@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.LayerContracts.FrameRetractions
 
+/-!
+A sliding window can update aggregate state as a row leaves when the retained state
+suffices to reconstruct the new result.
+
+Proved
+
+- `BitUnion.SingleSource` — `∀ x, 0 < x → repaired model [x,0] x = some 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 set_option linter.unusedSimpArgs false

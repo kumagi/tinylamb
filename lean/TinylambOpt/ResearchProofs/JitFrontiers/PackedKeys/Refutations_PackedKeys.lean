@@ -1,4 +1,22 @@
 import TinylambOpt.ResearchProofs.JitFrontiers.PackedKeys.BackFields_PackedKeys
+
+/-!
+SQL grouping or ordering can use a packed key when the representation preserves the
+relevant comparisons and validity bits.
+
+Refuted by counterexample
+
+- `DeltaMagnitude.ReuseForSort` — Strong proposal: the unsigned packed comparison also
+  implements SQL lexicographic order.
+- `MixedDirection.ReuseForSort` — Strong proposal: the unsigned packed comparison also
+  implements SQL lexicographic order.
+- `SignedHalves.ReuseForSort` — Strong proposal: the unsigned packed comparison also
+  implements SQL lexicographic order.
+- `XorSide.ReuseForSort` — Strong proposal: the unsigned packed comparison also
+  implements SQL lexicographic order.
+- `ZigzagPair.ReuseForSort` — Strong proposal: the unsigned packed comparison also
+  implements SQL lexicographic order.
+-/
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 open TinylambOpt.ResearchGoals.JitFrontiers.PackedKeys

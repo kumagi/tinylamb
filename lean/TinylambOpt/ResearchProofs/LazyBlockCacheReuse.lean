@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.LazyBlockCacheReuse
 
+/-!
+Proved
+
+- `Goal` — C++ `ReuseLazyDecodedBlock` (`table/tlcs_file.cpp`): bumping
+  `LayoutGeneration` invalidates stale cache entries lazily without eagerly flushing
+  the per-block cache, while per-key `evict` drops only that key.
+
+The reference model is defined in `TinylambOpt.ResearchGoals.LazyBlockCacheReuse`.
+-/
+
 namespace TinylambOpt.ResearchProofs.LazyBlockCacheReuse
 
 open TinylambOpt.ResearchGoals.LazyBlockCacheReuse

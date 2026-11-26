@@ -1,5 +1,21 @@
 import Std
 
+/-!
+Reference single-stage global aggregate: decodes every row's local dictionary code to
+`Option String` upfront and aggregates globally.
+
+Stage 1: accumulates purely inside code-indexed local slots `[0..dict.length]`, where
+`dict.length` represents `NULL`, never touching dictionary strings.
+
+Modeled claims
+
+- `Goal` — Multi-block per-block local-dictionary two-stage aggregation
+  (DictionaryJoinsAndLateLabels B1 / JOB J4 / LDBC L1, L5): accumulating into local
+  code arrays without reading dictionary strings per row and decoding only occupied
+  dictionary slots at global merge matches eager full-string decoding across blocks
+  with distinct codebooks, duplicate dictionary entries, and NULL keys/values.
+-/
+
 namespace TinylambOpt.ResearchGoals.MultiBlockLocalDictTwoStageAggregate
 
 structure DictBlock where
@@ -83,7 +99,7 @@ def optTwoStageAgg (blocks : List DictBlock) (target : Option String) :
       (0, 0, 0)
   (combined.1, if combined.2.1 == 0 then none else some combined.2.2)
 
-/-- Multi-block per-block local-dictionary two-stage aggregation (BigBench B1 /
+/-- Multi-block per-block local-dictionary two-stage aggregation (DictionaryJoinsAndLateLabels B1 /
     JOB J4 / LDBC L1, L5): accumulating into local code arrays without reading
     dictionary strings per row and decoding only occupied dictionary slots at
     global merge matches eager full-string decoding across blocks with distinct

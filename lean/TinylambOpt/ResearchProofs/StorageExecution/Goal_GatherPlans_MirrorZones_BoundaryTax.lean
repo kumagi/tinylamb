@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.StorageExecution.GatherPlans
 
+/-!
+Late materialization can gather payloads at selected row positions while preserving the
+selection's order and multiplicities.
+
+Proved
+
+- `MirrorZones.BoundaryTax` — `∀ z h a b, a≤b → price z h a b = price z 0 a b +
+  h*(b/(z+1)-a/(z+1))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

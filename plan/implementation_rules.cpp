@@ -3844,7 +3844,8 @@ void CollectAntiJoinRightRelations(
   }
 }
 
-// Lean proof: lean/TinylambOpt/Discovery.lean (outer_to_anti_join_aggressive)
+// Lean proof: lean/TinylambOpt/OuterJoinToAntiJoin.lean
+// (outer_to_anti_join_aggressive)
 Expression FoldAntiJoinColumnsToNull(
     const Expression& expr, const Schema& child_schema,
     const std::unordered_set<std::string>& anti_right_rels,

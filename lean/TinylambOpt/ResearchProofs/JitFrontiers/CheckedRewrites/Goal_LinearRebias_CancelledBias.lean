@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.JitFrontiers.CheckedRewrites
 
+/-!
+The expression compiler must preserve both the checked integer result and observable
+overflow behavior.
+
+Proved
+
+- `LinearRebias.CancelledBias` — `∀ w, 4≤w → scalar rule w (limit w-1) 7=.error 0`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

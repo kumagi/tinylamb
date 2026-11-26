@@ -387,3 +387,9 @@ example : anchoredChain [97,98,97] [] [97,98] [] = false ∧
     anchoredChain [97,98,97,98] [] [97,98] [] = true := by decide
 
 end TinylambOpt.LikeSegmentChain
+
+-- C++ references to this model or its proof.
+-- common/literal_like_pattern.hpp
+-- executor/detail/expression_eval.cpp
+-- executor/detail/scan_filter.cpp
+-- expression/binary_expression.cpp

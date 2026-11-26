@@ -1,5 +1,14 @@
 import TinylambOpt.ResearchGoals.RecursiveDelta
 
+/-!
+Proved
+
+- `Goal` — `∀ edges seeds, let s := execute edges seeds (∀ v, v ∈ s.seen ↔ Reach edges
+  seeds v) ∧ s.seen.Nodup ∧ s.frontier = [] ∧ s.expanded.Perm s.seen`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.RecursiveDelta`.
+-/
+
 namespace TinylambOpt.ResearchProofs.RecursiveDelta
 
 open TinylambOpt.ResearchGoals.RecursiveDelta

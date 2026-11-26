@@ -1234,6 +1234,8 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
   // Multi-slice skew match tracking across probe rows:
   OocAdaptiveHashProbeSource::ActiveProbeRowState probe_state;
   DataChunk active_probe_chunk;
+  DataChunk pending_build_chunk;
+  size_t pending_build_row{0};
   JoinHashIndex slice_index;
   QueryMemoryGrant::LocalBatchCache* grant_cache{nullptr};
   bool any_null_safe{false};
@@ -1286,24 +1288,55 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
     }
     RETURN_IF_FAIL(build_slice_reader->Seek(next_build_offset));
     bool reached_eof = false;
-    const size_t slice_cap = chunked_skew_mode
-                                 ? std::max<size_t>(16384, budget_bytes / 2)
-                                 : std::numeric_limits<size_t>::max();
+    const size_t slice_cap =
+        chunked_skew_mode
+            ? (budget_bytes > 0 ? std::max<size_t>(1024, budget_bytes / 2)
+                                : size_t{16384})
+            : std::numeric_limits<size_t>::max();
     size_t slice_bytes = 0;
-    DataChunk chunk;
-    while (true) {
-      ASSIGN_OR_RETURN(
-          bool, has,
-          ReadDataChunk(build_slice_reader.get(), &chunk, &codec_scratch));
-      if (!has) {
-        reached_eof = true;
-        break;
+    // Stage chunk cursor in locals so a failed ReadDataChunk / Reserve / Open
+    // leaves (pending_build_chunk, pending_build_row, next_build_offset)
+    // untouched for a clean retry.
+    DataChunk work_chunk;
+    size_t work_row = pending_build_row;
+    const bool using_saved_chunk = (work_row < pending_build_chunk.Size());
+    if (using_saved_chunk) {
+      for (size_t i = work_row; i < pending_build_chunk.Size(); ++i) {
+        work_chunk.AppendFrom(pending_build_chunk, i);
       }
-      for (size_t r = 0; r < chunk.Size(); ++r) {
-        Row row = chunk.RowAt(r);
-        slice_bytes += EstimateRowMemoryBytes(row) + sizeof(RowPosition);
+      work_row = 0;
+    }
+    while (true) {
+      if (work_row >= work_chunk.Size()) {
+        ASSIGN_OR_RETURN(
+            bool, has,
+            ReadDataChunk(build_slice_reader.get(), &work_chunk,
+                          &codec_scratch));
+        work_row = 0;
+        if (!has) {
+          work_chunk.Reset();
+          reached_eof = true;
+          break;
+        }
+      }
+      bool slice_full = false;
+      while (work_row < work_chunk.Size()) {
+        Row row = work_chunk.RowAt(work_row);
+        const size_t rb = EstimateRowMemoryBytes(row) + sizeof(RowPosition);
+        if (chunked_skew_mode && !slice_build_rows.empty() &&
+            slice_bytes + rb +
+                    EstimateJoinHashIndexBytes(slice_build_rows.size() + 1) >
+                slice_cap) {
+          slice_full = true;
+          break;
+        }
+        slice_bytes += rb;
         slice_build_rows.push_back(std::move(row));
-        slice_build_positions.push_back(chunk.PositionAt(r));
+        slice_build_positions.push_back(work_chunk.PositionAt(work_row));
+        ++work_row;
+      }
+      if (slice_full) {
+        break;
       }
       if (chunked_skew_mode &&
           slice_bytes + EstimateJoinHashIndexBytes(slice_build_rows.size()) >=
@@ -1389,8 +1422,10 @@ struct OocAdaptiveHashProbeSource::GracePartitionCursor {
     probe_state.Reset();
     unmatched_build_cursor = 0;
     draining_unmatched_build = false;
+    pending_build_chunk = std::move(work_chunk);
+    pending_build_row = work_row;
     next_build_offset = build_slice_reader->Offset();
-    build_eof = reached_eof;
+    build_eof = reached_eof && (pending_build_row >= pending_build_chunk.Size());
     loading_build_slice = false;
     return Status::kSuccess;
   }

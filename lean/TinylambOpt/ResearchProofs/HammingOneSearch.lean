@@ -14,6 +14,14 @@ reindexing lemma turns it into the reference's filtered `List.range`.
 -/
 import TinylambOpt.ResearchGoals.HammingOneSearch
 
+/-!
+Proved
+
+- `Goal` — `∀ pat text, pat.length ≤ 64 → search pat text = reference pat text`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.HammingOneSearch`.
+-/
+
 namespace TinylambOpt.ResearchProofs.HammingOneSearch
 
 open TinylambOpt.ResearchGoals.HammingOneSearch

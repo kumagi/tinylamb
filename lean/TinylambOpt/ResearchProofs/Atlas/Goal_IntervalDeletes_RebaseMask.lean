@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.SnapshotMaintenance
 
+/-!
+Snapshot maintenance must preserve the rows visible to a SQL transaction across edits,
+retention, and compaction.
+
+Proved
+
+- `IntervalDeletes.RebaseMask` — `∀ base n rs, ((List.range n).filter (fun i =>
+  !blocked rs (base+i))) = live n (rs.map (fun (a,b) => (a-base,b-base)))`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.Atlas.ExecutorResources
 
+/-!
+SQL operators may batch or defer work under the modeled memory and resource ownership
+conditions.
+
+Proved
+
+- `Pipeline.SteadyState` — `∀ n a b, 0 < n → finish (List.replicate n (a,b)) =
+  a+b+(n-1)*max a b`
+-/
+
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
 

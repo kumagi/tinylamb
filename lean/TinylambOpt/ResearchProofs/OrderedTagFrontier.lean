@@ -1,5 +1,15 @@
 import TinylambOpt.ResearchGoals.OrderedTagFrontier
 
+/-!
+Proved
+
+- `Goal` — `∀ nfa limit input, winner nfa input.length (frontier nfa limit input) =
+  winner nfa input.length (fullRun nfa limit input) ∧ ((frontier nfa limit input).map
+  Prod.fst).Nodup`
+
+The reference model is defined in `TinylambOpt.ResearchGoals.OrderedTagFrontier`.
+-/
+
 /-
 Two evaluators run the same NFA with the same epsilon bound.  The reference
 `fullRun` keeps every history; `frontier` keeps, after each epsilon round and

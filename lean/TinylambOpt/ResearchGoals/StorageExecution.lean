@@ -8,3 +8,8 @@ import TinylambOpt.ResearchGoals.StorageExecution.GrammarScans
 import TinylambOpt.ResearchGoals.StorageExecution.OrderedFooters
 import TinylambOpt.ResearchGoals.StorageExecution.PostingJoins
 import TinylambOpt.ResearchGoals.StorageExecution.RankedMasks
+
+/-!
+This module collects models for Bag Kernels, Bit Layouts, Cluster Order, Derived Zones
+and related cases.
+-/

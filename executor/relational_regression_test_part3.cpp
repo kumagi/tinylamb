@@ -1339,7 +1339,8 @@ TEST_F(RelationalRegressionTest, ExactIntegerRollupReusesWeightedFineGroups) {
 
 TEST_F(RelationalRegressionTest,
        SurrogateKeyPreAggRollupMatchesCanonicalAndHandlesDuplicates) {
-  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave9TpcdsRollupAndSetOps.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/QueryRewrites/SurrogateKeyRollupsAndSetCounts.lean
   //   (SurrogateKeyPreAggRollup_sound)
   RelationalRun(*rs_,
                 "CREATE TABLE SurrInv (inv_date_sk INT64, inv_item_sk INT64, "
@@ -1450,7 +1451,7 @@ TEST_F(RelationalRegressionTest,
 
 TEST_F(RelationalRegressionTest, MultiBucketScalarCrossJoinMatchesCanonical) {
   // Lean proof:
-  //   lean/TinylambOpt/ResearchProofs/Wave9TpcdsMultiChannelAndTpch.lean
+  //   lean/TinylambOpt/ResearchProofs/QueryRewrites/PivotedAggregatesAndSemijoinFilters.lean
   //   (SingleScanConditionalCountDistinct_sound)
   RelationalRun(*rs_,
                 "CREATE TABLE BucketSales (qty INT64, lp FLOAT64, "
@@ -1521,7 +1522,8 @@ TEST_F(RelationalRegressionTest, MultiBucketScalarCrossJoinMatchesCanonical) {
 
 TEST_F(RelationalRegressionTest,
        LexicographicDimPrefixTopKMatchesCanonicalWithTies) {
-  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
   //   (LexicographicDimPrefixTopK_sound)
   RelationalRun(*rs_, "CREATE TABLE LexStore (s_sk INT64, s_name STRING)");
   RelationalRun(*rs_, "CREATE TABLE LexItem (i_sk INT64, i_desc STRING)");
@@ -1596,7 +1598,8 @@ TEST_F(RelationalRegressionTest,
 
 TEST_F(RelationalRegressionTest,
        MultiChannelExistsBitsetPushdownOrdersConjuncts) {
-  // Lean proof: lean/TinylambOpt/ResearchProofs/IndividualQueryGaps.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/SemijoinFiltersAndGroupThresholds.lean
   //   (MultiChannelExistsBitsetPushdown_sound,
   //    MultiChannelAntiExistsBitsetPushdown_sound)
   RelationalRun(*rs_,

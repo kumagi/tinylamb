@@ -181,9 +181,9 @@ inline std::optional<FlushPlan> SelectFlushSubset(
 }
 
 // ============================================================================
-// 3. ClickBenchLayout.Execution.LengthRollup
+// 3. ClickstreamLayout.Execution.LengthRollup
 // Lean proof:
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_LengthRollup.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/LengthSubtotalRollup.lean
 //     (LengthRollup.Goal)
 // Prefix-sum index over string ends and non-empty ranks for O(1)/slice
 // SUM(BYTE_LENGTH) and COUNT(non-empty) without materializing strings.
@@ -347,9 +347,9 @@ enum class SealedBuildVerdict : uint8_t {
 }
 
 // ============================================================================
-// 7. ClickBenchLayout.Execution.SparseMark
+// 7. ClickstreamLayout.Execution.SparseMark
 // Lean proof:
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_SparseMark.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/SparseGroupMarkerBounds.lean
 //     (SparseMark.Goal)
 // Necessary-and-sufficient 2-column rectangular range pruning over a
 // lexicographically clustered granule with inclusive bounds `[first, last]`.
@@ -387,9 +387,9 @@ struct LexMarkKey {
 }
 
 // ============================================================================
-// 8. ClickBenchLayout.Execution.DefaultGroups
+// 8. ClickstreamLayout.Execution.DefaultGroups
 // Lean proof:
-//   lean/TinylambOpt/ResearchProofs/ClickBenchLayout/Goal_CB_DefaultGroups.lean
+//   lean/TinylambOpt/ResearchProofs/ClickstreamLayout/DefaultGroupComplement.lean
 //     (DefaultGroups.Goal)
 // Exact GROUP BY multiplicity over sparse lanes (each lane has a default value
 // and exception `(row_id, val)` overrides): untouched rows contribute `n -

@@ -1,5 +1,17 @@
 import TinylambOpt.ResearchGoals.Atlas.EncodedPages
-import TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E4
+import TinylambOpt.ResearchProofs.Atlas.EncodedPages.WaveAndLaneProgressions
+
+/-!
+SQL scans and aggregates can use encoded page structure when positions and arithmetic
+summaries agree with expanded rows.
+
+Proved
+
+- `LaneMajor.AlignedProduct` — `∀ c (b : Lane), 0 < b.stride → ((rows layout c).map
+  (fun r => ((List.range b.n).map (fun i => if r.1 == b.start+i*b.stride then
+  r.2*(b.base+b.step*(i:Int)) else 0)).sum)).sum = ((layout.lanes c).map (aligned ·
+  b)).sum`
+-/
 
 set_option maxHeartbeats 0
 set_option maxRecDepth 10000
@@ -14,6 +26,6 @@ open TinylambOpt.ResearchGoals.Atlas.EncodedPages.LaneMajor
     for `LaneMajor.layout` in `Auto_EncodedPages_E4`. -/
 theorem sound_LaneMajor_AlignedProduct :
     TinylambOpt.ResearchGoals.Atlas.EncodedPages.LaneMajor.AlignedProduct.Goal := by
-  exact TinylambOpt.ResearchProofs.Atlas.Auto_EncodedPages_E4.LaneMajor.LaneMajor_AlignedProduct
+  exact TinylambOpt.ResearchProofs.Atlas.EncodedPages.WaveAndLaneProgressions.LaneMajor.LaneMajor_AlignedProduct
 
 end TinylambOpt.ResearchProofs.Atlas.Goal_LaneMajor_AlignedProduct

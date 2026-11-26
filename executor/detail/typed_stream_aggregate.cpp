@@ -1424,7 +1424,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     interval_empty = interval_empty || interval_low > interval_high;
   }
 
-  // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+  // Lean proof:
+  // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
   // (InRangeSynopsis_sound).
   // A scalar fold over one integer IN-list AND one integer interval on a
   // direct LSTableStore avoids boxed rows and per-cell predicate/aggregate
@@ -2651,7 +2652,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
 
         if (scalar_in_range_sum) {
-          // Lean proof: lean/TinylambOpt/ResearchProofs/Wave8H2o.lean
+          // Lean proof:
+          // lean/TinylambOpt/ResearchProofs/AnalyticsWorkloads/HotKeyAndEpochAggregates.lean
           // (InRangeSynopsis_sound).
           if (in_range_empty) {
             return;

@@ -1,5 +1,15 @@
 import Std
 
+/-!
+These claims count pairs whose intervals overlap. A SQL range join can use the endpoint
+structure to compute counts without expanding the result pairs.
+
+Modeled claims
+
+- `Goal` — `∀ a b, valid a → valid b → (count a b).1 = reference a.data b.data ∧
+  ((count a b).2 = true → ∃ x ∈ a.data, ∃ y ∈ b.data, hit x y = false)`
+-/
+
 namespace TinylambOpt.ResearchGoals.OverlapPairCount
 
 -- Intervals must be nonempty for this specialized inner join.

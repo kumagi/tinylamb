@@ -485,7 +485,7 @@ void CollectCteNamesInScope(const SelectStatement& stmt,
 // ============================================================================
 // TPCH-1: Disjunctive Common-Conjunct Factoring, Per-Table Envelopes, and
 //         Numeric/Date Bounding-Hull Range Synthesis
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - kleene_common_conjunct_factor_or_sound
 //   - disjunctive_join_envelope_pushdown_sound
 //   - interval_hull_of_disjuncts_sound
@@ -563,7 +563,7 @@ Expression MakeBoundConstantExpr(const ScalarBoundVal& b) {
   return ConstantValueExp(Value(b.dbl_val));
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (interval_hull_of_disjuncts_sound)
 void AppendDisjunctiveIntervalHulls(
     const std::vector<std::vector<Expression>>& branch_conjs,
@@ -1012,7 +1012,7 @@ bool FactorAndEnvelopeRecursive(  // NOLINT(misc-no-recursion)
 // ============================================================================
 // TPCH-2: Left-Join Right Pre-Aggregation and Unique-Left GROUP BY Elision
 // Lean proofs:
-//   - lean/TinylambOpt/TpchSf10Discovery.lean
+//   - lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //     - left_join_right_preagg_and_unique_elide_groupby_sound
 //     - nullable_unique_left_elides_groupby_bug (Trap 2a guard)
 //     - left_join_count_nonstrict_expr_bug (Trap 2b guard)
@@ -1366,7 +1366,7 @@ bool PreaggregateLeftJoinRecursive(  // NOLINT(misc-no-recursion)
 
 // ============================================================================
 // TPCH-3: Self-Semi-Join HAVING Aggregate Absorption
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - self_semijoin_having_agg_absorption_sound
 //   - self_semijoin_mismatched_where_bug (Trap 3 guard)
 // ============================================================================
@@ -1940,7 +1940,7 @@ bool AbsorbSelfSemijoinRecursive(  // NOLINT(misc-no-recursion)
 
 // ============================================================================
 // TPCH-4a: CTE Self-MAX / Self-MIN Subquery -> Non-Null Top-1 WITH TIES
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - cte_argmax_subquery_to_nonnull_max_ties_sound
 //   - argmax_with_ties_without_is_not_null_bug (Trap 4a guard)
 // ============================================================================
@@ -2044,7 +2044,7 @@ std::string OutputColumnNameAt(const SelectStatement& stmt, size_t idx) {
 
 // ============================================================================
 // TPCH-5b: Transitive Equijoin Closure Synthesis
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - equijoin_transitive_closure_sound
 // ============================================================================
 
@@ -2216,7 +2216,7 @@ bool SynthesizeTransitiveEquijoinsRecursive(  // NOLINT(misc-no-recursion)
 
 // ============================================================================
 // TPCH-5a: Late Unique-Dimension Wide Attribute Materialization After Top-N
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - topn_agg_late_unique_dim_attribute_join_sound
 //   - late_dim_join_without_key_semijoin_steals_limit_bug (Trap 5 guard)
 // ============================================================================
@@ -2767,7 +2767,7 @@ bool DeferUniqueDimAfterTopNOneSelect(
 
 // ============================================================================
 // TPCH-6a: Correlated Strict Comparison Against SUM/AVG/MIN/MAX -> INNER JOIN
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   - correlated_gt_sum_decorrelate_to_inner_join_sound
 //   - correlated_gt_count_demotes_to_inner_join_bug (Trap 6a Kim's COUNT guard)
 // ============================================================================
@@ -2992,7 +2992,7 @@ bool DecorrelateCorrelatedSumOneSelect(
       continue;
     }
     const auto& cmp = conj->AsBinaryExpression();
-    // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+    // Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
     // (correlated_scalar_agg_decorrelation_sound)
     auto extract_outer_scaled_q =
         [](const Expression& side, const QueryExpression** q_out,
@@ -3379,7 +3379,7 @@ bool DecorrelateCorrelatedSumRecursive(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (kleene_common_conjunct_factor_or_sound,
 //    disjunctive_join_envelope_pushdown_sound,
 //    interval_hull_of_disjuncts_sound,
@@ -3389,7 +3389,7 @@ bool FactorAndEnvelopeDisjunctiveWhere(SelectStatement* select,
   return FactorAndEnvelopeRecursive(select, {}, ctx);
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (left_join_right_preagg_and_unique_elide_groupby_sound,
 //    nullable_unique_left_elides_groupby_bug,
 //    left_join_count_nonstrict_expr_bug)
@@ -3398,7 +3398,7 @@ bool PreaggregateLeftJoinRightCounts(SelectStatement* select,
   return PreaggregateLeftJoinRecursive(select, {}, ctx);
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (self_semijoin_having_agg_absorption_sound,
 //    self_semijoin_mismatched_where_bug)
 bool AbsorbSelfSemijoinHavingAggregate(SelectStatement* select,
@@ -3406,7 +3406,7 @@ bool AbsorbSelfSemijoinHavingAggregate(SelectStatement* select,
   return AbsorbSelfSemijoinRecursive(select, {}, ctx);
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (cte_argmax_subquery_to_nonnull_max_ties_sound,
 //    argmax_with_ties_without_is_not_null_bug)
 bool RewriteCteArgmaxSubqueryToTopTies(SelectStatement* outer,
@@ -3688,14 +3688,14 @@ bool RewriteCteArgmaxSubqueryToTopTies(SelectStatement* outer,
   return any_rewritten;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (equijoin_transitive_closure_sound)
 bool SynthesizeTransitiveEquijoins(SelectStatement* select,
                                    TransactionContext& ctx) {
   return SynthesizeTransitiveEquijoinsRecursive(select, {}, ctx);
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (topn_agg_late_unique_dim_attribute_join_sound,
 //    late_dim_join_without_key_semijoin_steals_limit_bug)
 bool DeferUniqueDimensionAttributesAfterTopN(SelectStatement* select,
@@ -3708,7 +3708,7 @@ bool DeferUniqueDimensionAttributesAfterTopN(SelectStatement* select,
   return DeferUniqueDimAfterTopNOneSelect(select, ctes, ctx);
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (correlated_gt_sum_decorrelate_to_inner_join_sound,
 //    correlated_gt_count_demotes_to_inner_join_bug)
 bool DecorrelateCorrelatedSumComparisons(SelectStatement* select,
@@ -4017,7 +4017,7 @@ bool RewriteAffineLinearSumsOneSelect(
     return false;
   }
 
-  // Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+  // Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
   //   (affine_sum_no_overflow_fusion_sound,
   //   affine_sum_row_overflow_unsound_bug)
   // Share canonical `SUM(col)` / `COUNT(col)` AggregateExpression instances per
@@ -4156,7 +4156,7 @@ bool RewriteAffineLinearSumsRecursive(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/ClickBenchRound2.lean
+// Lean proof: lean/TinylambOpt/CountBoundsAndBlockAggregates.lean
 //   (affine_sum_homomorphism_sound, affine_sum_coalesce_empty_bug,
 //    affine_sum_overflow_masked_bug, affine_sum_no_overflow_fusion_sound)
 bool RewriteAffineLinearSums(SelectStatement* select, TransactionContext& ctx) {
@@ -4167,7 +4167,7 @@ namespace {
 
 // Bottom-up Kleene 3VL common-conjunct factoring over OR trees:
 // `(A AND B) OR (A AND C) -> A AND (B OR C)` and `(A AND B) OR A -> A`.
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (kleene_and_or_distrib_left_sound)
 Expression FactorCommonConjunctsInOrTree(  // NOLINT(misc-no-recursion)
     const Expression& expr, size_t depth = 0) {
@@ -4654,7 +4654,7 @@ bool RewriteCorrelatedPositiveCountRecursive(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+// Lean proof: lean/TinylambOpt/PredicateAndRelationalLowering.lean
 //   (kleene_and_or_distrib_left_sound,
 //    correlated_count_gt_zero_to_in_subquery_sound,
 //    trap_correlated_count_eq_zero_not_in_null_outer_unsound)
@@ -4707,7 +4707,7 @@ bool AsInt64ConstLiteral(const Expression& expr, int64_t* out) {
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (count_distinct_gt_one_iff_min_lt_max,
 //    count_distinct_eq_one_iff_min_eq_max)
 bool RewriteHavingCountDistinctOneSelect(
@@ -4836,7 +4836,7 @@ bool RewriteHavingCountDistinctRecursive(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (count_distinct_gt_one_iff_min_lt_max,
 //    count_distinct_eq_one_iff_min_eq_max)
 bool RewriteHavingCountDistinctToMinMax(SelectStatement* select,
@@ -5221,7 +5221,7 @@ bool RewriteSubqueryAggArgToCteCol(  // NOLINT(misc-no-recursion)
 
 }  // namespace
 
-// Lean proof: lean/TinylambOpt/TpchSf10Discovery.lean
+// Lean proof: lean/TinylambOpt/JoinAndAggregatePushdown.lean
 //   (grouped_having_global_sum_fubini_sound,
 //    grouped_having_distinct_sum_fubini_bug)
 bool RewriteHavingGlobalSumFubini(SelectStatement* stmt,
@@ -5395,7 +5395,7 @@ bool RewriteHavingGlobalSumFubini(SelectStatement* stmt,
   return false;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (self_join_unique_dim_cte_decorrelate_sound)
 bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* stmt,
                                            TransactionContext& ctx) {
@@ -5738,7 +5738,7 @@ bool RewriteSelfJoinUniqueDimCorrelatedAgg(SelectStatement* stmt,
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (semijoin_domain_pushdown_in_subquery_sound)
 bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* stmt,
                                                   TransactionContext& ctx) {
@@ -5963,7 +5963,7 @@ bool RewritePushOuterSemiJoinDomainIntoInSubquery(SelectStatement* stmt,
 // ============================================================================
 // TPC-DS Q78: Disjunctive Left-Join Key-Domain Intersection Pushdown into
 // Grouped CTEs
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (disjunctive_left_join_semijoin_pushdown_sound)
 // ============================================================================
 
@@ -6449,7 +6449,7 @@ bool RewriteDisjunctiveLeftJoinCteKeyDomain(SelectStatement* stmt,
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (join_union_all_distribute_sound)
 // Distributes inner/cross joins and WHERE predicates over a UNION ALL derived
 // table of plain base-table projections:
@@ -6907,7 +6907,7 @@ bool RewriteDistributeJoinOverUnionAll(SelectStatement* stmt,
   return true;
 }
 
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (grouped_sum_union_all_distribute_sound)
 // Distributes grouped SUM/MIN/MAX aggregation over a pure UNION ALL CTE or
 // derived table of plain base-table projections:
@@ -8178,7 +8178,7 @@ bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* root,
     // Also push selective dimension semi-filters into non-grouped UNION ALL /
     // UNION DISTINCT derived tables (e.g. TPC-DS Q71: item.i_manager_id = 1
     // and time_dim.t_meal_time IN (...) pushed into 3-way UNION ALL).
-    // Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+    // Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
     //   (union_semi_filter_pushdown_sound)
     for (size_t u_idx = 0; u_idx < nsrc; ++u_idx) {
       SelectStatement* u = metas[u_idx].union_target;
@@ -8433,7 +8433,7 @@ bool PushTransitiveGroupedSubqueryDimSemiFilter(SelectStatement* root,
 // into a single-pass window derived table `AVG(f.v) OVER (PARTITION BY F.fk)`
 // when `D_item.pk` is certified unique non-null and all non-correlated
 // predicates on `{F, D_date}` match identically between outer and subquery.
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (correlated_self_avg_to_window_sound)
 bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* root,
                                       TransactionContext& ctx) {
@@ -9043,7 +9043,7 @@ bool RewriteCorrelatedSelfAvgToWindow(SelectStatement* root,
 //     -> FROM (SELECT COND_AGG(__m_dim.__m_pk IS NOT NULL), AGG
 //              FROM B LEFT OUTER JOIN (SELECT P.pk AS __m_pk FROM P WHERE Cp)
 //              __m_dim ON fk = __m_dim.__m_pk WHERE C) M
-// Lean proof: lean/TinylambOpt/TpchSf10VectorizedExec.lean
+// Lean proof: lean/TinylambOpt/VectorizedJoinAndPruning.lean
 //   (scalar_agg_cross_join_merge_case1_sound,
 //    scalar_agg_cross_join_merge_case2_sound)
 bool RewriteScalarAggCrossJoinMerge(SelectStatement* root,
