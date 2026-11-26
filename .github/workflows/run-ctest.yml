@@ -1,54 +1,125 @@
 name: ctest
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
-jobs:
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
 
-      # AGENTS.md mandatory gates: include-lint and OOC invariant lint must
-      # exit 0 (the same checks scripts/verify_all.sh runs). Pure static
-      # checks -- run them before the expensive build so violations fail fast.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # AGENTS.md mandatory gates: include-lint and OOC invariant lint must exit 0
+  # (the same checks scripts/verify_all.sh runs). Pure static checks, so they
+  # run in their own seconds-long job and fail fast before any compilation.
+  lint:
+    name: layering / OOC lint + script tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: layering and OOC invariant lint
         run: |
           python3 scripts/check_layering.py
           python3 scripts/check_ooc_invariants.py
-
-      - name: build and test
+      # Self-tests of the lint / bench-gate scripts the gates above rely on.
+      # ooc_fuzz_test.py is excluded: it drives real fuzz binaries and takes
+      # minutes. Missing files are skipped so the job tracks what is committed.
+      - name: unit tests for CI helper scripts
+        working-directory: scripts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
-          # The SQL tests assume the GoogleSQL frontend (GoogleSqlFrontend::
-          # Available() is baked in at configure time); OFF would fail 300+
-          # of them, so keep the default ON here.
-          CC=clang CXX=clang++ cmake -S . -B build \
-            -DTINYLAMB_ENABLE_SANITIZERS=ON \
-            -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build -j"$(nproc)"
-          # Scale tests (label "scale", TIMEOUT 600) are opt-in via
-          # `ctest -L scale`; the default run excludes them so every
-          # executed unit honors the 60-second contract.
-          ctest --test-dir build -j"$(nproc)" --output-on-failure -LE scale
-          python3 scripts/clean_root_artifacts.py
+          mods=()
+          for m in check_layering_test check_ooc_invariants_test bench_gate_test; do
+            [ -f "$m.py" ] && mods+=("$m")
+          done
+          if [ ${#mods[@]} -eq 0 ]; then echo "no script tests committed"; exit 0; fi
+          python3 -m unittest -v "${mods[@]}"
+
+  asan:
+    name: ASan + UBSan (Debug, clang-21)
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: asan-debug
+
+      # The SQL tests assume the GoogleSQL frontend (GoogleSqlFrontend::
+      # Available() is baked in at configure time); OFF would fail 300+ of
+      # them, so keep the default ON here.
+      - name: configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTINYLAMB_ENABLE_SANITIZERS=ON
+
+      - name: build
+        run: cmake --build build
+
+      # Scale tests (label "scale", TIMEOUT 600) are opt-in via
+      # `ctest -L scale`; the default run excludes them so every executed
+      # unit honors the 60-second contract.
+      - name: test
+        env:
+          # UBSan recovers by default: a report would scroll by while the test
+          # still passes. Halting turns every UB report into a red test.
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ctest --test-dir build -LE scale \
+            --output-junit "$PWD/build/ctest-junit.xml" \
+            --timeout 300
+
+      - name: test summary
+        if: always()
+        run: python3 .github/scripts/ctest_summary.py build/ctest-junit.xml --title "ctest (ASan+UBSan)"
+
+      - name: upload test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ctest-asan-logs
+          path: |
+            build/ctest-junit.xml
+            build/Testing/Temporary/LastTest*.log
+          retention-days: 14
+
+      - name: sweep test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py
 
   # Informational only: continue-on-error below means failures do NOT gate CI.
   googlesql-compliance-non-gating:
-    timeout-minutes: 120
+    name: GoogleSQL compliance (informational)
+    needs: lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-
-      - name: build and run GoogleSQL compliance
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: compliance-debug
+      - name: build
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DTINYLAMB_ENABLE_GOOGLESQL=ON
-          cmake --build build -j"$(nproc)" --target googlesql_compliance_test
-          ctest --test-dir build -R GoogleSqlCompliance --output-on-failure -j"$(nproc)"
-          python3 scripts/clean_root_artifacts.py
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTINYLAMB_ENABLE_GOOGLESQL=ON
+          cmake --build build --target googlesql_compliance_test
+      - name: run GoogleSQL compliance
+        run: |
+          ctest --test-dir build -R GoogleSqlCompliance \
+            --output-junit "$PWD/build/compliance-junit.xml"
+      - name: compliance summary
+        if: always()
+        run: python3 .github/scripts/ctest_summary.py build/compliance-junit.xml --title "GoogleSQL compliance"
+      - name: sweep test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py

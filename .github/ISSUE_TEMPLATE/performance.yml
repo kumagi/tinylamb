@@ -1,0 +1,28 @@
+name: Performance regression / opportunity
+description: A query got slower, or tinylamb loses to another engine on a query
+labels: [performance]
+body:
+  - type: input
+    id: workload
+    attributes:
+      label: Workload
+      placeholder: "TPC-H SF=10 Q18"
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: Warm median (not cold / best-of) for tinylamb and the comparison engine, plus the machine.
+      placeholder: |
+        tinylamb  (abc1234): 812 ms
+        tinylamb  (def5678): 655 ms
+        DuckDB 1.x        : 540 ms
+        machine: evo-x2
+    validations:
+      required: true
+  - type: textarea
+    id: explain
+    attributes:
+      label: EXPLAIN ANALYZE
+      render: text

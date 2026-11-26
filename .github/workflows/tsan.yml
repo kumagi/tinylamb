@@ -1,65 +1,103 @@
 name: tsan
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # CamelCase gtest suite names, anchored to the suite start: unanchored
+  # "Transaction" also pulled in PostgresServerTest TCP-protocol tests, which
+  # are not part of the concurrency subset. Every alternative must name a
+  # suite that exists today (deleted suites silently match nothing). These
+  # are the suites whose tests spawn threads or exercise latch/MVCC/WAL/
+  # budget concurrency. Shared by both jobs so they cannot drift apart.
+  TSAN_SUITES: '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)'
+
 jobs:
   concurrency:
+    name: TSan concurrency subset
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-
-      - name: build and test concurrency subset
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: tsan
+      - name: configure
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
-          CC=clang CXX=clang++ cmake -S . -B build \
+          cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_TSAN=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
-          cmake --build build -j"$(nproc)"
-          # CamelCase gtest suite names; the old lowercase regex matched zero
-          # tests, so the job vacuously passed. Anchored to the suite start:
-          # unanchored "Transaction" also pulled in PostgresServerTest
-          # TCP-protocol tests, which are not part of the concurrency subset.
-          # Every alternative must name a suite that exists today (the old
-          # LockManager/LockWaitProgress/CacheConcurrent/PagePool/
-          # RowPageConcurrent/BPlusTreeConcurrent suites were deleted, so six
-          # of seven alternatives silently matched nothing). These are the
-          # suites whose tests spawn threads or exercise latch/MVCC/WAL/
-          # budget concurrency.
-          ctest --test-dir build \
-            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)' \
-            -j"$(nproc)" --output-on-failure
-          python3 scripts/clean_root_artifacts.py
+      - name: build
+        run: cmake --build build
+      # TSAN_OPTIONS is set per test by CMakeLists.txt (detect_deadlocks /
+      # die_after_fork), so it is not overridden here.
+      - name: test
+        run: |
+          # Guard against the "regex matches zero tests" failure mode that
+          # once made this job pass vacuously.
+          n=$(ctest --test-dir build -N -R "$TSAN_SUITES" | sed -nE 's/^Total Tests: ([0-9]+)/\1/p')
+          echo "selected $n tests"
+          if [ "${n:-0}" -eq 0 ]; then
+            echo "::error::TSAN_SUITES matched zero tests"; exit 1
+          fi
+          ctest --test-dir build -R "$TSAN_SUITES" \
+            --output-junit "$PWD/build/ctest-junit.xml"
+      - name: test summary
+        if: always()
+        run: python3 .github/scripts/ctest_summary.py build/ctest-junit.xml --title "TSan concurrency subset"
+      - name: upload test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tsan-logs
+          path: build/Testing/Temporary/LastTest*.log
+          retention-days: 14
+      - name: sweep test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py
 
   # Lock-order (ABBA) detection needs TSan's deadlock detector, which the job
-  # above disables.  Advisory until the baseline reports are triaged.
+  # above disables. Advisory until the baseline reports are triaged.
   lock-order:
-    timeout-minutes: 120
+    name: TSan lock-order (advisory)
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-
-      - name: build and test with detect_deadlocks=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          ccache-key: tsan-deadlock
+      - name: configure
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DTINYLAMB_ENABLE_TSAN=ON \
             -DTINYLAMB_TSAN_DETECT_DEADLOCKS=ON \
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
-          cmake --build build -j"$(nproc)"
-          # Keep this subset in sync with the concurrency job above: the
-          # missing QueueTable/FullScanMvccFastPath/MemoryBudget/QueryGrant/
-          # QueryParallelismBudget suites take the same latch/budget paths
-          # and must also run under the deadlock detector.
-          ctest --test-dir build \
-            -R '^(Transaction|WriteIntentWait|CommitPublication|DurabilityBarrier|IndexReservation|QueueTable|FullScanMvccFastPath|PageManager|ParallelWork|SpillStore|Logger|TableTest|MemoryBudget|QueryGrant|QueryParallelismBudget)' \
-            -j"$(nproc)" --output-on-failure
-
-      - name: Clean test database artifacts
+      - name: build
+        run: cmake --build build
+      - name: test with detect_deadlocks=1
+        run: |
+          ctest --test-dir build -R "$TSAN_SUITES" \
+            --output-junit "$PWD/build/ctest-junit.xml"
+      - name: test summary
+        if: always()
+        run: python3 .github/scripts/ctest_summary.py build/ctest-junit.xml --title "TSan lock-order"
+      - name: sweep test database artifacts
         if: always()
         run: python3 scripts/clean_root_artifacts.py

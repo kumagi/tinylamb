@@ -1,0 +1,81 @@
+name: coverage
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '30 5 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lcov:
+    name: line coverage (gcc-14, gcov)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write   # Codecov tokenless upload via OIDC
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          compiler: gcc
+          extra-packages: lcov
+          ccache-key: coverage
+
+      # coverage_report.py calls plain `gcov` through lcov; make it the
+      # gcov that matches the compiler, or the .gcda format is rejected.
+      - name: match gcov to gcc-14
+        run: sudo ln -sf "$(command -v gcov-14)" /usr/local/bin/gcov
+
+      - name: configure
+        run: |
+          cmake -S . -B build-cov \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTINYLAMB_ENABLE_COVERAGE=ON
+
+      - name: build
+        run: cmake --build build-cov
+
+      # Coverage is a measurement, not a gate: failing tests are reported by
+      # ctest.yml, so a red test must not hide the coverage number.
+      - name: test
+        run: ctest --test-dir build-cov -LE scale --timeout 600 || echo "::warning::some tests failed during the coverage run"
+
+      - name: lcov report
+        run: |
+          python3 scripts/coverage_report.py --build build-cov --top 30 \
+            --info coverage.info | tee coverage.txt
+          {
+            echo "## Line coverage (production sources)"
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: coverage.info
+          disable_search: true
+          use_oidc: true
+          fail_ci_if_error: false
+
+      - name: upload lcov artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: |
+            coverage.info
+            coverage.txt
+          retention-days: 30
+
+      - name: sweep test database artifacts
+        if: always()
+        run: python3 scripts/clean_root_artifacts.py
